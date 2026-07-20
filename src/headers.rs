@@ -14,6 +14,9 @@ use bitcoin::{
 };
 use thiserror::Error;
 
+/// Bitcoin Core's maximum permitted future block timestamp offset.
+pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
+
 /// Stored metadata for a proof-of-work-valid header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeaderInfo {
@@ -45,6 +48,22 @@ pub enum HeaderError {
     /// The parent height cannot be incremented without overflowing.
     #[error("header height overflow")]
     HeightOverflow,
+    /// The timestamp is not strictly later than the parent chain's median time past.
+    #[error("header timestamp {time} is not later than median time past {median}")]
+    TimeTooOld {
+        /// Candidate header timestamp.
+        time: u32,
+        /// Median of the previous up-to-eleven timestamps.
+        median: u32,
+    },
+    /// The timestamp is too far beyond the network-adjusted clock.
+    #[error("header timestamp {time} exceeds adjusted time limit {maximum}")]
+    TimeTooNew {
+        /// Candidate header timestamp.
+        time: u32,
+        /// Largest accepted timestamp for the supplied adjusted clock.
+        maximum: u32,
+    },
 }
 
 /// In-memory header DAG with the best-work tip selected independently of arrival order.
@@ -91,6 +110,60 @@ impl HeaderDag {
     #[must_use]
     pub fn get(&self, hash: &BlockHash) -> Option<HeaderInfo> {
         self.headers.get(hash).copied()
+    }
+
+    /// Calculates the median timestamp of a header and up to ten ancestors.
+    #[must_use]
+    pub fn median_time_past(&self, hash: BlockHash) -> Option<u32> {
+        let mut times = Vec::with_capacity(11);
+        let mut current = self.headers.get(&hash).copied()?;
+        times.push(current.header.time);
+        for _ in 1..11 {
+            let Some(parent) = self.headers.get(&current.header.prev_blockhash).copied() else {
+                break;
+            };
+            current = parent;
+            times.push(current.header.time);
+        }
+        times.sort_unstable();
+        Some(times[times.len() / 2])
+    }
+
+    /// Applies timestamp context before structurally inserting a header.
+    ///
+    /// `adjusted_time` must come from the P2P network-time subsystem rather
+    /// than the local wall clock alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns timestamp, structural, target, or proof-of-work validation errors.
+    pub fn insert_contextual(
+        &mut self,
+        header: Header,
+        adjusted_time: u32,
+    ) -> Result<HeaderInfo, HeaderError> {
+        let parent = self
+            .headers
+            .get(&header.prev_blockhash)
+            .copied()
+            .ok_or(HeaderError::UnknownParent(header.prev_blockhash))?;
+        let median = self
+            .median_time_past(parent.hash)
+            .expect("known parent has a median timestamp");
+        if header.time <= median {
+            return Err(HeaderError::TimeTooOld {
+                time: header.time,
+                median,
+            });
+        }
+        let maximum = adjusted_time.saturating_add(MAX_FUTURE_BLOCK_TIME_SECS);
+        if header.time > maximum {
+            return Err(HeaderError::TimeTooNew {
+                time: header.time,
+                maximum,
+            });
+        }
+        self.insert(header)
     }
 
     /// Adds a proof-of-work-valid child and promotes it if it has more chainwork.
@@ -172,6 +245,28 @@ mod tests {
         assert_eq!(info.height, 1);
         assert_eq!(dag.active_tip().hash, info.hash);
         assert!(dag.active_tip().chainwork > genesis.chainwork);
+    }
+
+    #[test]
+    fn contextual_insert_enforces_median_time_past_and_future_limit() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let median = dag.median_time_past(genesis.hash).unwrap();
+        let too_old = mine_child(genesis.hash, median);
+        assert!(matches!(
+            dag.insert_contextual(too_old, median),
+            Err(HeaderError::TimeTooOld { .. })
+        ));
+        let too_new = mine_child(
+            genesis.hash,
+            median.saturating_add(MAX_FUTURE_BLOCK_TIME_SECS + 1),
+        );
+        assert!(matches!(
+            dag.insert_contextual(too_new, median),
+            Err(HeaderError::TimeTooNew { .. })
+        ));
+        let valid = mine_child(genesis.hash, median + 1);
+        assert_eq!(dag.insert_contextual(valid, median + 1).unwrap().height, 1);
     }
 
     #[test]

@@ -10,7 +10,8 @@
 ## Phase 1 — fully validating node
 
 - [x] Header DAG, proof-of-work validation, and cumulative-work fork selection.
-- [ ] Contextual header validation: checkpoints, difficulty adjustment, median-time-past, and reorg undo data.
+- [x] Contextual timestamp validation: median-time-past and the two-hour future-time ceiling.
+- [ ] Contextual header validation: checkpoints, difficulty adjustment, network-specific min-difficulty rules, and reorg undo data.
 - [ ] Complete block/contextual validation: BIP34/30/68/113/141/143/147/341/342, coinbase maturity, subsidy, sigops, weight, deployment activation, and all standardness rules kept distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [ ] P2P peer manager, addrman, compact blocks, headers-first IBD, DoS limits, peer eviction, block relay, and transaction relay.
