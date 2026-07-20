@@ -7,6 +7,7 @@
 pub mod api;
 pub mod archive;
 pub mod consensus;
+pub mod headers;
 pub mod ledger;
 pub mod p2p;
 pub mod snapshot;

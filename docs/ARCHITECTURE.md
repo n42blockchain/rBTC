@@ -6,7 +6,7 @@
 Bitcoin peers (v1 now; BIP324 v2 later)
         │
         ▼
-header chain → contextual validator → libbitcoinconsensus scripts
+header DAG + chainwork → contextual validator → libbitcoinconsensus scripts
         │                                  │
         ├────────────── validated blocks ──┤
         ▼                                  ▼
