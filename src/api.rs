@@ -3,7 +3,10 @@
 //! Bind this router only to loopback by default. Authentication, rate limiting,
 //! TLS termination, and wallet-change persistence belong in the daemon layer.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use axum::{
     Json, Router,
@@ -60,6 +63,73 @@ pub trait ExplorerIndex: Send + Sync + 'static {
     fn transaction(&self, txid: &str) -> Result<Option<ExplorerTransaction>, String>;
     /// Returns current UTXOs for a checked Bitcoin address.
     fn address_utxos(&self, address: &str) -> Result<Vec<ExplorerUtxo>, String>;
+}
+
+/// Thread-safe in-memory explorer index for embedded and regtest deployments.
+///
+/// A production daemon should replace this with a persistent projection that is
+/// updated in the same lifecycle as validated block connect/disconnect events.
+#[derive(Default)]
+pub struct MemoryExplorerIndex {
+    blocks: RwLock<HashMap<u32, ExplorerBlock>>,
+    transactions: RwLock<HashMap<String, ExplorerTransaction>>,
+    address_utxos: RwLock<HashMap<String, Vec<ExplorerUtxo>>>,
+}
+
+impl MemoryExplorerIndex {
+    /// Records or replaces a block summary at its height.
+    pub fn upsert_block(&self, block: ExplorerBlock) {
+        self.blocks
+            .write()
+            .expect("explorer block lock not poisoned")
+            .insert(block.height, block);
+    }
+
+    /// Records or replaces a transaction summary by txid.
+    pub fn upsert_transaction(&self, transaction: ExplorerTransaction) {
+        self.transactions
+            .write()
+            .expect("explorer transaction lock not poisoned")
+            .insert(transaction.txid.clone(), transaction);
+    }
+
+    /// Replaces the current UTXO projection for an address.
+    pub fn set_address_utxos(&self, address: impl Into<String>, utxos: Vec<ExplorerUtxo>) {
+        self.address_utxos
+            .write()
+            .expect("explorer address lock not poisoned")
+            .insert(address.into(), utxos);
+    }
+}
+
+impl ExplorerIndex for MemoryExplorerIndex {
+    fn block(&self, height: u32) -> Result<Option<ExplorerBlock>, String> {
+        Ok(self
+            .blocks
+            .read()
+            .map_err(|_| "explorer block lock poisoned".to_owned())?
+            .get(&height)
+            .cloned())
+    }
+
+    fn transaction(&self, txid: &str) -> Result<Option<ExplorerTransaction>, String> {
+        Ok(self
+            .transactions
+            .read()
+            .map_err(|_| "explorer transaction lock poisoned".to_owned())?
+            .get(txid)
+            .cloned())
+    }
+
+    fn address_utxos(&self, address: &str) -> Result<Vec<ExplorerUtxo>, String> {
+        Ok(self
+            .address_utxos
+            .read()
+            .map_err(|_| "explorer address lock poisoned".to_owned())?
+            .get(address)
+            .cloned()
+            .unwrap_or_default())
+    }
 }
 
 /// Health response for load balancers and browser frontends.
@@ -175,5 +245,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn memory_index_returns_cloned_projections() {
+        let index = MemoryExplorerIndex::default();
+        index.upsert_block(ExplorerBlock {
+            height: 5,
+            hash: "block".into(),
+            time: 10,
+            transaction_count: 2,
+        });
+        index.set_address_utxos(
+            "bcrt1test",
+            vec![ExplorerUtxo {
+                txid: "tx".into(),
+                vout: 0,
+                value_sats: 1,
+                height: 5,
+            }],
+        );
+        assert_eq!(index.block(5).unwrap().unwrap().hash, "block");
+        assert_eq!(index.address_utxos("bcrt1test").unwrap().len(), 1);
+        assert!(index.transaction("missing").unwrap().is_none());
     }
 }

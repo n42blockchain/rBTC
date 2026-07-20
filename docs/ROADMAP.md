@@ -24,7 +24,8 @@
 
 ## Phase 2 — data services
 
-- [ ] Transaction/address/block indexes fed only by validated chain changes and correctly rolled back on reorg.
+- [x] In-memory explorer index implementation for embedded/regtest use.
+- [ ] Persistent transaction/address/block indexes fed only by validated chain changes and correctly rolled back on reorg.
 - [ ] Explorer REST, WebSocket/SSE notifications, pagination, endpoint limits, and an embedded static UI.
 - [ ] BDK wallet changeset persistence, encrypted secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast.
 - [ ] Authenticated local RPC plus optional REST API; wallet API disabled by default and bound only to localhost.
