@@ -37,6 +37,22 @@ pub fn verify_transaction_scripts(
     prevouts: &[Utxo],
     height: u32,
 ) -> Result<(), ConsensusError> {
+    verify_transaction_scripts_with_flags(
+        transaction,
+        prevouts,
+        bitcoinconsensus::height_to_flags(height),
+    )
+}
+
+/// Validates every transaction input using explicitly selected deployment flags.
+///
+/// This network-neutral entry point lets the header/chain service derive flags
+/// from the selected network's active BIP deployments.
+pub fn verify_transaction_scripts_with_flags(
+    transaction: &Transaction,
+    prevouts: &[Utxo],
+    flags: u32,
+) -> Result<(), ConsensusError> {
     if transaction.input.len() != prevouts.len() {
         return Err(ConsensusError::PrevoutCount {
             prevouts: prevouts.len(),
@@ -53,7 +69,6 @@ pub fn verify_transaction_scripts(
         })
         .collect::<Vec<_>>();
     let raw_transaction = serialize(transaction);
-    let flags = bitcoinconsensus::height_to_flags(height);
     for (input, utxo) in prevouts.iter().enumerate() {
         bitcoinconsensus::verify_with_flags(
             &utxo.script_pubkey,

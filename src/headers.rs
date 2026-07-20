@@ -10,7 +10,7 @@ use bitcoin::{
     Network,
     block::{BlockHash, Header},
     consensus::Params,
-    pow::Work,
+    pow::{CompactTarget, Work},
 };
 use thiserror::Error;
 
@@ -63,6 +63,17 @@ pub enum HeaderError {
         time: u32,
         /// Largest accepted timestamp for the supplied adjusted clock.
         maximum: u32,
+    },
+    /// The retained header graph lacks an ancestor needed for a retarget.
+    #[error("missing retarget ancestor at height {0}")]
+    MissingRetargetAncestor(u32),
+    /// The compact target does not match the network's next-work rule.
+    #[error("unexpected difficulty bits: expected {expected:#010x}, got {actual:#010x}")]
+    UnexpectedDifficulty {
+        /// Expected Bitcoin compact target.
+        expected: u32,
+        /// Compact target present in the candidate header.
+        actual: u32,
     },
 }
 
@@ -129,6 +140,66 @@ impl HeaderDag {
         Some(times[times.len() / 2])
     }
 
+    /// Computes the compact target required for a candidate's parent branch.
+    ///
+    /// This handles the normal 2016-block retarget, no-retarget networks, and
+    /// testnet-style minimum-difficulty exceptions. It does not validate PoW.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent or the retarget-epoch ancestor is absent.
+    pub fn expected_next_bits(&self, candidate: &Header) -> Result<CompactTarget, HeaderError> {
+        let parent = self
+            .headers
+            .get(&candidate.prev_blockhash)
+            .copied()
+            .ok_or(HeaderError::UnknownParent(candidate.prev_blockhash))?;
+        let next_height = parent
+            .height
+            .checked_add(1)
+            .ok_or(HeaderError::HeightOverflow)?;
+        let interval = self.params.difficulty_adjustment_interval();
+        let interval = u32::try_from(interval).expect("Bitcoin interval fits u32");
+
+        if next_height % interval == 0 {
+            let boundary_height = next_height - interval;
+            let boundary = self
+                .ancestor_at_height(parent, boundary_height)
+                .ok_or(HeaderError::MissingRetargetAncestor(boundary_height))?;
+            let elapsed = u64::from(parent.header.time.saturating_sub(boundary.header.time));
+            return Ok(CompactTarget::from_next_work_required(
+                parent.header.bits,
+                elapsed,
+                &self.params,
+            ));
+        }
+
+        if self.params.no_pow_retargeting {
+            return Ok(parent.header.bits);
+        }
+        if !self.params.allow_min_difficulty_blocks {
+            return Ok(parent.header.bits);
+        }
+
+        let min_difficulty_time = parent.header.time.saturating_add(
+            u32::try_from(self.params.pow_target_spacing * 2).expect("spacing fits u32"),
+        );
+        if candidate.time > min_difficulty_time {
+            return Ok(self.params.max_attainable_target.to_compact_lossy());
+        }
+
+        let pow_limit = self.params.max_attainable_target.to_compact_lossy();
+        let mut cursor = parent;
+        while cursor.height % interval != 0 && cursor.header.bits == pow_limit {
+            cursor = self
+                .headers
+                .get(&cursor.header.prev_blockhash)
+                .copied()
+                .ok_or(HeaderError::MissingRetargetAncestor(cursor.height - 1))?;
+        }
+        Ok(cursor.header.bits)
+    }
+
     /// Applies timestamp context before structurally inserting a header.
     ///
     /// `adjusted_time` must come from the P2P network-time subsystem rather
@@ -161,6 +232,13 @@ impl HeaderDag {
             return Err(HeaderError::TimeTooNew {
                 time: header.time,
                 maximum,
+            });
+        }
+        let expected = self.expected_next_bits(&header)?;
+        if header.bits != expected {
+            return Err(HeaderError::UnexpectedDifficulty {
+                expected: expected.to_consensus(),
+                actual: header.bits.to_consensus(),
             });
         }
         self.insert(header)
@@ -203,6 +281,13 @@ impl HeaderDag {
         }
         self.headers.insert(hash, info);
         Ok(info)
+    }
+
+    fn ancestor_at_height(&self, mut current: HeaderInfo, height: u32) -> Option<HeaderInfo> {
+        while current.height > height {
+            current = self.headers.get(&current.header.prev_blockhash).copied()?;
+        }
+        (current.height == height).then_some(current)
     }
 }
 
@@ -267,6 +352,93 @@ mod tests {
         ));
         let valid = mine_child(genesis.hash, median + 1);
         assert_eq!(dag.insert_contextual(valid, median + 1).unwrap().height, 1);
+    }
+
+    #[test]
+    fn expected_bits_honor_regtest_and_testnet_min_difficulty_rules() {
+        let regtest = HeaderDag::new(Network::Regtest);
+        let regtest_parent = regtest.active_tip();
+        let regtest_candidate = mine_child(regtest_parent.hash, regtest_parent.header.time + 1);
+        assert_eq!(
+            regtest.expected_next_bits(&regtest_candidate).unwrap(),
+            regtest_parent.header.bits
+        );
+
+        let mut testnet = HeaderDag::new(Network::Testnet);
+        let genesis = testnet.active_tip();
+        let hard_target = Params::new(Network::Testnet)
+            .max_attainable_target
+            .min_transition_threshold();
+        let mut parent_header = mine_child(genesis.hash, genesis.header.time + 1);
+        parent_header.bits = hard_target.to_compact_lossy();
+        let parent = HeaderInfo {
+            header: parent_header,
+            hash: parent_header.block_hash(),
+            height: 1,
+            chainwork: genesis.chainwork + hard_target.to_work(),
+        };
+        testnet.headers.insert(parent.hash, parent);
+        let normal = Header {
+            time: parent.header.time + 1,
+            prev_blockhash: parent.hash,
+            ..parent.header
+        };
+        assert_eq!(
+            testnet.expected_next_bits(&normal).unwrap(),
+            parent.header.bits
+        );
+        let delayed = Header {
+            time: parent.header.time + 1_201,
+            ..normal
+        };
+        assert_eq!(
+            testnet.expected_next_bits(&delayed).unwrap(),
+            Params::new(Network::Testnet)
+                .max_attainable_target
+                .to_compact_lossy()
+        );
+    }
+
+    #[test]
+    fn expected_bits_retargets_at_epoch_boundary() {
+        let mut dag = HeaderDag::new(Network::Bitcoin);
+        let params = Params::new(Network::Bitcoin);
+        let genesis = dag.active_tip();
+        let hard_target = params.max_attainable_target.min_transition_threshold();
+        let boundary_header = Header {
+            time: 1_000,
+            ..genesis.header
+        };
+        let boundary = HeaderInfo {
+            header: boundary_header,
+            hash: boundary_header.block_hash(),
+            height: 0,
+            chainwork: genesis.chainwork,
+        };
+        dag.headers.insert(boundary.hash, boundary);
+        let parent_header = Header {
+            prev_blockhash: boundary.hash,
+            time: boundary.header.time
+                + u32::try_from(params.pow_target_timespan / 4).expect("mainnet span fits u32"),
+            bits: hard_target.to_compact_lossy(),
+            ..boundary.header
+        };
+        let parent = HeaderInfo {
+            header: parent_header,
+            hash: parent_header.block_hash(),
+            height: 2_015,
+            chainwork: boundary.chainwork + hard_target.to_work(),
+        };
+        dag.headers.insert(parent.hash, parent);
+        let candidate = Header {
+            prev_blockhash: parent.hash,
+            time: parent.header.time + 1,
+            ..parent.header
+        };
+        assert_eq!(
+            dag.expected_next_bits(&candidate).unwrap(),
+            hard_target.min_transition_threshold().to_compact_lossy()
+        );
     }
 
     #[test]

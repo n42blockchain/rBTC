@@ -39,6 +39,12 @@ pub enum UtxoError {
     /// A mutation attempted to recreate an already unspent output.
     #[error("duplicate unspent output {0}")]
     Duplicate(OutPointKey),
+    /// A transaction attempted to spend an output that is not in chainstate.
+    #[error("missing unspent output {0}")]
+    Missing(OutPointKey),
+    /// A single atomic mutation contains the same input more than once.
+    #[error("duplicate spend {0}")]
+    DuplicateSpend(OutPointKey),
 }
 
 /// A fixed-width Bitcoin outpoint key: wire-order txid followed by vout (LE).
@@ -149,6 +155,30 @@ pub struct TierStats {
     pub cold: u64,
 }
 
+/// The information required to reverse one successful atomic UTXO mutation.
+///
+/// Undo records must be applied in reverse transaction/block order during a
+/// chain reorganization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UtxoUndo {
+    spent: Vec<(OutPointKey, Utxo)>,
+    created: Vec<OutPointKey>,
+}
+
+impl UtxoUndo {
+    /// Returns the spent outputs that must be restored on disconnect.
+    #[must_use]
+    pub fn spent(&self) -> &[(OutPointKey, Utxo)] {
+        &self.spent
+    }
+
+    /// Returns outputs that must be removed on disconnect.
+    #[must_use]
+    pub fn created(&self) -> &[OutPointKey] {
+        &self.created
+    }
+}
+
 /// Atomic UTXO operations used by chainstate and snapshots.
 pub trait UtxoStore: Send + Sync {
     /// Fetches a coin from either physical tier.
@@ -159,6 +189,14 @@ pub trait UtxoStore: Send + Sync {
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<(), UtxoError>;
+    /// Applies a mutation and returns durable logical undo data for a later reorg.
+    fn apply_with_undo(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError>;
+    /// Reverses one prior mutation using its undo data.
+    fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError>;
     /// Moves aged records from hot to cold without changing their consensus content.
     fn age_to_cold(&self, now: u64, hot_window_secs: u64) -> Result<u64, UtxoError>;
     /// Returns stable, sorted records for a consistent snapshot.
@@ -220,12 +258,39 @@ impl UtxoStore for RedbUtxoStore {
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<(), UtxoError> {
+        self.apply_with_undo(spent, created).map(|_| ())
+    }
+
+    fn apply_with_undo(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
         let _guard = self.lock();
         let transaction = self.db.begin_write()?;
-        {
+        let undo = {
             let mut hot = transaction.open_table(HOT_TABLE)?;
             let mut cold = transaction.open_table(COLD_TABLE)?;
+            let mut seen_spent = std::collections::BTreeSet::new();
+            let mut undo_spent = Vec::with_capacity(spent.len());
+            for key in spent {
+                if !seen_spent.insert(*key) {
+                    return Err(UtxoError::DuplicateSpend(*key));
+                }
+                let previous = match hot.get(key.as_bytes().as_slice())? {
+                    Some(value) => Utxo::decode(value.value())?,
+                    None => match cold.get(key.as_bytes().as_slice())? {
+                        Some(value) => Utxo::decode(value.value())?,
+                        None => return Err(UtxoError::Missing(*key)),
+                    },
+                };
+                undo_spent.push((*key, previous));
+            }
+            let mut seen_created = std::collections::BTreeSet::new();
             for (key, _) in created {
+                if !seen_created.insert(*key) {
+                    return Err(UtxoError::Duplicate(*key));
+                }
                 if hot.get(key.as_bytes().as_slice())?.is_some()
                     || cold.get(key.as_bytes().as_slice())?.is_some()
                 {
@@ -239,6 +304,41 @@ impl UtxoStore for RedbUtxoStore {
             for (key, utxo) in created {
                 let value = utxo.encode()?;
                 hot.insert(key.as_bytes().as_slice(), value.as_slice())?;
+            }
+            UtxoUndo {
+                spent: undo_spent,
+                created: created.iter().map(|(key, _)| *key).collect(),
+            }
+        };
+        transaction.commit()?;
+        Ok(undo)
+    }
+
+    fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError> {
+        let _guard = self.lock();
+        let cutoff = now.saturating_sub(hot_window_secs);
+        let transaction = self.db.begin_write()?;
+        {
+            let mut hot = transaction.open_table(HOT_TABLE)?;
+            let mut cold = transaction.open_table(COLD_TABLE)?;
+            for (key, _) in &undo.spent {
+                if hot.get(key.as_bytes().as_slice())?.is_some()
+                    || cold.get(key.as_bytes().as_slice())?.is_some()
+                {
+                    return Err(UtxoError::Duplicate(*key));
+                }
+            }
+            for key in &undo.created {
+                hot.remove(key.as_bytes().as_slice())?;
+                cold.remove(key.as_bytes().as_slice())?;
+            }
+            for (key, utxo) in &undo.spent {
+                let encoded = utxo.encode()?;
+                if utxo.last_touched < cutoff {
+                    cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+                } else {
+                    hot.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+                }
             }
         }
         transaction.commit()?;
@@ -391,6 +491,34 @@ mod tests {
         assert!(matches!(
             store.apply(&[], &[(key, coin(1))]),
             Err(UtxoError::Duplicate(_))
+        ));
+    }
+
+    #[test]
+    fn undo_restores_the_pre_mutation_chainstate() {
+        let (_dir, store) = store();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let before = store.snapshot_entries().unwrap();
+        let undo = store
+            .apply_with_undo(&[key(1)], &[(key(2), coin(20))])
+            .unwrap();
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert!(store.get(key(2)).unwrap().is_some());
+        store.undo(&undo, 100, 60).unwrap();
+        assert_eq!(store.snapshot_entries().unwrap(), before);
+    }
+
+    #[test]
+    fn rejects_missing_and_duplicate_spends() {
+        let (_dir, store) = store();
+        assert!(matches!(
+            store.apply(&[key(1)], &[]),
+            Err(UtxoError::Missing(_))
+        ));
+        store.apply(&[], &[(key(1), coin(1))]).unwrap();
+        assert!(matches!(
+            store.apply(&[key(1), key(1)], &[]),
+            Err(UtxoError::DuplicateSpend(_))
         ));
     }
 }
