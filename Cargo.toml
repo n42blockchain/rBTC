@@ -1,0 +1,48 @@
+[package]
+name = "rbtc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "A Rust Bitcoin full-node kernel focused on compact, verifiable chainstate."
+repository = "https://github.com/n42/rBTC"
+keywords = ["bitcoin", "utxo", "node", "zstd"]
+categories = ["cryptography::cryptocurrencies"]
+
+[lib]
+name = "rbtc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rbtcd"
+path = "src/main.rs"
+
+[dependencies]
+bitcoin = { version = "=0.32.8", default-features = true }
+bitcoinconsensus = "0.106"
+bdk_wallet = "3.1.0"
+axum = "0.8.9"
+redb = "2.6.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3.27"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
