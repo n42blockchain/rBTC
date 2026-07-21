@@ -19,7 +19,7 @@
 - [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
 - [x] Contextual header validation enforces the pinned Bitcoin Core 26 mainnet/testnet checkpoints.
 - [ ] Add minimum-chainwork/assume-valid IBD policy without weakening eventual full validation.
-- [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, BIP141 witness commitments, mutated transaction Merkle trees, buried deployments, Taproot BIP9 state, and the 80,000 legacy/P2SH/witness sigop-cost limit are checked. Remaining gates include full BIP141/143/147/341/342 block behavior, configurable regtest deployments, and keeping policy/standardness distinct from consensus.
+- [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, BIP141 witness commitments, mutated transaction Merkle trees, buried deployments, Taproot BIP9 state, the 80,000 legacy/P2SH/witness sigop-cost limit, and Core-style transaction duplicate/null-input/base-size checks are enforced. Remaining gates include full BIP141/143/147/341/342 vector coverage, configurable regtest deployments, and keeping policy/standardness distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
 - [ ] P2P peer manager, addrman, compact blocks, full headers-first/block IBD, additional DoS limits, peer eviction, block relay, and transaction relay. Outbound v1 handshake, `getheaders`, `getdata`, bounded response handling, and durable header-only IBD are implemented.

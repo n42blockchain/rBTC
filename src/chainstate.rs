@@ -1,5 +1,7 @@
 //! Transaction-to-UTXO application with consensus-critical accounting checks.
 
+use std::collections::BTreeSet;
+
 use bitcoin::{Script, Sequence, Transaction, Witness, WitnessVersion, script::Instruction};
 use thiserror::Error;
 
@@ -89,6 +91,15 @@ pub enum ChainstateError {
         /// The candidate parent MTP must be strictly above this value.
         minimum_mtp: u32,
     },
+    /// A transaction contains the same previous outpoint more than once.
+    #[error("duplicate transaction input {0}")]
+    DuplicateInput(OutPointKey),
+    /// A non-coinbase transaction contains the reserved null previous outpoint.
+    #[error("non-coinbase transaction contains null previous outpoint")]
+    NullPrevout,
+    /// A transaction's non-witness serialization alone exceeds block weight.
+    #[error("transaction base weight exceeds maximum block weight")]
+    Oversize,
 }
 
 /// Applies one transaction to a UTXO store after accounting and script checks.
@@ -146,6 +157,9 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
     script_flags: u32,
     csv_active: bool,
 ) -> Result<AppliedTransaction, ChainstateError> {
+    if transaction.base_size().saturating_mul(4) > 4_000_000 {
+        return Err(ChainstateError::Oversize);
+    }
     if !transaction_is_final(transaction, height, lock_time_context) {
         return Err(ChainstateError::NonFinalLockTime {
             lock_time: transaction.lock_time.to_consensus_u32(),
@@ -187,6 +201,17 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
 
     if transaction.input.is_empty() {
         return Err(ChainstateError::NoInputs);
+    }
+
+    let mut unique_inputs = BTreeSet::new();
+    for input in &transaction.input {
+        if input.previous_output.is_null() {
+            return Err(ChainstateError::NullPrevout);
+        }
+        let outpoint = OutPointKey::from(input.previous_output);
+        if !unique_inputs.insert(outpoint) {
+            return Err(ChainstateError::DuplicateInput(outpoint));
+        }
     }
 
     let mut spent = Vec::with_capacity(transaction.input.len());
@@ -505,6 +530,38 @@ mod tests {
         assert!(matches!(
             apply_transaction(&store, &no_outputs, 10, 100, 99, 100, 0),
             Err(ChainstateError::NoOutputs)
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_null_and_oversize_transaction_inputs() {
+        let (_dir, store) = store();
+        let previous = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+        insert_unspent(&store, previous, 0, 0);
+        let mut duplicate = spend(previous, Sequence::MAX, LockTime::ZERO);
+        duplicate.input.push(duplicate.input[0].clone());
+        assert!(matches!(
+            apply_transaction(&store, &duplicate, 1, 0, 0, 0, 0),
+            Err(ChainstateError::DuplicateInput(_))
+        ));
+
+        let mut null = spend(OutPoint::null(), Sequence::MAX, LockTime::ZERO);
+        null.input.push(TxIn {
+            previous_output: previous,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::default(),
+        });
+        assert!(matches!(
+            apply_transaction(&store, &null, 1, 0, 0, 0, 0),
+            Err(ChainstateError::NullPrevout)
+        ));
+
+        let mut oversize = spend(previous, Sequence::MAX, LockTime::ZERO);
+        oversize.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 1_000_001]);
+        assert!(matches!(
+            apply_transaction(&store, &oversize, 1, 0, 0, 0, 0),
+            Err(ChainstateError::Oversize)
         ));
     }
 
