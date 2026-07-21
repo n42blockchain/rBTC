@@ -657,12 +657,18 @@ mod tests {
     };
 
     fn coinbase(height: u32) -> Transaction {
+        let mut height_prefix = match height {
+            0 => vec![0x00],
+            1..=16 => vec![0x50 + u8::try_from(height).unwrap()],
+            _ => vec![1, u8::try_from(height).unwrap()],
+        };
+        height_prefix.push(0);
         Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![1, u8::try_from(height).unwrap()]),
+                script_sig: ScriptBuf::from_bytes(height_prefix),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             }],

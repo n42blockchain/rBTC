@@ -1068,7 +1068,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00]),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             }],

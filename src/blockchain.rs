@@ -365,12 +365,23 @@ fn check_witness_commitment(block: &Block, segwit_active: bool) -> Result<(), Bl
 }
 
 fn coinbase_has_height(transaction: &bitcoin::Transaction, height: u32) -> bool {
-    let encoded = encode_script_num(height);
+    let expected = encode_script_num_push(height);
     let script = transaction.input[0].script_sig.as_bytes();
-    encoded.len() <= 75
-        && script.len() > encoded.len()
-        && script[0] == u8::try_from(encoded.len()).expect("BIP34 height fits direct push")
-        && script[1..=encoded.len()] == encoded
+    script.len() >= expected.len() && script[..expected.len()] == expected
+}
+
+fn encode_script_num_push(height: u32) -> Vec<u8> {
+    match height {
+        0 => vec![0x00],
+        1..=16 => vec![0x50 + u8::try_from(height).expect("small script number")],
+        _ => {
+            let encoded = encode_script_num(height);
+            let mut pushed = Vec::with_capacity(encoded.len() + 1);
+            pushed.push(u8::try_from(encoded.len()).expect("u32 script number fits direct push"));
+            pushed.extend_from_slice(&encoded);
+            pushed
+        }
+    }
 }
 
 fn encode_script_num(mut value: u32) -> Vec<u8> {
@@ -675,9 +686,12 @@ mod tests {
     fn bip34_requires_minimally_encoded_coinbase_height() {
         let (_dir, store) = store();
         let mut transaction = coinbase();
-        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![1, 10]);
+        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![0x5a, 0x00]);
         let valid_block = block(vec![transaction.clone()]);
         assert!(apply_block_with_bip34(&store, &valid_block, 10, 100, 0, 60, 0, true).is_ok());
+        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![1, 17]);
+        let height_seventeen = block(vec![transaction]);
+        assert!(apply_block_with_bip34(&store, &height_seventeen, 17, 100, 0, 60, 0, true).is_ok());
         let bad = block(vec![coinbase()]);
         assert!(matches!(
             apply_block_with_bip34(&store, &bad, 10, 100, 0, 60, 0, true),
