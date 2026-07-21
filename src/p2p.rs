@@ -29,6 +29,7 @@ use tokio::{
 pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 32 * 1024 * 1024;
 const V1_HEADER_LEN: usize = 24;
 const MAX_HANDSHAKE_MESSAGES: usize = 8;
+const MAX_RESPONSE_MESSAGES: usize = 32;
 const PROTOCOL_VERSION: u32 = 70_016;
 
 /// Async v1 P2P framing error.
@@ -60,6 +61,26 @@ pub enum P2pError {
     /// The peer did not complete the handshake within the bounded message budget.
     #[error("peer did not complete handshake within {MAX_HANDSHAKE_MESSAGES} messages")]
     HandshakeIncomplete,
+    /// A peer did not provide the requested response within the bounded message budget.
+    #[error("peer did not provide headers within {MAX_RESPONSE_MESSAGES} messages")]
+    HeadersResponseIncomplete,
+    /// A peer did not provide a requested block within the bounded message budget.
+    #[error("peer did not provide block {requested} within {MAX_RESPONSE_MESSAGES} messages")]
+    BlockResponseIncomplete {
+        /// Block requested by the caller.
+        requested: BlockHash,
+    },
+    /// A peer supplied a block that was not part of the outstanding request.
+    #[error("peer sent unexpected block {actual}; requested {expected}")]
+    UnexpectedBlock {
+        /// Block requested by the caller.
+        expected: BlockHash,
+        /// Block received from the peer.
+        actual: BlockHash,
+    },
+    /// A peer explicitly reported that it does not have the requested block.
+    #[error("peer does not have requested block {0}")]
+    BlockNotFound(BlockHash),
 }
 
 /// An established Bitcoin peer session.
@@ -206,6 +227,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
+    /// Reads the next application message, answering P2P keepalive pings.
+    ///
+    /// Non-keepalive messages are returned in wire order. A caller that needs
+    /// a specific response should use the corresponding request/response
+    /// method so messages unrelated to its request are handled deliberately.
+    pub async fn read_message(&mut self) -> Result<NetworkMessage, P2pError> {
+        loop {
+            match self.transport.read_message().await?.into_payload() {
+                NetworkMessage::Ping(nonce) => {
+                    self.transport
+                        .write_message(NetworkMessage::Pong(nonce))
+                        .await?;
+                }
+                message => return Ok(message),
+            }
+        }
+    }
+
     /// Sends a standard `getheaders` request using a newest-to-oldest locator.
     ///
     /// A zero `stop_hash` requests the protocol maximum of 2,000 headers.
@@ -227,6 +266,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .await
     }
 
+    /// Waits for a `headers` response, transparently answering keepalives.
+    ///
+    /// Peers commonly announce capabilities immediately after `verack`; those
+    /// messages are safely skipped here because this method is used only by
+    /// the sequential headers-first synchronizer. The result still requires
+    /// contextual consensus validation before storage.
+    pub async fn receive_headers(&mut self) -> Result<Vec<bitcoin::block::Header>, P2pError> {
+        for _ in 0..MAX_RESPONSE_MESSAGES {
+            if let NetworkMessage::Headers(headers) = self.read_message().await? {
+                return Ok(headers);
+            }
+        }
+        Err(P2pError::HeadersResponseIncomplete)
+    }
+
     /// Requests witness-serialized blocks through standard `getdata` entries.
     pub async fn request_witness_blocks(&mut self, hashes: &[BlockHash]) -> Result<(), P2pError> {
         let inventory = hashes
@@ -237,6 +291,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         self.transport
             .write_message(NetworkMessage::GetData(inventory))
             .await
+    }
+
+    /// Waits for a particular block requested with [`Self::request_witness_blocks`].
+    ///
+    /// The returned block has only passed wire checksum validation. Its header,
+    /// merkle root, witness commitment, and every transaction still require
+    /// contextual chainstate validation before it can be committed.
+    pub async fn receive_requested_block(
+        &mut self,
+        expected: BlockHash,
+    ) -> Result<bitcoin::Block, P2pError> {
+        for _ in 0..MAX_RESPONSE_MESSAGES {
+            match self.read_message().await? {
+                NetworkMessage::Block(block) => {
+                    let actual = block.block_hash();
+                    if actual == expected {
+                        return Ok(block);
+                    }
+                    return Err(P2pError::UnexpectedBlock { expected, actual });
+                }
+                NetworkMessage::NotFound(inventory)
+                    if inventory.iter().any(|entry| {
+                        matches!(entry, Inventory::Block(hash) | Inventory::WitnessBlock(hash) if *hash == expected)
+                    }) =>
+                {
+                    return Err(P2pError::BlockNotFound(expected));
+                }
+                _ => {}
+            }
+        }
+        Err(P2pError::BlockResponseIncomplete {
+            requested: expected,
+        })
     }
 }
 
@@ -382,6 +469,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+            let block_hash = block.block_hash();
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = V1Transport::new(stream, Network::Regtest.magic());
             assert!(matches!(
@@ -402,9 +491,27 @@ mod tests {
                     assert_eq!(request.version, PROTOCOL_VERSION);
                     assert_eq!(request.locator_hashes, vec![BlockHash::all_zeros()]);
                     assert_eq!(request.stop_hash, BlockHash::all_zeros());
+                    server
+                        .write_message(NetworkMessage::SendHeaders)
+                        .await
+                        .unwrap();
+                    server
+                        .write_message(NetworkMessage::Headers(Vec::new()))
+                        .await
+                        .unwrap();
                 }
                 message => panic!("expected getheaders, got {message:?}"),
             }
+            match server.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(inventory, vec![Inventory::WitnessBlock(block_hash)]);
+                }
+                message => panic!("expected getdata, got {message:?}"),
+            }
+            server
+                .write_message(NetworkMessage::Block(block))
+                .await
+                .unwrap();
         });
 
         let mut client = connect_outbound(
@@ -421,6 +528,18 @@ mod tests {
             .request_headers(vec![BlockHash::all_zeros()], BlockHash::all_zeros())
             .await
             .unwrap();
+        assert!(client.receive_headers().await.unwrap().is_empty());
+        let block_hash =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        client.request_witness_blocks(&[block_hash]).await.unwrap();
+        assert_eq!(
+            client
+                .receive_requested_block(block_hash)
+                .await
+                .unwrap()
+                .block_hash(),
+            block_hash
+        );
         server.await.unwrap();
     }
 }
