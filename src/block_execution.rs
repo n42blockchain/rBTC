@@ -12,7 +12,7 @@ use crate::{
     blockchain::{AppliedBlock, BlockError, apply_block_with_deployments, disconnect_block},
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
-    undo_store::{RedbUndoStore, UndoStoreError},
+    undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -78,6 +78,128 @@ pub enum BlockExecutionError {
     /// BIP30 forbids overwriting an existing unspent transaction output.
     #[error("BIP30 duplicate unspent output {0}")]
     Bip30Collision(OutPointKey),
+    /// A write-ahead transition does not match either its pre- or post-state.
+    #[error("pending transition UTXO state is internally inconsistent")]
+    InconsistentTransition,
+    /// A pending transition is unrelated to the durable execution tip.
+    #[error("execution tip {actual_height}:{actual_hash} matches neither pending parent nor child")]
+    TransitionTipMismatch {
+        /// Durable execution height.
+        actual_height: u32,
+        /// Durable execution hash.
+        actual_hash: BlockHash,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingUtxoState {
+    Before,
+    After,
+    Mixed,
+}
+
+fn pending_utxo_state<S: UtxoStore>(
+    chainstate: &S,
+    pending: &PendingTransition,
+) -> Result<PendingUtxoState, UtxoError> {
+    let before = pending
+        .undo
+        .spent()
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let after = pending.created.iter().cloned().collect::<BTreeMap<_, _>>();
+    let keys = pending
+        .undo
+        .spent()
+        .iter()
+        .map(|(outpoint, _)| *outpoint)
+        .chain(pending.undo.created().iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut matches_before = true;
+    let mut matches_after = true;
+    for outpoint in keys {
+        let current = chainstate.get(outpoint)?;
+        matches_before &= current.as_ref() == before.get(&outpoint);
+        matches_after &= current.as_ref() == after.get(&outpoint);
+    }
+    Ok(match (matches_before, matches_after) {
+        (true, _) => PendingUtxoState::Before,
+        (false, true) => PendingUtxoState::After,
+        (false, false) => PendingUtxoState::Mixed,
+    })
+}
+
+/// Recovers an interrupted write-ahead block transition idempotently.
+///
+/// Connect intents are rolled back unless the execution tip reached the child.
+/// Disconnect intents are completed unless the execution tip already reached
+/// the parent. Every recovery step is safe to retry after another interruption.
+pub fn recover_pending_transition<S: UtxoStore>(
+    chainstate: &S,
+    undo_store: &RedbUndoStore,
+    execution_store: &RedbExecutionStore,
+    now: u64,
+    hot_window_secs: u64,
+) -> Result<bool, BlockExecutionError> {
+    let Some(pending) = undo_store.pending_transition()? else {
+        return Ok(false);
+    };
+    let execution_tip = execution_store.tip()?;
+    let state = pending_utxo_state(chainstate, &pending)?;
+    match pending.kind {
+        TransitionKind::Connect if execution_tip == pending.parent => {
+            match state {
+                PendingUtxoState::Before => {}
+                PendingUtxoState::After => {
+                    chainstate.undo(&pending.undo, now, hot_window_secs)?;
+                }
+                PendingUtxoState::Mixed => {
+                    return Err(BlockExecutionError::InconsistentTransition);
+                }
+            }
+            undo_store.remove(pending.next.hash)?;
+            undo_store.clear_transition(pending.next.hash)?;
+            Ok(true)
+        }
+        TransitionKind::Connect if execution_tip == pending.next => {
+            if state != PendingUtxoState::After {
+                return Err(BlockExecutionError::InconsistentTransition);
+            }
+            if undo_store.get(pending.next.hash)?.is_none() {
+                return Err(BlockExecutionError::MissingUndo(pending.next.hash));
+            }
+            undo_store.clear_transition(pending.next.hash)?;
+            Ok(true)
+        }
+        TransitionKind::Disconnect if execution_tip == pending.next => {
+            match state {
+                PendingUtxoState::After => {
+                    chainstate.undo(&pending.undo, now, hot_window_secs)?;
+                }
+                PendingUtxoState::Before => {}
+                PendingUtxoState::Mixed => {
+                    return Err(BlockExecutionError::InconsistentTransition);
+                }
+            }
+            execution_store.rewind(pending.next, pending.parent)?;
+            undo_store.remove(pending.next.hash)?;
+            undo_store.clear_transition(pending.next.hash)?;
+            Ok(true)
+        }
+        TransitionKind::Disconnect if execution_tip == pending.parent => {
+            if state != PendingUtxoState::Before {
+                return Err(BlockExecutionError::InconsistentTransition);
+            }
+            undo_store.remove(pending.next.hash)?;
+            undo_store.clear_transition(pending.next.hash)?;
+            Ok(true)
+        }
+        _ => Err(BlockExecutionError::TransitionTipMismatch {
+            actual_height: execution_tip.height,
+            actual_hash: execution_tip.hash,
+        }),
+    }
 }
 
 /// Validates and connects exactly the next active-chain block.
@@ -98,6 +220,13 @@ pub fn connect_active_block<S: UtxoStore>(
     hot_window_secs: u64,
     deployments: BlockDeploymentContext,
 ) -> Result<AppliedBlock, BlockExecutionError> {
+    recover_pending_transition(
+        chainstate,
+        undo_store,
+        execution_store,
+        now,
+        hot_window_secs,
+    )?;
     let current = execution_store.tip()?;
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
@@ -149,24 +278,39 @@ pub fn connect_active_block<S: UtxoStore>(
     if let Some(undo) = exception_undo {
         applied.transaction_undos.insert(0, undo);
     }
-    let (spent, created) = overlay.net_changes()?;
-    let committed_undo = chainstate.apply_with_undo(&spent, &created)?;
+    let transition = overlay.net_changes()?;
+    let next_tip = ExecutionTip {
+        height: next_height,
+        hash: applied.hash,
+    };
+    undo_store.prepare_transition(&PendingTransition {
+        kind: TransitionKind::Connect,
+        parent: current,
+        next: next_tip,
+        undo: transition.undo.clone(),
+        created: transition.created.clone(),
+    })?;
+    let committed_undo = match chainstate.apply_with_undo(&transition.spent, &transition.created) {
+        Ok(undo) => undo,
+        Err(error) => {
+            undo_store.clear_transition(applied.hash)?;
+            return Err(BlockExecutionError::Rollback(error));
+        }
+    };
+    debug_assert_eq!(committed_undo, transition.undo);
 
     if let Err(error) = undo_store.insert(applied.hash, &applied.transaction_undos) {
         chainstate.undo(&committed_undo, now, hot_window_secs)?;
+        undo_store.clear_transition(applied.hash)?;
         return Err(BlockExecutionError::Undo(error));
     }
-    if let Err(error) = execution_store.advance(
-        current.hash,
-        ExecutionTip {
-            height: next_height,
-            hash: applied.hash,
-        },
-    ) {
+    if let Err(error) = execution_store.advance(current.hash, next_tip) {
         undo_store.remove(applied.hash)?;
         chainstate.undo(&committed_undo, now, hot_window_secs)?;
+        undo_store.clear_transition(applied.hash)?;
         return Err(BlockExecutionError::Execution(error));
     }
+    undo_store.clear_transition(applied.hash)?;
     Ok(applied)
 }
 
@@ -176,7 +320,11 @@ struct OverlayState {
     current: BTreeMap<OutPointKey, Option<Utxo>>,
 }
 
-type UtxoChanges = (Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>);
+struct UtxoChanges {
+    spent: Vec<OutPointKey>,
+    created: Vec<(OutPointKey, Utxo)>,
+    undo: UtxoUndo,
+}
 
 /// Block-scoped UTXO mutations retained in memory until validation succeeds.
 struct UtxoOverlay<'a, S> {
@@ -210,6 +358,7 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
         let state = self.state.lock().expect("overlay lock not poisoned");
         let mut spent = Vec::new();
         let mut created = Vec::new();
+        let mut undo_spent = Vec::new();
         for (outpoint, original) in &state.original {
             let current = state
                 .current
@@ -220,12 +369,21 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
             }
             if original.is_some() {
                 spent.push(*outpoint);
+                undo_spent.push((
+                    *outpoint,
+                    original.clone().expect("original was checked as present"),
+                ));
             }
             if let Some(utxo) = current {
                 created.push((*outpoint, utxo.clone()));
             }
         }
-        Ok((spent, created))
+        let undo_created = created.iter().map(|(outpoint, _)| *outpoint).collect();
+        Ok(UtxoChanges {
+            spent,
+            created,
+            undo: UtxoUndo::new(undo_spent, undo_created),
+        })
     }
 }
 
@@ -373,6 +531,13 @@ pub fn disconnect_execution_tip<S: UtxoStore>(
     now: u64,
     hot_window_secs: u64,
 ) -> Result<ExecutionTip, BlockExecutionError> {
+    recover_pending_transition(
+        chainstate,
+        undo_store,
+        execution_store,
+        now,
+        hot_window_secs,
+    )?;
     let current = execution_store.tip()?;
     if current.height == 0 {
         return Err(BlockExecutionError::DisconnectGenesis);
@@ -394,13 +559,35 @@ pub fn disconnect_execution_tip<S: UtxoStore>(
         hash: current.hash,
         transaction_undos,
     };
-    disconnect_block(chainstate, &applied, now, hot_window_secs)?;
     let parent_tip = ExecutionTip {
         height: parent.height,
         hash: parent.hash,
     };
-    execution_store.rewind(current, parent_tip)?;
+    let overlay = UtxoOverlay::new(chainstate);
+    disconnect_block(&overlay, &applied, now, hot_window_secs)?;
+    let transition = overlay.net_changes()?;
+    let forward_undo = UtxoUndo::new(transition.created.clone(), transition.spent.clone());
+    undo_store.prepare_transition(&PendingTransition {
+        kind: TransitionKind::Disconnect,
+        parent: parent_tip,
+        next: current,
+        undo: forward_undo,
+        created: transition.undo.spent().to_vec(),
+    })?;
+    let committed_undo = match chainstate.apply_with_undo(&transition.spent, &transition.created) {
+        Ok(undo) => undo,
+        Err(error) => {
+            undo_store.clear_transition(current.hash)?;
+            return Err(BlockExecutionError::Rollback(error));
+        }
+    };
+    if let Err(error) = execution_store.rewind(current, parent_tip) {
+        chainstate.undo(&committed_undo, now, hot_window_secs)?;
+        undo_store.clear_transition(current.hash)?;
+        return Err(BlockExecutionError::Execution(error));
+    }
     undo_store.remove(current.hash)?;
+    undo_store.clear_transition(current.hash)?;
     Ok(parent_tip)
 }
 
@@ -657,6 +844,89 @@ mod tests {
         assert!(inner.get(previous.into()).unwrap().is_none());
         let created = OutPoint::new(active_block.txdata[1].compute_txid(), 0).into();
         assert_eq!(inner.get(created).unwrap().unwrap().value_sats, 900);
+    }
+
+    #[test]
+    fn write_ahead_recovery_rolls_back_or_finishes_from_execution_tip() {
+        let directory = TempDir::new().unwrap();
+        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
+        let execution_store =
+            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+                .unwrap();
+        let parent = execution_store.tip().unwrap();
+        let next = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([9; 32]),
+        };
+        let old_key = OutPointKey::from(OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0));
+        let new_key = OutPointKey::from(OutPoint::new(bitcoin::Txid::from_byte_array([2; 32]), 0));
+        let old_coin = Utxo {
+            value_sats: 10,
+            height: 0,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 0,
+            script_pubkey: vec![0x51],
+        };
+        let new_coin = Utxo {
+            value_sats: 9,
+            ..old_coin.clone()
+        };
+        chainstate
+            .apply(&[], &[(old_key, old_coin.clone())])
+            .unwrap();
+        let aggregate = UtxoUndo::new(vec![(old_key, old_coin.clone())], vec![new_key]);
+        let pending = PendingTransition {
+            kind: TransitionKind::Connect,
+            parent,
+            next,
+            undo: aggregate.clone(),
+            created: vec![(new_key, new_coin.clone())],
+        };
+
+        undo_store.prepare_transition(&pending).unwrap();
+        chainstate
+            .apply_with_undo(&[old_key], &[(new_key, new_coin.clone())])
+            .unwrap();
+        undo_store
+            .insert(next.hash, std::slice::from_ref(&aggregate))
+            .unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert_eq!(chainstate.get(old_key).unwrap(), Some(old_coin.clone()));
+        assert!(chainstate.get(new_key).unwrap().is_none());
+        assert!(undo_store.get(next.hash).unwrap().is_none());
+        assert!(undo_store.pending_transition().unwrap().is_none());
+
+        undo_store.prepare_transition(&pending).unwrap();
+        chainstate
+            .apply_with_undo(&[old_key], &[(new_key, new_coin.clone())])
+            .unwrap();
+        undo_store
+            .insert(next.hash, std::slice::from_ref(&aggregate))
+            .unwrap();
+        execution_store.advance(parent.hash, next).unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert!(chainstate.get(old_key).unwrap().is_none());
+        assert_eq!(chainstate.get(new_key).unwrap(), Some(new_coin));
+        assert!(undo_store.get(next.hash).unwrap().is_some());
+        assert!(undo_store.pending_transition().unwrap().is_none());
+
+        let mut disconnect_pending = pending;
+        disconnect_pending.kind = TransitionKind::Disconnect;
+        undo_store.prepare_transition(&disconnect_pending).unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert_eq!(execution_store.tip().unwrap(), parent);
+        assert_eq!(chainstate.get(old_key).unwrap(), Some(old_coin));
+        assert!(chainstate.get(new_key).unwrap().is_none());
+        assert!(undo_store.get(next.hash).unwrap().is_none());
+        assert!(undo_store.pending_transition().unwrap().is_none());
     }
 
     #[test]

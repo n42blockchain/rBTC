@@ -15,9 +15,10 @@
 - [x] Contextual difficulty validation: normal retarget, no-retarget chains, and min-difficulty fallback rules.
 - [x] Atomic UTXO undo records for reverse-order chain disconnects, plus durable block-undo encoding/storage.
 - [x] Transaction-level UTXO transition with script hooks, amount accounting, and coinbase maturity checks.
-- [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks and rollback.
-- [ ] Contextual header validation: checkpoints; connect header reorg selection to persisted block/UTXO undo journals.
-- [ ] Complete block/contextual validation: BIP30/141/143/147/341/342 (BIP34 height, BIP68/113 locks, and BIP141 witness commitment now checked), coinbase maturity, subsidy, sigops, complete deployment activation, and all standardness rules kept distinct from consensus.
+- [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks, one-transaction connect/disconnect, and restart-safe write-ahead recovery across UTXO/undo/execution stores.
+- [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
+- [ ] Contextual header validation: add network checkpoints and checkpoint-aware anti-DoS policy.
+- [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, and BIP141 witness commitments are checked. Remaining gates include sigops, full BIP141/143/147/341/342 deployment behavior, complete activation state, and keeping policy/standardness distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
 - [ ] P2P peer manager, addrman, compact blocks, full headers-first/block IBD, additional DoS limits, peer eviction, block relay, and transaction relay. Outbound v1 handshake, `getheaders`, `getdata`, bounded response handling, and durable header-only IBD are implemented.
@@ -44,10 +45,10 @@ Wire messages and block/transaction serialization must use Bitcoin's consensus e
 
 ## Current critical path
 
-The next acceptance milestone is deliberately narrow: a regtest daemon must
-restart from durable headers/chainstate, request the active-chain block bodies,
-apply them sequentially to UTXO state, retain undo data, and recover its
-execution tip. This is the prerequisite for mainnet-safe deployment activation,
-reorg handling, configurable pruning, snapshots, explorer indexes, and wallet
-sync. Compression, archive transport, and UI work must not be presented as a
-substitute for this validating-node path.
+The durable regtest headers-first/block IBD milestone is implemented, including
+active-branch rewinds and interrupted-transition recovery. The next acceptance
+milestone is mainnet/testnet-safe consensus activation: complete deployment
+state, remaining block rules and Core differential vectors before removing the
+regtest execution safety gate. Peer diversity/DoS hardening follows before a
+public long-running node. Compression, archive transport, explorer, and wallet
+work must not be presented as a substitute for this validating-node path.

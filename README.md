@@ -6,7 +6,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 - Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format.
 - Script validation adapter using Bitcoin Core's `libbitcoinconsensus`, including Taproot spent-output validation.
-- Pure-Rust redb UTXO chainstate with separate hot and cold tables and atomic cross-tier transactions.
+- Pure-Rust redb UTXO chainstate with separate hot/cold tables, atomic whole-block transitions, durable undo, reorg rewind, and interrupted-transition recovery.
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.
 - Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Only old block archives rotate; UTXO state and headers are retained.
@@ -14,7 +14,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. In particular, the service loop, full contextual block validation, header-chain fork choice, P2P peer manager, address/transaction indexer, wallet persistence, authentication, and release hardening are completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Durable regtest headers-first/block IBD and cumulative-work fork choice are implemented, but complete mainnet deployment activation and block rules, the P2P peer manager, persistent address/transaction indexes, wallet secret persistence, authentication, and release hardening remain completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 

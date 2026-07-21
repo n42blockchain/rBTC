@@ -11,7 +11,7 @@ use std::{
 
 use bitcoin::{BlockHash, Network, hashes::Hash};
 use rbtc::{
-    block_execution::{connect_active_block, disconnect_execution_tip},
+    block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
     deployments::{block_deployment_context, taproot_always_active},
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
@@ -181,6 +181,17 @@ async fn sync_regtest_node(
         RedbUndoStore::open(data_dir.join("undo.redb")).map_err(|error| error.to_string())?;
     let execution_store = RedbExecutionStore::open(data_dir.join("execution.redb"), network)
         .map_err(|error| error.to_string())?;
+    if recover_pending_transition(
+        &chainstate,
+        &undo_store,
+        &execution_store,
+        u64::from(unix_time()?),
+        DEFAULT_HOT_WINDOW_SECS,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        println!("recovered an interrupted chainstate transition");
+    }
 
     loop {
         let tip = execution_store.tip().map_err(|error| error.to_string())?;

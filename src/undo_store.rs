@@ -9,10 +9,16 @@ use bitcoin::{BlockHash, hashes::Hash};
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
-use crate::utxo::{UtxoError, UtxoUndo};
+use crate::{
+    execution_store::ExecutionTip,
+    utxo::{OutPointKey, Utxo, UtxoError, UtxoUndo},
+};
 
 const BLOCK_UNDOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("block_undos");
+const PENDING_TRANSITION: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_transition");
+const PENDING_KEY: &str = "active";
 const FORMAT_VERSION: u32 = 1;
+const PENDING_FORMAT_VERSION: u32 = 1;
 
 /// Failures from durable block undo storage.
 #[derive(Debug, Error)]
@@ -41,6 +47,36 @@ pub enum UndoStoreError {
     /// An undo record already exists for the block hash.
     #[error("undo already exists for block {0}")]
     Duplicate(BlockHash),
+    /// A previous block transition must be recovered before another begins.
+    #[error("pending block transition already exists")]
+    PendingExists,
+    /// The caller attempted to clear a different transition.
+    #[error("pending transition does not target block {0}")]
+    WrongPending(BlockHash),
+}
+
+/// Write-ahead information sufficient to classify and recover a block commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransition {
+    /// Whether the intended operation connects or disconnects `next`.
+    pub kind: TransitionKind,
+    /// Execution tip before the UTXO mutation.
+    pub parent: ExecutionTip,
+    /// Execution tip after a completed mutation.
+    pub next: ExecutionTip,
+    /// Aggregate mutation undo, describing every pre-transition value.
+    pub undo: UtxoUndo,
+    /// Every output present after the transition among the changed keys.
+    pub created: Vec<(OutPointKey, Utxo)>,
+}
+
+/// Direction of a write-ahead active-chain transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionKind {
+    /// Move from `parent` to `next`.
+    Connect,
+    /// Move from `next` back to `parent`.
+    Disconnect,
 }
 
 /// Append/remove storage for one block's transaction undos.
@@ -60,6 +96,7 @@ impl RedbUndoStore {
         let transaction = db.begin_write()?;
         {
             let _undos = transaction.open_table(BLOCK_UNDOS)?;
+            let _pending = transaction.open_table(PENDING_TRANSITION)?;
         }
         transaction.commit()?;
         Ok(Self {
@@ -107,9 +144,149 @@ impl RedbUndoStore {
         Ok(removed)
     }
 
+    /// Durably records intent before the corresponding UTXO transaction starts.
+    pub fn prepare_transition(&self, pending: &PendingTransition) -> Result<(), UndoStoreError> {
+        let _guard = self.lock();
+        let encoded = encode_pending_transition(pending)?;
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(PENDING_TRANSITION)?;
+            if table.get(PENDING_KEY)?.is_some() {
+                return Err(UndoStoreError::PendingExists);
+            }
+            table.insert(PENDING_KEY, encoded.as_slice())?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Loads an interrupted block transition, if one exists.
+    pub fn pending_transition(&self) -> Result<Option<PendingTransition>, UndoStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(PENDING_TRANSITION)?;
+        table
+            .get(PENDING_KEY)?
+            .map(|value| decode_pending_transition(value.value()))
+            .transpose()
+    }
+
+    /// Clears a recovered or fully completed transition.
+    pub fn clear_transition(&self, expected: BlockHash) -> Result<(), UndoStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(PENDING_TRANSITION)?;
+            let target = table
+                .get(PENDING_KEY)?
+                .map(|value| decode_pending_transition(value.value()))
+                .transpose()?
+                .map(|pending| pending.next.hash);
+            if let Some(target) = target {
+                if target != expected {
+                    return Err(UndoStoreError::WrongPending(expected));
+                }
+                table.remove(PENDING_KEY)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
     }
+}
+
+fn encode_tip(tip: ExecutionTip, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&tip.height.to_le_bytes());
+    bytes.extend_from_slice(&tip.hash.to_byte_array());
+}
+
+fn decode_tip(
+    bytes: &[u8],
+    cursor: &mut usize,
+    field: &'static str,
+) -> Result<ExecutionTip, UndoStoreError> {
+    let height = take_u32(bytes, cursor, field)?;
+    let hash = BlockHash::from_byte_array(
+        take(bytes, cursor, 32, field)?
+            .try_into()
+            .expect("checked hash length"),
+    );
+    Ok(ExecutionTip { height, hash })
+}
+
+fn encode_pending_transition(pending: &PendingTransition) -> Result<Vec<u8>, UndoStoreError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&PENDING_FORMAT_VERSION.to_le_bytes());
+    bytes.push(match pending.kind {
+        TransitionKind::Connect => 0,
+        TransitionKind::Disconnect => 1,
+    });
+    encode_tip(pending.parent, &mut bytes);
+    encode_tip(pending.next, &mut bytes);
+    let undo = pending.undo.encode()?;
+    let undo_len =
+        u32::try_from(undo.len()).map_err(|_| UndoStoreError::Malformed("pending undo length"))?;
+    bytes.extend_from_slice(&undo_len.to_le_bytes());
+    bytes.extend_from_slice(&undo);
+    let created_count = u32::try_from(pending.created.len())
+        .map_err(|_| UndoStoreError::Malformed("pending created count"))?;
+    bytes.extend_from_slice(&created_count.to_le_bytes());
+    for (outpoint, utxo) in &pending.created {
+        let utxo = utxo.encode()?;
+        let length = u32::try_from(utxo.len())
+            .map_err(|_| UndoStoreError::Malformed("pending UTXO length"))?;
+        bytes.extend_from_slice(outpoint.as_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&utxo);
+    }
+    Ok(bytes)
+}
+
+fn decode_pending_transition(bytes: &[u8]) -> Result<PendingTransition, UndoStoreError> {
+    let mut cursor = 0;
+    if take_u32(bytes, &mut cursor, "pending format version")? != PENDING_FORMAT_VERSION {
+        return Err(UndoStoreError::Malformed(
+            "unsupported pending format version",
+        ));
+    }
+    let kind = match take(bytes, &mut cursor, 1, "pending transition kind")?[0] {
+        0 => TransitionKind::Connect,
+        1 => TransitionKind::Disconnect,
+        _ => return Err(UndoStoreError::Malformed("pending transition kind")),
+    };
+    let parent = decode_tip(bytes, &mut cursor, "pending parent tip")?;
+    let next = decode_tip(bytes, &mut cursor, "pending next tip")?;
+    let undo_len = usize::try_from(take_u32(bytes, &mut cursor, "pending undo length")?)
+        .expect("u32 fits usize");
+    let undo = UtxoUndo::decode(take(bytes, &mut cursor, undo_len, "pending undo")?)?;
+    let created_count = usize::try_from(take_u32(bytes, &mut cursor, "pending created count")?)
+        .expect("u32 fits usize");
+    if created_count > bytes.len().saturating_sub(cursor) / 40 {
+        return Err(UndoStoreError::Malformed(
+            "pending created count exceeds record",
+        ));
+    }
+    let mut created = Vec::with_capacity(created_count);
+    for _ in 0..created_count {
+        let outpoint =
+            OutPointKey::from_bytes(take(bytes, &mut cursor, 36, "pending created outpoint")?)?;
+        let length = usize::try_from(take_u32(bytes, &mut cursor, "pending UTXO length")?)
+            .expect("u32 fits usize");
+        let utxo = Utxo::decode(take(bytes, &mut cursor, length, "pending UTXO")?)?;
+        created.push((outpoint, utxo));
+    }
+    if cursor != bytes.len() {
+        return Err(UndoStoreError::Malformed("trailing pending bytes"));
+    }
+    Ok(PendingTransition {
+        kind,
+        parent,
+        next,
+        undo,
+        created,
+    })
 }
 
 fn encode_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UndoStoreError> {
@@ -208,10 +385,36 @@ mod tests {
         let path = directory.path().join("undo.redb");
         let store = RedbUndoStore::open(&path).unwrap();
         store.insert(block, std::slice::from_ref(&undo)).unwrap();
+        let pending = PendingTransition {
+            kind: TransitionKind::Connect,
+            parent: ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([1; 32]),
+            },
+            next: ExecutionTip {
+                height: 1,
+                hash: block,
+            },
+            undo: undo.clone(),
+            created: vec![(
+                outpoint.into(),
+                Utxo {
+                    value_sats: 2,
+                    height: 2,
+                    is_coinbase: false,
+                    last_touched: 1,
+                    creation_mtp: 1,
+                    script_pubkey: vec![0x51],
+                },
+            )],
+        };
+        store.prepare_transition(&pending).unwrap();
         drop(store);
 
         let reopened = RedbUndoStore::open(path).unwrap();
         assert_eq!(reopened.get(block).unwrap(), Some(vec![undo]));
+        assert_eq!(reopened.pending_transition().unwrap(), Some(pending));
+        reopened.clear_transition(block).unwrap();
         assert!(reopened.remove(block).unwrap());
         assert!(reopened.get(block).unwrap().is_none());
     }
