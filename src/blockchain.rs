@@ -51,6 +51,9 @@ pub enum BlockError {
         /// Subsidy plus fees in satoshis.
         allowed: u64,
     },
+    /// Sum of individually valid transaction fees overflowed.
+    #[error("block fee sum overflow")]
+    FeeOverflow,
     /// One transaction failed validation or chainstate application.
     #[error("transaction {index}: {source}")]
     Transaction {
@@ -114,12 +117,11 @@ pub fn apply_block<S: UtxoStore>(
     }
     let fees = applied[1..].iter().try_fold(0_u64, |fees, transaction| {
         fees.checked_add(transaction.input_value_sats - transaction.output_value_sats)
-            .ok_or(BlockError::ExcessCoinbase {
-                claimed: u64::MAX,
-                allowed: u64::MAX,
-            })
+            .ok_or(BlockError::FeeOverflow)
     })?;
-    let allowed = block_subsidy(height).saturating_add(fees);
+    let allowed = block_subsidy(height)
+        .checked_add(fees)
+        .ok_or(BlockError::FeeOverflow)?;
     if applied[0].output_value_sats > allowed {
         rollback(store, &applied, now, hot_window_secs)?;
         return Err(BlockError::ExcessCoinbase {

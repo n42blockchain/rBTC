@@ -10,6 +10,8 @@ use crate::{
 
 /// Coinbase outputs require this many confirmations before they are spendable.
 pub const COINBASE_MATURITY: u32 = 100;
+/// Total bitcoin supply cap in satoshis.
+pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
 
 /// A successful transaction application and its reorg data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +52,15 @@ pub enum ChainstateError {
     /// Coinbase input script length is outside the consensus range 2..=100.
     #[error("coinbase script length must be between 2 and 100 bytes")]
     CoinbaseScriptSize,
+    /// A non-coinbase transaction contains no inputs.
+    #[error("non-coinbase transaction has no inputs")]
+    NoInputs,
+    /// A transaction contains no outputs.
+    #[error("transaction has no outputs")]
+    NoOutputs,
+    /// An output or aggregate transaction value exceeds Bitcoin's money range.
+    #[error("transaction value exceeds MAX_MONEY")]
+    MoneyRange,
 }
 
 /// Applies one transaction to a UTXO store after accounting and script checks.
@@ -71,9 +82,18 @@ pub fn apply_transaction<S: UtxoStore>(
 ) -> Result<AppliedTransaction, ChainstateError> {
     let txid = transaction.compute_txid();
     let output_value = transaction.output.iter().try_fold(0_u64, |sum, output| {
+        if output.value.to_sat() > MAX_MONEY_SATS {
+            return Err(ChainstateError::MoneyRange);
+        }
         sum.checked_add(output.value.to_sat())
             .ok_or(ChainstateError::ValueOverflow)
     })?;
+    if output_value > MAX_MONEY_SATS {
+        return Err(ChainstateError::MoneyRange);
+    }
+    if transaction.output.is_empty() {
+        return Err(ChainstateError::NoOutputs);
+    }
     if transaction.is_coinbase() {
         let script_len = transaction.input[0].script_sig.len();
         if !(2..=100).contains(&script_len) {
@@ -88,12 +108,19 @@ pub fn apply_transaction<S: UtxoStore>(
         });
     }
 
+    if transaction.input.is_empty() {
+        return Err(ChainstateError::NoInputs);
+    }
+
     let mut spent = Vec::with_capacity(transaction.input.len());
     let mut prevouts = Vec::with_capacity(transaction.input.len());
     let mut input_value = 0_u64;
     for input in &transaction.input {
         let outpoint = OutPointKey::from(input.previous_output);
         let utxo = store.get(outpoint)?.ok_or(UtxoError::Missing(outpoint))?;
+        if utxo.value_sats > MAX_MONEY_SATS {
+            return Err(ChainstateError::MoneyRange);
+        }
         if utxo.is_coinbase {
             let matures_at = utxo.height.saturating_add(COINBASE_MATURITY);
             if height < matures_at {
@@ -106,6 +133,9 @@ pub fn apply_transaction<S: UtxoStore>(
         input_value = input_value
             .checked_add(utxo.value_sats)
             .ok_or(ChainstateError::ValueOverflow)?;
+        if input_value > MAX_MONEY_SATS {
+            return Err(ChainstateError::MoneyRange);
+        }
         spent.push(outpoint);
         prevouts.push(utxo);
     }
@@ -201,6 +231,30 @@ mod tests {
         assert!(matches!(
             apply_transaction(&store, &coinbase(vec![1]), 10, 100, 0),
             Err(ChainstateError::CoinbaseScriptSize)
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_noncoinbase_inputs_and_all_empty_outputs() {
+        let (_dir, store) = store();
+        let no_inputs = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert!(matches!(
+            apply_transaction(&store, &no_inputs, 10, 100, 0),
+            Err(ChainstateError::NoInputs)
+        ));
+        let mut no_outputs = coinbase(vec![1, 2]);
+        no_outputs.output.clear();
+        assert!(matches!(
+            apply_transaction(&store, &no_outputs, 10, 100, 0),
+            Err(ChainstateError::NoOutputs)
         ));
     }
 }

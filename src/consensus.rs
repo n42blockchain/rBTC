@@ -8,6 +8,12 @@ use crate::utxo::Utxo;
 /// Script-validation failure returned by libbitcoinconsensus.
 #[derive(Debug, Error)]
 pub enum ConsensusError {
+    /// A UTXO cannot be represented by libbitcoinconsensus's signed amount ABI.
+    #[error("UTXO amount is outside the consensus ABI range")]
+    AmountOutOfRange,
+    /// A script is too large for the consensus ABI's length field.
+    #[error("UTXO script is outside the consensus ABI range")]
+    ScriptTooLarge,
     /// The supplied prevout vector is not aligned with transaction inputs.
     #[error("prevout count ({prevouts}) does not match input count ({inputs})")]
     PrevoutCount {
@@ -61,13 +67,16 @@ pub fn verify_transaction_scripts_with_flags(
     }
     let spent_outputs = prevouts
         .iter()
-        .map(|utxo| bitcoinconsensus::Utxo {
-            script_pubkey: utxo.script_pubkey.as_ptr(),
-            script_pubkey_len: u32::try_from(utxo.script_pubkey.len())
-                .expect("script length fits u32"),
-            value: i64::try_from(utxo.value_sats).expect("Bitcoin amount fits i64"),
+        .map(|utxo| -> Result<bitcoinconsensus::Utxo, ConsensusError> {
+            Ok(bitcoinconsensus::Utxo {
+                script_pubkey: utxo.script_pubkey.as_ptr(),
+                script_pubkey_len: u32::try_from(utxo.script_pubkey.len())
+                    .map_err(|_| ConsensusError::ScriptTooLarge)?,
+                value: i64::try_from(utxo.value_sats)
+                    .map_err(|_| ConsensusError::AmountOutOfRange)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let raw_transaction = serialize(transaction);
     for (input, utxo) in prevouts.iter().enumerate() {
         bitcoinconsensus::verify_with_flags(
