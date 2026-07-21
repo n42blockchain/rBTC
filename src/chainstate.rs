@@ -1,6 +1,6 @@
 //! Transaction-to-UTXO application with consensus-critical accounting checks.
 
-use bitcoin::{Sequence, Transaction};
+use bitcoin::{Script, Sequence, Transaction, Witness, WitnessVersion, script::Instruction};
 use thiserror::Error;
 
 use crate::{
@@ -24,6 +24,8 @@ pub struct AppliedTransaction {
     pub input_value_sats: u64,
     /// Sum of created outputs, in satoshis.
     pub output_value_sats: u64,
+    /// Consensus sigop cost including the witness scale factor where applicable.
+    pub sigop_cost: u64,
     /// Undo data to apply if this transaction's containing block disconnects.
     pub undo: UtxoUndo,
 }
@@ -178,6 +180,7 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
             txid,
             input_value_sats: 0,
             output_value_sats: output_value,
+            sigop_cost: legacy_sigop_cost(transaction),
             undo: store.apply_with_undo(&[], &created)?,
         });
     }
@@ -225,8 +228,87 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
         txid,
         input_value_sats: input_value,
         output_value_sats: output_value,
+        sigop_cost: transaction_sigop_cost(transaction, &prevouts, script_flags),
         undo: store.apply_with_undo(&spent, &created)?,
     })
+}
+
+fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
+    let sigops = transaction
+        .input
+        .iter()
+        .map(|input| input.script_sig.count_sigops_legacy())
+        .chain(
+            transaction
+                .output
+                .iter()
+                .map(|output| output.script_pubkey.count_sigops_legacy()),
+        )
+        .sum::<usize>();
+    u64::try_from(sigops).expect("transaction sigops fit u64") * 4
+}
+
+fn transaction_sigop_cost(transaction: &Transaction, prevouts: &[Utxo], flags: u32) -> u64 {
+    let mut cost = legacy_sigop_cost(transaction);
+    for (input, prevout) in transaction.input.iter().zip(prevouts) {
+        let script_pubkey = Script::from_bytes(&prevout.script_pubkey);
+        if flags & bitcoinconsensus::VERIFY_P2SH != 0 && script_pubkey.is_p2sh() {
+            cost += u64::try_from(p2sh_sigops(&input.script_sig)).expect("P2SH sigops fit u64") * 4;
+        }
+        if flags & bitcoinconsensus::VERIFY_WITNESS != 0 {
+            cost += u64::try_from(witness_sigops(
+                &input.script_sig,
+                script_pubkey,
+                &input.witness,
+            ))
+            .expect("witness sigops fit u64");
+        }
+    }
+    cost
+}
+
+fn p2sh_sigops(script_sig: &Script) -> usize {
+    last_push(script_sig).map_or(0, |redeem| Script::from_bytes(&redeem).count_sigops())
+}
+
+fn last_push(script: &Script) -> Option<Vec<u8>> {
+    let mut last = Vec::new();
+    for instruction in script.instructions() {
+        match instruction.ok()? {
+            Instruction::PushBytes(bytes) => last = bytes.as_bytes().to_vec(),
+            Instruction::Op(opcode) if opcode.to_u8() <= 0x60 => last.clear(),
+            Instruction::Op(_) => return None,
+        }
+    }
+    Some(last)
+}
+
+fn witness_sigops(script_sig: &Script, script_pubkey: &Script, witness: &Witness) -> usize {
+    if script_pubkey.is_witness_program() {
+        return witness_program_sigops(script_pubkey, witness);
+    }
+    if script_pubkey.is_p2sh() && script_sig.is_push_only() {
+        if let Some(redeem) = last_push(script_sig) {
+            let redeem = Script::from_bytes(&redeem);
+            if redeem.is_witness_program() {
+                return witness_program_sigops(redeem, witness);
+            }
+        }
+    }
+    0
+}
+
+fn witness_program_sigops(program: &Script, witness: &Witness) -> usize {
+    if program.witness_version() != Some(WitnessVersion::V0) {
+        return 0;
+    }
+    match program.as_bytes().get(1).copied() {
+        Some(20) => 1,
+        Some(32) => witness
+            .last()
+            .map_or(0, |script| Script::from_bytes(script).count_sigops()),
+        _ => 0,
+    }
 }
 
 fn transaction_is_final(transaction: &Transaction, height: u32, lock_time_context: u32) -> bool {
@@ -311,7 +393,11 @@ fn created_outputs(
 mod tests {
     use bitcoin::{
         Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
-        absolute::LockTime, hashes::Hash, transaction::Version,
+        absolute::LockTime,
+        hashes::Hash,
+        opcodes::all::{OP_CHECKMULTISIG, OP_CHECKSIG},
+        script::Builder,
+        transaction::Version,
     };
     use tempfile::TempDir;
 
@@ -461,5 +547,53 @@ mod tests {
         );
         assert!(!transaction_is_final(&transaction, 1, 500_000_000));
         assert!(transaction_is_final(&transaction, 1, 500_000_001));
+    }
+
+    #[test]
+    fn counts_legacy_p2sh_and_witness_sigop_cost_like_core() {
+        let mut legacy = coinbase(vec![1, 2]);
+        legacy.output[0].script_pubkey = Builder::new()
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(legacy_sigop_cost(&legacy), 84);
+
+        let redeem = Builder::new()
+            .push_int(2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        let mut p2sh_spend = spend(OutPoint::null(), Sequence::MAX, LockTime::ZERO);
+        p2sh_spend.input[0].script_sig = ScriptBuf::from_bytes(vec![2, 0x52, 0xae]);
+        let p2sh_prevout = Utxo {
+            value_sats: 1,
+            height: 0,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 0,
+            script_pubkey: redeem.to_p2sh().into_bytes(),
+        };
+        assert_eq!(
+            transaction_sigop_cost(
+                &p2sh_spend,
+                std::slice::from_ref(&p2sh_prevout),
+                bitcoinconsensus::VERIFY_P2SH,
+            ),
+            8
+        );
+
+        let mut witness_spend = spend(OutPoint::null(), Sequence::MAX, LockTime::ZERO);
+        witness_spend.input[0].witness = Witness::from_slice(&[&[0x53, 0xae]]);
+        let witness_prevout = Utxo {
+            script_pubkey: [vec![0x00, 0x20], vec![0; 32]].concat(),
+            ..p2sh_prevout
+        };
+        assert_eq!(
+            transaction_sigop_cost(
+                &witness_spend,
+                &[witness_prevout],
+                bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
+            ),
+            3
+        );
     }
 }

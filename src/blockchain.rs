@@ -14,6 +14,8 @@ use crate::{
 
 /// Bitcoin's maximum serialized block weight in weight units.
 pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+/// Maximum consensus signature-operation cost per block.
+pub const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 const HALVING_INTERVAL: u32 = 210_000;
 const INITIAL_SUBSIDY_SATS: u64 = 50 * 100_000_000;
 
@@ -70,6 +72,15 @@ pub enum BlockError {
     /// Sum of individually valid transaction fees overflowed.
     #[error("block fee sum overflow")]
     FeeOverflow,
+    /// Aggregate signature-operation cost exceeds the consensus block limit.
+    #[error("block sigop cost {cost} exceeds limit {MAX_BLOCK_SIGOPS_COST}")]
+    SigopCost {
+        /// Accumulated cost at the rejecting transaction.
+        cost: u64,
+    },
+    /// Aggregate signature-operation accounting overflowed.
+    #[error("block sigop cost overflow")]
+    SigopOverflow,
     /// One transaction failed validation or chainstate application.
     #[error("transaction {index}: {source}")]
     Transaction {
@@ -218,6 +229,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     }
 
     let mut applied = Vec::with_capacity(block.txdata.len());
+    let mut sigop_cost = 0_u64;
     let lock_time_context = if csv_active {
         creation_mtp
     } else {
@@ -234,7 +246,20 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
             script_flags,
             csv_active,
         ) {
-            Ok(transaction) => applied.push(transaction),
+            Ok(transaction) => {
+                applied.push(transaction);
+                let Some(next_sigop_cost) =
+                    sigop_cost.checked_add(applied.last().expect("just pushed").sigop_cost)
+                else {
+                    rollback(store, &applied, now, hot_window_secs)?;
+                    return Err(BlockError::SigopOverflow);
+                };
+                sigop_cost = next_sigop_cost;
+                if sigop_cost > MAX_BLOCK_SIGOPS_COST {
+                    rollback(store, &applied, now, hot_window_secs)?;
+                    return Err(BlockError::SigopCost { cost: sigop_cost });
+                }
+            }
             Err(source) => {
                 rollback(store, &applied, now, hot_window_secs)?;
                 return Err(BlockError::Transaction { index, source });
@@ -488,6 +513,19 @@ mod tests {
         assert!(matches!(
             apply_block(&store, &block, 0, 100, 0, 60, 0),
             Err(BlockError::MutatedMerkleTree)
+        ));
+        assert!(store.snapshot_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_excessive_sigop_cost_and_rolls_back_coinbase() {
+        let (_dir, store) = store();
+        let mut coinbase = coinbase();
+        coinbase.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
+        let block = block(vec![coinbase]);
+        assert!(matches!(
+            apply_block(&store, &block, 0, 100, 0, 60, 0),
+            Err(BlockError::SigopCost { cost: 80_004 })
         ));
         assert!(store.snapshot_entries().unwrap().is_empty());
     }
