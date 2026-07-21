@@ -173,6 +173,12 @@ pub struct UtxoUndo {
 }
 
 impl UtxoUndo {
+    /// Constructs logical undo data for one atomic mutation.
+    #[must_use]
+    pub(crate) fn new(spent: Vec<(OutPointKey, Utxo)>, created: Vec<OutPointKey>) -> Self {
+        Self { spent, created }
+    }
+
     /// Returns the spent outputs that must be restored on disconnect.
     #[must_use]
     pub fn spent(&self) -> &[(OutPointKey, Utxo)] {
@@ -385,8 +391,9 @@ impl UtxoStore for RedbUtxoStore {
                 if !seen_created.insert(*key) {
                     return Err(UtxoError::Duplicate(*key));
                 }
-                if hot.get(key.as_bytes().as_slice())?.is_some()
-                    || cold.get(key.as_bytes().as_slice())?.is_some()
+                if !seen_spent.contains(key)
+                    && (hot.get(key.as_bytes().as_slice())?.is_some()
+                        || cold.get(key.as_bytes().as_slice())?.is_some())
                 {
                     return Err(UtxoError::Duplicate(*key));
                 }
@@ -415,9 +422,15 @@ impl UtxoStore for RedbUtxoStore {
         {
             let mut hot = transaction.open_table(HOT_TABLE)?;
             let mut cold = transaction.open_table(COLD_TABLE)?;
+            let recreated = undo
+                .created
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
             for (key, _) in &undo.spent {
-                if hot.get(key.as_bytes().as_slice())?.is_some()
-                    || cold.get(key.as_bytes().as_slice())?.is_some()
+                if !recreated.contains(key)
+                    && (hot.get(key.as_bytes().as_slice())?.is_some()
+                        || cold.get(key.as_bytes().as_slice())?.is_some())
                 {
                     return Err(UtxoError::Duplicate(*key));
                 }
@@ -615,5 +628,21 @@ mod tests {
             store.apply(&[key(1), key(1)], &[]),
             Err(UtxoError::DuplicateSpend(_))
         ));
+    }
+
+    #[test]
+    fn atomic_replacement_undo_restores_original_coin() {
+        let (_dir, store) = store();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let replacement = Utxo {
+            value_sats: 99,
+            ..coin(20)
+        };
+        let undo = store
+            .apply_with_undo(&[key(1)], &[(key(1), replacement.clone())])
+            .unwrap();
+        assert_eq!(store.get(key(1)).unwrap(), Some(replacement));
+        store.undo(&undo, 100, 60).unwrap();
+        assert_eq!(store.get(key(1)).unwrap(), Some(coin(10)));
     }
 }

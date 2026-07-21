@@ -1,6 +1,9 @@
 //! Sequential active-chain block execution and durable progress coordination.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Mutex,
+};
 
 use bitcoin::{Block, BlockHash, OutPoint};
 use thiserror::Error;
@@ -10,7 +13,7 @@ use crate::{
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{RedbUndoStore, UndoStoreError},
-    utxo::{OutPointKey, UtxoError, UtxoStore},
+    utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
 /// Consensus deployments selected for a candidate block.
@@ -79,10 +82,11 @@ pub enum BlockExecutionError {
 
 /// Validates and connects exactly the next active-chain block.
 ///
-/// UTXO application occurs first, then undo storage, then execution-tip
-/// advancement. Failures in the latter two stages trigger an immediate UTXO
-/// rollback. These stores are not yet one physical redb transaction, so
-/// power-loss atomicity across the three files remains a release gate.
+/// Validation runs against a lazy in-memory overlay. The complete block's net
+/// UTXO effect is committed in one storage transaction, so a process crash
+/// cannot expose a partially applied block. Undo storage and execution-tip
+/// advancement remain separate durable transactions; failures observed by the
+/// process trigger an immediate UTXO rollback.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_active_block<S: UtxoStore>(
     chainstate: &S,
@@ -119,16 +123,17 @@ pub fn connect_active_block<S: UtxoStore>(
     let parent_mtp = headers
         .median_time_past(current.hash)
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
-    let collisions = block_output_collisions(chainstate, block)?;
+    let overlay = UtxoOverlay::new(chainstate);
+    let collisions = block_output_collisions(&overlay, block)?;
     let exception_undo = if collisions.is_empty() {
         None
     } else if deployments.bip30_exception {
-        Some(chainstate.apply_with_undo(&collisions, &[])?)
+        Some(overlay.apply_with_undo(&collisions, &[])?)
     } else {
         return Err(BlockExecutionError::Bip30Collision(collisions[0]));
     };
     let mut applied = match apply_block_with_deployments(
-        chainstate,
+        &overlay,
         block,
         next_height,
         now,
@@ -139,19 +144,16 @@ pub fn connect_active_block<S: UtxoStore>(
         deployments.csv_active,
     ) {
         Ok(applied) => applied,
-        Err(error) => {
-            if let Some(undo) = &exception_undo {
-                chainstate.undo(undo, now, hot_window_secs)?;
-            }
-            return Err(BlockExecutionError::Block(error));
-        }
+        Err(error) => return Err(BlockExecutionError::Block(error)),
     };
     if let Some(undo) = exception_undo {
         applied.transaction_undos.insert(0, undo);
     }
+    let (spent, created) = overlay.net_changes()?;
+    let committed_undo = chainstate.apply_with_undo(&spent, &created)?;
 
     if let Err(error) = undo_store.insert(applied.hash, &applied.transaction_undos) {
-        disconnect_block(chainstate, &applied, now, hot_window_secs)?;
+        chainstate.undo(&committed_undo, now, hot_window_secs)?;
         return Err(BlockExecutionError::Undo(error));
     }
     if let Err(error) = execution_store.advance(
@@ -162,10 +164,182 @@ pub fn connect_active_block<S: UtxoStore>(
         },
     ) {
         undo_store.remove(applied.hash)?;
-        disconnect_block(chainstate, &applied, now, hot_window_secs)?;
+        chainstate.undo(&committed_undo, now, hot_window_secs)?;
         return Err(BlockExecutionError::Execution(error));
     }
     Ok(applied)
+}
+
+#[derive(Default)]
+struct OverlayState {
+    original: BTreeMap<OutPointKey, Option<Utxo>>,
+    current: BTreeMap<OutPointKey, Option<Utxo>>,
+}
+
+type UtxoChanges = (Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>);
+
+/// Block-scoped UTXO mutations retained in memory until validation succeeds.
+struct UtxoOverlay<'a, S> {
+    base: &'a S,
+    state: Mutex<OverlayState>,
+}
+
+impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
+    fn new(base: &'a S) -> Self {
+        Self {
+            base,
+            state: Mutex::new(OverlayState::default()),
+        }
+    }
+
+    fn load(
+        &self,
+        state: &mut OverlayState,
+        outpoint: OutPointKey,
+    ) -> Result<Option<Utxo>, UtxoError> {
+        if let Some(value) = state.current.get(&outpoint) {
+            return Ok(value.clone());
+        }
+        let value = self.base.get(outpoint)?;
+        state.original.insert(outpoint, value.clone());
+        state.current.insert(outpoint, value.clone());
+        Ok(value)
+    }
+
+    fn net_changes(&self) -> Result<UtxoChanges, UtxoError> {
+        let state = self.state.lock().expect("overlay lock not poisoned");
+        let mut spent = Vec::new();
+        let mut created = Vec::new();
+        for (outpoint, original) in &state.original {
+            let current = state
+                .current
+                .get(outpoint)
+                .ok_or(UtxoError::Malformed("overlay current value"))?;
+            if original == current {
+                continue;
+            }
+            if original.is_some() {
+                spent.push(*outpoint);
+            }
+            if let Some(utxo) = current {
+                created.push((*outpoint, utxo.clone()));
+            }
+        }
+        Ok((spent, created))
+    }
+}
+
+impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
+    fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        self.load(&mut state, outpoint)
+    }
+
+    fn apply(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), UtxoError> {
+        self.apply_with_undo(spent, created).map(|_| ())
+    }
+
+    fn apply_with_undo(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        let mut seen_spent = BTreeSet::new();
+        let mut undo_spent = Vec::with_capacity(spent.len());
+        for outpoint in spent {
+            if !seen_spent.insert(*outpoint) {
+                return Err(UtxoError::DuplicateSpend(*outpoint));
+            }
+            let previous = self
+                .load(&mut state, *outpoint)?
+                .ok_or(UtxoError::Missing(*outpoint))?;
+            undo_spent.push((*outpoint, previous));
+        }
+        let mut seen_created = BTreeSet::new();
+        for (outpoint, _) in created {
+            if !seen_created.insert(*outpoint) || self.load(&mut state, *outpoint)?.is_some() {
+                return Err(UtxoError::Duplicate(*outpoint));
+            }
+        }
+        for outpoint in spent {
+            state.current.insert(*outpoint, None);
+        }
+        for (outpoint, utxo) in created {
+            state.current.insert(*outpoint, Some(utxo.clone()));
+        }
+        Ok(UtxoUndo::new(
+            undo_spent,
+            created.iter().map(|(outpoint, _)| *outpoint).collect(),
+        ))
+    }
+
+    fn undo(&self, undo: &UtxoUndo, _now: u64, _hot_window_secs: u64) -> Result<(), UtxoError> {
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        for (outpoint, _) in undo.spent() {
+            if self.load(&mut state, *outpoint)?.is_some() {
+                return Err(UtxoError::Duplicate(*outpoint));
+            }
+        }
+        for outpoint in undo.created() {
+            self.load(&mut state, *outpoint)?;
+            state.current.insert(*outpoint, None);
+        }
+        for (outpoint, utxo) in undo.spent() {
+            state.current.insert(*outpoint, Some(utxo.clone()));
+        }
+        Ok(())
+    }
+
+    fn age_to_cold(&self, _now: u64, _hot_window_secs: u64) -> Result<u64, UtxoError> {
+        Ok(0)
+    }
+
+    fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+        let mut entries = self.base.snapshot_entries()?;
+        let state = self.state.lock().expect("overlay lock not poisoned");
+        for (outpoint, current) in &state.current {
+            if let Some(utxo) = current {
+                entries.insert(*outpoint, utxo.clone());
+            } else {
+                entries.remove(outpoint);
+            }
+        }
+        Ok(entries)
+    }
+
+    fn replace_all(
+        &self,
+        entries: &BTreeMap<OutPointKey, Utxo>,
+        _now: u64,
+        _hot_window_secs: u64,
+    ) -> Result<(), UtxoError> {
+        let base = self.base.snapshot_entries()?;
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        state.original.clear();
+        state.current.clear();
+        for outpoint in base.keys().chain(entries.keys()) {
+            state
+                .original
+                .insert(*outpoint, base.get(outpoint).cloned());
+            state
+                .current
+                .insert(*outpoint, entries.get(outpoint).cloned());
+        }
+        Ok(())
+    }
+
+    fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+        Ok(TierStats {
+            hot: u64::try_from(self.snapshot_entries()?.len())
+                .map_err(|_| UtxoError::Malformed("overlay entry count"))?,
+            cold: 0,
+        })
+    }
 }
 
 fn block_output_collisions<S: UtxoStore>(
@@ -232,6 +406,8 @@ pub fn disconnect_execution_tip<S: UtxoStore>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use bitcoin::{
         Amount, Block, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
         TxOut, Witness,
@@ -267,8 +443,11 @@ mod tests {
         }
     }
 
-    fn block(parent: BlockHash, time: u32) -> Block {
-        let transaction = coinbase(1);
+    fn block_with_transactions(
+        parent: BlockHash,
+        time: u32,
+        transactions: Vec<Transaction>,
+    ) -> Block {
         let mut block = Block {
             header: Header {
                 version: HeaderVersion::ONE,
@@ -278,7 +457,7 @@ mod tests {
                 bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
                 nonce: 0,
             },
-            txdata: vec![transaction],
+            txdata: transactions,
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         while block
@@ -289,6 +468,65 @@ mod tests {
             block.header.nonce = block.header.nonce.checked_add(1).unwrap();
         }
         block
+    }
+
+    fn block(parent: BlockHash, time: u32) -> Block {
+        block_with_transactions(parent, time, vec![coinbase(1)])
+    }
+
+    struct CountingStore<'a> {
+        inner: &'a RedbUtxoStore,
+        writes: AtomicUsize,
+    }
+
+    impl UtxoStore for CountingStore<'_> {
+        fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+            self.inner.get(outpoint)
+        }
+
+        fn apply(
+            &self,
+            spent: &[OutPointKey],
+            created: &[(OutPointKey, Utxo)],
+        ) -> Result<(), UtxoError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.apply(spent, created)
+        }
+
+        fn apply_with_undo(
+            &self,
+            spent: &[OutPointKey],
+            created: &[(OutPointKey, Utxo)],
+        ) -> Result<UtxoUndo, UtxoError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.apply_with_undo(spent, created)
+        }
+
+        fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.undo(undo, now, hot_window_secs)
+        }
+
+        fn age_to_cold(&self, now: u64, hot_window_secs: u64) -> Result<u64, UtxoError> {
+            self.inner.age_to_cold(now, hot_window_secs)
+        }
+
+        fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+            self.inner.snapshot_entries()
+        }
+
+        fn replace_all(
+            &self,
+            entries: &BTreeMap<OutPointKey, Utxo>,
+            now: u64,
+            hot_window_secs: u64,
+        ) -> Result<(), UtxoError> {
+            self.inner.replace_all(entries, now, hot_window_secs)
+        }
+
+        fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+            self.inner.tier_stats()
+        }
     }
 
     #[test]
@@ -347,6 +585,78 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn commits_a_multi_transaction_block_with_one_utxo_write() {
+        let directory = TempDir::new().unwrap();
+        let inner = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        let previous = OutPoint::new(bitcoin::Txid::from_byte_array([7; 32]), 0);
+        inner
+            .apply(
+                &[],
+                &[(
+                    previous.into(),
+                    Utxo {
+                        value_sats: 1_000,
+                        height: 0,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51],
+                    },
+                )],
+            )
+            .unwrap();
+        let chainstate = CountingStore {
+            inner: &inner,
+            writes: AtomicUsize::new(0),
+        };
+        let spend = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: previous,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
+        let execution_store =
+            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+                .unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let active_block = block_with_transactions(
+            genesis.hash,
+            genesis.header.time + 1,
+            vec![coinbase(1), spend],
+        );
+        headers
+            .insert_contextual(active_block.header, active_block.header.time)
+            .unwrap();
+
+        connect_active_block(
+            &chainstate,
+            &undo_store,
+            &execution_store,
+            &headers,
+            &active_block,
+            1,
+            60,
+            BlockDeploymentContext::default(),
+        )
+        .unwrap();
+
+        assert_eq!(chainstate.writes.load(Ordering::Relaxed), 1);
+        assert!(inner.get(previous.into()).unwrap().is_none());
+        let created = OutPoint::new(active_block.txdata[1].compute_txid(), 0).into();
+        assert_eq!(inner.get(created).unwrap().unwrap().value_sats, 900);
     }
 
     #[test]
