@@ -30,6 +30,8 @@ pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 32 * 1024 * 1024;
 const V1_HEADER_LEN: usize = 24;
 const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
+/// Maximum headers permitted in one protocol `headers` response.
+pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 const PROTOCOL_VERSION: u32 = 70_016;
 
 /// Async v1 P2P framing error.
@@ -64,6 +66,12 @@ pub enum P2pError {
     /// A peer did not provide the requested response within the bounded message budget.
     #[error("peer did not provide headers within {MAX_RESPONSE_MESSAGES} messages")]
     HeadersResponseIncomplete,
+    /// A peer exceeded the protocol maximum for one `headers` response.
+    #[error("peer sent {count} headers; limit is {MAX_HEADERS_PER_RESPONSE}")]
+    TooManyHeaders {
+        /// Number of headers received from the peer.
+        count: usize,
+    },
     /// A peer did not provide a requested block within the bounded message budget.
     #[error("peer did not provide block {requested} within {MAX_RESPONSE_MESSAGES} messages")]
     BlockResponseIncomplete {
@@ -275,6 +283,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     pub async fn receive_headers(&mut self) -> Result<Vec<bitcoin::block::Header>, P2pError> {
         for _ in 0..MAX_RESPONSE_MESSAGES {
             if let NetworkMessage::Headers(headers) = self.read_message().await? {
+                if headers.len() > MAX_HEADERS_PER_RESPONSE {
+                    return Err(P2pError::TooManyHeaders {
+                        count: headers.len(),
+                    });
+                }
                 return Ok(headers);
             }
         }

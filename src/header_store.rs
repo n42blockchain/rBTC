@@ -86,34 +86,46 @@ impl RedbHeaderStore {
 
     /// Persists a header after the caller has accepted it into a header DAG.
     pub fn append(&self, header: Header) -> Result<(), HeaderStoreError> {
-        let _guard = self.lock();
-        let hash = header.block_hash();
-        let hash_bytes = hash.to_byte_array();
-        let encoded = serialize(&header);
-        if encoded.len() != 80 {
-            return Err(HeaderStoreError::Malformed("header encoding length"));
+        self.append_batch(&[header])
+    }
+
+    /// Persists a validated header batch in one redb write transaction.
+    ///
+    /// The caller should first use [`HeaderDag::validate_batch_contextual`].
+    /// A duplicate or malformed header aborts the complete batch, leaving the
+    /// durable prefix unchanged.
+    pub fn append_batch(&self, batch: &[Header]) -> Result<(), HeaderStoreError> {
+        if batch.is_empty() {
+            return Ok(());
         }
+        let _guard = self.lock();
         let transaction = self.db.begin_write()?;
         {
             let mut headers = transaction.open_table(HEADERS)?;
-            if headers.get(hash_bytes.as_slice())?.is_some() {
-                return Err(HeaderStoreError::Duplicate(hash));
-            }
             let mut meta = transaction.open_table(META)?;
-            let sequence = read_sequence(
+            let mut sequence = read_sequence(
                 meta.get(NEXT_SEQUENCE_KEY)?
                     .as_ref()
                     .map(redb::AccessGuard::value),
             )?;
-            let next_sequence = sequence
-                .checked_add(1)
-                .ok_or(HeaderStoreError::Malformed("header sequence overflow"))?;
-            headers.insert(hash_bytes.as_slice(), encoded.as_slice())?;
-            {
-                let mut order = transaction.open_table(INSERTION_ORDER)?;
+            let mut order = transaction.open_table(INSERTION_ORDER)?;
+            for header in batch {
+                let hash = header.block_hash();
+                let hash_bytes = hash.to_byte_array();
+                let encoded = serialize(header);
+                if encoded.len() != 80 {
+                    return Err(HeaderStoreError::Malformed("header encoding length"));
+                }
+                if headers.get(hash_bytes.as_slice())?.is_some() {
+                    return Err(HeaderStoreError::Duplicate(hash));
+                }
+                headers.insert(hash_bytes.as_slice(), encoded.as_slice())?;
                 order.insert(sequence, hash_bytes.as_slice())?;
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or(HeaderStoreError::Malformed("header sequence overflow"))?;
             }
-            meta.insert(NEXT_SEQUENCE_KEY, next_sequence.to_le_bytes().as_slice())?;
+            meta.insert(NEXT_SEQUENCE_KEY, sequence.to_le_bytes().as_slice())?;
         }
         transaction.commit()?;
         Ok(())
@@ -218,10 +230,9 @@ mod tests {
         let genesis = dag.active_tip();
         let first = mine_child(genesis.hash, genesis.header.time + 1);
         let first_info = dag.insert_contextual(first, first.time).unwrap();
-        store.append(first).unwrap();
         let second = mine_child(first_info.hash, first.time + 1);
         let second_info = dag.insert_contextual(second, second.time).unwrap();
-        store.append(second).unwrap();
+        store.append_batch(&[first, second]).unwrap();
 
         assert_eq!(store.len().unwrap(), 2);
         drop(store);

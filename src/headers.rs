@@ -78,6 +78,7 @@ pub enum HeaderError {
 }
 
 /// In-memory header DAG with the best-work tip selected independently of arrival order.
+#[derive(Clone)]
 pub struct HeaderDag {
     params: Params,
     headers: HashMap<BlockHash, HeaderInfo>,
@@ -115,6 +116,48 @@ impl HeaderDag {
     #[must_use]
     pub fn active_tip(&self) -> HeaderInfo {
         self.headers[&self.active_tip]
+    }
+
+    /// Builds a standard newest-to-oldest block locator for `getheaders`.
+    ///
+    /// The first ten entries walk one header at a time; thereafter the step
+    /// doubles until genesis. This retains recent reorg precision while
+    /// bounding the locator to the protocol's expected small size.
+    #[must_use]
+    pub fn block_locator(&self) -> Vec<BlockHash> {
+        let mut locator = Vec::new();
+        let mut current = self.active_tip();
+        let mut step = 1_u32;
+        while current.height > 0 {
+            locator.push(current.hash);
+            let next_height = current.height.saturating_sub(step);
+            current = self
+                .ancestor_at_height(current, next_height)
+                .expect("active chain has all ancestors");
+            if locator.len() >= 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+        locator.push(current.hash);
+        locator
+    }
+
+    /// Contextually validates a contiguous received header batch atomically.
+    ///
+    /// If any header fails, this DAG remains unchanged. Persistence callers
+    /// should commit the same raw batch before replacing their in-memory DAG,
+    /// giving crash recovery a replayable prefix only.
+    pub fn validate_batch_contextual(
+        &self,
+        headers: &[Header],
+        adjusted_time: u32,
+    ) -> Result<(Self, Vec<HeaderInfo>), HeaderError> {
+        let mut candidate = self.clone();
+        let mut accepted = Vec::with_capacity(headers.len());
+        for header in headers {
+            accepted.push(candidate.insert_contextual(*header, adjusted_time)?);
+        }
+        Ok((candidate, accepted))
     }
 
     /// Finds any known header, including side-chain headers.
@@ -464,5 +507,25 @@ mod tests {
         let header = mine_child(dag.active_tip().hash, 1);
         dag.insert(header).unwrap();
         assert!(matches!(dag.insert(header), Err(HeaderError::Duplicate(_))));
+    }
+
+    #[test]
+    fn locator_ends_at_genesis_and_validation_batches_are_atomic() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let child = mine_child(genesis.hash, genesis.header.time + 1);
+        let (candidate, accepted) = dag.validate_batch_contextual(&[child], child.time).unwrap();
+        assert_eq!(accepted[0].height, 1);
+        assert_eq!(dag.active_tip().height, 0);
+        dag = candidate;
+
+        let locator = dag.block_locator();
+        assert_eq!(locator[0], child.block_hash());
+        assert_eq!(*locator.last().unwrap(), genesis.hash);
+        assert!(matches!(
+            dag.validate_batch_contextual(&[child, child], child.time),
+            Err(HeaderError::Duplicate(_))
+        ));
+        assert_eq!(dag.active_tip().hash, child.block_hash());
     }
 }
