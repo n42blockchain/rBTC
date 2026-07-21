@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    api::{ExplorerBlock, ExplorerIndex, ExplorerTransaction, ExplorerUtxo},
+    api::{
+        ExplorerBlock, ExplorerIndex, ExplorerTransaction, ExplorerUtxo, MAX_UTXO_PAGE_OFFSET,
+        MAX_UTXO_PAGE_SIZE,
+    },
     blockchain::AppliedBlock,
     execution_store::ExecutionTip,
     utxo::OutPointKey,
@@ -374,8 +377,13 @@ impl ExplorerIndex for RedbExplorerIndex {
             .transpose()
     }
 
-    fn address_utxos(&self, address: &str) -> Result<Vec<ExplorerUtxo>, String> {
-        self.address_utxos_checked(address)
+    fn address_utxos(
+        &self,
+        address: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ExplorerUtxo>, String> {
+        self.address_utxos_checked(address, offset, limit)
             .map_err(|error| error.to_string())
     }
 }
@@ -384,7 +392,14 @@ impl RedbExplorerIndex {
     fn address_utxos_checked(
         &self,
         address: &str,
+        offset: u32,
+        limit: u32,
     ) -> Result<Vec<ExplorerUtxo>, ExplorerStoreError> {
+        if offset > MAX_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_UTXO_PAGE_SIZE + 1 {
+            return Err(ExplorerStoreError::Invalid(
+                "address UTXO page window exceeds limits",
+            ));
+        }
         let address = Address::from_str(address)
             .map_err(|error| ExplorerStoreError::Address(error.to_string()))?
             .require_network(self.network)
@@ -396,8 +411,14 @@ impl RedbExplorerIndex {
         end[..32].copy_from_slice(&prefix);
         let transaction = self.db.begin_read()?;
         let utxos = transaction.open_table(ADDRESS_UTXOS)?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| ExplorerStoreError::Invalid("address UTXO offset"))?;
+        let limit = usize::try_from(limit)
+            .map_err(|_| ExplorerStoreError::Invalid("address UTXO limit"))?;
         utxos
             .range(start.as_slice()..=end.as_slice())?
+            .skip(offset)
+            .take(limit)
             .map(|entry| {
                 let (_, value) = entry?;
                 Ok(serde_json::from_slice(value.value())?)
@@ -529,7 +550,10 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            index.address_utxos(&address_a.to_string()).unwrap().len(),
+            index
+                .address_utxos(&address_a.to_string(), 0, 100)
+                .unwrap()
+                .len(),
             1
         );
         drop(index);
@@ -565,7 +589,10 @@ mod tests {
             .unwrap();
         assert_eq!(index.disconnect_tip().unwrap().height, 1);
         assert_eq!(
-            index.address_utxos(&address_a.to_string()).unwrap().len(),
+            index
+                .address_utxos(&address_a.to_string(), 0, 100)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -616,23 +643,39 @@ mod tests {
         index.connect(2, &block_two, &applied_two).unwrap();
         assert!(
             index
-                .address_utxos(&address_a.to_string())
+                .address_utxos(&address_a.to_string(), 0, 100)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            index.address_utxos(&address_b.to_string()).unwrap().len(),
+            index
+                .address_utxos(&address_b.to_string(), 0, 100)
+                .unwrap()
+                .len(),
             2
+        );
+        let first_page = index.address_utxos(&address_b.to_string(), 0, 1).unwrap();
+        let second_page = index.address_utxos(&address_b.to_string(), 1, 1).unwrap();
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0], second_page[0]);
+        assert!(
+            index
+                .address_utxos(&address_b.to_string(), 0, MAX_UTXO_PAGE_SIZE + 2)
+                .is_err()
         );
 
         assert_eq!(index.disconnect_tip().unwrap().height, 1);
         assert_eq!(
-            index.address_utxos(&address_a.to_string()).unwrap().len(),
+            index
+                .address_utxos(&address_a.to_string(), 0, 100)
+                .unwrap()
+                .len(),
             1
         );
         assert!(
             index
-                .address_utxos(&address_b.to_string())
+                .address_utxos(&address_b.to_string(), 0, 100)
                 .unwrap()
                 .is_empty()
         );

@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Html,
     routing::{get, post},
@@ -56,14 +56,39 @@ pub struct ExplorerUtxo {
     pub height: u32,
 }
 
+/// A bounded page of current address UTXOs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExplorerUtxoPage {
+    /// UTXOs in deterministic outpoint order.
+    pub utxos: Vec<ExplorerUtxo>,
+    /// Zero-based number of matching entries skipped.
+    pub offset: u32,
+    /// Requested maximum number of returned entries.
+    pub limit: u32,
+    /// Whether at least one additional matching entry exists.
+    pub has_more: bool,
+}
+
+/// Default UTXO page size when the query omits `limit`.
+pub const DEFAULT_UTXO_PAGE_SIZE: u32 = 50;
+/// Maximum accepted UTXO page size.
+pub const MAX_UTXO_PAGE_SIZE: u32 = 100;
+/// Maximum accepted offset, bounding work for offset-based pagination.
+pub const MAX_UTXO_PAGE_OFFSET: u32 = 10_000;
+
 /// Read-only index required by explorer routes. Implement this against the node's block/tx indexes.
 pub trait ExplorerIndex: Send + Sync + 'static {
     /// Returns a block summary by height.
     fn block(&self, height: u32) -> Result<Option<ExplorerBlock>, String>;
     /// Returns a transaction summary by txid.
     fn transaction(&self, txid: &str) -> Result<Option<ExplorerTransaction>, String>;
-    /// Returns current UTXOs for a checked Bitcoin address.
-    fn address_utxos(&self, address: &str) -> Result<Vec<ExplorerUtxo>, String>;
+    /// Returns a bounded slice of current UTXOs for a checked Bitcoin address.
+    fn address_utxos(
+        &self,
+        address: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ExplorerUtxo>, String>;
 }
 
 /// Thread-safe in-memory explorer index for embedded and regtest deployments.
@@ -95,7 +120,10 @@ impl MemoryExplorerIndex {
     }
 
     /// Replaces the current UTXO projection for an address.
-    pub fn set_address_utxos(&self, address: impl Into<String>, utxos: Vec<ExplorerUtxo>) {
+    pub fn set_address_utxos(&self, address: impl Into<String>, mut utxos: Vec<ExplorerUtxo>) {
+        utxos.sort_unstable_by(|left, right| {
+            left.txid.cmp(&right.txid).then(left.vout.cmp(&right.vout))
+        });
         self.address_utxos
             .write()
             .expect("explorer address lock not poisoned")
@@ -122,14 +150,28 @@ impl ExplorerIndex for MemoryExplorerIndex {
             .cloned())
     }
 
-    fn address_utxos(&self, address: &str) -> Result<Vec<ExplorerUtxo>, String> {
+    fn address_utxos(
+        &self,
+        address: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<ExplorerUtxo>, String> {
+        if offset > MAX_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_UTXO_PAGE_SIZE + 1 {
+            return Err("explorer page window exceeds limits".to_owned());
+        }
+        let offset = usize::try_from(offset).map_err(|error| error.to_string())?;
+        let limit = usize::try_from(limit).map_err(|error| error.to_string())?;
         Ok(self
             .address_utxos
             .read()
             .map_err(|_| "explorer address lock poisoned".to_owned())?
             .get(address)
+            .into_iter()
+            .flatten()
+            .skip(offset)
+            .take(limit)
             .cloned()
-            .unwrap_or_default())
+            .collect())
     }
 }
 
@@ -207,6 +249,9 @@ async fn transaction<I: ExplorerIndex>(
     State(index): State<Arc<I>>,
     Path(txid): Path<String>,
 ) -> ApiResult<ExplorerTransaction> {
+    if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     index
         .transaction(&txid)
         .map_err(internal)?
@@ -216,8 +261,28 @@ async fn transaction<I: ExplorerIndex>(
 async fn address_utxos<I: ExplorerIndex>(
     State(index): State<Arc<I>>,
     Path(address): Path<String>,
-) -> ApiResult<Vec<ExplorerUtxo>> {
-    index.address_utxos(&address).map_err(internal).map(Json)
+    Query(query): Query<UtxoPageQuery>,
+) -> ApiResult<ExplorerUtxoPage> {
+    if address.is_empty() || address.len() > 128 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(DEFAULT_UTXO_PAGE_SIZE);
+    if offset > MAX_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_UTXO_PAGE_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let limit_usize = usize::try_from(limit).map_err(internal)?;
+    let mut utxos = index
+        .address_utxos(&address, offset, limit + 1)
+        .map_err(internal)?;
+    let has_more = utxos.len() > limit_usize;
+    utxos.truncate(limit_usize);
+    Ok(Json(ExplorerUtxoPage {
+        utxos,
+        offset,
+        limit,
+        has_more,
+    }))
 }
 async fn wallet_balance(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<WalletBalance> {
     wallet.balance().map_err(internal).map(Json)
@@ -229,6 +294,12 @@ async fn next_address(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<Wa
 type ApiResult<T> = Result<Json<T>, StatusCode>;
 fn internal<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+#[derive(Default, Deserialize)]
+struct UtxoPageQuery {
+    offset: Option<u32>,
+    limit: Option<u32>,
 }
 
 #[cfg(test)]
@@ -250,8 +321,22 @@ mod tests {
         fn transaction(&self, _: &str) -> Result<Option<ExplorerTransaction>, String> {
             Ok(None)
         }
-        fn address_utxos(&self, _: &str) -> Result<Vec<ExplorerUtxo>, String> {
-            Ok(vec![])
+        fn address_utxos(
+            &self,
+            _: &str,
+            offset: u32,
+            limit: u32,
+        ) -> Result<Vec<ExplorerUtxo>, String> {
+            Ok((0..3)
+                .map(|vout| ExplorerUtxo {
+                    txid: format!("{vout:064x}"),
+                    vout,
+                    value_sats: u64::from(vout),
+                    height: 1,
+                })
+                .skip(usize::try_from(offset).unwrap())
+                .take(usize::try_from(limit).unwrap())
+                .collect())
         }
     }
 
@@ -282,6 +367,41 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn explorer_bounds_and_pages_untrusted_queries() {
+        let app = explorer_router(Arc::new(TestIndex));
+        let page = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/address/bcrt1test/utxos?offset=1&limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(page.into_body(), 4096).await.unwrap();
+        let page: ExplorerUtxoPage = serde_json::from_slice(&body).unwrap();
+        assert_eq!(page.utxos.len(), 1);
+        assert_eq!(page.utxos[0].vout, 1);
+        assert!(page.has_more);
+
+        for uri in [
+            "/api/v1/address/bcrt1test/utxos?limit=0",
+            "/api/v1/address/bcrt1test/utxos?limit=101",
+            "/api/v1/address/bcrt1test/utxos?offset=10001",
+            "/api/v1/address/bcrt1test/utxos?limit=invalid",
+            "/api/v1/tx/not-a-txid",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
     #[test]
     fn memory_index_returns_cloned_projections() {
         let index = MemoryExplorerIndex::default();
@@ -301,7 +421,7 @@ mod tests {
             }],
         );
         assert_eq!(index.block(5).unwrap().unwrap().hash, "block");
-        assert_eq!(index.address_utxos("bcrt1test").unwrap().len(), 1);
+        assert_eq!(index.address_utxos("bcrt1test", 0, 100).unwrap().len(), 1);
         assert!(index.transaction("missing").unwrap().is_none());
     }
 }

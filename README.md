@@ -43,7 +43,7 @@ The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 - `GET /api/v1/health`
 - `GET /api/v1/blocks/{height}`
 - `GET /api/v1/tx/{txid}`
-- `GET /api/v1/address/{address}/utxos`
+- `GET /api/v1/address/{address}/utxos?offset=0&limit=50` (maximum page size 100 and offset 10,000)
 - `GET /api/v1/wallet/balance`
 - `POST /api/v1/wallet/address`
 
