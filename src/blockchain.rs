@@ -40,6 +40,12 @@ pub enum BlockError {
     /// A SegWit witness commitment is missing or does not match the transaction data.
     #[error("block witness commitment mismatch")]
     WitnessCommitment,
+    /// Coinbase does not begin with the minimally encoded BIP34 block height.
+    #[error("coinbase does not encode BIP34 height {height}")]
+    Bip34Height {
+        /// Expected block height.
+        height: u32,
+    },
     /// Block weight is over the consensus limit.
     #[error("block weight {weight} exceeds limit {MAX_BLOCK_WEIGHT}")]
     Weight {
@@ -88,11 +94,38 @@ pub fn apply_block<S: UtxoStore>(
     hot_window_secs: u64,
     script_flags: u32,
 ) -> Result<AppliedBlock, BlockError> {
+    apply_block_with_bip34(
+        store,
+        block,
+        height,
+        now,
+        hot_window_secs,
+        script_flags,
+        false,
+    )
+}
+
+/// Validates and applies a block, optionally enforcing the BIP34 height commitment.
+///
+/// The chain deployment manager must set `bip34_active` only at and after the
+/// selected network's activation height.
+pub fn apply_block_with_bip34<S: UtxoStore>(
+    store: &S,
+    block: &Block,
+    height: u32,
+    now: u64,
+    hot_window_secs: u64,
+    script_flags: u32,
+    bip34_active: bool,
+) -> Result<AppliedBlock, BlockError> {
     if block.txdata.is_empty() {
         return Err(BlockError::Empty);
     }
     if !block.txdata[0].is_coinbase() {
         return Err(BlockError::MissingCoinbase);
+    }
+    if bip34_active && !coinbase_has_height(&block.txdata[0], height) {
+        return Err(BlockError::Bip34Height { height });
     }
     if block.txdata[1..]
         .iter()
@@ -142,6 +175,30 @@ pub fn apply_block<S: UtxoStore>(
             .map(|transaction| transaction.undo)
             .collect(),
     })
+}
+
+fn coinbase_has_height(transaction: &bitcoin::Transaction, height: u32) -> bool {
+    let encoded = encode_script_num(height);
+    let script = transaction.input[0].script_sig.as_bytes();
+    encoded.len() <= 75
+        && script.len() > encoded.len()
+        && script[0] == u8::try_from(encoded.len()).expect("BIP34 height fits direct push")
+        && script[1..=encoded.len()] == encoded
+}
+
+fn encode_script_num(mut value: u32) -> Vec<u8> {
+    if value == 0 {
+        return Vec::new();
+    }
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push((value & 0xff) as u8);
+        value >>= 8;
+    }
+    if encoded.last().is_some_and(|byte| byte & 0x80 != 0) {
+        encoded.push(0);
+    }
+    encoded
 }
 
 /// Disconnects a previously applied block in reverse transaction order.
@@ -268,6 +325,20 @@ mod tests {
         assert!(matches!(
             apply_block(&store, &block, 0, 100, 60, 0),
             Err(BlockError::WitnessCommitment)
+        ));
+    }
+
+    #[test]
+    fn bip34_requires_minimally_encoded_coinbase_height() {
+        let (_dir, store) = store();
+        let mut transaction = coinbase();
+        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![1, 10]);
+        let valid_block = block(vec![transaction.clone()]);
+        assert!(apply_block_with_bip34(&store, &valid_block, 10, 100, 60, 0, true).is_ok());
+        let bad = block(vec![coinbase()]);
+        assert!(matches!(
+            apply_block_with_bip34(&store, &bad, 10, 100, 60, 0, true),
+            Err(BlockError::Bip34Height { height: 10 })
         ));
     }
 }
