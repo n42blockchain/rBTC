@@ -118,6 +118,15 @@ impl HeaderDag {
         self.headers[&self.active_tip]
     }
 
+    /// Returns the active-chain header at `height`.
+    #[must_use]
+    pub fn active_header_at(&self, height: u32) -> Option<HeaderInfo> {
+        let tip = self.active_tip();
+        (height <= tip.height)
+            .then(|| self.ancestor_at_height(tip, height))
+            .flatten()
+    }
+
     /// Builds a standard newest-to-oldest block locator for `getheaders`.
     ///
     /// The first ten entries walk one header at a time; thereafter the step

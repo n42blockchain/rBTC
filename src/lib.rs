@@ -6,9 +6,11 @@
 
 pub mod api;
 pub mod archive;
+pub mod block_execution;
 pub mod blockchain;
 pub mod chainstate;
 pub mod consensus;
+pub mod execution_store;
 pub mod header_store;
 pub mod headers;
 pub mod ledger;
