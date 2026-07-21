@@ -10,11 +10,11 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.
 - Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; only old block archives rotate, while UTXO state and headers are retained.
-- Embedded REST router contracts for a block explorer plus a BDK descriptor wallet façade.
+- Embedded REST router contracts for a block explorer plus a transactionally persisted BDK watch-only descriptor wallet façade.
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Durable regtest headers-first/block IBD, cumulative-work fork choice, and persistent explorer projections are implemented, but complete mainnet deployment activation and block rules, the P2P peer manager, wallet secret persistence, authenticated API serving, and release hardening remain completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Durable regtest headers-first/block IBD, cumulative-work fork choice, persistent explorer projections, and crash-safe watch-only wallet address derivation are implemented, but complete mainnet deployment activation and block rules, the P2P peer manager, encrypted wallet signing, authenticated API serving, and release hardening remain completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 
@@ -47,4 +47,4 @@ The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 - `GET /api/v1/wallet/balance`
 - `POST /api/v1/wallet/address`
 
-Bind the eventual daemon to loopback by default. Wallet endpoints require authentication, encrypted key material, durable BDK changesets, CSRF protection for browser sessions, and an explicit broadcast policy before being exposed beyond localhost.
+The wallet router currently accepts public descriptors only. BDK changesets are committed transactionally to an owner-only SQLite file before a derived address is returned; startup rejects a network or descriptor mismatch so a receive address cannot silently be reused after restart. The daemon still does not mount these routes. Wallet endpoints require authentication, CSRF protection for browser sessions, audit/rate limits, and an explicit transaction/signing/broadcast policy before they are enabled. Private descriptors remain rejected until encrypted secret storage is implemented.

@@ -1,7 +1,7 @@
 //! Embedded REST routes for the explorer and descriptor wallet.
 //!
 //! Bind this router only to loopback by default. Authentication, rate limiting,
-//! TLS termination, and wallet-change persistence belong in the daemon layer.
+//! TLS termination and wallet authorization belong in the daemon layer.
 
 use std::{
     collections::HashMap,
@@ -219,15 +219,15 @@ async fn address_utxos<I: ExplorerIndex>(
 ) -> ApiResult<Vec<ExplorerUtxo>> {
     index.address_utxos(&address).map_err(internal).map(Json)
 }
-async fn wallet_balance(State(wallet): State<Arc<EmbeddedWallet>>) -> Json<WalletBalance> {
-    Json(wallet.balance())
+async fn wallet_balance(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<WalletBalance> {
+    wallet.balance().map_err(internal).map(Json)
 }
-async fn next_address(State(wallet): State<Arc<EmbeddedWallet>>) -> Json<WalletAddress> {
-    Json(wallet.reveal_receive_address())
+async fn next_address(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<WalletAddress> {
+    wallet.reveal_receive_address().map_err(internal).map(Json)
 }
 
 type ApiResult<T> = Result<Json<T>, StatusCode>;
-fn internal(_: String) -> StatusCode {
+fn internal<E>(_: E) -> StatusCode {
     StatusCode::INTERNAL_SERVER_ERROR
 }
 

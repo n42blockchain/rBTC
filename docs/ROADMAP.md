@@ -30,7 +30,8 @@
 - [x] In-memory explorer index implementation for embedded/regtest use.
 - [x] Persistent redb transaction/address/block indexes fed only by validated chain changes, restart-reconciled from the ledger or full-history peers, and correctly rolled back on reorg.
 - [ ] Explorer WebSocket/SSE notifications, pagination, and endpoint limits. The read-only REST routes, loopback-only daemon listener, CSP-constrained embedded static UI, and persistent backing index are implemented.
-- [ ] BDK wallet changeset persistence, encrypted secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast.
+- [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, and explicit rejection of secret descriptors.
+- [ ] Encrypted wallet secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast.
 - [ ] Authenticated local RPC plus optional REST API; wallet API disabled by default and bound only to localhost.
 
 ## Phase 3 — performance and release
