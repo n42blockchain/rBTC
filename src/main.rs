@@ -253,6 +253,45 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::{
+        TxMerkleNode,
+        block::{Header, Version},
+        p2p::{Address, ServiceFlags, message::NetworkMessage, message_network::VersionMessage},
+        pow::Target,
+    };
+    use rbtc::{header_store::RedbHeaderStore, p2p::V1Transport};
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+
+    fn peer_version(nonce: u64) -> VersionMessage {
+        let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let sender: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        VersionMessage::new(
+            ServiceFlags::NONE,
+            0,
+            Address::new(&receiver, ServiceFlags::NONE),
+            Address::new(&sender, ServiceFlags::NONE),
+            nonce,
+            "/rbtcd:test-peer/".to_owned(),
+            1,
+        )
+    }
+
+    fn mine_regtest_child(parent: BlockHash, time: u32) -> Header {
+        let target = Target::MAX_ATTAINABLE_REGTEST;
+        let mut header = Header {
+            version: Version::ONE,
+            prev_blockhash: parent,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: target.to_compact_lossy(),
+            nonce: 0,
+        };
+        while header.validate_pow(target).is_err() {
+            header.nonce = header.nonce.checked_add(1).unwrap();
+        }
+        header
+    }
 
     #[test]
     fn parses_a_header_probe() {
@@ -267,5 +306,61 @@ mod tests {
         assert_eq!(options.network, Network::Regtest);
         assert!(options.fetch_block.is_none());
         assert!(options.headers_db.is_none());
+    }
+
+    #[tokio::test]
+    async fn daemon_validates_and_persists_a_header_sync() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let child = mine_regtest_child(genesis.block_hash(), genesis.time + 1);
+        let child_hash = child.block_hash();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(5)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(request) => {
+                    assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);
+                    peer.write_message(NetworkMessage::Headers(vec![child]))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected first getheaders, got {message:?}"),
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        let header_path = directory.path().join("headers.redb");
+        run(Options {
+            remote,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: Some(header_path.clone()),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let store = RedbHeaderStore::open(header_path).unwrap();
+        assert_eq!(
+            store
+                .load_dag(Network::Regtest, unix_time().unwrap())
+                .unwrap()
+                .active_tip()
+                .hash,
+            child_hash
+        );
     }
 }
