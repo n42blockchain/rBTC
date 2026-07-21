@@ -4,7 +4,7 @@
 //! transition rules, median-time-past, checkpoints, and deployment activation
 //! are intentionally separate contextual validation gates.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr};
 
 use bitcoin::{
     Network,
@@ -74,6 +74,16 @@ pub enum HeaderError {
         expected: u32,
         /// Compact target present in the candidate header.
         actual: u32,
+    },
+    /// A header at a hardened checkpoint height has the wrong hash.
+    #[error("checkpoint mismatch at height {height}: expected {expected}, got {actual}")]
+    CheckpointMismatch {
+        /// Hardened checkpoint height.
+        height: u32,
+        /// Hash pinned by the selected network parameters.
+        expected: BlockHash,
+        /// Candidate header hash.
+        actual: BlockHash,
     },
 }
 
@@ -312,6 +322,19 @@ impl HeaderDag {
             .get(&header.prev_blockhash)
             .copied()
             .ok_or(HeaderError::UnknownParent(header.prev_blockhash))?;
+        let height = parent
+            .height
+            .checked_add(1)
+            .ok_or(HeaderError::HeightOverflow)?;
+        if let Some(expected) = checkpoint_hash(self.params.network, height) {
+            if hash != expected {
+                return Err(HeaderError::CheckpointMismatch {
+                    height,
+                    expected,
+                    actual: hash,
+                });
+            }
+        }
         let target = header.target();
         if target == bitcoin::pow::Target::ZERO || target > self.params.max_attainable_target {
             return Err(HeaderError::InvalidTarget);
@@ -322,10 +345,7 @@ impl HeaderDag {
         let info = HeaderInfo {
             header,
             hash,
-            height: parent
-                .height
-                .checked_add(1)
-                .ok_or(HeaderError::HeightOverflow)?,
+            height,
             chainwork: parent.chainwork + target.to_work(),
         };
         if info.chainwork > self.active_tip().chainwork {
@@ -341,6 +361,55 @@ impl HeaderDag {
         }
         (current.height == height).then_some(current)
     }
+}
+
+fn checkpoint_hash(network: Network, height: u32) -> Option<BlockHash> {
+    let hash = match (network, height) {
+        (Network::Bitcoin, 11_111) => {
+            "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"
+        }
+        (Network::Bitcoin, 33_333) => {
+            "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"
+        }
+        (Network::Bitcoin, 74_000) => {
+            "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"
+        }
+        (Network::Bitcoin, 105_000) => {
+            "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97"
+        }
+        (Network::Bitcoin, 134_444) => {
+            "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe"
+        }
+        (Network::Bitcoin, 168_000) => {
+            "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763"
+        }
+        (Network::Bitcoin, 193_000) => {
+            "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317"
+        }
+        (Network::Bitcoin, 210_000) => {
+            "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e"
+        }
+        (Network::Bitcoin, 216_116) => {
+            "00000000000001b4f4b433e81ee46494af945cf96014816a4e2370f11b23df4e"
+        }
+        (Network::Bitcoin, 225_430) => {
+            "00000000000001c108384350f74090433e7fcf79a606b8e797f065b130575932"
+        }
+        (Network::Bitcoin, 250_000) => {
+            "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"
+        }
+        (Network::Bitcoin, 279_000) => {
+            "0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"
+        }
+        (Network::Bitcoin, 295_000) => {
+            "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983"
+        }
+        (Network::Testnet, 546) => {
+            "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"
+        }
+        _ => return None,
+    };
+    Some(BlockHash::from_str(hash).expect("hard-coded Bitcoin Core checkpoint"))
 }
 
 #[cfg(test)]
@@ -536,5 +605,35 @@ mod tests {
             Err(HeaderError::Duplicate(_))
         ));
         assert_eq!(dag.active_tip().hash, child.block_hash());
+    }
+
+    #[test]
+    fn rejects_a_header_that_conflicts_with_a_core_checkpoint() {
+        let mut dag = HeaderDag::new(Network::Bitcoin);
+        let genesis = dag.active_tip();
+        let parent_header = Header {
+            time: genesis.header.time + 1,
+            ..genesis.header
+        };
+        let parent = HeaderInfo {
+            header: parent_header,
+            hash: parent_header.block_hash(),
+            height: 11_110,
+            chainwork: genesis.chainwork,
+        };
+        dag.headers.insert(parent.hash, parent);
+        let candidate = Header {
+            prev_blockhash: parent.hash,
+            time: parent.header.time + 1,
+            ..parent.header
+        };
+        assert!(matches!(
+            dag.insert(candidate),
+            Err(HeaderError::CheckpointMismatch { height: 11_111, .. })
+        ));
+        assert_eq!(
+            checkpoint_hash(Network::Testnet, 546).unwrap().to_string(),
+            "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"
+        );
     }
 }
