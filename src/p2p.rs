@@ -16,6 +16,7 @@ use bitcoin::{
     },
 };
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,8 @@ const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
 /// Maximum headers permitted in one protocol `headers` response.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
+/// Maximum block bodies requested concurrently from one peer.
+pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
 const PROTOCOL_VERSION: u32 = 70_016;
 const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
 
@@ -109,6 +112,18 @@ pub enum P2pError {
         /// Services announced by the peer.
         offered: ServiceFlags,
     },
+    /// A caller attempted to exceed the per-peer in-flight block bound.
+    #[error("requested {count} blocks at once; limit is {MAX_BLOCKS_IN_FLIGHT}")]
+    TooManyBlockRequests {
+        /// Requested inventory count.
+        count: usize,
+    },
+    /// A batch contains the same requested hash more than once.
+    #[error("duplicate requested block {0}")]
+    DuplicateBlockRequest(BlockHash),
+    /// A peer sent a block outside the outstanding batch.
+    #[error("peer sent unsolicited block {0}")]
+    UnsolicitedBlock(BlockHash),
 }
 
 /// An established Bitcoin peer session.
@@ -334,6 +349,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
 
     /// Requests witness-serialized blocks through standard `getdata` entries.
     pub async fn request_witness_blocks(&mut self, hashes: &[BlockHash]) -> Result<(), P2pError> {
+        if hashes.len() > MAX_BLOCKS_IN_FLIGHT {
+            return Err(P2pError::TooManyBlockRequests {
+                count: hashes.len(),
+            });
+        }
         let inventory = hashes
             .iter()
             .copied()
@@ -353,27 +373,72 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         &mut self,
         expected: BlockHash,
     ) -> Result<bitcoin::Block, P2pError> {
-        for _ in 0..MAX_RESPONSE_MESSAGES {
+        self.receive_requested_blocks(&[expected])
+            .await?
+            .pop()
+            .ok_or(P2pError::BlockResponseIncomplete {
+                requested: expected,
+            })
+    }
+
+    /// Receives a bounded block batch and restores the caller's requested order.
+    ///
+    /// Peers may respond out of order, but may not inject or duplicate block
+    /// payloads. The returned vector aligns exactly with `expected`.
+    pub async fn receive_requested_blocks(
+        &mut self,
+        expected: &[BlockHash],
+    ) -> Result<Vec<bitcoin::Block>, P2pError> {
+        if expected.len() > MAX_BLOCKS_IN_FLIGHT {
+            return Err(P2pError::TooManyBlockRequests {
+                count: expected.len(),
+            });
+        }
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut positions = HashMap::with_capacity(expected.len());
+        for (position, hash) in expected.iter().copied().enumerate() {
+            if positions.insert(hash, position).is_some() {
+                return Err(P2pError::DuplicateBlockRequest(hash));
+            }
+        }
+        let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
+        for _ in 0..MAX_RESPONSE_MESSAGES.saturating_add(expected.len()) {
             match self.read_message().await? {
                 NetworkMessage::Block(block) => {
                     let actual = block.block_hash();
-                    if actual == expected {
-                        return Ok(block);
+                    let Some(position) = positions.remove(&actual) else {
+                        return Err(P2pError::UnsolicitedBlock(actual));
+                    };
+                    blocks[position] = Some(block);
+                    if positions.is_empty() {
+                        return Ok(blocks
+                            .into_iter()
+                            .map(|block| block.expect("every requested position was filled"))
+                            .collect());
                     }
-                    return Err(P2pError::UnexpectedBlock { expected, actual });
                 }
-                NetworkMessage::NotFound(inventory)
-                    if inventory.iter().any(|entry| {
-                        matches!(entry, Inventory::Block(hash) | Inventory::WitnessBlock(hash) if *hash == expected)
-                    }) =>
-                {
-                    return Err(P2pError::BlockNotFound(expected));
+                NetworkMessage::NotFound(inventory) => {
+                    if let Some(hash) = inventory.iter().find_map(|entry| match entry {
+                        Inventory::Block(hash) | Inventory::WitnessBlock(hash)
+                            if positions.contains_key(hash) =>
+                        {
+                            Some(*hash)
+                        }
+                        _ => None,
+                    }) {
+                        return Err(P2pError::BlockNotFound(hash));
+                    }
                 }
                 _ => {}
             }
         }
         Err(P2pError::BlockResponseIncomplete {
-            requested: expected,
+            requested: *positions
+                .keys()
+                .next()
+                .expect("non-empty batch remains incomplete"),
         })
     }
 }
@@ -538,6 +603,41 @@ mod tests {
             remote_version: remote,
         };
         session.ensure_full_witness_block_relay().unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_batch_restores_request_order_from_out_of_order_peer() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let first = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let second = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
+        let expected = [first.block_hash(), second.block_hash()];
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.request_witness_blocks(&expected).await.unwrap();
+            session.receive_requested_blocks(&expected).await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory) if inventory.len() == 2
+            ));
+            transport
+                .write_message(NetworkMessage::Block(second))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Block(first))
+                .await
+                .unwrap();
+        });
+        let blocks = client.await.unwrap();
+        assert_eq!(blocks[0].block_hash(), expected[0]);
+        assert_eq!(blocks[1].block_hash(), expected[1]);
+        server.await.unwrap();
     }
 
     #[tokio::test]

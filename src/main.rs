@@ -16,7 +16,7 @@ use rbtc::{
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
-    p2p::{MAX_HEADERS_PER_RESPONSE, connect_outbound},
+    p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
     undo_store::RedbUndoStore,
     utxo::{DEFAULT_HOT_WINDOW_SECS, RedbUtxoStore},
 };
@@ -228,46 +228,82 @@ async fn sync_regtest_node(
             println!("block execution caught up at height {}", tip.height);
             return Ok(());
         }
-        let next_height = tip
-            .height
-            .checked_add(1)
-            .ok_or_else(|| "execution height overflow".to_owned())?;
-        let expected = headers
-            .active_header_at(next_height)
-            .ok_or_else(|| format!("missing active header at height {next_height}"))?;
-        timeout(
-            PEER_TIMEOUT,
-            session.request_witness_blocks(&[expected.hash]),
-        )
-        .await
-        .map_err(|_| format!("getdata timed out for block {}", expected.hash))?
-        .map_err(|error| error.to_string())?;
-        let block = timeout(PEER_TIMEOUT, session.receive_requested_block(expected.hash))
-            .await
-            .map_err(|_| format!("block response timed out for {}", expected.hash))?
-            .map_err(|error| error.to_string())?;
-        connect_active_block(
+        download_execute_batch(
+            session,
+            network,
+            &headers,
             &chainstate,
             &undo_store,
             &execution_store,
-            &headers,
+        )
+        .await?;
+    }
+}
+
+async fn download_execute_batch(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    network: Network,
+    headers: &HeaderDag,
+    chainstate: &RedbUtxoStore,
+    undo_store: &RedbUndoStore,
+    execution_store: &RedbExecutionStore,
+) -> Result<(), String> {
+    let tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let next_height = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| "execution height overflow".to_owned())?;
+    let remaining = headers.active_tip().height - tip.height;
+    let batch_len = usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(MAX_BLOCKS_IN_FLIGHT);
+    let expected = (0..batch_len)
+        .map(|offset| {
+            let offset = u32::try_from(offset).expect("block batch fits u32");
+            let height = next_height
+                .checked_add(offset)
+                .ok_or_else(|| "execution height overflow".to_owned())?;
+            headers
+                .active_header_at(height)
+                .ok_or_else(|| format!("missing active header at height {height}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let hashes = expected
+        .iter()
+        .map(|header| header.hash)
+        .collect::<Vec<_>>();
+    timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+        .await
+        .map_err(|_| format!("getdata timed out for {batch_len} blocks"))?
+        .map_err(|error| error.to_string())?;
+    let blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
+        .await
+        .map_err(|_| format!("block batch response timed out for {batch_len} blocks"))?
+        .map_err(|error| error.to_string())?;
+    for (expected, block) in expected.into_iter().zip(blocks) {
+        connect_active_block(
+            chainstate,
+            undo_store,
+            execution_store,
+            headers,
             &block,
             u64::from(unix_time()?),
             DEFAULT_HOT_WINDOW_SECS,
             block_deployment_context(
                 network,
-                next_height,
+                expected.height,
                 expected.hash,
                 block.header.time,
-                taproot_active(&headers, next_height),
+                taproot_active(headers, expected.height),
             ),
         )
         .map_err(|error| error.to_string())?;
         println!(
-            "validated and executed block {next_height}:{}",
-            expected.hash
+            "validated and executed block {}:{}",
+            expected.height, expected.hash
         );
     }
+    Ok(())
 }
 
 async fn request_headers(
