@@ -1,6 +1,6 @@
 //! Transaction-to-UTXO application with consensus-critical accounting checks.
 
-use bitcoin::Transaction;
+use bitcoin::{Sequence, Transaction};
 use thiserror::Error;
 
 use crate::{
@@ -12,6 +12,8 @@ use crate::{
 pub const COINBASE_MATURITY: u32 = 100;
 /// Total bitcoin supply cap in satoshis.
 pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
+const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_FFFF;
+const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
 /// A successful transaction application and its reorg data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +63,30 @@ pub enum ChainstateError {
     /// An output or aggregate transaction value exceeds Bitcoin's money range.
     #[error("transaction value exceeds MAX_MONEY")]
     MoneyRange,
+    /// A transaction's absolute lock time is not yet final for this block.
+    #[error("transaction lock time {lock_time} is not final at {context}")]
+    NonFinalLockTime {
+        /// Transaction lock-time value in consensus units.
+        lock_time: u32,
+        /// Candidate block height or MTP used for the comparison.
+        context: u32,
+    },
+    /// An input's BIP68 height-based relative lock is not yet satisfied.
+    #[error("input {outpoint} requires block height above {minimum_height}")]
+    RelativeHeightLock {
+        /// Spent output subject to the lock.
+        outpoint: OutPointKey,
+        /// The candidate height must be strictly above this value.
+        minimum_height: u32,
+    },
+    /// An input's BIP68 time-based relative lock is not yet satisfied.
+    #[error("input {outpoint} requires median time past above {minimum_mtp}")]
+    RelativeTimeLock {
+        /// Spent output subject to the lock.
+        outpoint: OutPointKey,
+        /// The candidate parent MTP must be strictly above this value.
+        minimum_mtp: u32,
+    },
 }
 
 /// Applies one transaction to a UTXO store after accounting and script checks.
@@ -68,6 +94,8 @@ pub enum ChainstateError {
 /// `script_flags` must reflect the candidate block's active BIP deployments.
 /// Coinbase subsidy and the one-coinbase-per-block rule are enforced by the
 /// block-level validator, which also supplies the correct height and flags.
+/// `lock_time_context` is the candidate header time before BIP113 activation,
+/// or its parent MTP after activation.
 ///
 /// # Errors
 ///
@@ -79,8 +107,53 @@ pub fn apply_transaction<S: UtxoStore>(
     height: u32,
     now: u64,
     creation_mtp: u32,
+    lock_time_context: u32,
     script_flags: u32,
 ) -> Result<AppliedTransaction, ChainstateError> {
+    apply_transaction_with_context(
+        store,
+        transaction,
+        height,
+        now,
+        creation_mtp,
+        lock_time_context,
+        script_flags,
+        false,
+    )
+}
+
+/// Applies a transaction with deployment-aware absolute and relative lock-time context.
+///
+/// When `csv_active` is set, BIP68 relative locks are enforced for version-2+
+/// transactions and `lock_time_context` must be the candidate block parent's
+/// MTP, as required by BIP113. Before activation it must be the candidate
+/// block header time. `creation_mtp` is saved on newly created outputs.
+///
+/// # Errors
+///
+/// Returns the same errors as [`apply_transaction`], plus non-final absolute
+/// and relative lock-time violations when the deployment is active.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_transaction_with_context<S: UtxoStore>(
+    store: &S,
+    transaction: &Transaction,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    lock_time_context: u32,
+    script_flags: u32,
+    csv_active: bool,
+) -> Result<AppliedTransaction, ChainstateError> {
+    if !transaction_is_final(transaction, height, lock_time_context) {
+        return Err(ChainstateError::NonFinalLockTime {
+            lock_time: transaction.lock_time.to_consensus_u32(),
+            context: if transaction.lock_time.is_block_height() {
+                height
+            } else {
+                lock_time_context
+            },
+        });
+    }
     let txid = transaction.compute_txid();
     let output_value = transaction.output.iter().try_fold(0_u64, |sum, output| {
         if output.value.to_sat() > MAX_MONEY_SATS {
@@ -131,6 +204,9 @@ pub fn apply_transaction<S: UtxoStore>(
                 });
             }
         }
+        if csv_active && transaction.version.0 >= 2 {
+            check_sequence_lock(input.sequence, outpoint, &utxo, height, creation_mtp)?;
+        }
         input_value = input_value
             .checked_add(utxo.value_sats)
             .ok_or(ChainstateError::ValueOverflow)?;
@@ -151,6 +227,55 @@ pub fn apply_transaction<S: UtxoStore>(
         output_value_sats: output_value,
         undo: store.apply_with_undo(&spent, &created)?,
     })
+}
+
+fn transaction_is_final(transaction: &Transaction, height: u32, lock_time_context: u32) -> bool {
+    let lock_time = transaction.lock_time.to_consensus_u32();
+    let comparison = if transaction.lock_time.is_block_height() {
+        height
+    } else {
+        lock_time_context
+    };
+    lock_time < comparison
+        || transaction
+            .input
+            .iter()
+            .all(|input| input.sequence == Sequence::MAX)
+}
+
+fn check_sequence_lock(
+    sequence: Sequence,
+    outpoint: OutPointKey,
+    utxo: &Utxo,
+    height: u32,
+    parent_mtp: u32,
+) -> Result<(), ChainstateError> {
+    if !sequence.is_relative_lock_time() {
+        return Ok(());
+    }
+    let relative = sequence.to_consensus_u32() & SEQUENCE_LOCKTIME_MASK;
+    if sequence.is_height_locked() {
+        let minimum_height = utxo.height.saturating_add(relative).saturating_sub(1);
+        if height <= minimum_height {
+            return Err(ChainstateError::RelativeHeightLock {
+                outpoint,
+                minimum_height,
+            });
+        }
+    } else {
+        let relative_seconds = relative << SEQUENCE_LOCKTIME_GRANULARITY;
+        let minimum_mtp = utxo
+            .creation_mtp
+            .saturating_add(relative_seconds)
+            .saturating_sub(1);
+        if parent_mtp <= minimum_mtp {
+            return Err(ChainstateError::RelativeTimeLock {
+                outpoint,
+                minimum_mtp,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn created_outputs(
@@ -185,13 +310,13 @@ fn created_outputs(
 #[cfg(test)]
 mod tests {
     use bitcoin::{
-        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute::LockTime, transaction::Version,
+        Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        absolute::LockTime, hashes::Hash, transaction::Version,
     };
     use tempfile::TempDir;
 
     use super::*;
-    use crate::utxo::RedbUtxoStore;
+    use crate::utxo::{RedbUtxoStore, Utxo};
 
     fn store() -> (TempDir, RedbUtxoStore) {
         let dir = TempDir::new().unwrap();
@@ -216,11 +341,47 @@ mod tests {
         }
     }
 
+    fn spend(outpoint: OutPoint, sequence: Sequence, lock_time: LockTime) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn insert_unspent(store: &RedbUtxoStore, outpoint: OutPoint, height: u32, mtp: u32) {
+        store
+            .apply(
+                &[],
+                &[(
+                    (outpoint).into(),
+                    Utxo {
+                        value_sats: 1,
+                        height,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: mtp,
+                        script_pubkey: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn coinbase_creates_immature_utxo_and_returns_undo() {
         let (_dir, store) = store();
         let transaction = coinbase(vec![1, 2]);
-        let applied = apply_transaction(&store, &transaction, 10, 100, 99, 0).unwrap();
+        let applied = apply_transaction(&store, &transaction, 10, 100, 99, 100, 0).unwrap();
         let key = OutPointKey::from(OutPoint::new(transaction.compute_txid(), 0));
         assert!(store.get(key).unwrap().unwrap().is_coinbase);
         assert_eq!(applied.undo.created(), &[key]);
@@ -232,7 +393,7 @@ mod tests {
     fn coinbase_script_size_is_checked() {
         let (_dir, store) = store();
         assert!(matches!(
-            apply_transaction(&store, &coinbase(vec![1]), 10, 100, 99, 0),
+            apply_transaction(&store, &coinbase(vec![1]), 10, 100, 99, 100, 0),
             Err(ChainstateError::CoinbaseScriptSize)
         ));
     }
@@ -250,14 +411,55 @@ mod tests {
             }],
         };
         assert!(matches!(
-            apply_transaction(&store, &no_inputs, 10, 100, 99, 0),
+            apply_transaction(&store, &no_inputs, 10, 100, 99, 100, 0),
             Err(ChainstateError::NoInputs)
         ));
         let mut no_outputs = coinbase(vec![1, 2]);
         no_outputs.output.clear();
         assert!(matches!(
-            apply_transaction(&store, &no_outputs, 10, 100, 99, 0),
+            apply_transaction(&store, &no_outputs, 10, 100, 99, 100, 0),
             Err(ChainstateError::NoOutputs)
         ));
+    }
+
+    #[test]
+    fn bip68_rejects_unsatisfied_height_and_time_locks() {
+        let (_dir, store) = store();
+        let height_outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        insert_unspent(&store, height_outpoint, 100, 1_000);
+        let height_locked = spend(height_outpoint, Sequence::from_height(6), LockTime::ZERO);
+        assert!(matches!(
+            apply_transaction_with_context(&store, &height_locked, 105, 0, 2_000, 2_000, 0, true),
+            Err(ChainstateError::RelativeHeightLock {
+                minimum_height: 105,
+                ..
+            })
+        ));
+
+        let time_outpoint = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        insert_unspent(&store, time_outpoint, 100, 1_000);
+        let time_locked = spend(
+            time_outpoint,
+            Sequence::from_512_second_intervals(2),
+            LockTime::ZERO,
+        );
+        assert!(matches!(
+            apply_transaction_with_context(&store, &time_locked, 200, 0, 2_023, 2_023, 0, true),
+            Err(ChainstateError::RelativeTimeLock {
+                minimum_mtp: 2_023,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bip113_uses_strict_parent_mtp_for_absolute_time_locks() {
+        let transaction = spend(
+            OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            Sequence::ZERO,
+            LockTime::from_consensus(500_000_000),
+        );
+        assert!(!transaction_is_final(&transaction, 1, 500_000_000));
+        assert!(transaction_is_final(&transaction, 1, 500_000_001));
     }
 }

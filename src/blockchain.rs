@@ -4,7 +4,7 @@ use bitcoin::Block;
 use thiserror::Error;
 
 use crate::{
-    chainstate::{AppliedTransaction, ChainstateError, apply_transaction},
+    chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_context},
     utxo::{UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -122,7 +122,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
     script_flags: u32,
     bip34_active: bool,
 ) -> Result<AppliedBlock, BlockError> {
-    apply_block_with_context(
+    apply_block_with_deployments(
         store,
         block,
         height,
@@ -131,6 +131,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
         hot_window_secs,
         script_flags,
         bip34_active,
+        false,
     )
 }
 
@@ -148,6 +149,36 @@ pub fn apply_block_with_context<S: UtxoStore>(
     hot_window_secs: u64,
     script_flags: u32,
     bip34_active: bool,
+) -> Result<AppliedBlock, BlockError> {
+    apply_block_with_deployments(
+        store,
+        block,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        bip34_active,
+        false,
+    )
+}
+
+/// Validates and applies a block with deployment-aware BIP34 and CSV activation.
+///
+/// `csv_active` enables the BIP68 relative sequence locks and changes absolute
+/// lock-time evaluation to BIP113 parent-MTP semantics. Before activation,
+/// absolute lock-time is compared with the candidate header timestamp.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_with_deployments<S: UtxoStore>(
+    store: &S,
+    block: &Block,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    bip34_active: bool,
+    csv_active: bool,
 ) -> Result<AppliedBlock, BlockError> {
     if block.txdata.is_empty() {
         return Err(BlockError::Empty);
@@ -176,8 +207,22 @@ pub fn apply_block_with_context<S: UtxoStore>(
     }
 
     let mut applied = Vec::with_capacity(block.txdata.len());
+    let lock_time_context = if csv_active {
+        creation_mtp
+    } else {
+        block.header.time
+    };
     for (index, transaction) in block.txdata.iter().enumerate() {
-        match apply_transaction(store, transaction, height, now, creation_mtp, script_flags) {
+        match apply_transaction_with_context(
+            store,
+            transaction,
+            height,
+            now,
+            creation_mtp,
+            lock_time_context,
+            script_flags,
+            csv_active,
+        ) {
             Ok(transaction) => applied.push(transaction),
             Err(source) => {
                 rollback(store, &applied, now, hot_window_secs)?;
@@ -274,12 +319,13 @@ fn rollback<S: UtxoStore>(
 mod tests {
     use bitcoin::{
         Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute::LockTime, blockdata::constants::genesis_block, transaction::Version,
+        absolute::LockTime, blockdata::constants::genesis_block, hashes::Hash,
+        transaction::Version,
     };
     use tempfile::TempDir;
 
     use super::*;
-    use crate::utxo::{OutPointKey, RedbUtxoStore};
+    use crate::utxo::{OutPointKey, RedbUtxoStore, Utxo};
 
     fn store() -> (TempDir, RedbUtxoStore) {
         let dir = TempDir::new().unwrap();
@@ -311,6 +357,25 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         block
+    }
+
+    fn insert_spendable_output(store: &RedbUtxoStore, outpoint: OutPoint) {
+        store
+            .apply(
+                &[],
+                &[(
+                    (outpoint).into(),
+                    Utxo {
+                        value_sats: 1,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51],
+                    },
+                )],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -356,6 +421,62 @@ mod tests {
         assert!(matches!(
             apply_block(&store, &block, 0, 100, 0, 60, 0),
             Err(BlockError::WitnessCommitment)
+        ));
+    }
+
+    #[test]
+    fn bip113_switches_absolute_time_locks_to_parent_mtp() {
+        let previous_output = OutPoint::new(bitcoin::Txid::from_byte_array([9; 32]), 0);
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_consensus(500_000_000),
+            input: vec![TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ZERO,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut candidate = block(vec![coinbase(), spend]);
+        candidate.header.time = 500_000_001;
+
+        let (_dir, pre_csv_store) = store();
+        insert_spendable_output(&pre_csv_store, previous_output);
+        apply_block_with_deployments(
+            &pre_csv_store,
+            &candidate,
+            101,
+            0,
+            500_000_000,
+            60,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let (_dir, csv_store) = store();
+        insert_spendable_output(&csv_store, previous_output);
+        assert!(matches!(
+            apply_block_with_deployments(
+                &csv_store,
+                &candidate,
+                101,
+                0,
+                500_000_000,
+                60,
+                0,
+                false,
+                true,
+            ),
+            Err(BlockError::Transaction {
+                index: 1,
+                source: ChainstateError::NonFinalLockTime { .. },
+            })
         ));
     }
 
