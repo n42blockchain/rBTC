@@ -4,7 +4,8 @@
 //! block segment is pruning, not an undo of validated chainstate.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -12,7 +13,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::archive::{ArchiveError, ArchiveManifest, write_archive};
+use crate::archive::{ArchiveError, ArchiveManifest, read_archive_manifest, write_archive};
 
 const INDEX_FILE: &str = "ledger-index.json";
 
@@ -59,7 +60,7 @@ pub enum LedgerError {
     Invalid(&'static str),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Segment {
     first_height: u32,
     block_count: u32,
@@ -67,7 +68,7 @@ struct Segment {
     bytes: u64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct LedgerIndex {
     next_slot: u16,
     segments: Vec<Segment>,
@@ -89,11 +90,13 @@ impl PrunedBlockLedger {
             ));
         }
         fs::create_dir_all(root.as_ref())?;
-        Ok(Self {
+        let ledger = Self {
             root: root.as_ref().to_path_buf(),
             retention,
             write_guard: Mutex::new(()),
-        })
+        };
+        ledger.recover_index()?;
+        Ok(ledger)
     }
 
     /// Appends a contiguous segment, then rotates old slots until both bounds hold.
@@ -182,10 +185,131 @@ impl PrunedBlockLedger {
     }
     fn write_index(&self, index: &LedgerIndex) -> Result<(), LedgerError> {
         let temporary = self.root.join("ledger-index.json.new");
-        fs::write(&temporary, serde_json::to_vec(index)?)?;
-        fs::rename(temporary, self.index_path())?;
+        let mut file = File::create(&temporary)?;
+        file.write_all(&serde_json::to_vec(index)?)?;
+        file.sync_all()?;
+        fs::rename(&temporary, self.index_path())?;
+        File::open(&self.root)?.sync_all()?;
         Ok(())
     }
+
+    fn recover_index(&self) -> Result<(), LedgerError> {
+        let scanned = self.scan_segments();
+        let persisted = fs::read(self.index_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LedgerIndex>(&bytes).ok())
+            .filter(|index| valid_index(index, &scanned, self.retention.slots));
+        let mut segments = if let Some(index) = persisted.filter(|index| !index.segments.is_empty())
+        {
+            let mut segments = index.segments;
+            while let Some(expected) = segments
+                .last()
+                .and_then(|last| last.first_height.checked_add(last.block_count))
+            {
+                let Some(next) = scanned.iter().find(|segment| {
+                    segment.first_height == expected
+                        && !segments.iter().any(|live| live.slot == segment.slot)
+                }) else {
+                    break;
+                };
+                segments.push(next.clone());
+            }
+            segments
+        } else {
+            best_contiguous_chain(&scanned)
+        };
+        while exceeds(&segments, self.retention) {
+            segments.remove(0);
+        }
+        let next_slot = segments
+            .last()
+            .map_or(0, |segment| (segment.slot + 1) % self.retention.slots);
+        self.write_index(&LedgerIndex {
+            next_slot,
+            segments,
+        })
+    }
+
+    fn scan_segments(&self) -> Vec<Segment> {
+        let mut segments = Vec::new();
+        for slot in 0..self.retention.slots {
+            let path = self.slot_path(slot);
+            let Ok(manifest) = read_archive_manifest(&path) else {
+                continue;
+            };
+            let Ok(metadata) = fs::metadata(path) else {
+                continue;
+            };
+            if manifest.block_count == 0 || metadata.len() > self.retention.max_bytes {
+                continue;
+            }
+            segments.push(Segment {
+                first_height: manifest.first_height,
+                block_count: manifest.block_count,
+                slot,
+                bytes: metadata.len(),
+            });
+        }
+        segments.sort_by_key(|segment| (segment.first_height, segment.slot));
+        segments
+    }
+}
+
+fn valid_index(index: &LedgerIndex, scanned: &[Segment], slots: u16) -> bool {
+    if index.next_slot >= slots {
+        return false;
+    }
+    let mut expected = None;
+    let mut used_slots = std::collections::BTreeSet::new();
+    for segment in &index.segments {
+        if segment.slot >= slots
+            || !used_slots.insert(segment.slot)
+            || !scanned.contains(segment)
+            || expected.is_some_and(|height| height != segment.first_height)
+        {
+            return false;
+        }
+        expected = segment.first_height.checked_add(segment.block_count);
+        if expected.is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+fn best_contiguous_chain(scanned: &[Segment]) -> Vec<Segment> {
+    let mut best = Vec::new();
+    for first in 0..scanned.len() {
+        let mut chain = vec![scanned[first].clone()];
+        let mut used_slots = std::collections::BTreeSet::from([scanned[first].slot]);
+        loop {
+            let Some(expected) = chain
+                .last()
+                .and_then(|segment| segment.first_height.checked_add(segment.block_count))
+            else {
+                break;
+            };
+            let Some(next) = scanned.iter().find(|segment| {
+                segment.first_height == expected && !used_slots.contains(&segment.slot)
+            }) else {
+                break;
+            };
+            used_slots.insert(next.slot);
+            chain.push(next.clone());
+        }
+        let chain_end = chain
+            .last()
+            .and_then(|segment| segment.first_height.checked_add(segment.block_count))
+            .unwrap_or(0);
+        let best_end = best
+            .last()
+            .and_then(|segment: &Segment| segment.first_height.checked_add(segment.block_count))
+            .unwrap_or(0);
+        if (chain_end, chain.len()) > (best_end, best.len()) {
+            best = chain;
+        }
+    }
+    best
 }
 
 fn exceeds(segments: &[Segment], retention: LedgerRetention) -> bool {
@@ -233,5 +357,34 @@ mod tests {
             ledger.append(12, &[vec![12]]),
             Err(LedgerError::Invalid("segment is not contiguous"))
         ));
+    }
+
+    #[test]
+    fn rebuilds_missing_index_and_adopts_a_renamed_orphan_segment() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        write_archive(ledger.slot_path(0), 10, &[vec![10]]).unwrap();
+        drop(ledger);
+
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 10)]);
+        write_archive(ledger.slot_path(1), 11, &[vec![11]]).unwrap();
+        drop(ledger);
+
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 10), (11, 11)]);
+        fs::write(ledger.index_path(), b"not json").unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(
+            recovered.retained_ranges().unwrap(),
+            vec![(10, 10), (11, 11)]
+        );
     }
 }

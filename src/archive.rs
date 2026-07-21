@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const MAGIC: &[u8; 8] = b"RBTCBLK1";
 const PIECE_SIZE: usize = 4 * 1024 * 1024;
+const MAX_MANIFEST_SIZE: usize = 16 * 1024 * 1024;
 
 /// Archive read/write failure.
 #[derive(Debug, Error)]
@@ -132,6 +133,33 @@ pub fn read_archive(
     Ok((manifest, blocks))
 }
 
+/// Reads only the bounded archive manifest without decompressing block data.
+///
+/// This is used to reconstruct a rotating ledger index after interruption;
+/// full piece and record verification still occurs when block bytes are read.
+pub fn read_archive_manifest(path: impl AsRef<Path>) -> Result<ArchiveManifest, ArchiveError> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header)?;
+    if &header[..8] != MAGIC {
+        return Err(ArchiveError::Invalid("magic"));
+    }
+    let metadata_len = usize::try_from(u32::from_le_bytes(
+        header[8..12].try_into().expect("fixed manifest header"),
+    ))
+    .expect("u32 fits usize");
+    if metadata_len > MAX_MANIFEST_SIZE {
+        return Err(ArchiveError::Invalid("manifest too large"));
+    }
+    let mut metadata = vec![0_u8; metadata_len];
+    file.read_exact(&mut metadata)?;
+    let manifest: ArchiveManifest = serde_json::from_slice(&metadata)?;
+    if manifest.format_version != 1 || manifest.piece_size != PIECE_SIZE {
+        return Err(ArchiveError::Invalid("manifest version"));
+    }
+    Ok(manifest)
+}
+
 fn hash_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -148,6 +176,7 @@ mod tests {
         let blocks = vec![vec![1, 2, 3], vec![4; 300]];
         let manifest = write_archive(&file, 100, &blocks).unwrap();
         assert_eq!(manifest.block_count, 2);
+        assert_eq!(read_archive_manifest(&file).unwrap(), manifest);
         assert_eq!(read_archive(&file).unwrap().1, blocks);
         let mut bytes = fs::read(&file).unwrap();
         *bytes.last_mut().unwrap() ^= 1;
