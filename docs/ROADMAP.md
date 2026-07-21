@@ -16,7 +16,7 @@
 - [x] Transaction-level UTXO transition with script hooks, amount accounting, and coinbase maturity checks.
 - [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks and rollback.
 - [ ] Contextual header validation: checkpoints; connect header reorg selection to persisted block/UTXO undo journals.
-- [ ] Complete block/contextual validation: BIP34/30/68/113/141/143/147/341/342, coinbase maturity, subsidy, sigops, weight, deployment activation, and all standardness rules kept distinct from consensus.
+- [ ] Complete block/contextual validation: BIP34/30/68/113/141/143/147/341/342 (BIP141 witness commitment now checked), coinbase maturity, subsidy, sigops, weight, deployment activation, and all standardness rules kept distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
 - [ ] P2P peer manager, handshake, addrman, compact blocks, headers-first IBD, additional DoS limits, peer eviction, block relay, and transaction relay.

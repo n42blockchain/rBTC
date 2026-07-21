@@ -37,6 +37,9 @@ pub enum BlockError {
     /// Header's Merkle root does not commit to the supplied transactions.
     #[error("block merkle root mismatch")]
     MerkleRoot,
+    /// A SegWit witness commitment is missing or does not match the transaction data.
+    #[error("block witness commitment mismatch")]
+    WitnessCommitment,
     /// Block weight is over the consensus limit.
     #[error("block weight {weight} exceeds limit {MAX_BLOCK_WEIGHT}")]
     Weight {
@@ -99,6 +102,9 @@ pub fn apply_block<S: UtxoStore>(
     }
     if !block.check_merkle_root() {
         return Err(BlockError::MerkleRoot);
+    }
+    if !block.check_witness_commitment() {
+        return Err(BlockError::WitnessCommitment);
     }
     let weight = block.weight().to_wu();
     if weight > MAX_BLOCK_WEIGHT {
@@ -251,5 +257,17 @@ mod tests {
         ));
         let output = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 0));
         assert!(store.get(output).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_witness_data_without_a_witness_commitment() {
+        let (_dir, store) = store();
+        let mut transaction = coinbase();
+        transaction.input[0].witness = Witness::from_slice(&[b"reserved".as_slice()]);
+        let block = block(vec![transaction]);
+        assert!(matches!(
+            apply_block(&store, &block, 0, 100, 60, 0),
+            Err(BlockError::WitnessCommitment)
+        ));
     }
 }
