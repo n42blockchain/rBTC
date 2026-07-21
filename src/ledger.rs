@@ -160,13 +160,49 @@ impl PrunedBlockLedger {
             .segments
             .into_iter()
             .map(|segment| {
-                let end = segment
-                    .first_height
-                    .checked_add(segment.block_count - 1)
-                    .ok_or(LedgerError::Invalid("height overflow"))?;
+                let end = segment_end_inclusive(&segment)?;
                 Ok((segment.first_height, end))
             })
             .collect()
+    }
+
+    /// Returns the newest locally retained block height, if any.
+    pub fn retained_tip(&self) -> Result<Option<u32>, LedgerError> {
+        let _guard = self.lock();
+        self.read_index()?
+            .segments
+            .last()
+            .map(segment_end_inclusive)
+            .transpose()
+    }
+
+    /// Reads one consensus-serialized block by height when it is retained.
+    ///
+    /// The complete containing archive is checksum-verified before the block
+    /// is returned. A pruned or not-yet-appended height returns `None`.
+    pub fn read_block(&self, height: u32) -> Result<Option<Vec<u8>>, LedgerError> {
+        let _guard = self.lock();
+        let index = self.read_index()?;
+        let Some(segment) = index
+            .segments
+            .iter()
+            .find(|segment| segment_contains(segment, height))
+        else {
+            return Ok(None);
+        };
+        let (manifest, blocks) = read_archive(self.slot_path(segment.slot))?;
+        if manifest.first_height != segment.first_height
+            || manifest.block_count != segment.block_count
+        {
+            return Err(LedgerError::Invalid("archive does not match ledger index"));
+        }
+        let offset = usize::try_from(height - segment.first_height)
+            .expect("archive block offset fits usize");
+        blocks
+            .get(offset)
+            .cloned()
+            .map(Some)
+            .ok_or(LedgerError::Invalid("archive block missing"))
     }
 
     /// Removes every retained block at or above `first_removed_height`.
@@ -364,6 +400,25 @@ fn valid_index(index: &LedgerIndex, scanned: &[Segment], slots: u16) -> bool {
     true
 }
 
+fn segment_end_inclusive(segment: &Segment) -> Result<u32, LedgerError> {
+    let offset = segment
+        .block_count
+        .checked_sub(1)
+        .ok_or(LedgerError::Invalid("empty segment"))?;
+    segment
+        .first_height
+        .checked_add(offset)
+        .ok_or(LedgerError::Invalid("height overflow"))
+}
+
+fn segment_contains(segment: &Segment, height: u32) -> bool {
+    height >= segment.first_height
+        && segment
+            .first_height
+            .checked_add(segment.block_count)
+            .is_some_and(|end| height < end)
+}
+
 fn best_contiguous_chain(scanned: &[Segment]) -> Vec<Segment> {
     let mut best = Vec::new();
     for first in 0..scanned.len() {
@@ -524,5 +579,23 @@ mod tests {
 
         assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
         assert!(!recovered.truncate_path().exists());
+    }
+
+    #[test]
+    fn reads_retained_blocks_by_height_and_reports_the_tip() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert_eq!(ledger.retained_tip().unwrap(), None);
+        assert_eq!(ledger.read_block(10).unwrap(), None);
+
+        ledger.append(10, &[vec![10], vec![11]]).unwrap();
+        ledger.append(12, &[vec![12]]).unwrap();
+
+        assert_eq!(ledger.retained_tip().unwrap(), Some(12));
+        assert_eq!(ledger.read_block(9).unwrap(), None);
+        assert_eq!(ledger.read_block(10).unwrap(), Some(vec![10]));
+        assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
+        assert_eq!(ledger.read_block(12).unwrap(), Some(vec![12]));
+        assert_eq!(ledger.read_block(13).unwrap(), None);
     }
 }
