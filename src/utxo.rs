@@ -110,7 +110,7 @@ pub struct Utxo {
 }
 
 impl Utxo {
-    fn encode(&self) -> Result<Vec<u8>, UtxoError> {
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, UtxoError> {
         let script_len = u32::try_from(self.script_pubkey.len())
             .map_err(|_| UtxoError::Malformed("script exceeds u32"))?;
         let mut bytes = Vec::with_capacity(29 + self.script_pubkey.len());
@@ -124,7 +124,7 @@ impl Utxo {
         Ok(bytes)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
         if bytes.len() < 29 {
             return Err(UtxoError::Malformed("record header"));
         }
@@ -184,6 +184,93 @@ impl UtxoUndo {
     pub fn created(&self) -> &[OutPointKey] {
         &self.created
     }
+
+    /// Encodes undo data for durable block-disconnect storage.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, UtxoError> {
+        let spent_count = u32::try_from(self.spent.len())
+            .map_err(|_| UtxoError::Malformed("undo spent count"))?;
+        let created_count = u32::try_from(self.created.len())
+            .map_err(|_| UtxoError::Malformed("undo created count"))?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&spent_count.to_le_bytes());
+        for (outpoint, utxo) in &self.spent {
+            let utxo = utxo.encode()?;
+            let utxo_len =
+                u32::try_from(utxo.len()).map_err(|_| UtxoError::Malformed("undo UTXO length"))?;
+            bytes.extend_from_slice(outpoint.as_bytes());
+            bytes.extend_from_slice(&utxo_len.to_le_bytes());
+            bytes.extend_from_slice(&utxo);
+        }
+        bytes.extend_from_slice(&created_count.to_le_bytes());
+        for outpoint in &self.created {
+            bytes.extend_from_slice(outpoint.as_bytes());
+        }
+        Ok(bytes)
+    }
+
+    /// Decodes undo data previously produced by [`Self::encode`].
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
+        let (spent_count, mut cursor) = take_u32(bytes, 0, "undo spent count")?;
+        let spent_count = usize::try_from(spent_count).expect("u32 fits usize");
+        if spent_count > bytes.len().saturating_sub(cursor) / 40 {
+            return Err(UtxoError::Malformed("undo spent count exceeds record"));
+        }
+        let mut spent = Vec::with_capacity(spent_count);
+        for _ in 0..spent_count {
+            let outpoint =
+                OutPointKey::from_bytes(take(bytes, &mut cursor, 36, "undo spent outpoint")?)?;
+            let utxo_len = take_u32_at(bytes, &mut cursor, "undo UTXO length")?;
+            let utxo_len = usize::try_from(utxo_len).expect("u32 fits usize");
+            let utxo = Utxo::decode(take(bytes, &mut cursor, utxo_len, "undo UTXO")?)?;
+            spent.push((outpoint, utxo));
+        }
+        let created_count = take_u32_at(bytes, &mut cursor, "undo created count")?;
+        let created_count = usize::try_from(created_count).expect("u32 fits usize");
+        if created_count > bytes.len().saturating_sub(cursor) / 36 {
+            return Err(UtxoError::Malformed("undo created count exceeds record"));
+        }
+        let mut created = Vec::with_capacity(created_count);
+        for _ in 0..created_count {
+            created.push(OutPointKey::from_bytes(take(
+                bytes,
+                &mut cursor,
+                36,
+                "undo created outpoint",
+            )?)?);
+        }
+        if cursor != bytes.len() {
+            return Err(UtxoError::Malformed("trailing undo bytes"));
+        }
+        Ok(Self { spent, created })
+    }
+}
+
+fn take<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+    field: &'static str,
+) -> Result<&'a [u8], UtxoError> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or(UtxoError::Malformed(field))?;
+    let value = bytes.get(*cursor..end).ok_or(UtxoError::Malformed(field))?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_u32(bytes: &[u8], cursor: usize, field: &'static str) -> Result<(u32, usize), UtxoError> {
+    let mut cursor = cursor;
+    let value = take(bytes, &mut cursor, 4, field)?;
+    Ok((
+        u32::from_le_bytes(value.try_into().expect("fixed length")),
+        cursor,
+    ))
+}
+
+fn take_u32_at(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<u32, UtxoError> {
+    let value = take(bytes, cursor, 4, field)?;
+    Ok(u32::from_le_bytes(value.try_into().expect("fixed length")))
 }
 
 /// Atomic UTXO operations used by chainstate and snapshots.

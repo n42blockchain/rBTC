@@ -14,6 +14,7 @@ pub mod headers;
 pub mod ledger;
 pub mod p2p;
 pub mod snapshot;
+pub mod undo_store;
 pub mod utxo;
 pub mod wallet;
 
