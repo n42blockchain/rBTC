@@ -38,6 +38,7 @@ struct Options {
     fetch_block: Option<BlockHash>,
     headers_db: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    once: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -113,7 +114,7 @@ async fn run(options: Options) -> Result<(), String> {
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
-        return sync_regtest_node(&mut session, options.network, path).await;
+        return sync_regtest_node(&mut session, options.network, path, options.once).await;
     }
 
     if let Some(path) = options.headers_db {
@@ -178,6 +179,7 @@ async fn sync_regtest_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
     data_dir: PathBuf,
+    once: bool,
 ) -> Result<(), String> {
     if network != Network::Regtest {
         return Err(
@@ -187,7 +189,8 @@ async fn sync_regtest_node(
     }
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
-    let headers = sync_headers(session, network, data_dir.join("headers.redb")).await?;
+    let headers_path = data_dir.join("headers.redb");
+    let mut headers = sync_headers(session, network, headers_path.clone()).await?;
     let chainstate =
         RedbUtxoStore::open(data_dir.join("chainstate.redb")).map_err(|error| error.to_string())?;
     let undo_store =
@@ -210,58 +213,65 @@ async fn sync_regtest_node(
         println!("recovered an interrupted chainstate transition");
     }
 
-    loop {
-        let tip = execution_store.tip().map_err(|error| error.to_string())?;
-        if headers
-            .active_header_at(tip.height)
-            .is_some_and(|header| header.hash == tip.hash)
-        {
-            break;
+    'resync: loop {
+        loop {
+            let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if headers
+                .active_header_at(tip.height)
+                .is_some_and(|header| header.hash == tip.hash)
+            {
+                break;
+            }
+            let rewound = disconnect_execution_tip(
+                &chainstate,
+                &undo_store,
+                &execution_store,
+                &headers,
+                u64::from(unix_time()?),
+                DEFAULT_HOT_WINDOW_SECS,
+            )
+            .map_err(|error| error.to_string())?;
+            println!(
+                "disconnected stale execution tip; rewound to {}:{}",
+                rewound.height, rewound.hash
+            );
         }
-        let rewound = disconnect_execution_tip(
-            &chainstate,
-            &undo_store,
-            &execution_store,
-            &headers,
-            u64::from(unix_time()?),
-            DEFAULT_HOT_WINDOW_SECS,
-        )
-        .map_err(|error| error.to_string())?;
-        println!(
-            "disconnected stale execution tip; rewound to {}:{}",
-            rewound.height, rewound.hash
-        );
-    }
 
-    reconcile_ledger(session, network, &headers, &execution_store, &ledger).await?;
-    reconcile_explorer(
-        session,
-        network,
-        &headers,
-        &execution_store,
-        &undo_store,
-        &ledger,
-        &explorer,
-    )
-    .await?;
-
-    loop {
-        let tip = execution_store.tip().map_err(|error| error.to_string())?;
-        if tip.height >= headers.active_tip().height {
-            println!("block execution caught up at height {}", tip.height);
-            return Ok(());
-        }
-        download_execute_batch(
+        reconcile_ledger(session, network, &headers, &execution_store, &ledger).await?;
+        reconcile_explorer(
             session,
             network,
             &headers,
-            &chainstate,
-            &undo_store,
             &execution_store,
+            &undo_store,
             &ledger,
             &explorer,
         )
         .await?;
+
+        loop {
+            let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if tip.height >= headers.active_tip().height {
+                println!("block execution caught up at height {}", tip.height);
+                if once {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                headers = sync_headers(session, network, headers_path.clone()).await?;
+                continue 'resync;
+            }
+            download_execute_batch(
+                session,
+                network,
+                &headers,
+                &chainstate,
+                &undo_store,
+                &execution_store,
+                &ledger,
+                &explorer,
+            )
+            .await?;
+        }
     }
 }
 
@@ -663,6 +673,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut fetch_block = None;
     let mut headers_db = None;
     let mut data_dir = None;
+    let mut once = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -704,6 +715,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                         "--data-dir requires a directory path".to_owned()
                     })?));
             }
+            "--once" => once = true,
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
@@ -715,12 +727,13 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         fetch_block,
         headers_db,
         data_dir,
+        once,
     }))
 }
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -831,6 +844,7 @@ mod tests {
         assert!(options.fetch_block.is_none());
         assert!(options.headers_db.is_none());
         assert!(options.data_dir.is_none());
+        assert!(!options.once);
     }
 
     #[tokio::test]
@@ -874,6 +888,7 @@ mod tests {
             fetch_block: None,
             headers_db: Some(header_path.clone()),
             data_dir: None,
+            once: true,
         })
         .await
         .unwrap();
@@ -944,6 +959,7 @@ mod tests {
             fetch_block: None,
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
+            once: true,
         })
         .await
         .unwrap();
@@ -1012,6 +1028,7 @@ mod tests {
             fetch_block: None,
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
+            once: true,
         })
         .await
         .unwrap();
@@ -1070,6 +1087,7 @@ mod tests {
             fetch_block: None,
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
+            once: true,
         })
         .await
         .unwrap();
