@@ -49,6 +49,9 @@ pub enum BlockError {
     /// A SegWit witness commitment is missing or does not match the transaction data.
     #[error("block witness commitment mismatch")]
     WitnessCommitment,
+    /// Witness data appears without an active, valid coinbase commitment.
+    #[error("block contains unexpected witness data")]
+    UnexpectedWitness,
     /// Coinbase does not begin with the minimally encoded BIP34 block height.
     #[error("coinbase does not encode BIP34 height {height}")]
     Bip34Height {
@@ -220,9 +223,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     if mutated {
         return Err(BlockError::MutatedMerkleTree);
     }
-    if !block.check_witness_commitment() {
-        return Err(BlockError::WitnessCommitment);
-    }
+    check_witness_commitment(block, script_flags & bitcoinconsensus::VERIFY_WITNESS != 0)?;
     let weight = block.weight().to_wu();
     if weight > MAX_BLOCK_WEIGHT {
         return Err(BlockError::Weight { weight });
@@ -318,6 +319,29 @@ fn transaction_merkle_root(block: &Block) -> (Option<TxMerkleNode>, bool) {
         hashes = parents;
     }
     (Some(hashes[0].into()), mutated)
+}
+
+fn check_witness_commitment(block: &Block, segwit_active: bool) -> Result<(), BlockError> {
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let has_commitment = block.txdata[0].output.iter().any(|output| {
+        output.script_pubkey.len() >= 38 && output.script_pubkey.as_bytes()[..6] == MAGIC
+    });
+    let has_witness = block
+        .txdata
+        .iter()
+        .flat_map(|transaction| &transaction.input)
+        .any(|input| !input.witness.is_empty());
+    if segwit_active && has_commitment {
+        let reserved = &block.txdata[0].input[0].witness;
+        if reserved.len() != 1 || reserved[0].len() != 32 || !block.check_witness_commitment() {
+            return Err(BlockError::WitnessCommitment);
+        }
+        return Ok(());
+    }
+    if has_witness {
+        return Err(BlockError::UnexpectedWitness);
+    }
+    Ok(())
 }
 
 fn coinbase_has_height(transaction: &bitcoin::Transaction, height: u32) -> bool {
@@ -487,8 +511,34 @@ mod tests {
         let block = block(vec![transaction]);
         assert!(matches!(
             apply_block(&store, &block, 0, 100, 0, 60, 0),
+            Err(BlockError::UnexpectedWitness)
+        ));
+    }
+
+    #[test]
+    fn active_segwit_commitment_requires_a_reserved_nonce() {
+        let (_dir, store) = store();
+        let mut transaction = coinbase();
+        transaction.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(
+                [vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], vec![0; 32]].concat(),
+            ),
+        });
+        let block = block(vec![transaction]);
+        assert!(matches!(
+            apply_block(
+                &store,
+                &block,
+                0,
+                100,
+                0,
+                60,
+                bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
+            ),
             Err(BlockError::WitnessCommitment)
         ));
+        assert!(store.snapshot_entries().unwrap().is_empty());
     }
 
     #[test]
