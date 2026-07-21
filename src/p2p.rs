@@ -33,6 +33,7 @@ const MAX_RESPONSE_MESSAGES: usize = 32;
 /// Maximum headers permitted in one protocol `headers` response.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 const PROTOCOL_VERSION: u32 = 70_016;
+const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
 
 /// Async v1 P2P framing error.
 #[derive(Debug, Error)]
@@ -89,6 +90,25 @@ pub enum P2pError {
     /// A peer explicitly reported that it does not have the requested block.
     #[error("peer does not have requested block {0}")]
     BlockNotFound(BlockHash),
+    /// The peer predates the minimum protocol version accepted by Core 26.
+    #[error("peer protocol version {actual} is below minimum {minimum}")]
+    ObsoleteVersion {
+        /// Version announced by the peer.
+        actual: u32,
+        /// Minimum compatible version.
+        minimum: u32,
+    },
+    /// The outbound connection reached another instance of this node.
+    #[error("peer version nonce matches local nonce")]
+    SelfConnection,
+    /// A block source lacks full-history and/or witness relay capability.
+    #[error("peer services {offered} do not include required {required}")]
+    MissingServices {
+        /// Services required for full witness block IBD.
+        required: ServiceFlags,
+        /// Services announced by the peer.
+        offered: ServiceFlags,
+    },
 }
 
 /// An established Bitcoin peer session.
@@ -111,6 +131,18 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub fn into_transport(self) -> V1Transport<S> {
         self.transport
+    }
+
+    /// Requires a full-history peer capable of serving witness block payloads.
+    pub fn ensure_full_witness_block_relay(&self) -> Result<(), P2pError> {
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        if !self.remote_version.services.has(required) {
+            return Err(P2pError::MissingServices {
+                required,
+                offered: self.remote_version.services,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -207,6 +239,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
         for _ in 0..MAX_HANDSHAKE_MESSAGES {
             match self.read_message().await?.into_payload() {
                 NetworkMessage::Version(version) => {
+                    if version.version < MIN_PEER_PROTOCOL_VERSION {
+                        return Err(P2pError::ObsoleteVersion {
+                            actual: version.version,
+                            minimum: MIN_PEER_PROTOCOL_VERSION,
+                        });
+                    }
                     if remote_version.replace(version).is_some() {
                         return Err(P2pError::DuplicateVersion);
                     }
@@ -376,6 +414,9 @@ pub async fn connect_outbound(
 
     let mut transport = V1Transport::new(stream, magic);
     let remote_version = transport.handshake(local_version).await?;
+    if remote_version.nonce == nonce {
+        return Err(P2pError::SelfConnection);
+    }
     Ok(PeerSession {
         transport,
         remote_version,
@@ -474,6 +515,52 @@ mod tests {
         });
 
         assert_eq!(client.await.unwrap().nonce, 2);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn full_block_ibd_requires_network_and_witness_services() {
+        let (stream, _) = duplex(64);
+        let session = PeerSession {
+            transport: V1Transport::new(stream, Network::Regtest.magic()),
+            remote_version: version(1),
+        };
+        assert!(matches!(
+            session.ensure_full_witness_block_relay(),
+            Err(P2pError::MissingServices { .. })
+        ));
+
+        let (stream, _) = duplex(64);
+        let mut remote = version(2);
+        remote.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let session = PeerSession {
+            transport: V1Transport::new(stream, Network::Regtest.magic()),
+            remote_version: remote,
+        };
+        session.ensure_full_witness_block_relay().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_obsolete_protocol_versions() {
+        let (client_stream, server_stream) = duplex(4096);
+        let client = tokio::spawn(async move {
+            let mut client = V1Transport::new(client_stream, Network::Regtest.magic());
+            client.handshake(version(1)).await
+        });
+        let server = tokio::spawn(async move {
+            let mut server = V1Transport::new(server_stream, Network::Regtest.magic());
+            server.read_message().await.unwrap();
+            let mut obsolete = version(2);
+            obsolete.version = MIN_PEER_PROTOCOL_VERSION - 1;
+            server
+                .write_message(NetworkMessage::Version(obsolete))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::ObsoleteVersion { .. })
+        ));
         server.await.unwrap();
     }
 

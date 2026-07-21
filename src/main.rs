@@ -78,6 +78,9 @@ async fn run(options: Options) -> Result<(), String> {
     );
 
     if let Some(hash) = options.fetch_block {
+        session
+            .ensure_full_witness_block_relay()
+            .map_err(|error| error.to_string())?;
         timeout(PEER_TIMEOUT, session.request_witness_blocks(&[hash]))
             .await
             .map_err(|_| "getdata request timed out".to_owned())?
@@ -100,6 +103,9 @@ async fn run(options: Options) -> Result<(), String> {
     }
 
     if let Some(path) = options.data_dir {
+        session
+            .ensure_full_witness_block_relay()
+            .map_err(|error| error.to_string())?;
         return sync_regtest_node(&mut session, options.network, path).await;
     }
 
@@ -400,7 +406,7 @@ mod tests {
         let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
         let sender: SocketAddr = "0.0.0.0:0".parse().unwrap();
         VersionMessage::new(
-            ServiceFlags::NONE,
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
             0,
             Address::new(&receiver, ServiceFlags::NONE),
             Address::new(&sender, ServiceFlags::NONE),
