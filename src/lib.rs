@@ -9,6 +9,7 @@ pub mod archive;
 pub mod blockchain;
 pub mod chainstate;
 pub mod consensus;
+pub mod header_store;
 pub mod headers;
 pub mod ledger;
 pub mod p2p;
