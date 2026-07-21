@@ -13,9 +13,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::archive::{ArchiveError, ArchiveManifest, read_archive_manifest, write_archive};
+use crate::archive::{
+    ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, write_archive,
+};
 
 const INDEX_FILE: &str = "ledger-index.json";
+const TRUNCATE_FILE: &str = "ledger-truncate";
 
 /// Default approximate one-week historical retention at ten-minute blocks.
 pub const DEFAULT_RETENTION_BLOCKS: u32 = 1_008;
@@ -96,6 +99,7 @@ impl PrunedBlockLedger {
             write_guard: Mutex::new(()),
         };
         ledger.recover_index()?;
+        ledger.recover_truncation()?;
         Ok(ledger)
     }
 
@@ -165,6 +169,17 @@ impl PrunedBlockLedger {
             .collect()
     }
 
+    /// Removes every retained block at or above `first_removed_height`.
+    ///
+    /// A durable intent makes deletion and partial-segment rewriting
+    /// idempotent across process interruption.
+    pub fn truncate_from(&self, first_removed_height: u32) -> Result<(), LedgerError> {
+        let _guard = self.lock();
+        self.write_truncate_intent(first_removed_height)?;
+        self.apply_truncation(first_removed_height)?;
+        self.clear_truncate_intent()
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("ledger lock not poisoned")
     }
@@ -173,6 +188,9 @@ impl PrunedBlockLedger {
     }
     fn index_path(&self) -> PathBuf {
         self.root.join(INDEX_FILE)
+    }
+    fn truncate_path(&self) -> PathBuf {
+        self.root.join(TRUNCATE_FILE)
     }
     fn read_index(&self) -> Result<LedgerIndex, LedgerError> {
         match fs::read(self.index_path()) {
@@ -252,6 +270,75 @@ impl PrunedBlockLedger {
         }
         segments.sort_by_key(|segment| (segment.first_height, segment.slot));
         segments
+    }
+
+    fn recover_truncation(&self) -> Result<(), LedgerError> {
+        let bytes = match fs::read(self.truncate_path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let height = u32::from_le_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| LedgerError::Invalid("truncate intent"))?,
+        );
+        self.apply_truncation(height)?;
+        self.clear_truncate_intent()
+    }
+
+    fn write_truncate_intent(&self, height: u32) -> Result<(), LedgerError> {
+        let temporary = self.root.join("ledger-truncate.new");
+        let mut file = File::create(&temporary)?;
+        file.write_all(&height.to_le_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, self.truncate_path())?;
+        self.sync_directory()
+    }
+
+    fn clear_truncate_intent(&self) -> Result<(), LedgerError> {
+        match fs::remove_file(self.truncate_path()) {
+            Ok(()) => self.sync_directory(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn apply_truncation(&self, height: u32) -> Result<(), LedgerError> {
+        for slot in 0..self.retention.slots {
+            let path = self.slot_path(slot);
+            let manifest = match read_archive_manifest(&path) {
+                Ok(manifest) => manifest,
+                Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let end = manifest
+                .first_height
+                .checked_add(manifest.block_count)
+                .ok_or(LedgerError::Invalid("height overflow"))?;
+            if manifest.first_height >= height {
+                fs::remove_file(path)?;
+            } else if end > height {
+                let (_, mut blocks) = read_archive(&path)?;
+                let keep = usize::try_from(height - manifest.first_height)
+                    .expect("retained block count fits usize");
+                blocks.truncate(keep);
+                let temporary = path.with_extension("rblk.truncate");
+                write_archive(&temporary, manifest.first_height, &blocks)?;
+                File::open(&temporary)?.sync_all()?;
+                fs::rename(temporary, path)?;
+            }
+        }
+        self.sync_directory()?;
+        self.recover_index()
+    }
+
+    fn sync_directory(&self) -> Result<(), LedgerError> {
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
     }
 }
 
@@ -386,5 +473,56 @@ mod tests {
             recovered.retained_ranges().unwrap(),
             vec![(10, 10), (11, 11)]
         );
+    }
+
+    #[test]
+    fn truncates_a_segment_prefix_and_removes_newer_segments() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        ledger.append(13, &[vec![13], vec![14]]).unwrap();
+
+        ledger.truncate_from(12).unwrap();
+
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 11)]);
+        let (manifest, blocks) = read_archive(ledger.slot_path(0)).unwrap();
+        assert_eq!(manifest.first_height, 10);
+        assert_eq!(manifest.block_count, 2);
+        assert_eq!(blocks, vec![vec![10], vec![11]]);
+        assert!(!ledger.slot_path(1).exists());
+        drop(ledger);
+
+        let reopened = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(reopened.retained_ranges().unwrap(), vec![(10, 11)]);
+        reopened.append(12, &[vec![42]]).unwrap();
+        assert_eq!(
+            reopened.retained_ranges().unwrap(),
+            vec![(10, 11), (12, 12)]
+        );
+    }
+
+    #[test]
+    fn resumes_an_interrupted_truncation_intent_on_open() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        ledger.append(13, &[vec![13]]).unwrap();
+        ledger.write_truncate_intent(12).unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert!(!recovered.truncate_path().exists());
     }
 }

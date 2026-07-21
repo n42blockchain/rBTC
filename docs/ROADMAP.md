@@ -5,7 +5,7 @@
 - [x] Reuse `rust-bitcoin`, `bitcoinconsensus`, redb, zstd, and BDK rather than reimplementing their domains.
 - [x] Hot/cold UTXO persistence, verified snapshot container, immutable archive pieces, and circular pruning policy.
 - [x] Unit tests for storage atomicity, snapshot integrity/anchor rejection, archive tamper detection, pruning, P2P envelope, and explorer routing.
-- [ ] Property/fuzz tests for every untrusted parser and fault-injection tests for every file-ring transition. Manifest-bounded index reconstruction and orphan-rename adoption are implemented.
+- [ ] Property/fuzz tests for every untrusted parser and fault-injection tests for every file-ring transition. Manifest-bounded index reconstruction, orphan-rename adoption, and restart-safe partial-segment reorg truncation are implemented.
 
 ## Phase 1 — fully validating node
 
