@@ -10,16 +10,17 @@
 ## Phase 1 — fully validating node
 
 - [x] Header DAG, proof-of-work validation, and cumulative-work fork selection.
+- [x] Durable append-only header journal with replayed contextual validation on restart.
 - [x] Contextual timestamp validation: median-time-past and the two-hour future-time ceiling.
 - [x] Contextual difficulty validation: normal retarget, no-retarget chains, and min-difficulty fallback rules.
-- [x] Atomic UTXO undo records for reverse-order chain disconnects.
+- [x] Atomic UTXO undo records for reverse-order chain disconnects, plus durable block-undo encoding/storage.
 - [x] Transaction-level UTXO transition with script hooks, amount accounting, and coinbase maturity checks.
 - [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks and rollback.
 - [ ] Contextual header validation: checkpoints; connect header reorg selection to persisted block/UTXO undo journals.
-- [ ] Complete block/contextual validation: BIP30/68/113/141/143/147/341/342 (BIP34 height and BIP141 witness commitment now checked), coinbase maturity, subsidy, sigops, weight, deployment activation, and all standardness rules kept distinct from consensus.
+- [ ] Complete block/contextual validation: BIP30/141/143/147/341/342 (BIP34 height, BIP68/113 locks, and BIP141 witness commitment now checked), coinbase maturity, subsidy, sigops, complete deployment activation, and all standardness rules kept distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
-- [ ] P2P peer manager, handshake, addrman, compact blocks, headers-first IBD, additional DoS limits, peer eviction, block relay, and transaction relay.
+- [ ] P2P peer manager, addrman, compact blocks, full headers-first/block IBD, additional DoS limits, peer eviction, block relay, and transaction relay. Outbound v1 handshake, `getheaders`, `getdata`, bounded response handling, and durable header-only IBD are implemented.
 - [ ] BIP324 v2 transport using the maintained rust-bitcoin BIP324 implementation after interoperability tests with Core.
 
 ## Phase 2 — data services
@@ -40,3 +41,13 @@
 ## Compatibility policy
 
 Wire messages and block/transaction serialization must use Bitcoin's consensus encoding through `rust-bitcoin`. Consensus script checks use the version-pinned Bitcoin Core library. Snapshot and archive formats are rBTC-specific transport/storage formats, so they are versioned and never advertised as Bitcoin P2P messages without a ratified BIP and interoperability testing.
+
+## Current critical path
+
+The next acceptance milestone is deliberately narrow: a regtest daemon must
+restart from durable headers/chainstate, request the active-chain block bodies,
+apply them sequentially to UTXO state, retain undo data, and recover its
+execution tip. This is the prerequisite for mainnet-safe deployment activation,
+reorg handling, configurable pruning, snapshots, explorer indexes, and wallet
+sync. Compression, archive transport, and UI work must not be presented as a
+substitute for this validating-node path.
