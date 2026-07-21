@@ -37,6 +37,8 @@ The snapshot includes an anchor height/hash, count, and a SHA-256 of its canonic
 
 IBD first writes each downloaded batch to a checksum-protected staging archive. Blocks become visible in the retained ledger only after their UTXO transitions have reached the durable execution tip. On restart the daemon truncates archive data above the recovered active execution tip, publishes only the active validated prefix of a staged batch, and backfills a missing retained suffix from a full-history witness peer. This coordinates the separate redb chainstate and file ring without claiming an atomic transaction across storage engines.
 
+Consensus deployment selection is explicit at every structure-validation and block-execution call. Network defaults mirror the pinned Core 26 parameters; regtest additionally accepts Core's `taproot:start:end[:min_activation_height]` version-bits override with the 144-block/108-signal window. A canonical deployment encoding is bound when a fresh execution database is initialized and cannot be changed in place, even while the recorded tip is genesis, because another store may contain an interrupted transition. A restart with different parameters is rejected before recovery or block application; older databases can migrate only under the legacy default.
+
 For torrent distribution, the `ArchiveManifest` has stable 4 MiB compressed-piece SHA-256s. A future transport adapter can map them directly to torrent v2 pieces or verify webseed/range downloads before decompression. It must validate each recovered block through the normal chain validator; archive checksums are not consensus proof.
 
 ## Explorer and wallet

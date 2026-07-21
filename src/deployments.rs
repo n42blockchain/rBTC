@@ -1,12 +1,13 @@
 //! Network-specific buried deployments and consensus script flags.
 //!
 //! Values mirror the Bitcoin Core 26 sources bundled by the pinned
-//! `bitcoinconsensus` dependency. Version-bits state remains an explicit input
-//! for networks where Taproot was not configured `ALWAYS_ACTIVE`.
+//! `bitcoinconsensus` dependency, including regtest's `-vbparams` override
+//! semantics for Taproot.
 
 use std::str::FromStr;
 
 use bitcoin::{BlockHash, Network};
+use thiserror::Error;
 
 use crate::{block_execution::BlockDeploymentContext, headers::HeaderDag};
 
@@ -15,6 +16,9 @@ const VERSION_BITS_TOP_BITS: u32 = 0x2000_0000;
 const TAPROOT_BIT: u32 = 2;
 const TAPROOT_START_TIME: u32 = 1_619_222_400;
 const TAPROOT_TIMEOUT: u32 = 1_628_640_000;
+const ALWAYS_ACTIVE: i64 = -1;
+const NEVER_ACTIVE: i64 = -2;
+const CONFIG_ENCODING_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThresholdState {
@@ -25,11 +29,135 @@ enum ThresholdState {
     Failed,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct VersionBitsParams {
     period: u32,
     threshold: u32,
-    min_activation_height: u32,
+    start_time: i64,
+    timeout: i64,
+    min_activation_height: i32,
+}
+
+/// Complete deployment parameters used while validating one network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeploymentConfig {
+    network: Network,
+    taproot: VersionBitsParams,
+}
+
+/// Invalid deployment configuration.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum DeploymentConfigError {
+    /// Core-compatible version-bits overrides are a regtest-only facility.
+    #[error("--vbparams is only supported with --network regtest")]
+    RegtestOnly,
+    /// The value did not have Core's deployment:start:end[:min_height] shape.
+    #[error("malformed --vbparams; expected deployment:start:end[:min_activation_height]")]
+    Malformed,
+    /// rBTC does not implement the named version-bits deployment.
+    #[error("unsupported version-bits deployment: {0}")]
+    UnknownDeployment(String),
+    /// Start time was not a signed 64-bit integer.
+    #[error("invalid version-bits start time: {0}")]
+    StartTime(String),
+    /// Timeout was not a signed 64-bit integer.
+    #[error("invalid version-bits timeout: {0}")]
+    Timeout(String),
+    /// Minimum activation height was not a signed 32-bit integer.
+    #[error("invalid version-bits minimum activation height: {0}")]
+    MinimumActivationHeight(String),
+    /// The deployment configuration and header DAG select different networks.
+    #[error("deployment configuration network does not match header network")]
+    NetworkMismatch,
+}
+
+impl DeploymentConfig {
+    /// Returns the pinned default deployment parameters for `network`.
+    #[must_use]
+    pub const fn for_network(network: Network) -> Self {
+        let taproot = match network {
+            Network::Bitcoin => VersionBitsParams {
+                period: 2_016,
+                threshold: 1_815,
+                start_time: TAPROOT_START_TIME as i64,
+                timeout: TAPROOT_TIMEOUT as i64,
+                min_activation_height: 709_632,
+            },
+            Network::Testnet => VersionBitsParams {
+                period: 2_016,
+                threshold: 1_512,
+                start_time: TAPROOT_START_TIME as i64,
+                timeout: TAPROOT_TIMEOUT as i64,
+                min_activation_height: 0,
+            },
+            Network::Regtest => VersionBitsParams {
+                period: 144,
+                threshold: 108,
+                start_time: ALWAYS_ACTIVE,
+                timeout: i64::MAX,
+                min_activation_height: 0,
+            },
+            Network::Testnet4 | Network::Signet => VersionBitsParams {
+                period: 2_016,
+                threshold: 1_815,
+                start_time: ALWAYS_ACTIVE,
+                timeout: i64::MAX,
+                min_activation_height: 0,
+            },
+        };
+        Self { network, taproot }
+    }
+
+    /// Applies one Bitcoin Core-compatible regtest `-vbparams` value.
+    ///
+    /// The currently implemented deployment name is `taproot`. Repeated calls
+    /// use the last supplied value, matching Core's option processing.
+    pub fn apply_vbparams(&mut self, value: &str) -> Result<(), DeploymentConfigError> {
+        if self.network != Network::Regtest {
+            return Err(DeploymentConfigError::RegtestOnly);
+        }
+        let fields = value.split(':').collect::<Vec<_>>();
+        if !(3..=4).contains(&fields.len()) {
+            return Err(DeploymentConfigError::Malformed);
+        }
+        if fields[0] != "taproot" {
+            return Err(DeploymentConfigError::UnknownDeployment(
+                fields[0].to_owned(),
+            ));
+        }
+        let start_time = fields[1]
+            .parse::<i64>()
+            .map_err(|_| DeploymentConfigError::StartTime(fields[1].to_owned()))?;
+        let timeout = fields[2]
+            .parse::<i64>()
+            .map_err(|_| DeploymentConfigError::Timeout(fields[2].to_owned()))?;
+        let min_activation_height = fields.get(3).map_or(Ok(0), |height| {
+            height
+                .parse::<i32>()
+                .map_err(|_| DeploymentConfigError::MinimumActivationHeight((*height).to_owned()))
+        })?;
+        self.taproot = VersionBitsParams {
+            period: 144,
+            threshold: 108,
+            start_time,
+            timeout,
+            min_activation_height,
+        };
+        Ok(())
+    }
+
+    /// Canonical bytes that bind persisted execution state to these settings.
+    #[must_use]
+    pub fn consensus_id(self) -> [u8; 29] {
+        let mut encoded = [0_u8; 29];
+        encoded[0] = CONFIG_ENCODING_VERSION;
+        encoded[1..5].copy_from_slice(&self.taproot.period.to_le_bytes());
+        encoded[5..9].copy_from_slice(&self.taproot.threshold.to_le_bytes());
+        encoded[9..17].copy_from_slice(&self.taproot.start_time.to_le_bytes());
+        encoded[17..25].copy_from_slice(&self.taproot.timeout.to_le_bytes());
+        encoded[25..29].copy_from_slice(&self.taproot.min_activation_height.to_le_bytes());
+        encoded
+    }
 }
 
 /// Derives block and script consensus flags for one candidate.
@@ -81,36 +209,28 @@ pub fn block_deployment_context(
 /// Whether Taproot is unconditionally active for this network configuration.
 #[must_use]
 pub const fn taproot_always_active(network: Network) -> bool {
-    matches!(
-        network,
-        Network::Testnet4 | Network::Signet | Network::Regtest
-    )
+    DeploymentConfig::for_network(network).taproot.start_time == ALWAYS_ACTIVE
 }
 
 /// Computes Taproot's BIP9 state for a candidate on the active header chain.
 ///
 /// Mainnet and legacy testnet use the Core 26 deployment parameters. Newer
 /// test networks and default regtest configure Taproot as always active.
-#[must_use]
-pub fn taproot_active(headers: &HeaderDag, candidate_height: u32) -> bool {
-    let network = headers.network();
-    if taproot_always_active(network) {
-        return true;
+pub fn taproot_active(
+    headers: &HeaderDag,
+    candidate_height: u32,
+    config: DeploymentConfig,
+) -> Result<bool, DeploymentConfigError> {
+    if headers.network() != config.network {
+        return Err(DeploymentConfigError::NetworkMismatch);
     }
-    let params = match network {
-        Network::Bitcoin => VersionBitsParams {
-            period: 2_016,
-            threshold: 1_815,
-            min_activation_height: 709_632,
-        },
-        Network::Testnet => VersionBitsParams {
-            period: 2_016,
-            threshold: 1_512,
-            min_activation_height: 0,
-        },
-        Network::Testnet4 | Network::Signet | Network::Regtest => return true,
-    };
-    threshold_state(headers, candidate_height, params) == ThresholdState::Active
+    if config.taproot.start_time == ALWAYS_ACTIVE {
+        return Ok(true);
+    }
+    if config.taproot.start_time == NEVER_ACTIVE {
+        return Ok(false);
+    }
+    Ok(threshold_state(headers, candidate_height, config.taproot) == ThresholdState::Active)
 }
 
 fn threshold_state(
@@ -137,11 +257,13 @@ fn threshold_state(
         let Some(period_end_header) = headers.active_header_at(period_end) else {
             return ThresholdState::Defined;
         };
-        let period_mtp = headers
-            .median_time_past(period_end_header.hash)
-            .expect("active header has median time past");
+        let period_mtp = i64::from(
+            headers
+                .median_time_past(period_end_header.hash)
+                .expect("active header has median time past"),
+        );
         state = match state {
-            ThresholdState::Defined if period_mtp >= TAPROOT_START_TIME => ThresholdState::Started,
+            ThresholdState::Defined if period_mtp >= params.start_time => ThresholdState::Started,
             ThresholdState::Started => {
                 let period_start = period_end + 1 - params.period;
                 let signals = (period_start..=period_end)
@@ -150,14 +272,15 @@ fn threshold_state(
                     .count();
                 if signals >= usize::try_from(params.threshold).expect("threshold fits usize") {
                     ThresholdState::LockedIn
-                } else if period_mtp >= TAPROOT_TIMEOUT {
+                } else if period_mtp >= params.timeout {
                     ThresholdState::Failed
                 } else {
                     ThresholdState::Started
                 }
             }
             ThresholdState::LockedIn
-                if period_end.saturating_add(1) >= params.min_activation_height =>
+                if i64::from(period_end.saturating_add(1))
+                    >= i64::from(params.min_activation_height) =>
             {
                 ThresholdState::Active
             }
@@ -350,6 +473,8 @@ mod tests {
         let params = VersionBitsParams {
             period: 4,
             threshold: 3,
+            start_time: i64::from(TAPROOT_START_TIME),
+            timeout: i64::from(TAPROOT_TIMEOUT),
             min_activation_height: 12,
         };
         assert_eq!(
@@ -364,6 +489,92 @@ mod tests {
             threshold_state(&headers, 12, params),
             ThresholdState::Active
         );
-        assert!(taproot_active(&headers, 1));
+        assert!(
+            taproot_active(&headers, 1, DeploymentConfig::for_network(Network::Regtest)).unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_core_compatible_regtest_vbparams_and_special_states() {
+        let headers = HeaderDag::new(Network::Regtest);
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        config.apply_vbparams("taproot:-2:0").unwrap();
+        assert!(!taproot_active(&headers, 1, config).unwrap());
+
+        config
+            .apply_vbparams("taproot:-1:9223372036854775807:-5")
+            .unwrap();
+        assert!(taproot_active(&headers, 1, config).unwrap());
+        assert_ne!(
+            config.consensus_id(),
+            DeploymentConfig::for_network(Network::Regtest).consensus_id()
+        );
+    }
+
+    #[test]
+    fn configured_regtest_taproot_uses_core_period_and_threshold() {
+        let mut headers = HeaderDag::new(Network::Regtest);
+        for height in 1..432_u32 {
+            let parent = headers.active_tip();
+            let signals = (144..252).contains(&height);
+            let mut header = Header {
+                version: if signals {
+                    Version::from_consensus(
+                        i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT))
+                            .expect("version-bits value fits i32"),
+                    )
+                } else {
+                    Version::ONE
+                },
+                prev_blockhash: parent.hash,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: parent.header.time + 1,
+                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+                nonce: 0,
+            };
+            while header.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_err() {
+                header.nonce += 1;
+            }
+            headers.insert_contextual(header, u32::MAX).unwrap();
+        }
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        config
+            .apply_vbparams("taproot:0:9223372036854775807:432")
+            .unwrap();
+
+        assert!(!taproot_active(&headers, 144, config).unwrap());
+        assert!(!taproot_active(&headers, 288, config).unwrap());
+        assert!(taproot_active(&headers, 432, config).unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_or_non_regtest_vbparams() {
+        let mut regtest = DeploymentConfig::for_network(Network::Regtest);
+        assert_eq!(
+            regtest.apply_vbparams("unknown:0:1"),
+            Err(DeploymentConfigError::UnknownDeployment(
+                "unknown".to_owned()
+            ))
+        );
+        assert_eq!(
+            regtest.apply_vbparams("taproot:invalid:1"),
+            Err(DeploymentConfigError::StartTime("invalid".to_owned()))
+        );
+        assert_eq!(
+            regtest.apply_vbparams("taproot:0:1:2:3"),
+            Err(DeploymentConfigError::Malformed)
+        );
+        assert_eq!(
+            DeploymentConfig::for_network(Network::Bitcoin).apply_vbparams("taproot:0:1"),
+            Err(DeploymentConfigError::RegtestOnly)
+        );
+        assert_eq!(
+            taproot_active(
+                &HeaderDag::new(Network::Bitcoin),
+                1,
+                DeploymentConfig::for_network(Network::Regtest),
+            ),
+            Err(DeploymentConfigError::NetworkMismatch)
+        );
     }
 }

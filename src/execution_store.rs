@@ -12,6 +12,7 @@ use thiserror::Error;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("execution_metadata");
 const GENESIS_KEY: &str = "genesis";
 const TIP_KEY: &str = "tip";
+const CONSENSUS_CONFIG_KEY: &str = "consensus_config";
 
 /// Last block whose UTXO transition is recorded as complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +54,12 @@ pub enum ExecutionStoreError {
         /// Selected network genesis hash.
         expected: BlockHash,
     },
+    /// Persisted blocks were validated with different consensus configuration.
+    #[error("execution consensus configuration cannot change above genesis height {height}")]
+    ConsensusConfigMismatch {
+        /// Current executed height.
+        height: u32,
+    },
     /// A transition did not extend the stored tip by exactly one block.
     #[error("execution transition does not extend tip {current_height}:{current_hash}")]
     NonSequential {
@@ -67,6 +74,7 @@ pub enum ExecutionStoreError {
 pub struct RedbExecutionStore {
     db: Database,
     write_guard: Mutex<()>,
+    new_database: bool,
 }
 
 impl RedbExecutionStore {
@@ -75,9 +83,11 @@ impl RedbExecutionStore {
         let expected = bitcoin::blockdata::constants::genesis_block(network).block_hash();
         let db = Database::create(path)?;
         let transaction = db.begin_write()?;
+        let new_database;
         {
             let mut meta = transaction.open_table(META)?;
             let stored_genesis = meta.get(GENESIS_KEY)?.map(|value| value.value().to_vec());
+            new_database = stored_genesis.is_none();
             if let Some(value) = stored_genesis {
                 let stored = decode_hash(&value, "genesis hash")?;
                 if stored != expected {
@@ -102,6 +112,7 @@ impl RedbExecutionStore {
         Ok(Self {
             db,
             write_guard: Mutex::new(()),
+            new_database,
         })
     }
 
@@ -113,6 +124,49 @@ impl RedbExecutionStore {
             .get(TIP_KEY)?
             .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
         decode_tip(value.value())
+    }
+
+    /// Binds this execution database to a canonical consensus configuration.
+    ///
+    /// A fresh database accepts the first selected configuration. Once bound it
+    /// cannot be changed in place, even at genesis, because an interrupted block
+    /// transition may already exist in the other stores. Databases created
+    /// before this metadata existed can migrate only to `legacy_default`.
+    pub fn bind_consensus_config(
+        &self,
+        selected: &[u8],
+        legacy_default: &[u8],
+    ) -> Result<(), ExecutionStoreError> {
+        if selected.is_empty() || legacy_default.is_empty() {
+            return Err(ExecutionStoreError::Malformed(
+                "empty consensus configuration",
+            ));
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            let tip_value = meta
+                .get(TIP_KEY)?
+                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+            let tip = decode_tip(tip_value.value())?;
+            drop(tip_value);
+            let stored = meta
+                .get(CONSENSUS_CONFIG_KEY)?
+                .map(|value| value.value().to_vec());
+            let compatible = stored.as_deref().map_or_else(
+                || (self.new_database && tip.height == 0) || selected == legacy_default,
+                |stored| stored == selected,
+            );
+            if !compatible {
+                return Err(ExecutionStoreError::ConsensusConfigMismatch { height: tip.height });
+            }
+            if stored.as_deref() != Some(selected) {
+                meta.insert(CONSENSUS_CONFIG_KEY, selected)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Advances the execution tip by exactly one child block.
@@ -210,6 +264,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("execution.redb");
         let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        store.bind_consensus_config(b"default", b"default").unwrap();
         let genesis = store.tip().unwrap();
         let child = ExecutionTip {
             height: 1,
@@ -229,8 +284,57 @@ mod tests {
         drop(store);
 
         let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        reopened
+            .bind_consensus_config(b"default", b"default")
+            .unwrap();
+        assert!(matches!(
+            reopened.bind_consensus_config(b"custom", b"default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
+        ));
         assert_eq!(reopened.tip().unwrap(), child);
         reopened.rewind(child, genesis).unwrap();
         assert_eq!(reopened.tip().unwrap(), genesis);
+        assert!(matches!(
+            reopened.bind_consensus_config(b"custom", b"default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
+        ));
+    }
+
+    #[test]
+    fn legacy_non_genesis_store_only_accepts_default_consensus() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.tip().unwrap();
+        store
+            .advance(
+                genesis.hash,
+                ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([1; 32]),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.bind_consensus_config(b"custom", b"default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
+        ));
+        store.bind_consensus_config(b"default", b"default").unwrap();
+    }
+
+    #[test]
+    fn fresh_store_accepts_one_custom_consensus_binding() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        store.bind_consensus_config(b"custom", b"default").unwrap();
+        drop(store);
+
+        let store = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        store.bind_consensus_config(b"custom", b"default").unwrap();
+        assert!(matches!(
+            store.bind_consensus_config(b"other", b"default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
+        ));
     }
 }

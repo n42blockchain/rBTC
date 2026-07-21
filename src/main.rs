@@ -19,7 +19,7 @@ use rbtc::{
     api::explorer_router,
     block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
     blockchain::{AppliedBlock, validate_block_structure},
-    deployments::{block_deployment_context, taproot_active},
+    deployments::{DeploymentConfig, block_deployment_context, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
@@ -42,6 +42,7 @@ struct Options {
     data_dir: Option<PathBuf>,
     once: bool,
     explorer_listen: Option<SocketAddr>,
+    deployments: DeploymentConfig,
 }
 
 struct ExplorerServer {
@@ -175,6 +176,7 @@ async fn run(options: Options) -> Result<(), String> {
         return sync_regtest_node(
             &mut session,
             options.network,
+            options.deployments,
             path,
             options.once,
             options.explorer_listen,
@@ -244,6 +246,7 @@ async fn sync_headers(
 async fn sync_regtest_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
+    deployment_config: DeploymentConfig,
     data_dir: PathBuf,
     once: bool,
     explorer_listen: Option<SocketAddr>,
@@ -262,6 +265,12 @@ async fn sync_regtest_node(
     let undo_store =
         RedbUndoStore::open(data_dir.join("undo.redb")).map_err(|error| error.to_string())?;
     let execution_store = RedbExecutionStore::open(data_dir.join("execution.redb"), network)
+        .map_err(|error| error.to_string())?;
+    execution_store
+        .bind_consensus_config(
+            &deployment_config.consensus_id(),
+            &DeploymentConfig::for_network(network).consensus_id(),
+        )
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
@@ -316,10 +325,19 @@ async fn sync_regtest_node(
             );
         }
 
-        reconcile_ledger(session, network, &headers, &execution_store, &ledger).await?;
+        reconcile_ledger(
+            session,
+            network,
+            deployment_config,
+            &headers,
+            &execution_store,
+            &ledger,
+        )
+        .await?;
         reconcile_explorer(
             session,
             network,
+            deployment_config,
             &headers,
             &execution_store,
             &undo_store,
@@ -345,6 +363,7 @@ async fn sync_regtest_node(
             download_execute_batch(
                 session,
                 network,
+                deployment_config,
                 &headers,
                 &chainstate,
                 &undo_store,
@@ -360,6 +379,7 @@ async fn sync_regtest_node(
 async fn reconcile_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
+    deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
@@ -402,13 +422,21 @@ async fn reconcile_ledger(
                     on_active_chain = false;
                     break;
                 }
-                validate_archive_block(network, headers, height, expected.hash, &block)?;
+                validate_archive_block(
+                    network,
+                    deployment_config,
+                    headers,
+                    height,
+                    expected.hash,
+                    &block,
+                )?;
             }
             if on_active_chain {
                 let preceding_height = staged.manifest.first_height.saturating_sub(1);
                 backfill_ledger(
                     session,
                     network,
+                    deployment_config,
                     headers,
                     ledger,
                     preceding_height.min(tip.height),
@@ -426,12 +454,21 @@ async fn reconcile_ledger(
         }
     }
 
-    backfill_ledger(session, network, headers, ledger, tip.height).await
+    backfill_ledger(
+        session,
+        network,
+        deployment_config,
+        headers,
+        ledger,
+        tip.height,
+    )
+    .await
 }
 
 async fn backfill_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
+    deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
     target_height: u32,
@@ -477,7 +514,14 @@ async fn backfill_ledger(
             .map_err(|error| error.to_string())?;
         let mut serialized = Vec::with_capacity(blocks.len());
         for (expected, block) in expected.iter().zip(&blocks) {
-            validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+            validate_archive_block(
+                network,
+                deployment_config,
+                headers,
+                expected.height,
+                expected.hash,
+                block,
+            )?;
             serialized.push(serialize(block));
         }
         ledger
@@ -495,6 +539,7 @@ async fn backfill_ledger(
 
 fn validate_archive_block(
     network: Network,
+    deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     height: u32,
     expected_hash: BlockHash,
@@ -511,7 +556,7 @@ fn validate_archive_block(
         height,
         expected_hash,
         block.header.time,
-        taproot_active(headers, height),
+        taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?,
     );
     validate_block_structure(
         block,
@@ -526,6 +571,7 @@ fn validate_archive_block(
 async fn reconcile_explorer(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
+    deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     undo_store: &RedbUndoStore,
@@ -605,7 +651,14 @@ async fn reconcile_explorer(
                 .map_err(|error| error.to_string())?;
         }
         for (expected, block) in expected.iter().zip(&blocks) {
-            validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+            validate_archive_block(
+                network,
+                deployment_config,
+                headers,
+                expected.height,
+                expected.hash,
+                block,
+            )?;
             let transaction_undos = undo_store
                 .get(expected.hash)
                 .map_err(|error| error.to_string())?
@@ -630,6 +683,7 @@ async fn reconcile_explorer(
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
+    deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     chainstate: &RedbUtxoStore,
     undo_store: &RedbUndoStore,
@@ -670,7 +724,14 @@ async fn download_execute_batch(
         .map_err(|_| format!("block batch response timed out for {batch_len} blocks"))?
         .map_err(|error| error.to_string())?;
     for (expected, block) in expected.iter().zip(&blocks) {
-        validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+        validate_archive_block(
+            network,
+            deployment_config,
+            headers,
+            expected.height,
+            expected.hash,
+            block,
+        )?;
     }
     let serialized = blocks.iter().map(serialize).collect::<Vec<_>>();
     ledger
@@ -690,7 +751,8 @@ async fn download_execute_batch(
                 expected.height,
                 expected.hash,
                 block.header.time,
-                taproot_active(headers, expected.height),
+                taproot_active(headers, expected.height, deployment_config)
+                    .map_err(|error| error.to_string())?,
             ),
         )
         .map_err(|error| error.to_string())?;
@@ -757,6 +819,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut data_dir = None;
     let mut once = false;
     let mut explorer_listen = None;
+    let mut vbparams = Vec::new();
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -814,6 +877,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 }
                 explorer_listen = Some(address);
             }
+            "--vbparams" => {
+                vbparams.push(
+                    args.next()
+                        .ok_or_else(|| "--vbparams requires a value".to_owned())?,
+                );
+            }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
@@ -822,6 +891,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
+    let deployments = parse_deployment_config(network, data_dir.is_some(), vbparams)?;
     Ok(Some(Options {
         remote,
         network,
@@ -830,12 +900,30 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         data_dir,
         once,
         explorer_listen,
+        deployments,
     }))
+}
+
+fn parse_deployment_config(
+    network: Network,
+    has_data_dir: bool,
+    vbparams: Vec<String>,
+) -> Result<DeploymentConfig, String> {
+    if !vbparams.is_empty() && !has_data_dir {
+        return Err("--vbparams requires --data-dir".to_owned());
+    }
+    let mut deployments = DeploymentConfig::for_network(network);
+    for value in vbparams {
+        deployments
+            .apply_vbparams(&value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(deployments)
 }
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -949,6 +1037,10 @@ mod tests {
         assert!(options.data_dir.is_none());
         assert!(!options.once);
         assert!(options.explorer_listen.is_none());
+        assert_eq!(
+            options.deployments,
+            DeploymentConfig::for_network(Network::Regtest)
+        );
 
         let served = parse_options(
             [
@@ -960,6 +1052,8 @@ mod tests {
                 "/tmp/rbtc-test",
                 "--explorer-listen",
                 "127.0.0.1:0",
+                "--vbparams",
+                "taproot:-2:0:432",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -967,6 +1061,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(served.explorer_listen, Some("127.0.0.1:0".parse().unwrap()));
+        assert_ne!(
+            served.deployments,
+            DeploymentConfig::for_network(Network::Regtest)
+        );
         assert!(
             parse_options(
                 [
@@ -976,6 +1074,38 @@ mod tests {
                     "/tmp/rbtc-test",
                     "--explorer-listen",
                     "0.0.0.0:3000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "bitcoin",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--vbparams",
+                    "taproot:0:1",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "regtest",
+                    "--vbparams",
+                    "taproot:0:1",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -1052,6 +1182,7 @@ mod tests {
             data_dir: None,
             once: true,
             explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1124,6 +1255,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1194,6 +1326,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1254,6 +1387,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
         })
         .await
         .unwrap();
