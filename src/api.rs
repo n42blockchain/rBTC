@@ -14,12 +14,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::wallet::{EmbeddedWallet, WalletAddress, WalletBalance};
 
 /// Explorer block summary returned by the embedded API.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExplorerBlock {
     /// Block height.
     pub height: u32,
@@ -32,7 +32,7 @@ pub struct ExplorerBlock {
 }
 
 /// Explorer transaction summary returned by the embedded API.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExplorerTransaction {
     /// Display-order transaction ID.
     pub txid: String,
@@ -43,7 +43,7 @@ pub struct ExplorerTransaction {
 }
 
 /// UTXO response for an address/script search.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExplorerUtxo {
     /// Txid containing the output.
     pub txid: String,

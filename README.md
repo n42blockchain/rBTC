@@ -14,7 +14,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Durable regtest headers-first/block IBD and cumulative-work fork choice are implemented, but complete mainnet deployment activation and block rules, the P2P peer manager, persistent address/transaction indexes, wallet secret persistence, authentication, and release hardening remain completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Durable regtest headers-first/block IBD, cumulative-work fork choice, and persistent explorer projections are implemented, but complete mainnet deployment activation and block rules, the P2P peer manager, wallet secret persistence, authenticated API serving, and release hardening remain completion gates. The exact plan is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 

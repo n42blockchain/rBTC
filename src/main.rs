@@ -16,9 +16,10 @@ use bitcoin::{
 };
 use rbtc::{
     block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
-    blockchain::validate_block_structure,
+    blockchain::{AppliedBlock, validate_block_structure},
     deployments::{block_deployment_context, taproot_active},
     execution_store::RedbExecutionStore,
+    explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
     ledger::{LedgerRetention, PrunedBlockLedger},
@@ -195,6 +196,8 @@ async fn sync_regtest_node(
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
+    let explorer = RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
+        .map_err(|error| error.to_string())?;
     if recover_pending_transition(
         &chainstate,
         &undo_store,
@@ -231,6 +234,16 @@ async fn sync_regtest_node(
     }
 
     reconcile_ledger(session, network, &headers, &execution_store, &ledger).await?;
+    reconcile_explorer(
+        session,
+        network,
+        &headers,
+        &execution_store,
+        &undo_store,
+        &ledger,
+        &explorer,
+    )
+    .await?;
 
     loop {
         let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -246,6 +259,7 @@ async fn sync_regtest_node(
             &undo_store,
             &execution_store,
             &ledger,
+            &explorer,
         )
         .await?;
     }
@@ -416,6 +430,111 @@ fn validate_archive_block(
     .map_err(|error| format!("archive block structure at height {height}: {error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_explorer(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    network: Network,
+    headers: &HeaderDag,
+    execution_store: &RedbExecutionStore,
+    undo_store: &RedbUndoStore,
+    ledger: &PrunedBlockLedger,
+    explorer: &RedbExplorerIndex,
+) -> Result<(), String> {
+    let execution_tip = execution_store.tip().map_err(|error| error.to_string())?;
+    loop {
+        let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
+        if explorer_tip.height <= execution_tip.height
+            && headers
+                .active_header_at(explorer_tip.height)
+                .is_some_and(|header| header.hash == explorer_tip.hash)
+        {
+            break;
+        }
+        let rewound = explorer
+            .disconnect_tip()
+            .map_err(|error| error.to_string())?;
+        println!(
+            "disconnected stale explorer tip; rewound to {}:{}",
+            rewound.height, rewound.hash
+        );
+    }
+
+    loop {
+        let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
+        if explorer_tip.height >= execution_tip.height {
+            return Ok(());
+        }
+        let next_height = explorer_tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| "explorer height overflow".to_owned())?;
+        let remaining = execution_tip.height - explorer_tip.height;
+        let batch_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(MAX_BLOCKS_IN_FLIGHT);
+        let expected = (0..batch_len)
+            .map(|offset| {
+                let height = next_height
+                    .checked_add(u32::try_from(offset).expect("explorer batch fits u32"))
+                    .ok_or_else(|| "explorer height overflow".to_owned())?;
+                headers
+                    .active_header_at(height)
+                    .ok_or_else(|| format!("missing active header at height {height}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut blocks = Vec::with_capacity(batch_len);
+        let mut all_local = true;
+        for header in &expected {
+            let Some(bytes) = ledger
+                .read_block(header.height)
+                .map_err(|error| error.to_string())?
+            else {
+                all_local = false;
+                break;
+            };
+            blocks.push(deserialize(&bytes).map_err(|error| {
+                format!("decode retained block at height {}: {error}", header.height)
+            })?);
+        }
+        if !all_local {
+            let hashes = expected
+                .iter()
+                .map(|header| header.hash)
+                .collect::<Vec<_>>();
+            timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+                .await
+                .map_err(|_| format!("explorer backfill getdata timed out for {batch_len} blocks"))?
+                .map_err(|error| error.to_string())?;
+            blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
+                .await
+                .map_err(|_| {
+                    format!("explorer backfill response timed out for {batch_len} blocks")
+                })?
+                .map_err(|error| error.to_string())?;
+        }
+        for (expected, block) in expected.iter().zip(&blocks) {
+            validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+            let transaction_undos = undo_store
+                .get(expected.hash)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!("missing active undo for explorer block {}", expected.hash)
+                })?;
+            explorer
+                .connect(
+                    expected.height,
+                    block,
+                    &AppliedBlock {
+                        hash: expected.hash,
+                        transaction_undos,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
@@ -424,6 +543,7 @@ async fn download_execute_batch(
     undo_store: &RedbUndoStore,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
+    explorer: &RedbExplorerIndex,
 ) -> Result<(), String> {
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     let next_height = tip
@@ -465,7 +585,7 @@ async fn download_execute_batch(
         .stage(next_height, &serialized)
         .map_err(|error| error.to_string())?;
     for (expected, block) in expected.into_iter().zip(&blocks) {
-        connect_active_block(
+        let applied = connect_active_block(
             chainstate,
             undo_store,
             execution_store,
@@ -482,6 +602,9 @@ async fn download_execute_batch(
             ),
         )
         .map_err(|error| error.to_string())?;
+        explorer
+            .connect(expected.height, block, &applied)
+            .map_err(|error| error.to_string())?;
         println!(
             "validated and executed block {}:{}",
             expected.height, expected.hash
@@ -615,6 +738,7 @@ mod tests {
         transaction::Version as TransactionVersion,
     };
     use rbtc::{
+        api::ExplorerIndex,
         blockchain::block_subsidy,
         execution_store::RedbExecutionStore,
         header_store::RedbHeaderStore,
@@ -841,6 +965,15 @@ mod tests {
         let archived: Block = deserialize(&ledger.read_block(1).unwrap().unwrap()).unwrap();
         assert_eq!(archived.block_hash(), block_hash);
         assert!(ledger.staged().unwrap().is_none());
+        let explorer =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(explorer.tip().unwrap().height, 1);
+        assert_eq!(
+            explorer.block(1).unwrap().unwrap().hash,
+            block_hash.to_string()
+        );
+        drop(explorer);
 
         let archived_bytes = serialize(&archived);
         ledger.truncate_from(1).unwrap();
