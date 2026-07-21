@@ -10,6 +10,7 @@ pub mod block_execution;
 pub mod blockchain;
 pub mod chainstate;
 pub mod consensus;
+pub mod deployments;
 pub mod execution_store;
 pub mod header_store;
 pub mod headers;

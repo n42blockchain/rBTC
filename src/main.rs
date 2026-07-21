@@ -11,7 +11,8 @@ use std::{
 
 use bitcoin::{BlockHash, Network, hashes::Hash};
 use rbtc::{
-    block_execution::{BlockDeploymentContext, connect_active_block, disconnect_execution_tip},
+    block_execution::{connect_active_block, disconnect_execution_tip},
+    deployments::{block_deployment_context, taproot_always_active},
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
@@ -236,7 +237,13 @@ async fn sync_regtest_node(
             &block,
             u64::from(unix_time()?),
             DEFAULT_HOT_WINDOW_SECS,
-            BlockDeploymentContext::default(),
+            block_deployment_context(
+                network,
+                next_height,
+                expected.hash,
+                block.header.time,
+                taproot_always_active(network),
+            ),
         )
         .map_err(|error| error.to_string())?;
         println!(
