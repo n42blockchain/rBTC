@@ -59,6 +59,15 @@ pub enum BlockExecutionError {
     /// A persistence failure could not be cleanly rolled back from UTXO state.
     #[error("UTXO rollback after persistence failure: {0}")]
     Rollback(#[from] UtxoError),
+    /// The validated header journal lacks the executed tip or its parent.
+    #[error("missing executed header {0} during disconnect")]
+    MissingExecutedHeader(BlockHash),
+    /// The genesis execution tip cannot be disconnected.
+    #[error("cannot disconnect genesis execution tip")]
+    DisconnectGenesis,
+    /// Durable undo data is missing for an executed block.
+    #[error("missing durable undo for executed block {0}")]
+    MissingUndo(BlockHash),
 }
 
 /// Validates and connects exactly the next active-chain block.
@@ -133,6 +142,50 @@ pub fn connect_active_block<S: UtxoStore>(
     Ok(applied)
 }
 
+/// Disconnects the current execution tip using its durable undo record.
+///
+/// Unlike [`connect_active_block`], the executed header need not remain on the
+/// newly selected active chain; this is the primitive used to walk back to a
+/// common ancestor before connecting a stronger branch.
+pub fn disconnect_execution_tip<S: UtxoStore>(
+    chainstate: &S,
+    undo_store: &RedbUndoStore,
+    execution_store: &RedbExecutionStore,
+    headers: &HeaderDag,
+    now: u64,
+    hot_window_secs: u64,
+) -> Result<ExecutionTip, BlockExecutionError> {
+    let current = execution_store.tip()?;
+    if current.height == 0 {
+        return Err(BlockExecutionError::DisconnectGenesis);
+    }
+    let current_header = headers
+        .get(&current.hash)
+        .ok_or(BlockExecutionError::MissingExecutedHeader(current.hash))?;
+    let parent_hash = current_header.header.prev_blockhash;
+    let parent = headers
+        .get(&parent_hash)
+        .ok_or(BlockExecutionError::MissingExecutedHeader(parent_hash))?;
+    if parent.height.checked_add(1) != Some(current.height) {
+        return Err(BlockExecutionError::MissingExecutedHeader(parent_hash));
+    }
+    let transaction_undos = undo_store
+        .get(current.hash)?
+        .ok_or(BlockExecutionError::MissingUndo(current.hash))?;
+    let applied = AppliedBlock {
+        hash: current.hash,
+        transaction_undos,
+    };
+    disconnect_block(chainstate, &applied, now, hot_window_secs)?;
+    let parent_tip = ExecutionTip {
+        height: parent.height,
+        hash: parent.hash,
+    };
+    execution_store.rewind(current, parent_tip)?;
+    undo_store.remove(current.hash)?;
+    Ok(parent_tip)
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{
@@ -204,9 +257,9 @@ mod tests {
                 .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();
-        let block = block(genesis.hash, genesis.header.time + 1);
+        let active_block = block(genesis.hash, genesis.header.time + 1);
         let info = headers
-            .insert_contextual(block.header, block.header.time)
+            .insert_contextual(active_block.header, active_block.header.time)
             .unwrap();
 
         let applied = connect_active_block(
@@ -214,7 +267,7 @@ mod tests {
             &undo_store,
             &execution_store,
             &headers,
-            &block,
+            &active_block,
             1,
             60,
             BlockDeploymentContext::default(),
@@ -222,11 +275,33 @@ mod tests {
         .unwrap();
         assert_eq!(execution_store.tip().unwrap().hash, info.hash);
         assert!(undo_store.get(applied.hash).unwrap().is_some());
-        let coinbase_outpoint = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
+        let coinbase_outpoint =
+            OutPointKey::from(OutPoint::new(active_block.txdata[0].compute_txid(), 0));
         assert!(
             crate::utxo::UtxoStore::get(&chainstate, coinbase_outpoint)
                 .unwrap()
                 .is_some()
+        );
+
+        let side_one = block(genesis.hash, genesis.header.time + 2);
+        let side_one_info = headers
+            .insert_contextual(side_one.header, side_one.header.time)
+            .unwrap();
+        let side_two = block(side_one_info.hash, side_one.header.time + 1);
+        headers
+            .insert_contextual(side_two.header, side_two.header.time)
+            .unwrap();
+        assert_ne!(headers.active_header_at(1).unwrap().hash, info.hash);
+
+        let rewound =
+            disconnect_execution_tip(&chainstate, &undo_store, &execution_store, &headers, 2, 60)
+                .unwrap();
+        assert_eq!(rewound.height, 0);
+        assert!(undo_store.get(applied.hash).unwrap().is_none());
+        assert!(
+            crate::utxo::UtxoStore::get(&chainstate, coinbase_outpoint)
+                .unwrap()
+                .is_none()
         );
     }
 }

@@ -11,7 +11,7 @@ use std::{
 
 use bitcoin::{BlockHash, Network, hashes::Hash};
 use rbtc::{
-    block_execution::{BlockDeploymentContext, connect_active_block},
+    block_execution::{BlockDeploymentContext, connect_active_block, disconnect_execution_tip},
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
@@ -180,6 +180,29 @@ async fn sync_regtest_node(
         RedbUndoStore::open(data_dir.join("undo.redb")).map_err(|error| error.to_string())?;
     let execution_store = RedbExecutionStore::open(data_dir.join("execution.redb"), network)
         .map_err(|error| error.to_string())?;
+
+    loop {
+        let tip = execution_store.tip().map_err(|error| error.to_string())?;
+        if headers
+            .active_header_at(tip.height)
+            .is_some_and(|header| header.hash == tip.hash)
+        {
+            break;
+        }
+        let rewound = disconnect_execution_tip(
+            &chainstate,
+            &undo_store,
+            &execution_store,
+            &headers,
+            u64::from(unix_time()?),
+            DEFAULT_HOT_WINDOW_SECS,
+        )
+        .map_err(|error| error.to_string())?;
+        println!(
+            "disconnected stale execution tip; rewound to {}:{}",
+            rewound.height, rewound.hash
+        );
+    }
 
     loop {
         let tip = execution_store.tip().map_err(|error| error.to_string())?;
