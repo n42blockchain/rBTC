@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// Consensus deployments selected for a candidate block.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockDeploymentContext {
     /// Explicit libbitcoinconsensus script verification flags.
     pub script_flags: u32,
@@ -27,6 +27,8 @@ pub struct BlockDeploymentContext {
     pub csv_active: bool,
     /// Whether this is one of the two historical mainnet BIP30 exceptions.
     pub bip30_exception: bool,
+    /// Maximum proof-of-work subsidy for this candidate height.
+    pub subsidy_sats: u64,
 }
 
 /// Failures while connecting one downloaded active-chain block.
@@ -271,6 +273,7 @@ pub fn connect_active_block<S: UtxoStore>(
         deployments.script_flags,
         deployments.bip34_active,
         deployments.csv_active,
+        deployments.subsidy_sats,
     ) {
         Ok(applied) => applied,
         Err(error) => return Err(BlockExecutionError::Block(error)),
@@ -609,6 +612,7 @@ mod tests {
     use super::*;
     use crate::{
         blockchain::block_subsidy,
+        deployments::block_deployment_context,
         headers::HeaderDag,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
@@ -659,6 +663,16 @@ mod tests {
 
     fn block(parent: BlockHash, time: u32) -> Block {
         block_with_transactions(parent, time, vec![coinbase(1)])
+    }
+
+    fn deployments(height: u32) -> BlockDeploymentContext {
+        block_deployment_context(
+            Network::Regtest,
+            height,
+            BlockHash::all_zeros(),
+            u32::MAX,
+            true,
+        )
     }
 
     struct CountingStore<'a> {
@@ -739,7 +753,7 @@ mod tests {
             &active_block,
             1,
             60,
-            BlockDeploymentContext::default(),
+            deployments(1),
         )
         .unwrap();
         assert_eq!(execution_store.tip().unwrap().hash, info.hash);
@@ -836,7 +850,7 @@ mod tests {
             &active_block,
             1,
             60,
-            BlockDeploymentContext::default(),
+            deployments(1),
         )
         .unwrap();
 
@@ -970,7 +984,7 @@ mod tests {
                 &block,
                 1,
                 60,
-                BlockDeploymentContext::default(),
+                deployments(1),
             ),
             Err(BlockExecutionError::Bip30Collision(key)) if key == collision
         ));
@@ -986,7 +1000,7 @@ mod tests {
             60,
             BlockDeploymentContext {
                 bip30_exception: true,
-                ..BlockDeploymentContext::default()
+                ..deployments(1)
             },
         )
         .unwrap();

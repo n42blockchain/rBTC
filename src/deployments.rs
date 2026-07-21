@@ -9,7 +9,10 @@ use std::str::FromStr;
 use bitcoin::{BlockHash, Network};
 use thiserror::Error;
 
-use crate::{block_execution::BlockDeploymentContext, headers::HeaderDag};
+use crate::{
+    block_execution::BlockDeploymentContext, blockchain::block_subsidy_with_interval,
+    headers::HeaderDag,
+};
 
 const VERSION_BITS_TOP_MASK: u32 = 0xE000_0000;
 const VERSION_BITS_TOP_BITS: u32 = 0x2000_0000;
@@ -19,6 +22,8 @@ const TAPROOT_TIMEOUT: u32 = 1_628_640_000;
 const ALWAYS_ACTIVE: i64 = -1;
 const NEVER_ACTIVE: i64 = -2;
 const CONFIG_ENCODING_VERSION: u8 = 1;
+const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
+const REGTEST_HALVING_INTERVAL: u32 = 150;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThresholdState {
@@ -170,12 +175,14 @@ pub fn block_deployment_context(
     taproot_active: bool,
 ) -> BlockDeploymentContext {
     let bip30_exception = is_bip30_exception(network, height, block_hash);
+    let subsidy_sats = block_subsidy_with_interval(height, halving_interval(network));
     if let Some(script_flags) = script_flag_exception(network, block_hash) {
         return BlockDeploymentContext {
             script_flags,
             bip34_active: height >= activation_heights(network).bip34,
             csv_active: height >= activation_heights(network).csv,
             bip30_exception,
+            subsidy_sats,
         };
     }
     let heights = activation_heights(network);
@@ -203,6 +210,16 @@ pub fn block_deployment_context(
         bip34_active: height >= heights.bip34,
         csv_active: height >= heights.csv,
         bip30_exception,
+        subsidy_sats,
+    }
+}
+
+const fn halving_interval(network: Network) -> u32 {
+    match network {
+        Network::Regtest => REGTEST_HALVING_INTERVAL,
+        Network::Bitcoin | Network::Testnet | Network::Testnet4 | Network::Signet => {
+            BITCOIN_HALVING_INTERVAL
+        }
     }
 }
 
@@ -413,6 +430,19 @@ mod tests {
         );
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_TAPROOT, 0);
+    }
+
+    #[test]
+    fn network_subsidy_halving_intervals_match_core() {
+        let hash = BlockHash::all_zeros();
+        let regtest_before = block_deployment_context(Network::Regtest, 149, hash, 0, true);
+        let regtest_after = block_deployment_context(Network::Regtest, 150, hash, 0, true);
+        let mainnet_early = block_deployment_context(Network::Bitcoin, 150, hash, 0, false);
+        let mainnet_after = block_deployment_context(Network::Bitcoin, 210_000, hash, 0, false);
+        assert_eq!(regtest_before.subsidy_sats, 50 * 100_000_000);
+        assert_eq!(regtest_after.subsidy_sats, 25 * 100_000_000);
+        assert_eq!(mainnet_early.subsidy_sats, 50 * 100_000_000);
+        assert_eq!(mainnet_after.subsidy_sats, 25 * 100_000_000);
     }
 
     #[test]

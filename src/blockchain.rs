@@ -16,7 +16,7 @@ use crate::{
 pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
 /// Maximum consensus signature-operation cost per block.
 pub const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
-const HALVING_INTERVAL: u32 = 210_000;
+const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const INITIAL_SUBSIDY_SATS: u64 = 50 * 100_000_000;
 
 /// Reorg data produced by a successfully applied block.
@@ -153,6 +153,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
         script_flags,
         bip34_active,
         false,
+        block_subsidy(height),
     )
 }
 
@@ -181,6 +182,7 @@ pub fn apply_block_with_context<S: UtxoStore>(
         script_flags,
         bip34_active,
         false,
+        block_subsidy(height),
     )
 }
 
@@ -189,6 +191,8 @@ pub fn apply_block_with_context<S: UtxoStore>(
 /// `csv_active` enables the BIP68 relative sequence locks and changes absolute
 /// lock-time evaluation to BIP113 parent-MTP semantics. Before activation,
 /// absolute lock-time is compared with the candidate header timestamp.
+/// `subsidy_sats` must come from the selected network's consensus parameters
+/// at `height`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_block_with_deployments<S: UtxoStore>(
     store: &S,
@@ -200,6 +204,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     script_flags: u32,
     bip34_active: bool,
     csv_active: bool,
+    subsidy_sats: u64,
 ) -> Result<AppliedBlock, BlockError> {
     validate_block_structure(block, height, script_flags, bip34_active)?;
 
@@ -245,7 +250,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
         fees.checked_add(transaction.input_value_sats - transaction.output_value_sats)
             .ok_or(BlockError::FeeOverflow)
     })?;
-    let allowed = block_subsidy(height)
+    let allowed = subsidy_sats
         .checked_add(fees)
         .ok_or(BlockError::FeeOverflow)?;
     if applied[0].output_value_sats > allowed {
@@ -396,10 +401,23 @@ pub fn disconnect_block<S: UtxoStore>(
     Ok(())
 }
 
-/// Returns the fixed block subsidy at `height`, excluding transaction fees.
+/// Returns the Bitcoin 210,000-block-interval subsidy, excluding fees.
+///
+/// Network-aware execution should use its candidate deployment context; this
+/// helper preserves the public Bitcoin/mainnet calculation used by callers.
 #[must_use]
 pub const fn block_subsidy(height: u32) -> u64 {
-    let halvings = height / HALVING_INTERVAL;
+    block_subsidy_with_interval(height, BITCOIN_HALVING_INTERVAL)
+}
+
+/// Returns the proof-of-work subsidy for a network-specific halving interval.
+///
+/// The interval is a consensus parameter: Bitcoin, testnet, and signet use
+/// 210,000 blocks, while Bitcoin Core regtest uses 150 blocks.
+#[must_use]
+pub const fn block_subsidy_with_interval(height: u32, halving_interval: u32) -> u64 {
+    assert!(halving_interval != 0, "halving interval must be non-zero");
+    let halvings = height / halving_interval;
     if halvings >= 64 {
         0
     } else {
@@ -627,6 +645,7 @@ mod tests {
             0,
             false,
             false,
+            block_subsidy(101),
         )
         .unwrap();
 
@@ -643,6 +662,7 @@ mod tests {
                 0,
                 false,
                 true,
+                block_subsidy(101),
             ),
             Err(BlockError::Transaction {
                 index: 1,
@@ -663,5 +683,32 @@ mod tests {
             apply_block_with_bip34(&store, &bad, 10, 100, 0, 60, 0, true),
             Err(BlockError::Bip34Height { height: 10 })
         ));
+    }
+
+    #[test]
+    fn candidate_subsidy_is_a_consensus_parameter() {
+        let (_dir, store) = store();
+        let candidate = block(vec![coinbase()]);
+        let regtest_subsidy = block_subsidy_with_interval(150, 150);
+        assert_eq!(regtest_subsidy, 25 * 100_000_000);
+        assert!(matches!(
+            apply_block_with_deployments(
+                &store,
+                &candidate,
+                150,
+                0,
+                0,
+                60,
+                0,
+                false,
+                false,
+                regtest_subsidy,
+            ),
+            Err(BlockError::ExcessCoinbase {
+                claimed: 5_000_000_000,
+                allowed: 2_500_000_000,
+            })
+        ));
+        assert!(store.snapshot_entries().unwrap().is_empty());
     }
 }
