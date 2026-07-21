@@ -34,7 +34,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-For the current safety-gated regtest daemon, `rbtcd --connect HOST:PORT --network regtest --data-dir PATH` stays attached and polls the peer for new headers every 30 seconds. Add `--once` for a bounded sync-and-exit run.
+For the current safety-gated regtest daemon, `rbtcd --connect HOST:PORT --network regtest --data-dir PATH` stays attached and polls the peer for new headers every 30 seconds. Add `--once` for a bounded sync-and-exit run. Add `--explorer-listen 127.0.0.1:3000` to serve the embedded read-only explorer and REST API; non-loopback binds are rejected until authentication is implemented.
 
 ## API boundary
 

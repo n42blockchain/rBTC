@@ -11,7 +11,8 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::Html,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -144,11 +145,38 @@ pub struct Health {
 /// Creates REST routes for the embedded read-only block explorer.
 pub fn explorer_router<I: ExplorerIndex>(index: Arc<I>) -> Router {
     Router::new()
+        .route("/", get(explorer_page))
         .route("/api/v1/health", get(health))
         .route("/api/v1/blocks/{height}", get(block::<I>))
         .route("/api/v1/tx/{txid}", get(transaction::<I>))
         .route("/api/v1/address/{address}/utxos", get(address_utxos::<I>))
         .with_state(index)
+}
+
+const EXPLORER_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>rBTC Explorer</title><style>
+:root{color-scheme:dark;background:#0b0f14;color:#d9e2ec;font:15px system-ui,sans-serif}body{max-width:900px;margin:0 auto;padding:32px 20px}h1{color:#f7931a}section{background:#131a22;border:1px solid #263241;border-radius:10px;padding:18px;margin:16px 0}form{display:flex;gap:8px}input{flex:1;background:#0b0f14;color:inherit;border:1px solid #405166;border-radius:6px;padding:10px}button{background:#f7931a;color:#111;border:0;border-radius:6px;padding:10px 16px;font-weight:700}pre{white-space:pre-wrap;word-break:break-word;min-height:24px}.muted{color:#91a4b7}</style></head>
+<body><h1>rBTC Explorer</h1><p class="muted">Local, read-only active-chain explorer</p>
+<section><h2>Block height</h2><form data-kind="blocks"><input inputmode="numeric" required placeholder="Height"><button>Search</button></form><pre></pre></section>
+<section><h2>Transaction</h2><form data-kind="tx"><input required placeholder="txid"><button>Search</button></form><pre></pre></section>
+<section><h2>Address UTXOs</h2><form data-kind="address"><input required placeholder="Checked Bitcoin address"><button>Search</button></form><pre></pre></section>
+<script>for(const f of document.querySelectorAll('form'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
+</body></html>"#;
+
+async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    (headers, Html(EXPLORER_HTML))
 }
 
 /// Creates REST routes for the in-process descriptor wallet.
@@ -230,6 +258,13 @@ mod tests {
     #[tokio::test]
     async fn explorer_returns_health_and_not_found() {
         let app = explorer_router(Arc::new(TestIndex));
+        let page = app
+            .clone()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(page.headers().contains_key(header::CONTENT_SECURITY_POLICY));
         let health = app
             .clone()
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())

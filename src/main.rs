@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     process,
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,7 @@ use bitcoin::{
     hashes::Hash,
 };
 use rbtc::{
+    api::explorer_router,
     block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
     blockchain::{AppliedBlock, validate_block_structure},
     deployments::{block_deployment_context, taproot_active},
@@ -39,6 +41,62 @@ struct Options {
     headers_db: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     once: bool,
+    explorer_listen: Option<SocketAddr>,
+}
+
+struct ExplorerServer {
+    #[cfg(test)]
+    address: SocketAddr,
+    task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl ExplorerServer {
+    async fn bind(address: SocketAddr, index: Arc<RedbExplorerIndex>) -> Result<Self, String> {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|error| format!("bind explorer at {address}: {error}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|error| format!("read explorer address: {error}"))?;
+        println!("embedded explorer listening on http://{bound}");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, explorer_router(index))
+                .await
+                .map_err(|error| format!("explorer server: {error}"))
+        });
+        Ok(Self {
+            #[cfg(test)]
+            address: bound,
+            task: Some(task),
+        })
+    }
+
+    #[cfg(test)]
+    const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    async fn ensure_running(&mut self) -> Result<(), String> {
+        let Some(task) = self.task.as_ref() else {
+            return Err("explorer server task missing".to_owned());
+        };
+        if !task.is_finished() {
+            return Ok(());
+        }
+        self.task
+            .take()
+            .expect("finished explorer task exists")
+            .await
+            .map_err(|error| format!("explorer server task: {error}"))?
+    }
+}
+
+impl Drop for ExplorerServer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -114,7 +172,14 @@ async fn run(options: Options) -> Result<(), String> {
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
-        return sync_regtest_node(&mut session, options.network, path, options.once).await;
+        return sync_regtest_node(
+            &mut session,
+            options.network,
+            path,
+            options.once,
+            options.explorer_listen,
+        )
+        .await;
     }
 
     if let Some(path) = options.headers_db {
@@ -175,11 +240,13 @@ async fn sync_headers(
     Ok(dag)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn sync_regtest_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
     data_dir: PathBuf,
     once: bool,
+    explorer_listen: Option<SocketAddr>,
 ) -> Result<(), String> {
     if network != Network::Regtest {
         return Err(
@@ -190,7 +257,6 @@ async fn sync_regtest_node(
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     let headers_path = data_dir.join("headers.redb");
-    let mut headers = sync_headers(session, network, headers_path.clone()).await?;
     let chainstate =
         RedbUtxoStore::open(data_dir.join("chainstate.redb")).map_err(|error| error.to_string())?;
     let undo_store =
@@ -199,8 +265,15 @@ async fn sync_regtest_node(
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
-    let explorer = RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
-        .map_err(|error| error.to_string())?;
+    let explorer = Arc::new(
+        RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
+            .map_err(|error| error.to_string())?,
+    );
+    let mut explorer_server = match explorer_listen {
+        Some(address) => Some(ExplorerServer::bind(address, Arc::clone(&explorer)).await?),
+        None => None,
+    };
+    let mut headers = sync_headers(session, network, headers_path.clone()).await?;
     if recover_pending_transition(
         &chainstate,
         &undo_store,
@@ -214,7 +287,13 @@ async fn sync_regtest_node(
     }
 
     'resync: loop {
+        if let Some(server) = &mut explorer_server {
+            server.ensure_running().await?;
+        }
         loop {
+            if let Some(server) = &mut explorer_server {
+                server.ensure_running().await?;
+            }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             if headers
                 .active_header_at(tip.height)
@@ -250,6 +329,9 @@ async fn sync_regtest_node(
         .await?;
 
         loop {
+            if let Some(server) = &mut explorer_server {
+                server.ensure_running().await?;
+            }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             if tip.height >= headers.active_tip().height {
                 println!("block execution caught up at height {}", tip.height);
@@ -674,6 +756,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut headers_db = None;
     let mut data_dir = None;
     let mut once = false;
+    let mut explorer_listen = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -716,11 +799,29 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     })?));
             }
             "--once" => once = true,
+            "--explorer-listen" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--explorer-listen requires IP:PORT".to_owned())?;
+                let address: SocketAddr = value
+                    .parse()
+                    .map_err(|_| format!("invalid explorer listen address: {value}"))?;
+                if !address.ip().is_loopback() {
+                    return Err(
+                        "--explorer-listen must use a loopback IP until authentication is enabled"
+                            .to_owned(),
+                    );
+                }
+                explorer_listen = Some(address);
+            }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
 
     let remote = remote.ok_or_else(|| "--connect is required".to_owned())?;
+    if explorer_listen.is_some() && data_dir.is_none() {
+        return Err("--explorer-listen requires --data-dir".to_owned());
+    }
     Ok(Some(Options {
         remote,
         network,
@@ -728,12 +829,13 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         headers_db,
         data_dir,
         once,
+        explorer_listen,
     }))
 }
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -761,6 +863,7 @@ mod tests {
         utxo::{OutPointKey, RedbUtxoStore, UtxoStore},
     };
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn peer_version(nonce: u64) -> VersionMessage {
@@ -845,6 +948,65 @@ mod tests {
         assert!(options.headers_db.is_none());
         assert!(options.data_dir.is_none());
         assert!(!options.once);
+        assert!(options.explorer_listen.is_none());
+
+        let served = parse_options(
+            [
+                "--connect",
+                "127.0.0.1:18444",
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-test",
+                "--explorer-listen",
+                "127.0.0.1:0",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(served.explorer_listen, Some("127.0.0.1:0".parse().unwrap()));
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--explorer-listen",
+                    "0.0.0.0:3000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_explorer_serves_the_static_page_on_loopback() {
+        let directory = TempDir::new().unwrap();
+        let index = Arc::new(
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap(),
+        );
+        let server = ExplorerServer::bind("127.0.0.1:0".parse().unwrap(), index)
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect(server.address())
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-security-policy:"));
+        assert!(response.contains("<title>rBTC Explorer</title>"));
     }
 
     #[tokio::test]
@@ -889,6 +1051,7 @@ mod tests {
             headers_db: Some(header_path.clone()),
             data_dir: None,
             once: true,
+            explorer_listen: None,
         })
         .await
         .unwrap();
@@ -960,6 +1123,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
+            explorer_listen: None,
         })
         .await
         .unwrap();
@@ -1029,6 +1193,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
+            explorer_listen: None,
         })
         .await
         .unwrap();
@@ -1088,6 +1253,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
+            explorer_listen: None,
         })
         .await
         .unwrap();
