@@ -354,6 +354,19 @@ const fn activation_heights(network: Network) -> ActivationHeights {
     }
 }
 
+pub(crate) const fn minimum_block_version(network: Network, height: u32) -> i32 {
+    let heights = activation_heights(network);
+    if height >= heights.bip65 {
+        4
+    } else if height >= heights.bip66 {
+        3
+    } else if height >= heights.bip34 {
+        2
+    } else {
+        1
+    }
+}
+
 fn script_flag_exception(network: Network, hash: BlockHash) -> Option<u32> {
     let exception = match network {
         Network::Bitcoin
@@ -487,7 +500,7 @@ mod tests {
                             .expect("version-bits value fits i32"),
                     )
                 } else {
-                    Version::ONE
+                    Version::from_consensus(4)
                 },
                 prev_blockhash: parent.hash,
                 merkle_root: TxMerkleNode::all_zeros(),
@@ -554,7 +567,7 @@ mod tests {
                             .expect("version-bits value fits i32"),
                     )
                 } else {
-                    Version::ONE
+                    Version::from_consensus(4)
                 },
                 prev_blockhash: parent.hash,
                 merkle_root: TxMerkleNode::all_zeros(),

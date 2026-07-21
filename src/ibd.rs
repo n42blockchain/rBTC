@@ -171,7 +171,7 @@ mod tests {
     fn mine_child(headers: &mut HeaderDag) -> BlockHash {
         let parent = headers.active_tip();
         let mut header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: parent.hash,
             merkle_root: TxMerkleNode::all_zeros(),
             time: parent.header.time + 1,
@@ -217,7 +217,7 @@ mod tests {
         let active = mine_child(&mut headers);
         let genesis = headers.active_header_at(0).unwrap();
         let mut side_header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: genesis.hash,
             merkle_root: TxMerkleNode::all_zeros(),
             time: genesis.header.time + 2,

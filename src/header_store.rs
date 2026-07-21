@@ -208,7 +208,7 @@ mod tests {
     fn mine_child(parent: BlockHash, time: u32) -> Header {
         let target = Target::MAX_ATTAINABLE_REGTEST;
         let mut header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: parent,
             merkle_root: TxMerkleNode::all_zeros(),
             time,

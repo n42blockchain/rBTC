@@ -14,6 +14,8 @@ use bitcoin::{
 };
 use thiserror::Error;
 
+use crate::deployments::minimum_block_version;
+
 /// Bitcoin Core's maximum permitted future block timestamp offset.
 pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
 
@@ -84,6 +86,16 @@ pub enum HeaderError {
         expected: BlockHash,
         /// Candidate header hash.
         actual: BlockHash,
+    },
+    /// A buried deployment requires a newer block-header version.
+    #[error("obsolete block version {actual} at height {height}; minimum version is {required}")]
+    ObsoleteVersion {
+        /// Candidate height.
+        height: u32,
+        /// Minimum version selected by buried deployments.
+        required: i32,
+        /// Candidate's signed consensus version.
+        actual: i32,
     },
 }
 
@@ -280,6 +292,19 @@ impl HeaderDag {
             .get(&header.prev_blockhash)
             .copied()
             .ok_or(HeaderError::UnknownParent(header.prev_blockhash))?;
+        let height = parent
+            .height
+            .checked_add(1)
+            .ok_or(HeaderError::HeightOverflow)?;
+        let required_version = minimum_block_version(self.params.network, height);
+        let actual_version = header.version.to_consensus();
+        if actual_version < required_version {
+            return Err(HeaderError::ObsoleteVersion {
+                height,
+                required: required_version,
+                actual: actual_version,
+            });
+        }
         let median = self
             .median_time_past(parent.hash)
             .expect("known parent has a median timestamp");
@@ -426,7 +451,7 @@ mod tests {
     fn mine_child(parent: BlockHash, time: u32) -> Header {
         let target = Params::new(Network::Regtest).max_attainable_target;
         let mut header = Header {
-            version: Version::ONE,
+            version: Version::from_consensus(4),
             prev_blockhash: parent,
             merkle_root: TxMerkleNode::all_zeros(),
             time,
@@ -473,6 +498,35 @@ mod tests {
         ));
         let valid = mine_child(genesis.hash, median + 1);
         assert_eq!(dag.insert_contextual(valid, median + 1).unwrap().height, 1);
+    }
+
+    #[test]
+    fn contextual_insert_enforces_buried_minimum_block_versions() {
+        assert_eq!(minimum_block_version(Network::Bitcoin, 227_930), 1);
+        assert_eq!(minimum_block_version(Network::Bitcoin, 227_931), 2);
+        assert_eq!(minimum_block_version(Network::Bitcoin, 363_725), 3);
+        assert_eq!(minimum_block_version(Network::Bitcoin, 388_381), 4);
+        assert_eq!(minimum_block_version(Network::Testnet, 21_111), 2);
+        assert_eq!(minimum_block_version(Network::Testnet, 330_776), 3);
+        assert_eq!(minimum_block_version(Network::Testnet, 581_885), 4);
+
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let target = Target::MAX_ATTAINABLE_REGTEST;
+        let mut obsolete = mine_child(genesis.hash, genesis.header.time + 1);
+        obsolete.version = Version::from_consensus(3);
+        obsolete.nonce = 0;
+        while obsolete.validate_pow(target).is_err() {
+            obsolete.nonce = obsolete.nonce.checked_add(1).unwrap();
+        }
+        assert!(matches!(
+            dag.insert_contextual(obsolete, genesis.header.time + 1),
+            Err(HeaderError::ObsoleteVersion {
+                height: 1,
+                required: 4,
+                actual: 3
+            })
+        ));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::{
         MAX_UTXO_PAGE_SIZE,
     },
     blockchain::AppliedBlock,
+    chainstate::is_unspendable,
     execution_store::ExecutionTip,
     utxo::OutPointKey,
 };
@@ -227,6 +228,9 @@ impl RedbExplorerIndex {
                 )?;
 
                 for (vout, output) in bitcoin_tx.output.iter().enumerate() {
+                    if is_unspendable(&output.script_pubkey) {
+                        continue;
+                    }
                     let vout = u32::try_from(vout)
                         .map_err(|_| ExplorerStoreError::Invalid("output index"))?;
                     let outpoint = OutPointKey::from(bitcoin::OutPoint::new(txid, vout));
@@ -518,6 +522,43 @@ mod tests {
                 0,
             ))],
         )
+    }
+
+    #[test]
+    fn explorer_does_not_publish_provably_unspendable_outputs_as_utxos() {
+        let directory = TempDir::new().unwrap();
+        let index =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = index.tip().unwrap();
+        let script = ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([9; 20]));
+        let mut coinbase = transaction(None, script.clone());
+        coinbase.output.insert(
+            0,
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x01]),
+            },
+        );
+        let spendable = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 1));
+        let block = block(genesis.hash, 1, vec![coinbase]);
+        index
+            .connect(
+                1,
+                &block,
+                &AppliedBlock {
+                    hash: block.block_hash(),
+                    transaction_undos: vec![UtxoUndo::new(Vec::new(), vec![spendable])],
+                },
+            )
+            .unwrap();
+
+        let read = index.db.begin_read().unwrap();
+        let utxos = read.open_table(ADDRESS_UTXOS).unwrap();
+        assert_eq!(utxos.iter().unwrap().count(), 1);
+        drop(utxos);
+        drop(read);
+        assert_eq!(index.disconnect_tip().unwrap(), genesis);
     }
 
     #[test]

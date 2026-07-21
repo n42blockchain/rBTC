@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{
     blockchain::{AppliedBlock, BlockError, apply_block_with_deployments, disconnect_block},
     chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
+    chainstate::is_unspendable,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
@@ -575,7 +576,10 @@ fn block_output_collisions<S: UtxoStore>(
     let mut collisions = BTreeSet::new();
     for transaction in &block.txdata {
         let txid = transaction.compute_txid();
-        for vout in 0..transaction.output.len() {
+        for (vout, output) in transaction.output.iter().enumerate() {
+            if is_unspendable(&output.script_pubkey) {
+                continue;
+            }
             let vout = u32::try_from(vout).map_err(|_| UtxoError::Malformed("output index"))?;
             let outpoint = OutPointKey::from(OutPoint::new(txid, vout));
             if chainstate.get(outpoint)?.is_some() {
@@ -676,7 +680,7 @@ mod tests {
     ) -> Block {
         let mut block = Block {
             header: Header {
-                version: HeaderVersion::ONE,
+                version: HeaderVersion::from_consensus(4),
                 prev_blockhash: parent,
                 merkle_root: TxMerkleNode::all_zeros(),
                 time,

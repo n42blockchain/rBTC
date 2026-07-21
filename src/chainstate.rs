@@ -14,6 +14,7 @@ use crate::{
 pub const COINBASE_MATURITY: u32 = 100;
 /// Total bitcoin supply cap in satoshis.
 pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
+const MAX_SCRIPT_SIZE: usize = 10_000;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_FFFF;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
@@ -397,6 +398,7 @@ fn created_outputs(
         .output
         .iter()
         .enumerate()
+        .filter(|(_, output)| !is_unspendable(&output.script_pubkey))
         .map(|(vout, output)| {
             let vout = u32::try_from(vout).expect("transaction output count fits u32");
             (
@@ -412,6 +414,11 @@ fn created_outputs(
             )
         })
         .collect()
+}
+
+/// Matches Bitcoin Core's `CScript::IsUnspendable` UTXO-pruning predicate.
+pub(crate) fn is_unspendable(script: &Script) -> bool {
+    script.is_op_return() || script.len() > MAX_SCRIPT_SIZE
 }
 
 #[cfg(test)]
@@ -498,6 +505,34 @@ mod tests {
         assert_eq!(applied.undo.created(), &[key]);
         store.undo(&applied.undo, 100, 60).unwrap();
         assert!(store.get(key).unwrap().is_none());
+    }
+
+    #[test]
+    fn provably_unspendable_outputs_affect_value_but_not_the_utxo_set() {
+        let (_dir, store) = store();
+        let mut transaction = coinbase(vec![1, 2]);
+        transaction.output = vec![
+            TxOut {
+                value: Amount::from_sat(7),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x01]),
+            },
+            TxOut {
+                value: Amount::from_sat(11),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ];
+        let applied = apply_transaction(&store, &transaction, 10, 100, 99, 100, 0).unwrap();
+        let unspendable = OutPointKey::from(OutPoint::new(transaction.compute_txid(), 0));
+        let spendable = OutPointKey::from(OutPoint::new(transaction.compute_txid(), 1));
+
+        assert_eq!(applied.output_value_sats, 18);
+        assert!(store.get(unspendable).unwrap().is_none());
+        assert!(store.get(spendable).unwrap().is_some());
+        assert_eq!(applied.undo.created(), &[spendable]);
+
+        assert!(is_unspendable(Script::from_bytes(&[0x6a])));
+        assert!(is_unspendable(Script::from_bytes(&[0x51; 10_001])));
+        assert!(!is_unspendable(Script::from_bytes(&[0x65])));
     }
 
     #[test]
