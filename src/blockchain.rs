@@ -1,6 +1,10 @@
 //! Atomic block-to-chainstate transition checks.
 
-use bitcoin::Block;
+use bitcoin::{
+    Block, TxMerkleNode,
+    consensus::Encodable,
+    hashes::{Hash, sha256d},
+};
 use thiserror::Error;
 
 use crate::{
@@ -37,6 +41,9 @@ pub enum BlockError {
     /// Header's Merkle root does not commit to the supplied transactions.
     #[error("block merkle root mismatch")]
     MerkleRoot,
+    /// The transaction Merkle tree contains an ambiguous duplicated branch.
+    #[error("block transaction merkle tree is mutated")]
+    MutatedMerkleTree,
     /// A SegWit witness commitment is missing or does not match the transaction data.
     #[error("block witness commitment mismatch")]
     WitnessCommitment,
@@ -195,8 +202,12 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     {
         return Err(BlockError::MultipleCoinbase);
     }
-    if !block.check_merkle_root() {
+    let (merkle_root, mutated) = transaction_merkle_root(block);
+    if merkle_root != Some(block.header.merkle_root) {
         return Err(BlockError::MerkleRoot);
+    }
+    if mutated {
+        return Err(BlockError::MutatedMerkleTree);
     }
     if !block.check_witness_commitment() {
         return Err(BlockError::WitnessCommitment);
@@ -251,6 +262,37 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
             .map(|transaction| transaction.undo)
             .collect(),
     })
+}
+
+fn transaction_merkle_root(block: &Block) -> (Option<TxMerkleNode>, bool) {
+    let mut hashes = block
+        .txdata
+        .iter()
+        .map(|transaction| transaction.compute_txid().to_raw_hash())
+        .collect::<Vec<_>>();
+    if hashes.is_empty() {
+        return (None, false);
+    }
+    let mut mutated = false;
+    while hashes.len() > 1 {
+        let mut parents = Vec::with_capacity(hashes.len().div_ceil(2));
+        for pair in hashes.chunks(2) {
+            let left = pair[0];
+            let right = pair.get(1).copied().unwrap_or(left);
+            if pair.len() == 2 && left == right {
+                mutated = true;
+            }
+            let mut engine = sha256d::Hash::engine();
+            left.consensus_encode(&mut engine)
+                .expect("hash engines do not fail");
+            right
+                .consensus_encode(&mut engine)
+                .expect("hash engines do not fail");
+            parents.push(sha256d::Hash::from_engine(engine));
+        }
+        hashes = parents;
+    }
+    (Some(hashes[0].into()), mutated)
 }
 
 fn coinbase_has_height(transaction: &bitcoin::Transaction, height: u32) -> bool {
@@ -422,6 +464,32 @@ mod tests {
             apply_block(&store, &block, 0, 100, 0, 60, 0),
             Err(BlockError::WitnessCommitment)
         ));
+    }
+
+    #[test]
+    fn rejects_a_mutated_transaction_merkle_tree() {
+        let (_dir, store) = store();
+        let transaction = |value| Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let duplicate = transaction(2);
+        let block = block(vec![
+            coinbase(),
+            transaction(1),
+            duplicate.clone(),
+            duplicate,
+        ]);
+        assert!(matches!(
+            apply_block(&store, &block, 0, 100, 0, 60, 0),
+            Err(BlockError::MutatedMerkleTree)
+        ));
+        assert!(store.snapshot_entries().unwrap().is_empty());
     }
 
     #[test]
