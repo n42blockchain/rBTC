@@ -19,6 +19,7 @@ use crate::archive::{
 
 const INDEX_FILE: &str = "ledger-index.json";
 const TRUNCATE_FILE: &str = "ledger-truncate";
+const STAGED_FILE: &str = "ledger-staged.rblk";
 
 /// Default approximate one-week historical retention at ten-minute blocks.
 pub const DEFAULT_RETENTION_BLOCKS: u32 = 1_008;
@@ -41,7 +42,9 @@ impl Default for LedgerRetention {
         Self {
             max_blocks: DEFAULT_RETENTION_BLOCKS,
             max_bytes: DEFAULT_MAX_BYTES,
-            slots: 8,
+            // One slot per retained block preserves the full window even when
+            // a caught-up node receives and publishes one block at a time.
+            slots: 1_008,
         }
     }
 }
@@ -77,6 +80,15 @@ struct LedgerIndex {
     segments: Vec<Segment>,
 }
 
+/// Checksum-verified downloaded blocks awaiting ledger publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedSegment {
+    /// Archive metadata, including the first height and block count.
+    pub manifest: ArchiveManifest,
+    /// Consensus-serialized blocks in height order.
+    pub blocks: Vec<Vec<u8>>,
+}
+
 /// A rotating file-ring for locally retained, consensus-serialized blocks.
 pub struct PrunedBlockLedger {
     root: PathBuf,
@@ -103,6 +115,12 @@ impl PrunedBlockLedger {
         Ok(ledger)
     }
 
+    /// Returns the configured pruning bounds.
+    #[must_use]
+    pub const fn retention(&self) -> LedgerRetention {
+        self.retention
+    }
+
     /// Appends a contiguous segment, then rotates old slots until both bounds hold.
     ///
     /// The write uses a temporary file plus rename, so a sudden shutdown leaves
@@ -112,13 +130,120 @@ impl PrunedBlockLedger {
         first_height: u32,
         blocks: &[Vec<u8>],
     ) -> Result<ArchiveManifest, LedgerError> {
+        let _guard = self.lock();
+        self.append_locked(first_height, blocks)
+    }
+
+    /// Durably stages a downloaded segment before its chainstate transition.
+    ///
+    /// Only one segment may be staged. It is not visible through retained
+    /// reads until [`Self::commit_staged`] publishes its validated prefix.
+    pub fn stage(&self, first_height: u32, blocks: &[Vec<u8>]) -> Result<(), LedgerError> {
+        if blocks.is_empty() {
+            return Err(LedgerError::Invalid("empty staged segment"));
+        }
+        let block_count =
+            u32::try_from(blocks.len()).map_err(|_| LedgerError::Invalid("too many blocks"))?;
+        if block_count > self.retention.max_blocks {
+            return Err(LedgerError::Invalid(
+                "staged segment exceeds maximum blocks",
+            ));
+        }
+        let _guard = self.lock();
+        if self.staged_path().exists() {
+            return Err(LedgerError::Invalid("staged segment already exists"));
+        }
+        let temporary = self.root.join("ledger-staged.rblk.new");
+        write_archive(&temporary, first_height, blocks)?;
+        if fs::metadata(&temporary)?.len() > self.retention.max_bytes {
+            fs::remove_file(temporary)?;
+            return Err(LedgerError::Invalid("staged segment exceeds maximum bytes"));
+        }
+        File::open(&temporary)?.sync_all()?;
+        fs::rename(temporary, self.staged_path())?;
+        self.sync_directory()
+    }
+
+    /// Returns the checksum-verified segment awaiting publication, if any.
+    pub fn staged(&self) -> Result<Option<StagedSegment>, LedgerError> {
+        let _guard = self.lock();
+        match read_archive(self.staged_path()) {
+            Ok((manifest, blocks)) => Ok(Some(StagedSegment { manifest, blocks })),
+            Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Publishes the first `block_count` staged blocks and discards the rest.
+    ///
+    /// Repeating this after interruption is safe: if the same prefix is
+    /// already the retained ledger tip, its bytes are verified before the
+    /// staging file is removed.
+    pub fn commit_staged(&self, block_count: u32) -> Result<(), LedgerError> {
+        if block_count == 0 {
+            return Err(LedgerError::Invalid("empty staged commit"));
+        }
+        let _guard = self.lock();
+        let (manifest, blocks) = read_archive(self.staged_path())?;
+        if block_count > manifest.block_count {
+            return Err(LedgerError::Invalid("staged commit exceeds segment"));
+        }
+        let count = usize::try_from(block_count).expect("staged block count fits usize");
+        let prefix = &blocks[..count];
+        let index = self.read_index()?;
+        let retained_next = index
+            .segments
+            .last()
+            .map(segment_end_exclusive)
+            .transpose()?;
+        match retained_next {
+            None => {
+                self.append_locked(manifest.first_height, prefix)?;
+            }
+            Some(next) if next == manifest.first_height => {
+                self.append_locked(manifest.first_height, prefix)?;
+            }
+            Some(next)
+                if manifest.first_height.checked_add(block_count) == Some(next)
+                    && self.retained_bytes_match(&index, manifest.first_height, prefix)? => {}
+            Some(_) => {
+                return Err(LedgerError::Invalid(
+                    "staged segment does not extend ledger tip",
+                ));
+            }
+        }
+        fs::remove_file(self.staged_path())?;
+        self.sync_directory()
+    }
+
+    /// Removes an uncommitted staged segment, if one exists.
+    pub fn discard_staged(&self) -> Result<(), LedgerError> {
+        let _guard = self.lock();
+        match fs::remove_file(self.staged_path()) {
+            Ok(()) => self.sync_directory(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn append_locked(
+        &self,
+        first_height: u32,
+        blocks: &[Vec<u8>],
+    ) -> Result<ArchiveManifest, LedgerError> {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty segment"));
         }
-        let _guard = self.lock();
         let mut index = self.read_index()?;
         let block_count =
             u32::try_from(blocks.len()).map_err(|_| LedgerError::Invalid("too many blocks"))?;
+        if block_count > self.retention.max_blocks {
+            return Err(LedgerError::Invalid(
+                "single segment exceeds maximum blocks",
+            ));
+        }
         if let Some(last) = index.segments.last() {
             let expected = last
                 .first_height
@@ -136,8 +261,10 @@ impl PrunedBlockLedger {
         let manifest = write_archive(&temporary, first_height, blocks)?;
         let bytes = fs::metadata(&temporary)?.len();
         if bytes > self.retention.max_bytes {
+            fs::remove_file(temporary)?;
             return Err(LedgerError::Invalid("single segment exceeds maximum bytes"));
         }
+        File::open(&temporary)?.sync_all()?;
         fs::rename(&temporary, &destination)?;
         index.segments.push(Segment {
             first_height,
@@ -183,26 +310,7 @@ impl PrunedBlockLedger {
     pub fn read_block(&self, height: u32) -> Result<Option<Vec<u8>>, LedgerError> {
         let _guard = self.lock();
         let index = self.read_index()?;
-        let Some(segment) = index
-            .segments
-            .iter()
-            .find(|segment| segment_contains(segment, height))
-        else {
-            return Ok(None);
-        };
-        let (manifest, blocks) = read_archive(self.slot_path(segment.slot))?;
-        if manifest.first_height != segment.first_height
-            || manifest.block_count != segment.block_count
-        {
-            return Err(LedgerError::Invalid("archive does not match ledger index"));
-        }
-        let offset = usize::try_from(height - segment.first_height)
-            .expect("archive block offset fits usize");
-        blocks
-            .get(offset)
-            .cloned()
-            .map(Some)
-            .ok_or(LedgerError::Invalid("archive block missing"))
+        self.read_block_from_index(&index, height)
     }
 
     /// Removes every retained block at or above `first_removed_height`.
@@ -227,6 +335,9 @@ impl PrunedBlockLedger {
     }
     fn truncate_path(&self) -> PathBuf {
         self.root.join(TRUNCATE_FILE)
+    }
+    fn staged_path(&self) -> PathBuf {
+        self.root.join(STAGED_FILE)
     }
     fn read_index(&self) -> Result<LedgerIndex, LedgerError> {
         match fs::read(self.index_path()) {
@@ -376,6 +487,53 @@ impl PrunedBlockLedger {
         File::open(&self.root)?.sync_all()?;
         Ok(())
     }
+
+    fn retained_bytes_match(
+        &self,
+        index: &LedgerIndex,
+        first_height: u32,
+        expected: &[Vec<u8>],
+    ) -> Result<bool, LedgerError> {
+        for (offset, expected) in expected.iter().enumerate() {
+            let height = first_height
+                .checked_add(u32::try_from(offset).expect("staged block offset fits u32"))
+                .ok_or(LedgerError::Invalid("height overflow"))?;
+            let Some(actual) = self.read_block_from_index(index, height)? else {
+                return Ok(false);
+            };
+            if actual != *expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn read_block_from_index(
+        &self,
+        index: &LedgerIndex,
+        height: u32,
+    ) -> Result<Option<Vec<u8>>, LedgerError> {
+        let Some(segment) = index
+            .segments
+            .iter()
+            .find(|segment| segment_contains(segment, height))
+        else {
+            return Ok(None);
+        };
+        let (manifest, blocks) = read_archive(self.slot_path(segment.slot))?;
+        if manifest.first_height != segment.first_height
+            || manifest.block_count != segment.block_count
+        {
+            return Err(LedgerError::Invalid("archive does not match ledger index"));
+        }
+        let offset = usize::try_from(height - segment.first_height)
+            .expect("archive block offset fits usize");
+        blocks
+            .get(offset)
+            .cloned()
+            .map(Some)
+            .ok_or(LedgerError::Invalid("archive block missing"))
+    }
 }
 
 fn valid_index(index: &LedgerIndex, scanned: &[Segment], slots: u16) -> bool {
@@ -408,6 +566,13 @@ fn segment_end_inclusive(segment: &Segment) -> Result<u32, LedgerError> {
     segment
         .first_height
         .checked_add(offset)
+        .ok_or(LedgerError::Invalid("height overflow"))
+}
+
+fn segment_end_exclusive(segment: &Segment) -> Result<u32, LedgerError> {
+    segment
+        .first_height
+        .checked_add(segment.block_count)
         .ok_or(LedgerError::Invalid("height overflow"))
 }
 
@@ -597,5 +762,57 @@ mod tests {
         assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
         assert_eq!(ledger.read_block(12).unwrap(), Some(vec![12]));
         assert_eq!(ledger.read_block(13).unwrap(), None);
+    }
+
+    #[test]
+    fn staged_blocks_are_hidden_until_a_validated_prefix_is_committed() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.stage(10, &[vec![10], vec![11], vec![12]]).unwrap();
+
+        assert_eq!(ledger.retained_tip().unwrap(), None);
+        assert_eq!(ledger.staged().unwrap().unwrap().blocks.len(), 3);
+        ledger.commit_staged(2).unwrap();
+
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert_eq!(ledger.read_block(10).unwrap(), Some(vec![10]));
+        assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
+        assert_eq!(ledger.read_block(12).unwrap(), None);
+        assert!(ledger.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_commit_recovers_after_the_prefix_was_already_published() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.stage(10, &[vec![10], vec![11]]).unwrap();
+        ledger.append(10, &[vec![10], vec![11]]).unwrap();
+
+        ledger.commit_staged(2).unwrap();
+
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert!(ledger.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_a_segment_larger_than_the_block_retention_limit() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(
+            dir.path(),
+            LedgerRetention {
+                max_blocks: 1,
+                max_bytes: 1_000_000,
+                slots: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ledger.append(10, &[vec![10], vec![11]]),
+            Err(LedgerError::Invalid(
+                "single segment exceeds maximum blocks"
+            ))
+        ));
+        assert_eq!(ledger.retained_tip().unwrap(), None);
     }
 }

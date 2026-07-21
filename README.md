@@ -9,7 +9,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 - Pure-Rust redb UTXO chainstate with separate hot/cold tables, atomic whole-block transitions, durable undo, reorg rewind, and interrupted-transition recovery.
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.
-- Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Only old block archives rotate; UTXO state and headers are retained.
+- Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; only old block archives rotate, while UTXO state and headers are retained.
 - Embedded REST router contracts for a block explorer plus a BDK descriptor wallet façade.
 
 ## Important safety status

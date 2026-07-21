@@ -9,13 +9,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use bitcoin::{BlockHash, Network, hashes::Hash};
+use bitcoin::{
+    Block, BlockHash, Network,
+    consensus::{deserialize, serialize},
+    hashes::Hash,
+};
 use rbtc::{
     block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
+    blockchain::validate_block_structure,
     deployments::{block_deployment_context, taproot_active},
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
+    ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
     undo_store::RedbUndoStore,
     utxo::{DEFAULT_HOT_WINDOW_SECS, RedbUtxoStore},
@@ -187,6 +193,8 @@ async fn sync_regtest_node(
         RedbUndoStore::open(data_dir.join("undo.redb")).map_err(|error| error.to_string())?;
     let execution_store = RedbExecutionStore::open(data_dir.join("execution.redb"), network)
         .map_err(|error| error.to_string())?;
+    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
+        .map_err(|error| error.to_string())?;
     if recover_pending_transition(
         &chainstate,
         &undo_store,
@@ -222,6 +230,8 @@ async fn sync_regtest_node(
         );
     }
 
+    reconcile_ledger(session, network, &headers, &execution_store, &ledger).await?;
+
     loop {
         let tip = execution_store.tip().map_err(|error| error.to_string())?;
         if tip.height >= headers.active_tip().height {
@@ -235,9 +245,175 @@ async fn sync_regtest_node(
             &chainstate,
             &undo_store,
             &execution_store,
+            &ledger,
         )
         .await?;
     }
+}
+
+async fn reconcile_ledger(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    network: Network,
+    headers: &HeaderDag,
+    execution_store: &RedbExecutionStore,
+    ledger: &PrunedBlockLedger,
+) -> Result<(), String> {
+    let tip = execution_store.tip().map_err(|error| error.to_string())?;
+    if let Some(first_unexecuted) = tip.height.checked_add(1) {
+        ledger
+            .truncate_from(first_unexecuted)
+            .map_err(|error| error.to_string())?;
+    }
+
+    if let Some(staged) = ledger.staged().map_err(|error| error.to_string())? {
+        if staged.manifest.first_height > tip.height {
+            ledger.discard_staged().map_err(|error| error.to_string())?;
+        } else {
+            let available = tip
+                .height
+                .checked_sub(staged.manifest.first_height)
+                .and_then(|distance| distance.checked_add(1))
+                .ok_or_else(|| "staged ledger height overflow".to_owned())?;
+            let validated_count = available.min(staged.manifest.block_count);
+            let mut on_active_chain = true;
+            for (offset, bytes) in staged
+                .blocks
+                .iter()
+                .take(usize::try_from(validated_count).expect("staged count fits usize"))
+                .enumerate()
+            {
+                let height = staged
+                    .manifest
+                    .first_height
+                    .checked_add(u32::try_from(offset).expect("staged offset fits u32"))
+                    .ok_or_else(|| "staged ledger height overflow".to_owned())?;
+                let block: Block = deserialize(bytes)
+                    .map_err(|error| format!("decode staged block at height {height}: {error}"))?;
+                let expected = headers
+                    .active_header_at(height)
+                    .ok_or_else(|| format!("missing active header at height {height}"))?;
+                if block.block_hash() != expected.hash {
+                    on_active_chain = false;
+                    break;
+                }
+                validate_archive_block(network, headers, height, expected.hash, &block)?;
+            }
+            if on_active_chain {
+                let preceding_height = staged.manifest.first_height.saturating_sub(1);
+                backfill_ledger(
+                    session,
+                    network,
+                    headers,
+                    ledger,
+                    preceding_height.min(tip.height),
+                )
+                .await?;
+                ledger
+                    .commit_staged(validated_count)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "recovered {validated_count} validated blocks from the staged ledger segment"
+                );
+            } else {
+                ledger.discard_staged().map_err(|error| error.to_string())?;
+            }
+        }
+    }
+
+    backfill_ledger(session, network, headers, ledger, tip.height).await
+}
+
+async fn backfill_ledger(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    network: Network,
+    headers: &HeaderDag,
+    ledger: &PrunedBlockLedger,
+    target_height: u32,
+) -> Result<(), String> {
+    if target_height == 0 {
+        return Ok(());
+    }
+    let mut next_height = match ledger.retained_tip().map_err(|error| error.to_string())? {
+        Some(height) if height >= target_height => return Ok(()),
+        Some(height) => height
+            .checked_add(1)
+            .ok_or_else(|| "ledger height overflow".to_owned())?,
+        None => target_height
+            .saturating_sub(ledger.retention().max_blocks.saturating_sub(1))
+            .max(1),
+    };
+    while next_height <= target_height {
+        let remaining = target_height - next_height + 1;
+        let batch_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(MAX_BLOCKS_IN_FLIGHT);
+        let expected = (0..batch_len)
+            .map(|offset| {
+                let height = next_height
+                    .checked_add(u32::try_from(offset).expect("block batch fits u32"))
+                    .ok_or_else(|| "ledger height overflow".to_owned())?;
+                headers
+                    .active_header_at(height)
+                    .ok_or_else(|| format!("missing active header at height {height}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let hashes = expected
+            .iter()
+            .map(|header| header.hash)
+            .collect::<Vec<_>>();
+        timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+            .await
+            .map_err(|_| format!("ledger backfill getdata timed out for {batch_len} blocks"))?
+            .map_err(|error| error.to_string())?;
+        let blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
+            .await
+            .map_err(|_| format!("ledger backfill response timed out for {batch_len} blocks"))?
+            .map_err(|error| error.to_string())?;
+        let mut serialized = Vec::with_capacity(blocks.len());
+        for (expected, block) in expected.iter().zip(&blocks) {
+            validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+            serialized.push(serialize(block));
+        }
+        ledger
+            .append(next_height, &serialized)
+            .map_err(|error| error.to_string())?;
+        if u32::try_from(batch_len).expect("block batch fits u32") == remaining {
+            break;
+        }
+        next_height = next_height
+            .checked_add(u32::try_from(batch_len).expect("block batch fits u32"))
+            .ok_or_else(|| "ledger height overflow".to_owned())?;
+    }
+    Ok(())
+}
+
+fn validate_archive_block(
+    network: Network,
+    headers: &HeaderDag,
+    height: u32,
+    expected_hash: BlockHash,
+    block: &Block,
+) -> Result<(), String> {
+    let actual = block.block_hash();
+    if actual != expected_hash {
+        return Err(format!(
+            "archive block {actual} does not match active block {expected_hash} at height {height}"
+        ));
+    }
+    let deployments = block_deployment_context(
+        network,
+        height,
+        expected_hash,
+        block.header.time,
+        taproot_active(headers, height),
+    );
+    validate_block_structure(
+        block,
+        height,
+        deployments.script_flags,
+        deployments.bip34_active,
+    )
+    .map_err(|error| format!("archive block structure at height {height}: {error}"))
 }
 
 async fn download_execute_batch(
@@ -247,6 +423,7 @@ async fn download_execute_batch(
     chainstate: &RedbUtxoStore,
     undo_store: &RedbUndoStore,
     execution_store: &RedbExecutionStore,
+    ledger: &PrunedBlockLedger,
 ) -> Result<(), String> {
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     let next_height = tip
@@ -280,13 +457,20 @@ async fn download_execute_batch(
         .await
         .map_err(|_| format!("block batch response timed out for {batch_len} blocks"))?
         .map_err(|error| error.to_string())?;
-    for (expected, block) in expected.into_iter().zip(blocks) {
+    for (expected, block) in expected.iter().zip(&blocks) {
+        validate_archive_block(network, headers, expected.height, expected.hash, block)?;
+    }
+    let serialized = blocks.iter().map(serialize).collect::<Vec<_>>();
+    ledger
+        .stage(next_height, &serialized)
+        .map_err(|error| error.to_string())?;
+    for (expected, block) in expected.into_iter().zip(&blocks) {
         connect_active_block(
             chainstate,
             undo_store,
             execution_store,
             headers,
-            &block,
+            block,
             u64::from(unix_time()?),
             DEFAULT_HOT_WINDOW_SECS,
             block_deployment_context(
@@ -303,6 +487,9 @@ async fn download_execute_batch(
             expected.height, expected.hash
         );
     }
+    ledger
+        .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -431,6 +618,7 @@ mod tests {
         blockchain::block_subsidy,
         execution_store::RedbExecutionStore,
         header_store::RedbHeaderStore,
+        ledger::{LedgerRetention, PrunedBlockLedger},
         p2p::V1Transport,
         undo_store::RedbUndoStore,
         utxo::{OutPointKey, RedbUtxoStore, UtxoStore},
@@ -579,6 +767,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn daemon_downloads_executes_and_recovers_a_regtest_block() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
@@ -645,5 +834,117 @@ mod tests {
         assert!(undo.get(block_hash).unwrap().is_some());
         let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
         assert!(chainstate.get(coinbase_outpoint).unwrap().is_some());
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+        let archived: Block = deserialize(&ledger.read_block(1).unwrap().unwrap()).unwrap();
+        assert_eq!(archived.block_hash(), block_hash);
+        assert!(ledger.staged().unwrap().is_none());
+
+        let archived_bytes = serialize(&archived);
+        ledger.truncate_from(1).unwrap();
+        ledger.stage(1, &[archived_bytes]).unwrap();
+        drop(ledger);
+        drop((execution, undo, chainstate));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recovery_remote = listener.local_addr().unwrap();
+        let recovery_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(7)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetHeaders(_)
+            ));
+            peer.write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+        });
+        run(Options {
+            remote: recovery_remote,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+        })
+        .await
+        .unwrap();
+        recovery_server.await.unwrap();
+
+        let recovered_ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(recovered_ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+        assert!(recovered_ledger.staged().unwrap().is_none());
+        recovered_ledger.truncate_from(1).unwrap();
+        drop(recovered_ledger);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backfill_remote = listener.local_addr().unwrap();
+        let backfill_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(8)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetHeaders(_)
+            ));
+            peer.write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                            block_hash
+                        )]
+                    );
+                    peer.write_message(NetworkMessage::Block(archived))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected ledger backfill getdata, got {message:?}"),
+            }
+        });
+        run(Options {
+            remote: backfill_remote,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+        })
+        .await
+        .unwrap();
+        backfill_server.await.unwrap();
+
+        let backfilled_ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(backfilled_ledger.retained_ranges().unwrap(), vec![(1, 1)]);
     }
 }

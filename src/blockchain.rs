@@ -201,33 +201,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     bip34_active: bool,
     csv_active: bool,
 ) -> Result<AppliedBlock, BlockError> {
-    if block.txdata.is_empty() {
-        return Err(BlockError::Empty);
-    }
-    if !block.txdata[0].is_coinbase() {
-        return Err(BlockError::MissingCoinbase);
-    }
-    if bip34_active && !coinbase_has_height(&block.txdata[0], height) {
-        return Err(BlockError::Bip34Height { height });
-    }
-    if block.txdata[1..]
-        .iter()
-        .any(bitcoin::Transaction::is_coinbase)
-    {
-        return Err(BlockError::MultipleCoinbase);
-    }
-    let (merkle_root, mutated) = transaction_merkle_root(block);
-    if merkle_root != Some(block.header.merkle_root) {
-        return Err(BlockError::MerkleRoot);
-    }
-    if mutated {
-        return Err(BlockError::MutatedMerkleTree);
-    }
-    check_witness_commitment(block, script_flags & bitcoinconsensus::VERIFY_WITNESS != 0)?;
-    let weight = block.weight().to_wu();
-    if weight > MAX_BLOCK_WEIGHT {
-        return Err(BlockError::Weight { weight });
-    }
+    validate_block_structure(block, height, script_flags, bip34_active)?;
 
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut sigop_cost = 0_u64;
@@ -288,6 +262,47 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
             .map(|transaction| transaction.undo)
             .collect(),
     })
+}
+
+/// Validates block commitments and context-free structure without mutating UTXO state.
+///
+/// This is used when re-reading bytes for a block that the durable execution
+/// tip proves was previously fully validated. It rejects ambiguous mutated
+/// Merkle trees and enforces deployment-aware witness commitments.
+pub fn validate_block_structure(
+    block: &Block,
+    height: u32,
+    script_flags: u32,
+    bip34_active: bool,
+) -> Result<(), BlockError> {
+    if block.txdata.is_empty() {
+        return Err(BlockError::Empty);
+    }
+    if !block.txdata[0].is_coinbase() {
+        return Err(BlockError::MissingCoinbase);
+    }
+    if bip34_active && !coinbase_has_height(&block.txdata[0], height) {
+        return Err(BlockError::Bip34Height { height });
+    }
+    if block.txdata[1..]
+        .iter()
+        .any(bitcoin::Transaction::is_coinbase)
+    {
+        return Err(BlockError::MultipleCoinbase);
+    }
+    let (merkle_root, mutated) = transaction_merkle_root(block);
+    if merkle_root != Some(block.header.merkle_root) {
+        return Err(BlockError::MerkleRoot);
+    }
+    if mutated {
+        return Err(BlockError::MutatedMerkleTree);
+    }
+    check_witness_commitment(block, script_flags & bitcoinconsensus::VERIFY_WITNESS != 0)?;
+    let weight = block.weight().to_wu();
+    if weight > MAX_BLOCK_WEIGHT {
+        return Err(BlockError::Weight { weight });
+    }
+    Ok(())
 }
 
 fn transaction_merkle_root(block: &Block) -> (Option<TxMerkleNode>, bool) {
