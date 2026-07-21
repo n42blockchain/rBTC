@@ -9,6 +9,10 @@ repository = "https://github.com/n42/rBTC"
 keywords = ["bitcoin", "utxo", "node", "zstd"]
 categories = ["cryptography::cryptocurrencies"]
 
+[features]
+default = []
+mdbx = ["dep:libmdbx"]
+
 [lib]
 name = "rbtc"
 path = "src/lib.rs"
@@ -23,6 +27,7 @@ bitcoinconsensus = "0.106"
 bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
 axum = "0.8.9"
 redb = "2.6.3"
+libmdbx = { version = "0.6.6", optional = true }
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

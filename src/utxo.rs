@@ -3,11 +3,11 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use bitcoin::{OutPoint, Txid, hashes::Hash};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
 
 /// The number of seconds in the default hot window (60 days).
@@ -18,6 +18,13 @@ const COLD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxo_col
 /// Errors emitted by UTXO storage and encoding.
 #[derive(Debug, Error)]
 pub enum UtxoError {
+    /// Filesystem preparation failed.
+    #[error("UTXO filesystem: {0}")]
+    Io(#[from] std::io::Error),
+    /// Optional MDBX backend operation failed.
+    #[cfg(feature = "mdbx")]
+    #[error("MDBX UTXO store: {0}")]
+    Mdbx(#[from] libmdbx::Error),
     /// Database open/create failed.
     #[error("redb database: {0}")]
     Database(#[from] redb::DatabaseError),
@@ -314,7 +321,7 @@ pub trait UtxoStore: Send + Sync {
 
 /// redb-backed UTXO store. Its copy-on-write B-trees offer crash-safe ACID transactions without a C/C++ toolchain.
 pub struct RedbUtxoStore {
-    db: Database,
+    db: Arc<Database>,
     /// Coordinates logically related operations spanning both physical tables.
     write_guard: Mutex<()>,
 }
@@ -322,7 +329,10 @@ pub struct RedbUtxoStore {
 impl RedbUtxoStore {
     /// Opens or creates a chainstate file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtxoError> {
-        let db = Database::create(path)?;
+        Self::from_database(Arc::new(Database::create(path)?))
+    }
+
+    pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, UtxoError> {
         let transaction = db.begin_write()?;
         {
             let _hot = transaction.open_table(HOT_TABLE)?;
@@ -368,49 +378,7 @@ impl UtxoStore for RedbUtxoStore {
     ) -> Result<UtxoUndo, UtxoError> {
         let _guard = self.lock();
         let transaction = self.db.begin_write()?;
-        let undo = {
-            let mut hot = transaction.open_table(HOT_TABLE)?;
-            let mut cold = transaction.open_table(COLD_TABLE)?;
-            let mut seen_spent = std::collections::BTreeSet::new();
-            let mut undo_spent = Vec::with_capacity(spent.len());
-            for key in spent {
-                if !seen_spent.insert(*key) {
-                    return Err(UtxoError::DuplicateSpend(*key));
-                }
-                let previous = match hot.get(key.as_bytes().as_slice())? {
-                    Some(value) => Utxo::decode(value.value())?,
-                    None => match cold.get(key.as_bytes().as_slice())? {
-                        Some(value) => Utxo::decode(value.value())?,
-                        None => return Err(UtxoError::Missing(*key)),
-                    },
-                };
-                undo_spent.push((*key, previous));
-            }
-            let mut seen_created = std::collections::BTreeSet::new();
-            for (key, _) in created {
-                if !seen_created.insert(*key) {
-                    return Err(UtxoError::Duplicate(*key));
-                }
-                if !seen_spent.contains(key)
-                    && (hot.get(key.as_bytes().as_slice())?.is_some()
-                        || cold.get(key.as_bytes().as_slice())?.is_some())
-                {
-                    return Err(UtxoError::Duplicate(*key));
-                }
-            }
-            for key in spent {
-                hot.remove(key.as_bytes().as_slice())?;
-                cold.remove(key.as_bytes().as_slice())?;
-            }
-            for (key, utxo) in created {
-                let value = utxo.encode()?;
-                hot.insert(key.as_bytes().as_slice(), value.as_slice())?;
-            }
-            UtxoUndo {
-                spent: undo_spent,
-                created: created.iter().map(|(key, _)| *key).collect(),
-            }
-        };
+        let undo = apply_with_undo_transaction(&transaction, spent, created)?;
         transaction.commit()?;
         Ok(undo)
     }
@@ -549,6 +517,54 @@ impl UtxoStore for RedbUtxoStore {
             cold: count(COLD_TABLE)?,
         })
     }
+}
+
+pub(crate) fn apply_with_undo_transaction(
+    transaction: &WriteTransaction,
+    spent: &[OutPointKey],
+    created: &[(OutPointKey, Utxo)],
+) -> Result<UtxoUndo, UtxoError> {
+    let mut hot = transaction.open_table(HOT_TABLE)?;
+    let mut cold = transaction.open_table(COLD_TABLE)?;
+    let mut seen_spent = std::collections::BTreeSet::new();
+    let mut undo_spent = Vec::with_capacity(spent.len());
+    for key in spent {
+        if !seen_spent.insert(*key) {
+            return Err(UtxoError::DuplicateSpend(*key));
+        }
+        let previous = match hot.get(key.as_bytes().as_slice())? {
+            Some(value) => Utxo::decode(value.value())?,
+            None => match cold.get(key.as_bytes().as_slice())? {
+                Some(value) => Utxo::decode(value.value())?,
+                None => return Err(UtxoError::Missing(*key)),
+            },
+        };
+        undo_spent.push((*key, previous));
+    }
+    let mut seen_created = std::collections::BTreeSet::new();
+    for (key, _) in created {
+        if !seen_created.insert(*key) {
+            return Err(UtxoError::Duplicate(*key));
+        }
+        if !seen_spent.contains(key)
+            && (hot.get(key.as_bytes().as_slice())?.is_some()
+                || cold.get(key.as_bytes().as_slice())?.is_some())
+        {
+            return Err(UtxoError::Duplicate(*key));
+        }
+    }
+    for key in spent {
+        hot.remove(key.as_bytes().as_slice())?;
+        cold.remove(key.as_bytes().as_slice())?;
+    }
+    for (key, utxo) in created {
+        let value = utxo.encode()?;
+        hot.insert(key.as_bytes().as_slice(), value.as_slice())?;
+    }
+    Ok(UtxoUndo {
+        spent: undo_spent,
+        created: created.iter().map(|(key, _)| *key).collect(),
+    })
 }
 
 #[cfg(test)]

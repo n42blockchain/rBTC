@@ -6,7 +6,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 - Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format.
 - Script validation adapter using Bitcoin Core's `libbitcoinconsensus`, including Taproot spent-output validation.
-- Pure-Rust redb UTXO chainstate with separate hot/cold tables, atomic whole-block transitions, durable undo, reorg rewind, and interrupted-transition recovery.
+- Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.
 - Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; only old block archives rotate, while UTXO state and headers are retained.
@@ -22,7 +22,7 @@ rBTC is **not yet a production full node** and must not be trusted with mainnet 
 | --- | --- | --- |
 | Bitcoin types and v1 P2P encoding | `rust-bitcoin` | Maintained Rust Bitcoin primitives and consensus serialization. |
 | Script interpreter | `bitcoinconsensus` | Reuses Bitcoin Core's consensus library, including Taproot spent-output API. |
-| UTXO persistence | redb | Pure-Rust ordered copy-on-write B-trees, ACID transactions, and concurrent reads keep local builds portable. |
+| UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust; `--features mdbx` enables a durable hot/cold UTXO comparison backend, not yet a production chainstate selector. |
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |
 
@@ -32,6 +32,7 @@ rBTC is **not yet a production full node** and must not be trusted with mainnet 
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo test --release --all-features --test storage_bench -- --ignored --nocapture
 ```
 
 For the current safety-gated regtest daemon, `rbtcd --connect HOST:PORT --network regtest --data-dir PATH` stays attached and polls the peer for new headers every 30 seconds. Add `--once` for a bounded sync-and-exit run. Add `--explorer-listen 127.0.0.1:3000` to serve the embedded read-only explorer and REST API; non-loopback binds are rejected until authentication is implemented. Regtest Taproot activation can be overridden with Core-compatible `--vbparams taproot:START:END[:MIN_HEIGHT]`; the selected consensus configuration is bound to a fresh execution database and cannot later change in place. Core 26 minimum-chainwork and assume-valid defaults are loaded per supported legacy network and can be overridden with `--minimum-chainwork HEX` and `--assumevalid HASH|0`. A chain below the work floor remains in IBD. Assume-valid currently identifies a reviewed active-chain anchor only: all scripts are still verified.

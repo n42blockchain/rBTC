@@ -2,11 +2,11 @@
 
 use std::{
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use bitcoin::{BlockHash, Network, hashes::Hash};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("execution_metadata");
@@ -72,7 +72,7 @@ pub enum ExecutionStoreError {
 
 /// redb-backed execution tip initialized to the selected network's genesis.
 pub struct RedbExecutionStore {
-    db: Database,
+    db: Arc<Database>,
     write_guard: Mutex<()>,
     new_database: bool,
 }
@@ -80,8 +80,14 @@ pub struct RedbExecutionStore {
 impl RedbExecutionStore {
     /// Opens or initializes execution metadata at `path`.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, ExecutionStoreError> {
+        Self::from_database(Arc::new(Database::create(path)?), network)
+    }
+
+    pub(crate) fn from_database(
+        db: Arc<Database>,
+        network: Network,
+    ) -> Result<Self, ExecutionStoreError> {
         let expected = bitcoin::blockdata::constants::genesis_block(network).block_hash();
-        let db = Database::create(path)?;
         let transaction = db.begin_write()?;
         let new_database;
         {
@@ -177,22 +183,7 @@ impl RedbExecutionStore {
     ) -> Result<(), ExecutionStoreError> {
         let _guard = self.lock();
         let transaction = self.db.begin_write()?;
-        {
-            let mut meta = transaction.open_table(META)?;
-            let current_value = meta
-                .get(TIP_KEY)?
-                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
-            let current = decode_tip(current_value.value())?;
-            if current.hash != expected_parent || current.height.checked_add(1) != Some(next.height)
-            {
-                return Err(ExecutionStoreError::NonSequential {
-                    current_height: current.height,
-                    current_hash: current.hash,
-                });
-            }
-            drop(current_value);
-            meta.insert(TIP_KEY, encode_tip(next).as_slice())?;
-        }
+        advance_transaction(&transaction, expected_parent, next)?;
         transaction.commit()?;
         Ok(())
     }
@@ -205,21 +196,7 @@ impl RedbExecutionStore {
     ) -> Result<(), ExecutionStoreError> {
         let _guard = self.lock();
         let transaction = self.db.begin_write()?;
-        {
-            let mut meta = transaction.open_table(META)?;
-            let current_value = meta
-                .get(TIP_KEY)?
-                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
-            let current = decode_tip(current_value.value())?;
-            if current != expected_current || parent.height.checked_add(1) != Some(current.height) {
-                return Err(ExecutionStoreError::NonSequential {
-                    current_height: current.height,
-                    current_hash: current.hash,
-                });
-            }
-            drop(current_value);
-            meta.insert(TIP_KEY, encode_tip(parent).as_slice())?;
-        }
+        rewind_transaction(&transaction, expected_current, parent)?;
         transaction.commit()?;
         Ok(())
     }
@@ -227,6 +204,57 @@ impl RedbExecutionStore {
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
     }
+}
+
+pub(crate) fn metadata_exists(db: &Database) -> Result<bool, ExecutionStoreError> {
+    let transaction = db.begin_read()?;
+    match transaction.open_table(META) {
+        Ok(meta) => Ok(meta.get(GENESIS_KEY)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn advance_transaction(
+    transaction: &WriteTransaction,
+    expected_parent: BlockHash,
+    next: ExecutionTip,
+) -> Result<(), ExecutionStoreError> {
+    let mut meta = transaction.open_table(META)?;
+    let current_value = meta
+        .get(TIP_KEY)?
+        .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+    let current = decode_tip(current_value.value())?;
+    if current.hash != expected_parent || current.height.checked_add(1) != Some(next.height) {
+        return Err(ExecutionStoreError::NonSequential {
+            current_height: current.height,
+            current_hash: current.hash,
+        });
+    }
+    drop(current_value);
+    meta.insert(TIP_KEY, encode_tip(next).as_slice())?;
+    Ok(())
+}
+
+pub(crate) fn rewind_transaction(
+    transaction: &WriteTransaction,
+    expected_current: ExecutionTip,
+    parent: ExecutionTip,
+) -> Result<(), ExecutionStoreError> {
+    let mut meta = transaction.open_table(META)?;
+    let current_value = meta
+        .get(TIP_KEY)?
+        .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+    let current = decode_tip(current_value.value())?;
+    if current != expected_current || parent.height.checked_add(1) != Some(current.height) {
+        return Err(ExecutionStoreError::NonSequential {
+            current_height: current.height,
+            current_hash: current.hash,
+        });
+    }
+    drop(current_value);
+    meta.insert(TIP_KEY, encode_tip(parent).as_slice())?;
+    Ok(())
 }
 
 fn encode_tip(tip: ExecutionTip) -> [u8; 36] {

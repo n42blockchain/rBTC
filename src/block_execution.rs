@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     blockchain::{AppliedBlock, BlockError, apply_block_with_deployments, disconnect_block},
+    chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
@@ -59,6 +60,9 @@ pub enum BlockExecutionError {
     /// Block consensus validation or UTXO application failed.
     #[error("block validation: {0}")]
     Block(#[from] BlockError),
+    /// Unified chain-state transaction failed.
+    #[error("atomic chain-state persistence: {0}")]
+    ChainStore(#[from] ChainStoreError),
     /// Durable block undo insertion failed.
     #[error("undo persistence: {0}")]
     Undo(#[from] UndoStoreError),
@@ -80,6 +84,14 @@ pub enum BlockExecutionError {
     /// BIP30 forbids overwriting an existing unspent transaction output.
     #[error("BIP30 duplicate unspent output {0}")]
     Bip30Collision(OutPointKey),
+    /// A batch did not provide exactly one deployment context per block.
+    #[error("block batch has {blocks} blocks but {deployments} deployment contexts")]
+    DeploymentCount {
+        /// Number of candidate blocks.
+        blocks: usize,
+        /// Number of deployment contexts.
+        deployments: usize,
+    },
     /// A write-ahead transition does not match either its pre- or post-state.
     #[error("pending transition UTXO state is internally inconsistent")]
     InconsistentTransition,
@@ -207,29 +219,114 @@ pub fn recover_pending_transition<S: UtxoStore>(
 /// Validates and connects exactly the next active-chain block.
 ///
 /// Validation runs against a lazy in-memory overlay. The complete block's net
-/// UTXO effect is committed in one storage transaction, so a process crash
-/// cannot expose a partially applied block. Undo storage and execution-tip
-/// advancement remain separate durable transactions; failures observed by the
-/// process trigger an immediate UTXO rollback.
+/// UTXO effect, block undo, and execution tip are committed in one storage
+/// transaction, so a process crash cannot expose a partially applied block.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_active_block<S: UtxoStore>(
-    chainstate: &S,
-    undo_store: &RedbUndoStore,
-    execution_store: &RedbExecutionStore,
+pub fn connect_active_block(
+    chainstate: &RedbChainStore,
     headers: &HeaderDag,
     block: &Block,
     now: u64,
     hot_window_secs: u64,
     deployments: BlockDeploymentContext,
 ) -> Result<AppliedBlock, BlockExecutionError> {
-    recover_pending_transition(
+    let current = chainstate.execution().tip()?;
+    let (applied, transition) = validate_active_block(
         chainstate,
-        undo_store,
-        execution_store,
+        headers,
+        block,
+        current,
         now,
         hot_window_secs,
+        deployments,
     )?;
-    let current = execution_store.tip()?;
+    let next_tip = ExecutionTip {
+        height: current.height + 1,
+        hash: applied.hash,
+    };
+    let committed_undo = chainstate.commit_connect(
+        current.hash,
+        next_tip,
+        &transition.spent,
+        &transition.created,
+        &applied.transaction_undos,
+    )?;
+    debug_assert_eq!(committed_undo, transition.undo);
+    Ok(applied)
+}
+
+/// Validates a contiguous IBD block group and commits it as one checkpoint.
+///
+/// Every block is evaluated against the prior block's in-memory UTXO result.
+/// A validation or persistence failure exposes neither a UTXO prefix nor a
+/// corresponding undo/tip prefix.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_active_blocks(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    if blocks.len() != deployments.len() {
+        return Err(BlockExecutionError::DeploymentCount {
+            blocks: blocks.len(),
+            deployments: deployments.len(),
+        });
+    }
+    if blocks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut current = chainstate.execution().tip()?;
+    let cumulative = UtxoOverlay::new(chainstate);
+    let mut applied_blocks = Vec::with_capacity(blocks.len());
+    let mut transitions = Vec::with_capacity(blocks.len());
+    for (block, deployment) in blocks.iter().zip(deployments) {
+        let block_overlay = UtxoOverlay::new(&cumulative);
+        let (applied, changes) = validate_active_block(
+            &block_overlay,
+            headers,
+            block,
+            current,
+            now,
+            hot_window_secs,
+            *deployment,
+        )?;
+        let next = ExecutionTip {
+            height: current
+                .height
+                .checked_add(1)
+                .ok_or(BlockExecutionError::NoNextHeader(current.height))?,
+            hash: applied.hash,
+        };
+        cumulative.apply(&changes.spent, &changes.created)?;
+        transitions.push(ConnectTransition {
+            expected_parent: current.hash,
+            next,
+            spent: changes.spent,
+            created: changes.created,
+            transaction_undos: applied.transaction_undos.clone(),
+        });
+        applied_blocks.push(applied);
+        current = next;
+    }
+    let committed = chainstate.commit_connect_batch(&transitions)?;
+    debug_assert_eq!(committed.len(), transitions.len());
+    Ok(applied_blocks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_active_block<S: UtxoStore>(
+    chainstate: &S,
+    headers: &HeaderDag,
+    block: &Block,
+    current: ExecutionTip,
+    now: u64,
+    hot_window_secs: u64,
+    deployments: BlockDeploymentContext,
+) -> Result<(AppliedBlock, UtxoChanges), BlockExecutionError> {
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
@@ -282,39 +379,7 @@ pub fn connect_active_block<S: UtxoStore>(
         applied.transaction_undos.insert(0, undo);
     }
     let transition = overlay.net_changes()?;
-    let next_tip = ExecutionTip {
-        height: next_height,
-        hash: applied.hash,
-    };
-    undo_store.prepare_transition(&PendingTransition {
-        kind: TransitionKind::Connect,
-        parent: current,
-        next: next_tip,
-        undo: transition.undo.clone(),
-        created: transition.created.clone(),
-    })?;
-    let committed_undo = match chainstate.apply_with_undo(&transition.spent, &transition.created) {
-        Ok(undo) => undo,
-        Err(error) => {
-            undo_store.clear_transition(applied.hash)?;
-            return Err(BlockExecutionError::Rollback(error));
-        }
-    };
-    debug_assert_eq!(committed_undo, transition.undo);
-
-    if let Err(error) = undo_store.insert(applied.hash, &applied.transaction_undos) {
-        chainstate.undo(&committed_undo, now, hot_window_secs)?;
-        undo_store.clear_transition(applied.hash)?;
-        return Err(BlockExecutionError::Undo(error));
-    }
-    if let Err(error) = execution_store.advance(current.hash, next_tip) {
-        undo_store.remove(applied.hash)?;
-        chainstate.undo(&committed_undo, now, hot_window_secs)?;
-        undo_store.clear_transition(applied.hash)?;
-        return Err(BlockExecutionError::Execution(error));
-    }
-    undo_store.clear_transition(applied.hash)?;
-    Ok(applied)
+    Ok((applied, transition))
 }
 
 #[derive(Default)]
@@ -526,22 +591,13 @@ fn block_output_collisions<S: UtxoStore>(
 /// Unlike [`connect_active_block`], the executed header need not remain on the
 /// newly selected active chain; this is the primitive used to walk back to a
 /// common ancestor before connecting a stronger branch.
-pub fn disconnect_execution_tip<S: UtxoStore>(
-    chainstate: &S,
-    undo_store: &RedbUndoStore,
-    execution_store: &RedbExecutionStore,
+pub fn disconnect_execution_tip(
+    chainstate: &RedbChainStore,
     headers: &HeaderDag,
     now: u64,
     hot_window_secs: u64,
 ) -> Result<ExecutionTip, BlockExecutionError> {
-    recover_pending_transition(
-        chainstate,
-        undo_store,
-        execution_store,
-        now,
-        hot_window_secs,
-    )?;
-    let current = execution_store.tip()?;
+    let current = chainstate.execution().tip()?;
     if current.height == 0 {
         return Err(BlockExecutionError::DisconnectGenesis);
     }
@@ -555,7 +611,8 @@ pub fn disconnect_execution_tip<S: UtxoStore>(
     if parent.height.checked_add(1) != Some(current.height) {
         return Err(BlockExecutionError::MissingExecutedHeader(parent_hash));
     }
-    let transaction_undos = undo_store
+    let transaction_undos = chainstate
+        .undos()
         .get(current.hash)?
         .ok_or(BlockExecutionError::MissingUndo(current.hash))?;
     let applied = AppliedBlock {
@@ -569,35 +626,12 @@ pub fn disconnect_execution_tip<S: UtxoStore>(
     let overlay = UtxoOverlay::new(chainstate);
     disconnect_block(&overlay, &applied, now, hot_window_secs)?;
     let transition = overlay.net_changes()?;
-    let forward_undo = UtxoUndo::new(transition.created.clone(), transition.spent.clone());
-    undo_store.prepare_transition(&PendingTransition {
-        kind: TransitionKind::Disconnect,
-        parent: parent_tip,
-        next: current,
-        undo: forward_undo,
-        created: transition.undo.spent().to_vec(),
-    })?;
-    let committed_undo = match chainstate.apply_with_undo(&transition.spent, &transition.created) {
-        Ok(undo) => undo,
-        Err(error) => {
-            undo_store.clear_transition(current.hash)?;
-            return Err(BlockExecutionError::Rollback(error));
-        }
-    };
-    if let Err(error) = execution_store.rewind(current, parent_tip) {
-        chainstate.undo(&committed_undo, now, hot_window_secs)?;
-        undo_store.clear_transition(current.hash)?;
-        return Err(BlockExecutionError::Execution(error));
-    }
-    undo_store.remove(current.hash)?;
-    undo_store.clear_transition(current.hash)?;
+    chainstate.commit_disconnect(current, parent_tip, &transition.spent, &transition.created)?;
     Ok(parent_tip)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use bitcoin::{
         Amount, Block, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
         TxOut, Witness,
@@ -612,6 +646,7 @@ mod tests {
     use super::*;
     use crate::{
         blockchain::block_subsidy,
+        chain_store::RedbChainStore,
         deployments::block_deployment_context,
         headers::HeaderDag,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
@@ -665,6 +700,10 @@ mod tests {
         block_with_transactions(parent, time, vec![coinbase(1)])
     }
 
+    fn height_block(parent: BlockHash, time: u32, height: u32) -> Block {
+        block_with_transactions(parent, time, vec![coinbase(height)])
+    }
+
     fn deployments(height: u32) -> BlockDeploymentContext {
         block_deployment_context(
             Network::Regtest,
@@ -675,68 +714,11 @@ mod tests {
         )
     }
 
-    struct CountingStore<'a> {
-        inner: &'a RedbUtxoStore,
-        writes: AtomicUsize,
-    }
-
-    impl UtxoStore for CountingStore<'_> {
-        fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
-            self.inner.get(outpoint)
-        }
-
-        fn apply(
-            &self,
-            spent: &[OutPointKey],
-            created: &[(OutPointKey, Utxo)],
-        ) -> Result<(), UtxoError> {
-            self.writes.fetch_add(1, Ordering::Relaxed);
-            self.inner.apply(spent, created)
-        }
-
-        fn apply_with_undo(
-            &self,
-            spent: &[OutPointKey],
-            created: &[(OutPointKey, Utxo)],
-        ) -> Result<UtxoUndo, UtxoError> {
-            self.writes.fetch_add(1, Ordering::Relaxed);
-            self.inner.apply_with_undo(spent, created)
-        }
-
-        fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError> {
-            self.writes.fetch_add(1, Ordering::Relaxed);
-            self.inner.undo(undo, now, hot_window_secs)
-        }
-
-        fn age_to_cold(&self, now: u64, hot_window_secs: u64) -> Result<u64, UtxoError> {
-            self.inner.age_to_cold(now, hot_window_secs)
-        }
-
-        fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
-            self.inner.snapshot_entries()
-        }
-
-        fn replace_all(
-            &self,
-            entries: &BTreeMap<OutPointKey, Utxo>,
-            now: u64,
-            hot_window_secs: u64,
-        ) -> Result<(), UtxoError> {
-            self.inner.replace_all(entries, now, hot_window_secs)
-        }
-
-        fn tier_stats(&self) -> Result<TierStats, UtxoError> {
-            self.inner.tier_stats()
-        }
-    }
-
     #[test]
     fn connects_active_block_and_recovers_execution_tip() {
         let directory = TempDir::new().unwrap();
-        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
-        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
-        let execution_store =
-            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();
@@ -745,19 +727,11 @@ mod tests {
             .insert_contextual(active_block.header, active_block.header.time)
             .unwrap();
 
-        let applied = connect_active_block(
-            &chainstate,
-            &undo_store,
-            &execution_store,
-            &headers,
-            &active_block,
-            1,
-            60,
-            deployments(1),
-        )
-        .unwrap();
-        assert_eq!(execution_store.tip().unwrap().hash, info.hash);
-        assert!(undo_store.get(applied.hash).unwrap().is_some());
+        let applied =
+            connect_active_block(&chainstate, &headers, &active_block, 1, 60, deployments(1))
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().hash, info.hash);
+        assert!(chainstate.undos().get(applied.hash).unwrap().is_some());
         let coinbase_outpoint =
             OutPointKey::from(OutPoint::new(active_block.txdata[0].compute_txid(), 0));
         assert!(
@@ -776,11 +750,9 @@ mod tests {
             .unwrap();
         assert_ne!(headers.active_header_at(1).unwrap().hash, info.hash);
 
-        let rewound =
-            disconnect_execution_tip(&chainstate, &undo_store, &execution_store, &headers, 2, 60)
-                .unwrap();
+        let rewound = disconnect_execution_tip(&chainstate, &headers, 2, 60).unwrap();
         assert_eq!(rewound.height, 0);
-        assert!(undo_store.get(applied.hash).unwrap().is_none());
+        assert!(chainstate.undos().get(applied.hash).unwrap().is_none());
         assert!(
             crate::utxo::UtxoStore::get(&chainstate, coinbase_outpoint)
                 .unwrap()
@@ -789,11 +761,13 @@ mod tests {
     }
 
     #[test]
-    fn commits_a_multi_transaction_block_with_one_utxo_write() {
+    fn commits_a_multi_transaction_block_atomically() {
         let directory = TempDir::new().unwrap();
-        let inner = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
         let previous = OutPoint::new(bitcoin::Txid::from_byte_array([7; 32]), 0);
-        inner
+        chainstate
             .apply(
                 &[],
                 &[(
@@ -809,10 +783,6 @@ mod tests {
                 )],
             )
             .unwrap();
-        let chainstate = CountingStore {
-            inner: &inner,
-            writes: AtomicUsize::new(0),
-        };
         let spend = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
@@ -827,10 +797,6 @@ mod tests {
                 script_pubkey: ScriptBuf::new(),
             }],
         };
-        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
-        let execution_store =
-            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
-                .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();
         let active_block = block_with_transactions(
@@ -842,22 +808,98 @@ mod tests {
             .insert_contextual(active_block.header, active_block.header.time)
             .unwrap();
 
-        connect_active_block(
+        connect_active_block(&chainstate, &headers, &active_block, 1, 60, deployments(1)).unwrap();
+
+        assert!(chainstate.get(previous.into()).unwrap().is_none());
+        let created = OutPoint::new(active_block.txdata[1].compute_txid(), 0).into();
+        assert_eq!(chainstate.get(created).unwrap().unwrap().value_sats, 900);
+        assert!(
+            chainstate
+                .undos()
+                .get(active_block.block_hash())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+    }
+
+    #[test]
+    fn ibd_checkpoint_commits_all_blocks_or_no_blocks() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let chainstate = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let second = height_block(first.block_hash(), first.header.time + 1, 2);
+        headers
+            .insert_contextual(second.header, second.header.time)
+            .unwrap();
+        let contexts = [deployments(1), deployments(2)];
+
+        let applied = connect_active_blocks(
             &chainstate,
-            &undo_store,
-            &execution_store,
             &headers,
-            &active_block,
+            &[first.clone(), second.clone()],
             1,
             60,
-            deployments(1),
+            &contexts,
         )
         .unwrap();
+        assert_eq!(applied.len(), 2);
+        assert_eq!(chainstate.execution().tip().unwrap().height, 2);
+        assert!(
+            chainstate
+                .undos()
+                .get(first.block_hash())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            chainstate
+                .undos()
+                .get(second.block_hash())
+                .unwrap()
+                .is_some()
+        );
+        drop(chainstate);
 
-        assert_eq!(chainstate.writes.load(Ordering::Relaxed), 1);
-        assert!(inner.get(previous.into()).unwrap().is_none());
-        let created = OutPoint::new(active_block.txdata[1].compute_txid(), 0).into();
-        assert_eq!(inner.get(created).unwrap().unwrap().value_sats, 900);
+        let reopened = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution().tip().unwrap().height, 2);
+        for block in [&first, &second] {
+            let outpoint = OutPoint::new(block.txdata[0].compute_txid(), 0).into();
+            assert!(reopened.get(outpoint).unwrap().is_some());
+            assert!(reopened.undos().get(block.block_hash()).unwrap().is_some());
+        }
+
+        let failed_directory = TempDir::new().unwrap();
+        let failed = RedbChainStore::open(
+            failed_directory.path().join("chainstate.redb"),
+            Network::Regtest,
+        )
+        .unwrap();
+        let mut invalid_second = second.clone();
+        invalid_second.txdata[0].output[0].value =
+            Amount::from_sat(block_subsidy(2).checked_add(1).unwrap());
+        invalid_second.header.merkle_root = invalid_second.compute_merkle_root().unwrap();
+        assert!(
+            connect_active_blocks(
+                &failed,
+                &headers,
+                &[first.clone(), invalid_second],
+                1,
+                60,
+                &contexts,
+            )
+            .is_err()
+        );
+        assert_eq!(failed.execution().tip().unwrap().height, 0);
+        let first_outpoint = OutPoint::new(first.txdata[0].compute_txid(), 0).into();
+        assert!(failed.get(first_outpoint).unwrap().is_none());
+        assert!(failed.undos().get(first.block_hash()).unwrap().is_none());
     }
 
     #[test]
@@ -946,10 +988,8 @@ mod tests {
     #[test]
     fn bip30_rejects_collisions_and_exception_undo_restores_overwritten_coin() {
         let directory = TempDir::new().unwrap();
-        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
-        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
-        let execution_store =
-            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();
@@ -978,8 +1018,6 @@ mod tests {
         assert!(matches!(
             connect_active_block(
                 &chainstate,
-                &undo_store,
-                &execution_store,
                 &headers,
                 &block,
                 1,
@@ -992,8 +1030,6 @@ mod tests {
 
         connect_active_block(
             &chainstate,
-            &undo_store,
-            &execution_store,
             &headers,
             &block,
             1,
@@ -1008,8 +1044,7 @@ mod tests {
             chainstate.get(collision).unwrap().unwrap().value_sats,
             block_subsidy(1)
         );
-        disconnect_execution_tip(&chainstate, &undo_store, &execution_store, &headers, 2, 60)
-            .unwrap();
+        disconnect_execution_tip(&chainstate, &headers, 2, 60).unwrap();
         assert_eq!(chainstate.get(collision).unwrap().unwrap().value_sats, 42);
     }
 }

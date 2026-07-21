@@ -2,11 +2,11 @@
 
 use std::{
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use bitcoin::{BlockHash, hashes::Hash};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
 
 use crate::{
@@ -85,14 +85,17 @@ pub enum TransitionKind {
 /// reverse order when disconnecting a block, exactly as
 /// [`crate::blockchain::disconnect_block`] does for in-memory data.
 pub struct RedbUndoStore {
-    db: Database,
+    db: Arc<Database>,
     write_guard: Mutex<()>,
 }
 
 impl RedbUndoStore {
     /// Opens or creates an undo database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UndoStoreError> {
-        let db = Database::create(path)?;
+        Self::from_database(Arc::new(Database::create(path)?))
+    }
+
+    pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, UndoStoreError> {
         let transaction = db.begin_write()?;
         {
             let _undos = transaction.open_table(BLOCK_UNDOS)?;
@@ -108,16 +111,8 @@ impl RedbUndoStore {
     /// Stores the complete undo vector for one connected block.
     pub fn insert(&self, block: BlockHash, undos: &[UtxoUndo]) -> Result<(), UndoStoreError> {
         let _guard = self.lock();
-        let block_bytes = block.to_byte_array();
-        let encoded = encode_block_undo(undos)?;
         let transaction = self.db.begin_write()?;
-        {
-            let mut table = transaction.open_table(BLOCK_UNDOS)?;
-            if table.get(block_bytes.as_slice())?.is_some() {
-                return Err(UndoStoreError::Duplicate(block));
-            }
-            table.insert(block_bytes.as_slice(), encoded.as_slice())?;
-        }
+        insert_transaction(&transaction, block, undos)?;
         transaction.commit()?;
         Ok(())
     }
@@ -136,10 +131,7 @@ impl RedbUndoStore {
     pub fn remove(&self, block: BlockHash) -> Result<bool, UndoStoreError> {
         let _guard = self.lock();
         let transaction = self.db.begin_write()?;
-        let removed = {
-            let mut table = transaction.open_table(BLOCK_UNDOS)?;
-            table.remove(block.to_byte_array().as_slice())?.is_some()
-        };
+        let removed = remove_transaction(&transaction, block)?;
         transaction.commit()?;
         Ok(removed)
     }
@@ -195,6 +187,29 @@ impl RedbUndoStore {
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
     }
+}
+
+pub(crate) fn insert_transaction(
+    transaction: &WriteTransaction,
+    block: BlockHash,
+    undos: &[UtxoUndo],
+) -> Result<(), UndoStoreError> {
+    let block_bytes = block.to_byte_array();
+    let encoded = encode_block_undo(undos)?;
+    let mut table = transaction.open_table(BLOCK_UNDOS)?;
+    if table.get(block_bytes.as_slice())?.is_some() {
+        return Err(UndoStoreError::Duplicate(block));
+    }
+    table.insert(block_bytes.as_slice(), encoded.as_slice())?;
+    Ok(())
+}
+
+pub(crate) fn remove_transaction(
+    transaction: &WriteTransaction,
+    block: BlockHash,
+) -> Result<bool, UndoStoreError> {
+    let mut table = transaction.open_table(BLOCK_UNDOS)?;
+    Ok(table.remove(block.to_byte_array().as_slice())?.is_some())
 }
 
 fn encode_tip(tip: ExecutionTip, bytes: &mut Vec<u8>) {

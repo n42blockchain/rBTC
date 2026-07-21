@@ -17,8 +17,9 @@ use bitcoin::{
 };
 use rbtc::{
     api::explorer_router,
-    block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
+    block_execution::{connect_active_block, connect_active_blocks, disconnect_execution_tip},
     blockchain::{AppliedBlock, validate_block_structure},
+    chain_store::RedbChainStore,
     deployments::{DeploymentConfig, block_deployment_context, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
@@ -28,7 +29,7 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
     undo_store::RedbUndoStore,
-    utxo::{DEFAULT_HOT_WINDOW_SECS, RedbUtxoStore},
+    utxo::DEFAULT_HOT_WINDOW_SECS,
 };
 use tokio::time::timeout;
 
@@ -272,12 +273,19 @@ async fn sync_regtest_node(
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     let headers_path = data_dir.join("headers.redb");
-    let chainstate =
-        RedbUtxoStore::open(data_dir.join("chainstate.redb")).map_err(|error| error.to_string())?;
-    let undo_store =
-        RedbUndoStore::open(data_dir.join("undo.redb")).map_err(|error| error.to_string())?;
-    let execution_store = RedbExecutionStore::open(data_dir.join("execution.redb"), network)
+    for legacy in ["undo.redb", "execution.redb"] {
+        let path = data_dir.join(legacy);
+        if path.exists() {
+            return Err(format!(
+                "legacy split chain-state file {} is not migrated automatically; move the old data directory aside and rebuild or import a verified snapshot",
+                path.display()
+            ));
+        }
+    }
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), network)
         .map_err(|error| error.to_string())?;
+    let undo_store = chainstate.undos();
+    let execution_store = chainstate.execution();
     execution_store
         .bind_consensus_config(
             &deployment_config.consensus_id(),
@@ -295,18 +303,6 @@ async fn sync_regtest_node(
         None => None,
     };
     let mut headers = sync_headers(session, network, headers_path.clone()).await?;
-    if recover_pending_transition(
-        &chainstate,
-        &undo_store,
-        &execution_store,
-        u64::from(unix_time()?),
-        DEFAULT_HOT_WINDOW_SECS,
-    )
-    .map_err(|error| error.to_string())?
-    {
-        println!("recovered an interrupted chainstate transition");
-    }
-
     'resync: loop {
         if let Some(server) = &mut explorer_server {
             server.ensure_running().await?;
@@ -324,8 +320,6 @@ async fn sync_regtest_node(
             }
             let rewound = disconnect_execution_tip(
                 &chainstate,
-                &undo_store,
-                &execution_store,
                 &headers,
                 u64::from(unix_time()?),
                 DEFAULT_HOT_WINDOW_SECS,
@@ -342,7 +336,7 @@ async fn sync_regtest_node(
             network,
             deployment_config,
             &headers,
-            &execution_store,
+            execution_store,
             &ledger,
         )
         .await?;
@@ -351,8 +345,8 @@ async fn sync_regtest_node(
             network,
             deployment_config,
             &headers,
-            &execution_store,
-            &undo_store,
+            execution_store,
+            undo_store,
             &ledger,
             &explorer,
         )
@@ -399,8 +393,6 @@ async fn sync_regtest_node(
                 deployment_config,
                 &headers,
                 &chainstate,
-                &undo_store,
-                &execution_store,
                 &ledger,
                 &explorer,
             )
@@ -718,12 +710,11 @@ async fn download_execute_batch(
     network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
-    chainstate: &RedbUtxoStore,
-    undo_store: &RedbUndoStore,
-    execution_store: &RedbExecutionStore,
+    chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
 ) -> Result<(), String> {
+    let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     let next_height = tip
         .height
@@ -770,27 +761,47 @@ async fn download_execute_batch(
     ledger
         .stage(next_height, &serialized)
         .map_err(|error| error.to_string())?;
-    for (expected, block) in expected.into_iter().zip(&blocks) {
-        let applied = connect_active_block(
-            chainstate,
-            undo_store,
-            execution_store,
-            headers,
-            block,
-            u64::from(unix_time()?),
-            DEFAULT_HOT_WINDOW_SECS,
-            block_deployment_context(
+    let deployment_contexts = expected
+        .iter()
+        .zip(&blocks)
+        .map(|(expected, block)| {
+            Ok(block_deployment_context(
                 network,
                 expected.height,
                 expected.hash,
                 block.header.time,
                 taproot_active(headers, expected.height, deployment_config)
                     .map_err(|error| error.to_string())?,
-            ),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let now = u64::from(unix_time()?);
+    let applied_blocks = if blocks.len() == 1 {
+        vec![
+            connect_active_block(
+                chainstate,
+                headers,
+                &blocks[0],
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                deployment_contexts[0],
+            )
+            .map_err(|error| error.to_string())?,
+        ]
+    } else {
+        connect_active_blocks(
+            chainstate,
+            headers,
+            &blocks,
+            now,
+            DEFAULT_HOT_WINDOW_SECS,
+            &deployment_contexts,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+    };
+    for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
         explorer
-            .connect(expected.height, block, &applied)
+            .connect(expected.height, block, applied)
             .map_err(|error| error.to_string())?;
         println!(
             "validated and executed block {}:{}",
@@ -1011,12 +1022,11 @@ mod tests {
     use rbtc::{
         api::ExplorerIndex,
         blockchain::block_subsidy,
-        execution_store::RedbExecutionStore,
+        chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
         p2p::V1Transport,
-        undo_store::RedbUndoStore,
-        utxo::{OutPointKey, RedbUtxoStore, UtxoStore},
+        utxo::{OutPointKey, UtxoStore},
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1397,14 +1407,12 @@ mod tests {
         .unwrap();
         server.await.unwrap();
 
-        let execution =
-            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
-        assert_eq!(execution.tip().unwrap().height, 1);
-        assert_eq!(execution.tip().unwrap().hash, block_hash);
-        let undo = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
-        assert!(undo.get(block_hash).unwrap().is_some());
-        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert_eq!(chainstate.execution().tip().unwrap().hash, block_hash);
+        assert!(chainstate.undos().get(block_hash).unwrap().is_some());
         assert!(chainstate.get(coinbase_outpoint).unwrap().is_some());
         let ledger =
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
@@ -1427,7 +1435,7 @@ mod tests {
         ledger.truncate_from(1).unwrap();
         ledger.stage(1, &[archived_bytes]).unwrap();
         drop(ledger);
-        drop((execution, undo, chainstate));
+        drop(chainstate);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recovery_remote = listener.local_addr().unwrap();

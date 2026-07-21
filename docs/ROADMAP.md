@@ -15,7 +15,7 @@
 - [x] Contextual difficulty validation: normal retarget, no-retarget chains, and min-difficulty fallback rules.
 - [x] Atomic UTXO undo records for reverse-order chain disconnects, plus durable block-undo encoding/storage.
 - [x] Transaction-level UTXO transition with script hooks, amount accounting, and coinbase maturity checks.
-- [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks, one-transaction connect/disconnect, and restart-safe write-ahead recovery across UTXO/undo/execution stores.
+- [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks; UTXO, per-block undo, and execution tip share one physical redb database and one transaction for connect/disconnect.
 - [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
 - [x] Contextual header validation enforces the pinned Bitcoin Core 26 mainnet/testnet checkpoints.
 - [x] Minimum-chainwork IBD completion policy with pinned Core 26 defaults, strict overrides, and low-work peer chains kept in IBD without treating their otherwise valid headers as consensus-invalid.
@@ -39,7 +39,7 @@
 ## Phase 3 — performance and release
 
 - [ ] Benchmark IBD, UTXO lookup/mutation, snapshot import/export, compaction, and compression on NVMe and HDD; publish reproducible benchmark fixtures.
-- [ ] Benchmark and tune redb from measurements; validate low-disk behavior, growth/cleanup policy, power-loss recovery, and pruning invariants. Consider an optional RocksDB backend only after reproducible toolchain packaging and comparative benchmarks.
+- [ ] Complete storage benchmarks on target NVMe and HDD. A deterministic release fixture now compares redb quick-repair on/off with the optional durable MDBX UTXO backend; simulated disk-full, repeated SIGKILL/reopen, transaction abort, and truncated-copy gates enforce old-or-new atomic state. MDBX cannot become selectable production chainstate until it atomically includes undo and execution metadata and passes the same crash matrix.
 - [ ] CI gates: format, clippy, test, LCOV generation (implemented), a coverage threshold based on the completed validation corpus, Miri where applicable, sanitizers, fuzz regression, dependency/license/security audit, SBOM, reproducible release builds, and signed artifacts.
 - [ ] External security review and at least a sustained public testnet/regtest soak before any mainnet wallet recommendation.
 
@@ -50,7 +50,7 @@ Wire messages and block/transaction serialization must use Bitcoin's consensus e
 ## Current critical path
 
 The durable regtest headers-first/block IBD milestone is implemented, including
-active-branch rewinds and interrupted-transition recovery. The next acceptance
+atomic multi-block checkpoints and active-branch rewinds. The next acceptance
 milestone is mainnet/testnet-safe consensus activation: complete deployment
 state, remaining block rules and Core differential vectors before removing the
 regtest execution safety gate. Peer diversity/DoS hardening follows before a

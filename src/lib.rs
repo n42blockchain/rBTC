@@ -8,6 +8,7 @@ pub mod api;
 pub mod archive;
 pub mod block_execution;
 pub mod blockchain;
+pub mod chain_store;
 pub mod chainstate;
 pub mod consensus;
 pub mod deployments;
@@ -17,6 +18,8 @@ pub mod header_store;
 pub mod headers;
 pub mod ibd;
 pub mod ledger;
+#[cfg(feature = "mdbx")]
+pub mod mdbx_utxo;
 pub mod p2p;
 pub mod snapshot;
 pub mod undo_store;
