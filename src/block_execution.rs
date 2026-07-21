@@ -1,6 +1,8 @@
 //! Sequential active-chain block execution and durable progress coordination.
 
-use bitcoin::{Block, BlockHash};
+use std::collections::BTreeSet;
+
+use bitcoin::{Block, BlockHash, OutPoint};
 use thiserror::Error;
 
 use crate::{
@@ -8,7 +10,7 @@ use crate::{
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{RedbUndoStore, UndoStoreError},
-    utxo::{UtxoError, UtxoStore},
+    utxo::{OutPointKey, UtxoError, UtxoStore},
 };
 
 /// Consensus deployments selected for a candidate block.
@@ -20,6 +22,8 @@ pub struct BlockDeploymentContext {
     pub bip34_active: bool,
     /// Whether the CSV deployment (BIP68/BIP112/BIP113) is active.
     pub csv_active: bool,
+    /// Whether this is one of the two historical mainnet BIP30 exceptions.
+    pub bip30_exception: bool,
 }
 
 /// Failures while connecting one downloaded active-chain block.
@@ -68,6 +72,9 @@ pub enum BlockExecutionError {
     /// Durable undo data is missing for an executed block.
     #[error("missing durable undo for executed block {0}")]
     MissingUndo(BlockHash),
+    /// BIP30 forbids overwriting an existing unspent transaction output.
+    #[error("BIP30 duplicate unspent output {0}")]
+    Bip30Collision(OutPointKey),
 }
 
 /// Validates and connects exactly the next active-chain block.
@@ -112,7 +119,15 @@ pub fn connect_active_block<S: UtxoStore>(
     let parent_mtp = headers
         .median_time_past(current.hash)
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
-    let applied = apply_block_with_deployments(
+    let collisions = block_output_collisions(chainstate, block)?;
+    let exception_undo = if collisions.is_empty() {
+        None
+    } else if deployments.bip30_exception {
+        Some(chainstate.apply_with_undo(&collisions, &[])?)
+    } else {
+        return Err(BlockExecutionError::Bip30Collision(collisions[0]));
+    };
+    let mut applied = match apply_block_with_deployments(
         chainstate,
         block,
         next_height,
@@ -122,7 +137,18 @@ pub fn connect_active_block<S: UtxoStore>(
         deployments.script_flags,
         deployments.bip34_active,
         deployments.csv_active,
-    )?;
+    ) {
+        Ok(applied) => applied,
+        Err(error) => {
+            if let Some(undo) = &exception_undo {
+                chainstate.undo(undo, now, hot_window_secs)?;
+            }
+            return Err(BlockExecutionError::Block(error));
+        }
+    };
+    if let Some(undo) = exception_undo {
+        applied.transaction_undos.insert(0, undo);
+    }
 
     if let Err(error) = undo_store.insert(applied.hash, &applied.transaction_undos) {
         disconnect_block(chainstate, &applied, now, hot_window_secs)?;
@@ -140,6 +166,24 @@ pub fn connect_active_block<S: UtxoStore>(
         return Err(BlockExecutionError::Execution(error));
     }
     Ok(applied)
+}
+
+fn block_output_collisions<S: UtxoStore>(
+    chainstate: &S,
+    block: &Block,
+) -> Result<Vec<OutPointKey>, UtxoError> {
+    let mut collisions = BTreeSet::new();
+    for transaction in &block.txdata {
+        let txid = transaction.compute_txid();
+        for vout in 0..transaction.output.len() {
+            let vout = u32::try_from(vout).map_err(|_| UtxoError::Malformed("output index"))?;
+            let outpoint = OutPointKey::from(OutPoint::new(txid, vout));
+            if chainstate.get(outpoint)?.is_some() {
+                collisions.insert(outpoint);
+            }
+        }
+    }
+    Ok(collisions.into_iter().collect())
 }
 
 /// Disconnects the current execution tip using its durable undo record.
@@ -203,7 +247,7 @@ mod tests {
     use crate::{
         blockchain::block_subsidy,
         headers::HeaderDag,
-        utxo::{OutPointKey, RedbUtxoStore},
+        utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
 
     fn coinbase(height: u32) -> Transaction {
@@ -303,5 +347,75 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn bip30_rejects_collisions_and_exception_undo_restores_overwritten_coin() {
+        let directory = TempDir::new().unwrap();
+        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
+        let execution_store =
+            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+                .unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let block = block(genesis.hash, genesis.header.time + 1);
+        headers
+            .insert_contextual(block.header, block.header.time)
+            .unwrap();
+        let collision = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
+        chainstate
+            .apply(
+                &[],
+                &[(
+                    collision,
+                    Utxo {
+                        value_sats: 42,
+                        height: 0,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            connect_active_block(
+                &chainstate,
+                &undo_store,
+                &execution_store,
+                &headers,
+                &block,
+                1,
+                60,
+                BlockDeploymentContext::default(),
+            ),
+            Err(BlockExecutionError::Bip30Collision(key)) if key == collision
+        ));
+        assert_eq!(chainstate.get(collision).unwrap().unwrap().value_sats, 42);
+
+        connect_active_block(
+            &chainstate,
+            &undo_store,
+            &execution_store,
+            &headers,
+            &block,
+            1,
+            60,
+            BlockDeploymentContext {
+                bip30_exception: true,
+                ..BlockDeploymentContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chainstate.get(collision).unwrap().unwrap().value_sats,
+            block_subsidy(1)
+        );
+        disconnect_execution_tip(&chainstate, &undo_store, &execution_store, &headers, 2, 60)
+            .unwrap();
+        assert_eq!(chainstate.get(collision).unwrap().unwrap().value_sats, 42);
     }
 }

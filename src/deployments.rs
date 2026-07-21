@@ -19,11 +19,13 @@ pub fn block_deployment_context(
     block_time: u32,
     taproot_active: bool,
 ) -> BlockDeploymentContext {
+    let bip30_exception = is_bip30_exception(network, height, block_hash);
     if let Some(script_flags) = script_flag_exception(network, block_hash) {
         return BlockDeploymentContext {
             script_flags,
             bip34_active: height >= activation_heights(network).bip34,
             csv_active: height >= activation_heights(network).csv,
+            bip30_exception,
         };
     }
     let heights = activation_heights(network);
@@ -50,6 +52,7 @@ pub fn block_deployment_context(
         script_flags,
         bip34_active: height >= heights.bip34,
         csv_active: height >= heights.csv,
+        bip30_exception,
     }
 }
 
@@ -133,6 +136,18 @@ fn script_flag_exception(network: Network, hash: BlockHash) -> Option<u32> {
         _ => return None,
     };
     Some(exception)
+}
+
+fn is_bip30_exception(network: Network, height: u32, hash: BlockHash) -> bool {
+    network == Network::Bitcoin
+        && ((height == 91_842
+            && hash
+                == parse_hash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"))
+            || (height == 91_880
+                && hash
+                    == parse_hash(
+                        "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+                    )))
 }
 
 fn parse_hash(hash: &str) -> BlockHash {
