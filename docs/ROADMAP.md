@@ -18,7 +18,8 @@
 - [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks, one-transaction connect/disconnect, and restart-safe write-ahead recovery across UTXO/undo/execution stores.
 - [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
 - [x] Contextual header validation enforces the pinned Bitcoin Core 26 mainnet/testnet checkpoints.
-- [ ] Add minimum-chainwork/assume-valid IBD policy without weakening eventual full validation.
+- [x] Minimum-chainwork IBD completion policy with pinned Core 26 defaults, strict overrides, and low-work peer chains kept in IBD without treating their otherwise valid headers as consensus-invalid.
+- [ ] Assume-valid acceleration backed by eventual full validation. Core anchors and overrides are validated against the active header chain, but rBTC intentionally continues checking every script until the background verifier and retained validation data exist.
 - [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, deployment-aware BIP141 witness commitment/unexpected-witness rules, mutated transaction Merkle trees, buried deployments, Taproot BIP9 state, Core-compatible configurable regtest Taproot activation, the 80,000 legacy/P2SH/witness sigop-cost limit, and Core-style transaction duplicate/null-input/base-size checks are enforced. Remaining gates include full BIP141/143/147/341/342 vector coverage and keeping policy/standardness distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.

@@ -34,7 +34,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-For the current safety-gated regtest daemon, `rbtcd --connect HOST:PORT --network regtest --data-dir PATH` stays attached and polls the peer for new headers every 30 seconds. Add `--once` for a bounded sync-and-exit run. Add `--explorer-listen 127.0.0.1:3000` to serve the embedded read-only explorer and REST API; non-loopback binds are rejected until authentication is implemented. Regtest Taproot activation can be overridden with Core-compatible `--vbparams taproot:START:END[:MIN_HEIGHT]`; the selected consensus configuration is bound to a fresh execution database and cannot later change in place.
+For the current safety-gated regtest daemon, `rbtcd --connect HOST:PORT --network regtest --data-dir PATH` stays attached and polls the peer for new headers every 30 seconds. Add `--once` for a bounded sync-and-exit run. Add `--explorer-listen 127.0.0.1:3000` to serve the embedded read-only explorer and REST API; non-loopback binds are rejected until authentication is implemented. Regtest Taproot activation can be overridden with Core-compatible `--vbparams taproot:START:END[:MIN_HEIGHT]`; the selected consensus configuration is bound to a fresh execution database and cannot later change in place. Core 26 minimum-chainwork and assume-valid defaults are loaded per supported legacy network and can be overridden with `--minimum-chainwork HEX` and `--assumevalid HASH|0`. A chain below the work floor remains in IBD. Assume-valid currently identifies a reviewed active-chain anchor only: all scripts are still verified.
 
 ## API boundary
 

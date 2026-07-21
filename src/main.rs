@@ -24,6 +24,7 @@ use rbtc::{
     explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
+    ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
     undo_store::RedbUndoStore,
@@ -43,6 +44,7 @@ struct Options {
     once: bool,
     explorer_listen: Option<SocketAddr>,
     deployments: DeploymentConfig,
+    ibd_policy: IbdPolicy,
 }
 
 struct ExplorerServer {
@@ -177,6 +179,7 @@ async fn run(options: Options) -> Result<(), String> {
             &mut session,
             options.network,
             options.deployments,
+            options.ibd_policy,
             path,
             options.once,
             options.explorer_listen,
@@ -185,7 +188,15 @@ async fn run(options: Options) -> Result<(), String> {
     }
 
     if let Some(path) = options.headers_db {
-        sync_headers(&mut session, options.network, path).await?;
+        let headers = sync_headers(&mut session, options.network, path).await?;
+        let status = options
+            .ibd_policy
+            .ensure_minimum_chainwork(&headers)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "minimum chainwork reached at height {}; full script validation remains required",
+            status.height
+        );
         return Ok(());
     }
 
@@ -236,7 +247,7 @@ async fn sync_headers(
         }
     }
     println!(
-        "headers sync complete at height {}",
+        "peer returned no more headers at height {}",
         dag.active_tip().height
     );
     Ok(dag)
@@ -247,6 +258,7 @@ async fn sync_regtest_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
     deployment_config: DeploymentConfig,
+    ibd_policy: IbdPolicy,
     data_dir: PathBuf,
     once: bool,
     explorer_listen: Option<SocketAddr>,
@@ -353,6 +365,27 @@ async fn sync_regtest_node(
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             if tip.height >= headers.active_tip().height {
                 println!("block execution caught up at height {}", tip.height);
+                let ibd_status = ibd_policy
+                    .status(&headers)
+                    .map_err(|error| error.to_string())?;
+                if ibd_status.minimum_chainwork_reached {
+                    println!(
+                        "minimum chainwork reached; full script validation remains enabled{}",
+                        ibd_status
+                            .active_assume_valid_height
+                            .map_or_else(String::new, |height| format!(
+                                " (assume-valid anchor active at {height})"
+                            ))
+                    );
+                } else {
+                    let error = ibd_policy
+                        .ensure_minimum_chainwork(&headers)
+                        .expect_err("status is below minimum chainwork");
+                    if once {
+                        return Err(error.to_string());
+                    }
+                    println!("remaining in IBD: {error}");
+                }
                 if once {
                     return Ok(());
                 }
@@ -820,13 +853,13 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut once = false;
     let mut explorer_listen = None;
     let mut vbparams = Vec::new();
+    let mut minimum_chainwork = None;
+    let mut assume_valid = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--connect" => {
-                let address = args
-                    .next()
-                    .ok_or_else(|| "--connect requires HOST:PORT".to_owned())?;
+                let address = required_option_value(&mut args, "--connect")?;
                 remote = Some(
                     address
                         .parse()
@@ -834,38 +867,32 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 );
             }
             "--network" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--network requires a network name".to_owned())?;
+                let value = required_option_value(&mut args, "--network")?;
                 network = Network::from_str(&value)
                     .map_err(|_| format!("unsupported network: {value}"))?;
             }
             "--fetch-block" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--fetch-block requires a block hash".to_owned())?;
+                let value = required_option_value(&mut args, "--fetch-block")?;
                 fetch_block = Some(
                     BlockHash::from_str(&value)
                         .map_err(|_| format!("invalid block hash: {value}"))?,
                 );
             }
             "--headers-db" => {
-                headers_db =
-                    Some(PathBuf::from(args.next().ok_or_else(|| {
-                        "--headers-db requires a file path".to_owned()
-                    })?));
+                headers_db = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--headers-db",
+                )?));
             }
             "--data-dir" => {
-                data_dir =
-                    Some(PathBuf::from(args.next().ok_or_else(|| {
-                        "--data-dir requires a directory path".to_owned()
-                    })?));
+                data_dir = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--data-dir",
+                )?));
             }
             "--once" => once = true,
             "--explorer-listen" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "--explorer-listen requires IP:PORT".to_owned())?;
+                let value = required_option_value(&mut args, "--explorer-listen")?;
                 let address: SocketAddr = value
                     .parse()
                     .map_err(|_| format!("invalid explorer listen address: {value}"))?;
@@ -878,10 +905,13 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 explorer_listen = Some(address);
             }
             "--vbparams" => {
-                vbparams.push(
-                    args.next()
-                        .ok_or_else(|| "--vbparams requires a value".to_owned())?,
-                );
+                vbparams.push(required_option_value(&mut args, "--vbparams")?);
+            }
+            "--minimum-chainwork" => {
+                minimum_chainwork = Some(required_option_value(&mut args, "--minimum-chainwork")?);
+            }
+            "--assumevalid" | "--assume-valid" => {
+                assume_valid = Some(required_option_value(&mut args, "--assumevalid")?);
             }
             _ => return Err(format!("unknown option: {argument}")),
         }
@@ -892,6 +922,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
     let deployments = parse_deployment_config(network, data_dir.is_some(), vbparams)?;
+    let ibd_policy = parse_ibd_policy(
+        network,
+        data_dir.is_some() || headers_db.is_some(),
+        minimum_chainwork,
+        assume_valid,
+    )?;
     Ok(Some(Options {
         remote,
         network,
@@ -901,7 +937,16 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         once,
         explorer_listen,
         deployments,
+        ibd_policy,
     }))
+}
+
+fn required_option_value(
+    args: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("{option} requires a value"))
 }
 
 fn parse_deployment_config(
@@ -921,9 +966,32 @@ fn parse_deployment_config(
     Ok(deployments)
 }
 
+fn parse_ibd_policy(
+    network: Network,
+    sync_enabled: bool,
+    minimum_chainwork: Option<String>,
+    assume_valid: Option<String>,
+) -> Result<IbdPolicy, String> {
+    if !sync_enabled && (minimum_chainwork.is_some() || assume_valid.is_some()) {
+        return Err("IBD policy options require --headers-db or --data-dir".to_owned());
+    }
+    let mut policy = IbdPolicy::for_network(network);
+    if let Some(value) = minimum_chainwork {
+        policy
+            .set_minimum_chainwork(&value)
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(value) = assume_valid {
+        policy
+            .set_assume_valid(&value)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(policy)
+}
+
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1041,6 +1109,7 @@ mod tests {
             options.deployments,
             DeploymentConfig::for_network(Network::Regtest)
         );
+        assert_eq!(options.ibd_policy, IbdPolicy::for_network(Network::Regtest));
 
         let served = parse_options(
             [
@@ -1106,6 +1175,71 @@ mod tests {
                     "regtest",
                     "--vbparams",
                     "taproot:0:1",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_and_rejects_ibd_policy_options() {
+        let customized = parse_options(
+            [
+                "--connect",
+                "127.0.0.1:18444",
+                "--network",
+                "regtest",
+                "--headers-db",
+                "/tmp/rbtc-headers",
+                "--minimum-chainwork",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                "--assumevalid",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            customized.ibd_policy,
+            IbdPolicy::for_network(Network::Regtest)
+        );
+
+        assert!(
+            parse_options(
+                ["--connect", "127.0.0.1:18444", "--minimum-chainwork", "01"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--headers-db",
+                    "/tmp/rbtc-headers",
+                    "--minimum-chainwork",
+                    "invalid",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--headers-db",
+                    "/tmp/rbtc-headers",
+                    "--assumevalid",
+                    "invalid",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -1183,6 +1317,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1256,6 +1391,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1327,6 +1463,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
         .await
         .unwrap();
@@ -1388,6 +1525,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
         .await
         .unwrap();

@@ -15,6 +15,7 @@ pub mod execution_store;
 pub mod explorer_store;
 pub mod header_store;
 pub mod headers;
+pub mod ibd;
 pub mod ledger;
 pub mod p2p;
 pub mod snapshot;
