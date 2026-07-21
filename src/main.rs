@@ -12,7 +12,7 @@ use std::{
 use bitcoin::{BlockHash, Network, hashes::Hash};
 use rbtc::{
     block_execution::{connect_active_block, disconnect_execution_tip, recover_pending_transition},
-    deployments::{block_deployment_context, taproot_always_active},
+    deployments::{block_deployment_context, taproot_active},
     execution_store::RedbExecutionStore,
     header_store::RedbHeaderStore,
     headers::HeaderDag,
@@ -253,7 +253,7 @@ async fn sync_regtest_node(
                 next_height,
                 expected.hash,
                 block.header.time,
-                taproot_always_active(network),
+                taproot_active(&headers, next_height),
             ),
         )
         .map_err(|error| error.to_string())?;

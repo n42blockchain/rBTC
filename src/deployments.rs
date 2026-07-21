@@ -8,7 +8,29 @@ use std::str::FromStr;
 
 use bitcoin::{BlockHash, Network};
 
-use crate::block_execution::BlockDeploymentContext;
+use crate::{block_execution::BlockDeploymentContext, headers::HeaderDag};
+
+const VERSION_BITS_TOP_MASK: u32 = 0xE000_0000;
+const VERSION_BITS_TOP_BITS: u32 = 0x2000_0000;
+const TAPROOT_BIT: u32 = 2;
+const TAPROOT_START_TIME: u32 = 1_619_222_400;
+const TAPROOT_TIMEOUT: u32 = 1_628_640_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThresholdState {
+    Defined,
+    Started,
+    LockedIn,
+    Active,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+struct VersionBitsParams {
+    period: u32,
+    threshold: u32,
+    min_activation_height: u32,
+}
 
 /// Derives block and script consensus flags for one candidate.
 #[must_use]
@@ -63,6 +85,91 @@ pub const fn taproot_always_active(network: Network) -> bool {
         network,
         Network::Testnet4 | Network::Signet | Network::Regtest
     )
+}
+
+/// Computes Taproot's BIP9 state for a candidate on the active header chain.
+///
+/// Mainnet and legacy testnet use the Core 26 deployment parameters. Newer
+/// test networks and default regtest configure Taproot as always active.
+#[must_use]
+pub fn taproot_active(headers: &HeaderDag, candidate_height: u32) -> bool {
+    let network = headers.network();
+    if taproot_always_active(network) {
+        return true;
+    }
+    let params = match network {
+        Network::Bitcoin => VersionBitsParams {
+            period: 2_016,
+            threshold: 1_815,
+            min_activation_height: 709_632,
+        },
+        Network::Testnet => VersionBitsParams {
+            period: 2_016,
+            threshold: 1_512,
+            min_activation_height: 0,
+        },
+        Network::Testnet4 | Network::Signet | Network::Regtest => return true,
+    };
+    threshold_state(headers, candidate_height, params) == ThresholdState::Active
+}
+
+fn threshold_state(
+    headers: &HeaderDag,
+    candidate_height: u32,
+    params: VersionBitsParams,
+) -> ThresholdState {
+    let Some(parent_height) = candidate_height.checked_sub(1) else {
+        return ThresholdState::Defined;
+    };
+    let completed_periods = candidate_height / params.period;
+    if completed_periods == 0 {
+        return ThresholdState::Defined;
+    }
+    let mut state = ThresholdState::Defined;
+    for period_index in 1..=completed_periods {
+        let period_end = period_index
+            .checked_mul(params.period)
+            .and_then(|height| height.checked_sub(1))
+            .expect("active header height is bounded by u32");
+        if period_end > parent_height {
+            break;
+        }
+        let Some(period_end_header) = headers.active_header_at(period_end) else {
+            return ThresholdState::Defined;
+        };
+        let period_mtp = headers
+            .median_time_past(period_end_header.hash)
+            .expect("active header has median time past");
+        state = match state {
+            ThresholdState::Defined if period_mtp >= TAPROOT_START_TIME => ThresholdState::Started,
+            ThresholdState::Started => {
+                let period_start = period_end + 1 - params.period;
+                let signals = (period_start..=period_end)
+                    .filter_map(|height| headers.active_header_at(height))
+                    .filter(|header| signals_taproot(header.header.version.to_consensus()))
+                    .count();
+                if signals >= usize::try_from(params.threshold).expect("threshold fits usize") {
+                    ThresholdState::LockedIn
+                } else if period_mtp >= TAPROOT_TIMEOUT {
+                    ThresholdState::Failed
+                } else {
+                    ThresholdState::Started
+                }
+            }
+            ThresholdState::LockedIn
+                if period_end.saturating_add(1) >= params.min_activation_height =>
+            {
+                ThresholdState::Active
+            }
+            other => other,
+        };
+    }
+    state
+}
+
+fn signals_taproot(version: i32) -> bool {
+    let version = u32::from_ne_bytes(version.to_ne_bytes());
+    version & VERSION_BITS_TOP_MASK == VERSION_BITS_TOP_BITS && version & (1 << TAPROOT_BIT) != 0
 }
 
 #[derive(Clone, Copy)]
@@ -156,7 +263,12 @@ fn parse_hash(hash: &str) -> BlockHash {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::hashes::Hash;
+    use bitcoin::{
+        TxMerkleNode,
+        block::{Header, Version},
+        hashes::Hash,
+        pow::Target,
+    };
 
     use super::*;
 
@@ -207,5 +319,51 @@ mod tests {
             false,
         );
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
+    }
+
+    #[test]
+    fn bip9_taproot_state_obeys_period_threshold_and_minimum_height() {
+        let mut headers = HeaderDag::new(Network::Regtest);
+        for height in 1..12_u32 {
+            let parent = headers.active_tip();
+            let signals = (4..=6).contains(&height);
+            let mut header = Header {
+                version: if signals {
+                    Version::from_consensus(
+                        i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT))
+                            .expect("version-bits value fits i32"),
+                    )
+                } else {
+                    Version::ONE
+                },
+                prev_blockhash: parent.hash,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: TAPROOT_START_TIME + height,
+                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+                nonce: 0,
+            };
+            while header.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_err() {
+                header.nonce += 1;
+            }
+            headers.insert_contextual(header, u32::MAX).unwrap();
+        }
+        let params = VersionBitsParams {
+            period: 4,
+            threshold: 3,
+            min_activation_height: 12,
+        };
+        assert_eq!(
+            threshold_state(&headers, 4, params),
+            ThresholdState::Started
+        );
+        assert_eq!(
+            threshold_state(&headers, 8, params),
+            ThresholdState::LockedIn
+        );
+        assert_eq!(
+            threshold_state(&headers, 12, params),
+            ThresholdState::Active
+        );
+        assert!(taproot_active(&headers, 1));
     }
 }

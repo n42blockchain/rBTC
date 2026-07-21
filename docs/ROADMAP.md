@@ -18,7 +18,7 @@
 - [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks, one-transaction connect/disconnect, and restart-safe write-ahead recovery across UTXO/undo/execution stores.
 - [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
 - [ ] Contextual header validation: add network checkpoints and checkpoint-aware anti-DoS policy.
-- [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, BIP141 witness commitments, and mutated transaction Merkle trees are checked. Remaining gates include sigops, full BIP141/143/147/341/342 deployment behavior, complete activation state, and keeping policy/standardness distinct from consensus.
+- [ ] Complete block/contextual validation: BIP30 is enforced with its two historical exceptions; BIP34 height, BIP68/113 locks, BIP141 witness commitments, mutated transaction Merkle trees, buried deployments, and Taproot BIP9 state are checked. Remaining gates include sigops, full BIP141/143/147/341/342 block behavior, configurable regtest deployments, and keeping policy/standardness distinct from consensus.
 - [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest; property tests and cargo-fuzz corpus in CI.
 - [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
 - [ ] P2P peer manager, addrman, compact blocks, full headers-first/block IBD, additional DoS limits, peer eviction, block relay, and transaction relay. Outbound v1 handshake, `getheaders`, `getdata`, bounded response handling, and durable header-only IBD are implemented.
