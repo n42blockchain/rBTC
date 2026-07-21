@@ -91,6 +91,7 @@ pub fn apply_block<S: UtxoStore>(
     block: &Block,
     height: u32,
     now: u64,
+    creation_mtp: u32,
     hot_window_secs: u64,
     script_flags: u32,
 ) -> Result<AppliedBlock, BlockError> {
@@ -99,6 +100,7 @@ pub fn apply_block<S: UtxoStore>(
         block,
         height,
         now,
+        creation_mtp,
         hot_window_secs,
         script_flags,
         false,
@@ -109,11 +111,40 @@ pub fn apply_block<S: UtxoStore>(
 ///
 /// The chain deployment manager must set `bip34_active` only at and after the
 /// selected network's activation height.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_block_with_bip34<S: UtxoStore>(
     store: &S,
     block: &Block,
     height: u32,
     now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    bip34_active: bool,
+) -> Result<AppliedBlock, BlockError> {
+    apply_block_with_context(
+        store,
+        block,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        bip34_active,
+    )
+}
+
+/// Validates and applies a block with its consensus-derived previous MTP.
+///
+/// `creation_mtp` is the median time past of the candidate block's parent and
+/// is persisted on every created output for BIP68 evaluation.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_with_context<S: UtxoStore>(
+    store: &S,
+    block: &Block,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
     hot_window_secs: u64,
     script_flags: u32,
     bip34_active: bool,
@@ -146,7 +177,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
 
     let mut applied = Vec::with_capacity(block.txdata.len());
     for (index, transaction) in block.txdata.iter().enumerate() {
-        match apply_transaction(store, transaction, height, now, script_flags) {
+        match apply_transaction(store, transaction, height, now, creation_mtp, script_flags) {
             Ok(transaction) => applied.push(transaction),
             Err(source) => {
                 rollback(store, &applied, now, hot_window_secs)?;
@@ -287,7 +318,7 @@ mod tests {
         let (_dir, store) = store();
         let transaction = coinbase();
         let block = block(vec![transaction.clone()]);
-        let applied = apply_block(&store, &block, 0, 100, 60, 0).unwrap();
+        let applied = apply_block(&store, &block, 0, 100, 0, 60, 0).unwrap();
         let output = OutPointKey::from(OutPoint::new(transaction.compute_txid(), 0));
         assert!(store.get(output).unwrap().is_some());
         disconnect_block(&store, &applied, 100, 60).unwrap();
@@ -309,7 +340,7 @@ mod tests {
         };
         let block = block(vec![coinbase.clone(), invalid]);
         assert!(matches!(
-            apply_block(&store, &block, 0, 100, 60, 0),
+            apply_block(&store, &block, 0, 100, 0, 60, 0),
             Err(BlockError::Transaction { index: 1, .. })
         ));
         let output = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 0));
@@ -323,7 +354,7 @@ mod tests {
         transaction.input[0].witness = Witness::from_slice(&[b"reserved".as_slice()]);
         let block = block(vec![transaction]);
         assert!(matches!(
-            apply_block(&store, &block, 0, 100, 60, 0),
+            apply_block(&store, &block, 0, 100, 0, 60, 0),
             Err(BlockError::WitnessCommitment)
         ));
     }
@@ -334,10 +365,10 @@ mod tests {
         let mut transaction = coinbase();
         transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![1, 10]);
         let valid_block = block(vec![transaction.clone()]);
-        assert!(apply_block_with_bip34(&store, &valid_block, 10, 100, 60, 0, true).is_ok());
+        assert!(apply_block_with_bip34(&store, &valid_block, 10, 100, 0, 60, 0, true).is_ok());
         let bad = block(vec![coinbase()]);
         assert!(matches!(
-            apply_block_with_bip34(&store, &bad, 10, 100, 60, 0, true),
+            apply_block_with_bip34(&store, &bad, 10, 100, 0, 60, 0, true),
             Err(BlockError::Bip34Height { height: 10 })
         ));
     }

@@ -101,6 +101,10 @@ pub struct Utxo {
     pub is_coinbase: bool,
     /// Unix seconds when this record was last created or observed unspent.
     pub last_touched: u64,
+    /// Median-time-past of the block immediately preceding this output's creation block.
+    ///
+    /// This is consensus metadata used to evaluate BIP68 time-based relative locks.
+    pub creation_mtp: u32,
     /// ScriptPubKey serialized exactly as it appears on the wire.
     pub script_pubkey: Vec<u8>,
 }
@@ -109,18 +113,19 @@ impl Utxo {
     fn encode(&self) -> Result<Vec<u8>, UtxoError> {
         let script_len = u32::try_from(self.script_pubkey.len())
             .map_err(|_| UtxoError::Malformed("script exceeds u32"))?;
-        let mut bytes = Vec::with_capacity(25 + self.script_pubkey.len());
+        let mut bytes = Vec::with_capacity(29 + self.script_pubkey.len());
         bytes.extend_from_slice(&self.value_sats.to_le_bytes());
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.push(u8::from(self.is_coinbase));
         bytes.extend_from_slice(&self.last_touched.to_le_bytes());
+        bytes.extend_from_slice(&self.creation_mtp.to_le_bytes());
         bytes.extend_from_slice(&script_len.to_le_bytes());
         bytes.extend_from_slice(&self.script_pubkey);
         Ok(bytes)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
-        if bytes.len() < 25 {
+        if bytes.len() < 29 {
             return Err(UtxoError::Malformed("record header"));
         }
         let value_sats = u64::from_le_bytes(bytes[..8].try_into().expect("checked length"));
@@ -131,9 +136,10 @@ impl Utxo {
             _ => return Err(UtxoError::Malformed("coinbase flag")),
         };
         let last_touched = u64::from_le_bytes(bytes[13..21].try_into().expect("checked length"));
-        let script_len = u32::from_le_bytes(bytes[21..25].try_into().expect("checked length"));
+        let creation_mtp = u32::from_le_bytes(bytes[21..25].try_into().expect("checked length"));
+        let script_len = u32::from_le_bytes(bytes[25..29].try_into().expect("checked length"));
         let script_len = usize::try_from(script_len).expect("u32 fits usize");
-        if bytes.len() != 25 + script_len {
+        if bytes.len() != 29 + script_len {
             return Err(UtxoError::Malformed("script length"));
         }
         Ok(Self {
@@ -141,7 +147,8 @@ impl Utxo {
             height,
             is_coinbase,
             last_touched,
-            script_pubkey: bytes[25..].to_vec(),
+            creation_mtp,
+            script_pubkey: bytes[29..].to_vec(),
         })
     }
 }
@@ -465,6 +472,7 @@ mod tests {
             height: 100,
             is_coinbase: false,
             last_touched: touched,
+            creation_mtp: 0,
             script_pubkey: vec![0x51],
         }
     }

@@ -78,6 +78,7 @@ pub fn apply_transaction<S: UtxoStore>(
     transaction: &Transaction,
     height: u32,
     now: u64,
+    creation_mtp: u32,
     script_flags: u32,
 ) -> Result<AppliedTransaction, ChainstateError> {
     let txid = transaction.compute_txid();
@@ -99,7 +100,7 @@ pub fn apply_transaction<S: UtxoStore>(
         if !(2..=100).contains(&script_len) {
             return Err(ChainstateError::CoinbaseScriptSize);
         }
-        let created = created_outputs(transaction, height, now, true);
+        let created = created_outputs(transaction, height, now, creation_mtp, true);
         return Ok(AppliedTransaction {
             txid,
             input_value_sats: 0,
@@ -143,7 +144,7 @@ pub fn apply_transaction<S: UtxoStore>(
         return Err(ChainstateError::Inflation);
     }
     verify_transaction_scripts_with_flags(transaction, &prevouts, script_flags)?;
-    let created = created_outputs(transaction, height, now, false);
+    let created = created_outputs(transaction, height, now, creation_mtp, false);
     Ok(AppliedTransaction {
         txid,
         input_value_sats: input_value,
@@ -156,6 +157,7 @@ fn created_outputs(
     transaction: &Transaction,
     height: u32,
     now: u64,
+    creation_mtp: u32,
     is_coinbase: bool,
 ) -> Vec<(OutPointKey, Utxo)> {
     let txid = transaction.compute_txid();
@@ -172,6 +174,7 @@ fn created_outputs(
                     height,
                     is_coinbase,
                     last_touched: now,
+                    creation_mtp,
                     script_pubkey: output.script_pubkey.as_bytes().to_vec(),
                 },
             )
@@ -217,7 +220,7 @@ mod tests {
     fn coinbase_creates_immature_utxo_and_returns_undo() {
         let (_dir, store) = store();
         let transaction = coinbase(vec![1, 2]);
-        let applied = apply_transaction(&store, &transaction, 10, 100, 0).unwrap();
+        let applied = apply_transaction(&store, &transaction, 10, 100, 99, 0).unwrap();
         let key = OutPointKey::from(OutPoint::new(transaction.compute_txid(), 0));
         assert!(store.get(key).unwrap().unwrap().is_coinbase);
         assert_eq!(applied.undo.created(), &[key]);
@@ -229,7 +232,7 @@ mod tests {
     fn coinbase_script_size_is_checked() {
         let (_dir, store) = store();
         assert!(matches!(
-            apply_transaction(&store, &coinbase(vec![1]), 10, 100, 0),
+            apply_transaction(&store, &coinbase(vec![1]), 10, 100, 99, 0),
             Err(ChainstateError::CoinbaseScriptSize)
         ));
     }
@@ -247,13 +250,13 @@ mod tests {
             }],
         };
         assert!(matches!(
-            apply_transaction(&store, &no_inputs, 10, 100, 0),
+            apply_transaction(&store, &no_inputs, 10, 100, 99, 0),
             Err(ChainstateError::NoInputs)
         ));
         let mut no_outputs = coinbase(vec![1, 2]);
         no_outputs.output.clear();
         assert!(matches!(
-            apply_transaction(&store, &no_outputs, 10, 100, 0),
+            apply_transaction(&store, &no_outputs, 10, 100, 99, 0),
             Err(ChainstateError::NoOutputs)
         ));
     }

@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::utxo::{OutPointKey, Utxo, UtxoError, UtxoStore};
 
 const MAGIC: &[u8; 8] = b"RBTCUTXO";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 /// Snapshot import and export failures.
 #[derive(Debug, Error)]
@@ -166,6 +166,7 @@ fn encode_entries(entries: &BTreeMap<OutPointKey, Utxo>) -> Result<Vec<u8>, Snap
         records.extend_from_slice(&utxo.height.to_le_bytes());
         records.push(u8::from(utxo.is_coinbase));
         records.extend_from_slice(&utxo.last_touched.to_le_bytes());
+        records.extend_from_slice(&utxo.creation_mtp.to_le_bytes());
         records.extend_from_slice(&script_len.to_le_bytes());
         records.extend_from_slice(&utxo.script_pubkey);
     }
@@ -175,7 +176,7 @@ fn encode_entries(entries: &BTreeMap<OutPointKey, Utxo>) -> Result<Vec<u8>, Snap
 fn decode_entries(mut records: &[u8]) -> Result<BTreeMap<OutPointKey, Utxo>, SnapshotError> {
     let mut entries = BTreeMap::new();
     while !records.is_empty() {
-        if records.len() < 61 {
+        if records.len() < 65 {
             return Err(SnapshotError::Invalid("entry header"));
         }
         let key = OutPointKey::from_bytes(&records[..36])?;
@@ -187,9 +188,10 @@ fn decode_entries(mut records: &[u8]) -> Result<BTreeMap<OutPointKey, Utxo>, Sna
             _ => return Err(SnapshotError::Invalid("coinbase flag")),
         };
         let last_touched = u64::from_le_bytes(records[49..57].try_into().expect("checked header"));
-        let script_len = u32::from_le_bytes(records[57..61].try_into().expect("checked header"));
+        let creation_mtp = u32::from_le_bytes(records[57..61].try_into().expect("checked header"));
+        let script_len = u32::from_le_bytes(records[61..65].try_into().expect("checked header"));
         let script_len = usize::try_from(script_len).expect("u32 fits usize");
-        let entry_len = 61_usize
+        let entry_len = 65_usize
             .checked_add(script_len)
             .ok_or(SnapshotError::Invalid("script length"))?;
         if records.len() < entry_len {
@@ -200,7 +202,8 @@ fn decode_entries(mut records: &[u8]) -> Result<BTreeMap<OutPointKey, Utxo>, Sna
             height,
             is_coinbase,
             last_touched,
-            script_pubkey: records[61..entry_len].to_vec(),
+            creation_mtp,
+            script_pubkey: records[65..entry_len].to_vec(),
         };
         if entries.insert(key, utxo).is_some() {
             return Err(SnapshotError::Invalid("duplicate outpoint"));
@@ -236,6 +239,7 @@ mod tests {
                         height: 5,
                         is_coinbase: false,
                         last_touched: 1,
+                        creation_mtp: 0,
                         script_pubkey: vec![0x51],
                     },
                 )],
