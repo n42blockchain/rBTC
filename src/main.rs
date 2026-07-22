@@ -34,7 +34,7 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, connect_outbound},
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
-    snapshot::{SnapshotTrustAnchor, verify_snapshot},
+    snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
     wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
@@ -76,6 +76,8 @@ struct SnapshotActivationOptions {
     path: PathBuf,
     height: u32,
     block_hash: BlockHash,
+    utxo_count: u64,
+    records_bytes: u64,
     records_sha256: String,
 }
 
@@ -516,13 +518,15 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
         options.network,
         snapshot.height,
         snapshot.block_hash,
+        snapshot.utxo_count,
+        snapshot.records_bytes,
         snapshot.records_sha256.clone(),
     )
     .map_err(|error| error.to_string())?;
     let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
         .map_err(|error| error.to_string())?;
     let now = u64::from(unix_time()?);
-    let manifest = verify_snapshot(&snapshot.path)
+    let manifest = verify_snapshot_with_trust(&snapshot.path, &trusted)
         .and_then(|verified| {
             verified.assume_into(
                 &chainstate,
@@ -534,8 +538,8 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
         })
         .map_err(|error| error.to_string())?;
     println!(
-        "activated assumed UTXO snapshot at {}:{} with {} entries; background genesis validation remains required",
-        manifest.height, manifest.block_hash, manifest.utxo_count
+        "activated assumed UTXO snapshot at {}:{} with {} entries/{} canonical bytes; background genesis validation remains required",
+        manifest.height, manifest.block_hash, manifest.utxo_count, manifest.records_bytes
     );
     Ok(())
 }
@@ -1904,6 +1908,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut snapshot_path = None;
     let mut snapshot_height = None;
     let mut snapshot_block_hash = None;
+    let mut snapshot_utxo_count = None;
+    let mut snapshot_records_bytes = None;
     let mut snapshot_records_sha256 = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -2043,6 +2049,32 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                         .map_err(|_| format!("invalid snapshot block hash: {value}"))?,
                 );
             }
+            "--snapshot-utxo-count" => {
+                if snapshot_utxo_count.is_some() {
+                    return Err(
+                        "--snapshot-utxo-count cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-utxo-count")?;
+                snapshot_utxo_count = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid snapshot UTXO count: {value}"))?,
+                );
+            }
+            "--snapshot-records-bytes" => {
+                if snapshot_records_bytes.is_some() {
+                    return Err(
+                        "--snapshot-records-bytes cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-records-bytes")?;
+                snapshot_records_bytes = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid snapshot records length: {value}"))?,
+                );
+            }
             "--snapshot-records-sha256" => {
                 if snapshot_records_sha256.is_some() {
                     return Err(
@@ -2103,12 +2135,28 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         snapshot_path,
         snapshot_height,
         snapshot_block_hash,
+        snapshot_utxo_count,
+        snapshot_records_bytes,
         snapshot_records_sha256,
     ) {
-        (None, None, None, None) => None,
-        (Some(path), Some(height), Some(block_hash), Some(records_sha256)) => {
-            SnapshotTrustAnchor::new(network, height, block_hash, records_sha256.clone())
-                .map_err(|error| error.to_string())?;
+        (None, None, None, None, None, None) => None,
+        (
+            Some(path),
+            Some(height),
+            Some(block_hash),
+            Some(utxo_count),
+            Some(records_bytes),
+            Some(records_sha256),
+        ) => {
+            SnapshotTrustAnchor::new(
+                network,
+                height,
+                block_hash,
+                utxo_count,
+                records_bytes,
+                records_sha256.clone(),
+            )
+            .map_err(|error| error.to_string())?;
             if data_dir.is_none() {
                 return Err("--assumeutxo-snapshot requires --data-dir".to_owned());
             }
@@ -2129,12 +2177,14 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 path,
                 height,
                 block_hash,
+                utxo_count,
+                records_bytes,
                 records_sha256,
             })
         }
         _ => {
             return Err(
-                "--assumeutxo-snapshot requires --snapshot-height, --snapshot-blockhash, and --snapshot-records-sha256"
+                "--assumeutxo-snapshot requires --snapshot-height, --snapshot-blockhash, --snapshot-utxo-count, --snapshot-records-bytes, and --snapshot-records-sha256"
                     .to_owned(),
             );
         }
@@ -2266,7 +2316,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-records-sha256 HEX\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2624,6 +2674,10 @@ mod tests {
                 "100".to_owned(),
                 "--snapshot-blockhash".to_owned(),
                 hash.to_owned(),
+                "--snapshot-utxo-count".to_owned(),
+                "1".to_owned(),
+                "--snapshot-records-bytes".to_owned(),
+                "66".to_owned(),
                 "--snapshot-records-sha256".to_owned(),
                 digest.clone(),
             ]
@@ -2635,6 +2689,8 @@ mod tests {
         assert_eq!(snapshot.path, PathBuf::from("/tmp/base.rbtc"));
         assert_eq!(snapshot.height, 100);
         assert_eq!(snapshot.block_hash, BlockHash::from_str(hash).unwrap());
+        assert_eq!(snapshot.utxo_count, 1);
+        assert_eq!(snapshot.records_bytes, 66);
         assert_eq!(snapshot.records_sha256, digest);
 
         for arguments in [
@@ -2659,6 +2715,10 @@ mod tests {
                 "100",
                 "--snapshot-blockhash",
                 hash,
+                "--snapshot-utxo-count",
+                "1",
+                "--snapshot-records-bytes",
+                "66",
                 "--snapshot-records-sha256",
                 "abababababababababababababababababababababababababababababababab",
             ],
@@ -2718,6 +2778,8 @@ mod tests {
                 path,
                 height: 1,
                 block_hash: info.hash,
+                utxo_count: manifest.utxo_count,
+                records_bytes: manifest.records_bytes,
                 records_sha256: manifest.records_sha256,
             }),
         })

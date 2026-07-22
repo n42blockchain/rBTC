@@ -24,7 +24,7 @@ use crate::{
     },
     utxo::{
         OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo,
-        apply_with_undo_transaction, replace_all_transaction, tables_empty_transaction,
+        apply_with_undo_transaction, insert_snapshot_entries_transaction, tables_empty_transaction,
     },
 };
 
@@ -33,6 +33,17 @@ use crate::{
 pub struct ChainStoreOptions {
     /// Persist allocator state and use redb's two-phase commit protocol.
     pub quick_repair: bool,
+}
+
+/// Authenticated identity of one canonical snapshot entry stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotContentIdentity {
+    /// SHA-256 of every canonical uncompressed record.
+    pub records_sha256: [u8; 32],
+    /// Exact number of UTXO records.
+    pub utxo_count: u64,
+    /// Exact canonical uncompressed byte length.
+    pub records_bytes: u64,
 }
 
 impl Default for ChainStoreOptions {
@@ -71,6 +82,25 @@ pub enum ChainStoreError {
     /// Snapshot activation would overwrite previously initialized chain state.
     #[error("assumed snapshot activation requires empty UTXO and undo tables")]
     SnapshotNotFresh,
+    /// The imported canonical entry stream did not match its trusted digest.
+    #[error("assumed snapshot records SHA-256 mismatch")]
+    SnapshotDigestMismatch,
+    /// The imported entry count differed from the inspected manifest.
+    #[error("assumed snapshot expected {expected} UTXOs but decoded {actual}")]
+    SnapshotCountMismatch {
+        /// Count declared by the verified manifest.
+        expected: u64,
+        /// Count decoded again inside the activation transaction.
+        actual: u64,
+    },
+    /// The imported canonical stream length differed from authenticated metadata.
+    #[error("assumed snapshot expected {expected} record bytes but decoded {actual}")]
+    SnapshotSizeMismatch {
+        /// Canonical byte length in authenticated release metadata.
+        expected: u64,
+        /// Canonical byte length decoded inside the transaction.
+        actual: u64,
+    },
 }
 
 /// One physical redb database containing UTXOs, block undo, and execution metadata.
@@ -163,6 +193,41 @@ impl RedbChainStore {
         now: u64,
         hot_window_secs: u64,
     ) -> Result<(), ChainStoreError> {
+        let records_bytes = entries.values().try_fold(0_u64, |total, utxo| {
+            let encoded = utxo.encode()?;
+            total
+                .checked_add(u64::try_from(36 + encoded.len()).expect("record length fits u64"))
+                .ok_or(UtxoError::Malformed("snapshot records length overflow"))
+        })?;
+        self.assume_snapshot_entries(
+            anchor,
+            SnapshotContentIdentity {
+                records_sha256: *records_sha256,
+                utxo_count: u64::try_from(entries.len()).expect("usize fits u64"),
+                records_bytes,
+            },
+            entries.iter().map(|(key, utxo)| Ok((*key, utxo.clone()))),
+            now,
+            hot_window_secs,
+        )
+    }
+
+    /// Streams a canonical snapshot directly into one atomic chainstate transaction.
+    ///
+    /// The digest and count are recomputed while records enter redb. Any decoder,
+    /// ordering, count, digest, or commit error aborts all inserted records and
+    /// leaves the genesis execution metadata unchanged.
+    pub fn assume_snapshot_entries<I>(
+        &self,
+        anchor: ExecutionTip,
+        content: SnapshotContentIdentity,
+        entries: I,
+        now: u64,
+        hot_window_secs: u64,
+    ) -> Result<(), ChainStoreError>
+    where
+        I: IntoIterator<Item = Result<(OutPointKey, Utxo), UtxoError>>,
+    {
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
@@ -170,8 +235,31 @@ impl RedbChainStore {
         {
             return Err(ChainStoreError::SnapshotNotFresh);
         }
-        assume_snapshot_transaction(&transaction, anchor, records_sha256)?;
-        replace_all_transaction(&transaction, entries, now, hot_window_secs)?;
+        let (actual_count, actual_records_bytes, actual_digest) =
+            insert_snapshot_entries_transaction(
+                &transaction,
+                entries,
+                content.utxo_count,
+                content.records_bytes,
+                now,
+                hot_window_secs,
+            )?;
+        if actual_count != content.utxo_count {
+            return Err(ChainStoreError::SnapshotCountMismatch {
+                expected: content.utxo_count,
+                actual: actual_count,
+            });
+        }
+        if actual_records_bytes != content.records_bytes {
+            return Err(ChainStoreError::SnapshotSizeMismatch {
+                expected: content.records_bytes,
+                actual: actual_records_bytes,
+            });
+        }
+        if actual_digest != content.records_sha256 {
+            return Err(ChainStoreError::SnapshotDigestMismatch);
+        }
+        assume_snapshot_transaction(&transaction, anchor, &content.records_sha256)?;
         transaction.commit()?;
         Ok(())
     }
@@ -319,6 +407,7 @@ mod tests {
 
     use bitcoin::{OutPoint, Txid, hashes::Hash};
     use redb::StorageBackend;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     use super::*;
@@ -336,6 +425,22 @@ mod tests {
             creation_mtp: 0,
             script_pubkey: vec![0x51],
         }
+    }
+
+    fn snapshot_digest(entries: &BTreeMap<OutPointKey, Utxo>) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        for (key, utxo) in entries {
+            digest.update(key.as_bytes());
+            digest.update(utxo.encode().unwrap());
+        }
+        digest.finalize().into()
+    }
+
+    fn snapshot_bytes(entries: &BTreeMap<OutPointKey, Utxo>) -> u64 {
+        entries
+            .values()
+            .map(|utxo| u64::try_from(36 + utxo.encode().unwrap().len()).unwrap())
+            .sum()
     }
 
     #[derive(Clone)]
@@ -503,8 +608,9 @@ mod tests {
             hash: BlockHash::from_byte_array([44; 32]),
         };
         let entries = BTreeMap::from([(key(1), coin(10)), (key(2), coin(20))]);
+        let records_sha256 = snapshot_digest(&entries);
         store
-            .assume_snapshot(anchor, &[1; 32], &entries, 100, 60)
+            .assume_snapshot(anchor, &records_sha256, &entries, 100, 60)
             .unwrap();
         assert_eq!(store.execution().tip().unwrap(), anchor);
         assert_eq!(
@@ -513,7 +619,7 @@ mod tests {
         );
         assert_eq!(
             store.execution().assumed_snapshot_records_sha256().unwrap(),
-            Some([1; 32])
+            Some(records_sha256)
         );
         assert_eq!(store.snapshot_entries().unwrap(), entries);
         drop(store);
@@ -529,7 +635,7 @@ mod tests {
                 .execution()
                 .assumed_snapshot_records_sha256()
                 .unwrap(),
-            Some([1; 32])
+            Some(records_sha256)
         );
         assert_eq!(reopened.snapshot_entries().unwrap(), entries);
     }
@@ -576,6 +682,110 @@ mod tests {
             store.snapshot_entries().unwrap(),
             BTreeMap::from([(key(1), coin(10))])
         );
+    }
+
+    #[test]
+    fn streaming_snapshot_rejects_count_digest_order_and_late_input_errors_atomically() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        let anchor = ExecutionTip {
+            height: 10,
+            hash: BlockHash::from_byte_array([47; 32]),
+        };
+        let entries = BTreeMap::from([(key(1), coin(10)), (key(2), coin(20))]);
+        let digest = snapshot_digest(&entries);
+        let records_bytes = snapshot_bytes(&entries);
+        let stream = || entries.iter().map(|(key, utxo)| Ok((*key, utxo.clone())));
+
+        assert!(matches!(
+            store.assume_snapshot_entries(
+                anchor,
+                SnapshotContentIdentity {
+                    records_sha256: digest,
+                    utxo_count: 3,
+                    records_bytes,
+                },
+                stream(),
+                100,
+                60
+            ),
+            Err(ChainStoreError::SnapshotCountMismatch {
+                expected: 3,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            store.assume_snapshot_entries(
+                anchor,
+                SnapshotContentIdentity {
+                    records_sha256: [0; 32],
+                    utxo_count: 2,
+                    records_bytes,
+                },
+                stream(),
+                100,
+                60
+            ),
+            Err(ChainStoreError::SnapshotDigestMismatch)
+        ));
+        assert!(matches!(
+            store.assume_snapshot_entries(
+                anchor,
+                SnapshotContentIdentity {
+                    records_sha256: digest,
+                    utxo_count: 2,
+                    records_bytes: records_bytes + 1,
+                },
+                stream(),
+                100,
+                60
+            ),
+            Err(ChainStoreError::SnapshotSizeMismatch {
+                expected,
+                actual
+            }) if expected == records_bytes + 1 && actual == records_bytes
+        ));
+        assert!(matches!(
+            store.assume_snapshot_entries(
+                anchor,
+                SnapshotContentIdentity {
+                    records_sha256: digest,
+                    utxo_count: 2,
+                    records_bytes,
+                },
+                vec![Ok((key(2), coin(20))), Ok((key(1), coin(10)))],
+                100,
+                60
+            ),
+            Err(ChainStoreError::Utxo(UtxoError::Malformed(
+                "snapshot outpoints are not strictly ordered"
+            )))
+        ));
+        assert!(matches!(
+            store.assume_snapshot_entries(
+                anchor,
+                SnapshotContentIdentity {
+                    records_sha256: digest,
+                    utxo_count: 2,
+                    records_bytes,
+                },
+                vec![
+                    Ok((key(1), coin(10))),
+                    Err(UtxoError::Malformed("late decoder failure"))
+                ],
+                100,
+                60
+            ),
+            Err(ChainStoreError::Utxo(UtxoError::Malformed(
+                "late decoder failure"
+            )))
+        ));
+        assert_eq!(store.execution().tip().unwrap(), genesis);
+        assert_eq!(store.execution().assumed_snapshot_base().unwrap(), None);
+        assert!(store.snapshot_entries().unwrap().is_empty());
     }
 
     #[test]

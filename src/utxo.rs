@@ -8,6 +8,7 @@ use std::{
 
 use bitcoin::{OutPoint, Txid, hashes::Hash};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// The number of seconds in the default hot window (60 days).
@@ -541,6 +542,63 @@ pub(crate) fn replace_all_transaction(
         }
     }
     Ok(())
+}
+
+pub(crate) fn insert_snapshot_entries_transaction<I>(
+    transaction: &WriteTransaction,
+    entries: I,
+    expected_count: u64,
+    expected_records_bytes: u64,
+    now: u64,
+    hot_window_secs: u64,
+) -> Result<(u64, u64, [u8; 32]), UtxoError>
+where
+    I: IntoIterator<Item = Result<(OutPointKey, Utxo), UtxoError>>,
+{
+    let cutoff = now.saturating_sub(hot_window_secs);
+    let mut hot = transaction.open_table(HOT_TABLE)?;
+    let mut cold = transaction.open_table(COLD_TABLE)?;
+    let mut previous = None;
+    let mut count = 0_u64;
+    let mut records_bytes = 0_u64;
+    let mut records = Sha256::new();
+    for entry in entries {
+        let (key, utxo) = entry?;
+        if previous.is_some_and(|previous| key <= previous) {
+            return Err(UtxoError::Malformed(
+                "snapshot outpoints are not strictly ordered",
+            ));
+        }
+        previous = Some(key);
+        let encoded = utxo.encode()?;
+        // Snapshot v2 records are exactly the 36-byte key followed by the
+        // canonical UTXO encoding. Hash inside the redb transaction so a file
+        // replacement between inspection and activation cannot become durable.
+        records.update(key.as_bytes());
+        records.update(&encoded);
+        if utxo.last_touched < cutoff {
+            cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+        } else {
+            hot.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+        records_bytes = records_bytes
+            .checked_add(u64::try_from(36 + encoded.len()).expect("record length fits u64"))
+            .ok_or(UtxoError::Malformed("snapshot records length overflow"))?;
+        if count > expected_count {
+            return Err(UtxoError::Malformed(
+                "snapshot exceeds authenticated UTXO count",
+            ));
+        }
+        if records_bytes > expected_records_bytes {
+            return Err(UtxoError::Malformed(
+                "snapshot exceeds authenticated records length",
+            ));
+        }
+    }
+    Ok((count, records_bytes, records.finalize().into()))
 }
 
 pub(crate) fn apply_with_undo_transaction(
