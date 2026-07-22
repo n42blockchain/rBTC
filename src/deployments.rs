@@ -269,8 +269,8 @@ pub fn block_deployment_context_with_config(
     config: DeploymentConfig,
     height: u32,
     block_hash: BlockHash,
-    block_time: u32,
-    taproot_active: bool,
+    _block_time: u32,
+    _taproot_active: bool,
 ) -> BlockDeploymentContext {
     let network = config.network;
     let bip30_exception = is_bip30_exception(network, height, block_hash);
@@ -280,15 +280,18 @@ pub fn block_deployment_context_with_config(
             script_flags,
             bip34_active: height >= config.activation_heights.bip34,
             csv_active: height >= config.activation_heights.csv,
+            segwit_active: height >= config.activation_heights.segwit,
             bip30_exception,
             subsidy_sats,
         };
     }
     let heights = config.activation_heights;
-    let mut script_flags = bitcoinconsensus::VERIFY_NONE;
-    if block_time >= 1_333_238_400 {
-        script_flags |= bitcoinconsensus::VERIFY_P2SH;
-    }
+    // Core 26 enables these mutually dependent interpreter flags for ordinary
+    // blocks and handles their historical activation through the exceptions
+    // above plus separate consensus gates such as the witness commitment check.
+    let mut script_flags = bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_TAPROOT;
     if height >= heights.bip66 {
         script_flags |= bitcoinconsensus::VERIFY_DERSIG;
     }
@@ -299,15 +302,13 @@ pub fn block_deployment_context_with_config(
         script_flags |= bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY;
     }
     if height >= heights.segwit {
-        script_flags |= bitcoinconsensus::VERIFY_NULLDUMMY | bitcoinconsensus::VERIFY_WITNESS;
-    }
-    if taproot_active {
-        script_flags |= bitcoinconsensus::VERIFY_TAPROOT;
+        script_flags |= bitcoinconsensus::VERIFY_NULLDUMMY;
     }
     BlockDeploymentContext {
         script_flags,
         bip34_active: height >= heights.bip34,
         csv_active: height >= heights.csv,
+        segwit_active: height >= heights.segwit,
         bip30_exception,
         subsidy_sats,
     }
@@ -511,6 +512,7 @@ mod tests {
         hashes::Hash,
         pow::Target,
     };
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -525,7 +527,8 @@ mod tests {
         );
         assert!(context.bip34_active);
         assert!(context.csv_active);
-        assert_eq!(context.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
+        assert!(context.segwit_active);
+        assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
         assert_ne!(
             context.script_flags & bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
             0
@@ -565,7 +568,11 @@ mod tests {
             false,
         );
         assert!(csv.csv_active);
-        assert_eq!(csv.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
+        assert!(!csv.segwit_active);
+        assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
+        assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
+        assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_TAPROOT, 0);
+        assert_eq!(csv.script_flags & bitcoinconsensus::VERIFY_NULLDUMMY, 0);
         let segwit = block_deployment_context(
             Network::Bitcoin,
             481_824,
@@ -573,7 +580,9 @@ mod tests {
             u32::MAX,
             false,
         );
+        assert!(segwit.segwit_active);
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
+        assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_NULLDUMMY, 0);
     }
 
     #[test]
@@ -679,10 +688,12 @@ mod tests {
             context(13).script_flags & bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
             0
         );
-        assert_eq!(
+        assert!(!context(13).segwit_active);
+        assert_ne!(
             context(13).script_flags & bitcoinconsensus::VERIFY_WITNESS,
             0
         );
+        assert!(context(14).segwit_active);
         assert_ne!(
             context(14).script_flags & bitcoinconsensus::VERIFY_WITNESS,
             0
@@ -795,5 +806,25 @@ mod tests {
             ),
             Err(DeploymentConfigError::NetworkMismatch)
         );
+    }
+
+    proptest! {
+        #[test]
+        fn buried_height_parser_matches_core_signed_int_range(height in any::<u32>()) {
+            let mut config = DeploymentConfig::for_network(Network::Regtest);
+            let result = config.apply_test_activation_height(&format!("csv@{height}"));
+            prop_assert_eq!(result.is_ok(), height < i32::MAX as u32);
+        }
+
+        #[test]
+        fn rejected_buried_override_never_partially_mutates_config(
+            value in proptest::string::string_regex("[ -~]{0,64}").unwrap()
+        ) {
+            let mut config = DeploymentConfig::for_network(Network::Regtest);
+            let original = config;
+            if config.apply_test_activation_height(&value).is_err() {
+                prop_assert_eq!(config, original);
+            }
+        }
     }
 }

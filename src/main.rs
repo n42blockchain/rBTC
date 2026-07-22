@@ -18,7 +18,7 @@ use bitcoin::{
 use rbtc::{
     api::explorer_router,
     block_execution::{connect_active_block, connect_active_blocks, disconnect_execution_tip},
-    blockchain::{AppliedBlock, validate_block_structure},
+    blockchain::{AppliedBlock, validate_block_structure_with_deployments},
     chain_store::RedbChainStore,
     deployments::{DeploymentConfig, block_deployment_context_with_config, taproot_active},
     execution_store::RedbExecutionStore,
@@ -560,11 +560,11 @@ fn validate_archive_block(
         block.header.time,
         taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?,
     );
-    validate_block_structure(
+    validate_block_structure_with_deployments(
         block,
         height,
-        deployments.script_flags,
         deployments.bip34_active,
+        deployments.segwit_active,
     )
     .map_err(|error| format!("archive block structure at height {height}: {error}"))
 }

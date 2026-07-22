@@ -159,6 +159,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
         script_flags,
         bip34_active,
         false,
+        script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
         block_subsidy(height),
     )
 }
@@ -188,11 +189,12 @@ pub fn apply_block_with_context<S: UtxoStore>(
         script_flags,
         bip34_active,
         false,
+        script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
         block_subsidy(height),
     )
 }
 
-/// Validates and applies a block with deployment-aware BIP34 and CSV activation.
+/// Validates and applies a block with deployment-aware BIP34, CSV, and SegWit activation.
 ///
 /// `csv_active` enables the BIP68 relative sequence locks and changes absolute
 /// lock-time evaluation to BIP113 parent-MTP semantics. Before activation,
@@ -210,9 +212,10 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     script_flags: u32,
     bip34_active: bool,
     csv_active: bool,
+    segwit_active: bool,
     subsidy_sats: u64,
 ) -> Result<AppliedBlock, BlockError> {
-    validate_block_structure(block, height, script_flags, bip34_active)?;
+    validate_block_structure_with_deployments(block, height, bip34_active, segwit_active)?;
 
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut sigop_cost = 0_u64;
@@ -300,6 +303,21 @@ pub fn validate_block_structure(
     script_flags: u32,
     bip34_active: bool,
 ) -> Result<(), BlockError> {
+    validate_block_structure_with_deployments(
+        block,
+        height,
+        bip34_active,
+        script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
+    )
+}
+
+/// Validates block structure with script verification and SegWit activation separated.
+pub fn validate_block_structure_with_deployments(
+    block: &Block,
+    height: u32,
+    bip34_active: bool,
+    segwit_active: bool,
+) -> Result<(), BlockError> {
     if block.txdata.is_empty() {
         return Err(BlockError::Empty);
     }
@@ -322,7 +340,7 @@ pub fn validate_block_structure(
     if mutated {
         return Err(BlockError::MutatedMerkleTree);
     }
-    check_witness_commitment(block, script_flags & bitcoinconsensus::VERIFY_WITNESS != 0)?;
+    check_witness_commitment(block, segwit_active)?;
     let weight = block.weight().to_wu();
     if weight > MAX_BLOCK_WEIGHT {
         return Err(BlockError::Weight { weight });
@@ -648,6 +666,7 @@ mod tests {
                 0,
                 false,
                 false,
+                false,
                 u64::MAX,
             ),
             Err(BlockError::FeeOverflow)
@@ -765,6 +784,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             block_subsidy(101),
         )
         .unwrap();
@@ -782,6 +802,7 @@ mod tests {
                 0,
                 false,
                 true,
+                false,
                 block_subsidy(101),
             ),
             Err(BlockError::Transaction {
@@ -823,6 +844,7 @@ mod tests {
                 0,
                 60,
                 0,
+                false,
                 false,
                 false,
                 regtest_subsidy,

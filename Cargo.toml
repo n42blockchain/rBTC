@@ -37,6 +37,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 zstd = "0.13"
 
 [dev-dependencies]
+proptest = "1.7"
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 

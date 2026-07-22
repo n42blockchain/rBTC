@@ -286,6 +286,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::deployments::DeploymentConfig;
 
     #[test]
     fn advances_and_recovers_tip_while_rejecting_gaps() {
@@ -362,6 +363,31 @@ mod tests {
         store.bind_consensus_config(b"custom", b"default").unwrap();
         assert!(matches!(
             store.bind_consensus_config(b"other", b"default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
+        ));
+    }
+
+    #[test]
+    fn buried_activation_binding_survives_restart_and_rejects_changes() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let defaults = DeploymentConfig::for_network(Network::Regtest);
+        let mut selected = defaults;
+        selected.apply_test_activation_height("bip34@10").unwrap();
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        store
+            .bind_consensus_config(&selected.consensus_id(), &defaults.consensus_id())
+            .unwrap();
+        drop(store);
+
+        let store = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        store
+            .bind_consensus_config(&selected.consensus_id(), &defaults.consensus_id())
+            .unwrap();
+        let mut changed = defaults;
+        changed.apply_test_activation_height("bip34@11").unwrap();
+        assert!(matches!(
+            store.bind_consensus_config(&changed.consensus_id(), &defaults.consensus_id()),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
         ));
     }

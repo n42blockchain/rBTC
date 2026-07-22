@@ -20,6 +20,7 @@ use crate::{
 
 /// Consensus deployments selected for a candidate block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BlockDeploymentContext {
     /// Explicit libbitcoinconsensus script verification flags.
     pub script_flags: u32,
@@ -27,6 +28,8 @@ pub struct BlockDeploymentContext {
     pub bip34_active: bool,
     /// Whether the CSV deployment (BIP68/BIP112/BIP113) is active.
     pub csv_active: bool,
+    /// Whether BIP141 witness commitments and BIP147 NULLDUMMY are active.
+    pub segwit_active: bool,
     /// Whether this is one of the two historical mainnet BIP30 exceptions.
     pub bip30_exception: bool,
     /// Maximum proof-of-work subsidy for this candidate height.
@@ -371,6 +374,7 @@ fn validate_active_block<S: UtxoStore>(
         deployments.script_flags,
         deployments.bip34_active,
         deployments.csv_active,
+        deployments.segwit_active,
         deployments.subsidy_sats,
     ) {
         Ok(applied) => applied,
