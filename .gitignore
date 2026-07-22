@@ -2,3 +2,4 @@
 *.rbtc
 *.rblk
 ledger-index.json
+/rbtc.cdx.json
