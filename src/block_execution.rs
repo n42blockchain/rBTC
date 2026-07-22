@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{Block, BlockHash, OutPoint};
@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Consensus deployments selected for a candidate block.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BlockDeploymentContext {
     /// Explicit libbitcoinconsensus script verification flags.
@@ -30,8 +30,8 @@ pub struct BlockDeploymentContext {
     pub csv_active: bool,
     /// Whether BIP141 witness commitments and BIP147 NULLDUMMY are active.
     pub segwit_active: bool,
-    /// Whether the default BIP325 Signet block challenge must be verified.
-    pub signet: bool,
+    /// BIP325 challenge script for the selected default or custom Signet.
+    pub signet_challenge: Option<Arc<[u8]>>,
     /// Whether this is one of the two historical mainnet BIP30 exceptions.
     pub bip30_exception: bool,
     /// Maximum proof-of-work subsidy for this candidate height.
@@ -246,7 +246,7 @@ pub fn connect_active_block(
     block: &Block,
     now: u64,
     hot_window_secs: u64,
-    deployments: BlockDeploymentContext,
+    deployments: &BlockDeploymentContext,
 ) -> Result<AppliedBlock, BlockExecutionError> {
     let current = chainstate.execution().tip()?;
     let (applied, transition) = validate_active_block(
@@ -310,7 +310,7 @@ pub fn connect_active_blocks(
             current,
             now,
             hot_window_secs,
-            *deployment,
+            deployment,
         )?;
         let next = ExecutionTip {
             height: current
@@ -343,7 +343,7 @@ fn validate_active_block<S: UtxoStore>(
     current: ExecutionTip,
     now: u64,
     hot_window_secs: u64,
-    deployments: BlockDeploymentContext,
+    deployments: &BlockDeploymentContext,
 ) -> Result<(AppliedBlock, UtxoChanges), BlockExecutionError> {
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
@@ -389,7 +389,7 @@ fn validate_active_block<S: UtxoStore>(
         deployments.bip34_active,
         deployments.csv_active,
         deployments.segwit_active,
-        deployments.signet,
+        deployments.signet_challenge.as_deref(),
         deployments.subsidy_sats,
     ) {
         Ok(applied) => applied,
@@ -776,7 +776,7 @@ mod tests {
             .unwrap();
 
         let applied =
-            connect_active_block(&chainstate, &headers, &active_block, 1, 60, deployments(1))
+            connect_active_block(&chainstate, &headers, &active_block, 1, 60, &deployments(1))
                 .unwrap();
         assert_eq!(chainstate.execution().tip().unwrap().hash, info.hash);
         assert!(chainstate.undos().get(applied.hash).unwrap().is_some());
@@ -856,7 +856,7 @@ mod tests {
             .insert_contextual(active_block.header, active_block.header.time)
             .unwrap();
 
-        connect_active_block(&chainstate, &headers, &active_block, 1, 60, deployments(1)).unwrap();
+        connect_active_block(&chainstate, &headers, &active_block, 1, 60, &deployments(1)).unwrap();
 
         assert!(chainstate.get(previous.into()).unwrap().is_none());
         let created = OutPoint::new(active_block.txdata[1].compute_txid(), 0).into();
@@ -1070,7 +1070,7 @@ mod tests {
                 &block,
                 1,
                 60,
-                deployments(1),
+                &deployments(1),
             ),
             Err(BlockExecutionError::Bip30Collision(key)) if key == collision
         ));
@@ -1082,7 +1082,7 @@ mod tests {
             &block,
             1,
             60,
-            BlockDeploymentContext {
+            &BlockDeploymentContext {
                 bip30_exception: true,
                 ..deployments(1)
             },
@@ -1113,7 +1113,7 @@ mod tests {
             block.header.time,
             false,
         );
-        assert!(context.signet);
+        assert!(context.signet_challenge.is_some());
 
         let mut damaged = block.clone();
         let script = damaged.txdata[0].output[1].script_pubkey.as_mut_bytes();
@@ -1125,7 +1125,7 @@ mod tests {
         let damaged_outpoint =
             OutPointKey::from(OutPoint::new(damaged.txdata[0].compute_txid(), 0));
         assert!(matches!(
-            connect_active_block(&chainstate, &headers, &damaged, 1, 60, context),
+            connect_active_block(&chainstate, &headers, &damaged, 1, 60, &context),
             Err(BlockExecutionError::Block(BlockError::Signet(_)))
         ));
         assert_eq!(chainstate.execution().tip().unwrap().height, 0);
@@ -1138,7 +1138,7 @@ mod tests {
         );
         assert!(chainstate.get(damaged_outpoint).unwrap().is_none());
 
-        connect_active_block(&chainstate, &headers, &block, 1, 60, context).unwrap();
+        connect_active_block(&chainstate, &headers, &block, 1, 60, &context).unwrap();
         assert_eq!(chainstate.execution().tip().unwrap().height, 1);
         assert!(
             chainstate
@@ -1146,6 +1146,43 @@ mod tests {
                 .get(block.block_hash())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn custom_signet_challenge_reaches_atomic_block_execution() {
+        let encoded = include_str!("../tests/data/bitcoin-core-26/signet-block-1.hex");
+        let block: Block = deserialize(&Vec::<u8>::from_hex(encoded.trim()).unwrap()).unwrap();
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Signet)
+                .unwrap();
+        let mut headers = HeaderDag::new(Network::Signet);
+        headers.insert_contextual(block.header, u32::MAX).unwrap();
+        let mut context = block_deployment_context(
+            Network::Signet,
+            1,
+            block.block_hash(),
+            block.header.time,
+            true,
+        );
+        context.signet_challenge = Some(Arc::from([0x00]));
+
+        assert!(matches!(
+            connect_active_block(&chainstate, &headers, &block, 1, 60, &context),
+            Err(BlockExecutionError::Block(BlockError::Signet(_)))
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+        assert!(
+            chainstate
+                .undos()
+                .get(block.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            chainstate.tier_stats().unwrap(),
+            TierStats { hot: 0, cold: 0 }
         );
     }
 }

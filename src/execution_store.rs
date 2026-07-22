@@ -372,7 +372,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("execution.redb");
         let defaults = DeploymentConfig::for_network(Network::Regtest);
-        let mut selected = defaults;
+        let mut selected = defaults.clone();
         selected.apply_test_activation_height("bip34@10").unwrap();
         let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
         store
@@ -384,7 +384,7 @@ mod tests {
         store
             .bind_consensus_config(&selected.consensus_id(), &defaults.consensus_id())
             .unwrap();
-        let mut changed = defaults;
+        let mut changed = defaults.clone();
         changed.apply_test_activation_height("bip34@11").unwrap();
         assert!(matches!(
             store.bind_consensus_config(&changed.consensus_id(), &defaults.consensus_id()),

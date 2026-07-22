@@ -16,6 +16,7 @@ use bitcoin::{
     Block, BlockHash, Network,
     consensus::{deserialize, serialize},
     hashes::Hash,
+    hex::FromHex,
 };
 use rbtc::{
     api::{WalletAuthToken, explorer_router, wallet_router},
@@ -367,9 +368,7 @@ fn read_owner_only_text_file(
 #[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
     if let Some(data_dir) = &options.data_dir {
-        fs::create_dir_all(data_dir)
-            .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
-        reject_legacy_split_chainstate(data_dir)?;
+        preflight_data_dir(data_dir, options.network, &options.deployments)?;
     }
     let api_runtime = prepare_api_runtime(&options)?;
     let peer_store = if let Some(data_dir) = &options.data_dir {
@@ -487,6 +486,25 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     ))
 }
 
+fn preflight_data_dir(
+    data_dir: &std::path::Path,
+    network: Network,
+    deployments: &DeploymentConfig,
+) -> Result<(), String> {
+    fs::create_dir_all(data_dir)
+        .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+    reject_legacy_split_chainstate(data_dir)?;
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), network)
+        .map_err(|error| error.to_string())?;
+    chainstate
+        .execution()
+        .bind_consensus_config(
+            &deployments.consensus_id(),
+            &DeploymentConfig::for_network(network).consensus_id(),
+        )
+        .map_err(|error| error.to_string())
+}
+
 fn completed_validating_session(options: &Options) -> bool {
     options.fetch_block.is_none() && (options.data_dir.is_some() || options.headers_db.is_some())
 }
@@ -503,7 +521,7 @@ async fn run_with_peer(
         PEER_TIMEOUT,
         connect_outbound(
             remote,
-            options.network.magic(),
+            options.deployments.message_start(),
             local_nonce,
             USER_AGENT.to_owned(),
             0,
@@ -560,7 +578,7 @@ async fn run_with_peer(
         return sync_validating_node(
             &mut session,
             options.network,
-            options.deployments,
+            &options.deployments,
             options.ibd_policy,
             path.clone(),
             options.once,
@@ -570,7 +588,7 @@ async fn run_with_peer(
     }
 
     if let Some(path) = &options.headers_db {
-        let headers = sync_headers(&mut session, options.deployments, path.clone()).await?;
+        let headers = sync_headers(&mut session, &options.deployments, path.clone()).await?;
         let status = options
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
@@ -708,13 +726,16 @@ async fn discover_peer_addresses(
 
 async fn sync_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployments: DeploymentConfig,
+    deployments: &DeploymentConfig,
     path: PathBuf,
 ) -> Result<HeaderDag, PeerRunError> {
     let store =
         RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
     let mut dag = store
-        .load_dag_with_deployments(deployments, unix_time().map_err(PeerRunError::transient)?)
+        .load_dag_with_deployments(
+            deployments.clone(),
+            unix_time().map_err(PeerRunError::transient)?,
+        )
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
     println!(
         "resuming headers-first sync from height {} (local-clock fallback until network-time aggregation lands)",
@@ -767,7 +788,7 @@ fn reject_legacy_split_chainstate(data_dir: &std::path::Path) -> Result<(), Stri
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
     once: bool,
@@ -775,7 +796,7 @@ async fn sync_validating_node(
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
         return Err(PeerRunError::transient(
-            "block execution is currently safety-gated to regtest and default signet until mainnet/testnet activation coverage is complete",
+            "block execution is currently safety-gated to regtest and Signet until mainnet/testnet activation coverage is complete",
         ));
     }
     fs::create_dir_all(&data_dir)
@@ -932,7 +953,7 @@ async fn sync_validating_node(
 #[allow(clippy::too_many_lines)]
 async fn reconcile_wallet(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
@@ -1052,7 +1073,7 @@ async fn reconcile_wallet(
 #[allow(clippy::too_many_arguments)]
 async fn replay_wallet_blocks(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
     wallet: &EmbeddedWallet,
@@ -1130,7 +1151,7 @@ async fn replay_wallet_blocks(
 
 async fn reconcile_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
@@ -1202,7 +1223,7 @@ async fn reconcile_ledger(
 
 async fn backfill_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
     target_height: u32,
@@ -1271,7 +1292,7 @@ async fn backfill_ledger(
 }
 
 fn validate_archive_block(
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     height: u32,
     expected_hash: BlockHash,
@@ -1295,7 +1316,7 @@ fn validate_archive_block(
         height,
         deployments.bip34_active,
         deployments.segwit_active,
-        deployments.signet,
+        deployments.signet_challenge.as_deref(),
     )
     .map_err(|error| format!("archive block structure at height {height}: {error}"))
 }
@@ -1303,7 +1324,7 @@ fn validate_archive_block(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_explorer(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     undo_store: &RedbUndoStore,
@@ -1413,7 +1434,7 @@ async fn reconcile_explorer(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
@@ -1493,7 +1514,7 @@ async fn download_execute_batch(
                 &blocks[0],
                 now,
                 DEFAULT_HOT_WINDOW_SECS,
-                deployment_contexts[0],
+                &deployment_contexts[0],
             )
             .map_err(|error| PeerRunError::block(&error))?,
         ]
@@ -1522,7 +1543,7 @@ async fn download_execute_batch(
 }
 
 fn validate_downloaded_block(
-    deployment_config: DeploymentConfig,
+    deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
     height: u32,
     expected_hash: BlockHash,
@@ -1548,7 +1569,7 @@ fn validate_downloaded_block(
         height,
         deployments.bip34_active,
         deployments.segwit_active,
-        deployments.signet,
+        deployments.signet_challenge.as_deref(),
     )
     .map_err(|error| {
         PeerRunError::protocol(format!(
@@ -1818,6 +1839,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut test_activation_heights = Vec::new();
     let mut minimum_chainwork = None;
     let mut assume_valid = None;
+    let mut signet_challenges = Vec::new();
+    let mut signet_seed_values = Vec::new();
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -1904,6 +1927,20 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 test_activation_heights
                     .push(required_option_value(&mut args, "--testactivationheight")?);
             }
+            "--signetchallenge" => {
+                signet_challenges.push(required_option_value(&mut args, "--signetchallenge")?);
+            }
+            "--signetseednode" => {
+                let seed = required_option_value(&mut args, "--signetseednode")?;
+                if !signet_seed_values.contains(&seed) {
+                    if signet_seed_values.len() == MAX_DNS_SEEDS {
+                        return Err(format!(
+                            "too many unique --signetseednode values; limit is {MAX_DNS_SEEDS}"
+                        ));
+                    }
+                    signet_seed_values.push(seed);
+                }
+            }
             "--minimum-chainwork" => {
                 minimum_chainwork = Some(required_option_value(&mut args, "--minimum-chainwork")?);
             }
@@ -1916,6 +1953,20 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
 
     if no_dns_seeds && !dns_seed_values.is_empty() {
         return Err("--dns-seed conflicts with --no-dns-seeds".to_owned());
+    }
+    if signet_challenges.len() > 1 {
+        return Err("--signetchallenge cannot be supplied more than once".to_owned());
+    }
+    if (!signet_challenges.is_empty() || !signet_seed_values.is_empty())
+        && network != Network::Signet
+    {
+        return Err("--signetchallenge and --signetseednode require --network signet".to_owned());
+    }
+    if !signet_seed_values.is_empty() && (!dns_seed_values.is_empty() || no_dns_seeds) {
+        return Err("--signetseednode conflicts with --dns-seed and --no-dns-seeds".to_owned());
+    }
+    if !signet_seed_values.is_empty() {
+        dns_seed_values = signet_seed_values;
     }
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
@@ -1943,36 +1994,44 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     };
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
-            "--data-dir block execution currently supports only regtest and default signet"
-                .to_owned(),
+            "--data-dir block execution currently supports only regtest and Signet".to_owned(),
         );
     }
-    let deployments = parse_deployment_config(
+    let mut deployments = parse_deployment_config(
         network,
         data_dir.is_some(),
         vbparams,
         test_activation_heights,
     )?;
+    if let Some(value) = signet_challenges.first() {
+        let challenge = Vec::<u8>::from_hex(value)
+            .map_err(|_| "invalid --signetchallenge; expected one hexadecimal script".to_owned())?;
+        deployments
+            .set_signet_challenge(challenge)
+            .map_err(|error| error.to_string())?;
+    }
     let ibd_policy = parse_ibd_policy(
         network,
+        deployments.is_custom_signet(),
         data_dir.is_some() || headers_db.is_some(),
         minimum_chainwork,
         assume_valid,
     )?;
-    let dns_seeds = if no_dns_seeds {
-        Some(Vec::new())
-    } else if dns_seed_values.is_empty() {
-        None
-    } else {
-        let mut seeds = Vec::with_capacity(dns_seed_values.len());
-        for value in dns_seed_values {
-            let seed = parse_dns_seed(&value, network)?;
-            if !seeds.contains(&seed) {
-                seeds.push(seed);
+    let dns_seeds =
+        if no_dns_seeds || (deployments.is_custom_signet() && dns_seed_values.is_empty()) {
+            Some(Vec::new())
+        } else if dns_seed_values.is_empty() {
+            None
+        } else {
+            let mut seeds = Vec::with_capacity(dns_seed_values.len());
+            for value in dns_seed_values {
+                let seed = parse_dns_seed(&value, network)?;
+                if !seeds.contains(&seed) {
+                    seeds.push(seed);
+                }
             }
-        }
-        Some(seeds)
-    };
+            Some(seeds)
+        };
     let has_dns_bootstrap = dns_seeds.as_ref().map_or_else(
         || !core26_dns_seed_hosts(network).is_empty(),
         |seeds| !seeds.is_empty(),
@@ -2031,6 +2090,7 @@ fn parse_deployment_config(
 
 fn parse_ibd_policy(
     network: Network,
+    custom_signet: bool,
     sync_enabled: bool,
     minimum_chainwork: Option<String>,
     assume_valid: Option<String>,
@@ -2038,7 +2098,11 @@ fn parse_ibd_policy(
     if !sync_enabled && (minimum_chainwork.is_some() || assume_valid.is_some()) {
         return Err("IBD policy options require --headers-db or --data-dir".to_owned());
     }
-    let mut policy = IbdPolicy::for_network(network);
+    let mut policy = if custom_signet {
+        IbdPolicy::for_custom_signet()
+    } else {
+        IbdPolicy::for_network(network)
+    };
     if let Some(value) = minimum_chainwork {
         policy
             .set_minimum_chainwork(&value)
@@ -2054,7 +2118,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2460,6 +2524,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_core_compatible_custom_signet_identity_and_seeds() {
+        let options = parse_options(
+            [
+                "--network",
+                "signet",
+                "--data-dir",
+                "/tmp/rbtc-custom-signet",
+                "--signetchallenge",
+                "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be43051ae",
+                "--signetseednode",
+                "seed.example:39000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(options.deployments.is_custom_signet());
+        assert_eq!(
+            options.deployments.message_start().to_bytes(),
+            [0x7e, 0xc6, 0x53, 0xa5]
+        );
+        assert_eq!(options.ibd_policy, IbdPolicy::for_custom_signet());
+        assert_eq!(
+            selected_dns_seeds(&options),
+            vec![DnsSeed {
+                host: "seed.example".to_owned(),
+                port: 39_000,
+            }]
+        );
+
+        let without_seeds = parse_options(
+            [
+                "--network",
+                "signet",
+                "--data-dir",
+                "/tmp/rbtc-custom-signet",
+                "--signetchallenge",
+                "51",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(selected_dns_seeds(&without_seeds).is_empty());
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_cross_network_signet_parameters() {
+        for arguments in [
+            vec!["--network", "bitcoin", "--signetchallenge", "51"],
+            vec!["--network", "signet", "--signetchallenge", "0"],
+            vec![
+                "--network",
+                "signet",
+                "--signetchallenge",
+                "51",
+                "--signetchallenge",
+                "52",
+            ],
+            vec![
+                "--network",
+                "signet",
+                "--signetseednode",
+                "seed.example",
+                "--dns-seed",
+                "other.example",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_deduplicates_and_bounds_peer_candidates() {
         let options = parse_options(
             [
@@ -2681,8 +2820,24 @@ mod tests {
             let Err(error) = result else {
                 panic!("{network} execution must remain safety-gated");
             };
-            assert!(error.contains("only regtest and default signet"));
+            assert!(error.contains("only regtest and Signet"));
         }
+    }
+
+    #[test]
+    fn custom_signet_identity_is_rejected_before_network_or_wallet_startup() {
+        let directory = TempDir::new().unwrap();
+        let default = DeploymentConfig::for_network(Network::Signet);
+        preflight_data_dir(directory.path(), Network::Signet, &default).unwrap();
+        assert!(!directory.path().join("peers.redb").exists());
+        assert!(!directory.path().join("wallet.sqlite").exists());
+
+        let mut custom = DeploymentConfig::for_network(Network::Signet);
+        custom.set_signet_challenge(vec![0x51]).unwrap();
+        let error = preflight_data_dir(directory.path(), Network::Signet, &custom).unwrap_err();
+        assert!(error.contains("consensus configuration"));
+        assert!(!directory.path().join("peers.redb").exists());
+        assert!(!directory.path().join("wallet.sqlite").exists());
     }
 
     #[tokio::test]

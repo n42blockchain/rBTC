@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_context},
-    signet::{SignetError, validate_default_signet_block_solution},
+    signet::{SignetError, validate_signet_block_solution},
     utxo::{UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -190,7 +190,7 @@ pub fn apply_block_with_bip34<S: UtxoStore>(
         bip34_active,
         false,
         script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
-        false,
+        None,
         block_subsidy(height),
     )
 }
@@ -221,7 +221,7 @@ pub fn apply_block_with_context<S: UtxoStore>(
         bip34_active,
         false,
         script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
-        false,
+        None,
         block_subsidy(height),
     )
 }
@@ -231,7 +231,7 @@ pub fn apply_block_with_context<S: UtxoStore>(
 /// `csv_active` enables the BIP68 relative sequence locks and changes absolute
 /// lock-time evaluation to BIP113 parent-MTP semantics. Before activation,
 /// absolute lock-time is compared with the candidate header timestamp.
-/// `signet` selects Bitcoin's default global BIP325 challenge. `subsidy_sats`
+/// `signet_challenge` selects the exact default or custom BIP325 script. `subsidy_sats`
 /// must come from the selected network's consensus parameters at `height`.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::fn_params_excessive_bools)]
@@ -246,10 +246,16 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
     bip34_active: bool,
     csv_active: bool,
     segwit_active: bool,
-    signet: bool,
+    signet_challenge: Option<&[u8]>,
     subsidy_sats: u64,
 ) -> Result<AppliedBlock, BlockError> {
-    validate_block_structure_with_deployments(block, height, bip34_active, segwit_active, signet)?;
+    validate_block_structure_with_deployments(
+        block,
+        height,
+        bip34_active,
+        segwit_active,
+        signet_challenge,
+    )?;
 
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut sigop_cost = 0_u64;
@@ -342,20 +348,24 @@ pub fn validate_block_structure(
         height,
         bip34_active,
         script_flags & bitcoinconsensus::VERIFY_WITNESS != 0,
-        false,
+        None,
     )
 }
 
-/// Validates block structure with script, SegWit, and default-Signet gates separated.
+/// Validates block structure with script, SegWit, and Signet gates separated.
 pub fn validate_block_structure_with_deployments(
     block: &Block,
     height: u32,
     bip34_active: bool,
     segwit_active: bool,
-    signet: bool,
+    signet_challenge: Option<&[u8]>,
 ) -> Result<(), BlockError> {
-    if signet {
-        validate_default_signet_block_solution(block)?;
+    if let Some(challenge) = signet_challenge {
+        if block.block_hash()
+            != bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet).block_hash()
+        {
+            validate_signet_block_solution(block, challenge)?;
+        }
     }
     if block.txdata.is_empty() {
         return Err(BlockError::Empty);
@@ -706,7 +716,7 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
+                None,
                 u64::MAX,
             ),
             Err(BlockError::FeeOverflow)
@@ -825,7 +835,7 @@ mod tests {
             false,
             false,
             false,
-            false,
+            None,
             block_subsidy(101),
         )
         .unwrap();
@@ -844,7 +854,7 @@ mod tests {
                 false,
                 true,
                 false,
-                false,
+                None,
                 block_subsidy(101),
             ),
             Err(BlockError::Transaction {
@@ -889,7 +899,7 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
+                None,
                 regtest_subsidy,
             ),
             Err(BlockError::ExcessCoinbase {

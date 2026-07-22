@@ -298,15 +298,15 @@ struct RbtcOutcome {
 }
 
 fn rbtc_outcome(blocks: &[Block]) -> RbtcOutcome {
-    rbtc_outcome_with_config(blocks, DeploymentConfig::for_network(Network::Regtest))
+    rbtc_outcome_with_config(blocks, &DeploymentConfig::for_network(Network::Regtest))
 }
 
-fn rbtc_outcome_with_config(blocks: &[Block], deployments: DeploymentConfig) -> RbtcOutcome {
+fn rbtc_outcome_with_config(blocks: &[Block], deployments: &DeploymentConfig) -> RbtcOutcome {
     assert!(!blocks.is_empty());
     let directory = TempDir::new().unwrap();
     let store =
         RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest).unwrap();
-    let mut headers = HeaderDag::with_deployments(deployments);
+    let mut headers = HeaderDag::with_deployments(deployments.clone());
     let mut accepted = true;
     for (offset, block) in blocks.iter().enumerate() {
         let height = u32::try_from(offset + 1).unwrap();
@@ -327,7 +327,7 @@ fn rbtc_outcome_with_config(blocks: &[Block], deployments: DeploymentConfig) -> 
             block,
             u64::from(block.header.time),
             60,
-            context,
+            &context,
         )
         .is_err()
         {
@@ -578,7 +578,7 @@ fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
         vec![pre_activation_coinbase],
     );
     assert!(core.submit(&first).is_empty());
-    let first_outcome = rbtc_outcome_with_config(std::slice::from_ref(&first), deployments);
+    let first_outcome = rbtc_outcome_with_config(std::slice::from_ref(&first), &deployments);
     assert!(first_outcome.accepted);
     assert_eq!(first_outcome.tip_height, 1);
 
@@ -590,7 +590,7 @@ fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
         vec![wrong_coinbase],
     );
     assert_eq!(core.submit(&wrong), "bad-cb-height");
-    let wrong_outcome = rbtc_outcome_with_config(&[first.clone(), wrong], deployments);
+    let wrong_outcome = rbtc_outcome_with_config(&[first.clone(), wrong], &deployments);
     assert!(!wrong_outcome.accepted);
     assert_eq!(wrong_outcome.tip_height, 1);
     assert!(!wrong_outcome.candidate_undo);
@@ -602,7 +602,7 @@ fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
         vec![coinbase(2, subsidy)],
     );
     assert!(core.submit(&valid).is_empty());
-    let valid_outcome = rbtc_outcome_with_config(&[first, valid], deployments);
+    let valid_outcome = rbtc_outcome_with_config(&[first, valid], &deployments);
     assert!(valid_outcome.accepted);
     assert_eq!(valid_outcome.tip_height, 2);
     assert!(valid_outcome.candidate_undo);
@@ -639,7 +639,7 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
     first.header.version = HeaderVersion::from_consensus(2);
     remine(&mut first);
     assert!(core.submit(&first).is_empty());
-    assert!(rbtc_outcome_with_config(std::slice::from_ref(&first), deployments).accepted);
+    assert!(rbtc_outcome_with_config(std::slice::from_ref(&first), &deployments).accepted);
 
     let mut obsolete_two = mine_block(
         first.block_hash(),
@@ -649,7 +649,7 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
     obsolete_two.header.version = HeaderVersion::from_consensus(2);
     remine(&mut obsolete_two);
     assert!(core.submit(&obsolete_two).contains("bad-version"));
-    let rejected = rbtc_outcome_with_config(&[first.clone(), obsolete_two], deployments);
+    let rejected = rbtc_outcome_with_config(&[first.clone(), obsolete_two], &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 1);
     assert!(!rejected.candidate_undo);
@@ -674,7 +674,7 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
     assert!(core.submit(&obsolete_three).contains("bad-version"));
     let rejected = rbtc_outcome_with_config(
         &[first.clone(), second.clone(), obsolete_three],
-        deployments,
+        &deployments,
     );
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 2);
@@ -687,7 +687,7 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
         vec![coinbase(3, subsidy)],
     );
     assert!(core.submit(&third).is_empty());
-    let accepted = rbtc_outcome_with_config(&[first, second, third], deployments);
+    let accepted = rbtc_outcome_with_config(&[first, second, third], &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 3);
     assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "3");
@@ -713,7 +713,7 @@ fn core_26_and_rbtc_agree_on_segwit_override_boundary() {
         vec![coinbase_with_witness_commitment(1, subsidy, false)],
     );
     assert!(core.submit(&first).is_empty());
-    assert!(rbtc_outcome_with_config(std::slice::from_ref(&first), deployments).accepted);
+    assert!(rbtc_outcome_with_config(std::slice::from_ref(&first), &deployments).accepted);
 
     let mut malformed_coinbase = coinbase_with_witness_commitment(2, subsidy, false);
     malformed_coinbase.input[0].witness = Witness::from_slice(&[[0_u8]]);
@@ -723,7 +723,7 @@ fn core_26_and_rbtc_agree_on_segwit_override_boundary() {
         vec![malformed_coinbase],
     );
     assert_eq!(core.submit(&malformed), "bad-witness-nonce-size");
-    let rejected = rbtc_outcome_with_config(&[first.clone(), malformed], deployments);
+    let rejected = rbtc_outcome_with_config(&[first.clone(), malformed], &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 1);
     assert!(!rejected.candidate_undo);
@@ -735,7 +735,7 @@ fn core_26_and_rbtc_agree_on_segwit_override_boundary() {
         vec![coinbase_with_witness_commitment(2, subsidy, true)],
     );
     assert!(core.submit(&valid).is_empty());
-    let accepted = rbtc_outcome_with_config(&[first, valid], deployments);
+    let accepted = rbtc_outcome_with_config(&[first, valid], &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 2);
     assert!(accepted.candidate_undo);
@@ -770,7 +770,7 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
     let spendable = OutPoint::new(pre_activation.txdata[1].compute_txid(), 0);
     parent = pre_activation.block_hash();
     blocks.push(pre_activation);
-    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    let accepted = rbtc_outcome_with_config(&blocks, &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 101);
 
@@ -786,7 +786,7 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
     assert_eq!(core.submit(&relative_locked), "bad-txns-nonfinal");
     let mut rejected_chain = blocks.clone();
     rejected_chain.push(relative_locked);
-    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 101);
     assert!(!rejected.candidate_undo);
@@ -802,7 +802,7 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
     );
     assert!(core.submit(&valid).is_empty());
     blocks.push(valid);
-    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    let accepted = rbtc_outcome_with_config(&blocks, &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 102);
     assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");
@@ -836,7 +836,7 @@ fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
     let relative_prevout = OutPoint::new(pre_activation.txdata[1].compute_txid(), 0);
     parent = pre_activation.block_hash();
     blocks.push(pre_activation);
-    assert!(rbtc_outcome_with_config(&blocks, deployments).accepted);
+    assert!(rbtc_outcome_with_config(&blocks, &deployments).accepted);
 
     let parent_mtp = median_time_past(&blocks);
     let second_coinbase = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
@@ -857,7 +857,7 @@ fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
     assert_eq!(core.submit(&absolute_locked), "bad-txns-nonfinal");
     let mut rejected_chain = blocks.clone();
     rejected_chain.push(absolute_locked);
-    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 101);
     assert!(!rejected.candidate_undo);
@@ -878,7 +878,7 @@ fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
     assert_eq!(core.submit(&relative_locked), "bad-txns-nonfinal");
     let mut rejected_chain = blocks.clone();
     rejected_chain.push(relative_locked);
-    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 101);
     assert!(!rejected.candidate_undo);
@@ -905,7 +905,7 @@ fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
     );
     assert!(core.submit(&valid).is_empty());
     blocks.push(valid);
-    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    let accepted = rbtc_outcome_with_config(&blocks, &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 102);
     assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");
@@ -953,7 +953,7 @@ fn core_26_and_rbtc_agree_on_bip147_nulldummy_boundary() {
     assert!(core.submit(&pre_activation).is_empty());
     parent = pre_activation.block_hash();
     blocks.push(pre_activation);
-    assert!(rbtc_outcome_with_config(&blocks, deployments).accepted);
+    assert!(rbtc_outcome_with_config(&blocks, &deployments).accepted);
 
     let second_coinbase = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
     let non_null_dummy = mine_block(
@@ -977,7 +977,7 @@ fn core_26_and_rbtc_agree_on_bip147_nulldummy_boundary() {
     );
     let mut rejected_chain = blocks.clone();
     rejected_chain.push(non_null_dummy);
-    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, &deployments);
     assert!(!rejected.accepted);
     assert_eq!(rejected.tip_height, 101);
     assert!(!rejected.candidate_undo);
@@ -999,7 +999,7 @@ fn core_26_and_rbtc_agree_on_bip147_nulldummy_boundary() {
     );
     assert!(core.submit(&valid).is_empty());
     blocks.push(valid);
-    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    let accepted = rbtc_outcome_with_config(&blocks, &deployments);
     assert!(accepted.accepted);
     assert_eq!(accepted.tip_height, 102);
     assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");

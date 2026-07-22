@@ -4,14 +4,14 @@
 //! `bitcoinconsensus` dependency, including regtest's `-vbparams` override
 //! semantics for Taproot.
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, Network, consensus::serialize, hashes::Hash, p2p::Magic};
 use thiserror::Error;
 
 use crate::{
     block_execution::BlockDeploymentContext, blockchain::block_subsidy_with_interval,
-    headers::HeaderDag,
+    headers::HeaderDag, signet::DEFAULT_SIGNET_CHALLENGE,
 };
 
 const VERSION_BITS_TOP_MASK: u32 = 0xE000_0000;
@@ -23,6 +23,7 @@ const ALWAYS_ACTIVE: i64 = -1;
 const NEVER_ACTIVE: i64 = -2;
 const CONFIG_ENCODING_VERSION: u8 = 1;
 const BURIED_CONFIG_ENCODING_VERSION: u8 = 2;
+const CUSTOM_SIGNET_CONFIG_ENCODING_VERSION: u8 = 3;
 const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const REGTEST_HALVING_INTERVAL: u32 = 150;
 
@@ -54,11 +55,13 @@ struct VersionBitsParams {
 }
 
 /// Complete deployment parameters used while validating one network.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeploymentConfig {
     network: Network,
     taproot: VersionBitsParams,
     activation_heights: ActivationHeights,
+    signet_challenge: Option<Arc<[u8]>>,
+    custom_signet: bool,
 }
 
 /// Invalid deployment configuration.
@@ -97,25 +100,28 @@ pub enum DeploymentConfigError {
     /// The deployment configuration and header DAG select different networks.
     #[error("deployment configuration network does not match header network")]
     NetworkMismatch,
+    /// Custom Signet parameters only apply to the Signet network.
+    #[error("--signetchallenge is only supported with --network signet")]
+    SignetOnly,
 }
 
 impl DeploymentConfig {
     /// Returns the pinned default deployment parameters for `network`.
     #[must_use]
-    pub const fn for_network(network: Network) -> Self {
+    pub fn for_network(network: Network) -> Self {
         let taproot = match network {
             Network::Bitcoin => VersionBitsParams {
                 period: 2_016,
                 threshold: 1_815,
-                start_time: TAPROOT_START_TIME as i64,
-                timeout: TAPROOT_TIMEOUT as i64,
+                start_time: i64::from(TAPROOT_START_TIME),
+                timeout: i64::from(TAPROOT_TIMEOUT),
                 min_activation_height: 709_632,
             },
             Network::Testnet => VersionBitsParams {
                 period: 2_016,
                 threshold: 1_512,
-                start_time: TAPROOT_START_TIME as i64,
-                timeout: TAPROOT_TIMEOUT as i64,
+                start_time: i64::from(TAPROOT_START_TIME),
+                timeout: i64::from(TAPROOT_TIMEOUT),
                 min_activation_height: 0,
             },
             Network::Regtest => VersionBitsParams {
@@ -137,7 +143,43 @@ impl DeploymentConfig {
             network,
             taproot,
             activation_heights: activation_heights(network),
+            signet_challenge: (network == Network::Signet)
+                .then(|| Arc::<[u8]>::from(DEFAULT_SIGNET_CHALLENGE)),
+            custom_signet: false,
         }
+    }
+
+    /// Selects the one Core-compatible custom Signet challenge script.
+    pub fn set_signet_challenge(
+        &mut self,
+        challenge: Vec<u8>,
+    ) -> Result<(), DeploymentConfigError> {
+        if self.network != Network::Signet {
+            return Err(DeploymentConfigError::SignetOnly);
+        }
+        self.signet_challenge = Some(Arc::from(challenge));
+        self.custom_signet = true;
+        Ok(())
+    }
+
+    /// Whether this selects a custom Signet rather than Core's default Signet.
+    #[must_use]
+    pub fn is_custom_signet(&self) -> bool {
+        self.custom_signet
+    }
+
+    /// P2P message start derived from the serialized challenge on Signet.
+    #[must_use]
+    pub fn message_start(&self) -> Magic {
+        let Some(challenge) = self.signet_challenge.as_deref() else {
+            return self.network.magic();
+        };
+        let hash = bitcoin::hashes::sha256d::Hash::hash(&serialize(&challenge.to_vec()));
+        Magic::from_bytes(
+            hash.to_byte_array()[..4]
+                .try_into()
+                .expect("four-byte hash prefix"),
+        )
     }
 
     /// Applies one Bitcoin Core-compatible regtest `-vbparams` value.
@@ -211,7 +253,7 @@ impl DeploymentConfig {
 
     /// Canonical bytes that bind persisted execution state to these settings.
     #[must_use]
-    pub fn consensus_id(self) -> Vec<u8> {
+    pub fn consensus_id(&self) -> Vec<u8> {
         let mut encoded = vec![0_u8; 29];
         encoded[0] = CONFIG_ENCODING_VERSION;
         encoded[1..5].copy_from_slice(&self.taproot.period.to_le_bytes());
@@ -231,16 +273,29 @@ impl DeploymentConfig {
                 encoded.extend_from_slice(&height.to_le_bytes());
             }
         }
+        if self.is_custom_signet() {
+            encoded[0] = CUSTOM_SIGNET_CONFIG_ENCODING_VERSION;
+            let challenge = self
+                .signet_challenge
+                .as_deref()
+                .expect("custom Signet has a challenge");
+            encoded.extend_from_slice(
+                &u32::try_from(challenge.len())
+                    .expect("Bitcoin script length fits u32")
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(challenge);
+        }
         encoded
     }
 
     /// Returns the network whose consensus parameters this value describes.
     #[must_use]
-    pub const fn network(self) -> Network {
+    pub const fn network(&self) -> Network {
         self.network
     }
 
-    pub(crate) const fn minimum_block_version(self, height: u32) -> i32 {
+    pub(crate) const fn minimum_block_version(&self, height: u32) -> i32 {
         minimum_block_version_for_heights(self.activation_heights, height)
     }
 }
@@ -255,7 +310,7 @@ pub fn block_deployment_context(
     taproot_active: bool,
 ) -> BlockDeploymentContext {
     block_deployment_context_with_config(
-        DeploymentConfig::for_network(network),
+        &DeploymentConfig::for_network(network),
         height,
         block_hash,
         block_time,
@@ -266,7 +321,7 @@ pub fn block_deployment_context(
 /// Derives candidate consensus flags using an explicitly selected configuration.
 #[must_use]
 pub fn block_deployment_context_with_config(
-    config: DeploymentConfig,
+    config: &DeploymentConfig,
     height: u32,
     block_hash: BlockHash,
     _block_time: u32,
@@ -281,7 +336,7 @@ pub fn block_deployment_context_with_config(
             bip34_active: height >= config.activation_heights.bip34,
             csv_active: height >= config.activation_heights.csv,
             segwit_active: height >= config.activation_heights.segwit,
-            signet: network == Network::Signet,
+            signet_challenge: config.signet_challenge.clone(),
             bip30_exception,
             subsidy_sats,
         };
@@ -310,7 +365,7 @@ pub fn block_deployment_context_with_config(
         bip34_active: height >= heights.bip34,
         csv_active: height >= heights.csv,
         segwit_active: height >= heights.segwit,
-        signet: network == Network::Signet,
+        signet_challenge: config.signet_challenge.clone(),
         bip30_exception,
         subsidy_sats,
     }
@@ -327,7 +382,7 @@ const fn halving_interval(network: Network) -> u32 {
 
 /// Whether Taproot is unconditionally active for this network configuration.
 #[must_use]
-pub const fn taproot_always_active(network: Network) -> bool {
+pub fn taproot_always_active(network: Network) -> bool {
     DeploymentConfig::for_network(network).taproot.start_time == ALWAYS_ACTIVE
 }
 
@@ -338,7 +393,7 @@ pub const fn taproot_always_active(network: Network) -> bool {
 pub fn taproot_active(
     headers: &HeaderDag,
     candidate_height: u32,
-    config: DeploymentConfig,
+    config: &DeploymentConfig,
 ) -> Result<bool, DeploymentConfigError> {
     if headers.network() != config.network {
         return Err(DeploymentConfigError::NetworkMismatch);
@@ -512,6 +567,7 @@ mod tests {
         TxMerkleNode,
         block::{Header, Version},
         hashes::Hash,
+        hex::FromHex,
         pow::Target,
     };
     use proptest::prelude::*;
@@ -530,7 +586,7 @@ mod tests {
         assert!(context.bip34_active);
         assert!(context.csv_active);
         assert!(context.segwit_active);
-        assert!(!context.signet);
+        assert!(context.signet_challenge.is_none());
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
         assert_ne!(
             context.script_flags & bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
@@ -541,17 +597,68 @@ mod tests {
     }
 
     #[test]
-    fn only_default_signet_selects_bip325_block_validation() {
+    fn only_signet_selects_bip325_block_validation() {
         let hash = BlockHash::all_zeros();
-        assert!(block_deployment_context(Network::Signet, 1, hash, 0, false).signet);
+        assert!(
+            block_deployment_context(Network::Signet, 1, hash, 0, false)
+                .signet_challenge
+                .is_some()
+        );
         for network in [
             Network::Bitcoin,
             Network::Testnet,
             Network::Testnet4,
             Network::Regtest,
         ] {
-            assert!(!block_deployment_context(network, 1, hash, 0, false).signet);
+            assert!(
+                block_deployment_context(network, 1, hash, 0, false)
+                    .signet_challenge
+                    .is_none()
+            );
         }
+    }
+
+    #[test]
+    fn custom_signet_derives_bip325_message_start_and_execution_identity() {
+        let mut config = DeploymentConfig::for_network(Network::Signet);
+        assert_eq!(config.message_start(), Network::Signet.magic());
+        let default_id = config.consensus_id();
+        let mut explicit_default = config.clone();
+        explicit_default
+            .set_signet_challenge(DEFAULT_SIGNET_CHALLENGE.to_vec())
+            .unwrap();
+        assert!(explicit_default.is_custom_signet());
+        assert_eq!(explicit_default.message_start(), Network::Signet.magic());
+        assert_ne!(explicit_default.consensus_id(), default_id);
+        let challenge = Vec::from_hex(
+            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be43051ae",
+        )
+        .unwrap();
+        config.set_signet_challenge(challenge.clone()).unwrap();
+        assert!(config.is_custom_signet());
+        assert_eq!(config.message_start().to_bytes(), [0x7e, 0xc6, 0x53, 0xa5]);
+        assert_ne!(config.consensus_id(), default_id);
+        assert_eq!(
+            config.consensus_id()[0],
+            CUSTOM_SIGNET_CONFIG_ENCODING_VERSION
+        );
+        let context =
+            block_deployment_context_with_config(&config, 1, BlockHash::all_zeros(), 0, true);
+        assert_eq!(
+            context.signet_challenge.as_deref(),
+            Some(challenge.as_slice())
+        );
+    }
+
+    #[test]
+    fn custom_signet_parameters_are_network_scoped_and_allow_core_empty_script() {
+        assert_eq!(
+            DeploymentConfig::for_network(Network::Bitcoin).set_signet_challenge(vec![0x51]),
+            Err(DeploymentConfigError::SignetOnly)
+        );
+        let mut config = DeploymentConfig::for_network(Network::Signet);
+        config.set_signet_challenge(Vec::new()).unwrap();
+        assert!(config.is_custom_signet());
     }
 
     #[test]
@@ -648,7 +755,12 @@ mod tests {
             ThresholdState::Active
         );
         assert!(
-            taproot_active(&headers, 1, DeploymentConfig::for_network(Network::Regtest)).unwrap()
+            taproot_active(
+                &headers,
+                1,
+                &DeploymentConfig::for_network(Network::Regtest),
+            )
+            .unwrap()
         );
     }
 
@@ -659,12 +771,12 @@ mod tests {
         assert_eq!(config.consensus_id().len(), 29);
         assert_eq!(config.consensus_id()[0], CONFIG_ENCODING_VERSION);
         config.apply_vbparams("taproot:-2:0").unwrap();
-        assert!(!taproot_active(&headers, 1, config).unwrap());
+        assert!(!taproot_active(&headers, 1, &config).unwrap());
 
         config
             .apply_vbparams("taproot:-1:9223372036854775807:-5")
             .unwrap();
-        assert!(taproot_active(&headers, 1, config).unwrap());
+        assert!(taproot_active(&headers, 1, &config).unwrap());
         assert_ne!(
             config.consensus_id(),
             DeploymentConfig::for_network(Network::Regtest).consensus_id()
@@ -679,7 +791,7 @@ mod tests {
             config.apply_test_activation_height(value).unwrap();
         }
         let context = |height| {
-            block_deployment_context_with_config(config, height, BlockHash::all_zeros(), 0, false)
+            block_deployment_context_with_config(&config, height, BlockHash::all_zeros(), 0, false)
         };
         assert!(!context(9).bip34_active);
         assert!(context(10).bip34_active);
@@ -728,7 +840,7 @@ mod tests {
         config.apply_test_activation_height("bip34@10").unwrap();
         config.apply_test_activation_height("bip34@20").unwrap();
         assert!(
-            !block_deployment_context_with_config(config, 19, BlockHash::all_zeros(), 0, false,)
+            !block_deployment_context_with_config(&config, 19, BlockHash::all_zeros(), 0, false,)
                 .bip34_active
         );
         assert_eq!(
@@ -789,9 +901,9 @@ mod tests {
             .apply_vbparams("taproot:0:9223372036854775807:432")
             .unwrap();
 
-        assert!(!taproot_active(&headers, 144, config).unwrap());
-        assert!(!taproot_active(&headers, 288, config).unwrap());
-        assert!(taproot_active(&headers, 432, config).unwrap());
+        assert!(!taproot_active(&headers, 144, &config).unwrap());
+        assert!(!taproot_active(&headers, 288, &config).unwrap());
+        assert!(taproot_active(&headers, 432, &config).unwrap());
     }
 
     #[test]
@@ -819,7 +931,7 @@ mod tests {
             taproot_active(
                 &HeaderDag::new(Network::Bitcoin),
                 1,
-                DeploymentConfig::for_network(Network::Regtest),
+                &DeploymentConfig::for_network(Network::Regtest),
             ),
             Err(DeploymentConfigError::NetworkMismatch)
         );
@@ -838,7 +950,7 @@ mod tests {
             value in proptest::string::string_regex("[ -~]{0,64}").unwrap()
         ) {
             let mut config = DeploymentConfig::for_network(Network::Regtest);
-            let original = config;
+            let original = config.clone();
             if config.apply_test_activation_height(&value).is_err() {
                 prop_assert_eq!(config, original);
             }

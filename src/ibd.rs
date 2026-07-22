@@ -93,6 +93,19 @@ impl IbdPolicy {
         }
     }
 
+    /// Returns Core's trust-free defaults for an unknown custom Signet.
+    #[must_use]
+    pub fn for_custom_signet() -> Self {
+        Self {
+            network: Network::Signet,
+            minimum_chainwork: Work::from_unprefixed_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("zero work"),
+            assume_valid: None,
+        }
+    }
+
     /// Applies a hexadecimal minimum-chainwork override.
     pub fn set_minimum_chainwork(&mut self, value: &str) -> Result<(), IbdPolicyError> {
         self.minimum_chainwork =
