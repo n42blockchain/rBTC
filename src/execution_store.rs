@@ -18,6 +18,7 @@ const ASSUMED_SNAPSHOT_RECORDS_KEY: &str = "assumed_snapshot_records_sha256";
 const ASSUMED_SNAPSHOT_COUNT_KEY: &str = "assumed_snapshot_utxo_count";
 const ASSUMED_SNAPSHOT_BYTES_KEY: &str = "assumed_snapshot_records_bytes";
 const ASSUMED_SNAPSHOT_UTXO_SET_KEY: &str = "assumed_snapshot_utxo_set_sha256";
+const VALIDATION_TARGET_KEY: &str = "validation_target";
 
 /// Last block whose UTXO transition is recorded as complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +95,39 @@ pub enum ExecutionStoreError {
     /// The assumed-state marker changed while validation was being finalized.
     #[error("assumed snapshot identity changed during finalization")]
     AssumedSnapshotChanged,
+    /// A validation directory is permanently bound to another snapshot base.
+    #[error(
+        "validation target {stored_height}:{stored_hash} does not match requested {requested_height}:{requested_hash}"
+    )]
+    ValidationTargetMismatch {
+        /// Persisted validation height.
+        stored_height: u32,
+        /// Persisted validation hash.
+        stored_hash: BlockHash,
+        /// Requested validation height.
+        requested_height: u32,
+        /// Requested validation hash.
+        requested_hash: BlockHash,
+    },
+    /// The requested validation target is below the already executed tip.
+    #[error("validation target height {target_height} is below execution height {tip_height}")]
+    ValidationTargetBehindTip {
+        /// Requested validation height.
+        target_height: u32,
+        /// Existing execution height.
+        tip_height: u32,
+    },
+    /// A transition tried to execute beyond the immutable validation ceiling.
+    #[error("execution height {next_height} exceeds immutable validation target {target_height}")]
+    ValidationTargetExceeded {
+        /// Persisted validation height.
+        target_height: u32,
+        /// Proposed execution height.
+        next_height: u32,
+    },
+    /// An assumed chainstate cannot serve as a genesis validator.
+    #[error("validation target cannot be bound to an assumed chainstate")]
+    ValidationTargetOnAssumedChainstate,
 }
 
 /// redb-backed execution tip initialized to the selected network's genesis.
@@ -184,6 +218,72 @@ impl RedbExecutionStore {
         Ok(meta
             .get(CONSENSUS_CONFIG_KEY)?
             .map(|value| value.value().to_vec()))
+    }
+
+    /// Returns the immutable snapshot base assigned to this validation directory.
+    pub fn validation_target(&self) -> Result<Option<ExecutionTip>, ExecutionStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        meta.get(VALIDATION_TARGET_KEY)?
+            .map(|value| decode_tip(value.value()))
+            .transpose()
+    }
+
+    /// Permanently binds a non-assumed chainstate to one validation target.
+    pub fn bind_validation_target(
+        &self,
+        requested: ExecutionTip,
+    ) -> Result<(), ExecutionStoreError> {
+        if requested.height == 0 {
+            return Err(ExecutionStoreError::Malformed(
+                "validation target cannot be genesis",
+            ));
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            if decode_assumed_snapshot(&meta)?.is_some() {
+                return Err(ExecutionStoreError::ValidationTargetOnAssumedChainstate);
+            }
+            let tip_value = meta
+                .get(TIP_KEY)?
+                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+            let tip = decode_tip(tip_value.value())?;
+            drop(tip_value);
+            if tip.height > requested.height {
+                return Err(ExecutionStoreError::ValidationTargetBehindTip {
+                    target_height: requested.height,
+                    tip_height: tip.height,
+                });
+            }
+            let stored = meta
+                .get(VALIDATION_TARGET_KEY)?
+                .map(|value| decode_tip(value.value()))
+                .transpose()?;
+            if let Some(stored) = stored {
+                if stored != requested {
+                    return Err(ExecutionStoreError::ValidationTargetMismatch {
+                        stored_height: stored.height,
+                        stored_hash: stored.hash,
+                        requested_height: requested.height,
+                        requested_hash: requested.hash,
+                    });
+                }
+            } else {
+                meta.insert(VALIDATION_TARGET_KEY, encode_tip(requested).as_slice())?;
+            }
+            if tip.height == requested.height && tip.hash != requested.hash {
+                return Err(ExecutionStoreError::ValidationTargetMismatch {
+                    stored_height: tip.height,
+                    stored_hash: tip.hash,
+                    requested_height: requested.height,
+                    requested_hash: requested.hash,
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Binds this execution database to a canonical consensus configuration.
@@ -285,6 +385,26 @@ pub(crate) fn advance_transaction(
             current_hash: current.hash,
         });
     }
+    let validation_target = meta
+        .get(VALIDATION_TARGET_KEY)?
+        .map(|value| decode_tip(value.value()))
+        .transpose()?;
+    if let Some(target) = validation_target {
+        if next.height > target.height {
+            return Err(ExecutionStoreError::ValidationTargetExceeded {
+                target_height: target.height,
+                next_height: next.height,
+            });
+        }
+        if next.height == target.height && next.hash != target.hash {
+            return Err(ExecutionStoreError::ValidationTargetMismatch {
+                stored_height: target.height,
+                stored_hash: target.hash,
+                requested_height: next.height,
+                requested_hash: next.hash,
+            });
+        }
+    }
     drop(current_value);
     meta.insert(TIP_KEY, encode_tip(next).as_slice())?;
     Ok(())
@@ -313,6 +433,7 @@ pub(crate) fn assume_snapshot_transaction(
         ASSUMED_SNAPSHOT_COUNT_KEY,
         ASSUMED_SNAPSHOT_BYTES_KEY,
         ASSUMED_SNAPSHOT_UTXO_SET_KEY,
+        VALIDATION_TARGET_KEY,
     ]
     .into_iter()
     .try_fold(false, |present, key| {
@@ -503,6 +624,73 @@ mod tests {
                 "incomplete assumed snapshot identity"
             ))
         ));
+    }
+
+    #[test]
+    fn validation_target_is_durable_and_cannot_change_or_move_behind_tip() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.tip().unwrap();
+        let target = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([2; 32]),
+        };
+        store.bind_validation_target(target).unwrap();
+        store.bind_validation_target(target).unwrap();
+        assert_eq!(store.validation_target().unwrap(), Some(target));
+        assert!(matches!(
+            store.bind_validation_target(ExecutionTip {
+                height: 2,
+                hash: BlockHash::from_byte_array([3; 32]),
+            }),
+            Err(ExecutionStoreError::ValidationTargetMismatch { .. })
+        ));
+        store
+            .advance(
+                genesis.hash,
+                ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([1; 32]),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.advance(
+                BlockHash::from_byte_array([1; 32]),
+                ExecutionTip {
+                    height: 2,
+                    hash: BlockHash::from_byte_array([3; 32]),
+                },
+            ),
+            Err(ExecutionStoreError::ValidationTargetMismatch { .. })
+        ));
+        store
+            .advance(BlockHash::from_byte_array([1; 32]), target)
+            .unwrap();
+        assert!(matches!(
+            store.advance(
+                target.hash,
+                ExecutionTip {
+                    height: 3,
+                    hash: BlockHash::from_byte_array([4; 32]),
+                },
+            ),
+            Err(ExecutionStoreError::ValidationTargetExceeded {
+                target_height: 2,
+                next_height: 3,
+            })
+        ));
+        assert!(matches!(
+            store.bind_validation_target(ExecutionTip {
+                height: 1,
+                hash: BlockHash::from_byte_array([1; 32]),
+            }),
+            Err(ExecutionStoreError::ValidationTargetBehindTip { .. })
+        ));
+        drop(store);
+        let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(reopened.validation_target().unwrap(), Some(target));
     }
 
     #[test]

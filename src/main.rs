@@ -51,6 +51,7 @@ const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
 const MAX_WALLET_SCAN_PASSES: usize = 64;
+const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
@@ -73,6 +74,7 @@ struct Options {
     finalize_assumeutxo: Option<PathBuf>,
     validation_target: Option<ValidationTarget>,
     complete_assumeutxo: Option<PathBuf>,
+    validation_limits: ValidationLimits,
 }
 
 struct SnapshotActivationOptions {
@@ -88,6 +90,21 @@ struct SnapshotActivationOptions {
 struct ValidationTarget {
     height: u32,
     block_hash: BlockHash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidationLimits {
+    max_blocks_per_batch: usize,
+    pause_between_batches: Duration,
+}
+
+impl Default for ValidationLimits {
+    fn default() -> Self {
+        Self {
+            max_blocks_per_batch: MAX_BLOCKS_IN_FLIGHT,
+            pause_between_batches: Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -777,6 +794,7 @@ async fn run_with_peer(
             path.clone(),
             options.once,
             options.validation_target,
+            options.validation_limits,
             api_runtime,
         )
         .await;
@@ -835,6 +853,7 @@ async fn complete_assumeutxo_validation(
             height: assumed.base.height,
             block_hash: assumed.base.hash,
         }),
+        options.validation_limits,
         None,
     )
     .await?;
@@ -1024,6 +1043,7 @@ async fn sync_validating_node(
     data_dir: PathBuf,
     once: bool,
     validation_target: Option<ValidationTarget>,
+    validation_limits: ValidationLimits,
     api_runtime: Option<&ApiRuntime>,
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
@@ -1039,22 +1059,28 @@ async fn sync_validating_node(
         .map_err(|error| error.to_string())?;
     let undo_store = chainstate.undos();
     let execution_store = chainstate.execution();
-    if validation_target.is_some()
-        && execution_store
-            .assumed_snapshot()
-            .map_err(|error| error.to_string())?
-            .is_some()
-    {
-        return Err(PeerRunError::transient(
-            "bounded genesis validation requires a non-assumed chainstate",
-        ));
-    }
     execution_store
         .bind_consensus_config(
             &deployment_config.consensus_id(),
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
+    if let Some(target) = validation_target {
+        execution_store
+            .bind_validation_target(rbtc::execution_store::ExecutionTip {
+                height: target.height,
+                hash: target.block_hash,
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    let validation_target = execution_store
+        .validation_target()
+        .map_err(|error| error.to_string())?
+        .map(|target| ValidationTarget {
+            height: target.height,
+            block_hash: target.hash,
+        })
+        .or(validation_target);
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
     let explorer = Arc::new(
@@ -1225,6 +1251,7 @@ async fn sync_validating_node(
                 &explorer,
                 wallet,
                 validation_target.map(|target| target.height),
+                validation_limits.max_blocks_per_batch,
             )
             .await?;
             if let Some(wallet) = wallet_runtime {
@@ -1238,6 +1265,17 @@ async fn sync_validating_node(
                     wallet.scan,
                 )
                 .await?;
+            }
+            if let Some(target) = validation_target {
+                let tip = execution_store.tip().map_err(|error| error.to_string())?;
+                let remaining = target.height.saturating_sub(tip.height);
+                println!(
+                    "genesis validation progress: {} / {} blocks ({} remaining)",
+                    tip.height, target.height, remaining
+                );
+                if remaining > 0 && !validation_limits.pause_between_batches.is_zero() {
+                    tokio::time::sleep(validation_limits.pause_between_batches).await;
+                }
             }
         }
     }
@@ -1736,6 +1774,7 @@ async fn download_execute_batch(
     explorer: &RedbExplorerIndex,
     wallet: Option<&EmbeddedWallet>,
     maximum_height: Option<u32>,
+    maximum_batch_size: usize,
 ) -> Result<(), PeerRunError> {
     let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -1754,7 +1793,7 @@ async fn download_execute_batch(
     })?;
     let batch_len = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
-        .min(MAX_BLOCKS_IN_FLIGHT);
+        .min(maximum_batch_size);
     let expected = (0..batch_len)
         .map(|offset| {
             let offset = u32::try_from(offset).expect("block batch fits u32");
@@ -2159,6 +2198,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut validation_height = None;
     let mut validation_block_hash = None;
     let mut complete_assumeutxo = None;
+    let mut validation_batch_size = None;
+    let mut validation_pause_ms = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -2324,6 +2365,40 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     &mut args,
                     "--complete-assumeutxo",
                 )?));
+            }
+            "--validation-batch-size" => {
+                if validation_batch_size.is_some() {
+                    return Err(
+                        "--validation-batch-size cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--validation-batch-size")?;
+                let size = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid validation batch size: {value}"))?;
+                if !(1..=MAX_BLOCKS_IN_FLIGHT).contains(&size) {
+                    return Err(format!(
+                        "validation batch size must be between 1 and {MAX_BLOCKS_IN_FLIGHT}"
+                    ));
+                }
+                validation_batch_size = Some(size);
+            }
+            "--validation-pause-ms" => {
+                if validation_pause_ms.is_some() {
+                    return Err(
+                        "--validation-pause-ms cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--validation-pause-ms")?;
+                let pause = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid validation pause: {value}"))?;
+                if pause > MAX_VALIDATION_PAUSE_MS {
+                    return Err(format!(
+                        "validation pause cannot exceed {MAX_VALIDATION_PAUSE_MS} milliseconds"
+                    ));
+                }
+                validation_pause_ms = Some(pause);
             }
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
@@ -2549,6 +2624,19 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
+    if (validation_batch_size.is_some() || validation_pause_ms.is_some())
+        && validation_target.is_none()
+        && complete_assumeutxo.is_none()
+    {
+        return Err(
+            "validation resource limits require bounded or automatic AssumeUTXO validation"
+                .to_owned(),
+        );
+    }
+    let validation_limits = ValidationLimits {
+        max_blocks_per_batch: validation_batch_size.unwrap_or(MAX_BLOCKS_IN_FLIGHT),
+        pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
+    };
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
             "--data-dir block execution currently supports only regtest and Signet".to_owned(),
@@ -2615,6 +2703,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         finalize_assumeutxo,
         validation_target,
         complete_assumeutxo,
+        validation_limits,
     }))
 }
 
@@ -2679,7 +2768,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -3149,6 +3238,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -3207,6 +3297,7 @@ mod tests {
             finalize_assumeutxo: Some(validation_dir),
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -3336,6 +3427,10 @@ mod tests {
                 "/tmp/rbtc-validation",
                 "--connect",
                 "127.0.0.1:18444",
+                "--validation-batch-size",
+                "3",
+                "--validation-pause-ms",
+                "7",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -3345,6 +3440,13 @@ mod tests {
         assert_eq!(
             options.complete_assumeutxo,
             Some(PathBuf::from("/tmp/rbtc-validation"))
+        );
+        assert_eq!(
+            options.validation_limits,
+            ValidationLimits {
+                max_blocks_per_batch: 3,
+                pause_between_batches: Duration::from_millis(7),
+            }
         );
         for arguments in [
             vec!["--network", "regtest", "--complete-assumeutxo", "/tmp/v"],
@@ -3366,6 +3468,24 @@ mod tests {
                 "/tmp/v",
                 "--explorer-listen",
                 "127.0.0.1:3000",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--validation-batch-size",
+                "1",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--complete-assumeutxo",
+                "/tmp/v",
+                "--validation-pause-ms",
+                "60001",
             ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
@@ -3803,6 +3923,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap_err();
@@ -3847,6 +3968,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -3987,6 +4109,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4068,6 +4191,7 @@ mod tests {
                 block_hash: first_hash,
             }),
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4079,6 +4203,13 @@ mod tests {
         assert_eq!(chainstate.execution().tip().unwrap().height, 1);
         assert_eq!(chainstate.execution().tip().unwrap().hash, first_hash);
         assert_eq!(chainstate.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(
+            chainstate.execution().validation_target().unwrap(),
+            Some(rbtc::execution_store::ExecutionTip {
+                height: 1,
+                hash: first_hash,
+            })
+        );
         drop(chainstate);
         let headers = RedbHeaderStore::open(directory.path().join("headers.redb"))
             .unwrap()
@@ -4119,11 +4250,9 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
-            validation_target: Some(ValidationTarget {
-                height: 1,
-                block_hash: first_hash,
-            }),
+            validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4200,6 +4329,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4247,6 +4377,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: Some(validation_dir.clone()),
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4265,6 +4396,13 @@ mod tests {
         assert_eq!(validation.execution().tip().unwrap().height, 1);
         assert_eq!(validation.execution().tip().unwrap().hash, block_hash);
         assert_eq!(validation.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(
+            validation.execution().validation_target().unwrap(),
+            Some(rbtc::execution_store::ExecutionTip {
+                height: 1,
+                hash: block_hash,
+            })
+        );
         drop(validation);
         drop(active);
         let repeated = run(Options {
@@ -4283,6 +4421,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: Some(validation_dir),
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap_err();
@@ -4353,6 +4492,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4423,6 +4563,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4451,6 +4592,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4510,6 +4652,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap_err();
@@ -4563,6 +4706,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap_err();
@@ -4650,6 +4794,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap_err();
@@ -4780,6 +4925,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4874,6 +5020,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -4940,6 +5087,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();
@@ -5036,6 +5184,7 @@ mod tests {
                 finalize_assumeutxo: None,
                 validation_target: None,
                 complete_assumeutxo: None,
+                validation_limits: ValidationLimits::default(),
             },
             local_nonce,
         )
@@ -5146,6 +5295,7 @@ mod tests {
             finalize_assumeutxo: None,
             validation_target: None,
             complete_assumeutxo: None,
+            validation_limits: ValidationLimits::default(),
         })
         .await
         .unwrap();

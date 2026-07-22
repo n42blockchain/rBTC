@@ -125,6 +125,9 @@ pub enum ChainStoreError {
     /// The two chainstates were not executed under identical consensus rules.
     #[error("active and validation chainstates have different consensus configurations")]
     ValidationConsensusMismatch,
+    /// The validation directory was assigned to another snapshot base.
+    #[error("validation directory target does not match the assumed snapshot base")]
+    ValidationTargetMismatch,
     /// The snapshot base is not on the selected active header chain.
     #[error("snapshot base {height}:{hash} is not on the active header chain")]
     SnapshotBaseNotActive {
@@ -344,6 +347,13 @@ impl RedbChainStore {
                 actual_height: validation_tip.height,
                 actual_hash: validation_tip.hash,
             });
+        }
+        if validation
+            .execution
+            .validation_target()?
+            .is_some_and(|target| target != assumed.base)
+        {
+            return Err(ChainStoreError::ValidationTargetMismatch);
         }
         let active_config = self.execution.consensus_config()?;
         let validation_config = validation.execution.consensus_config()?;
