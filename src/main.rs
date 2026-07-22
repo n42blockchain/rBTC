@@ -9,7 +9,7 @@ use std::{
     process,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bitcoin::{
@@ -38,7 +38,7 @@ use rbtc::{
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, connect_outbound},
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
-    utxo::DEFAULT_HOT_WINDOW_SECS,
+    utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
     wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
 };
 use tokio::time::timeout;
@@ -262,6 +262,66 @@ struct ValidationStatusResponse {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct NodeTipResponse {
+    height: u32,
+    hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct NodeStatusProgress {
+    network: String,
+    header: NodeTipResponse,
+    execution: NodeTipResponse,
+    explorer: NodeTipResponse,
+    wallet: Option<NodeTipResponse>,
+    minimum_chainwork_reached: bool,
+    active_assume_valid_height: Option<u32>,
+    full_script_validation: bool,
+    independently_validated: bool,
+    utxo_hot: u64,
+    utxo_cold: u64,
+    ledger_segments: u32,
+    ledger_blocks: u32,
+    ledger_bytes: u64,
+    ledger_first_height: Option<u32>,
+    ledger_tip_height: Option<u32>,
+}
+
+#[derive(Clone)]
+struct NodeStatus {
+    started: Instant,
+    progress: Arc<Mutex<NodeStatusProgress>>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct NodeTrustResponse {
+    minimum_chainwork_reached: bool,
+    active_assume_valid_height: Option<u32>,
+    full_script_validation: bool,
+    independently_validated: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct NodeStatusResponse {
+    network: String,
+    phase: &'static str,
+    ready: bool,
+    session_uptime_seconds: u64,
+    header: NodeTipResponse,
+    execution: NodeTipResponse,
+    explorer: NodeTipResponse,
+    wallet: Option<NodeTipResponse>,
+    trust: NodeTrustResponse,
+    utxo_hot: u64,
+    utxo_cold: u64,
+    ledger_segments: u32,
+    ledger_blocks: u32,
+    ledger_bytes: u64,
+    ledger_first_height: Option<u32>,
+    ledger_tip_height: Option<u32>,
+}
+
 #[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ValidationDirectoryOwner {
@@ -379,6 +439,154 @@ impl BackgroundValidationStatus {
     }
 }
 
+impl NodeStatus {
+    fn new(progress: NodeStatusProgress) -> Self {
+        Self {
+            started: Instant::now(),
+            progress: Arc::new(Mutex::new(progress)),
+        }
+    }
+
+    fn update(&self, progress: NodeStatusProgress) {
+        *self.progress.lock().expect("node status lock not poisoned") = progress;
+    }
+
+    fn response(&self) -> NodeStatusResponse {
+        let progress = self
+            .progress
+            .lock()
+            .expect("node status lock not poisoned")
+            .clone();
+        let chain_caught_up = progress.header == progress.execution;
+        let explorer_caught_up = progress.explorer == progress.execution;
+        let wallet_caught_up = progress
+            .wallet
+            .as_ref()
+            .is_none_or(|wallet| *wallet == progress.execution);
+        let ready = progress.minimum_chainwork_reached
+            && chain_caught_up
+            && explorer_caught_up
+            && wallet_caught_up;
+        let phase = if !progress.minimum_chainwork_reached {
+            "ibd"
+        } else if !chain_caught_up {
+            "syncing_blocks"
+        } else if !explorer_caught_up || !wallet_caught_up {
+            "reconciling"
+        } else if progress.independently_validated {
+            "ready"
+        } else {
+            "assumed_ready"
+        };
+        NodeStatusResponse {
+            network: progress.network,
+            phase,
+            ready,
+            session_uptime_seconds: self.started.elapsed().as_secs(),
+            header: progress.header,
+            execution: progress.execution,
+            explorer: progress.explorer,
+            wallet: progress.wallet,
+            trust: NodeTrustResponse {
+                minimum_chainwork_reached: progress.minimum_chainwork_reached,
+                active_assume_valid_height: progress.active_assume_valid_height,
+                full_script_validation: progress.full_script_validation,
+                independently_validated: progress.independently_validated,
+            },
+            utxo_hot: progress.utxo_hot,
+            utxo_cold: progress.utxo_cold,
+            ledger_segments: progress.ledger_segments,
+            ledger_blocks: progress.ledger_blocks,
+            ledger_bytes: progress.ledger_bytes,
+            ledger_first_height: progress.ledger_first_height,
+            ledger_tip_height: progress.ledger_tip_height,
+        }
+    }
+}
+
+fn node_status_router(status: NodeStatus) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/status", axum::routing::get(node_status))
+        .route("/api/v1/ready", axum::routing::get(node_ready))
+        .route("/metrics", axum::routing::get(node_metrics))
+        .with_state(status)
+}
+
+async fn node_status(
+    axum::extract::State(status): axum::extract::State<NodeStatus>,
+) -> (
+    [(axum::http::HeaderName, &'static str); 1],
+    axum::Json<NodeStatusResponse>,
+) {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(status.response()),
+    )
+}
+
+async fn node_ready(
+    axum::extract::State(status): axum::extract::State<NodeStatus>,
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    axum::Json<NodeStatusResponse>,
+) {
+    let response = status.response();
+    let code = if response.ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(response),
+    )
+}
+
+async fn node_metrics(
+    axum::extract::State(status): axum::extract::State<NodeStatus>,
+) -> ([(axum::http::HeaderName, &'static str); 2], String) {
+    let status = status.response();
+    let ready = u8::from(status.ready);
+    let minimum_chainwork = u8::from(status.trust.minimum_chainwork_reached);
+    let independently_validated = u8::from(status.trust.independently_validated);
+    let wallet_enabled = u8::from(status.wallet.is_some());
+    let wallet_height = status.wallet.as_ref().map_or(0, |tip| tip.height);
+    let ledger_first_height = status.ledger_first_height.unwrap_or(0);
+    let ledger_tip_height = status.ledger_tip_height.unwrap_or(0);
+    let execution_lag = status.header.height.saturating_sub(status.execution.height);
+    let explorer_lag = status
+        .execution
+        .height
+        .saturating_sub(status.explorer.height);
+    let utxo_total = status.utxo_hot.saturating_add(status.utxo_cold);
+    let body = format!(
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        status.network,
+        status.phase,
+        status.header.height,
+        status.execution.height,
+        status.explorer.height,
+        status.utxo_hot,
+        status.utxo_cold,
+        status.ledger_segments,
+        status.ledger_blocks,
+        status.ledger_bytes,
+        status.session_uptime_seconds,
+    );
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+}
+
 fn validation_status_router(status: BackgroundValidationStatus) -> axum::Router {
     axum::Router::new()
         .route("/api/v1/validation", axum::routing::get(validation_status))
@@ -402,6 +610,7 @@ impl ApiServer {
         address: SocketAddr,
         index: Arc<RedbExplorerIndex>,
         explorer_events: ExplorerEventHub,
+        node_status: NodeStatus,
         wallet: Option<&WalletApiRuntime>,
         background_validation: Option<&BackgroundValidationStatus>,
     ) -> Result<Self, String> {
@@ -411,7 +620,9 @@ impl ApiServer {
         let bound = listener
             .local_addr()
             .map_err(|error| format!("read explorer address: {error}"))?;
-        let mut router = explorer_router(index).merge(explorer_events_router(explorer_events));
+        let mut router = explorer_router(index)
+            .merge(explorer_events_router(explorer_events))
+            .merge(node_status_router(node_status));
         if let Some(wallet) = wallet {
             router = router.merge(wallet_router(
                 Arc::clone(&wallet.wallet),
@@ -460,6 +671,66 @@ impl Drop for ApiServer {
             task.abort();
         }
     }
+}
+
+fn collect_node_status(
+    network: Network,
+    ibd_policy: IbdPolicy,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    explorer: &RedbExplorerIndex,
+    ledger: &PrunedBlockLedger,
+    wallet: Option<&EmbeddedWallet>,
+) -> Result<NodeStatusProgress, String> {
+    let header = headers.active_tip();
+    let execution = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let explorer = explorer.tip().map_err(|error| error.to_string())?;
+    let wallet = wallet
+        .map(|wallet| wallet.chain_tip().map_err(|error| error.to_string()))
+        .transpose()?;
+    let ibd = ibd_policy
+        .status(headers)
+        .map_err(|error| error.to_string())?;
+    let utxos = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    let ledger = ledger.stats().map_err(|error| error.to_string())?;
+    let independently_validated = chainstate
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .is_none();
+    Ok(NodeStatusProgress {
+        network: network.to_string(),
+        header: NodeTipResponse {
+            height: header.height,
+            hash: header.hash.to_string(),
+        },
+        execution: NodeTipResponse {
+            height: execution.height,
+            hash: execution.hash.to_string(),
+        },
+        explorer: NodeTipResponse {
+            height: explorer.height,
+            hash: explorer.hash.to_string(),
+        },
+        wallet: wallet.map(|tip| NodeTipResponse {
+            height: tip.height,
+            hash: tip.hash.to_string(),
+        }),
+        minimum_chainwork_reached: ibd.minimum_chainwork_reached,
+        active_assume_valid_height: ibd.active_assume_valid_height,
+        full_script_validation: ibd.full_script_validation,
+        independently_validated,
+        utxo_hot: utxos.hot,
+        utxo_cold: utxos.cold,
+        ledger_segments: ledger.segments,
+        ledger_blocks: ledger.blocks,
+        ledger_bytes: ledger.bytes,
+        ledger_first_height: ledger.first_height,
+        ledger_tip_height: ledger.tip_height,
+    })
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1727,12 +1998,32 @@ async fn sync_validating_node(
         RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
             .map_err(|error| error.to_string())?,
     );
-    let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
-    let explorer_events = ExplorerEventHub::new(explorer_tip.height, explorer_tip.hash.to_string());
+    let explorer_events = api_runtime
+        .map(|_| {
+            explorer
+                .tip()
+                .map(|tip| ExplorerEventHub::new(tip.height, tip.hash.to_string()))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let wallet_runtime = api_runtime.and_then(|api| api.wallet.as_ref());
     let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+    let node_status = api_runtime
+        .map(|_| {
+            collect_node_status(
+                network,
+                ibd_policy,
+                &headers,
+                &chainstate,
+                &explorer,
+                &ledger,
+                wallet,
+            )
+            .map(NodeStatus::new)
+        })
+        .transpose()?;
     'resync: loop {
         let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
         if let Some(status) = background_validation {
@@ -1828,7 +2119,7 @@ async fn sync_validating_node(
             &chainstate,
             &ledger,
             &explorer,
-            &explorer_events,
+            explorer_events.as_ref(),
         )
         .await?;
         if let Some(wallet) = wallet_runtime {
@@ -1843,13 +2134,31 @@ async fn sync_validating_node(
             )
             .await?;
         }
+        if let Some(status) = &node_status {
+            status.update(collect_node_status(
+                network,
+                ibd_policy,
+                &headers,
+                &chainstate,
+                &explorer,
+                &ledger,
+                wallet,
+            )?);
+        }
         if api_server.is_none() {
             if let Some(api) = api_runtime {
                 api_server = Some(
                     ApiServer::bind(
                         api.listen,
                         Arc::clone(&explorer),
-                        explorer_events.clone(),
+                        explorer_events
+                            .as_ref()
+                            .expect("API runtime has explorer events")
+                            .clone(),
+                        node_status
+                            .as_ref()
+                            .expect("API runtime has node status")
+                            .clone(),
                         api.wallet.as_ref(),
                         background_validation,
                     )
@@ -1863,6 +2172,17 @@ async fn sync_validating_node(
                 server.ensure_running().await?;
             }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if let Some(status) = &node_status {
+                status.update(collect_node_status(
+                    network,
+                    ibd_policy,
+                    &headers,
+                    &chainstate,
+                    &explorer,
+                    &ledger,
+                    wallet,
+                )?);
+            }
             if let Some(status) = background_validation {
                 status.update_active(tip.height, headers.active_tip().height);
             }
@@ -1936,7 +2256,7 @@ async fn sync_validating_node(
                 &chainstate,
                 &ledger,
                 &explorer,
-                &explorer_events,
+                explorer_events.as_ref(),
                 wallet,
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
@@ -2359,7 +2679,7 @@ async fn reconcile_explorer(
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
-    events: &ExplorerEventHub,
+    events: Option<&ExplorerEventHub>,
 ) -> Result<(), String> {
     let execution_store = chainstate.execution();
     let undo_store = chainstate.undos();
@@ -2509,7 +2829,7 @@ async fn download_execute_batch(
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
-    explorer_events: &ExplorerEventHub,
+    explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
@@ -2672,7 +2992,7 @@ fn validate_downloaded_block(
 
 fn index_validated_block(
     explorer: &RedbExplorerIndex,
-    explorer_events: &ExplorerEventHub,
+    explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
     height: u32,
     block: &Block,
@@ -2698,11 +3018,13 @@ fn index_validated_block(
 }
 
 fn publish_explorer_event(
-    events: &ExplorerEventHub,
+    events: Option<&ExplorerEventHub>,
     kind: ExplorerEventKind,
     tip: rbtc::execution_store::ExecutionTip,
 ) {
-    events.publish(kind, tip.height, tip.hash.to_string());
+    if let Some(events) = events {
+        events.publish(kind, tip.height, tip.hash.to_string());
+    }
 }
 
 async fn request_headers(
@@ -3602,6 +3924,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
@@ -3635,6 +3958,58 @@ mod tests {
         .await
         .unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    fn ready_test_node_status(genesis: BlockHash) -> NodeStatus {
+        let tip = NodeTipResponse {
+            height: 0,
+            hash: genesis.to_string(),
+        };
+        NodeStatus::new(NodeStatusProgress {
+            network: Network::Regtest.to_string(),
+            header: tip.clone(),
+            execution: tip.clone(),
+            explorer: tip.clone(),
+            wallet: Some(tip),
+            minimum_chainwork_reached: true,
+            active_assume_valid_height: None,
+            full_script_validation: true,
+            independently_validated: true,
+            utxo_hot: 1,
+            utxo_cold: 2,
+            ledger_segments: 0,
+            ledger_blocks: 0,
+            ledger_bytes: 0,
+            ledger_first_height: None,
+            ledger_tip_height: None,
+        })
+    }
+
+    async fn assert_node_observability(address: SocketAddr) {
+        let response = http_request(
+            address,
+            b"GET /api/v1/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("cache-control: no-store"));
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let status: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(status["phase"], "ready");
+        assert_eq!(status["utxo_hot"], 1);
+        assert_eq!(status["utxo_cold"], 2);
+        assert_eq!(status["trust"]["independently_validated"], true);
+
+        let response = http_request(
+            address,
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-type: text/plain; version=0.0.4; charset=utf-8"));
+        assert!(response.contains("cache-control: no-store"));
+        assert!(response.contains("rbtc_ready 1"));
+        assert!(response.contains("rbtc_utxos{tier=\"total\"} 3"));
     }
 
     fn write_owner_only(path: &std::path::Path, contents: &str) {
@@ -4503,6 +4878,92 @@ mod tests {
     }
 
     #[test]
+    fn node_readiness_requires_work_and_projection_consistency() {
+        let hash = BlockHash::from_byte_array([9; 32]).to_string();
+        let tip = NodeTipResponse {
+            height: 10,
+            hash: hash.clone(),
+        };
+        let mut progress = NodeStatusProgress {
+            network: Network::Regtest.to_string(),
+            header: tip.clone(),
+            execution: tip.clone(),
+            explorer: tip.clone(),
+            wallet: Some(tip.clone()),
+            minimum_chainwork_reached: true,
+            active_assume_valid_height: None,
+            full_script_validation: true,
+            independently_validated: true,
+            utxo_hot: 4,
+            utxo_cold: 6,
+            ledger_segments: 1,
+            ledger_blocks: 10,
+            ledger_bytes: 1_024,
+            ledger_first_height: Some(1),
+            ledger_tip_height: Some(10),
+        };
+        let status = NodeStatus::new(progress.clone());
+        assert!(status.response().ready);
+        assert_eq!(status.response().phase, "ready");
+
+        progress.header.height = 11;
+        status.update(progress.clone());
+        assert!(!status.response().ready);
+        assert_eq!(status.response().phase, "syncing_blocks");
+
+        progress.execution = progress.header.clone();
+        status.update(progress.clone());
+        assert_eq!(status.response().phase, "reconciling");
+
+        progress.explorer = progress.execution.clone();
+        progress.wallet = Some(progress.execution.clone());
+        progress.independently_validated = false;
+        status.update(progress.clone());
+        assert!(status.response().ready);
+        assert_eq!(status.response().phase, "assumed_ready");
+
+        progress.minimum_chainwork_reached = false;
+        status.update(progress);
+        assert!(!status.response().ready);
+        assert_eq!(status.response().phase, "ibd");
+    }
+
+    #[tokio::test]
+    async fn readiness_route_returns_service_unavailable_during_ibd() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let status = ready_test_node_status(genesis);
+        let mut progress = status
+            .progress
+            .lock()
+            .expect("node status lock not poisoned")
+            .clone();
+        progress.minimum_chainwork_reached = false;
+        status.update(progress);
+        let response = node_status_router(status)
+            .oneshot(
+                axum::http::Request::get("/api/v1/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["phase"], "ibd");
+        assert_eq!(status["ready"], false);
+    }
+
+    #[test]
     fn validation_cleanup_refuses_unknown_files_without_renaming_directory() {
         let directory = TempDir::new().unwrap();
         let active_dir = directory.path().join("active");
@@ -5162,10 +5623,12 @@ mod tests {
         );
         validation.update_active(12, 12);
         validation.update_validation(4);
+        let node_status = ready_test_node_status(genesis);
         let server = ApiServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             index,
             ExplorerEventHub::new(0, genesis.to_string()),
+            node_status,
             Some(&wallet),
             Some(&validation),
         )
@@ -5194,6 +5657,8 @@ mod tests {
         assert!(response.contains(r#""sequence":0"#));
         assert!(response.contains(r#""kind":"snapshot""#));
         assert!(response.contains(&event_marker));
+
+        assert_node_observability(server.address()).await;
 
         let response = http_request(
             server.address(),

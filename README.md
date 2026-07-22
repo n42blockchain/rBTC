@@ -53,6 +53,8 @@ The lower-level two-step interface remains available: build with `rbtcd --data-d
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 
 - `GET /api/v1/health`
+- `GET /api/v1/status` (dynamic node/projection/storage state)
+- `GET /api/v1/ready` (deployment readiness gate)
 - `GET /api/v1/events` (SSE persistent explorer-tip changes)
 - `GET /api/v1/validation` (present during background AssumeUTXO operation)
 - `GET /api/v1/blocks/{height}`
@@ -63,7 +65,10 @@ The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 - `GET /api/v1/wallet/transactions?offset=0&limit=50` (maximum page size 100 and offset 10,000)
 - `GET /api/v1/wallet/utxos?offset=0&limit=50` (maximum page size 100 and offset 10,000)
 - `POST /api/v1/wallet/address`
+- `GET /metrics` (Prometheus text exposition)
 
 The embedded page opens the SSE feed and displays the live persistent explorer tip. Every client first receives a `tip` snapshot, followed only by changes committed to `explorer.redb`: `connected`, `disconnected`, or snapshot-aware `rebased`. The broadcast ring is globally bounded at 128 events and 64 simultaneous streams. A client that falls behind receives `resync` with the missed count and must reconnect or reload its REST state; 15-second SSE comments keep idle intermediaries from silently expiring the stream.
+
+`/api/v1/health` is a process-liveness check. `/api/v1/ready` returns 503 during IBD, block catch-up, or explorer/wallet reconciliation, and 200 only when header, execution, explorer, and optional wallet tips agree and the configured minimum chainwork is reached. `/api/v1/status` returns the same decision with hashes, phase, AssumeUTXO independence, hot/cold UTXO counts, and compressed ledger footprint. `/metrics` exposes those bounded counters and gauges without reading archive payloads. Dynamic status and metric responses use `Cache-Control: no-store`; all routes remain loopback-only.
 
 The wallet router accepts public descriptors only. BDK changesets are committed transactionally to an owner-only SQLite file before a derived address is returned; a separate monotonically increasing issuance cursor is reserved first so a crash can skip an address but cannot return it twice. Startup rejects a network or descriptor mismatch. Descriptor import supports a bounded `gap_limit` (default 20, maximum 1,000) on both receive and change keychains and an optional `birthday_height` (default 0). It repeatedly replays only fully validated blocks until the unused-script window converges, records the earliest completed scan boundary only after success, and uses sparse validated checkpoints to avoid fetching raw blocks before the birthday. Lowering a birthday or extending the discovered window triggers a durable rescan from the retained ledger or a full-history peer. On reorg, the wallet rewinds to the execution chain's common ancestor before replay. Authenticated status, balance, canonical transaction history, current UTXO, and address routes expose the projection with bounded pagination; fees are returned only when BDK knows every input amount. The daemon mounts these watch-only routes only when both `--wallet-descriptors PATH` and `--wallet-auth-token-file PATH` accompany a loopback `--explorer-listen`. Both input files must be regular, bounded, and owner-only on Unix. The descriptor JSON keys are `receive_descriptor`, `change_descriptor`, optional `gap_limit`, and optional `birthday_height`; the token is 32-256 printable ASCII bytes and is sent as `Authorization: Bearer TOKEN`. Wallet responses use `Cache-Control: no-store`; address revelation permits a burst of 20 requests and refills one request per minute. The token and descriptors are never accepted directly on the command line or printed. Private descriptors, signing, transaction construction, and broadcast remain disabled until encrypted secret storage and their additional policy/audit gates are complete.

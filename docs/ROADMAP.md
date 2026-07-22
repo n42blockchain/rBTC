@@ -40,6 +40,7 @@
 
 ## Phase 3 — performance and release
 
+- [x] Loopback deployment observability: separate liveness/readiness, phase-aware height/hash consistency across header/execution/explorer/wallet state, AssumeUTXO trust visibility, hot/cold UTXO and circular-ledger footprint status, and bounded Prometheus exposition.
 - [ ] Benchmark IBD, UTXO lookup/mutation, snapshot import/export, compaction, and compression on NVMe and HDD; publish reproducible benchmark fixtures.
 - [ ] Complete storage benchmarks on target NVMe and HDD. A deterministic release fixture now compares redb quick-repair on/off with the optional durable MDBX UTXO backend; simulated disk-full, repeated SIGKILL/reopen, transaction abort, and truncated-copy gates enforce old-or-new atomic state. MDBX cannot become selectable production chainstate until it atomically includes undo and execution metadata and passes the same crash matrix.
 - [ ] CI gates: format, clippy, test, LCOV generation (implemented), a coverage threshold based on the completed validation corpus, Miri where applicable, sanitizers, fuzz regression, dependency/license/security audit, SBOM, reproducible release builds, and signed artifacts.

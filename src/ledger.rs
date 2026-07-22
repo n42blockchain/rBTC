@@ -37,6 +37,21 @@ pub struct LedgerRetention {
     pub slots: u16,
 }
 
+/// Current durable footprint of the live circular-ledger index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LedgerStats {
+    /// Number of immutable archive segments in the live index.
+    pub segments: u32,
+    /// Number of retrievable blocks across all live segments.
+    pub blocks: u32,
+    /// Compressed bytes occupied by all live segments.
+    pub bytes: u64,
+    /// Oldest retained block height, if the ledger is non-empty.
+    pub first_height: Option<u32>,
+    /// Newest retained block height, if the ledger is non-empty.
+    pub tip_height: Option<u32>,
+}
+
 impl Default for LedgerRetention {
     fn default() -> Self {
         Self {
@@ -301,6 +316,34 @@ impl PrunedBlockLedger {
             .last()
             .map(segment_end_inclusive)
             .transpose()
+    }
+
+    /// Returns bounded live-index counts without reading archive payloads.
+    pub fn stats(&self) -> Result<LedgerStats, LedgerError> {
+        let _guard = self.lock();
+        let index = self.read_index()?;
+        let mut blocks = 0_u32;
+        let mut bytes = 0_u64;
+        for segment in &index.segments {
+            blocks = blocks
+                .checked_add(segment.block_count)
+                .ok_or(LedgerError::Invalid("retained block count overflow"))?;
+            bytes = bytes
+                .checked_add(segment.bytes)
+                .ok_or(LedgerError::Invalid("retained byte count overflow"))?;
+        }
+        Ok(LedgerStats {
+            segments: u32::try_from(index.segments.len())
+                .map_err(|_| LedgerError::Invalid("retained segment count overflow"))?,
+            blocks,
+            bytes,
+            first_height: index.segments.first().map(|segment| segment.first_height),
+            tip_height: index
+                .segments
+                .last()
+                .map(segment_end_inclusive)
+                .transpose()?,
+        })
     }
 
     /// Reads one consensus-serialized block by height when it is retained.
@@ -653,6 +696,12 @@ mod tests {
             ledger.retained_ranges().unwrap(),
             vec![(11, 11), (12, 12), (13, 13)]
         );
+        let stats = ledger.stats().unwrap();
+        assert_eq!(stats.segments, 3);
+        assert_eq!(stats.blocks, 3);
+        assert!(stats.bytes > 0);
+        assert_eq!(stats.first_height, Some(11));
+        assert_eq!(stats.tip_height, Some(13));
     }
 
     #[test]
