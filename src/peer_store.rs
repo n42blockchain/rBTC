@@ -19,6 +19,8 @@ const ADDRESS_TIME_PENALTY_SECS: u32 = 2 * 60 * 60;
 const BAD_TIMESTAMP_REPLACEMENT_AGE_SECS: u32 = 5 * 24 * 60 * 60;
 const MAX_FUTURE_SECS: u32 = 10 * 60;
 const MIN_REASONABLE_TIMESTAMP: u32 = 100_000_000;
+const INITIAL_RETRY_BACKOFF_SECS: u32 = 60;
+const MAX_RETRY_BACKOFF_SECS: u32 = 6 * 60 * 60;
 
 /// Peer-address persistence failures.
 #[derive(Debug, Error)]
@@ -54,6 +56,12 @@ struct StoredPeer {
     services: u64,
     last_seen: u32,
     source_group: String,
+    #[serde(default)]
+    last_attempt: u32,
+    #[serde(default)]
+    last_success: u32,
+    #[serde(default)]
+    consecutive_failures: u8,
 }
 
 /// Result counters for one learned-address batch.
@@ -144,12 +152,27 @@ impl RedbPeerStore {
             if existing.is_none() {
                 group_count += 1;
             }
+            let (source_group, last_attempt, last_success, consecutive_failures) = existing
+                .map_or_else(
+                    || (group.clone(), 0, 0, 0),
+                    |record| {
+                        (
+                            record.source_group.clone(),
+                            record.last_attempt,
+                            record.last_success,
+                            record.consecutive_failures,
+                        )
+                    },
+                );
             records.insert(
                 key,
                 StoredPeer {
                     services: address.services.to_u64(),
                     last_seen,
-                    source_group: group.clone(),
+                    source_group,
+                    last_attempt,
+                    last_success,
+                    consecutive_failures,
                 },
             );
             stats.accepted += 1;
@@ -177,13 +200,49 @@ impl RedbPeerStore {
                 let services = ServiceFlags::from(record.services);
                 (services.has(required)
                     && acceptable_ip(socket.ip(), self.network)
-                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS)
-                    .then_some((record.last_seen, socket))
+                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
+                    && retry_ready(&record, now))
+                .then_some((
+                    record.consecutive_failures,
+                    std::cmp::Reverse(record.last_success),
+                    std::cmp::Reverse(record.last_seen),
+                    socket,
+                ))
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by_key(|(last_seen, _)| std::cmp::Reverse(*last_seen));
+        candidates.sort_unstable_by_key(|candidate| *candidate);
         candidates.truncate(limit.min(MAX_STORED_PEERS));
-        Ok(candidates.into_iter().map(|(_, socket)| socket).collect())
+        Ok(candidates
+            .into_iter()
+            .map(|(_, _, _, socket)| socket)
+            .collect())
+    }
+
+    /// Durably records a connection attempt before network I/O starts.
+    ///
+    /// The failure count is incremented up front so a process crash cannot
+    /// cause the same learned address to be retried immediately on restart.
+    pub fn record_attempt(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_existing(address, |record| {
+            record.last_attempt = now;
+            record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        })
+    }
+
+    /// Records a successful full-history+witness handshake and clears backoff.
+    pub fn record_success(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_existing(address, |record| {
+            record.last_success = now;
+            record.consecutive_failures = 0;
+        })
     }
 
     /// Returns the number of persisted records.
@@ -194,6 +253,22 @@ impl RedbPeerStore {
     /// Returns whether the store contains no peer records.
     pub fn is_empty(&self) -> Result<bool, PeerStoreError> {
         Ok(self.len()? == 0)
+    }
+
+    fn update_existing(
+        &self,
+        address: std::net::SocketAddr,
+        update: impl FnOnce(&mut StoredPeer),
+    ) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_records()?;
+        let Some(record) = records.get_mut(&address.to_string()) else {
+            return Ok(false);
+        };
+        update(record);
+        let records = records.into_iter().collect::<Vec<_>>();
+        self.replace_all(&records)?;
+        Ok(true)
     }
 
     fn load_records(&self) -> Result<HashMap<String, StoredPeer>, PeerStoreError> {
@@ -241,6 +316,17 @@ fn normalize_last_seen(last_seen: u32, now: u32) -> u32 {
         now.saturating_sub(BAD_TIMESTAMP_REPLACEMENT_AGE_SECS)
     };
     normalized.saturating_sub(ADDRESS_TIME_PENALTY_SECS)
+}
+
+fn retry_ready(record: &StoredPeer, now: u32) -> bool {
+    if record.consecutive_failures == 0 {
+        return true;
+    }
+    let exponent = u32::from(record.consecutive_failures.saturating_sub(1)).min(9);
+    let delay = INITIAL_RETRY_BACKOFF_SECS
+        .saturating_mul(1_u32 << exponent)
+        .min(MAX_RETRY_BACKOFF_SECS);
+    now.saturating_sub(record.last_attempt) >= delay
 }
 
 fn source_group(ip: IpAddr) -> String {
@@ -384,5 +470,103 @@ mod tests {
             IpAddr::V6("::ffff:1.1.1.1".parse().unwrap()),
             Network::Bitcoin
         ));
+    }
+
+    #[test]
+    fn persists_exponential_retry_backoff_and_resets_it_after_success() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let now = 1_800_000_000;
+        let address = "127.0.0.1:18444".parse().unwrap();
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        store
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[learned("127.0.0.1:18444", services, now)],
+                now,
+            )
+            .unwrap();
+
+        assert!(store.record_attempt(address, now).unwrap());
+        assert!(store.candidates(now + 59, 16).unwrap().is_empty());
+        assert_eq!(store.candidates(now + 60, 16).unwrap(), vec![address]);
+        assert!(store.record_attempt(address, now + 60).unwrap());
+        store
+            .insert_discovered(
+                "127.1.0.2:18444".parse().unwrap(),
+                &[learned("127.0.0.1:18444", services, now + 61)],
+                now + 61,
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_records().unwrap()[&address.to_string()].source_group,
+            "v4:127:0"
+        );
+        assert!(store.candidates(now + 179, 16).unwrap().is_empty());
+        drop(store);
+
+        let reopened = RedbPeerStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(reopened.candidates(now + 180, 16).unwrap(), vec![address]);
+        assert!(reopened.record_success(address, now + 61).unwrap());
+        assert_eq!(reopened.candidates(now + 61, 16).unwrap(), vec![address]);
+        let unproven = "127.0.0.3:18444".parse().unwrap();
+        reopened
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[learned("127.0.0.3:18444", services, now + 62)],
+                now + 62,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.candidates(now + 62, 16).unwrap(),
+            vec![address, unproven]
+        );
+        assert!(
+            !reopened
+                .record_attempt("127.0.0.9:18444".parse().unwrap(), now)
+                .unwrap()
+        );
+
+        let maximally_failed = StoredPeer {
+            services: services.to_u64(),
+            last_seen: now,
+            source_group: "v4:127:0".to_owned(),
+            last_attempt: now,
+            last_success: 0,
+            consecutive_failures: u8::MAX,
+        };
+        assert!(!retry_ready(
+            &maximally_failed,
+            now + MAX_RETRY_BACKOFF_SECS - 1
+        ));
+        assert!(retry_ready(&maximally_failed, now + MAX_RETRY_BACKOFF_SECS));
+    }
+
+    #[test]
+    fn loads_records_written_before_attempt_history_fields_existed() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let address = "127.0.0.1:18444";
+        let services = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "services": services,
+            "last_seen": now,
+            "source_group": "v4:127:0"
+        }))
+        .unwrap();
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(PEERS).unwrap();
+            table.insert(address, legacy.as_slice()).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let socket = address.parse().unwrap();
+        assert_eq!(store.candidates(now, 16).unwrap(), vec![socket]);
+        assert!(store.record_attempt(socket, now).unwrap());
+        assert!(store.candidates(now, 16).unwrap().is_empty());
     }
 }

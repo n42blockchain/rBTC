@@ -181,6 +181,7 @@ async fn run_with_peer(
     local_nonce: u64,
     peer_store: Option<&RedbPeerStore>,
 ) -> Result<(), String> {
+    record_peer_attempt(peer_store, remote);
     let mut session = timeout(
         PEER_TIMEOUT,
         connect_outbound(
@@ -236,6 +237,7 @@ async fn run_with_peer(
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
         if let Some(store) = peer_store {
+            record_peer_success(store, remote);
             discover_peer_addresses(&mut session, store, remote).await;
         }
         return sync_validating_node(
@@ -271,6 +273,35 @@ async fn run_with_peer(
         headers.len()
     );
     Ok(())
+}
+
+fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+    let Some(store) = store else {
+        return;
+    };
+    let now = match unix_time() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("peer attempt history for {remote} skipped: {error}");
+            return;
+        }
+    };
+    if let Err(error) = store.record_attempt(remote, now) {
+        eprintln!("peer attempt history for {remote} failed: {error}");
+    }
+}
+
+fn record_peer_success(store: &RedbPeerStore, remote: SocketAddr) {
+    let now = match unix_time() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("peer success history for {remote} skipped: {error}");
+            return;
+        }
+    };
+    if let Err(error) = store.record_success(remote, now) {
+        eprintln!("peer success history for {remote} failed: {error}");
+    }
 }
 
 async fn discover_peer_addresses(
@@ -1134,7 +1165,7 @@ mod tests {
         chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
-        p2p::V1Transport,
+        p2p::{PeerAddress, V1Transport},
         utxo::{OutPointKey, UtxoStore},
     };
     use tempfile::TempDir;
@@ -1621,6 +1652,77 @@ mod tests {
                 .active_tip()
                 .hash,
             child_hash
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_uses_persisted_fallback_and_cools_failed_learned_peer() {
+        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_remote = live_listener.local_addr().unwrap();
+        let explicit_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let explicit_remote = explicit_listener.local_addr().unwrap();
+        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_remote = failed_listener.local_addr().unwrap();
+        drop(explicit_listener);
+        drop(failed_listener);
+
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(live_listener, peer_version(25)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(Vec::new()))
+                    .await
+                    .unwrap(),
+                message => panic!("expected learned-peer getheaders, got {message:?}"),
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        let now = unix_time().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        store
+            .insert_discovered(
+                "127.0.0.10:18444".parse().unwrap(),
+                &[
+                    PeerAddress {
+                        socket: failed_remote,
+                        services,
+                        last_seen: now,
+                    },
+                    PeerAddress {
+                        socket: live_remote,
+                        services,
+                        last_seen: now.saturating_sub(1),
+                    },
+                ],
+                now,
+            )
+            .unwrap();
+        drop(store);
+
+        run(Options {
+            remotes: vec![explicit_remote],
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let reopened =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert_eq!(
+            reopened.candidates(unix_time().unwrap(), 16).unwrap(),
+            vec![live_remote]
         );
     }
 
