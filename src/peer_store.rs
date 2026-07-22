@@ -120,8 +120,7 @@ impl RedbPeerStore {
         records.retain(|address, record| {
             std::net::SocketAddr::from_str(address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
-                    && acceptable_ip(socket.ip(), self.network)
-                    && socket.port() != 0
+                    && is_acceptable_peer_address(socket, self.network)
                     && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
             })
         });
@@ -138,8 +137,7 @@ impl RedbPeerStore {
             let key = address.socket.to_string();
             let existing = records.get(&key);
             if !address.services.has(required)
-                || !acceptable_ip(address.socket.ip(), self.network)
-                || address.socket.port() == 0
+                || !is_acceptable_peer_address(address.socket, self.network)
             {
                 stats.rejected += 1;
                 continue;
@@ -191,6 +189,29 @@ impl RedbPeerStore {
         Ok(stats)
     }
 
+    /// Persists a peer whose advertised services were verified by a successful handshake.
+    ///
+    /// Unlike learned addresses, a verified peer is immediately marked successful so a
+    /// restart can use it without inheriting a stale retry delay.
+    pub fn insert_verified(
+        &self,
+        address: std::net::SocketAddr,
+        services: ServiceFlags,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let stats = self.insert_discovered(
+            address,
+            &[PeerAddress {
+                socket: address,
+                services,
+                last_seen: now,
+            }],
+            now,
+        )?;
+        let existed = self.record_success(address, now)?;
+        Ok(stats.accepted > 0 || existed)
+    }
+
     /// Returns fresh full-history+witness candidates, newest first.
     pub fn candidates(
         &self,
@@ -205,7 +226,7 @@ impl RedbPeerStore {
                 let socket = std::net::SocketAddr::from_str(&address).ok()?;
                 let services = ServiceFlags::from(record.services);
                 (services.has(required)
-                    && acceptable_ip(socket.ip(), self.network)
+                    && is_acceptable_peer_address(socket, self.network)
                     && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
                     && retry_ready(&record, now))
                 .then_some((peer_priority(&record), socket))
@@ -395,6 +416,14 @@ fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
     }
 }
 
+/// Returns whether a resolved socket is eligible for outbound use on `network`.
+///
+/// Public networks exclude local, private, documentation, transition, multicast, and other
+/// reserved ranges. Regtest deliberately permits local addresses for isolated test networks.
+pub fn is_acceptable_peer_address(address: std::net::SocketAddr, network: Network) -> bool {
+    address.port() != 0 && acceptable_ip(address.ip(), network)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +474,40 @@ mod tests {
             RedbPeerStore::open(path, Network::Bitcoin),
             Err(PeerStoreError::NetworkMismatch)
         ));
+    }
+
+    #[test]
+    fn verified_peers_are_immediately_persisted_and_service_filtered() {
+        let directory = TempDir::new().unwrap();
+        let now = 1_800_000_000;
+        let address = "127.0.0.1:18444".parse().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(
+            !store
+                .insert_verified(address, ServiceFlags::NETWORK, now)
+                .unwrap()
+        );
+        assert!(store.is_empty().unwrap());
+        assert!(
+            store
+                .insert_verified(address, ServiceFlags::NETWORK | ServiceFlags::WITNESS, now,)
+                .unwrap()
+        );
+        assert_eq!(store.candidates(now, 16).unwrap(), vec![address]);
+
+        let public =
+            RedbPeerStore::open(directory.path().join("public.redb"), Network::Bitcoin).unwrap();
+        assert!(
+            !public
+                .insert_verified(
+                    "10.0.0.1:8333".parse().unwrap(),
+                    ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    now,
+                )
+                .unwrap()
+        );
+        assert!(public.is_empty().unwrap());
     }
 
     #[test]

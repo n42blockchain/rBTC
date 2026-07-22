@@ -1,9 +1,10 @@
 //! Command line entry point for the rBTC node daemon.
 
 use std::{
+    collections::HashSet,
     env, fs,
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     process,
     str::FromStr,
@@ -29,7 +30,7 @@ use rbtc::{
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
-    peer_store::RedbPeerStore,
+    peer_store::{RedbPeerStore, is_acceptable_peer_address},
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
     wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
@@ -38,8 +39,11 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
+const MAX_DNS_SEEDS: usize = 16;
+const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
 const MAX_WALLET_SCAN_PASSES: usize = 64;
@@ -50,6 +54,8 @@ const fn supports_block_execution(network: Network) -> bool {
 
 struct Options {
     remotes: Vec<SocketAddr>,
+    /// `None` selects the pinned Core 26 defaults; `Some` is an explicit override.
+    dns_seeds: Option<Vec<DnsSeed>>,
     network: Network,
     fetch_block: Option<BlockHash>,
     headers_db: Option<PathBuf>,
@@ -59,6 +65,12 @@ struct Options {
     wallet_api_files: Option<WalletApiFiles>,
     deployments: DeploymentConfig,
     ibd_policy: IbdPolicy,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DnsSeed {
+    host: String,
+    port: u16,
 }
 
 struct WalletApiFiles {
@@ -311,7 +323,8 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             }
         }
     }
-    let mut failures = Vec::with_capacity(remotes.len());
+    let mut attempted = remotes.iter().copied().collect::<HashSet<_>>();
+    let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS);
     for remote in remotes {
         match run_with_peer(
             &options,
@@ -329,8 +342,48 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             }
         }
     }
+
+    let seeds = selected_dns_seeds(&options);
+    if !seeds.is_empty() && attempted.len() < MAX_CONFIGURED_PEERS {
+        let remaining = MAX_CONFIGURED_PEERS - attempted.len();
+        let (resolved, resolution_failures, rejected) =
+            resolve_dns_candidates(options.network, &seeds, &attempted, remaining).await;
+        for failure in resolution_failures {
+            eprintln!("DNS seed failed: {failure}");
+        }
+        if !resolved.is_empty() || rejected > 0 {
+            println!(
+                "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
+                resolved.len()
+            );
+        }
+        for remote in resolved {
+            attempted.insert(remote);
+            match run_with_peer(
+                &options,
+                remote,
+                local_nonce,
+                peer_store.as_ref(),
+                api_runtime.as_ref(),
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    eprintln!("peer {remote} failed: {error}");
+                    failures.push(format!("{remote}: {error}"));
+                }
+            }
+        }
+    }
+    if attempted.is_empty() {
+        return Err(
+            "no peer candidates available; provide --connect, enable/configure DNS seeds, or retain a verified peer database"
+                .to_owned(),
+        );
+    }
     Err(format!(
-        "all {} configured peers failed: {}",
+        "all {} peer candidates failed: {}",
         failures.len(),
         failures.join("; ")
     ))
@@ -399,7 +452,7 @@ async fn run_with_peer(
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
         if let Some(store) = peer_store {
-            record_peer_success(store, remote);
+            record_verified_peer(store, remote, remote_version.services);
             discover_peer_addresses(&mut session, store, remote).await;
         }
         return sync_validating_node(
@@ -453,7 +506,11 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
     }
 }
 
-fn record_peer_success(store: &RedbPeerStore, remote: SocketAddr) {
+fn record_verified_peer(
+    store: &RedbPeerStore,
+    remote: SocketAddr,
+    services: bitcoin::p2p::ServiceFlags,
+) {
     let now = match unix_time() {
         Ok(now) => now,
         Err(error) => {
@@ -461,8 +518,10 @@ fn record_peer_success(store: &RedbPeerStore, remote: SocketAddr) {
             return;
         }
     };
-    if let Err(error) = store.record_success(remote, now) {
-        eprintln!("peer success history for {remote} failed: {error}");
+    match store.insert_verified(remote, services, now) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("verified peer {remote} was not eligible for persistence"),
+        Err(error) => eprintln!("verified peer persistence for {remote} failed: {error}"),
     }
 }
 
@@ -1367,6 +1426,191 @@ fn unix_time() -> Result<u32, String> {
         .map_err(|_| "system clock does not fit Bitcoin timestamp range".to_owned())
 }
 
+fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {
+    options.dns_seeds.clone().unwrap_or_else(|| {
+        core26_dns_seed_hosts(options.network)
+            .iter()
+            .map(|host| DnsSeed {
+                host: (*host).to_owned(),
+                port: default_p2p_port(options.network),
+            })
+            .collect()
+    })
+}
+
+const fn core26_dns_seed_hosts(network: Network) -> &'static [&'static str] {
+    match network {
+        Network::Bitcoin => &[
+            "seed.bitcoin.sipa.be.",
+            "dnsseed.bluematt.me.",
+            "dnsseed.bitcoin.dashjr.org.",
+            "seed.bitcoinstats.com.",
+            "seed.bitcoin.jonasschnelli.ch.",
+            "seed.btc.petertodd.org.",
+            "seed.bitcoin.sprovoost.nl.",
+            "dnsseed.emzy.de.",
+            "seed.bitcoin.wiz.biz.",
+        ],
+        Network::Testnet => &[
+            "testnet-seed.bitcoin.jonasschnelli.ch.",
+            "seed.tbtc.petertodd.org.",
+            "seed.testnet.bitcoin.sprovoost.nl.",
+            "testnet-seed.bluematt.me.",
+        ],
+        Network::Signet => &["seed.signet.bitcoin.sprovoost.nl.", "178.128.221.177"],
+        // Core 26 predates testnet4. Regtest intentionally has no public bootstrap source.
+        Network::Testnet4 | Network::Regtest => &[],
+    }
+}
+
+const fn default_p2p_port(network: Network) -> u16 {
+    match network {
+        Network::Bitcoin => 8_333,
+        Network::Testnet => 18_333,
+        Network::Testnet4 => 48_333,
+        Network::Signet => 38_333,
+        Network::Regtest => 18_444,
+    }
+}
+
+async fn resolve_dns_candidates(
+    network: Network,
+    seeds: &[DnsSeed],
+    excluded: &HashSet<SocketAddr>,
+    limit: usize,
+) -> (Vec<SocketAddr>, Vec<String>, usize) {
+    let mut lookups = tokio::task::JoinSet::new();
+    let seed_count = seeds.len().min(MAX_DNS_SEEDS);
+    for (index, seed) in seeds.iter().take(MAX_DNS_SEEDS).cloned().enumerate() {
+        lookups.spawn(async move {
+            let host = seed.host;
+            let port = seed.port;
+            let lookup = timeout(
+                DNS_SEED_TIMEOUT,
+                tokio::net::lookup_host((host.as_str(), port)),
+            )
+            .await;
+            let result = match lookup {
+                Ok(Ok(addresses)) => Ok(addresses
+                    .take(MAX_DNS_ADDRESSES_PER_SEED)
+                    .collect::<Vec<_>>()),
+                Ok(Err(error)) => Err(format!("{host}:{port}: {error}")),
+                Err(_) => Err(format!(
+                    "{}:{} timed out after {} seconds",
+                    host,
+                    port,
+                    DNS_SEED_TIMEOUT.as_secs()
+                )),
+            };
+            (index, result)
+        });
+    }
+
+    let mut batches = vec![None; seed_count];
+    let mut failures = Vec::new();
+    while let Some(result) = lookups.join_next().await {
+        match result {
+            Ok((index, Ok(addresses))) => batches[index] = Some(addresses),
+            Ok((_index, Err(error))) => failures.push(error),
+            Err(error) => failures.push(format!("resolver task failed: {error}")),
+        }
+    }
+    let resolved = round_robin_addresses(&batches);
+    let (candidates, rejected) = filter_resolved_peer_addresses(network, resolved, excluded, limit);
+    (candidates, failures, rejected)
+}
+
+fn round_robin_addresses(batches: &[Option<Vec<SocketAddr>>]) -> Vec<SocketAddr> {
+    let capacity = batches
+        .iter()
+        .flatten()
+        .map(|batch| batch.len().min(MAX_DNS_ADDRESSES_PER_SEED))
+        .sum::<usize>();
+    let mut addresses = Vec::with_capacity(capacity);
+    for offset in 0..MAX_DNS_ADDRESSES_PER_SEED {
+        for batch in batches.iter().flatten() {
+            if let Some(address) = batch.get(offset) {
+                addresses.push(*address);
+            }
+        }
+    }
+    addresses
+}
+
+fn filter_resolved_peer_addresses(
+    network: Network,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    excluded: &HashSet<SocketAddr>,
+    limit: usize,
+) -> (Vec<SocketAddr>, usize) {
+    let limit = limit.min(MAX_CONFIGURED_PEERS);
+    let mut selected = Vec::with_capacity(limit);
+    let mut seen = excluded.clone();
+    let mut rejected = 0;
+    for address in resolved {
+        if selected.len() == limit
+            || !is_acceptable_peer_address(address, network)
+            || !seen.insert(address)
+        {
+            rejected += 1;
+        } else {
+            selected.push(address);
+        }
+    }
+    (selected, rejected)
+}
+
+fn parse_dns_seed(value: &str, network: Network) -> Result<DnsSeed, String> {
+    if value.is_empty() || value.trim() != value {
+        return Err(format!("invalid DNS seed: {value}"));
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        if address.port() == 0 {
+            return Err(format!("invalid DNS seed port: {value}"));
+        }
+        return Ok(DnsSeed {
+            host: address.ip().to_string(),
+            port: address.port(),
+        });
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(DnsSeed {
+            host: ip.to_string(),
+            port: default_p2p_port(network),
+        });
+    }
+
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| format!("invalid DNS seed port: {value}"))?;
+            (host, port)
+        }
+        None => (value, default_p2p_port(network)),
+    };
+    let dns_name = host.strip_suffix('.').unwrap_or(host);
+    if port == 0
+        || dns_name.is_empty()
+        || dns_name.len() > 253
+        || !dns_name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(format!("invalid DNS seed: {value}"));
+    }
+    Ok(DnsSeed {
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut args = args.peekable();
@@ -1375,6 +1619,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     }
 
     let mut remotes: Vec<SocketAddr> = Vec::new();
+    let mut dns_seed_values = Vec::new();
+    let mut no_dns_seeds = false;
     let mut network = Network::Bitcoin;
     let mut fetch_block = None;
     let mut headers_db = None;
@@ -1404,6 +1650,18 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     remotes.push(remote);
                 }
             }
+            "--dns-seed" => {
+                let seed = required_option_value(&mut args, "--dns-seed")?;
+                if !dns_seed_values.contains(&seed) {
+                    if dns_seed_values.len() == MAX_DNS_SEEDS {
+                        return Err(format!(
+                            "too many unique --dns-seed values; limit is {MAX_DNS_SEEDS}"
+                        ));
+                    }
+                    dns_seed_values.push(seed);
+                }
+            }
+            "--no-dns-seeds" => no_dns_seeds = true,
             "--network" => {
                 let value = required_option_value(&mut args, "--network")?;
                 network = Network::from_str(&value)
@@ -1471,8 +1729,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         }
     }
 
-    if remotes.is_empty() {
-        return Err("--connect is required".to_owned());
+    if no_dns_seeds && !dns_seed_values.is_empty() {
+        return Err("--dns-seed conflicts with --no-dns-seeds".to_owned());
     }
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
@@ -1516,8 +1774,33 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         minimum_chainwork,
         assume_valid,
     )?;
+    let dns_seeds = if no_dns_seeds {
+        Some(Vec::new())
+    } else if dns_seed_values.is_empty() {
+        None
+    } else {
+        let mut seeds = Vec::with_capacity(dns_seed_values.len());
+        for value in dns_seed_values {
+            let seed = parse_dns_seed(&value, network)?;
+            if !seeds.contains(&seed) {
+                seeds.push(seed);
+            }
+        }
+        Some(seeds)
+    };
+    let has_dns_bootstrap = dns_seeds.as_ref().map_or_else(
+        || !core26_dns_seed_hosts(network).is_empty(),
+        |seeds| !seeds.is_empty(),
+    );
+    if remotes.is_empty() && !has_dns_bootstrap && data_dir.is_none() {
+        return Err(
+            "no peer bootstrap source; provide --connect or --dns-seed (a data directory may reuse verified peers)"
+                .to_owned(),
+        );
+    }
     Ok(Some(Options {
         remotes,
+        dns_seeds,
         network,
         fetch_block,
         headers_db,
@@ -1586,7 +1869,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2027,6 +2310,155 @@ mod tests {
     }
 
     #[test]
+    fn parses_pinned_and_overridden_dns_bootstrap_sources() {
+        let defaults = parse_options(["--network", "bitcoin"].into_iter().map(str::to_owned))
+            .unwrap()
+            .unwrap();
+        let seeds = selected_dns_seeds(&defaults);
+        assert_eq!(seeds.len(), 9);
+        assert!(seeds.iter().all(|seed| seed.port == 8_333));
+        assert_eq!(seeds[0].host, "seed.bitcoin.sipa.be.");
+
+        let custom = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--dns-seed",
+                "LOCALHOST:19000",
+                "--dns-seed",
+                "localhost:19000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            selected_dns_seeds(&custom),
+            vec![DnsSeed {
+                host: "localhost".to_owned(),
+                port: 19_000,
+            }]
+        );
+
+        let persisted_only = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-persisted-peer-bootstrap",
+                "--no-dns-seeds",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(persisted_only.remotes.is_empty());
+        assert!(selected_dns_seeds(&persisted_only).is_empty());
+
+        for arguments in [
+            vec!["--network", "testnet4"],
+            vec!["--network", "regtest", "--no-dns-seeds"],
+            vec![
+                "--connect",
+                "127.0.0.1:18444",
+                "--dns-seed",
+                "localhost",
+                "--no-dns-seeds",
+            ],
+            vec!["--dns-seed", "bad_name.invalid"],
+            vec!["--dns-seed", "localhost:0"],
+        ] {
+            assert!(
+                parse_options(arguments.into_iter().map(str::to_owned)).is_err(),
+                "arguments must be rejected"
+            );
+        }
+
+        let mut excessive = vec!["--network".to_owned(), "regtest".to_owned()];
+        for index in 0..=MAX_DNS_SEEDS {
+            excessive.push("--dns-seed".to_owned());
+            excessive.push(format!("seed{index}.example"));
+        }
+        let Err(error) = parse_options(excessive.into_iter()) else {
+            panic!("the DNS seed bound must be enforced");
+        };
+        assert!(error.contains("too many unique --dns-seed"));
+    }
+
+    #[test]
+    fn filters_dns_results_by_network_deduplication_and_global_bound() {
+        let excluded = HashSet::from(["1.1.1.1:8333".parse().unwrap()]);
+        let (selected, rejected) = filter_resolved_peer_addresses(
+            Network::Bitcoin,
+            [
+                "1.1.1.1:8333".parse().unwrap(),
+                "10.0.0.1:8333".parse().unwrap(),
+                "8.8.8.8:0".parse().unwrap(),
+                "8.8.8.8:8333".parse().unwrap(),
+                "8.8.8.8:8333".parse().unwrap(),
+                "9.9.9.9:8333".parse().unwrap(),
+            ],
+            &excluded,
+            1,
+        );
+        assert_eq!(selected, vec!["8.8.8.8:8333".parse().unwrap()]);
+        assert_eq!(rejected, 5);
+
+        let (regtest, rejected) = filter_resolved_peer_addresses(
+            Network::Regtest,
+            [
+                "127.0.0.1:18444".parse().unwrap(),
+                "0.0.0.0:18444".parse().unwrap(),
+            ],
+            &HashSet::new(),
+            16,
+        );
+        assert_eq!(regtest, vec!["127.0.0.1:18444".parse().unwrap()]);
+        assert_eq!(rejected, 1);
+
+        let interleaved = round_robin_addresses(&[
+            Some(vec![
+                "1.1.1.1:8333".parse().unwrap(),
+                "1.1.1.2:8333".parse().unwrap(),
+            ]),
+            None,
+            Some(vec![
+                "2.2.2.1:8333".parse().unwrap(),
+                "2.2.2.2:8333".parse().unwrap(),
+            ]),
+        ]);
+        assert_eq!(
+            interleaved,
+            [
+                "1.1.1.1:8333",
+                "2.2.2.1:8333",
+                "1.1.1.2:8333",
+                "2.2.2.2:8333",
+            ]
+            .map(|address| address.parse().unwrap())
+        );
+
+        let oversized = Some(
+            (1_u16..=65)
+                .map(|suffix| format!("1.1.1.{suffix}:8333").parse().unwrap())
+                .collect(),
+        );
+        assert_eq!(round_robin_addresses(&[oversized]).len(), 64);
+
+        let public = (1_u16..=32)
+            .map(|suffix| format!("8.8.0.{suffix}:8333").parse().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filter_resolved_peer_addresses(Network::Bitcoin, public, &HashSet::new(), usize::MAX,)
+                .0
+                .len(),
+            MAX_CONFIGURED_PEERS
+        );
+    }
+
+    #[test]
     fn data_dir_execution_network_gate_is_enforced_before_connect() {
         for network in ["regtest", "signet"] {
             let options = parse_options(
@@ -2084,6 +2516,7 @@ mod tests {
 
         let error = run(Options {
             remotes: vec!["127.0.0.1:1".parse().unwrap()],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2123,6 +2556,7 @@ mod tests {
         write_owner_only(&auth_token, &format!("{}\n", "a".repeat(32)));
         let options = Options {
             remotes: vec!["127.0.0.1:1".parse().unwrap()],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2261,6 +2695,7 @@ mod tests {
         let header_path = directory.path().join("headers.redb");
         run(Options {
             remotes: vec![remote],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: Some(header_path.clone()),
@@ -2336,6 +2771,7 @@ mod tests {
 
         run(Options {
             remotes: vec![explicit_remote],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2356,6 +2792,84 @@ mod tests {
             reopened.candidates(unix_time().unwrap(), 16).unwrap(),
             vec![live_remote]
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_falls_back_to_dns_and_reuses_the_verified_peer_without_dns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns_remote = listener.local_addr().unwrap();
+        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failed_explicit = failed_listener.local_addr().unwrap();
+        drop(failed_listener);
+
+        let server = tokio::spawn(async move {
+            for nonce in [31, 32] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+                assert!(matches!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::Version(_)
+                ));
+                peer.write_message(NetworkMessage::Version(peer_version(nonce)))
+                    .await
+                    .unwrap();
+                receive_client_negotiation(&mut peer).await;
+                peer.write_message(NetworkMessage::Verack).await.unwrap();
+                respond_to_getaddr(&mut peer).await;
+                match peer.read_message().await.unwrap().into_payload() {
+                    NetworkMessage::GetHeaders(_) => peer
+                        .write_message(NetworkMessage::Headers(Vec::new()))
+                        .await
+                        .unwrap(),
+                    message => panic!("expected DNS-bootstrap getheaders, got {message:?}"),
+                }
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        run(Options {
+            remotes: vec![failed_explicit],
+            dns_seeds: Some(vec![DnsSeed {
+                host: dns_remote.ip().to_string(),
+                port: dns_remote.port(),
+            }]),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap();
+
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert_eq!(
+            peers.candidates(unix_time().unwrap(), 16).unwrap(),
+            vec![dns_remote]
+        );
+        drop(peers);
+
+        run(Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2449,6 +2963,7 @@ mod tests {
 
         run(Options {
             remotes: vec![remote],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2504,11 +3019,10 @@ mod tests {
         drop(wallet);
         let peers =
             RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
-        assert_eq!(peers.len().unwrap(), 1);
-        assert_eq!(
-            peers.candidates(unix_time().unwrap(), 16).unwrap(),
-            vec!["127.0.0.2:18445".parse().unwrap()]
-        );
+        assert_eq!(peers.len().unwrap(), 2);
+        let candidates = peers.candidates(unix_time().unwrap(), 16).unwrap();
+        assert_eq!(candidates[0], remote);
+        assert!(candidates.contains(&"127.0.0.2:18445".parse().unwrap()));
         drop(peers);
 
         let archived_bytes = serialize(&archived);
@@ -2542,6 +3056,7 @@ mod tests {
         });
         run(Options {
             remotes: vec![recovery_remote],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2603,6 +3118,7 @@ mod tests {
         });
         run(Options {
             remotes: vec![backfill_remote],
+            dns_seeds: None,
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -2694,6 +3210,7 @@ mod tests {
         run_with_nonce(
             Options {
                 remotes: vec![deficient_remote, interrupted_remote, recovery_remote],
+                dns_seeds: None,
                 network: Network::Regtest,
                 fetch_block: None,
                 headers_db: None,
@@ -2799,6 +3316,7 @@ mod tests {
         ibd_policy.set_assume_valid("0").unwrap();
         run(Options {
             remotes: vec![remote],
+            dns_seeds: None,
             network: Network::Signet,
             fetch_block: None,
             headers_db: None,
