@@ -76,6 +76,9 @@ pub enum P2pError {
     /// A peer sent a second version message during the initial handshake.
     #[error("duplicate version message during handshake")]
     DuplicateVersion,
+    /// A peer sent `version` after the handshake had completed.
+    #[error("version message received after handshake")]
+    PostHandshakeVersion,
     /// A peer acknowledged the connection before identifying itself.
     #[error("verack received before version during handshake")]
     VerackBeforeVersion,
@@ -344,6 +347,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
+    async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
+        match self.transport.read_message().await?.into_payload() {
+            NetworkMessage::Ping(nonce) => {
+                self.transport
+                    .write_message(NetworkMessage::Pong(nonce))
+                    .await?;
+                Ok(None)
+            }
+            NetworkMessage::Version(_) => Err(P2pError::PostHandshakeVersion),
+            message => Ok(Some(message)),
+        }
+    }
+
     /// Reads the next application message, answering P2P keepalive pings.
     ///
     /// Non-keepalive messages are returned in wire order. A caller that needs
@@ -351,13 +367,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// method so messages unrelated to its request are handled deliberately.
     pub async fn read_message(&mut self) -> Result<NetworkMessage, P2pError> {
         loop {
-            match self.transport.read_message().await?.into_payload() {
-                NetworkMessage::Ping(nonce) => {
-                    self.transport
-                        .write_message(NetworkMessage::Pong(nonce))
-                        .await?;
-                }
-                message => return Ok(message),
+            if let Some(message) = self.read_bounded_response_message().await? {
+                return Ok(message);
             }
         }
     }
@@ -399,8 +410,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// or IPv6 socket addresses are returned once in their original order.
     pub async fn receive_addresses(&mut self) -> Result<Vec<PeerAddress>, P2pError> {
         for _ in 0..MAX_RESPONSE_MESSAGES {
-            match self.read_message().await? {
-                NetworkMessage::Addr(addresses) => {
+            match self.read_bounded_response_message().await? {
+                Some(NetworkMessage::Addr(addresses)) => {
                     if addresses.len() > MAX_ADDRESSES_PER_MESSAGE {
                         return Err(P2pError::TooManyAddresses {
                             count: addresses.len(),
@@ -417,7 +428,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                         },
                     )));
                 }
-                NetworkMessage::AddrV2(addresses) => {
+                Some(NetworkMessage::AddrV2(addresses)) => {
                     if addresses.len() > MAX_ADDRESSES_PER_MESSAGE {
                         return Err(P2pError::TooManyAddresses {
                             count: addresses.len(),
@@ -448,7 +459,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// contextual consensus validation before storage.
     pub async fn receive_headers(&mut self) -> Result<Vec<bitcoin::block::Header>, P2pError> {
         for _ in 0..MAX_RESPONSE_MESSAGES {
-            if let NetworkMessage::Headers(headers) = self.read_message().await? {
+            if let Some(NetworkMessage::Headers(headers)) =
+                self.read_bounded_response_message().await?
+            {
                 if headers.len() > MAX_HEADERS_PER_RESPONSE {
                     return Err(P2pError::TooManyHeaders {
                         count: headers.len(),
@@ -523,9 +536,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             }
         }
         let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
-        for _ in 0..MAX_RESPONSE_MESSAGES.saturating_add(expected.len()) {
-            match self.read_message().await? {
-                NetworkMessage::Block(block) => {
+        for _ in 0..MAX_RESPONSE_MESSAGES {
+            match self.read_bounded_response_message().await? {
+                Some(NetworkMessage::Block(block)) => {
                     let actual = block.block_hash();
                     let Some(position) = positions.remove(&actual) else {
                         return Err(P2pError::UnsolicitedBlock(actual));
@@ -538,7 +551,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                             .collect());
                     }
                 }
-                NetworkMessage::NotFound(inventory) => {
+                Some(NetworkMessage::NotFound(inventory)) => {
                     if let Some(hash) = inventory.iter().find_map(|entry| match entry {
                         Inventory::Block(hash) | Inventory::WitnessBlock(hash)
                             if positions.contains_key(hash) =>
@@ -1122,6 +1135,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keepalive_pings_consume_the_bounded_response_budget() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_headers().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            for nonce in 0..u64::try_from(MAX_RESPONSE_MESSAGES).unwrap() {
+                transport
+                    .write_message(NetworkMessage::Ping(nonce))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    transport.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::Pong(received) if received == nonce
+                ));
+            }
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::HeadersResponseIncomplete)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_wait_uses_the_same_total_frame_budget() {
+        let expected = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_requested_block(expected).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            for nonce in 0..u64::try_from(MAX_RESPONSE_MESSAGES).unwrap() {
+                transport
+                    .write_message(NetworkMessage::Ping(nonce))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    transport.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::Pong(received) if received == nonce
+                ));
+            }
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::BlockResponseIncomplete { requested }) if requested == expected
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_rejects_version_after_handshake() {
+        let (client_stream, server_stream) = duplex(4096);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_headers().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::Version(version(2)))
+                .await
+                .unwrap();
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::PostHandshakeVersion)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn handshake_rejects_obsolete_protocol_versions() {
         let (client_stream, server_stream) = duplex(4096);
         let client = tokio::spawn(async move {
@@ -1240,6 +1341,14 @@ mod tests {
                         .write_message(NetworkMessage::SendHeaders)
                         .await
                         .unwrap();
+                    server
+                        .write_message(NetworkMessage::Ping(42))
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        server.read_message().await.unwrap().into_payload(),
+                        NetworkMessage::Pong(42)
+                    ));
                     server
                         .write_message(NetworkMessage::Headers(Vec::new()))
                         .await

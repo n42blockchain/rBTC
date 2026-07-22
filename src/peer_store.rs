@@ -116,12 +116,20 @@ impl RedbPeerStore {
     ) -> Result<PeerInsertStats, PeerStoreError> {
         let _guard = self.write_guard.lock().expect("peer lock not poisoned");
         let mut records = self.load_records()?;
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        records.retain(|address, record| {
+            std::net::SocketAddr::from_str(address).is_ok_and(|socket| {
+                ServiceFlags::from(record.services).has(required)
+                    && acceptable_ip(socket.ip(), self.network)
+                    && socket.port() != 0
+                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
+            })
+        });
         let group = source_group(source.ip());
         let mut group_count = records
             .values()
             .filter(|record| record.source_group == group)
             .count();
-        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let mut incoming = addresses.to_vec();
         incoming.sort_unstable_by_key(|address| std::cmp::Reverse(address.last_seen));
         let mut stats = PeerInsertStats::default();
@@ -178,9 +186,7 @@ impl RedbPeerStore {
             stats.accepted += 1;
         }
 
-        let mut ordered = records.into_iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(_, record)| std::cmp::Reverse(record.last_seen));
-        ordered.truncate(MAX_STORED_PEERS);
+        let ordered = retain_best(records, MAX_STORED_PEERS);
         self.replace_all(&ordered)?;
         Ok(stats)
     }
@@ -202,20 +208,12 @@ impl RedbPeerStore {
                     && acceptable_ip(socket.ip(), self.network)
                     && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
                     && retry_ready(&record, now))
-                .then_some((
-                    record.consecutive_failures,
-                    std::cmp::Reverse(record.last_success),
-                    std::cmp::Reverse(record.last_seen),
-                    socket,
-                ))
+                .then_some((peer_priority(&record), socket))
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|candidate| *candidate);
         candidates.truncate(limit.min(MAX_STORED_PEERS));
-        Ok(candidates
-            .into_iter()
-            .map(|(_, _, _, socket)| socket)
-            .collect())
+        Ok(candidates.into_iter().map(|(_, socket)| socket).collect())
     }
 
     /// Durably records a connection attempt before network I/O starts.
@@ -327,6 +325,25 @@ fn retry_ready(record: &StoredPeer, now: u32) -> bool {
         .saturating_mul(1_u32 << exponent)
         .min(MAX_RETRY_BACKOFF_SECS);
     now.saturating_sub(record.last_attempt) >= delay
+}
+
+fn peer_priority(record: &StoredPeer) -> (u8, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>) {
+    (
+        record.consecutive_failures,
+        std::cmp::Reverse(record.last_success),
+        std::cmp::Reverse(record.last_seen),
+    )
+}
+
+fn retain_best(records: HashMap<String, StoredPeer>, limit: usize) -> Vec<(String, StoredPeer)> {
+    let mut ordered = records.into_iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by(|(left_address, left), (right_address, right)| {
+        peer_priority(left)
+            .cmp(&peer_priority(right))
+            .then_with(|| left_address.cmp(right_address))
+    });
+    ordered.truncate(limit);
+    ordered
 }
 
 fn source_group(ip: IpAddr) -> String {
@@ -455,6 +472,14 @@ mod tests {
             store.candidates(now, 100).unwrap().len(),
             MAX_PEERS_PER_SOURCE_GROUP
         );
+        store
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[],
+                now + ADDRESS_HORIZON_SECS,
+            )
+            .unwrap();
+        assert!(store.is_empty().unwrap());
     }
 
     #[test]
@@ -568,5 +593,28 @@ mod tests {
         assert_eq!(store.candidates(now, 16).unwrap(), vec![socket]);
         assert!(store.record_attempt(socket, now).unwrap());
         assert!(store.candidates(now, 16).unwrap().is_empty());
+    }
+
+    #[test]
+    fn capacity_retains_successful_and_unfailed_peers_before_failed_ones() {
+        let record = |last_seen, last_success, consecutive_failures| StoredPeer {
+            services: (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64(),
+            last_seen,
+            source_group: "v4:1:1".to_owned(),
+            last_attempt: 0,
+            last_success,
+            consecutive_failures,
+        };
+        let records = HashMap::from([
+            ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),
+            ("2.2.2.2:8333".to_owned(), record(110, 0, 0)),
+            ("3.3.3.3:8333".to_owned(), record(120, 100, 1)),
+        ]);
+
+        let retained = retain_best(records, 2)
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect::<Vec<_>>();
+        assert_eq!(retained, vec!["1.1.1.1:8333", "2.2.2.2:8333"]);
     }
 }
