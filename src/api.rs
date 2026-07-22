@@ -21,7 +21,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::wallet::{EmbeddedWallet, WalletAddress, WalletBalance, WalletUtxo};
+use crate::wallet::{
+    EmbeddedWallet, WalletAddress, WalletBalance, WalletStatus, WalletTransaction, WalletUtxo,
+};
 
 /// Explorer block summary returned by the embedded API.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,6 +80,19 @@ pub struct ExplorerUtxoPage {
 pub struct WalletUtxoPage {
     /// Current unspent wallet outputs.
     pub utxos: Vec<WalletUtxo>,
+    /// Zero-based number of entries skipped.
+    pub offset: u32,
+    /// Requested maximum number of returned entries.
+    pub limit: u32,
+    /// Whether at least one additional entry exists.
+    pub has_more: bool,
+}
+
+/// A bounded page of canonical wallet transactions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WalletTransactionPage {
+    /// Canonical transactions in newest-first order.
+    pub transactions: Vec<WalletTransaction>,
     /// Zero-based number of entries skipped.
     pub offset: u32,
     /// Requested maximum number of returned entries.
@@ -299,7 +314,7 @@ const EXPLORER_HTML: &str = r#"<!doctype html>
 <section><h2>Block height</h2><form data-kind="blocks"><input inputmode="numeric" required placeholder="Height"><button>Search</button></form><pre></pre></section>
 <section><h2>Transaction</h2><form data-kind="tx"><input required placeholder="txid"><button>Search</button></form><pre></pre></section>
 <section><h2>Address UTXOs</h2><form data-kind="address"><input required placeholder="Checked Bitcoin address"><button>Search</button></form><pre></pre></section>
-<section><h2>Watch-only wallet</h2><p class="muted">Optional authenticated wallet; token stays only in this page's memory.</p><form id="wallet"><input type="password" autocomplete="off" required placeholder="Bearer token"><button value="balance">Balance</button><button value="utxos">UTXOs</button><button value="address">New address</button></form><pre></pre></section>
+<section><h2>Watch-only wallet</h2><p class="muted">Optional authenticated wallet; token stays only in this page's memory.</p><form id="wallet"><input type="password" autocomplete="off" required placeholder="Bearer token"><button value="status">Status</button><button value="balance">Balance</button><button value="transactions">Transactions</button><button value="utxos">UTXOs</button><button value="address">New address</button></form><pre></pre></section>
 <script>for(const f of document.querySelectorAll('form[data-kind]'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});const w=document.querySelector('#wallet');w.addEventListener('submit',async e=>{e.preventDefault();const t=w.querySelector('input').value,a=e.submitter.value,o=w.nextElementSibling;o.textContent='Loading…';try{const r=await fetch(`/api/v1/wallet/${a}`,{method:a==='address'?'POST':'GET',headers:{Authorization:`Bearer ${t}`}});o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
 </body></html>"#;
 
@@ -325,7 +340,9 @@ pub fn wallet_router(wallet: Arc<EmbeddedWallet>, token: WalletAuthToken) -> Rou
         address_limiter: Mutex::new(AddressRateLimiter::new()),
     });
     Router::new()
+        .route("/api/v1/wallet/status", get(wallet_status))
         .route("/api/v1/wallet/balance", get(wallet_balance))
+        .route("/api/v1/wallet/transactions", get(wallet_transactions))
         .route("/api/v1/wallet/utxos", get(wallet_utxos))
         .route("/api/v1/wallet/address", post(next_address))
         .with_state(state)
@@ -425,6 +442,32 @@ async fn address_utxos<I: ExplorerIndex>(
 }
 async fn wallet_balance(State(state): State<Arc<WalletApiState>>) -> ApiResult<WalletBalance> {
     state.wallet.balance().map_err(internal).map(Json)
+}
+async fn wallet_status(State(state): State<Arc<WalletApiState>>) -> ApiResult<WalletStatus> {
+    state.wallet.status().map_err(internal).map(Json)
+}
+async fn wallet_transactions(
+    State(state): State<Arc<WalletApiState>>,
+    Query(query): Query<UtxoPageQuery>,
+) -> ApiResult<WalletTransactionPage> {
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(DEFAULT_UTXO_PAGE_SIZE);
+    if offset > MAX_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_UTXO_PAGE_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let limit_usize = usize::try_from(limit).map_err(internal)?;
+    let mut transactions = state
+        .wallet
+        .transactions(offset, limit + 1)
+        .map_err(internal)?;
+    let has_more = transactions.len() > limit_usize;
+    transactions.truncate(limit_usize);
+    Ok(Json(WalletTransactionPage {
+        transactions,
+        offset,
+        limit,
+        has_more,
+    }))
 }
 async fn wallet_utxos(
     State(state): State<Arc<WalletApiState>>,
@@ -699,19 +742,67 @@ mod tests {
         );
         let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
         let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
-        for query in ["limit=0", "limit=101", "offset=10001"] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::get(format!("/api/v1/wallet/utxos?{query}"))
-                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for route in ["utxos", "transactions"] {
+            for query in ["limit=0", "limit=101", "offset=10001"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!("/api/v1/wallet/{route}?{query}"))
+                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_history_and_status_are_authenticated_and_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(
+            EmbeddedWallet::open_or_create(
+                directory.path().join("wallet.sqlite"),
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
+        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
+        let request = |path: &'static str| {
+            Request::get(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let status = app
+            .clone()
+            .oneshot(request("/api/v1/wallet/status"))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), 4096)
+            .await
+            .unwrap();
+        let status: WalletStatus = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.tip_height, 0);
+        assert_eq!(status.issued_receive_addresses, 0);
+
+        let history = app
+            .oneshot(request("/api/v1/wallet/transactions?limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(history.into_body(), 4096)
+            .await
+            .unwrap();
+        let history: WalletTransactionPage = serde_json::from_slice(&body).unwrap();
+        assert!(history.transactions.is_empty());
+        assert!(!history.has_more);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
 
 use bdk_wallet::{
     ChangeSet, KeychainKind, PersistedWallet, Update, Wallet, WalletPersister,
-    chain::BlockId,
+    chain::{BlockId, ChainPosition},
     miniscript::{Descriptor, DescriptorPublicKey},
     rusqlite::{Connection, OptionalExtension, params},
 };
@@ -27,8 +27,8 @@ pub const MAX_WALLET_GAP_LIMIT: u32 = 1_000;
 const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
 const NEXT_RECEIVE_INDEX_KEY: &str = "next_receive_index";
 const SCAN_START_HEIGHT_KEY: &str = "scan_start_height";
-const MAX_WALLET_UTXO_PAGE_OFFSET: u32 = 10_000;
-const MAX_WALLET_UTXO_PAGE_READ: u32 = 101;
+const MAX_WALLET_PAGE_OFFSET: u32 = 10_000;
+const MAX_WALLET_PAGE_READ: u32 = 101;
 
 /// A compact, serializable address response for the embedded wallet API.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -67,6 +67,44 @@ pub struct WalletUtxo {
     pub derivation_index: u32,
     /// Confirmation height, or none for an unconfirmed transaction.
     pub confirmed_height: Option<u32>,
+}
+
+/// A canonical transaction affecting the watch-only wallet.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletTransaction {
+    /// Display-order transaction ID.
+    pub txid: String,
+    /// Value sent from wallet-controlled outputs.
+    pub sent_sats: u64,
+    /// Value received by wallet-controlled outputs.
+    pub received_sats: u64,
+    /// Signed net wallet value change.
+    pub net_sats: i64,
+    /// Transaction fee when every input amount is known.
+    pub fee_sats: Option<u64>,
+    /// Virtual transaction size.
+    pub vbytes: u64,
+    /// Active-chain confirmation height.
+    pub confirmed_height: Option<u32>,
+    /// Confirmation block timestamp.
+    pub confirmation_time: Option<u64>,
+    /// First mempool observation time, when known.
+    pub first_seen: Option<u64>,
+    /// Most recent mempool observation time, when known.
+    pub last_seen: Option<u64>,
+}
+
+/// Durable wallet synchronization metadata.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletStatus {
+    /// Wallet active-chain checkpoint height.
+    pub tip_height: u32,
+    /// Wallet active-chain checkpoint hash.
+    pub tip_hash: String,
+    /// Earliest height covered by a converged descriptor scan.
+    pub scan_start_height: Option<u32>,
+    /// Number of receive indices durably reserved for API issuance.
+    pub issued_receive_addresses: u32,
 }
 
 /// A durable checkpoint in the wallet's view of the validated active chain.
@@ -282,9 +320,7 @@ impl EmbeddedWallet {
 
     /// Returns a bounded slice of current wallet UTXOs.
     pub fn utxos(&self, offset: u32, limit: u32) -> Result<Vec<WalletUtxo>, WalletError> {
-        if offset > MAX_WALLET_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_WALLET_UTXO_PAGE_READ {
-            return Err(WalletError::QueryLimit);
-        }
+        ensure_query_window(offset, limit)?;
         let state = self.state()?;
         Ok(state
             .wallet
@@ -304,6 +340,74 @@ impl EmbeddedWallet {
                 confirmed_height: output.chain_position.confirmation_height_upper_bound(),
             })
             .collect())
+    }
+
+    /// Returns canonical wallet transactions in newest-first order.
+    pub fn transactions(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<WalletTransaction>, WalletError> {
+        ensure_query_window(offset, limit)?;
+        let state = self.state()?;
+        let wallet = &state.wallet;
+        Ok(wallet
+            .transactions_sort_by(|left, right| {
+                right
+                    .chain_position
+                    .cmp(&left.chain_position)
+                    .then_with(|| right.tx_node.txid.cmp(&left.tx_node.txid))
+            })
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|transaction| {
+                let tx = &transaction.tx_node.tx;
+                let (sent, received) = wallet.sent_and_received(tx);
+                let (confirmed_height, confirmation_time, first_seen, last_seen) =
+                    match transaction.chain_position {
+                        ChainPosition::Confirmed { anchor, .. } => (
+                            Some(anchor.block_id.height),
+                            Some(anchor.confirmation_time),
+                            None,
+                            None,
+                        ),
+                        ChainPosition::Unconfirmed {
+                            first_seen,
+                            last_seen,
+                        } => (None, None, first_seen, last_seen),
+                    };
+                let sent_sats = sent.to_sat();
+                let received_sats = received.to_sat();
+                WalletTransaction {
+                    txid: transaction.tx_node.txid.to_string(),
+                    sent_sats,
+                    received_sats,
+                    net_sats: i64::try_from(received_sats).expect("Bitcoin amount fits i64")
+                        - i64::try_from(sent_sats).expect("Bitcoin amount fits i64"),
+                    fee_sats: wallet.calculate_fee(tx).ok().map(bitcoin::Amount::to_sat),
+                    vbytes: u64::try_from(tx.vsize()).unwrap_or(u64::MAX),
+                    confirmed_height,
+                    confirmation_time,
+                    first_seen,
+                    last_seen,
+                }
+            })
+            .collect())
+    }
+
+    /// Returns durable chain, scan, and address-issuance state.
+    pub fn status(&self) -> Result<WalletStatus, WalletError> {
+        let state = self.state()?;
+        let tip = state.wallet.latest_checkpoint().block_id();
+        let issued_receive_addresses = read_metadata_u32(&state.database, NEXT_RECEIVE_INDEX_KEY)?
+            .ok_or_else(|| WalletError::Chain("missing receive issuance cursor".to_owned()))?;
+        Ok(WalletStatus {
+            tip_height: tip.height,
+            tip_hash: tip.hash.to_string(),
+            scan_start_height: read_metadata_u32(&state.database, SCAN_START_HEIGHT_KEY)?,
+            issued_receive_addresses,
+        })
     }
 
     /// Returns the latest persisted validated-chain checkpoint.
@@ -484,6 +588,13 @@ fn read_metadata_u32(database: &Connection, key: &str) -> Result<Option<u32>, Wa
         .transpose()
 }
 
+fn ensure_query_window(offset: u32, limit: u32) -> Result<(), WalletError> {
+    if offset > MAX_WALLET_PAGE_OFFSET || limit == 0 || limit > MAX_WALLET_PAGE_READ {
+        return Err(WalletError::QueryLimit);
+    }
+    Ok(())
+}
+
 fn public_descriptor(
     descriptor: &str,
     keychain: &'static str,
@@ -625,6 +736,21 @@ mod tests {
             assert_eq!(utxos.len(), 1);
             assert_eq!(utxos[0].value_sats, 42_000);
             assert_eq!(utxos[0].confirmed_height, Some(1));
+            let transactions = wallet.transactions(0, 10).unwrap();
+            assert_eq!(transactions.len(), 1);
+            assert_eq!(transactions[0].received_sats, 42_000);
+            assert_eq!(transactions[0].net_sats, 42_000);
+            assert_eq!(transactions[0].confirmed_height, Some(1));
+            assert_eq!(wallet.transactions(1, 10).unwrap(), Vec::new());
+            assert!(matches!(
+                wallet.transactions(0, 0),
+                Err(WalletError::QueryLimit)
+            ));
+            let status = wallet.status().unwrap();
+            assert_eq!(status.tip_height, 1);
+            assert_eq!(status.tip_hash, expected_tip.hash.to_string());
+            assert_eq!(status.scan_start_height, None);
+            assert_eq!(status.issued_receive_addresses, 1);
             (address, block, expected_tip)
         };
 
@@ -671,6 +797,7 @@ mod tests {
             .unwrap();
         assert_eq!(wallet.chain_tip().unwrap().height, 0);
         assert_eq!(wallet.balance().unwrap().immature, 0);
+        assert!(wallet.transactions(0, 10).unwrap().is_empty());
         drop(wallet);
 
         let wallet = EmbeddedWallet::open_or_create(
@@ -749,6 +876,15 @@ mod tests {
         wallet.apply_validated_block(&first, 1).unwrap();
         wallet.apply_validated_block(&second, 2).unwrap();
         assert!(!wallet.ensure_scan_lookahead(30).unwrap());
+        assert_eq!(
+            wallet
+                .transactions(0, 10)
+                .unwrap()
+                .into_iter()
+                .map(|transaction| transaction.confirmed_height)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(1)]
+        );
 
         assert_eq!(wallet.reveal_receive_address().unwrap().index, 0);
         assert_eq!(wallet.reveal_receive_address().unwrap().index, 1);
