@@ -2,6 +2,7 @@
 
 use std::{
     env, fs,
+    io::Read,
     net::SocketAddr,
     path::PathBuf,
     process,
@@ -16,7 +17,7 @@ use bitcoin::{
     hashes::Hash,
 };
 use rbtc::{
-    api::explorer_router,
+    api::{WalletAuthToken, explorer_router, wallet_router},
     block_execution::{connect_active_block, connect_active_blocks, disconnect_execution_tip},
     blockchain::{AppliedBlock, validate_block_structure_with_deployments},
     chain_store::RedbChainStore,
@@ -31,6 +32,7 @@ use rbtc::{
     peer_store::RedbPeerStore,
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
+    wallet::EmbeddedWallet,
 };
 use tokio::time::timeout;
 
@@ -38,6 +40,8 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
+const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
+const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
@@ -51,29 +55,63 @@ struct Options {
     data_dir: Option<PathBuf>,
     once: bool,
     explorer_listen: Option<SocketAddr>,
+    wallet_api_files: Option<WalletApiFiles>,
     deployments: DeploymentConfig,
     ibd_policy: IbdPolicy,
 }
 
-struct ExplorerServer {
+struct WalletApiFiles {
+    descriptors: PathBuf,
+    auth_token: PathBuf,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletDescriptorFile {
+    receive_descriptor: String,
+    change_descriptor: String,
+}
+
+struct WalletApiRuntime {
+    wallet: Arc<EmbeddedWallet>,
+    token: WalletAuthToken,
+}
+
+struct ApiRuntime {
+    listen: SocketAddr,
+    wallet: Option<WalletApiRuntime>,
+}
+
+struct ApiServer {
     #[cfg(test)]
     address: SocketAddr,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
-impl ExplorerServer {
-    async fn bind(address: SocketAddr, index: Arc<RedbExplorerIndex>) -> Result<Self, String> {
+impl ApiServer {
+    async fn bind(
+        address: SocketAddr,
+        index: Arc<RedbExplorerIndex>,
+        wallet: Option<&WalletApiRuntime>,
+    ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .map_err(|error| format!("bind explorer at {address}: {error}"))?;
         let bound = listener
             .local_addr()
             .map_err(|error| format!("read explorer address: {error}"))?;
-        println!("embedded explorer listening on http://{bound}");
+        let mut router = explorer_router(index);
+        if let Some(wallet) = wallet {
+            router = router.merge(wallet_router(
+                Arc::clone(&wallet.wallet),
+                wallet.token.clone(),
+            ));
+        }
+        println!("embedded API listening on http://{bound}");
         let task = tokio::spawn(async move {
-            axum::serve(listener, explorer_router(index))
+            axum::serve(listener, router)
                 .await
-                .map_err(|error| format!("explorer server: {error}"))
+                .map_err(|error| format!("API server: {error}"))
         });
         Ok(Self {
             #[cfg(test)]
@@ -89,7 +127,7 @@ impl ExplorerServer {
 
     async fn ensure_running(&mut self) -> Result<(), String> {
         let Some(task) = self.task.as_ref() else {
-            return Err("explorer server task missing".to_owned());
+            return Err("API server task missing".to_owned());
         };
         if !task.is_finished() {
             return Ok(());
@@ -98,11 +136,11 @@ impl ExplorerServer {
             .take()
             .expect("finished explorer task exists")
             .await
-            .map_err(|error| format!("explorer server task: {error}"))?
+            .map_err(|error| format!("API server task: {error}"))?
     }
 }
 
-impl Drop for ExplorerServer {
+impl Drop for ApiServer {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
@@ -132,11 +170,101 @@ async fn run(options: Options) -> Result<(), String> {
     run_with_nonce(options, rand::random()).await
 }
 
+fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> {
+    let Some(listen) = options.explorer_listen else {
+        return Ok(None);
+    };
+    let wallet = options
+        .wallet_api_files
+        .as_ref()
+        .map(|files| {
+            let descriptors = read_owner_only_text_file(
+                &files.descriptors,
+                "wallet descriptor",
+                MAX_WALLET_DESCRIPTOR_FILE_LEN,
+            )?;
+            let descriptors: WalletDescriptorFile =
+                serde_json::from_str(&descriptors).map_err(|_| {
+                    "wallet descriptor file must contain the documented JSON object".to_owned()
+                })?;
+            let token = read_owner_only_text_file(
+                &files.auth_token,
+                "wallet authentication token",
+                MAX_WALLET_TOKEN_FILE_LEN,
+            )?;
+            let token = WalletAuthToken::new(token.trim_end_matches(['\r', '\n']))
+                .map_err(str::to_owned)?;
+            let data_dir = options
+                .data_dir
+                .as_ref()
+                .expect("wallet API parser requires data directory");
+            let wallet = EmbeddedWallet::open_or_create(
+                data_dir.join("wallet.sqlite"),
+                descriptors.receive_descriptor,
+                descriptors.change_descriptor,
+                options.network,
+            )
+            .map_err(|_| {
+                "wallet initialization failed; verify descriptors, network, database, and file permissions"
+                    .to_owned()
+            })?;
+            println!(
+                "authenticated watch-only wallet API enabled; token file {}",
+                files.auth_token.display()
+            );
+            Ok::<_, String>(WalletApiRuntime {
+                wallet: Arc::new(wallet),
+                token,
+            })
+        })
+        .transpose()?;
+    Ok(Some(ApiRuntime { listen, wallet }))
+}
+
+fn read_owner_only_text_file(
+    path: &std::path::Path,
+    label: &str,
+    limit: u64,
+) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("read {label} file metadata {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{label} file must be a regular file, not a symlink"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{label} file permissions must not grant group or other access"
+            ));
+        }
+    }
+    if metadata.len() > limit {
+        return Err(format!("{label} file exceeds {limit} bytes"));
+    }
+    let file = fs::File::open(path)
+        .map_err(|error| format!("open {label} file {}: {error}", path.display()))?;
+    let mut contents = String::new();
+    file.take(limit.saturating_add(1))
+        .read_to_string(&mut contents)
+        .map_err(|error| format!("read {label} file {}: {error}", path.display()))?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
+        return Err(format!("{label} file exceeds {limit} bytes"));
+    }
+    Ok(contents)
+}
+
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
-    let peer_store = if let Some(data_dir) = &options.data_dir {
+    if let Some(data_dir) = &options.data_dir {
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
         reject_legacy_split_chainstate(data_dir)?;
+    }
+    let api_runtime = prepare_api_runtime(&options)?;
+    let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(
             RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
                 .map_err(|error| error.to_string())?,
@@ -160,7 +288,15 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     }
     let mut failures = Vec::with_capacity(remotes.len());
     for remote in remotes {
-        match run_with_peer(&options, remote, local_nonce, peer_store.as_ref()).await {
+        match run_with_peer(
+            &options,
+            remote,
+            local_nonce,
+            peer_store.as_ref(),
+            api_runtime.as_ref(),
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(error) => {
                 eprintln!("peer {remote} failed: {error}");
@@ -180,6 +316,7 @@ async fn run_with_peer(
     remote: SocketAddr,
     local_nonce: u64,
     peer_store: Option<&RedbPeerStore>,
+    api_runtime: Option<&ApiRuntime>,
 ) -> Result<(), String> {
     record_peer_attempt(peer_store, remote);
     let mut session = timeout(
@@ -247,7 +384,7 @@ async fn run_with_peer(
             options.ibd_policy,
             path.clone(),
             options.once,
-            options.explorer_listen,
+            api_runtime,
         )
         .await;
     }
@@ -404,7 +541,7 @@ async fn sync_validating_node(
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
     once: bool,
-    explorer_listen: Option<SocketAddr>,
+    api_runtime: Option<&ApiRuntime>,
 ) -> Result<(), String> {
     if !supports_block_execution(network) {
         return Err(
@@ -432,17 +569,19 @@ async fn sync_validating_node(
         RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
             .map_err(|error| error.to_string())?,
     );
-    let mut explorer_server = match explorer_listen {
-        Some(address) => Some(ExplorerServer::bind(address, Arc::clone(&explorer)).await?),
+    let mut api_server = match api_runtime {
+        Some(api) => {
+            Some(ApiServer::bind(api.listen, Arc::clone(&explorer), api.wallet.as_ref()).await?)
+        }
         None => None,
     };
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
-        if let Some(server) = &mut explorer_server {
+        if let Some(server) = &mut api_server {
             server.ensure_running().await?;
         }
         loop {
-            if let Some(server) = &mut explorer_server {
+            if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
             }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -485,7 +624,7 @@ async fn sync_validating_node(
         .await?;
 
         loop {
-            if let Some(server) = &mut explorer_server {
+            if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
             }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -972,6 +1111,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut data_dir = None;
     let mut once = false;
     let mut explorer_listen = None;
+    let mut wallet_descriptors = None;
+    let mut wallet_auth_token_file = None;
     let mut vbparams = Vec::new();
     let mut test_activation_heights = Vec::new();
     let mut minimum_chainwork = None;
@@ -1031,6 +1172,18 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 }
                 explorer_listen = Some(address);
             }
+            "--wallet-descriptors" => {
+                wallet_descriptors = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--wallet-descriptors",
+                )?));
+            }
+            "--wallet-auth-token-file" => {
+                wallet_auth_token_file = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--wallet-auth-token-file",
+                )?));
+            }
             "--vbparams" => {
                 vbparams.push(required_option_value(&mut args, "--vbparams")?);
             }
@@ -1054,6 +1207,27 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
+    let wallet_api_files = match (wallet_descriptors, wallet_auth_token_file) {
+        (None, None) => None,
+        (Some(descriptors), Some(auth_token)) => {
+            if explorer_listen.is_none() || data_dir.is_none() {
+                return Err(
+                    "wallet API options require --data-dir and loopback --explorer-listen"
+                        .to_owned(),
+                );
+            }
+            Some(WalletApiFiles {
+                descriptors,
+                auth_token,
+            })
+        }
+        _ => {
+            return Err(
+                "--wallet-descriptors and --wallet-auth-token-file must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
             "--data-dir block execution currently supports only regtest and default signet"
@@ -1080,6 +1254,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         data_dir,
         once,
         explorer_listen,
+        wallet_api_files,
         deployments,
         ibd_policy,
     }))
@@ -1141,7 +1316,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1171,6 +1346,26 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
+    const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
+
+    async fn http_request(address: SocketAddr, request: &[u8]) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    fn write_owner_only(path: &std::path::Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
 
     fn peer_version(nonce: u64) -> VersionMessage {
         let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
@@ -1309,6 +1504,7 @@ mod tests {
         assert!(options.data_dir.is_none());
         assert!(!options.once);
         assert!(options.explorer_listen.is_none());
+        assert!(options.wallet_api_files.is_none());
         assert_eq!(
             options.deployments,
             DeploymentConfig::for_network(Network::Regtest)
@@ -1325,6 +1521,10 @@ mod tests {
                 "/tmp/rbtc-test",
                 "--explorer-listen",
                 "127.0.0.1:0",
+                "--wallet-descriptors",
+                "/tmp/rbtc-wallet.json",
+                "--wallet-auth-token-file",
+                "/tmp/rbtc-wallet.token",
                 "--vbparams",
                 "taproot:-2:0:432",
                 "--testactivationheight",
@@ -1336,6 +1536,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(served.explorer_listen, Some("127.0.0.1:0".parse().unwrap()));
+        let wallet_files = served.wallet_api_files.as_ref().unwrap();
+        assert_eq!(
+            wallet_files.descriptors,
+            PathBuf::from("/tmp/rbtc-wallet.json")
+        );
+        assert_eq!(
+            wallet_files.auth_token,
+            PathBuf::from("/tmp/rbtc-wallet.token")
+        );
         assert_ne!(
             served.deployments,
             DeploymentConfig::for_network(Network::Regtest)
@@ -1350,6 +1559,44 @@ mod tests {
                     "/tmp/rbtc-test",
                     "--explorer-listen",
                     "0.0.0.0:3000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "regtest",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--explorer-listen",
+                    "127.0.0.1:3000",
+                    "--wallet-descriptors",
+                    "/tmp/rbtc-wallet.json",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "regtest",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--wallet-descriptors",
+                    "/tmp/rbtc-wallet.json",
+                    "--wallet-auth-token-file",
+                    "/tmp/rbtc-wallet.token",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -1553,6 +1800,17 @@ mod tests {
     async fn legacy_chainstate_is_rejected_before_peer_store_creation_or_connect() {
         let directory = TempDir::new().unwrap();
         fs::write(directory.path().join("undo.redb"), b"legacy").unwrap();
+        let descriptors = directory.path().join("wallet.json");
+        let auth_token = directory.path().join("wallet.token");
+        write_owner_only(
+            &descriptors,
+            &serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR
+            })
+            .to_string(),
+        );
+        write_owner_only(&auth_token, &"a".repeat(32));
 
         let error = run(Options {
             remotes: vec!["127.0.0.1:1".parse().unwrap()],
@@ -1561,7 +1819,11 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            explorer_listen: None,
+            explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            wallet_api_files: Some(WalletApiFiles {
+                descriptors,
+                auth_token,
+            }),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -1570,31 +1832,100 @@ mod tests {
 
         assert!(error.contains("legacy split chain-state file"));
         assert!(!directory.path().join("peers.redb").exists());
+        assert!(!directory.path().join("wallet.sqlite").exists());
+    }
+
+    #[test]
+    fn wallet_runtime_loads_only_owner_only_bounded_configuration_files() {
+        let directory = TempDir::new().unwrap();
+        let descriptors = directory.path().join("wallet.json");
+        let auth_token = directory.path().join("wallet.token");
+        write_owner_only(
+            &descriptors,
+            &serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR
+            })
+            .to_string(),
+        );
+        write_owner_only(&auth_token, &format!("{}\n", "a".repeat(32)));
+        let options = Options {
+            remotes: vec!["127.0.0.1:1".parse().unwrap()],
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            wallet_api_files: Some(WalletApiFiles {
+                descriptors: descriptors.clone(),
+                auth_token: auth_token.clone(),
+            }),
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        };
+
+        let runtime = prepare_api_runtime(&options).unwrap().unwrap();
+        assert!(runtime.wallet.is_some());
+        assert!(directory.path().join("wallet.sqlite").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_token, fs::Permissions::from_mode(0o644)).unwrap();
+            let error = prepare_api_runtime(&options).err().unwrap();
+            assert!(error.contains("permissions"));
+            assert!(!error.contains(&"a".repeat(32)));
+        }
     }
 
     #[tokio::test]
-    async fn embedded_explorer_serves_the_static_page_on_loopback() {
+    async fn embedded_api_serves_explorer_and_authenticated_watch_only_wallet() {
         let directory = TempDir::new().unwrap();
         let index = Arc::new(
             RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
                 .unwrap(),
         );
-        let server = ExplorerServer::bind("127.0.0.1:0".parse().unwrap(), index)
+        let token_text = "a".repeat(32);
+        let wallet = WalletApiRuntime {
+            wallet: Arc::new(
+                EmbeddedWallet::open_or_create(
+                    directory.path().join("wallet.sqlite"),
+                    RECEIVE_DESCRIPTOR,
+                    CHANGE_DESCRIPTOR,
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            token: WalletAuthToken::new(&token_text).unwrap(),
+        };
+        let server = ApiServer::bind("127.0.0.1:0".parse().unwrap(), index, Some(&wallet))
             .await
             .unwrap();
-        let mut stream = tokio::net::TcpStream::connect(server.address())
-            .await
-            .unwrap();
-        stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await
-            .unwrap();
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).await.unwrap();
-        let response = String::from_utf8(response).unwrap();
+        let response = http_request(
+            server.address(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("content-security-policy:"));
         assert!(response.contains("<title>rBTC Explorer</title>"));
+        assert!(response.contains("Watch-only wallet"));
+
+        let unauthorized = http_request(
+            server.address(),
+            b"GET /api/v1/wallet/balance HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+        let request = format!(
+            "POST /api/v1/wallet/address HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token_text}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let authorized = http_request(server.address(), request.as_bytes()).await;
+        assert!(authorized.starts_with("HTTP/1.1 200 OK"));
+        let body = authorized.split("\r\n\r\n").nth(1).unwrap();
+        let address: rbtc::wallet::WalletAddress = serde_json::from_str(body).unwrap();
+        assert_eq!(address.index, 0);
     }
 
     #[tokio::test]
@@ -1637,6 +1968,7 @@ mod tests {
             data_dir: None,
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -1711,6 +2043,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -1789,6 +2122,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -1865,6 +2199,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -1925,6 +2260,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
@@ -2015,6 +2351,7 @@ mod tests {
                 data_dir: Some(directory.path().to_path_buf()),
                 once: true,
                 explorer_listen: None,
+                wallet_api_files: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
             },
@@ -2119,6 +2456,7 @@ mod tests {
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
             explorer_listen: None,
+            wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Signet),
             ibd_policy,
         })

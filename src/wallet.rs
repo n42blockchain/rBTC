@@ -20,7 +20,7 @@ use bitcoin::Network;
 use thiserror::Error;
 
 /// A compact, serializable address response for the embedded wallet API.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WalletAddress {
     /// BIP32 child index.
     pub index: u32,
@@ -29,7 +29,7 @@ pub struct WalletAddress {
 }
 
 /// Segmented wallet balance in satoshis.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WalletBalance {
     /// Confirmed balance, including mature coinbase outputs.
     pub confirmed: u64,

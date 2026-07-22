@@ -1,18 +1,22 @@
 //! Embedded REST routes for the explorer and descriptor wallet.
 //!
-//! Bind this router only to loopback by default. Authentication, rate limiting,
-//! TLS termination and wallet authorization belong in the daemon layer.
+//! Bind this router only to loopback. Watch-only wallet routes enforce bearer
+//! authentication, no-store responses, and address-revelation rate limits;
+//! TLS termination, token rotation, and broader authorization remain daemon
+//! deployment concerns.
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::Html,
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +79,81 @@ pub const DEFAULT_UTXO_PAGE_SIZE: u32 = 50;
 pub const MAX_UTXO_PAGE_SIZE: u32 = 100;
 /// Maximum accepted offset, bounding work for offset-based pagination.
 pub const MAX_UTXO_PAGE_OFFSET: u32 = 10_000;
+const MIN_WALLET_AUTH_TOKEN_LEN: usize = 32;
+const MAX_WALLET_AUTH_TOKEN_LEN: usize = 256;
+const WALLET_ADDRESS_BURST: u8 = 20;
+const WALLET_ADDRESS_REFILL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// In-memory bearer credential protecting every wallet route.
+///
+/// The value is intentionally not printable through `Debug` or `Display`.
+#[derive(Clone)]
+pub struct WalletAuthToken(Arc<[u8]>);
+
+struct WalletApiState {
+    wallet: Arc<EmbeddedWallet>,
+    address_limiter: Mutex<AddressRateLimiter>,
+}
+
+struct AddressRateLimiter {
+    available: u8,
+    last_refill: Instant,
+}
+
+impl AddressRateLimiter {
+    fn new() -> Self {
+        Self {
+            available: WALLET_ADDRESS_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        let intervals = now.saturating_duration_since(self.last_refill).as_secs()
+            / WALLET_ADDRESS_REFILL_INTERVAL.as_secs();
+        if intervals > 0 {
+            let refill = u8::try_from(intervals.min(u64::from(WALLET_ADDRESS_BURST)))
+                .expect("refill is capped to u8 burst");
+            self.available = self
+                .available
+                .saturating_add(refill)
+                .min(WALLET_ADDRESS_BURST);
+            self.last_refill += Duration::from_secs(
+                intervals.saturating_mul(WALLET_ADDRESS_REFILL_INTERVAL.as_secs()),
+            );
+        }
+        if self.available == 0 {
+            return false;
+        }
+        self.available -= 1;
+        true
+    }
+}
+
+impl WalletAuthToken {
+    /// Validates an ASCII token read from an owner-only file.
+    pub fn new(token: impl AsRef<str>) -> Result<Self, &'static str> {
+        let token = token.as_ref().as_bytes();
+        if !(MIN_WALLET_AUTH_TOKEN_LEN..=MAX_WALLET_AUTH_TOKEN_LEN).contains(&token.len())
+            || !token.iter().all(u8::is_ascii_graphic)
+        {
+            return Err("wallet API token must be 32-256 printable ASCII bytes");
+        }
+        Ok(Self(Arc::from(token)))
+    }
+
+    fn authorizes(&self, header: Option<&HeaderValue>) -> bool {
+        let Some(header) = header.and_then(|value| value.to_str().ok()) else {
+            return false;
+        };
+        let Some((scheme, supplied)) = header.split_once(' ') else {
+            return false;
+        };
+        scheme.eq_ignore_ascii_case("Bearer")
+            && supplied.len() <= MAX_WALLET_AUTH_TOKEN_LEN
+            && constant_time_eq(supplied.as_bytes(), &self.0)
+    }
+}
 
 /// Read-only index required by explorer routes. Implement this against the node's block/tx indexes.
 pub trait ExplorerIndex: Send + Sync + 'static {
@@ -203,7 +282,8 @@ const EXPLORER_HTML: &str = r#"<!doctype html>
 <section><h2>Block height</h2><form data-kind="blocks"><input inputmode="numeric" required placeholder="Height"><button>Search</button></form><pre></pre></section>
 <section><h2>Transaction</h2><form data-kind="tx"><input required placeholder="txid"><button>Search</button></form><pre></pre></section>
 <section><h2>Address UTXOs</h2><form data-kind="address"><input required placeholder="Checked Bitcoin address"><button>Search</button></form><pre></pre></section>
-<script>for(const f of document.querySelectorAll('form'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
+<section><h2>Watch-only wallet</h2><p class="muted">Optional authenticated wallet; token stays only in this page's memory.</p><form id="wallet"><input type="password" autocomplete="off" required placeholder="Bearer token"><button value="balance">Balance</button><button value="address">New address</button></form><pre></pre></section>
+<script>for(const f of document.querySelectorAll('form[data-kind]'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});const w=document.querySelector('#wallet');w.addEventListener('submit',async e=>{e.preventDefault();const t=w.querySelector('input').value,a=e.submitter.value,o=w.nextElementSibling;o.textContent='Loading…';try{const r=await fetch(`/api/v1/wallet/${a}`,{method:a==='address'?'POST':'GET',headers:{Authorization:`Bearer ${t}`}});o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
 </body></html>"#;
 
 async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
@@ -211,7 +291,7 @@ async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
     );
     headers.insert(
@@ -221,12 +301,50 @@ async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
     (headers, Html(EXPLORER_HTML))
 }
 
-/// Creates REST routes for the in-process descriptor wallet.
-pub fn wallet_router(wallet: Arc<EmbeddedWallet>) -> Router {
+/// Creates bearer-authenticated REST routes for the in-process descriptor wallet.
+pub fn wallet_router(wallet: Arc<EmbeddedWallet>, token: WalletAuthToken) -> Router {
+    let state = Arc::new(WalletApiState {
+        wallet,
+        address_limiter: Mutex::new(AddressRateLimiter::new()),
+    });
     Router::new()
         .route("/api/v1/wallet/balance", get(wallet_balance))
         .route("/api/v1/wallet/address", post(next_address))
-        .with_state(wallet)
+        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(token, require_wallet_auth))
+}
+
+async fn require_wallet_auth(
+    State(token): State<WalletAuthToken>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if token.authorizes(request.headers().get(header::AUTHORIZATION)) {
+        let mut response = next.run(request).await;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"rbtc-wallet\""),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        let left = left.get(index).copied().unwrap_or(0);
+        let right = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 async fn health() -> Json<Health> {
@@ -284,11 +402,23 @@ async fn address_utxos<I: ExplorerIndex>(
         has_more,
     }))
 }
-async fn wallet_balance(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<WalletBalance> {
-    wallet.balance().map_err(internal).map(Json)
+async fn wallet_balance(State(state): State<Arc<WalletApiState>>) -> ApiResult<WalletBalance> {
+    state.wallet.balance().map_err(internal).map(Json)
 }
-async fn next_address(State(wallet): State<Arc<EmbeddedWallet>>) -> ApiResult<WalletAddress> {
-    wallet.reveal_receive_address().map_err(internal).map(Json)
+async fn next_address(State(state): State<Arc<WalletApiState>>) -> ApiResult<WalletAddress> {
+    let allowed = state
+        .address_limiter
+        .lock()
+        .map_err(internal)?
+        .take(Instant::now());
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .wallet
+        .reveal_receive_address()
+        .map_err(internal)
+        .map(Json)
 }
 
 type ApiResult<T> = Result<Json<T>, StatusCode>;
@@ -306,7 +436,11 @@ struct UtxoPageQuery {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use bitcoin::Network;
     use tower::ServiceExt;
+
+    const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
+    const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
 
     struct TestIndex;
     impl ExplorerIndex for TestIndex {
@@ -400,6 +534,120 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_routes_require_bearer_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(
+            EmbeddedWallet::open_or_create(
+                directory.path().join("wallet.sqlite"),
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
+        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
+
+        for authorization in [None, Some("Bearer wrong-token")] {
+            let mut request = Request::get("/api/v1/wallet/balance");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        }
+
+        let balance = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/wallet/balance")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance.status(), StatusCode::OK);
+        assert_eq!(balance.headers()[header::CACHE_CONTROL], "no-store");
+        let address = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/address")
+                    .header(header::AUTHORIZATION, format!("bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(address.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(address.into_body(), 4096)
+            .await
+            .unwrap();
+        let address: WalletAddress = serde_json::from_slice(&body).unwrap();
+        assert_eq!(address.index, 0);
+
+        for _ in 1..WALLET_ADDRESS_BURST {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/wallet/address")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let limited = app
+            .oneshot(
+                Request::post("/api/v1/wallet/address")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn wallet_auth_token_rejects_short_or_non_graphic_values() {
+        assert!(WalletAuthToken::new("short").is_err());
+        assert!(WalletAuthToken::new(format!("{} ", "a".repeat(31))).is_err());
+        assert!(WalletAuthToken::new("a".repeat(256)).is_ok());
+        assert!(WalletAuthToken::new("a".repeat(257)).is_err());
+        let token = WalletAuthToken::new("a".repeat(32)).unwrap();
+        let oversized = HeaderValue::from_str(&format!("Bearer {}", "a".repeat(257))).unwrap();
+        assert!(!token.authorizes(Some(&oversized)));
+    }
+
+    #[test]
+    fn wallet_address_rate_limit_refills_one_token_per_minute() {
+        let mut limiter = AddressRateLimiter::new();
+        let start = limiter.last_refill;
+        for _ in 0..WALLET_ADDRESS_BURST {
+            assert!(limiter.take(start));
+        }
+        assert!(!limiter.take(start));
+        assert!(limiter.take(start + WALLET_ADDRESS_REFILL_INTERVAL));
+        assert!(!limiter.take(start + WALLET_ADDRESS_REFILL_INTERVAL));
+
+        let much_later = start + Duration::from_secs(1_000 * 60);
+        for _ in 0..WALLET_ADDRESS_BURST {
+            assert!(limiter.take(much_later));
+        }
+        assert!(!limiter.take(much_later));
     }
 
     #[test]

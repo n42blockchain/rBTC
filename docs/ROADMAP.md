@@ -34,7 +34,7 @@
 - [ ] Explorer WebSocket/SSE notifications. The read-only REST routes, loopback-only daemon listener, CSP-constrained embedded static UI, and persistent backing index are implemented.
 - [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, and explicit rejection of secret descriptors.
 - [ ] Encrypted wallet secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast.
-- [ ] Authenticated local RPC plus optional REST API; wallet API disabled by default and bound only to localhost.
+- [ ] Authenticated local RPC plus optional REST API. The watch-only balance/address REST subset is explicitly enabled with owner-only descriptor/token files, bearer-protected with non-short-circuit comparison, no-store responses, loopback-only binding, and bounded address-revelation rate. General RPC authentication, audit logging, token rotation, and signing/broadcast authorization remain open.
 
 ## Phase 3 — performance and release
 

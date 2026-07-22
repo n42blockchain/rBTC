@@ -10,7 +10,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.
 - Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; only old block archives rotate, while UTXO state and headers are retained.
-- Embedded REST router contracts for a block explorer plus a transactionally persisted BDK watch-only descriptor wallet façade.
+- Embedded block-explorer UI and REST API plus an optional authenticated, transactionally persisted BDK watch-only descriptor wallet panel/API.
 
 ## Important safety status
 
@@ -51,4 +51,4 @@ The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 - `GET /api/v1/wallet/balance`
 - `POST /api/v1/wallet/address`
 
-The wallet router currently accepts public descriptors only. BDK changesets are committed transactionally to an owner-only SQLite file before a derived address is returned; startup rejects a network or descriptor mismatch so a receive address cannot silently be reused after restart. The daemon still does not mount these routes. Wallet endpoints require authentication, CSRF protection for browser sessions, audit/rate limits, and an explicit transaction/signing/broadcast policy before they are enabled. Private descriptors remain rejected until encrypted secret storage is implemented.
+The wallet router accepts public descriptors only. BDK changesets are committed transactionally to an owner-only SQLite file before a derived address is returned; startup rejects a network or descriptor mismatch so a receive address cannot silently be reused after restart. The daemon mounts these watch-only routes only when both `--wallet-descriptors PATH` and `--wallet-auth-token-file PATH` accompany a loopback `--explorer-listen`. Both input files must be regular, bounded, and owner-only on Unix. The descriptor file is a JSON object with `receive_descriptor` and `change_descriptor` strings; the token is 32-256 printable ASCII bytes and is sent as `Authorization: Bearer TOKEN`. Wallet responses use `Cache-Control: no-store`; address revelation permits a burst of 20 requests and refills one request per minute. The token and descriptors are never accepted directly on the command line or printed. Private descriptors, signing, transaction construction, and broadcast remain disabled until encrypted secret storage and their additional policy/audit gates are complete.
