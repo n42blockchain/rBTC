@@ -72,6 +72,7 @@ struct Options {
     snapshot: Option<SnapshotActivationOptions>,
     finalize_assumeutxo: Option<PathBuf>,
     validation_target: Option<ValidationTarget>,
+    complete_assumeutxo: Option<PathBuf>,
 }
 
 struct SnapshotActivationOptions {
@@ -389,6 +390,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if let Some(data_dir) = &options.data_dir {
         preflight_data_dir(data_dir, options.network, &options.deployments)?;
     }
+    if let Some(validation_dir) = &options.complete_assumeutxo {
+        prepare_assumeutxo_validation(&options, validation_dir)?;
+    }
     if options.snapshot.is_some() {
         return activate_assumed_snapshot(&options);
     }
@@ -560,6 +564,13 @@ fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
         .finalize_assumeutxo
         .as_ref()
         .expect("caller checked snapshot finalization mode");
+    finalize_assumed_snapshot_from(options, validation_dir)
+}
+
+fn finalize_assumed_snapshot_from(
+    options: &Options,
+    validation_dir: &std::path::Path,
+) -> Result<(), String> {
     let data_dir = options
         .data_dir
         .as_ref()
@@ -572,19 +583,7 @@ fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
             validation_path.display()
         ));
     }
-    let active_canonical = fs::canonicalize(&active_path).map_err(|error| {
-        format!(
-            "resolve active chainstate {}: {error}",
-            active_path.display()
-        )
-    })?;
-    let validation_canonical = fs::canonicalize(&validation_path).map_err(|error| {
-        format!(
-            "resolve validation chainstate {}: {error}",
-            validation_path.display()
-        )
-    })?;
-    if active_canonical == validation_canonical {
+    if same_file(&active_path, &validation_path)? {
         return Err("validation chainstate must be separate from active chainstate".to_owned());
     }
     reject_legacy_split_chainstate(validation_dir)?;
@@ -612,6 +611,69 @@ fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
         finalized.base.height, finalized.base.hash, finalized.utxo_count, finalized.records_bytes
     );
     Ok(())
+}
+
+fn prepare_assumeutxo_validation(
+    options: &Options,
+    validation_dir: &std::path::Path,
+) -> Result<(), String> {
+    let active_dir = options
+        .data_dir
+        .as_ref()
+        .expect("completion parser requires active data directory");
+    fs::create_dir_all(validation_dir).map_err(|error| {
+        format!(
+            "create validation data directory {}: {error}",
+            validation_dir.display()
+        )
+    })?;
+    let active_dir = fs::canonicalize(active_dir)
+        .map_err(|error| format!("resolve active data directory: {error}"))?;
+    let validation_dir = fs::canonicalize(validation_dir)
+        .map_err(|error| format!("resolve validation data directory: {error}"))?;
+    if active_dir == validation_dir {
+        return Err(
+            "validation data directory must be separate from active data directory".to_owned(),
+        );
+    }
+    let active_chainstate = active_dir.join("chainstate.redb");
+    let validation_chainstate = validation_dir.join("chainstate.redb");
+    if validation_chainstate.exists() && same_file(&active_chainstate, &validation_chainstate)? {
+        return Err("validation chainstate must be separate from active chainstate".to_owned());
+    }
+    preflight_data_dir(&validation_dir, options.network, &options.deployments)?;
+    if same_file(&active_chainstate, &validation_chainstate)? {
+        return Err("validation chainstate must be separate from active chainstate".to_owned());
+    }
+    let active = RedbChainStore::open(active_chainstate, options.network)
+        .map_err(|error| error.to_string())?;
+    active
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active chainstate has no assumed UTXO snapshot to validate".to_owned())?;
+    Ok(())
+}
+
+fn same_file(first: &std::path::Path, second: &std::path::Path) -> Result<bool, String> {
+    let first_canonical =
+        fs::canonicalize(first).map_err(|error| format!("resolve {}: {error}", first.display()))?;
+    let second_canonical = fs::canonicalize(second)
+        .map_err(|error| format!("resolve {}: {error}", second.display()))?;
+    if first_canonical == second_canonical {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let first = fs::metadata(first_canonical)
+            .map_err(|error| format!("inspect {}: {error}", first.display()))?;
+        let second = fs::metadata(second_canonical)
+            .map_err(|error| format!("inspect {}: {error}", second.display()))?;
+        Ok(first.dev() == second.dev() && first.ino() == second.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(false)
 }
 
 fn preflight_data_dir(
@@ -703,6 +765,10 @@ async fn run_with_peer(
             record_verified_peer(store, remote, remote_version.services);
             discover_peer_addresses(&mut session, store, remote).await;
         }
+        if let Some(validation_dir) = &options.complete_assumeutxo {
+            return complete_assumeutxo_validation(&mut session, options, validation_dir.clone())
+                .await;
+        }
         return sync_validating_node(
             &mut session,
             options.network,
@@ -737,6 +803,42 @@ async fn run_with_peer(
         headers.len()
     );
     Ok(())
+}
+
+async fn complete_assumeutxo_validation(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    options: &Options,
+    validation_dir: PathBuf,
+) -> Result<(), PeerRunError> {
+    let active_dir = options
+        .data_dir
+        .as_ref()
+        .expect("completion parser requires active data directory");
+    let active = RedbChainStore::open(active_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    let assumed = active
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            PeerRunError::transient("active chainstate has no assumed UTXO snapshot to validate")
+        })?;
+    drop(active);
+    sync_validating_node(
+        session,
+        options.network,
+        &options.deployments,
+        options.ibd_policy,
+        validation_dir.clone(),
+        false,
+        Some(ValidationTarget {
+            height: assumed.base.height,
+            block_hash: assumed.base.hash,
+        }),
+        None,
+    )
+    .await?;
+    finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)
 }
 
 fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
@@ -2056,6 +2158,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut finalize_assumeutxo = None;
     let mut validation_height = None;
     let mut validation_block_hash = None;
+    let mut complete_assumeutxo = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -2210,6 +2313,17 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     BlockHash::from_str(&value)
                         .map_err(|_| format!("invalid validation target block hash: {value}"))?,
                 );
+            }
+            "--complete-assumeutxo" => {
+                if complete_assumeutxo.is_some() {
+                    return Err(
+                        "--complete-assumeutxo cannot be supplied more than once".to_owned()
+                    );
+                }
+                complete_assumeutxo = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--complete-assumeutxo",
+                )?));
             }
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
@@ -2417,6 +2531,24 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     };
+    if complete_assumeutxo.is_some() {
+        if data_dir.is_none() {
+            return Err("--complete-assumeutxo requires --data-dir".to_owned());
+        }
+        if snapshot.is_some()
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+        {
+            return Err(
+                "automatic AssumeUTXO completion conflicts with snapshot activation, offline finalization, explicit validation targets, fetch, headers-db, once, explorer, and wallet modes"
+                    .to_owned(),
+            );
+        }
+    }
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
             "--data-dir block execution currently supports only regtest and Signet".to_owned(),
@@ -2482,6 +2614,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         snapshot,
         finalize_assumeutxo,
         validation_target,
+        complete_assumeutxo,
     }))
 }
 
@@ -2546,7 +2679,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -3015,6 +3148,7 @@ mod tests {
             }),
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3072,6 +3206,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: Some(validation_dir),
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3187,6 +3322,68 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_automatic_assumeutxo_completion_as_a_network_mode() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-active",
+                "--complete-assumeutxo",
+                "/tmp/rbtc-validation",
+                "--connect",
+                "127.0.0.1:18444",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.complete_assumeutxo,
+            Some(PathBuf::from("/tmp/rbtc-validation"))
+        );
+        for arguments in [
+            vec!["--network", "regtest", "--complete-assumeutxo", "/tmp/v"],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--complete-assumeutxo",
+                "/tmp/v",
+                "--once",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--complete-assumeutxo",
+                "/tmp/v",
+                "--explorer-listen",
+                "127.0.0.1:3000",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_rejects_symlink_and_hardlink_aliases() {
+        let directory = TempDir::new().unwrap();
+        let original = directory.path().join("original");
+        let hardlink = directory.path().join("hardlink");
+        let symlink = directory.path().join("symlink");
+        fs::write(&original, b"chainstate").unwrap();
+        fs::hard_link(&original, &hardlink).unwrap();
+        std::os::unix::fs::symlink(&original, &symlink).unwrap();
+        assert!(same_file(&original, &hardlink).unwrap());
+        assert!(same_file(&original, &symlink).unwrap());
     }
 
     #[test]
@@ -3605,6 +3802,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -3648,6 +3846,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -3787,6 +3986,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3867,6 +4067,7 @@ mod tests {
                 height: 1,
                 block_hash: first_hash,
             }),
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3922,6 +4123,7 @@ mod tests {
                 height: 1,
                 block_hash: first_hash,
             }),
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3931,6 +4133,160 @@ mod tests {
                 .unwrap();
         assert_eq!(reopened.execution().tip().unwrap().height, 1);
         assert_eq!(reopened.execution().tip().unwrap().hash, first_hash);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn automatic_assumeutxo_completion_syncs_proves_and_clears_marker() {
+        let directory = TempDir::new().unwrap();
+        let active_dir = directory.path().join("active");
+        fs::create_dir(&active_dir).unwrap();
+        let validation_dir = directory.path().join("validation");
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let block = regtest_block(genesis.block_hash(), genesis.time + 1);
+        let block_hash = block.block_hash();
+        RedbHeaderStore::open(active_dir.join("headers.redb"))
+            .unwrap()
+            .append(block.header)
+            .unwrap();
+        let outpoint = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
+        let source = RedbUtxoStore::open(directory.path().join("source.redb")).unwrap();
+        source
+            .apply(
+                &[],
+                &[(
+                    outpoint,
+                    Utxo {
+                        value_sats: block_subsidy(1),
+                        height: 1,
+                        is_coinbase: true,
+                        last_touched: 0,
+                        creation_mtp: genesis.time,
+                        script_pubkey: Vec::new(),
+                    },
+                )],
+            )
+            .unwrap();
+        let snapshot_path = directory.path().join("base.rbtc");
+        let manifest = export_snapshot(
+            &source,
+            &snapshot_path,
+            "regtest",
+            1,
+            block_hash.to_string(),
+        )
+        .unwrap();
+        drop(source);
+        run(Options {
+            remotes: Vec::new(),
+            dns_seeds: None,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(active_dir.clone()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: Some(SnapshotActivationOptions {
+                path: snapshot_path,
+                height: 1,
+                block_hash,
+                utxo_count: manifest.utxo_count,
+                records_bytes: manifest.records_bytes,
+                records_sha256: manifest.records_sha256,
+            }),
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+        })
+        .await
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(63)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(vec![block.header]))
+                    .await
+                    .unwrap(),
+                message => panic!("expected automatic-validation getheaders, got {message:?}"),
+            }
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                            block_hash
+                        )]
+                    );
+                    peer.write_message(NetworkMessage::Block(block))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected automatic-validation block, got {message:?}"),
+            }
+        });
+        run(Options {
+            remotes: vec![remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(active_dir.clone()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: Some(validation_dir.clone()),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let active =
+            RedbChainStore::open(active_dir.join("chainstate.redb"), Network::Regtest).unwrap();
+        assert_eq!(active.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(active.execution().tip().unwrap().hash, block_hash);
+        assert_eq!(
+            active.get(outpoint).unwrap().unwrap().value_sats,
+            block_subsidy(1)
+        );
+        let validation =
+            RedbChainStore::open(validation_dir.join("chainstate.redb"), Network::Regtest).unwrap();
+        assert_eq!(validation.execution().tip().unwrap().height, 1);
+        assert_eq!(validation.execution().tip().unwrap().hash, block_hash);
+        assert_eq!(validation.execution().assumed_snapshot().unwrap(), None);
+        drop(validation);
+        drop(active);
+        let repeated = run(Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(active_dir),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: Some(validation_dir),
+        })
+        .await
+        .unwrap_err();
+        assert!(repeated.contains("no assumed UTXO snapshot"));
     }
 
     #[tokio::test]
@@ -3996,6 +4352,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4065,6 +4422,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4092,6 +4450,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4150,6 +4509,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -4202,6 +4562,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -4288,6 +4649,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -4417,6 +4779,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4510,6 +4873,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4575,6 +4939,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4670,6 +5035,7 @@ mod tests {
                 snapshot: None,
                 finalize_assumeutxo: None,
                 validation_target: None,
+                complete_assumeutxo: None,
             },
             local_nonce,
         )
@@ -4779,6 +5145,7 @@ mod tests {
             snapshot: None,
             finalize_assumeutxo: None,
             validation_target: None,
+            complete_assumeutxo: None,
         })
         .await
         .unwrap();
