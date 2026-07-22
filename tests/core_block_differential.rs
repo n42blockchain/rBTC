@@ -96,7 +96,8 @@ impl CoreNode {
     }
 
     fn submit(&self, block: &Block) -> String {
-        self.rpc(&["submitblock", &serialize_hex(block)]).unwrap()
+        self.rpc(&["submitblock", &serialize_hex(block)])
+            .unwrap_or_else(|error| error)
     }
 }
 
@@ -159,7 +160,9 @@ fn mine_block(parent: BlockHash, time: u32, transactions: Vec<Transaction>) -> B
         },
         txdata: transactions,
     };
-    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block.header.merkle_root = block
+        .compute_merkle_root()
+        .unwrap_or_else(TxMerkleNode::all_zeros);
     remine(&mut block);
     block
 }
@@ -211,17 +214,27 @@ fn rbtc_outcome(blocks: &[Block]) -> RbtcOutcome {
         }
     }
     let candidate = blocks.last().unwrap();
-    let output = OutPointKey::from(OutPoint::new(candidate.txdata[0].compute_txid(), 0));
+    let candidate_output = candidate.txdata.first().is_some_and(|transaction| {
+        !transaction.output.is_empty()
+            && store
+                .get(OutPointKey::from(OutPoint::new(
+                    transaction.compute_txid(),
+                    0,
+                )))
+                .unwrap()
+                .is_some()
+    });
     RbtcOutcome {
         accepted,
         tip_height: store.execution().tip().unwrap().height,
         candidate_undo: store.undos().get(candidate.block_hash()).unwrap().is_some(),
-        candidate_output: store.get(output).unwrap().is_some(),
+        candidate_output,
     }
 }
 
 #[test]
 #[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
+#[allow(clippy::too_many_lines)]
 fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
     let bitcoind = PathBuf::from(
         std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
@@ -259,14 +272,14 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
         first.header.time + 2,
         vec![coinbase(2, subsidy + 1)],
     );
-    invalid.push(("excessive coinbase", excessive));
+    invalid.push(("excessive coinbase", "bad-cb-amount", excessive));
 
     let wrong_height = mine_block(
         first.block_hash(),
         first.header.time + 3,
         vec![coinbase(3, subsidy)],
     );
-    invalid.push(("wrong BIP34 height", wrong_height));
+    invalid.push(("wrong BIP34 height", "bad-cb-height", wrong_height));
 
     let mut second_coinbase = coinbase(2, 0);
     second_coinbase.input[0].script_sig.push_slice([0x01]);
@@ -275,17 +288,132 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
         first.header.time + 4,
         vec![coinbase(2, subsidy), second_coinbase],
     );
-    invalid.push(("multiple coinbase", multiple));
+    invalid.push(("multiple coinbase", "bad-cb-multiple", multiple));
 
     let mut bad_merkle = valid.clone();
     bad_merkle.header.time = first.header.time + 5;
     bad_merkle.header.merkle_root = TxMerkleNode::all_zeros();
     remine(&mut bad_merkle);
-    invalid.push(("bad transaction merkle root", bad_merkle));
+    invalid.push(("bad transaction merkle root", "bad-txnmrklroot", bad_merkle));
 
-    for (name, block) in invalid {
+    let empty = mine_block(first.block_hash(), first.header.time + 6, Vec::new());
+    invalid.push(("empty block", "Block does not start with a coinbase", empty));
+
+    let ordinary_input = TxIn {
+        previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    let ordinary_output = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new(),
+    };
+    let ordinary = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![ordinary_input.clone()],
+        output: vec![ordinary_output.clone()],
+    };
+    let missing_coinbase = mine_block(
+        first.block_hash(),
+        first.header.time + 7,
+        vec![ordinary.clone()],
+    );
+    invalid.push((
+        "missing coinbase",
+        "Block does not start with a coinbase",
+        missing_coinbase,
+    ));
+
+    let mut short_coinbase = coinbase(2, subsidy);
+    short_coinbase.input[0].script_sig = ScriptBuf::from_bytes(vec![0x52]);
+    let short_coinbase = mine_block(
+        first.block_hash(),
+        first.header.time + 8,
+        vec![short_coinbase],
+    );
+    invalid.push(("short coinbase script", "bad-cb-length", short_coinbase));
+
+    let mut long_coinbase = coinbase(2, subsidy);
+    long_coinbase.input[0].script_sig = ScriptBuf::from_bytes([vec![0x52], vec![0; 100]].concat());
+    let long_coinbase = mine_block(
+        first.block_hash(),
+        first.header.time + 9,
+        vec![long_coinbase],
+    );
+    invalid.push(("long coinbase script", "bad-cb-length", long_coinbase));
+
+    let mut no_outputs = coinbase(2, subsidy);
+    no_outputs.output.clear();
+    let no_outputs = mine_block(first.block_hash(), first.header.time + 10, vec![no_outputs]);
+    invalid.push((
+        "transaction without outputs",
+        "bad-txns-vout-empty",
+        no_outputs,
+    ));
+
+    let no_inputs = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: vec![ordinary_output.clone()],
+    };
+    let no_inputs = mine_block(
+        first.block_hash(),
+        first.header.time + 11,
+        vec![coinbase(2, subsidy), no_inputs],
+    );
+    invalid.push((
+        "transaction without inputs",
+        "Block decode failed",
+        no_inputs,
+    ));
+
+    let mut duplicate_inputs = ordinary.clone();
+    duplicate_inputs.input.push(ordinary_input.clone());
+    let duplicate_inputs = mine_block(
+        first.block_hash(),
+        first.header.time + 12,
+        vec![coinbase(2, subsidy), duplicate_inputs],
+    );
+    invalid.push((
+        "duplicate transaction inputs",
+        "bad-txns-inputs-duplicate",
+        duplicate_inputs,
+    ));
+
+    let null_prevout = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            },
+            ordinary_input,
+        ],
+        output: vec![ordinary_output],
+    };
+    let null_prevout = mine_block(
+        first.block_hash(),
+        first.header.time + 13,
+        vec![coinbase(2, subsidy), null_prevout],
+    );
+    invalid.push((
+        "null previous output",
+        "bad-txns-prevout-null",
+        null_prevout,
+    ));
+
+    for (name, expected_rejection, block) in invalid {
         let rejection = core.submit(&block);
-        assert!(!rejection.is_empty(), "Core accepted {name}");
+        assert!(
+            rejection.contains(expected_rejection),
+            "unexpected Core result for {name}: {rejection}"
+        );
         let outcome = rbtc_outcome(&[first.clone(), block]);
         assert!(!outcome.accepted, "rBTC accepted {name}");
         assert_eq!(outcome.tip_height, 1, "rBTC advanced tip for {name}");

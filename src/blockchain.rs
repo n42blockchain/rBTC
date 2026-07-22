@@ -72,8 +72,14 @@ pub enum BlockError {
         /// Subsidy plus fees in satoshis.
         allowed: u64,
     },
-    /// Sum of individually valid transaction fees overflowed.
-    #[error("block fee sum overflow")]
+    /// Sum of individually valid transaction fees exceeded Bitcoin's money range.
+    #[error("block fee sum {fees} exceeds MAX_MONEY")]
+    FeeOutOfRange {
+        /// Accumulated transaction fees in satoshis.
+        fees: u64,
+    },
+    /// Fee or subsidy accounting overflowed its integer representation.
+    #[error("block fee accounting overflow")]
     FeeOverflow,
     /// Aggregate signature-operation cost exceeds the consensus block limit.
     #[error("block sigop cost {cost} exceeds limit {MAX_BLOCK_SIGOPS_COST}")]
@@ -210,6 +216,7 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
 
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut sigop_cost = 0_u64;
+    let mut fees = 0_u64;
     let lock_time_context = if csv_active {
         creation_mtp
     } else {
@@ -228,6 +235,22 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
         ) {
             Ok(transaction) => {
                 applied.push(transaction);
+                if index != 0 {
+                    let transaction = applied.last().expect("just pushed");
+                    let transaction_fee = transaction
+                        .input_value_sats
+                        .checked_sub(transaction.output_value_sats)
+                        .expect("validated non-coinbase transaction cannot inflate");
+                    let Some(next_fees) = fees.checked_add(transaction_fee) else {
+                        rollback(store, &applied, now, hot_window_secs)?;
+                        return Err(BlockError::FeeOverflow);
+                    };
+                    if next_fees > crate::chainstate::MAX_MONEY_SATS {
+                        rollback(store, &applied, now, hot_window_secs)?;
+                        return Err(BlockError::FeeOutOfRange { fees: next_fees });
+                    }
+                    fees = next_fees;
+                }
                 let Some(next_sigop_cost) =
                     sigop_cost.checked_add(applied.last().expect("just pushed").sigop_cost)
                 else {
@@ -246,13 +269,10 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
             }
         }
     }
-    let fees = applied[1..].iter().try_fold(0_u64, |fees, transaction| {
-        fees.checked_add(transaction.input_value_sats - transaction.output_value_sats)
-            .ok_or(BlockError::FeeOverflow)
-    })?;
-    let allowed = subsidy_sats
-        .checked_add(fees)
-        .ok_or(BlockError::FeeOverflow)?;
+    let Some(allowed) = subsidy_sats.checked_add(fees) else {
+        rollback(store, &applied, now, hot_window_secs)?;
+        return Err(BlockError::FeeOverflow);
+    };
     if applied[0].output_value_sats > allowed {
         rollback(store, &applied, now, hot_window_secs)?;
         return Err(BlockError::ExcessCoinbase {
@@ -545,6 +565,95 @@ mod tests {
         ));
         let output = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 0));
         assert!(store.get(output).unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_accumulated_fees_above_money_range_and_rolls_back() {
+        let (_dir, store) = store();
+        let previous = [
+            OutPoint::new(bitcoin::Txid::from_byte_array([7; 32]), 0),
+            OutPoint::new(bitcoin::Txid::from_byte_array([8; 32]), 0),
+        ];
+        let spendable = |outpoint: OutPoint| {
+            (
+                OutPointKey::from(outpoint),
+                Utxo {
+                    value_sats: crate::chainstate::MAX_MONEY_SATS,
+                    height: 0,
+                    is_coinbase: false,
+                    last_touched: 0,
+                    creation_mtp: 0,
+                    script_pubkey: vec![0x51],
+                },
+            )
+        };
+        store
+            .apply(&[], &[spendable(previous[0]), spendable(previous[1])])
+            .unwrap();
+        let spend = |outpoint: OutPoint| Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let candidate = block(vec![coinbase(), spend(previous[0]), spend(previous[1])]);
+
+        assert!(matches!(
+            apply_block(&store, &candidate, 1, 100, 0, 60, 0),
+            Err(BlockError::FeeOutOfRange { fees })
+                if fees == crate::chainstate::MAX_MONEY_SATS * 2
+        ));
+        assert!(store.get(previous[0].into()).unwrap().is_some());
+        assert!(store.get(previous[1].into()).unwrap().is_some());
+        assert_eq!(store.snapshot_entries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fee_accounting_overflow_rolls_back_every_transaction() {
+        let (_dir, store) = store();
+        let previous = OutPoint::new(bitcoin::Txid::from_byte_array([9; 32]), 0);
+        insert_spendable_output(&store, previous);
+        let spend = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: previous,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let candidate = block(vec![coinbase(), spend]);
+
+        assert!(matches!(
+            apply_block_with_deployments(
+                &store,
+                &candidate,
+                1,
+                100,
+                0,
+                60,
+                0,
+                false,
+                false,
+                u64::MAX,
+            ),
+            Err(BlockError::FeeOverflow)
+        ));
+        assert!(store.get(previous.into()).unwrap().is_some());
+        assert_eq!(store.snapshot_entries().unwrap().len(), 1);
     }
 
     #[test]
