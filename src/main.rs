@@ -569,12 +569,10 @@ async fn sync_validating_node(
         RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
             .map_err(|error| error.to_string())?,
     );
-    let mut api_server = match api_runtime {
-        Some(api) => {
-            Some(ApiServer::bind(api.listen, Arc::clone(&explorer), api.wallet.as_ref()).await?)
-        }
-        None => None,
-    };
+    let wallet = api_runtime
+        .and_then(|api| api.wallet.as_ref())
+        .map(|runtime| runtime.wallet.as_ref());
+    let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
         if let Some(server) = &mut api_server {
@@ -622,6 +620,24 @@ async fn sync_validating_node(
             &explorer,
         )
         .await?;
+        if let Some(wallet) = wallet {
+            reconcile_wallet(
+                session,
+                deployment_config,
+                &headers,
+                execution_store,
+                &ledger,
+                wallet,
+            )
+            .await?;
+        }
+        if api_server.is_none() {
+            if let Some(api) = api_runtime {
+                api_server = Some(
+                    ApiServer::bind(api.listen, Arc::clone(&explorer), api.wallet.as_ref()).await?,
+                );
+            }
+        }
 
         loop {
             if let Some(server) = &mut api_server {
@@ -665,8 +681,106 @@ async fn sync_validating_node(
                 &chainstate,
                 &ledger,
                 &explorer,
+                wallet,
             )
             .await?;
+        }
+    }
+}
+
+async fn reconcile_wallet(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    deployment_config: DeploymentConfig,
+    headers: &HeaderDag,
+    execution_store: &RedbExecutionStore,
+    ledger: &PrunedBlockLedger,
+    wallet: &EmbeddedWallet,
+) -> Result<(), String> {
+    let execution_tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
+    let common = wallet
+        .chain_checkpoints()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|checkpoint| {
+            checkpoint.height <= execution_tip.height
+                && headers
+                    .active_header_at(checkpoint.height)
+                    .is_some_and(|header| header.hash == checkpoint.hash)
+        })
+        .ok_or_else(|| "wallet has no checkpoint in common with the active chain".to_owned())?;
+    if common != wallet_tip {
+        wallet
+            .rewind_to(common)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "disconnected stale wallet tip; rewound to {}:{}",
+            common.height, common.hash
+        );
+    }
+
+    loop {
+        let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
+        if wallet_tip.height >= execution_tip.height {
+            return Ok(());
+        }
+        let next_height = wallet_tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| "wallet height overflow".to_owned())?;
+        let remaining = execution_tip.height - wallet_tip.height;
+        let batch_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(MAX_BLOCKS_IN_FLIGHT);
+        let expected = (0..batch_len)
+            .map(|offset| {
+                let height = next_height
+                    .checked_add(u32::try_from(offset).expect("wallet batch fits u32"))
+                    .ok_or_else(|| "wallet height overflow".to_owned())?;
+                headers
+                    .active_header_at(height)
+                    .ok_or_else(|| format!("missing active header at height {height}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut blocks = Vec::with_capacity(batch_len);
+        let mut all_local = true;
+        for header in &expected {
+            let Some(bytes) = ledger
+                .read_block(header.height)
+                .map_err(|error| error.to_string())?
+            else {
+                all_local = false;
+                break;
+            };
+            blocks.push(deserialize(&bytes).map_err(|error| {
+                format!("decode retained block at height {}: {error}", header.height)
+            })?);
+        }
+        if !all_local {
+            let hashes = expected
+                .iter()
+                .map(|header| header.hash)
+                .collect::<Vec<_>>();
+            timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+                .await
+                .map_err(|_| format!("wallet backfill getdata timed out for {batch_len} blocks"))?
+                .map_err(|error| error.to_string())?;
+            blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
+                .await
+                .map_err(|_| format!("wallet backfill response timed out for {batch_len} blocks"))?
+                .map_err(|error| error.to_string())?;
+        }
+        for (expected, block) in expected.iter().zip(&blocks) {
+            validate_archive_block(
+                deployment_config,
+                headers,
+                expected.height,
+                expected.hash,
+                block,
+            )?;
+            wallet
+                .apply_validated_block(block, expected.height)
+                .map_err(|error| error.to_string())?;
         }
     }
 }
@@ -961,6 +1075,7 @@ async fn download_execute_batch(
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
+    wallet: Option<&EmbeddedWallet>,
 ) -> Result<(), String> {
     let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -1047,9 +1162,7 @@ async fn download_execute_batch(
         .map_err(|error| error.to_string())?
     };
     for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
-        explorer
-            .connect(expected.height, block, applied)
-            .map_err(|error| error.to_string())?;
+        index_validated_block(explorer, wallet, expected.height, block, applied)?;
         println!(
             "validated and executed block {}:{}",
             expected.height, expected.hash
@@ -1058,6 +1171,24 @@ async fn download_execute_batch(
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn index_validated_block(
+    explorer: &RedbExplorerIndex,
+    wallet: Option<&EmbeddedWallet>,
+    height: u32,
+    block: &Block,
+    applied: &AppliedBlock,
+) -> Result<(), String> {
+    explorer
+        .connect(height, block, applied)
+        .map_err(|error| error.to_string())?;
+    if let Some(wallet) = wallet {
+        wallet
+            .apply_validated_block(block, height)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -2062,10 +2193,45 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn daemon_downloads_executes_and_recovers_a_regtest_block() {
+        let directory = TempDir::new().unwrap();
+        let descriptors = directory.path().join("wallet.json");
+        let auth_token = directory.path().join("wallet.token");
+        write_owner_only(
+            &descriptors,
+            &serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR
+            })
+            .to_string(),
+        );
+        write_owner_only(&auth_token, &"a".repeat(32));
+        let receive_address = {
+            let wallet = EmbeddedWallet::open_or_create(
+                directory.path().join("wallet.sqlite"),
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Regtest,
+            )
+            .unwrap();
+            wallet.reveal_receive_address().unwrap().address
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
-        let block = regtest_block(genesis.block_hash(), genesis.time + 1);
+        let mut block = regtest_block(genesis.block_hash(), genesis.time + 1);
+        block.txdata[0].output[0].script_pubkey = bitcoin::Address::from_str(&receive_address)
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap()
+            .script_pubkey();
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while block
+            .header
+            .validate_pow(Target::MAX_ATTAINABLE_REGTEST)
+            .is_err()
+        {
+            block.header.nonce = block.header.nonce.checked_add(1).unwrap();
+        }
         let block_hash = block.block_hash();
         let coinbase_outpoint = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
         let server = tokio::spawn(async move {
@@ -2113,7 +2279,6 @@ mod tests {
             }
         });
 
-        let directory = TempDir::new().unwrap();
         run(Options {
             remotes: vec![remote],
             network: Network::Regtest,
@@ -2121,13 +2286,18 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            explorer_listen: None,
-            wallet_api_files: None,
+            explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            wallet_api_files: Some(WalletApiFiles {
+                descriptors: descriptors.clone(),
+                auth_token: auth_token.clone(),
+            }),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
         })
         .await
         .unwrap();
+        // Let the aborted embedded API task release its Arc-backed databases.
+        tokio::task::yield_now().await;
         server.await.unwrap();
 
         let chainstate =
@@ -2153,6 +2323,17 @@ mod tests {
             block_hash.to_string()
         );
         drop(explorer);
+        let wallet = EmbeddedWallet::open_or_create(
+            directory.path().join("wallet.sqlite"),
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Regtest,
+        )
+        .unwrap();
+        assert_eq!(wallet.chain_tip().unwrap().height, 1);
+        assert_eq!(wallet.chain_tip().unwrap().hash, block_hash);
+        assert_eq!(wallet.balance().unwrap().immature, block_subsidy(1));
+        drop(wallet);
         let peers =
             RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
         assert_eq!(peers.len().unwrap(), 1);

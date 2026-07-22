@@ -161,6 +161,10 @@ pub trait ExplorerIndex: Send + Sync + 'static {
     fn block(&self, height: u32) -> Result<Option<ExplorerBlock>, String>;
     /// Returns a transaction summary by txid.
     fn transaction(&self, txid: &str) -> Result<Option<ExplorerTransaction>, String>;
+    /// Validates an address against the index network before querying storage.
+    fn validate_address(&self, _address: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Returns a bounded slice of current UTXOs for a checked Bitcoin address.
     fn address_utxos(
         &self,
@@ -384,6 +388,9 @@ async fn address_utxos<I: ExplorerIndex>(
     if address.is_empty() || address.len() > 128 {
         return Err(StatusCode::BAD_REQUEST);
     }
+    index
+        .validate_address(&address)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(DEFAULT_UTXO_PAGE_SIZE);
     if offset > MAX_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_UTXO_PAGE_SIZE {
@@ -455,6 +462,13 @@ mod tests {
         fn transaction(&self, _: &str) -> Result<Option<ExplorerTransaction>, String> {
             Ok(None)
         }
+        fn validate_address(&self, address: &str) -> Result<(), String> {
+            if address == "invalid" {
+                Err("invalid address".to_owned())
+            } else {
+                Ok(())
+            }
+        }
         fn address_utxos(
             &self,
             _: &str,
@@ -524,6 +538,7 @@ mod tests {
             "/api/v1/address/bcrt1test/utxos?limit=0",
             "/api/v1/address/bcrt1test/utxos?limit=101",
             "/api/v1/address/bcrt1test/utxos?offset=10001",
+            "/api/v1/address/invalid/utxos",
             "/api/v1/address/bcrt1test/utxos?limit=invalid",
             "/api/v1/tx/not-a-txid",
         ] {

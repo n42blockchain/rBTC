@@ -32,7 +32,8 @@
 - [x] Persistent redb transaction/address/block indexes fed only by validated chain changes, restart-reconciled from the ledger or full-history peers, and correctly rolled back on reorg.
 - [x] Explorer UTXO pagination and endpoint input limits, enforced before bounded reads from the persistent index.
 - [ ] Explorer WebSocket/SSE notifications. The read-only REST routes, loopback-only daemon listener, CSP-constrained embedded static UI, and persistent backing index are implemented.
-- [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, and explicit rejection of secret descriptors.
+- [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, explicit rejection of secret descriptors, validated-block balance tracking, durable chain checkpoints, and reorg/restart reconciliation from retained blocks or a full-history peer.
+- [ ] Descriptor birthday and gap-limit scanning for imported watch-only wallets. Current block tracking covers scripts already revealed in the persisted BDK index.
 - [ ] Encrypted wallet secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast.
 - [ ] Authenticated local RPC plus optional REST API. The watch-only balance/address REST subset is explicitly enabled with owner-only descriptor/token files, bearer-protected with non-short-circuit comparison, no-store responses, loopback-only binding, and bounded address-revelation rate. General RPC authentication, audit logging, token rotation, and signing/broadcast authorization remain open.
 

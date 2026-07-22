@@ -381,6 +381,14 @@ impl ExplorerIndex for RedbExplorerIndex {
             .transpose()
     }
 
+    fn validate_address(&self, address: &str) -> Result<(), String> {
+        Address::from_str(address)
+            .map_err(|error| error.to_string())?
+            .require_network(self.network)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
     fn address_utxos(
         &self,
         address: &str,
