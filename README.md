@@ -4,7 +4,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## What is implemented now
 
-- Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format. Core 26's 4,000,000-byte message, 256-byte user-agent, and 101-hash locator bounds are enforced before unbounded work, and one process nonce spans every fallback connection for self-connection detection.
+- Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format. Core 26's 4,000,000-byte message, 256-byte user-agent, 101-hash locator, and 1,000-address response bounds are enforced before unbounded work. Modern peers receive Core-ordered BIP339 `wtxidrelay` and BIP155 `sendaddrv2` negotiation before `verack`; bounded `getaddr` decoding supports legacy and IPv4/IPv6 addrv2 responses. One process nonce spans every fallback connection for self-connection detection. Learned addresses are not yet persisted or automatically trusted as IBD candidates.
 - Script validation adapter using Bitcoin Core's `libbitcoinconsensus`, including Taproot spent-output and default-Signet BIP325 block-solution validation.
 - Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.

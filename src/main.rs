@@ -1072,7 +1072,7 @@ mod tests {
     fn peer_version(nonce: u64) -> VersionMessage {
         let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
         let sender: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        VersionMessage::new(
+        let mut version = VersionMessage::new(
             ServiceFlags::NETWORK | ServiceFlags::WITNESS,
             0,
             Address::new(&receiver, ServiceFlags::NONE),
@@ -1080,7 +1080,24 @@ mod tests {
             nonce,
             "/rbtcd:test-peer/".to_owned(),
             1,
-        )
+        );
+        version.version = 70_016;
+        version
+    }
+
+    async fn receive_client_negotiation(peer: &mut V1Transport<tokio::net::TcpStream>) {
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::WtxidRelay
+        ));
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::SendAddrV2
+        ));
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Verack
+        ));
     }
 
     async fn accept_peer(
@@ -1097,10 +1114,7 @@ mod tests {
         peer.write_message(NetworkMessage::Version(version))
             .await
             .unwrap();
-        assert!(matches!(
-            peer.read_message().await.unwrap().into_payload(),
-            NetworkMessage::Verack
-        ));
+        receive_client_negotiation(&mut peer).await;
         peer.write_message(NetworkMessage::Verack).await.unwrap();
         (peer, local_version)
     }
@@ -1457,10 +1471,7 @@ mod tests {
             peer.write_message(NetworkMessage::Version(peer_version(5)))
                 .await
                 .unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Verack
-            ));
+            receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
@@ -1520,10 +1531,7 @@ mod tests {
             peer.write_message(NetworkMessage::Version(peer_version(6)))
                 .await
                 .unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Verack
-            ));
+            receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(_) => peer
@@ -1606,10 +1614,7 @@ mod tests {
             peer.write_message(NetworkMessage::Version(peer_version(7)))
                 .await
                 .unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Verack
-            ));
+            receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
             assert!(matches!(
                 peer.read_message().await.unwrap().into_payload(),
@@ -1654,10 +1659,7 @@ mod tests {
             peer.write_message(NetworkMessage::Version(peer_version(8)))
                 .await
                 .unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Verack
-            ));
+            receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
             assert!(matches!(
                 peer.read_message().await.unwrap().into_payload(),
@@ -1837,10 +1839,7 @@ mod tests {
             peer.write_message(NetworkMessage::Version(peer_version(9)))
                 .await
                 .unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Verack
-            ));
+            receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {

@@ -10,6 +10,7 @@ use bitcoin::{
     consensus::{deserialize, encode::Error as EncodeError, serialize},
     p2p::{
         Address, Magic, ServiceFlags,
+        address::AddrV2Message,
         message::{NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
         message_network::VersionMessage,
@@ -33,6 +34,8 @@ const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
+const ADDRESS_RELAY_VERSION: u32 = 70_016;
+const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
 /// Maximum headers permitted in one protocol `headers` response.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 /// Maximum block bodies requested concurrently from one peer.
@@ -82,6 +85,9 @@ pub enum P2pError {
     /// A peer did not provide the requested response within the bounded message budget.
     #[error("peer did not provide headers within {MAX_RESPONSE_MESSAGES} messages")]
     HeadersResponseIncomplete,
+    /// A peer did not provide an address response within the bounded message budget.
+    #[error("peer did not provide addresses within {MAX_RESPONSE_MESSAGES} messages")]
+    AddressResponseIncomplete,
     /// A peer exceeded the protocol maximum for one `headers` response.
     #[error("peer sent {count} headers; limit is {MAX_HEADERS_PER_RESPONSE}")]
     TooManyHeaders {
@@ -150,6 +156,23 @@ pub enum P2pError {
         /// Number of supplied locator hashes.
         count: usize,
     },
+    /// A peer exceeded Bitcoin Core's address-message entry limit.
+    #[error("peer sent {count} addresses; limit is {MAX_ADDRESSES_PER_MESSAGE}")]
+    TooManyAddresses {
+        /// Number of addresses received from the peer.
+        count: usize,
+    },
+}
+
+/// A directly connectable IPv4 or IPv6 address learned from `addr`/`addrv2`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PeerAddress {
+    /// Socket address advertised by the peer.
+    pub socket: SocketAddr,
+    /// Service flags associated with the advertised address.
+    pub services: ServiceFlags,
+    /// Peer-supplied last-seen Unix timestamp.
+    pub last_seen: u32,
 }
 
 /// An established Bitcoin peer session.
@@ -273,6 +296,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
     /// Returns an error for malformed transport frames, an invalid handshake
     /// ordering, or a peer that does not finish negotiation promptly.
     pub async fn handshake(&mut self, local: VersionMessage) -> Result<VersionMessage, P2pError> {
+        let local_protocol_version = local.version;
         self.write_message(NetworkMessage::Version(local)).await?;
 
         let mut remote_version = None;
@@ -287,8 +311,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
                         });
                     }
                     validate_user_agent(&version.user_agent)?;
+                    let common_version = local_protocol_version.min(version.version);
                     if remote_version.replace(version).is_some() {
                         return Err(P2pError::DuplicateVersion);
+                    }
+                    if common_version >= ADDRESS_RELAY_VERSION {
+                        self.write_message(NetworkMessage::WtxidRelay).await?;
+                        self.write_message(NetworkMessage::SendAddrV2).await?;
                     }
                     self.write_message(NetworkMessage::Verack).await?;
                 }
@@ -357,6 +386,58 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         self.transport
             .write_message(NetworkMessage::GetHeaders(request))
             .await
+    }
+
+    /// Requests a one-shot address sample from the connected peer.
+    pub async fn request_addresses(&mut self) -> Result<(), P2pError> {
+        self.transport.write_message(NetworkMessage::GetAddr).await
+    }
+
+    /// Receives one bounded legacy `addr` or BIP155 `addrv2` response.
+    ///
+    /// Unsupported address families and zero ports are ignored. Repeated IPv4
+    /// or IPv6 socket addresses are returned once in their original order.
+    pub async fn receive_addresses(&mut self) -> Result<Vec<PeerAddress>, P2pError> {
+        for _ in 0..MAX_RESPONSE_MESSAGES {
+            match self.read_message().await? {
+                NetworkMessage::Addr(addresses) => {
+                    if addresses.len() > MAX_ADDRESSES_PER_MESSAGE {
+                        return Err(P2pError::TooManyAddresses {
+                            count: addresses.len(),
+                        });
+                    }
+                    return Ok(deduplicate_addresses(addresses.into_iter().filter_map(
+                        |(last_seen, address)| {
+                            let socket = address.socket_addr().ok()?;
+                            (socket.port() != 0).then_some(PeerAddress {
+                                socket,
+                                services: address.services,
+                                last_seen,
+                            })
+                        },
+                    )));
+                }
+                NetworkMessage::AddrV2(addresses) => {
+                    if addresses.len() > MAX_ADDRESSES_PER_MESSAGE {
+                        return Err(P2pError::TooManyAddresses {
+                            count: addresses.len(),
+                        });
+                    }
+                    return Ok(deduplicate_addresses(addresses.into_iter().filter_map(
+                        |address: AddrV2Message| {
+                            let socket = address.socket_addr().ok()?;
+                            (socket.port() != 0).then_some(PeerAddress {
+                                socket,
+                                services: address.services,
+                                last_seen: address.time,
+                            })
+                        },
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Err(P2pError::AddressResponseIncomplete)
     }
 
     /// Waits for a `headers` response, transparently answering keepalives.
@@ -481,6 +562,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     }
 }
 
+fn deduplicate_addresses(addresses: impl Iterator<Item = PeerAddress>) -> Vec<PeerAddress> {
+    let mut sockets = HashSet::new();
+    addresses
+        .filter(|address| sockets.insert(address.socket))
+        .collect()
+}
+
 /// Opens a TCP connection and completes an outbound Bitcoin v1 handshake.
 ///
 /// The caller supplies a process-unique nonce (normally from a CSPRNG) to
@@ -545,11 +633,14 @@ mod tests {
         Network,
         hashes::Hash,
         p2p::{
-            Address, Magic, ServiceFlags, message::NetworkMessage, message_network::VersionMessage,
+            Address, Magic, ServiceFlags,
+            address::{AddrV2, AddrV2Message},
+            message::NetworkMessage,
+            message_network::VersionMessage,
         },
     };
     use proptest::prelude::*;
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use tokio::{
         io::{AsyncWriteExt, duplex},
         net::TcpListener,
@@ -702,6 +793,175 @@ mod tests {
         });
 
         assert_eq!(client.await.unwrap().nonce, 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn modern_handshake_negotiates_wtxid_and_addrv2_before_verack() {
+        let (client_stream, server_stream) = duplex(4096);
+        let client = tokio::spawn(async move {
+            let mut local = version(1);
+            local.version = ADDRESS_RELAY_VERSION;
+            let mut client = V1Transport::new(client_stream, Network::Regtest.magic());
+            client.handshake(local).await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut server = V1Transport::new(server_stream, Network::Regtest.magic());
+            server.read_message().await.unwrap();
+            let mut remote = version(2);
+            remote.version = ADDRESS_RELAY_VERSION;
+            server
+                .write_message(NetworkMessage::Version(remote))
+                .await
+                .unwrap();
+            assert!(matches!(
+                server.read_message().await.unwrap().into_payload(),
+                NetworkMessage::WtxidRelay
+            ));
+            assert!(matches!(
+                server.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendAddrV2
+            ));
+            assert!(matches!(
+                server.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            server.write_message(NetworkMessage::Verack).await.unwrap();
+        });
+
+        assert_eq!(client.await.unwrap().nonce, 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn addrv2_request_filters_unsupported_zero_port_and_duplicates() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let expected: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.request_addresses().await.unwrap();
+            session.receive_addresses().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            let full_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+            transport
+                .write_message(NetworkMessage::AddrV2(vec![
+                    AddrV2Message {
+                        time: 100,
+                        services: full_services,
+                        addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+                        port: 8333,
+                    },
+                    AddrV2Message {
+                        time: 101,
+                        services: full_services,
+                        addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+                        port: 8333,
+                    },
+                    AddrV2Message {
+                        time: 102,
+                        services: full_services,
+                        addr: AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+                        port: 0,
+                    },
+                    AddrV2Message {
+                        time: 103,
+                        services: full_services,
+                        addr: AddrV2::TorV3([7; 32]),
+                        port: 8333,
+                    },
+                ]))
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            client.await.unwrap(),
+            vec![PeerAddress {
+                socket: expected,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                last_seen: 100,
+            }]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_address_response_converts_ipv4_and_ipv6() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let ipv4: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+        let ipv6: SocketAddr = "[2001:4860:4860::8888]:8333".parse().unwrap();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_addresses().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::Addr(vec![
+                    (200, Address::new(&ipv4, ServiceFlags::NETWORK)),
+                    (201, Address::new(&ipv6, ServiceFlags::NETWORK_LIMITED)),
+                ]))
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            client.await.unwrap(),
+            vec![
+                PeerAddress {
+                    socket: ipv4,
+                    services: ServiceFlags::NETWORK,
+                    last_seen: 200,
+                },
+                PeerAddress {
+                    socket: ipv6,
+                    services: ServiceFlags::NETWORK_LIMITED,
+                    last_seen: 201,
+                },
+            ]
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn address_response_rejects_more_than_core_limit() {
+        let (client_stream, server_stream) = duplex(128 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_addresses().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            let address: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+            transport
+                .write_message(NetworkMessage::Addr(vec![
+                    (
+                        100,
+                        Address::new(&address, ServiceFlags::NETWORK)
+                    );
+                    MAX_ADDRESSES_PER_MESSAGE + 1
+                ]))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::TooManyAddresses { count })
+                if count == MAX_ADDRESSES_PER_MESSAGE + 1
+        ));
         server.await.unwrap();
     }
 
