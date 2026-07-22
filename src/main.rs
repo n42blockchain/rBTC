@@ -565,6 +565,7 @@ fn validate_archive_block(
         height,
         deployments.bip34_active,
         deployments.segwit_active,
+        deployments.signet,
     )
     .map_err(|error| format!("archive block structure at height {height}: {error}"))
 }

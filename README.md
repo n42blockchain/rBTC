@@ -5,7 +5,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 ## What is implemented now
 
 - Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format.
-- Script validation adapter using Bitcoin Core's `libbitcoinconsensus`, including Taproot spent-output validation.
+- Script validation adapter using Bitcoin Core's `libbitcoinconsensus`, including Taproot spent-output and default-Signet BIP325 block-solution validation.
 - Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots, SHA-256 verification, mandatory header-anchor check, and AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, ready for a BitTorrent/webseed transport adapter.

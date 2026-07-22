@@ -21,6 +21,7 @@ pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod p2p;
+pub mod signet;
 pub mod snapshot;
 pub mod undo_store;
 pub mod utxo;

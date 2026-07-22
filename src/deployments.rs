@@ -281,6 +281,7 @@ pub fn block_deployment_context_with_config(
             bip34_active: height >= config.activation_heights.bip34,
             csv_active: height >= config.activation_heights.csv,
             segwit_active: height >= config.activation_heights.segwit,
+            signet: network == Network::Signet,
             bip30_exception,
             subsidy_sats,
         };
@@ -309,6 +310,7 @@ pub fn block_deployment_context_with_config(
         bip34_active: height >= heights.bip34,
         csv_active: height >= heights.csv,
         segwit_active: height >= heights.segwit,
+        signet: network == Network::Signet,
         bip30_exception,
         subsidy_sats,
     }
@@ -528,6 +530,7 @@ mod tests {
         assert!(context.bip34_active);
         assert!(context.csv_active);
         assert!(context.segwit_active);
+        assert!(!context.signet);
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
         assert_ne!(
             context.script_flags & bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
@@ -535,6 +538,20 @@ mod tests {
         );
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
         assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_TAPROOT, 0);
+    }
+
+    #[test]
+    fn only_default_signet_selects_bip325_block_validation() {
+        let hash = BlockHash::all_zeros();
+        assert!(block_deployment_context(Network::Signet, 1, hash, 0, false).signet);
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Regtest,
+        ] {
+            assert!(!block_deployment_context(network, 1, hash, 0, false).signet);
+        }
     }
 
     #[test]

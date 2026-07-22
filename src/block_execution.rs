@@ -30,6 +30,8 @@ pub struct BlockDeploymentContext {
     pub csv_active: bool,
     /// Whether BIP141 witness commitments and BIP147 NULLDUMMY are active.
     pub segwit_active: bool,
+    /// Whether the default BIP325 Signet block challenge must be verified.
+    pub signet: bool,
     /// Whether this is one of the two historical mainnet BIP30 exceptions.
     pub bip30_exception: bool,
     /// Maximum proof-of-work subsidy for this candidate height.
@@ -375,6 +377,7 @@ fn validate_active_block<S: UtxoStore>(
         deployments.bip34_active,
         deployments.csv_active,
         deployments.segwit_active,
+        deployments.signet,
         deployments.subsidy_sats,
     ) {
         Ok(applied) => applied,
@@ -645,7 +648,9 @@ mod tests {
         TxOut, Witness,
         absolute::LockTime,
         block::{Header, Version as HeaderVersion},
+        consensus::deserialize,
         hashes::Hash,
+        hex::FromHex,
         pow::Target,
         transaction::Version,
     };
@@ -1060,5 +1065,58 @@ mod tests {
         );
         disconnect_execution_tip(&chainstate, &headers, 2, 60).unwrap();
         assert_eq!(chainstate.get(collision).unwrap().unwrap().value_sats, 42);
+    }
+
+    #[test]
+    fn default_signet_solution_is_enforced_before_chainstate_commit() {
+        let encoded = include_str!("../tests/data/bitcoin-core-26/signet-block-1.hex");
+        let block: Block = deserialize(&Vec::<u8>::from_hex(encoded.trim()).unwrap()).unwrap();
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Signet)
+                .unwrap();
+        let mut headers = HeaderDag::new(Network::Signet);
+        headers.insert_contextual(block.header, u32::MAX).unwrap();
+        let context = block_deployment_context(
+            Network::Signet,
+            1,
+            block.block_hash(),
+            block.header.time,
+            false,
+        );
+        assert!(context.signet);
+
+        let mut damaged = block.clone();
+        let script = damaged.txdata[0].output[1].script_pubkey.as_mut_bytes();
+        let header = script
+            .windows(4)
+            .position(|window| window == [0xec, 0xc7, 0xda, 0xa2])
+            .unwrap();
+        script[header + 12] ^= 1;
+        let damaged_outpoint =
+            OutPointKey::from(OutPoint::new(damaged.txdata[0].compute_txid(), 0));
+        assert!(matches!(
+            connect_active_block(&chainstate, &headers, &damaged, 1, 60, context),
+            Err(BlockExecutionError::Block(BlockError::Signet(_)))
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+        assert!(
+            chainstate
+                .undos()
+                .get(block.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        assert!(chainstate.get(damaged_outpoint).unwrap().is_none());
+
+        connect_active_block(&chainstate, &headers, &block, 1, 60, context).unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert!(
+            chainstate
+                .undos()
+                .get(block.block_hash())
+                .unwrap()
+                .is_some()
+        );
     }
 }
