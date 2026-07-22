@@ -28,12 +28,14 @@ use rbtc::{
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
+    peer_store::RedbPeerStore,
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
 };
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
 
@@ -131,9 +133,34 @@ async fn run(options: Options) -> Result<(), String> {
 }
 
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
-    let mut failures = Vec::with_capacity(options.remotes.len());
-    for remote in options.remotes.iter().copied() {
-        match run_with_peer(&options, remote, local_nonce).await {
+    let peer_store = if let Some(data_dir) = &options.data_dir {
+        fs::create_dir_all(data_dir)
+            .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+        reject_legacy_split_chainstate(data_dir)?;
+        Some(
+            RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut remotes = options.remotes.clone();
+    if let Some(store) = &peer_store {
+        for learned in store
+            .candidates(unix_time()?, MAX_CONFIGURED_PEERS)
+            .map_err(|error| error.to_string())?
+        {
+            if remotes.len() == MAX_CONFIGURED_PEERS {
+                break;
+            }
+            if !remotes.contains(&learned) {
+                remotes.push(learned);
+            }
+        }
+    }
+    let mut failures = Vec::with_capacity(remotes.len());
+    for remote in remotes {
+        match run_with_peer(&options, remote, local_nonce, peer_store.as_ref()).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 eprintln!("peer {remote} failed: {error}");
@@ -152,6 +179,7 @@ async fn run_with_peer(
     options: &Options,
     remote: SocketAddr,
     local_nonce: u64,
+    peer_store: Option<&RedbPeerStore>,
 ) -> Result<(), String> {
     let mut session = timeout(
         PEER_TIMEOUT,
@@ -207,6 +235,9 @@ async fn run_with_peer(
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
+        if let Some(store) = peer_store {
+            discover_peer_addresses(&mut session, store, remote).await;
+        }
         return sync_validating_node(
             &mut session,
             options.network,
@@ -240,6 +271,42 @@ async fn run_with_peer(
         headers.len()
     );
     Ok(())
+}
+
+async fn discover_peer_addresses(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    store: &RedbPeerStore,
+    source: SocketAddr,
+) {
+    let discovery = timeout(PEER_DISCOVERY_TIMEOUT, async {
+        session.request_addresses().await?;
+        session.receive_addresses().await
+    })
+    .await;
+    match discovery {
+        Ok(Ok(addresses)) => {
+            let now = match unix_time() {
+                Ok(now) => now,
+                Err(error) => {
+                    eprintln!("peer address persistence from {source} skipped: {error}");
+                    return;
+                }
+            };
+            match store.insert_discovered(source, &addresses, now) {
+                Ok(stats) if stats.accepted > 0 => println!(
+                    "persisted {} learned peer addresses from {source}; rejected {}",
+                    stats.accepted, stats.rejected
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("peer address persistence from {source} failed: {error}"),
+            }
+        }
+        Ok(Err(error)) => eprintln!("peer address discovery from {source} failed: {error}"),
+        Err(_) => eprintln!(
+            "peer address discovery from {source} timed out after {} seconds",
+            PEER_DISCOVERY_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 async fn sync_headers(
@@ -285,6 +352,19 @@ async fn sync_headers(
     Ok(dag)
 }
 
+fn reject_legacy_split_chainstate(data_dir: &std::path::Path) -> Result<(), String> {
+    for legacy in ["undo.redb", "execution.redb"] {
+        let path = data_dir.join(legacy);
+        if path.exists() {
+            return Err(format!(
+                "legacy split chain-state file {} is not migrated automatically; move the old data directory aside and rebuild or import a verified snapshot",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
@@ -304,15 +384,7 @@ async fn sync_validating_node(
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     let headers_path = data_dir.join("headers.redb");
-    for legacy in ["undo.redb", "execution.redb"] {
-        let path = data_dir.join(legacy);
-        if path.exists() {
-            return Err(format!(
-                "legacy split chain-state file {} is not migrated automatically; move the old data directory aside and rebuild or import a verified snapshot",
-                path.display()
-            ));
-        }
-    }
+    reject_legacy_split_chainstate(&data_dir)?;
     let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), network)
         .map_err(|error| error.to_string())?;
     let undo_store = chainstate.undos();
@@ -1100,6 +1172,23 @@ mod tests {
         ));
     }
 
+    async fn respond_to_getaddr(peer: &mut V1Transport<tokio::net::TcpStream>) {
+        respond_to_getaddr_with(peer, Vec::new()).await;
+    }
+
+    async fn respond_to_getaddr_with(
+        peer: &mut V1Transport<tokio::net::TcpStream>,
+        addresses: Vec<bitcoin::p2p::address::AddrV2Message>,
+    ) {
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::GetAddr
+        ));
+        peer.write_message(NetworkMessage::AddrV2(addresses))
+            .await
+            .unwrap();
+    }
+
     async fn accept_peer(
         listener: TcpListener,
         version: VersionMessage,
@@ -1430,6 +1519,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_chainstate_is_rejected_before_peer_store_creation_or_connect() {
+        let directory = TempDir::new().unwrap();
+        fs::write(directory.path().join("undo.redb"), b"legacy").unwrap();
+
+        let error = run(Options {
+            remotes: vec!["127.0.0.1:1".parse().unwrap()],
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("legacy split chain-state file"));
+        assert!(!directory.path().join("peers.redb").exists());
+    }
+
+    #[tokio::test]
     async fn embedded_explorer_serves_the_static_page_on_loopback() {
         let directory = TempDir::new().unwrap();
         let index = Arc::new(
@@ -1533,6 +1645,16 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
+            respond_to_getaddr_with(
+                &mut peer,
+                vec![bitcoin::p2p::address::AddrV2Message {
+                    time: 0,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.2".parse().unwrap()),
+                    port: 18_445,
+                }],
+            )
+            .await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(_) => peer
                     .write_message(NetworkMessage::Headers(vec![block.header]))
@@ -1595,6 +1717,14 @@ mod tests {
             block_hash.to_string()
         );
         drop(explorer);
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert_eq!(peers.len().unwrap(), 1);
+        assert_eq!(
+            peers.candidates(unix_time().unwrap(), 16).unwrap(),
+            vec!["127.0.0.2:18445".parse().unwrap()]
+        );
+        drop(peers);
 
         let archived_bytes = serialize(&archived);
         ledger.truncate_from(1).unwrap();
@@ -1616,6 +1746,7 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
+            respond_to_getaddr(&mut peer).await;
             assert!(matches!(
                 peer.read_message().await.unwrap().into_payload(),
                 NetworkMessage::GetHeaders(_)
@@ -1661,6 +1792,7 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
+            respond_to_getaddr(&mut peer).await;
             assert!(matches!(
                 peer.read_message().await.unwrap().into_payload(),
                 NetworkMessage::GetHeaders(_)
@@ -1727,6 +1859,7 @@ mod tests {
         let interrupted_server = tokio::spawn(async move {
             let (mut peer, local_version) =
                 accept_peer(interrupted_listener, peer_version(11)).await;
+            respond_to_getaddr(&mut peer).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);
@@ -1748,6 +1881,7 @@ mod tests {
         let recovery_remote = recovery_listener.local_addr().unwrap();
         let recovery_server = tokio::spawn(async move {
             let (mut peer, local_version) = accept_peer(recovery_listener, peer_version(12)).await;
+            respond_to_getaddr(&mut peer).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes.first(), Some(&block_hash));
@@ -1841,6 +1975,7 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
+            respond_to_getaddr(&mut peer).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes, vec![genesis]);
