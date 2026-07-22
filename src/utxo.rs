@@ -359,6 +359,67 @@ impl RedbUtxoStore {
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
     }
+
+    /// Computes count, encoded length, and logical UTXO-set identity without
+    /// materializing all UTXOs. The digest excludes local `last_touched` time.
+    pub(crate) fn snapshot_content_identity(&self) -> Result<(u64, u64, [u8; 32]), UtxoError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_read()?;
+        let hot = transaction.open_table(HOT_TABLE)?;
+        let cold = transaction.open_table(COLD_TABLE)?;
+        let mut hot_rows = hot.iter()?;
+        let mut cold_rows = cold.iter()?;
+        let mut hot_next = hot_rows
+            .next()
+            .transpose()?
+            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+        let mut cold_next = cold_rows
+            .next()
+            .transpose()?
+            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+        let mut count = 0_u64;
+        let mut records_bytes = 0_u64;
+        let mut digest = Sha256::new();
+        while hot_next.is_some() || cold_next.is_some() {
+            let take_hot = match (&hot_next, &cold_next) {
+                (Some((hot_key, _)), Some((cold_key, _))) => match hot_key.cmp(cold_key) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => {
+                        return Err(UtxoError::Malformed("outpoint in both tiers"));
+                    }
+                },
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (key, value) = if take_hot {
+                let row = hot_next.take().expect("selected populated hot iterator");
+                hot_next = hot_rows
+                    .next()
+                    .transpose()?
+                    .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+                row
+            } else {
+                let row = cold_next.take().expect("selected populated cold iterator");
+                cold_next = cold_rows
+                    .next()
+                    .transpose()?
+                    .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+                row
+            };
+            OutPointKey::from_bytes(&key)?;
+            let utxo = Utxo::decode(&value)?;
+            update_utxo_set_digest(&mut digest, &key, &utxo);
+            count = count
+                .checked_add(1)
+                .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+            records_bytes = records_bytes
+                .checked_add(u64::try_from(key.len() + value.len()).expect("record fits u64"))
+                .ok_or(UtxoError::Malformed("snapshot records length overflow"))?;
+        }
+        Ok((count, records_bytes, digest.finalize().into()))
+    }
 }
 
 impl UtxoStore for RedbUtxoStore {
@@ -551,7 +612,7 @@ pub(crate) fn insert_snapshot_entries_transaction<I>(
     expected_records_bytes: u64,
     now: u64,
     hot_window_secs: u64,
-) -> Result<(u64, u64, [u8; 32]), UtxoError>
+) -> Result<(u64, u64, [u8; 32], [u8; 32]), UtxoError>
 where
     I: IntoIterator<Item = Result<(OutPointKey, Utxo), UtxoError>>,
 {
@@ -562,6 +623,7 @@ where
     let mut count = 0_u64;
     let mut records_bytes = 0_u64;
     let mut records = Sha256::new();
+    let mut utxo_set = Sha256::new();
     for entry in entries {
         let (key, utxo) = entry?;
         if previous.is_some_and(|previous| key <= previous) {
@@ -576,6 +638,7 @@ where
         // replacement between inspection and activation cannot become durable.
         records.update(key.as_bytes());
         records.update(&encoded);
+        update_utxo_set_digest(&mut utxo_set, key.as_bytes(), &utxo);
         if utxo.last_touched < cutoff {
             cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
         } else {
@@ -598,7 +661,26 @@ where
             ));
         }
     }
-    Ok((count, records_bytes, records.finalize().into()))
+    Ok((
+        count,
+        records_bytes,
+        records.finalize().into(),
+        utxo_set.finalize().into(),
+    ))
+}
+
+fn update_utxo_set_digest(digest: &mut Sha256, key: &[u8], utxo: &Utxo) {
+    digest.update(key);
+    digest.update(utxo.value_sats.to_le_bytes());
+    digest.update(utxo.height.to_le_bytes());
+    digest.update([u8::from(utxo.is_coinbase)]);
+    digest.update(utxo.creation_mtp.to_le_bytes());
+    digest.update(
+        u32::try_from(utxo.script_pubkey.len())
+            .expect("persisted script length was validated")
+            .to_le_bytes(),
+    );
+    digest.update(&utxo.script_pubkey);
 }
 
 pub(crate) fn apply_with_undo_transaction(

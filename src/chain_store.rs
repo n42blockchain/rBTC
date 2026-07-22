@@ -13,10 +13,11 @@ use thiserror::Error;
 
 use crate::{
     execution_store::{
-        ExecutionStoreError, ExecutionTip, RedbExecutionStore, advance_transaction,
-        assume_snapshot_transaction, metadata_exists as execution_metadata_exists,
-        rewind_transaction,
+        AssumedSnapshot, ExecutionStoreError, ExecutionTip, RedbExecutionStore,
+        advance_transaction, assume_snapshot_transaction, clear_assumed_snapshot_transaction,
+        metadata_exists as execution_metadata_exists, rewind_transaction,
     },
+    headers::HeaderDag,
     undo_store::{
         RedbUndoStore, UndoStoreError, insert_transaction as insert_undo_transaction,
         remove_transaction as remove_undo_transaction,
@@ -101,6 +102,48 @@ pub enum ChainStoreError {
         /// Canonical byte length decoded inside the transaction.
         actual: u64,
     },
+    /// The active chainstate has no assumed-state marker to finalize.
+    #[error("chainstate has no assumed UTXO snapshot awaiting validation")]
+    NoAssumedSnapshot,
+    /// The independent validation chainstate is itself snapshot-based.
+    #[error("validation chainstate must be independently executed from genesis")]
+    ValidationChainstateIsAssumed,
+    /// The validation chainstate did not stop exactly at the snapshot base.
+    #[error(
+        "validation chainstate tip {actual_height}:{actual_hash} does not match snapshot base {expected_height}:{expected_hash}"
+    )]
+    ValidationTipMismatch {
+        /// Required snapshot-base height.
+        expected_height: u32,
+        /// Required snapshot-base hash.
+        expected_hash: BlockHash,
+        /// Independently validated height.
+        actual_height: u32,
+        /// Independently validated hash.
+        actual_hash: BlockHash,
+    },
+    /// The two chainstates were not executed under identical consensus rules.
+    #[error("active and validation chainstates have different consensus configurations")]
+    ValidationConsensusMismatch,
+    /// The snapshot base is not on the selected active header chain.
+    #[error("snapshot base {height}:{hash} is not on the active header chain")]
+    SnapshotBaseNotActive {
+        /// Snapshot-base height.
+        height: u32,
+        /// Snapshot-base hash.
+        hash: BlockHash,
+    },
+    /// The current execution tip is not on the selected active header chain.
+    #[error("execution tip {height}:{hash} is not on the active header chain")]
+    ExecutionTipNotActive {
+        /// Current execution height.
+        height: u32,
+        /// Current execution hash.
+        hash: BlockHash,
+    },
+    /// The independently computed UTXO identity differs from trusted metadata.
+    #[error("validation chainstate UTXO identity does not match the assumed snapshot")]
+    ValidationContentMismatch,
 }
 
 /// One physical redb database containing UTXOs, block undo, and execution metadata.
@@ -235,7 +278,7 @@ impl RedbChainStore {
         {
             return Err(ChainStoreError::SnapshotNotFresh);
         }
-        let (actual_count, actual_records_bytes, actual_digest) =
+        let (actual_count, actual_records_bytes, actual_digest, utxo_set_sha256) =
             insert_snapshot_entries_transaction(
                 &transaction,
                 entries,
@@ -259,9 +302,86 @@ impl RedbChainStore {
         if actual_digest != content.records_sha256 {
             return Err(ChainStoreError::SnapshotDigestMismatch);
         }
-        assume_snapshot_transaction(&transaction, anchor, &content.records_sha256)?;
+        assume_snapshot_transaction(
+            &transaction,
+            AssumedSnapshot {
+                base: anchor,
+                utxo_count: content.utxo_count,
+                records_bytes: content.records_bytes,
+                records_sha256: content.records_sha256,
+                utxo_set_sha256,
+            },
+        )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Clears an assumed-state marker after an independent genesis validation matches it.
+    ///
+    /// `validation` must be a separate, non-assumed chainstate stopped exactly at
+    /// the snapshot base. Its UTXOs are streamed in canonical order, so this check
+    /// has bounded memory use. The marker is rechecked and removed in one durable
+    /// transaction; active UTXOs and the (possibly newer) active execution tip are
+    /// left untouched.
+    pub fn finalize_assumed_snapshot(
+        &self,
+        validation: &Self,
+        headers: &HeaderDag,
+    ) -> Result<AssumedSnapshot, ChainStoreError> {
+        let _guard = self.lock();
+        let assumed = self
+            .execution
+            .assumed_snapshot()?
+            .ok_or(ChainStoreError::NoAssumedSnapshot)?;
+        if validation.execution.assumed_snapshot()?.is_some() {
+            return Err(ChainStoreError::ValidationChainstateIsAssumed);
+        }
+        let validation_tip = validation.execution.tip()?;
+        if validation_tip != assumed.base {
+            return Err(ChainStoreError::ValidationTipMismatch {
+                expected_height: assumed.base.height,
+                expected_hash: assumed.base.hash,
+                actual_height: validation_tip.height,
+                actual_hash: validation_tip.hash,
+            });
+        }
+        let active_config = self.execution.consensus_config()?;
+        let validation_config = validation.execution.consensus_config()?;
+        if active_config.is_none() || active_config != validation_config {
+            return Err(ChainStoreError::ValidationConsensusMismatch);
+        }
+        if headers
+            .active_header_at(assumed.base.height)
+            .is_none_or(|header| header.hash != assumed.base.hash)
+        {
+            return Err(ChainStoreError::SnapshotBaseNotActive {
+                height: assumed.base.height,
+                hash: assumed.base.hash,
+            });
+        }
+        let active_tip = self.execution.tip()?;
+        if headers
+            .active_header_at(active_tip.height)
+            .is_none_or(|header| header.hash != active_tip.hash)
+        {
+            return Err(ChainStoreError::ExecutionTipNotActive {
+                height: active_tip.height,
+                hash: active_tip.hash,
+            });
+        }
+        let (utxo_count, records_bytes, utxo_set_sha256) =
+            validation.utxos.snapshot_content_identity()?;
+        if utxo_count != assumed.utxo_count
+            || records_bytes != assumed.records_bytes
+            || utxo_set_sha256 != assumed.utxo_set_sha256
+        {
+            return Err(ChainStoreError::ValidationContentMismatch);
+        }
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        clear_assumed_snapshot_transaction(&transaction, assumed)?;
+        transaction.commit()?;
+        Ok(assumed)
     }
 
     /// Atomically applies UTXOs, records block undo, and advances the execution tip.
@@ -405,7 +525,12 @@ mod tests {
         },
     };
 
-    use bitcoin::{OutPoint, Txid, hashes::Hash};
+    use bitcoin::{
+        OutPoint, TxMerkleNode, Txid,
+        block::{Header, Version},
+        consensus::Params,
+        hashes::Hash,
+    };
     use redb::StorageBackend;
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
@@ -441,6 +566,22 @@ mod tests {
             .values()
             .map(|utxo| u64::try_from(36 + utxo.encode().unwrap().len()).unwrap())
             .sum()
+    }
+
+    fn mine_child(parent: BlockHash, time: u32) -> Header {
+        let target = Params::new(Network::Regtest).max_attainable_target;
+        let mut header = Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: parent,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: target.to_compact_lossy(),
+            nonce: 0,
+        };
+        while header.validate_pow(target).is_err() {
+            header.nonce += 1;
+        }
+        header
     }
 
     #[derive(Clone)]
@@ -638,6 +779,121 @@ mod tests {
             Some(records_sha256)
         );
         assert_eq!(reopened.snapshot_entries().unwrap(), entries);
+    }
+
+    #[test]
+    fn independent_genesis_validation_atomically_finalizes_assumed_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let active =
+            RedbChainStore::open(directory.path().join("active.redb"), Network::Regtest).unwrap();
+        let validation =
+            RedbChainStore::open(directory.path().join("validation.redb"), Network::Regtest)
+                .unwrap();
+        active
+            .execution()
+            .bind_consensus_config(b"rules", b"rules")
+            .unwrap();
+        validation
+            .execution()
+            .bind_consensus_config(b"rules", b"rules")
+            .unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let header = mine_child(genesis.hash, genesis.header.time + 1);
+        let anchor = ExecutionTip {
+            height: 1,
+            hash: header.block_hash(),
+        };
+        headers.insert(header).unwrap();
+        let mut recent = coin(20);
+        recent.last_touched = 100;
+        let entries = BTreeMap::from([(key(1), coin(10)), (key(2), recent)]);
+        let digest = snapshot_digest(&entries);
+        active
+            .assume_snapshot(anchor, &digest, &entries, 100, 60)
+            .unwrap();
+        let independently_replayed = entries
+            .iter()
+            .map(|(key, utxo)| {
+                let mut utxo = utxo.clone();
+                utxo.last_touched = utxo.last_touched.saturating_add(10_000);
+                (*key, utxo)
+            })
+            .collect::<Vec<_>>();
+        validation
+            .commit_connect(genesis.hash, anchor, &[], &independently_replayed, &[])
+            .unwrap();
+        let next_header = mine_child(anchor.hash, header.time + 1);
+        let active_tip = ExecutionTip {
+            height: 2,
+            hash: next_header.block_hash(),
+        };
+        headers.insert(next_header).unwrap();
+        active
+            .commit_connect(anchor.hash, active_tip, &[], &[], &[])
+            .unwrap();
+
+        let finalized = active
+            .finalize_assumed_snapshot(&validation, &headers)
+            .unwrap();
+        assert_eq!(finalized.base, anchor);
+        assert_eq!(finalized.utxo_count, 2);
+        assert_eq!(finalized.records_bytes, snapshot_bytes(&entries));
+        assert_eq!(active.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(active.execution().tip().unwrap(), active_tip);
+        assert_eq!(active.snapshot_entries().unwrap(), entries);
+        assert!(matches!(
+            active.finalize_assumed_snapshot(&validation, &headers),
+            Err(ChainStoreError::NoAssumedSnapshot)
+        ));
+        drop(active);
+        let reopened =
+            RedbChainStore::open(directory.path().join("active.redb"), Network::Regtest).unwrap();
+        assert_eq!(reopened.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(reopened.execution().tip().unwrap(), active_tip);
+        assert_eq!(reopened.snapshot_entries().unwrap(), entries);
+    }
+
+    #[test]
+    fn finalize_rejects_wrong_validation_identity_and_preserves_marker() {
+        let directory = TempDir::new().unwrap();
+        let active =
+            RedbChainStore::open(directory.path().join("active.redb"), Network::Regtest).unwrap();
+        let validation =
+            RedbChainStore::open(directory.path().join("validation.redb"), Network::Regtest)
+                .unwrap();
+        active
+            .execution()
+            .bind_consensus_config(b"rules", b"rules")
+            .unwrap();
+        validation
+            .execution()
+            .bind_consensus_config(b"rules", b"rules")
+            .unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let header = mine_child(genesis.hash, genesis.header.time + 1);
+        let anchor = ExecutionTip {
+            height: 1,
+            hash: header.block_hash(),
+        };
+        headers.insert(header).unwrap();
+        let entries = BTreeMap::from([(key(1), coin(10))]);
+        active
+            .assume_snapshot(anchor, &snapshot_digest(&entries), &entries, 100, 60)
+            .unwrap();
+        validation
+            .commit_connect(genesis.hash, anchor, &[], &[(key(1), coin(11))], &[])
+            .unwrap();
+
+        assert!(matches!(
+            active.finalize_assumed_snapshot(&validation, &headers),
+            Err(ChainStoreError::ValidationContentMismatch)
+        ));
+        assert_eq!(
+            active.execution().assumed_snapshot().unwrap().unwrap().base,
+            anchor
+        );
     }
 
     #[test]

@@ -70,6 +70,7 @@ struct Options {
     deployments: DeploymentConfig,
     ibd_policy: IbdPolicy,
     snapshot: Option<SnapshotActivationOptions>,
+    finalize_assumeutxo: Option<PathBuf>,
 }
 
 struct SnapshotActivationOptions {
@@ -384,6 +385,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if options.snapshot.is_some() {
         return activate_assumed_snapshot(&options);
     }
+    if options.finalize_assumeutxo.is_some() {
+        return finalize_assumed_snapshot(&options);
+    }
     let api_runtime = prepare_api_runtime(&options)?;
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(
@@ -540,6 +544,65 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
     println!(
         "activated assumed UTXO snapshot at {}:{} with {} entries/{} canonical bytes; background genesis validation remains required",
         manifest.height, manifest.block_hash, manifest.utxo_count, manifest.records_bytes
+    );
+    Ok(())
+}
+
+fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
+    let validation_dir = options
+        .finalize_assumeutxo
+        .as_ref()
+        .expect("caller checked snapshot finalization mode");
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("finalization parser requires data directory");
+    let active_path = data_dir.join("chainstate.redb");
+    let validation_path = validation_dir.join("chainstate.redb");
+    if !validation_path.is_file() {
+        return Err(format!(
+            "validation chainstate does not exist: {}",
+            validation_path.display()
+        ));
+    }
+    let active_canonical = fs::canonicalize(&active_path).map_err(|error| {
+        format!(
+            "resolve active chainstate {}: {error}",
+            active_path.display()
+        )
+    })?;
+    let validation_canonical = fs::canonicalize(&validation_path).map_err(|error| {
+        format!(
+            "resolve validation chainstate {}: {error}",
+            validation_path.display()
+        )
+    })?;
+    if active_canonical == validation_canonical {
+        return Err("validation chainstate must be separate from active chainstate".to_owned());
+    }
+    reject_legacy_split_chainstate(validation_dir)?;
+    let header_store =
+        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
+    let headers = header_store
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    let active =
+        RedbChainStore::open(active_path, options.network).map_err(|error| error.to_string())?;
+    let validation = RedbChainStore::open(validation_path, options.network)
+        .map_err(|error| error.to_string())?;
+    validation
+        .execution()
+        .bind_consensus_config(
+            &options.deployments.consensus_id(),
+            &DeploymentConfig::for_network(options.network).consensus_id(),
+        )
+        .map_err(|error| error.to_string())?;
+    let finalized = active
+        .finalize_assumed_snapshot(&validation, &headers)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "independent genesis validation matched assumed UTXO snapshot at {}:{} ({} entries/{} canonical bytes); assumed-state marker cleared",
+        finalized.base.height, finalized.base.hash, finalized.utxo_count, finalized.records_bytes
     );
     Ok(())
 }
@@ -1911,6 +1974,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut snapshot_utxo_count = None;
     let mut snapshot_records_bytes = None;
     let mut snapshot_records_sha256 = None;
+    let mut finalize_assumeutxo = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -2026,6 +2090,17 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 snapshot_path = Some(PathBuf::from(required_option_value(
                     &mut args,
                     "--assumeutxo-snapshot",
+                )?));
+            }
+            "--finalize-assumeutxo" => {
+                if finalize_assumeutxo.is_some() {
+                    return Err(
+                        "--finalize-assumeutxo cannot be supplied more than once".to_owned()
+                    );
+                }
+                finalize_assumeutxo = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--finalize-assumeutxo",
                 )?));
             }
             "--snapshot-height" => {
@@ -2189,6 +2264,25 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     };
+    if finalize_assumeutxo.is_some() {
+        if data_dir.is_none() {
+            return Err("--finalize-assumeutxo requires --data-dir".to_owned());
+        }
+        if snapshot.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+        {
+            return Err(
+                "snapshot finalization is offline and conflicts with snapshot activation, peer, fetch, headers-db, once, explorer, and wallet modes"
+                    .to_owned(),
+            );
+        }
+    }
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
             "--data-dir block execution currently supports only regtest and Signet".to_owned(),
@@ -2252,6 +2346,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         deployments,
         ibd_policy,
         snapshot,
+        finalize_assumeutxo,
     }))
 }
 
@@ -2316,7 +2411,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2728,6 +2823,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn offline_snapshot_cli_activates_and_reopens_the_assumed_base() {
         let directory = TempDir::new().unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
@@ -2782,6 +2878,7 @@ mod tests {
                 records_bytes: manifest.records_bytes,
                 records_sha256: manifest.records_sha256,
             }),
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -2795,6 +2892,104 @@ mod tests {
             Some(reopened.execution().tip().unwrap())
         );
         assert_eq!(reopened.get(outpoint).unwrap().unwrap().value_sats, 123);
+        let mut expected_utxo = reopened.get(outpoint).unwrap().unwrap();
+        expected_utxo.last_touched = expected_utxo.last_touched.saturating_add(10_000);
+        drop(reopened);
+
+        let validation_dir = directory.path().join("validation");
+        fs::create_dir(&validation_dir).unwrap();
+        let validation =
+            RedbChainStore::open(validation_dir.join("chainstate.redb"), Network::Regtest).unwrap();
+        validation
+            .execution()
+            .bind_consensus_config(
+                &DeploymentConfig::for_network(Network::Regtest).consensus_id(),
+                &DeploymentConfig::for_network(Network::Regtest).consensus_id(),
+            )
+            .unwrap();
+        validation
+            .commit_connect(
+                genesis.hash,
+                rbtc::execution_store::ExecutionTip {
+                    height: 1,
+                    hash: info.hash,
+                },
+                &[],
+                &[(outpoint, expected_utxo)],
+                &[],
+            )
+            .unwrap();
+        drop(validation);
+
+        run(Options {
+            remotes: vec![],
+            dns_seeds: None,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: Some(validation_dir),
+        })
+        .await
+        .unwrap();
+
+        let finalized =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(finalized.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(finalized.get(outpoint).unwrap().unwrap().value_sats, 123);
+    }
+
+    #[test]
+    fn parses_only_offline_assumeutxo_finalization() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-active",
+                "--finalize-assumeutxo",
+                "/tmp/rbtc-validation",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.finalize_assumeutxo,
+            Some(PathBuf::from("/tmp/rbtc-validation"))
+        );
+        for arguments in [
+            vec!["--network", "regtest", "--finalize-assumeutxo", "/tmp/v"],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--finalize-assumeutxo",
+                "/tmp/v",
+                "--connect",
+                "127.0.0.1:18444",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--finalize-assumeutxo",
+                "/tmp/v",
+                "--once",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]
@@ -3211,6 +3406,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -3252,6 +3448,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -3389,6 +3586,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3466,6 +3664,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3533,6 +3732,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3558,6 +3758,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3614,6 +3815,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -3664,6 +3866,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -3748,6 +3951,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap_err();
@@ -3875,6 +4079,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -3966,6 +4171,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4029,6 +4235,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();
@@ -4122,6 +4329,7 @@ mod tests {
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
                 snapshot: None,
+                finalize_assumeutxo: None,
             },
             local_nonce,
         )
@@ -4229,6 +4437,7 @@ mod tests {
             deployments: DeploymentConfig::for_network(Network::Signet),
             ibd_policy,
             snapshot: None,
+            finalize_assumeutxo: None,
         })
         .await
         .unwrap();

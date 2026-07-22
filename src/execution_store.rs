@@ -15,6 +15,9 @@ const TIP_KEY: &str = "tip";
 const CONSENSUS_CONFIG_KEY: &str = "consensus_config";
 const ASSUMED_SNAPSHOT_BASE_KEY: &str = "assumed_snapshot_base";
 const ASSUMED_SNAPSHOT_RECORDS_KEY: &str = "assumed_snapshot_records_sha256";
+const ASSUMED_SNAPSHOT_COUNT_KEY: &str = "assumed_snapshot_utxo_count";
+const ASSUMED_SNAPSHOT_BYTES_KEY: &str = "assumed_snapshot_records_bytes";
+const ASSUMED_SNAPSHOT_UTXO_SET_KEY: &str = "assumed_snapshot_utxo_set_sha256";
 
 /// Last block whose UTXO transition is recorded as complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +26,21 @@ pub struct ExecutionTip {
     pub height: u32,
     /// Hash at `height`.
     pub hash: BlockHash,
+}
+
+/// Durable identity of an assumed UTXO snapshot awaiting genesis validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssumedSnapshot {
+    /// Active-chain block represented by the snapshot.
+    pub base: ExecutionTip,
+    /// Exact number of canonical UTXO records.
+    pub utxo_count: u64,
+    /// Exact byte length of the canonical uncompressed record stream.
+    pub records_bytes: u64,
+    /// SHA-256 of the canonical uncompressed record stream.
+    pub records_sha256: [u8; 32],
+    /// SHA-256 of consensus UTXO fields, excluding local tier-aging time.
+    pub utxo_set_sha256: [u8; 32],
 }
 
 /// Execution-tip persistence failures.
@@ -73,6 +91,9 @@ pub enum ExecutionStoreError {
     /// An assumed UTXO snapshot can only initialize an untouched genesis state.
     #[error("assumed snapshot requires a fresh genesis chainstate")]
     SnapshotRequiresFreshChainstate,
+    /// The assumed-state marker changed while validation was being finalized.
+    #[error("assumed snapshot identity changed during finalization")]
+    AssumedSnapshotChanged,
 }
 
 /// redb-backed execution tip initialized to the selected network's genesis.
@@ -139,25 +160,30 @@ impl RedbExecutionStore {
 
     /// Returns the UTXO snapshot base that still requires background validation.
     pub fn assumed_snapshot_base(&self) -> Result<Option<ExecutionTip>, ExecutionStoreError> {
-        let transaction = self.db.begin_read()?;
-        let meta = transaction.open_table(META)?;
-        meta.get(ASSUMED_SNAPSHOT_BASE_KEY)?
-            .map(|value| decode_tip(value.value()))
-            .transpose()
+        self.assumed_snapshot()
+            .map(|snapshot| snapshot.map(|value| value.base))
     }
 
     /// Returns the authenticated canonical-record digest of the assumed snapshot.
     pub fn assumed_snapshot_records_sha256(&self) -> Result<Option<[u8; 32]>, ExecutionStoreError> {
+        self.assumed_snapshot()
+            .map(|snapshot| snapshot.map(|value| value.records_sha256))
+    }
+
+    /// Returns the complete authenticated identity of an assumed snapshot.
+    pub fn assumed_snapshot(&self) -> Result<Option<AssumedSnapshot>, ExecutionStoreError> {
         let transaction = self.db.begin_read()?;
         let meta = transaction.open_table(META)?;
-        meta.get(ASSUMED_SNAPSHOT_RECORDS_KEY)?
-            .map(|value| {
-                value
-                    .value()
-                    .try_into()
-                    .map_err(|_| ExecutionStoreError::Malformed("assumed snapshot digest length"))
-            })
-            .transpose()
+        decode_assumed_snapshot(&meta)
+    }
+
+    /// Returns the consensus configuration bound to this execution database.
+    pub fn consensus_config(&self) -> Result<Option<Vec<u8>>, ExecutionStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        Ok(meta
+            .get(CONSENSUS_CONFIG_KEY)?
+            .map(|value| value.value().to_vec()))
     }
 
     /// Binds this execution database to a canonical consensus configuration.
@@ -266,9 +292,9 @@ pub(crate) fn advance_transaction(
 
 pub(crate) fn assume_snapshot_transaction(
     transaction: &WriteTransaction,
-    anchor: ExecutionTip,
-    records_sha256: &[u8; 32],
+    snapshot: AssumedSnapshot,
 ) -> Result<(), ExecutionStoreError> {
+    let anchor = snapshot.base;
     if anchor.height == 0 {
         return Err(ExecutionStoreError::SnapshotRequiresFreshChainstate);
     }
@@ -281,9 +307,18 @@ pub(crate) fn assume_snapshot_transaction(
         .get(GENESIS_KEY)?
         .ok_or(ExecutionStoreError::Malformed("missing genesis hash"))?;
     let genesis = decode_hash(genesis_value.value(), "genesis hash")?;
-    let has_snapshot = meta.get(ASSUMED_SNAPSHOT_BASE_KEY)?.is_some();
-    let has_snapshot_digest = meta.get(ASSUMED_SNAPSHOT_RECORDS_KEY)?.is_some();
-    if current.height != 0 || current.hash != genesis || has_snapshot || has_snapshot_digest {
+    let has_snapshot = [
+        ASSUMED_SNAPSHOT_BASE_KEY,
+        ASSUMED_SNAPSHOT_RECORDS_KEY,
+        ASSUMED_SNAPSHOT_COUNT_KEY,
+        ASSUMED_SNAPSHOT_BYTES_KEY,
+        ASSUMED_SNAPSHOT_UTXO_SET_KEY,
+    ]
+    .into_iter()
+    .try_fold(false, |present, key| {
+        meta.get(key).map(|value| present || value.is_some())
+    })?;
+    if current.height != 0 || current.hash != genesis || has_snapshot {
         return Err(ExecutionStoreError::SnapshotRequiresFreshChainstate);
     }
     drop(current_value);
@@ -291,8 +326,103 @@ pub(crate) fn assume_snapshot_transaction(
     let encoded = encode_tip(anchor);
     meta.insert(TIP_KEY, encoded.as_slice())?;
     meta.insert(ASSUMED_SNAPSHOT_BASE_KEY, encoded.as_slice())?;
-    meta.insert(ASSUMED_SNAPSHOT_RECORDS_KEY, records_sha256.as_slice())?;
+    meta.insert(
+        ASSUMED_SNAPSHOT_RECORDS_KEY,
+        snapshot.records_sha256.as_slice(),
+    )?;
+    meta.insert(
+        ASSUMED_SNAPSHOT_COUNT_KEY,
+        snapshot.utxo_count.to_le_bytes().as_slice(),
+    )?;
+    meta.insert(
+        ASSUMED_SNAPSHOT_BYTES_KEY,
+        snapshot.records_bytes.to_le_bytes().as_slice(),
+    )?;
+    meta.insert(
+        ASSUMED_SNAPSHOT_UTXO_SET_KEY,
+        snapshot.utxo_set_sha256.as_slice(),
+    )?;
     Ok(())
+}
+
+pub(crate) fn clear_assumed_snapshot_transaction(
+    transaction: &WriteTransaction,
+    expected: AssumedSnapshot,
+) -> Result<(), ExecutionStoreError> {
+    let mut meta = transaction.open_table(META)?;
+    if decode_assumed_snapshot(&meta)? != Some(expected) {
+        return Err(ExecutionStoreError::AssumedSnapshotChanged);
+    }
+    for key in [
+        ASSUMED_SNAPSHOT_BASE_KEY,
+        ASSUMED_SNAPSHOT_RECORDS_KEY,
+        ASSUMED_SNAPSHOT_COUNT_KEY,
+        ASSUMED_SNAPSHOT_BYTES_KEY,
+        ASSUMED_SNAPSHOT_UTXO_SET_KEY,
+    ] {
+        meta.remove(key)?;
+    }
+    Ok(())
+}
+
+fn decode_assumed_snapshot(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Option<AssumedSnapshot>, ExecutionStoreError> {
+    let base = meta
+        .get(ASSUMED_SNAPSHOT_BASE_KEY)?
+        .map(|value| value.value().to_vec());
+    let digest = meta
+        .get(ASSUMED_SNAPSHOT_RECORDS_KEY)?
+        .map(|value| value.value().to_vec());
+    let count = meta
+        .get(ASSUMED_SNAPSHOT_COUNT_KEY)?
+        .map(|value| value.value().to_vec());
+    let bytes = meta
+        .get(ASSUMED_SNAPSHOT_BYTES_KEY)?
+        .map(|value| value.value().to_vec());
+    let utxo_set = meta
+        .get(ASSUMED_SNAPSHOT_UTXO_SET_KEY)?
+        .map(|value| value.value().to_vec());
+    if [&base, &digest, &count, &bytes, &utxo_set]
+        .into_iter()
+        .all(Option::is_none)
+    {
+        return Ok(None);
+    }
+    let base = base.ok_or(ExecutionStoreError::Malformed(
+        "incomplete assumed snapshot identity",
+    ))?;
+    let digest = digest.ok_or(ExecutionStoreError::Malformed(
+        "incomplete assumed snapshot identity",
+    ))?;
+    let count = count.ok_or(ExecutionStoreError::Malformed(
+        "incomplete assumed snapshot identity",
+    ))?;
+    let bytes = bytes.ok_or(ExecutionStoreError::Malformed(
+        "incomplete assumed snapshot identity",
+    ))?;
+    let utxo_set = utxo_set.ok_or(ExecutionStoreError::Malformed(
+        "incomplete assumed snapshot identity",
+    ))?;
+    Ok(Some(AssumedSnapshot {
+        base: decode_tip(&base)?,
+        records_sha256: digest
+            .try_into()
+            .map_err(|_| ExecutionStoreError::Malformed("assumed snapshot digest length"))?,
+        utxo_count: decode_u64(&count, "assumed snapshot UTXO count")?,
+        records_bytes: decode_u64(&bytes, "assumed snapshot records length")?,
+        utxo_set_sha256: utxo_set.try_into().map_err(|_| {
+            ExecutionStoreError::Malformed("assumed snapshot UTXO-set digest length")
+        })?,
+    }))
+}
+
+fn decode_u64(bytes: &[u8], field: &'static str) -> Result<u64, ExecutionStoreError> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| ExecutionStoreError::Malformed(field))?,
+    ))
 }
 
 pub(crate) fn rewind_transaction(
@@ -346,6 +476,34 @@ mod tests {
 
     use super::*;
     use crate::deployments::DeploymentConfig;
+
+    #[test]
+    fn incomplete_assumed_snapshot_identity_fails_closed() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+                .unwrap();
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.insert(
+                ASSUMED_SNAPSHOT_BASE_KEY,
+                encode_tip(ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([1; 32]),
+                })
+                .as_slice(),
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        assert!(matches!(
+            store.assumed_snapshot(),
+            Err(ExecutionStoreError::Malformed(
+                "incomplete assumed snapshot identity"
+            ))
+        ));
+    }
 
     #[test]
     fn advances_and_recovers_tip_while_rejecting_gaps() {
