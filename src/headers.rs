@@ -14,7 +14,7 @@ use bitcoin::{
 };
 use thiserror::Error;
 
-use crate::deployments::minimum_block_version;
+use crate::deployments::DeploymentConfig;
 
 /// Bitcoin Core's maximum permitted future block timestamp offset.
 pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
@@ -103,6 +103,7 @@ pub enum HeaderError {
 #[derive(Clone)]
 pub struct HeaderDag {
     params: Params,
+    deployments: DeploymentConfig,
     headers: HashMap<BlockHash, HeaderInfo>,
     active_tip: BlockHash,
 }
@@ -111,6 +112,13 @@ impl HeaderDag {
     /// Starts a DAG at the selected network's consensus genesis header.
     #[must_use]
     pub fn new(network: Network) -> Self {
+        Self::with_deployments(DeploymentConfig::for_network(network))
+    }
+
+    /// Starts a DAG using an explicitly selected deployment configuration.
+    #[must_use]
+    pub fn with_deployments(deployments: DeploymentConfig) -> Self {
+        let network = deployments.network();
         let header = bitcoin::blockdata::constants::genesis_block(network).header;
         let hash = header.block_hash();
         let info = HeaderInfo {
@@ -123,6 +131,7 @@ impl HeaderDag {
         headers.insert(hash, info);
         Self {
             params: Params::new(network),
+            deployments,
             headers,
             active_tip: hash,
         }
@@ -296,7 +305,7 @@ impl HeaderDag {
             .height
             .checked_add(1)
             .ok_or(HeaderError::HeightOverflow)?;
-        let required_version = minimum_block_version(self.params.network, height);
+        let required_version = self.deployments.minimum_block_version(height);
         let actual_version = header.version.to_consensus();
         if actual_version < required_version {
             return Err(HeaderError::ObsoleteVersion {
@@ -502,13 +511,15 @@ mod tests {
 
     #[test]
     fn contextual_insert_enforces_buried_minimum_block_versions() {
-        assert_eq!(minimum_block_version(Network::Bitcoin, 227_930), 1);
-        assert_eq!(minimum_block_version(Network::Bitcoin, 227_931), 2);
-        assert_eq!(minimum_block_version(Network::Bitcoin, 363_725), 3);
-        assert_eq!(minimum_block_version(Network::Bitcoin, 388_381), 4);
-        assert_eq!(minimum_block_version(Network::Testnet, 21_111), 2);
-        assert_eq!(minimum_block_version(Network::Testnet, 330_776), 3);
-        assert_eq!(minimum_block_version(Network::Testnet, 581_885), 4);
+        let bitcoin = DeploymentConfig::for_network(Network::Bitcoin);
+        assert_eq!(bitcoin.minimum_block_version(227_930), 1);
+        assert_eq!(bitcoin.minimum_block_version(227_931), 2);
+        assert_eq!(bitcoin.minimum_block_version(363_725), 3);
+        assert_eq!(bitcoin.minimum_block_version(388_381), 4);
+        let testnet = DeploymentConfig::for_network(Network::Testnet);
+        assert_eq!(testnet.minimum_block_version(21_111), 2);
+        assert_eq!(testnet.minimum_block_version(330_776), 3);
+        assert_eq!(testnet.minimum_block_version(581_885), 4);
 
         let mut dag = HeaderDag::new(Network::Regtest);
         let genesis = dag.active_tip();
@@ -527,6 +538,25 @@ mod tests {
                 actual: 3
             })
         ));
+
+        let mut delayed = DeploymentConfig::for_network(Network::Regtest);
+        delayed.apply_test_activation_height("bip34@10").unwrap();
+        delayed.apply_test_activation_height("dersig@10").unwrap();
+        delayed.apply_test_activation_height("cltv@10").unwrap();
+        let mut dag = HeaderDag::with_deployments(delayed);
+        let genesis = dag.active_tip();
+        let mut version_one = mine_child(genesis.hash, genesis.header.time + 1);
+        version_one.version = Version::from_consensus(1);
+        version_one.nonce = 0;
+        while version_one.validate_pow(target).is_err() {
+            version_one.nonce = version_one.nonce.checked_add(1).unwrap();
+        }
+        assert_eq!(
+            dag.insert_contextual(version_one, genesis.header.time + 1)
+                .unwrap()
+                .height,
+            1
+        );
     }
 
     #[test]

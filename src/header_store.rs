@@ -14,7 +14,10 @@ use bitcoin::{
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
-use crate::headers::{HeaderDag, HeaderError};
+use crate::{
+    deployments::DeploymentConfig,
+    headers::{HeaderDag, HeaderError},
+};
 
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("header_insertion_order");
@@ -158,10 +161,19 @@ impl RedbHeaderStore {
         network: Network,
         adjusted_time: u32,
     ) -> Result<HeaderDag, HeaderStoreError> {
+        self.load_dag_with_deployments(DeploymentConfig::for_network(network), adjusted_time)
+    }
+
+    /// Rebuilds the header DAG under an explicitly selected consensus configuration.
+    pub fn load_dag_with_deployments(
+        &self,
+        deployments: DeploymentConfig,
+        adjusted_time: u32,
+    ) -> Result<HeaderDag, HeaderStoreError> {
         let transaction = self.db.begin_read()?;
         let order = transaction.open_table(INSERTION_ORDER)?;
         let headers = transaction.open_table(HEADERS)?;
-        let mut dag = HeaderDag::new(network);
+        let mut dag = HeaderDag::with_deployments(deployments);
         for row in order.iter()? {
             let (_sequence, hash) = row?;
             let hash = BlockHash::from_byte_array(
@@ -242,5 +254,34 @@ mod tests {
             .unwrap();
         assert_eq!(restored.active_tip().hash, second_info.hash);
         assert_eq!(restored.active_tip().height, 2);
+    }
+
+    #[test]
+    fn replay_uses_selected_buried_activation_heights() {
+        let directory = TempDir::new().unwrap();
+        let store = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
+        let genesis = HeaderDag::new(Network::Regtest).active_tip();
+        let mut header = mine_child(genesis.hash, genesis.header.time + 1);
+        header.version = Version::from_consensus(1);
+        header.nonce = 0;
+        while header.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_err() {
+            header.nonce = header.nonce.checked_add(1).unwrap();
+        }
+        store.append(header).unwrap();
+        assert!(matches!(
+            store.load_dag(Network::Regtest, header.time),
+            Err(HeaderStoreError::Header(
+                HeaderError::ObsoleteVersion { .. }
+            ))
+        ));
+
+        let mut deployments = DeploymentConfig::for_network(Network::Regtest);
+        for value in ["bip34@10", "dersig@10", "cltv@10"] {
+            deployments.apply_test_activation_height(value).unwrap();
+        }
+        let restored = store
+            .load_dag_with_deployments(deployments, header.time)
+            .unwrap();
+        assert_eq!(restored.active_tip().hash, header.block_hash());
     }
 }

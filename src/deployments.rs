@@ -22,8 +22,18 @@ const TAPROOT_TIMEOUT: u32 = 1_628_640_000;
 const ALWAYS_ACTIVE: i64 = -1;
 const NEVER_ACTIVE: i64 = -2;
 const CONFIG_ENCODING_VERSION: u8 = 1;
+const BURIED_CONFIG_ENCODING_VERSION: u8 = 2;
 const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const REGTEST_HALVING_INTERVAL: u32 = 150;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActivationHeights {
+    bip34: u32,
+    bip65: u32,
+    bip66: u32,
+    csv: u32,
+    segwit: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ThresholdState {
@@ -48,6 +58,7 @@ struct VersionBitsParams {
 pub struct DeploymentConfig {
     network: Network,
     taproot: VersionBitsParams,
+    activation_heights: ActivationHeights,
 }
 
 /// Invalid deployment configuration.
@@ -56,6 +67,9 @@ pub enum DeploymentConfigError {
     /// Core-compatible version-bits overrides are a regtest-only facility.
     #[error("--vbparams is only supported with --network regtest")]
     RegtestOnly,
+    /// Core-compatible buried-deployment overrides are a regtest-only facility.
+    #[error("--testactivationheight is only supported with --network regtest")]
+    TestActivationRegtestOnly,
     /// The value did not have Core's deployment:start:end[:min_height] shape.
     #[error("malformed --vbparams; expected deployment:start:end[:min_activation_height]")]
     Malformed,
@@ -71,6 +85,15 @@ pub enum DeploymentConfigError {
     /// Minimum activation height was not a signed 32-bit integer.
     #[error("invalid version-bits minimum activation height: {0}")]
     MinimumActivationHeight(String),
+    /// A buried-deployment override did not have Core's name@height shape.
+    #[error("malformed --testactivationheight; expected name@height")]
+    TestActivationMalformed,
+    /// The buried deployment name is not supported by Bitcoin Core 26.
+    #[error("unsupported buried deployment: {0}")]
+    UnknownBuriedDeployment(String),
+    /// The buried activation height was outside Core's accepted range.
+    #[error("invalid buried activation height: {0}")]
+    BuriedActivationHeight(String),
     /// The deployment configuration and header DAG select different networks.
     #[error("deployment configuration network does not match header network")]
     NetworkMismatch,
@@ -110,7 +133,11 @@ impl DeploymentConfig {
                 min_activation_height: 0,
             },
         };
-        Self { network, taproot }
+        Self {
+            network,
+            taproot,
+            activation_heights: activation_heights(network),
+        }
     }
 
     /// Applies one Bitcoin Core-compatible regtest `-vbparams` value.
@@ -151,17 +178,70 @@ impl DeploymentConfig {
         Ok(())
     }
 
+    /// Applies one Bitcoin Core-compatible regtest `name@height` buried override.
+    pub fn apply_test_activation_height(
+        &mut self,
+        value: &str,
+    ) -> Result<(), DeploymentConfigError> {
+        if self.network != Network::Regtest {
+            return Err(DeploymentConfigError::TestActivationRegtestOnly);
+        }
+        let (name, height) = value
+            .split_once('@')
+            .ok_or(DeploymentConfigError::TestActivationMalformed)?;
+        let height = height
+            .parse::<u32>()
+            .ok()
+            .filter(|height| *height < i32::MAX as u32)
+            .ok_or_else(|| DeploymentConfigError::BuriedActivationHeight(value.to_owned()))?;
+        match name {
+            "bip34" => self.activation_heights.bip34 = height,
+            "dersig" => self.activation_heights.bip66 = height,
+            "cltv" => self.activation_heights.bip65 = height,
+            "csv" => self.activation_heights.csv = height,
+            "segwit" => self.activation_heights.segwit = height,
+            _ => {
+                return Err(DeploymentConfigError::UnknownBuriedDeployment(
+                    name.to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical bytes that bind persisted execution state to these settings.
     #[must_use]
-    pub fn consensus_id(self) -> [u8; 29] {
-        let mut encoded = [0_u8; 29];
+    pub fn consensus_id(self) -> Vec<u8> {
+        let mut encoded = vec![0_u8; 29];
         encoded[0] = CONFIG_ENCODING_VERSION;
         encoded[1..5].copy_from_slice(&self.taproot.period.to_le_bytes());
         encoded[5..9].copy_from_slice(&self.taproot.threshold.to_le_bytes());
         encoded[9..17].copy_from_slice(&self.taproot.start_time.to_le_bytes());
         encoded[17..25].copy_from_slice(&self.taproot.timeout.to_le_bytes());
         encoded[25..29].copy_from_slice(&self.taproot.min_activation_height.to_le_bytes());
+        if self.activation_heights != activation_heights(self.network) {
+            encoded[0] = BURIED_CONFIG_ENCODING_VERSION;
+            for height in [
+                self.activation_heights.bip34,
+                self.activation_heights.bip65,
+                self.activation_heights.bip66,
+                self.activation_heights.csv,
+                self.activation_heights.segwit,
+            ] {
+                encoded.extend_from_slice(&height.to_le_bytes());
+            }
+        }
         encoded
+    }
+
+    /// Returns the network whose consensus parameters this value describes.
+    #[must_use]
+    pub const fn network(self) -> Network {
+        self.network
+    }
+
+    pub(crate) const fn minimum_block_version(self, height: u32) -> i32 {
+        minimum_block_version_for_heights(self.activation_heights, height)
     }
 }
 
@@ -174,18 +254,37 @@ pub fn block_deployment_context(
     block_time: u32,
     taproot_active: bool,
 ) -> BlockDeploymentContext {
+    block_deployment_context_with_config(
+        DeploymentConfig::for_network(network),
+        height,
+        block_hash,
+        block_time,
+        taproot_active,
+    )
+}
+
+/// Derives candidate consensus flags using an explicitly selected configuration.
+#[must_use]
+pub fn block_deployment_context_with_config(
+    config: DeploymentConfig,
+    height: u32,
+    block_hash: BlockHash,
+    block_time: u32,
+    taproot_active: bool,
+) -> BlockDeploymentContext {
+    let network = config.network;
     let bip30_exception = is_bip30_exception(network, height, block_hash);
     let subsidy_sats = block_subsidy_with_interval(height, halving_interval(network));
     if let Some(script_flags) = script_flag_exception(network, block_hash) {
         return BlockDeploymentContext {
             script_flags,
-            bip34_active: height >= activation_heights(network).bip34,
-            csv_active: height >= activation_heights(network).csv,
+            bip34_active: height >= config.activation_heights.bip34,
+            csv_active: height >= config.activation_heights.csv,
             bip30_exception,
             subsidy_sats,
         };
     }
-    let heights = activation_heights(network);
+    let heights = config.activation_heights;
     let mut script_flags = bitcoinconsensus::VERIFY_NONE;
     if block_time >= 1_333_238_400 {
         script_flags |= bitcoinconsensus::VERIFY_P2SH;
@@ -312,15 +411,6 @@ fn signals_taproot(version: i32) -> bool {
     version & VERSION_BITS_TOP_MASK == VERSION_BITS_TOP_BITS && version & (1 << TAPROOT_BIT) != 0
 }
 
-#[derive(Clone, Copy)]
-struct ActivationHeights {
-    bip34: u32,
-    bip65: u32,
-    bip66: u32,
-    csv: u32,
-    segwit: u32,
-}
-
 const fn activation_heights(network: Network) -> ActivationHeights {
     match network {
         Network::Bitcoin => ActivationHeights {
@@ -354,8 +444,7 @@ const fn activation_heights(network: Network) -> ActivationHeights {
     }
 }
 
-pub(crate) const fn minimum_block_version(network: Network, height: u32) -> i32 {
-    let heights = activation_heights(network);
+const fn minimum_block_version_for_heights(heights: ActivationHeights, height: u32) -> i32 {
     if height >= heights.bip65 {
         4
     } else if height >= heights.bip66 {
@@ -541,6 +630,8 @@ mod tests {
     fn parses_core_compatible_regtest_vbparams_and_special_states() {
         let headers = HeaderDag::new(Network::Regtest);
         let mut config = DeploymentConfig::for_network(Network::Regtest);
+        assert_eq!(config.consensus_id().len(), 29);
+        assert_eq!(config.consensus_id()[0], CONFIG_ENCODING_VERSION);
         config.apply_vbparams("taproot:-2:0").unwrap();
         assert!(!taproot_active(&headers, 1, config).unwrap());
 
@@ -551,6 +642,91 @@ mod tests {
         assert_ne!(
             config.consensus_id(),
             DeploymentConfig::for_network(Network::Regtest).consensus_id()
+        );
+        assert_eq!(config.consensus_id().len(), 29);
+    }
+
+    #[test]
+    fn core_compatible_buried_overrides_select_every_consensus_boundary() {
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        for value in ["bip34@10", "dersig@11", "cltv@12", "csv@13", "segwit@14"] {
+            config.apply_test_activation_height(value).unwrap();
+        }
+        let context = |height| {
+            block_deployment_context_with_config(config, height, BlockHash::all_zeros(), 0, false)
+        };
+        assert!(!context(9).bip34_active);
+        assert!(context(10).bip34_active);
+        assert_eq!(config.minimum_block_version(9), 1);
+        assert_eq!(config.minimum_block_version(10), 2);
+        assert_eq!(config.minimum_block_version(11), 3);
+        assert_eq!(config.minimum_block_version(12), 4);
+        assert_eq!(
+            context(10).script_flags & bitcoinconsensus::VERIFY_DERSIG,
+            0
+        );
+        assert_ne!(
+            context(11).script_flags & bitcoinconsensus::VERIFY_DERSIG,
+            0
+        );
+        assert_ne!(
+            context(12).script_flags & bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY,
+            0
+        );
+        assert!(!context(12).csv_active);
+        assert!(context(13).csv_active);
+        assert_ne!(
+            context(13).script_flags & bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
+            0
+        );
+        assert_eq!(
+            context(13).script_flags & bitcoinconsensus::VERIFY_WITNESS,
+            0
+        );
+        assert_ne!(
+            context(14).script_flags & bitcoinconsensus::VERIFY_WITNESS,
+            0
+        );
+        assert_eq!(config.consensus_id().len(), 49);
+        assert_eq!(config.consensus_id()[0], BURIED_CONFIG_ENCODING_VERSION);
+        let original_id = config.consensus_id();
+        config.apply_test_activation_height("bip34@11").unwrap();
+        assert_ne!(config.consensus_id(), original_id);
+    }
+
+    #[test]
+    fn buried_overrides_are_strict_regtest_only_and_last_value_wins() {
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        config.apply_test_activation_height("bip34@10").unwrap();
+        config.apply_test_activation_height("bip34@20").unwrap();
+        assert!(
+            !block_deployment_context_with_config(config, 19, BlockHash::all_zeros(), 0, false,)
+                .bip34_active
+        );
+        assert_eq!(
+            config.apply_test_activation_height("bip66@10"),
+            Err(DeploymentConfigError::UnknownBuriedDeployment(
+                "bip66".to_owned()
+            ))
+        );
+        assert_eq!(
+            config.apply_test_activation_height("csv"),
+            Err(DeploymentConfigError::TestActivationMalformed)
+        );
+        assert_eq!(
+            config.apply_test_activation_height("csv@2147483647"),
+            Err(DeploymentConfigError::BuriedActivationHeight(
+                "csv@2147483647".to_owned()
+            ))
+        );
+        assert!(
+            config
+                .apply_test_activation_height("csv@2147483646")
+                .is_ok()
+        );
+        assert_eq!(
+            DeploymentConfig::for_network(Network::Bitcoin).apply_test_activation_height("csv@10"),
+            Err(DeploymentConfigError::TestActivationRegtestOnly)
         );
     }
 

@@ -21,7 +21,7 @@ use rbtc::{
     block_execution::connect_active_block,
     blockchain::block_subsidy_with_interval,
     chain_store::RedbChainStore,
-    deployments::block_deployment_context,
+    deployments::{DeploymentConfig, block_deployment_context_with_config},
     headers::HeaderDag,
     utxo::{OutPointKey, UtxoStore},
 };
@@ -36,11 +36,16 @@ struct CoreNode {
 
 impl CoreNode {
     fn start(bitcoind: &Path) -> Self {
+        Self::start_with_args(bitcoind, &[])
+    }
+
+    fn start_with_args(bitcoind: &Path, extra_args: &[&str]) -> Self {
         let cli = bitcoind.with_file_name("bitcoin-cli");
         assert!(cli.is_file(), "bitcoin-cli must be next to bitcoind");
         let data_dir = TempDir::new().unwrap().keep();
         let rpc_port = unused_port();
-        let child = Command::new(bitcoind)
+        let mut command = Command::new(bitcoind);
+        command
             .args([
                 "-regtest",
                 "-server=1",
@@ -51,12 +56,12 @@ impl CoreNode {
                 "-rpcbind=127.0.0.1",
                 "-rpcallowip=127.0.0.1",
             ])
+            .args(extra_args)
             .arg(format!("-datadir={}", data_dir.display()))
             .arg(format!("-rpcport={rpc_port}"))
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        let child = command.spawn().unwrap();
         let mut node = Self {
             child: Some(child),
             cli,
@@ -183,17 +188,21 @@ struct RbtcOutcome {
 }
 
 fn rbtc_outcome(blocks: &[Block]) -> RbtcOutcome {
+    rbtc_outcome_with_config(blocks, DeploymentConfig::for_network(Network::Regtest))
+}
+
+fn rbtc_outcome_with_config(blocks: &[Block], deployments: DeploymentConfig) -> RbtcOutcome {
     assert!(!blocks.is_empty());
     let directory = TempDir::new().unwrap();
     let store =
         RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest).unwrap();
-    let mut headers = HeaderDag::new(Network::Regtest);
+    let mut headers = HeaderDag::with_deployments(deployments);
     let mut accepted = true;
     for (offset, block) in blocks.iter().enumerate() {
         let height = u32::try_from(offset + 1).unwrap();
         headers.insert_contextual(block.header, u32::MAX).unwrap();
-        let context = block_deployment_context(
-            Network::Regtest,
+        let context = block_deployment_context_with_config(
+            deployments,
             height,
             block.block_hash(),
             block.header.time,
@@ -424,6 +433,63 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
 
     assert!(core.submit(&valid).is_empty());
     let valid_outcome = rbtc_outcome(&[first, valid]);
+    assert!(valid_outcome.accepted);
+    assert_eq!(valid_outcome.tip_height, 2);
+    assert!(valid_outcome.candidate_undo);
+    assert!(valid_outcome.candidate_output);
+    assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "2");
+}
+
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
+fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
+    let bitcoind = PathBuf::from(
+        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
+    );
+    let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=bip34@2"]);
+    assert!(
+        core.rpc(&["getnetworkinfo"])
+            .unwrap()
+            .contains("\"version\": 260000")
+    );
+    let mut deployments = DeploymentConfig::for_network(Network::Regtest);
+    deployments.apply_test_activation_height("bip34@2").unwrap();
+
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let subsidy = block_subsidy_with_interval(1, 150);
+    let mut pre_activation_coinbase = coinbase(1, subsidy);
+    pre_activation_coinbase.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00]);
+    let first = mine_block(
+        genesis.block_hash(),
+        genesis.header.time + 1,
+        vec![pre_activation_coinbase],
+    );
+    assert!(core.submit(&first).is_empty());
+    let first_outcome = rbtc_outcome_with_config(std::slice::from_ref(&first), deployments);
+    assert!(first_outcome.accepted);
+    assert_eq!(first_outcome.tip_height, 1);
+
+    let mut wrong_coinbase = coinbase(2, subsidy);
+    wrong_coinbase.input[0].script_sig = ScriptBuf::from_bytes(vec![0x51, 0x00]);
+    let wrong = mine_block(
+        first.block_hash(),
+        first.header.time + 1,
+        vec![wrong_coinbase],
+    );
+    assert_eq!(core.submit(&wrong), "bad-cb-height");
+    let wrong_outcome = rbtc_outcome_with_config(&[first.clone(), wrong], deployments);
+    assert!(!wrong_outcome.accepted);
+    assert_eq!(wrong_outcome.tip_height, 1);
+    assert!(!wrong_outcome.candidate_undo);
+    assert!(!wrong_outcome.candidate_output);
+
+    let valid = mine_block(
+        first.block_hash(),
+        first.header.time + 2,
+        vec![coinbase(2, subsidy)],
+    );
+    assert!(core.submit(&valid).is_empty());
+    let valid_outcome = rbtc_outcome_with_config(&[first, valid], deployments);
     assert!(valid_outcome.accepted);
     assert_eq!(valid_outcome.tip_height, 2);
     assert!(valid_outcome.candidate_undo);

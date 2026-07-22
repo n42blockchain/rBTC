@@ -20,7 +20,7 @@ use rbtc::{
     block_execution::{connect_active_block, connect_active_blocks, disconnect_execution_tip},
     blockchain::{AppliedBlock, validate_block_structure},
     chain_store::RedbChainStore,
-    deployments::{DeploymentConfig, block_deployment_context, taproot_active},
+    deployments::{DeploymentConfig, block_deployment_context_with_config, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
@@ -189,7 +189,7 @@ async fn run(options: Options) -> Result<(), String> {
     }
 
     if let Some(path) = options.headers_db {
-        let headers = sync_headers(&mut session, options.network, path).await?;
+        let headers = sync_headers(&mut session, options.deployments, path).await?;
         let status = options
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
@@ -213,12 +213,12 @@ async fn run(options: Options) -> Result<(), String> {
 
 async fn sync_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    network: Network,
+    deployments: DeploymentConfig,
     path: PathBuf,
 ) -> Result<HeaderDag, String> {
     let store = RedbHeaderStore::open(path).map_err(|error| error.to_string())?;
     let mut dag = store
-        .load_dag(network, unix_time()?)
+        .load_dag_with_deployments(deployments, unix_time()?)
         .map_err(|error| error.to_string())?;
     println!(
         "resuming headers-first sync from height {} (local-clock fallback until network-time aggregation lands)",
@@ -302,7 +302,7 @@ async fn sync_regtest_node(
         Some(address) => Some(ExplorerServer::bind(address, Arc::clone(&explorer)).await?),
         None => None,
     };
-    let mut headers = sync_headers(session, network, headers_path.clone()).await?;
+    let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
         if let Some(server) = &mut explorer_server {
             server.ensure_running().await?;
@@ -333,7 +333,6 @@ async fn sync_regtest_node(
 
         reconcile_ledger(
             session,
-            network,
             deployment_config,
             &headers,
             execution_store,
@@ -342,7 +341,6 @@ async fn sync_regtest_node(
         .await?;
         reconcile_explorer(
             session,
-            network,
             deployment_config,
             &headers,
             execution_store,
@@ -384,12 +382,11 @@ async fn sync_regtest_node(
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                headers = sync_headers(session, network, headers_path.clone()).await?;
+                headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
                 continue 'resync;
             }
             download_execute_batch(
                 session,
-                network,
                 deployment_config,
                 &headers,
                 &chainstate,
@@ -403,7 +400,6 @@ async fn sync_regtest_node(
 
 async fn reconcile_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
@@ -447,20 +443,12 @@ async fn reconcile_ledger(
                     on_active_chain = false;
                     break;
                 }
-                validate_archive_block(
-                    network,
-                    deployment_config,
-                    headers,
-                    height,
-                    expected.hash,
-                    &block,
-                )?;
+                validate_archive_block(deployment_config, headers, height, expected.hash, &block)?;
             }
             if on_active_chain {
                 let preceding_height = staged.manifest.first_height.saturating_sub(1);
                 backfill_ledger(
                     session,
-                    network,
                     deployment_config,
                     headers,
                     ledger,
@@ -479,20 +467,11 @@ async fn reconcile_ledger(
         }
     }
 
-    backfill_ledger(
-        session,
-        network,
-        deployment_config,
-        headers,
-        ledger,
-        tip.height,
-    )
-    .await
+    backfill_ledger(session, deployment_config, headers, ledger, tip.height).await
 }
 
 async fn backfill_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
@@ -540,7 +519,6 @@ async fn backfill_ledger(
         let mut serialized = Vec::with_capacity(blocks.len());
         for (expected, block) in expected.iter().zip(&blocks) {
             validate_archive_block(
-                network,
                 deployment_config,
                 headers,
                 expected.height,
@@ -563,7 +541,6 @@ async fn backfill_ledger(
 }
 
 fn validate_archive_block(
-    network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     height: u32,
@@ -576,8 +553,8 @@ fn validate_archive_block(
             "archive block {actual} does not match active block {expected_hash} at height {height}"
         ));
     }
-    let deployments = block_deployment_context(
-        network,
+    let deployments = block_deployment_context_with_config(
+        deployment_config,
         height,
         expected_hash,
         block.header.time,
@@ -595,7 +572,6 @@ fn validate_archive_block(
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_explorer(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
@@ -677,7 +653,6 @@ async fn reconcile_explorer(
         }
         for (expected, block) in expected.iter().zip(&blocks) {
             validate_archive_block(
-                network,
                 deployment_config,
                 headers,
                 expected.height,
@@ -707,7 +682,6 @@ async fn reconcile_explorer(
 #[allow(clippy::too_many_arguments)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    network: Network,
     deployment_config: DeploymentConfig,
     headers: &HeaderDag,
     chainstate: &RedbChainStore,
@@ -749,7 +723,6 @@ async fn download_execute_batch(
         .map_err(|error| error.to_string())?;
     for (expected, block) in expected.iter().zip(&blocks) {
         validate_archive_block(
-            network,
             deployment_config,
             headers,
             expected.height,
@@ -765,8 +738,8 @@ async fn download_execute_batch(
         .iter()
         .zip(&blocks)
         .map(|(expected, block)| {
-            Ok(block_deployment_context(
-                network,
+            Ok(block_deployment_context_with_config(
+                deployment_config,
                 expected.height,
                 expected.hash,
                 block.header.time,
@@ -850,6 +823,7 @@ fn unix_time() -> Result<u32, String> {
         .map_err(|_| "system clock does not fit Bitcoin timestamp range".to_owned())
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut args = args.peekable();
     if args.peek().is_none() {
@@ -864,6 +838,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut once = false;
     let mut explorer_listen = None;
     let mut vbparams = Vec::new();
+    let mut test_activation_heights = Vec::new();
     let mut minimum_chainwork = None;
     let mut assume_valid = None;
     while let Some(argument) = args.next() {
@@ -918,6 +893,10 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             "--vbparams" => {
                 vbparams.push(required_option_value(&mut args, "--vbparams")?);
             }
+            "--testactivationheight" => {
+                test_activation_heights
+                    .push(required_option_value(&mut args, "--testactivationheight")?);
+            }
             "--minimum-chainwork" => {
                 minimum_chainwork = Some(required_option_value(&mut args, "--minimum-chainwork")?);
             }
@@ -932,7 +911,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
-    let deployments = parse_deployment_config(network, data_dir.is_some(), vbparams)?;
+    let deployments = parse_deployment_config(
+        network,
+        data_dir.is_some(),
+        vbparams,
+        test_activation_heights,
+    )?;
     let ibd_policy = parse_ibd_policy(
         network,
         data_dir.is_some() || headers_db.is_some(),
@@ -964,14 +948,20 @@ fn parse_deployment_config(
     network: Network,
     has_data_dir: bool,
     vbparams: Vec<String>,
+    test_activation_heights: Vec<String>,
 ) -> Result<DeploymentConfig, String> {
-    if !vbparams.is_empty() && !has_data_dir {
-        return Err("--vbparams requires --data-dir".to_owned());
+    if (!vbparams.is_empty() || !test_activation_heights.is_empty()) && !has_data_dir {
+        return Err("deployment overrides require --data-dir".to_owned());
     }
     let mut deployments = DeploymentConfig::for_network(network);
     for value in vbparams {
         deployments
             .apply_vbparams(&value)
+            .map_err(|error| error.to_string())?;
+    }
+    for value in test_activation_heights {
+        deployments
+            .apply_test_activation_height(&value)
             .map_err(|error| error.to_string())?;
     }
     Ok(deployments)
@@ -1002,7 +992,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1100,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn parses_a_header_probe() {
         let options = parse_options(
             ["--connect", "127.0.0.1:18444", "--network", "regtest"]
@@ -1133,6 +1124,8 @@ mod tests {
                 "127.0.0.1:0",
                 "--vbparams",
                 "taproot:-2:0:432",
+                "--testactivationheight",
+                "bip34@10",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1144,6 +1137,7 @@ mod tests {
             served.deployments,
             DeploymentConfig::for_network(Network::Regtest)
         );
+        assert_eq!(served.deployments.consensus_id().len(), 49);
         assert!(
             parse_options(
                 [
@@ -1153,6 +1147,23 @@ mod tests {
                     "/tmp/rbtc-test",
                     "--explorer-listen",
                     "0.0.0.0:3000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "bitcoin",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--testactivationheight",
+                    "csv@10",
                 ]
                 .into_iter()
                 .map(str::to_owned),
