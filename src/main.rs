@@ -35,13 +35,14 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
+const MAX_CONFIGURED_PEERS: usize = 16;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
 }
 
 struct Options {
-    remote: SocketAddr,
+    remotes: Vec<SocketAddr>,
     network: Network,
     fetch_block: Option<BlockHash>,
     headers_db: Option<PathBuf>,
@@ -126,10 +127,28 @@ async fn main() {
 }
 
 async fn run(options: Options) -> Result<(), String> {
+    let mut failures = Vec::with_capacity(options.remotes.len());
+    for remote in options.remotes.iter().copied() {
+        match run_with_peer(&options, remote).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!("peer {remote} failed: {error}");
+                failures.push(format!("{remote}: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "all {} configured peers failed: {}",
+        failures.len(),
+        failures.join("; ")
+    ))
+}
+
+async fn run_with_peer(options: &Options, remote: SocketAddr) -> Result<(), String> {
     let mut session = timeout(
         PEER_TIMEOUT,
         connect_outbound(
-            options.remote,
+            remote,
             options.network.magic(),
             rand::random(),
             USER_AGENT.to_owned(),
@@ -145,10 +164,10 @@ async fn run(options: Options) -> Result<(), String> {
     })?
     .map_err(|error| error.to_string())?;
 
-    let remote = session.remote_version();
+    let remote_version = session.remote_version();
     println!(
         "connected to {}: version={}, height={}, agent={}",
-        options.remote, remote.version, remote.start_height, remote.user_agent
+        remote, remote_version.version, remote_version.start_height, remote_version.user_agent
     );
 
     if let Some(hash) = options.fetch_block {
@@ -176,7 +195,7 @@ async fn run(options: Options) -> Result<(), String> {
         return Ok(());
     }
 
-    if let Some(path) = options.data_dir {
+    if let Some(path) = &options.data_dir {
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
@@ -185,15 +204,15 @@ async fn run(options: Options) -> Result<(), String> {
             options.network,
             options.deployments,
             options.ibd_policy,
-            path,
+            path.clone(),
             options.once,
             options.explorer_listen,
         )
         .await;
     }
 
-    if let Some(path) = options.headers_db {
-        let headers = sync_headers(&mut session, options.deployments, path).await?;
+    if let Some(path) = &options.headers_db {
+        let headers = sync_headers(&mut session, options.deployments, path.clone()).await?;
         let status = options
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
@@ -835,7 +854,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         return Ok(None);
     }
 
-    let mut remote = None;
+    let mut remotes: Vec<SocketAddr> = Vec::new();
     let mut network = Network::Bitcoin;
     let mut fetch_block = None;
     let mut headers_db = None;
@@ -851,11 +870,17 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             "--help" | "-h" => return Ok(None),
             "--connect" => {
                 let address = required_option_value(&mut args, "--connect")?;
-                remote = Some(
-                    address
-                        .parse()
-                        .map_err(|_| format!("invalid peer address: {address}"))?,
-                );
+                let remote = address
+                    .parse()
+                    .map_err(|_| format!("invalid peer address: {address}"))?;
+                if !remotes.contains(&remote) {
+                    if remotes.len() == MAX_CONFIGURED_PEERS {
+                        return Err(format!(
+                            "too many unique --connect peers; limit is {MAX_CONFIGURED_PEERS}"
+                        ));
+                    }
+                    remotes.push(remote);
+                }
             }
             "--network" => {
                 let value = required_option_value(&mut args, "--network")?;
@@ -912,7 +937,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         }
     }
 
-    let remote = remote.ok_or_else(|| "--connect is required".to_owned())?;
+    if remotes.is_empty() {
+        return Err("--connect is required".to_owned());
+    }
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
@@ -935,7 +962,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         assume_valid,
     )?;
     Ok(Some(Options {
-        remote,
+        remotes,
         network,
         fetch_block,
         headers_db,
@@ -1003,7 +1030,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT [--connect HOST:PORT ...] --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1046,6 +1073,27 @@ mod tests {
             "/rbtcd:test-peer/".to_owned(),
             1,
         )
+    }
+
+    async fn accept_peer(
+        listener: TcpListener,
+        version: VersionMessage,
+    ) -> V1Transport<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Version(_)
+        ));
+        peer.write_message(NetworkMessage::Version(version))
+            .await
+            .unwrap();
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Verack
+        ));
+        peer.write_message(NetworkMessage::Verack).await.unwrap();
+        peer
     }
 
     fn mine_regtest_child(parent: BlockHash, time: u32) -> Header {
@@ -1111,7 +1159,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(options.remote, "127.0.0.1:18444".parse().unwrap());
+        assert_eq!(options.remotes, vec!["127.0.0.1:18444".parse().unwrap()]);
         assert_eq!(options.network, Network::Regtest);
         assert!(options.fetch_block.is_none());
         assert!(options.headers_db.is_none());
@@ -1282,6 +1330,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_deduplicates_and_bounds_peer_candidates() {
+        let options = parse_options(
+            [
+                "--connect",
+                "127.0.0.1:18444",
+                "--connect",
+                "127.0.0.1:18445",
+                "--connect",
+                "127.0.0.1:18444",
+                "--network",
+                "regtest",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.remotes,
+            vec![
+                "127.0.0.1:18444".parse().unwrap(),
+                "127.0.0.1:18445".parse().unwrap()
+            ]
+        );
+
+        let mut arguments = Vec::new();
+        for port in 20_000..=(20_000 + MAX_CONFIGURED_PEERS) {
+            arguments.push("--connect".to_owned());
+            arguments.push(format!("127.0.0.1:{port}"));
+        }
+        let Err(error) = parse_options(arguments.into_iter()) else {
+            panic!("the peer candidate bound must be enforced");
+        };
+        assert!(error.contains("too many unique --connect peers"));
+    }
+
+    #[test]
     fn data_dir_execution_network_gate_is_enforced_before_connect() {
         for network in ["regtest", "signet"] {
             let options = parse_options(
@@ -1382,7 +1467,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let header_path = directory.path().join("headers.redb");
         run(Options {
-            remote,
+            remotes: vec![remote],
             network: Network::Regtest,
             fetch_block: None,
             headers_db: Some(header_path.clone()),
@@ -1456,7 +1541,7 @@ mod tests {
 
         let directory = TempDir::new().unwrap();
         run(Options {
-            remote,
+            remotes: vec![remote],
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -1526,7 +1611,7 @@ mod tests {
                 .unwrap();
         });
         run(Options {
-            remote: recovery_remote,
+            remotes: vec![recovery_remote],
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -1588,7 +1673,7 @@ mod tests {
             }
         });
         run(Options {
-            remote: backfill_remote,
+            remotes: vec![backfill_remote],
             network: Network::Regtest,
             fetch_block: None,
             headers_db: None,
@@ -1606,6 +1691,111 @@ mod tests {
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
         assert_eq!(backfilled_ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn daemon_fails_over_and_resumes_persisted_ibd_with_the_next_peer() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let block = regtest_block(genesis.block_hash(), genesis.time + 1);
+        let block_hash = block.block_hash();
+        let coinbase_outpoint = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
+
+        let deficient_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let deficient_remote = deficient_listener.local_addr().unwrap();
+        let deficient_server = tokio::spawn(async move {
+            let mut version = peer_version(10);
+            version.services = ServiceFlags::NETWORK;
+            let _peer = accept_peer(deficient_listener, version).await;
+        });
+
+        let interrupted_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let interrupted_remote = interrupted_listener.local_addr().unwrap();
+        let interrupted_header = block.header;
+        let interrupted_server = tokio::spawn(async move {
+            let mut peer = accept_peer(interrupted_listener, peer_version(11)).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(request) => {
+                    assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);
+                    peer.write_message(NetworkMessage::Headers(vec![interrupted_header]))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected initial getheaders, got {message:?}"),
+            }
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(block_hash)]
+            ));
+        });
+
+        let recovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recovery_remote = recovery_listener.local_addr().unwrap();
+        let recovery_server = tokio::spawn(async move {
+            let mut peer = accept_peer(recovery_listener, peer_version(12)).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(request) => {
+                    assert_eq!(request.locator_hashes.first(), Some(&block_hash));
+                    peer.write_message(NetworkMessage::Headers(Vec::new()))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected resumed getheaders, got {message:?}"),
+            }
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(block_hash)]
+            ));
+            peer.write_message(NetworkMessage::Block(block))
+                .await
+                .unwrap();
+        });
+
+        let directory = TempDir::new().unwrap();
+        run(Options {
+            remotes: vec![deficient_remote, interrupted_remote, recovery_remote],
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap();
+        deficient_server.await.unwrap();
+        interrupted_server.await.unwrap();
+        recovery_server.await.unwrap();
+
+        let headers = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
+        assert_eq!(
+            headers
+                .load_dag(Network::Regtest, unix_time().unwrap())
+                .unwrap()
+                .active_tip()
+                .hash,
+            block_hash
+        );
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert_eq!(chainstate.execution().tip().unwrap().hash, block_hash);
+        assert!(chainstate.undos().get(block_hash).unwrap().is_some());
+        assert!(chainstate.get(coinbase_outpoint).unwrap().is_some());
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+        assert!(ledger.staged().unwrap().is_none());
+        let explorer =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(explorer.tip().unwrap().height, 1);
     }
 
     #[tokio::test]
@@ -1666,7 +1856,7 @@ mod tests {
             .unwrap();
         ibd_policy.set_assume_valid("0").unwrap();
         run(Options {
-            remote,
+            remotes: vec![remote],
             network: Network::Signet,
             fetch_block: None,
             headers_db: None,
