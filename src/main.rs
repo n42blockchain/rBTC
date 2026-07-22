@@ -36,6 +36,10 @@ use tokio::time::timeout;
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 
+const fn supports_block_execution(network: Network) -> bool {
+    matches!(network, Network::Regtest | Network::Signet)
+}
+
 struct Options {
     remote: SocketAddr,
     network: Network,
@@ -176,7 +180,7 @@ async fn run(options: Options) -> Result<(), String> {
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| error.to_string())?;
-        return sync_regtest_node(
+        return sync_validating_node(
             &mut session,
             options.network,
             options.deployments,
@@ -255,7 +259,7 @@ async fn sync_headers(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn sync_regtest_node(
+async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
     deployment_config: DeploymentConfig,
@@ -264,9 +268,9 @@ async fn sync_regtest_node(
     once: bool,
     explorer_listen: Option<SocketAddr>,
 ) -> Result<(), String> {
-    if network != Network::Regtest {
+    if !supports_block_execution(network) {
         return Err(
-            "block execution is currently safety-gated to regtest until deployment activation is complete"
+            "block execution is currently safety-gated to regtest and default signet until mainnet/testnet activation coverage is complete"
                 .to_owned(),
         );
     }
@@ -912,6 +916,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     if explorer_listen.is_some() && data_dir.is_none() {
         return Err("--explorer-listen requires --data-dir".to_owned());
     }
+    if data_dir.is_some() && !supports_block_execution(network) {
+        return Err(
+            "--data-dir block execution currently supports only regtest and default signet"
+                .to_owned(),
+        );
+    }
     let deployments = parse_deployment_config(
         network,
         data_dir.is_some(),
@@ -993,7 +1003,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd --connect HOST:PORT [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd --connect HOST:PORT --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --connect HOST:PORT --fetch-block BLOCK_HASH [--network NETWORK]",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -1006,6 +1016,7 @@ mod tests {
         Witness,
         absolute::LockTime,
         block::{Header, Version},
+        hex::FromHex,
         p2p::{Address, ServiceFlags, message::NetworkMessage, message_network::VersionMessage},
         pow::Target,
         transaction::Version as TransactionVersion,
@@ -1268,6 +1279,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn data_dir_execution_network_gate_is_enforced_before_connect() {
+        for network in ["regtest", "signet"] {
+            let options = parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:1",
+                    "--network",
+                    network,
+                    "--data-dir",
+                    "/tmp/rbtc-execution-network-gate",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.network.to_string(), network);
+        }
+
+        for network in ["bitcoin", "testnet", "testnet4"] {
+            let result = parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:1",
+                    "--network",
+                    network,
+                    "--data-dir",
+                    "/tmp/rbtc-execution-network-gate",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            let Err(error) = result else {
+                panic!("{network} execution must remain safety-gated");
+            };
+            assert!(error.contains("only regtest and default signet"));
+        }
     }
 
     #[tokio::test]
@@ -1555,5 +1606,98 @@ mod tests {
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
         assert_eq!(backfilled_ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn daemon_downloads_and_executes_a_real_default_signet_block() {
+        let encoded = include_str!("../tests/data/bitcoin-core-26/signet-block-1.hex");
+        let block: Block = deserialize(&Vec::<u8>::from_hex(encoded.trim()).unwrap()).unwrap();
+        let block_hash = block.block_hash();
+        let coinbase_outpoint = OutPointKey::from(OutPoint::new(block.txdata[0].compute_txid(), 0));
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Signet).block_hash();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Signet.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(9)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(request) => {
+                    assert_eq!(request.locator_hashes, vec![genesis]);
+                    peer.write_message(NetworkMessage::Headers(vec![block.header]))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected Signet getheaders, got {message:?}"),
+            }
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                            block_hash
+                        )]
+                    );
+                    peer.write_message(NetworkMessage::Block(block))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected Signet getdata, got {message:?}"),
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        let mut ibd_policy = IbdPolicy::for_network(Network::Signet);
+        ibd_policy
+            .set_minimum_chainwork(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+        ibd_policy.set_assume_valid("0").unwrap();
+        run(Options {
+            remote,
+            network: Network::Signet,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            deployments: DeploymentConfig::for_network(Network::Signet),
+            ibd_policy,
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Signet)
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert_eq!(chainstate.execution().tip().unwrap().hash, block_hash);
+        assert!(chainstate.undos().get(block_hash).unwrap().is_some());
+        assert!(chainstate.get(coinbase_outpoint).unwrap().is_some());
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+        let explorer =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Signet)
+                .unwrap();
+        assert_eq!(explorer.tip().unwrap().height, 1);
+        assert_eq!(
+            explorer.block(1).unwrap().unwrap().hash,
+            block_hash.to_string()
+        );
     }
 }
