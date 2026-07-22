@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    io::Read,
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process,
@@ -51,6 +51,9 @@ const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
+const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
+const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
+const MAX_VALIDATION_OWNER_BYTES: u64 = 4_096;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
@@ -75,6 +78,7 @@ struct Options {
     validation_target: Option<ValidationTarget>,
     complete_assumeutxo: Option<PathBuf>,
     background_assumeutxo: Option<PathBuf>,
+    cleanup_validation_dir: bool,
     validation_limits: ValidationLimits,
 }
 
@@ -228,30 +232,160 @@ enum BackgroundValidationState {
 #[derive(Clone)]
 struct BackgroundValidationStatus {
     validation_dir: PathBuf,
-    state: Arc<Mutex<BackgroundValidationState>>,
+    cleanup_after_finalize: bool,
+    progress: Arc<Mutex<BackgroundValidationProgress>>,
+}
+
+#[derive(Clone, Debug)]
+struct BackgroundValidationProgress {
+    state: BackgroundValidationState,
+    target: ValidationTarget,
+    active_tip: Option<u32>,
+    active_header_tip: Option<u32>,
+    validation_tip: u32,
+    adaptive_throttled: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct ValidationStatusResponse {
+    phase: &'static str,
+    target_height: u32,
+    target_block_hash: String,
+    active_tip: Option<u32>,
+    active_header_tip: Option<u32>,
+    validation_tip: u32,
+    validation_remaining: u32,
+    adaptive_throttled: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationDirectoryOwner {
+    version: u32,
+    network: String,
+    target_height: u32,
+    target_block_hash: String,
 }
 
 impl BackgroundValidationStatus {
-    fn new(validation_dir: PathBuf) -> Self {
+    fn new(
+        validation_dir: PathBuf,
+        target: ValidationTarget,
+        cleanup_after_finalize: bool,
+    ) -> Self {
         Self {
             validation_dir,
-            state: Arc::new(Mutex::new(BackgroundValidationState::Pending)),
+            cleanup_after_finalize,
+            progress: Arc::new(Mutex::new(BackgroundValidationProgress {
+                state: BackgroundValidationState::Pending,
+                target,
+                active_tip: None,
+                active_header_tip: None,
+                validation_tip: 0,
+                adaptive_throttled: true,
+            })),
         }
     }
 
     fn state(&self) -> BackgroundValidationState {
-        self.state
+        self.progress
             .lock()
             .expect("background validation state lock not poisoned")
+            .state
             .clone()
     }
 
     fn set(&self, state: BackgroundValidationState) {
-        *self
-            .state
+        self.progress
             .lock()
-            .expect("background validation state lock not poisoned") = state;
+            .expect("background validation state lock not poisoned")
+            .state = state;
     }
+
+    fn update_active(&self, tip: u32, header_tip: u32) {
+        let mut progress = self
+            .progress
+            .lock()
+            .expect("background validation state lock not poisoned");
+        progress.active_tip = Some(tip);
+        progress.active_header_tip = Some(header_tip);
+    }
+
+    fn update_validation(&self, tip: u32) {
+        self.progress
+            .lock()
+            .expect("background validation state lock not poisoned")
+            .validation_tip = tip;
+    }
+
+    fn target(&self) -> ValidationTarget {
+        self.progress
+            .lock()
+            .expect("background validation state lock not poisoned")
+            .target
+    }
+
+    fn adaptive_limits(&self, configured: ValidationLimits) -> ValidationLimits {
+        let mut progress = self
+            .progress
+            .lock()
+            .expect("background validation state lock not poisoned");
+        let active_busy = progress
+            .active_tip
+            .zip(progress.active_header_tip)
+            .is_none_or(|(tip, header_tip)| tip < header_tip);
+        progress.adaptive_throttled = active_busy;
+        if active_busy {
+            ValidationLimits {
+                max_blocks_per_batch: 1,
+                pause_between_batches: configured
+                    .pause_between_batches
+                    .max(ADAPTIVE_VALIDATION_BUSY_PAUSE),
+            }
+        } else {
+            configured
+        }
+    }
+
+    fn response(&self) -> ValidationStatusResponse {
+        let progress = self
+            .progress
+            .lock()
+            .expect("background validation state lock not poisoned");
+        let (phase, error) = match &progress.state {
+            BackgroundValidationState::Pending => ("validating", None),
+            BackgroundValidationState::Complete => ("finalizing", None),
+            BackgroundValidationState::Finalized => ("finalized", None),
+            BackgroundValidationState::Failed(error) => ("failed", Some(error.clone())),
+        };
+        ValidationStatusResponse {
+            phase,
+            target_height: progress.target.height,
+            target_block_hash: progress.target.block_hash.to_string(),
+            active_tip: progress.active_tip,
+            active_header_tip: progress.active_header_tip,
+            validation_tip: progress.validation_tip,
+            validation_remaining: progress
+                .target
+                .height
+                .saturating_sub(progress.validation_tip),
+            adaptive_throttled: progress.adaptive_throttled,
+            error,
+        }
+    }
+}
+
+fn validation_status_router(status: BackgroundValidationStatus) -> axum::Router {
+    axum::Router::new()
+        .route("/api/v1/validation", axum::routing::get(validation_status))
+        .with_state(status)
+}
+
+async fn validation_status(
+    axum::extract::State(status): axum::extract::State<BackgroundValidationStatus>,
+) -> axum::Json<ValidationStatusResponse> {
+    axum::Json(status.response())
 }
 
 struct ApiServer {
@@ -265,6 +399,7 @@ impl ApiServer {
         address: SocketAddr,
         index: Arc<RedbExplorerIndex>,
         wallet: Option<&WalletApiRuntime>,
+        background_validation: Option<&BackgroundValidationStatus>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -278,6 +413,9 @@ impl ApiServer {
                 Arc::clone(&wallet.wallet),
                 wallet.token.clone(),
             ));
+        }
+        if let Some(status) = background_validation {
+            router = router.merge(validation_status_router(status.clone()));
         }
         println!("embedded API listening on http://{bound}");
         let task = tokio::spawn(async move {
@@ -462,7 +600,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if let Some(validation_dir) = options.background_assumeutxo.clone() {
         return run_background_assumeutxo(options, validation_dir, local_nonce).await;
     }
-    run_peer_pool(&options, local_nonce, None).await
+    run_peer_pool(&options, local_nonce, None, None).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -470,6 +608,7 @@ async fn run_peer_pool(
     options: &Options,
     local_nonce: u64,
     background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), String> {
     let api_runtime = prepare_api_runtime(options)?;
     let peer_store = if let Some(data_dir) = &options.data_dir {
@@ -505,6 +644,7 @@ async fn run_peer_pool(
             peer_store.as_ref(),
             api_runtime.as_ref(),
             background_validation,
+            validation_scheduler,
         )
         .await
         {
@@ -559,6 +699,7 @@ async fn run_peer_pool(
                 peer_store.as_ref(),
                 api_runtime.as_ref(),
                 background_validation,
+                validation_scheduler,
             )
             .await
             {
@@ -607,7 +748,15 @@ async fn run_background_assumeutxo(
         .ok_or_else(|| "active chainstate has no assumed UTXO snapshot to validate".to_owned())?;
     drop(active);
 
-    let status = BackgroundValidationStatus::new(validation_dir.clone());
+    let target = ValidationTarget {
+        height: assumed.base.height,
+        block_hash: assumed.base.hash,
+    };
+    let status = BackgroundValidationStatus::new(
+        validation_dir.clone(),
+        target,
+        options.cleanup_validation_dir,
+    );
     let mut active_options = options.clone();
     active_options.background_assumeutxo = None;
     active_options.validation_limits = ValidationLimits::default();
@@ -619,10 +768,7 @@ async fn run_background_assumeutxo(
     validation_options.wallet_api_files = None;
     validation_options.complete_assumeutxo = None;
     validation_options.background_assumeutxo = None;
-    validation_options.validation_target = Some(ValidationTarget {
-        height: assumed.base.height,
-        block_hash: assumed.base.hash,
-    });
+    validation_options.validation_target = Some(target);
 
     println!(
         "starting active-chain service and independent genesis validation concurrently through {}:{}",
@@ -630,7 +776,13 @@ async fn run_background_assumeutxo(
     );
     let validation_status = status.clone();
     let validation = async {
-        let result = run_peer_pool(&validation_options, local_nonce, None).await;
+        let result = run_peer_pool(
+            &validation_options,
+            local_nonce,
+            None,
+            Some(&validation_status),
+        )
+        .await;
         match &result {
             Ok(()) => validation_status.set(BackgroundValidationState::Complete),
             Err(error) => {
@@ -639,7 +791,7 @@ async fn run_background_assumeutxo(
         }
         result
     };
-    let active = run_peer_pool(&active_options, local_nonce, Some(&status));
+    let active = run_peer_pool(&active_options, local_nonce, Some(&status), None);
     tokio::pin!(active);
     tokio::pin!(validation);
     tokio::select! {
@@ -665,16 +817,32 @@ fn finalize_background_if_pending(
         .expect("background validation requires active data directory");
     let active = RedbChainStore::open(active_dir.join("chainstate.redb"), options.network)
         .map_err(|error| error.to_string())?;
-    if active
+    let pending = active
         .execution()
         .assumed_snapshot()
         .map_err(|error| error.to_string())?
-        .is_none()
-    {
-        return Ok(());
-    }
+        .is_some();
+    let origin = active
+        .execution()
+        .snapshot_origin()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "active chainstate is missing snapshot origin metadata".to_owned())?;
     drop(active);
-    finalize_assumed_snapshot_from(options, validation_dir)
+    if pending {
+        finalize_assumed_snapshot_from(options, validation_dir)?;
+    }
+    if options.cleanup_validation_dir && validation_dir.exists() {
+        cleanup_completed_validation_dir(
+            active_dir,
+            validation_dir,
+            options.network,
+            ValidationTarget {
+                height: origin.height,
+                block_hash: origin.hash,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
@@ -797,6 +965,7 @@ fn poll_background_validation(
     network: Network,
     deployments: &DeploymentConfig,
     active: &RedbChainStore,
+    active_dir: &std::path::Path,
     headers: &HeaderDag,
 ) -> Result<(), PeerRunError> {
     let Some(status) = status else {
@@ -820,6 +989,19 @@ fn poll_background_validation(
                     "background genesis validation finalization failed: {error}"
                 )));
             }
+            if status.cleanup_after_finalize {
+                if let Err(error) = cleanup_completed_validation_dir(
+                    active_dir,
+                    &status.validation_dir,
+                    network,
+                    status.target(),
+                ) {
+                    status.set(BackgroundValidationState::Failed(error.clone()));
+                    return Err(PeerRunError::transient(format!(
+                        "background validation directory cleanup failed: {error}"
+                    )));
+                }
+            }
             status.set(BackgroundValidationState::Finalized);
             println!("background genesis validation finalized while the active node remained live");
             Ok(())
@@ -835,6 +1017,17 @@ fn prepare_assumeutxo_validation(
         .data_dir
         .as_ref()
         .expect("completion parser requires active data directory");
+    reject_directory_symlink(validation_dir, "validation data directory")?;
+    let claimable = match fs::read_dir(validation_dir) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(format!(
+                "inspect validation data directory {}: {error}",
+                validation_dir.display()
+            ));
+        }
+    };
     fs::create_dir_all(validation_dir).map_err(|error| {
         format!(
             "create validation data directory {}: {error}",
@@ -845,9 +1038,13 @@ fn prepare_assumeutxo_validation(
         .map_err(|error| format!("resolve active data directory: {error}"))?;
     let validation_dir = fs::canonicalize(validation_dir)
         .map_err(|error| format!("resolve validation data directory: {error}"))?;
-    if active_dir == validation_dir {
+    if active_dir == validation_dir
+        || active_dir.starts_with(&validation_dir)
+        || validation_dir.starts_with(&active_dir)
+    {
         return Err(
-            "validation data directory must be separate from active data directory".to_owned(),
+            "validation data directory must be separate from and not contain or be contained by the active data directory"
+                .to_owned(),
         );
     }
     let active_chainstate = active_dir.join("chainstate.redb");
@@ -861,11 +1058,233 @@ fn prepare_assumeutxo_validation(
     }
     let active = RedbChainStore::open(active_chainstate, options.network)
         .map_err(|error| error.to_string())?;
-    active
+    let assumed = active
         .execution()
         .assumed_snapshot()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "active chainstate has no assumed UTXO snapshot to validate".to_owned())?;
+    let owner = ValidationDirectoryOwner {
+        version: 1,
+        network: options.network.to_string(),
+        target_height: assumed.base.height,
+        target_block_hash: assumed.base.hash.to_string(),
+    };
+    ensure_validation_directory_owner(
+        &validation_dir,
+        &owner,
+        claimable,
+        options.cleanup_validation_dir,
+    )?;
+    Ok(())
+}
+
+fn ensure_validation_directory_owner(
+    validation_dir: &std::path::Path,
+    expected: &ValidationDirectoryOwner,
+    claimable: bool,
+    cleanup_requested: bool,
+) -> Result<(), String> {
+    let marker = validation_dir.join(VALIDATION_OWNER_FILE);
+    if marker.exists() {
+        let contents = read_owner_only_text_file(
+            &marker,
+            "validation directory owner",
+            MAX_VALIDATION_OWNER_BYTES,
+        )?;
+        let actual: ValidationDirectoryOwner = serde_json::from_str(&contents)
+            .map_err(|_| "validation directory owner marker is malformed".to_owned())?;
+        if actual != *expected {
+            return Err(
+                "validation directory owner marker does not match this snapshot".to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    if !claimable {
+        if cleanup_requested {
+            return Err(
+                "validation directory cleanup requires an rBTC owner marker created in an initially empty directory"
+                    .to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    let mut builder = fs::OpenOptions::new();
+    builder.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        builder.mode(0o600);
+    }
+    let mut file = builder.open(&marker).map_err(|error| {
+        format!(
+            "create validation owner marker {}: {error}",
+            marker.display()
+        )
+    })?;
+    let mut contents = serde_json::to_vec(expected)
+        .map_err(|error| format!("encode validation owner marker: {error}"))?;
+    contents.push(b'\n');
+    file.write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist validation owner marker {}: {error}",
+                marker.display()
+            )
+        })
+}
+
+fn cleanup_completed_validation_dir(
+    active_dir: &std::path::Path,
+    validation_dir: &std::path::Path,
+    network: Network,
+    expected: ValidationTarget,
+) -> Result<(), String> {
+    reject_directory_symlink(validation_dir, "validation data directory before cleanup")?;
+    let active_dir = fs::canonicalize(active_dir)
+        .map_err(|error| format!("resolve active data directory before cleanup: {error}"))?;
+    let validation_dir = fs::canonicalize(validation_dir)
+        .map_err(|error| format!("resolve validation data directory before cleanup: {error}"))?;
+    if active_dir == validation_dir
+        || active_dir.starts_with(&validation_dir)
+        || validation_dir.starts_with(&active_dir)
+    {
+        return Err(
+            "refusing to clean a validation directory that contains or is contained by the active data directory"
+                .to_owned(),
+        );
+    }
+    let owner = ValidationDirectoryOwner {
+        version: 1,
+        network: network.to_string(),
+        target_height: expected.height,
+        target_block_hash: expected.block_hash.to_string(),
+    };
+    ensure_validation_directory_owner(&validation_dir, &owner, false, true)?;
+    let validation = RedbChainStore::open(validation_dir.join("chainstate.redb"), network)
+        .map_err(|error| error.to_string())?;
+    let target = rbtc::execution_store::ExecutionTip {
+        height: expected.height,
+        hash: expected.block_hash,
+    };
+    if validation
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .is_some()
+        || validation
+            .execution()
+            .validation_target()
+            .map_err(|error| error.to_string())?
+            != Some(target)
+        || validation
+            .execution()
+            .tip()
+            .map_err(|error| error.to_string())?
+            != target
+    {
+        return Err(
+            "validation directory cleanup requires a completed non-assumed target chainstate"
+                .to_owned(),
+        );
+    }
+    drop(validation);
+    for entry in fs::read_dir(&validation_dir)
+        .map_err(|error| format!("inspect validation directory before cleanup: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("inspect validation entry: {error}"))?;
+        let allowed = matches!(
+            entry.file_name().to_str(),
+            Some(
+                VALIDATION_OWNER_FILE
+                    | "chainstate.redb"
+                    | "headers.redb"
+                    | "peers.redb"
+                    | "explorer.redb"
+                    | "blocks"
+            )
+        );
+        if !allowed {
+            return Err(format!(
+                "refusing validation cleanup because {} is not an rBTC validation artifact",
+                entry.path().display()
+            ));
+        }
+    }
+    reject_cleanup_symlinks(&validation_dir)?;
+    quarantine_and_remove_validation_dir(&validation_dir)
+}
+
+fn quarantine_and_remove_validation_dir(validation_dir: &std::path::Path) -> Result<(), String> {
+    let parent = validation_dir
+        .parent()
+        .ok_or_else(|| "validation directory has no parent".to_owned())?;
+    let name = validation_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "validation directory name is not UTF-8".to_owned())?;
+    let tombstone = parent.join(format!(
+        ".{name}.rbtc-cleanup-{:016x}",
+        rand::random::<u64>()
+    ));
+    fs::rename(validation_dir, &tombstone).map_err(|error| {
+        format!(
+            "atomically quarantine validation directory {}: {error}",
+            validation_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync validation directory parent: {error}"))?;
+    fs::remove_dir_all(&tombstone).map_err(|error| {
+        format!(
+            "validation directory was quarantined at {} but removal failed: {error}",
+            tombstone.display()
+        )
+    })?;
+    println!(
+        "removed completed validation directory {} after owner and target revalidation; recovery is no longer possible",
+        validation_dir.display()
+    );
+    Ok(())
+}
+
+fn reject_directory_symlink(path: &std::path::Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} must not be a symbolic link"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {label} {}: {error}", path.display())),
+    }
+}
+
+fn reject_cleanup_symlinks(path: &std::path::Path) -> Result<(), String> {
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("inspect cleanup tree {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("inspect cleanup tree entry: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            format!("inspect cleanup entry {}: {error}", entry.path().display())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing validation cleanup because {} is a symlink",
+                entry.path().display()
+            ));
+        }
+        if metadata.is_dir() {
+            reject_cleanup_symlinks(&entry.path())?;
+        } else if !metadata.is_file() {
+            return Err(format!(
+                "refusing validation cleanup because {} is not a regular file",
+                entry.path().display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -920,6 +1339,7 @@ async fn run_with_peer(
     peer_store: Option<&RedbPeerStore>,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), PeerRunError> {
     record_peer_attempt(peer_store, remote);
     let mut session = timeout(
@@ -995,6 +1415,7 @@ async fn run_with_peer(
             options.validation_limits,
             api_runtime,
             background_validation,
+            validation_scheduler,
         )
         .await;
     }
@@ -1055,9 +1476,23 @@ async fn complete_assumeutxo_validation(
         options.validation_limits,
         None,
         None,
+        None,
     )
     .await?;
-    finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)
+    finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
+    if options.cleanup_validation_dir {
+        cleanup_completed_validation_dir(
+            active_dir,
+            &validation_dir,
+            options.network,
+            ValidationTarget {
+                height: assumed.base.height,
+                block_hash: assumed.base.hash,
+            },
+        )
+        .map_err(PeerRunError::transient)?;
+    }
+    Ok(())
 }
 
 fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
@@ -1246,6 +1681,7 @@ async fn sync_validating_node(
     validation_limits: ValidationLimits,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
         return Err(PeerRunError::transient(
@@ -1292,6 +1728,13 @@ async fn sync_validating_node(
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
+        let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
+        if let Some(status) = background_validation {
+            status.update_active(current_tip.height, headers.active_tip().height);
+        }
+        if let Some(status) = validation_scheduler {
+            status.update_validation(current_tip.height);
+        }
         if let Some(target) = validation_target {
             let active = headers.active_header_at(target.height).ok_or_else(|| {
                 PeerRunError::transient(format!(
@@ -1311,6 +1754,7 @@ async fn sync_validating_node(
             network,
             deployment_config,
             &chainstate,
+            &data_dir,
             &headers,
         )?;
         if let Some(server) = &mut api_server {
@@ -1325,6 +1769,7 @@ async fn sync_validating_node(
                 network,
                 deployment_config,
                 &chainstate,
+                &data_dir,
                 &headers,
             )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -1394,7 +1839,13 @@ async fn sync_validating_node(
         if api_server.is_none() {
             if let Some(api) = api_runtime {
                 api_server = Some(
-                    ApiServer::bind(api.listen, Arc::clone(&explorer), api.wallet.as_ref()).await?,
+                    ApiServer::bind(
+                        api.listen,
+                        Arc::clone(&explorer),
+                        api.wallet.as_ref(),
+                        background_validation,
+                    )
+                    .await?,
                 );
             }
         }
@@ -1404,6 +1855,12 @@ async fn sync_validating_node(
                 server.ensure_running().await?;
             }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if let Some(status) = background_validation {
+                status.update_active(tip.height, headers.active_tip().height);
+            }
+            if let Some(status) = validation_scheduler {
+                status.update_validation(tip.height);
+            }
             if let Some(target) = validation_target {
                 if tip.height > target.height {
                     return Err(PeerRunError::transient(format!(
@@ -1460,6 +1917,10 @@ async fn sync_validating_node(
                 headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
                 continue 'resync;
             }
+            let effective_validation_limits = validation_scheduler
+                .map_or(validation_limits, |status| {
+                    status.adaptive_limits(validation_limits)
+                });
             download_execute_batch(
                 session,
                 deployment_config,
@@ -1469,7 +1930,7 @@ async fn sync_validating_node(
                 &explorer,
                 wallet,
                 validation_target.map(|target| target.height),
-                validation_limits.max_blocks_per_batch,
+                effective_validation_limits.max_blocks_per_batch,
             )
             .await?;
             if let Some(wallet) = wallet_runtime {
@@ -1486,13 +1947,22 @@ async fn sync_validating_node(
             }
             if let Some(target) = validation_target {
                 let tip = execution_store.tip().map_err(|error| error.to_string())?;
+                if let Some(status) = validation_scheduler {
+                    status.update_validation(tip.height);
+                }
                 let remaining = target.height.saturating_sub(tip.height);
                 println!(
-                    "genesis validation progress: {} / {} blocks ({} remaining)",
-                    tip.height, target.height, remaining
+                    "genesis validation progress: {} / {} blocks ({} remaining; batch cap {}; pause {} ms)",
+                    tip.height,
+                    target.height,
+                    remaining,
+                    effective_validation_limits.max_blocks_per_batch,
+                    effective_validation_limits
+                        .pause_between_batches
+                        .as_millis()
                 );
-                if remaining > 0 && !validation_limits.pause_between_batches.is_zero() {
-                    tokio::time::sleep(validation_limits.pause_between_batches).await;
+                if remaining > 0 && !effective_validation_limits.pause_between_batches.is_zero() {
+                    tokio::time::sleep(effective_validation_limits.pause_between_batches).await;
                 }
             }
         }
@@ -2445,6 +2915,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut validation_block_hash = None;
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
+    let mut cleanup_validation_dir = false;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     while let Some(argument) = args.next() {
@@ -2624,6 +3095,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     "--background-assumeutxo",
                 )?));
             }
+            "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -2910,6 +3382,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 .to_owned(),
         );
     }
+    if cleanup_validation_dir && complete_assumeutxo.is_none() && background_assumeutxo.is_none() {
+        return Err(
+            "--cleanup-validation-dir requires automatic or background AssumeUTXO validation"
+                .to_owned(),
+        );
+    }
     let validation_limits = ValidationLimits {
         max_blocks_per_batch: validation_batch_size.unwrap_or(MAX_BLOCKS_IN_FLIGHT),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
@@ -2981,6 +3459,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         validation_target,
         complete_assumeutxo,
         background_assumeutxo,
+        cleanup_validation_dir,
         validation_limits,
     }))
 }
@@ -3046,7 +3525,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--once] [EXPLORER/WALLET OPTIONS]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/WALLET OPTIONS]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -3570,6 +4049,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -3630,6 +4110,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -3844,6 +4325,7 @@ mod tests {
                 "2",
                 "--validation-pause-ms",
                 "5",
+                "--cleanup-validation-dir",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -3855,6 +4337,7 @@ mod tests {
             Some(PathBuf::from("/tmp/rbtc-validation"))
         );
         assert!(options.once);
+        assert!(options.cleanup_validation_dir);
         assert_eq!(
             options.explorer_listen,
             Some("127.0.0.1:3000".parse().unwrap())
@@ -3878,6 +4361,13 @@ mod tests {
                 "--complete-assumeutxo",
                 "/tmp/v2",
             ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/a",
+                "--cleanup-validation-dir",
+            ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
@@ -3890,7 +4380,14 @@ mod tests {
             RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
         let headers = HeaderDag::new(Network::Regtest);
-        let status = BackgroundValidationStatus::new(directory.path().join("validation"));
+        let status = BackgroundValidationStatus::new(
+            directory.path().join("validation"),
+            ValidationTarget {
+                height: 1,
+                block_hash: headers.active_tip().hash,
+            },
+            false,
+        );
         status.set(BackgroundValidationState::Failed(
             "validator stopped".to_owned(),
         ));
@@ -3899,11 +4396,146 @@ mod tests {
             Network::Regtest,
             &DeploymentConfig::for_network(Network::Regtest),
             &chainstate,
+            directory.path(),
             &headers,
         )
         .unwrap_err();
         assert_eq!(error.kind, PeerFailureKind::Transient);
         assert!(error.message.contains("validator stopped"));
+    }
+
+    #[test]
+    fn adaptive_validation_yields_until_active_execution_catches_up() {
+        let target = ValidationTarget {
+            height: 100,
+            block_hash: BlockHash::from_byte_array([5; 32]),
+        };
+        let status = BackgroundValidationStatus::new(PathBuf::from("validation"), target, false);
+        let configured = ValidationLimits {
+            max_blocks_per_batch: 8,
+            pause_between_batches: Duration::from_millis(5),
+        };
+        assert_eq!(
+            status.adaptive_limits(configured),
+            ValidationLimits {
+                max_blocks_per_batch: 1,
+                pause_between_batches: ADAPTIVE_VALIDATION_BUSY_PAUSE,
+            }
+        );
+        status.update_active(40, 50);
+        assert_eq!(status.adaptive_limits(configured).max_blocks_per_batch, 1);
+        status.update_active(50, 50);
+        assert_eq!(status.adaptive_limits(configured), configured);
+        status.update_validation(25);
+        let response = status.response();
+        assert_eq!(response.validation_tip, 25);
+        assert_eq!(response.validation_remaining, 75);
+        assert!(!response.adaptive_throttled);
+    }
+
+    #[test]
+    fn validation_cleanup_refuses_unknown_files_without_renaming_directory() {
+        let directory = TempDir::new().unwrap();
+        let active_dir = directory.path().join("active");
+        let validation_dir = directory.path().join("validation");
+        fs::create_dir(&active_dir).unwrap();
+        fs::create_dir(&validation_dir).unwrap();
+        let target = ValidationTarget {
+            height: 1,
+            block_hash: BlockHash::from_byte_array([6; 32]),
+        };
+        ensure_validation_directory_owner(
+            &validation_dir,
+            &ValidationDirectoryOwner {
+                version: 1,
+                network: Network::Regtest.to_string(),
+                target_height: target.height,
+                target_block_hash: target.block_hash.to_string(),
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        let validation =
+            RedbChainStore::open(validation_dir.join("chainstate.redb"), Network::Regtest).unwrap();
+        let genesis = validation.execution().tip().unwrap();
+        validation
+            .execution()
+            .bind_validation_target(rbtc::execution_store::ExecutionTip {
+                height: target.height,
+                hash: target.block_hash,
+            })
+            .unwrap();
+        validation
+            .execution()
+            .advance(
+                genesis.hash,
+                rbtc::execution_store::ExecutionTip {
+                    height: target.height,
+                    hash: target.block_hash,
+                },
+            )
+            .unwrap();
+        drop(validation);
+        let unknown = validation_dir.join("user-notes.txt");
+        fs::write(&unknown, b"keep me").unwrap();
+        let error = cleanup_completed_validation_dir(
+            &active_dir,
+            &validation_dir,
+            Network::Regtest,
+            target,
+        )
+        .unwrap_err();
+        assert!(error.contains("not an rBTC validation artifact"));
+        assert!(validation_dir.is_dir());
+        assert_eq!(fs::read(unknown).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn validation_cleanup_refuses_nested_data_directories() {
+        let directory = TempDir::new().unwrap();
+        let active_dir = directory.path().join("active");
+        let validation_dir = active_dir.join("validation");
+        fs::create_dir_all(&validation_dir).unwrap();
+        let error = cleanup_completed_validation_dir(
+            &active_dir,
+            &validation_dir,
+            Network::Regtest,
+            ValidationTarget {
+                height: 1,
+                block_hash: BlockHash::from_byte_array([7; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("contained by the active data directory"));
+        assert!(validation_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_cleanup_refuses_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let active_dir = directory.path().join("active");
+        let validation_target = directory.path().join("validation-target");
+        let validation_link = directory.path().join("validation-link");
+        fs::create_dir(&active_dir).unwrap();
+        fs::create_dir(&validation_target).unwrap();
+        symlink(&validation_target, &validation_link).unwrap();
+        let error = cleanup_completed_validation_dir(
+            &active_dir,
+            &validation_link,
+            Network::Regtest,
+            ValidationTarget {
+                height: 1,
+                block_hash: BlockHash::from_byte_array([8; 32]),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("must not be a symbolic link"));
+        assert!(validation_target.is_dir());
+        assert!(validation_link.exists());
     }
 
     #[cfg(unix)]
@@ -4338,6 +4970,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4384,6 +5017,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         };
 
@@ -4448,9 +5082,25 @@ mod tests {
                 birthday_height: 0,
             },
         };
-        let server = ApiServer::bind("127.0.0.1:0".parse().unwrap(), index, Some(&wallet))
-            .await
-            .unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let validation = BackgroundValidationStatus::new(
+            directory.path().join("validation"),
+            ValidationTarget {
+                height: 10,
+                block_hash: genesis,
+            },
+            false,
+        );
+        validation.update_active(12, 12);
+        validation.update_validation(4);
+        let server = ApiServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            index,
+            Some(&wallet),
+            Some(&validation),
+        )
+        .await
+        .unwrap();
         let response = http_request(
             server.address(),
             b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -4460,6 +5110,19 @@ mod tests {
         assert!(response.contains("content-security-policy:"));
         assert!(response.contains("<title>rBTC Explorer</title>"));
         assert!(response.contains("Watch-only wallet"));
+
+        let response = http_request(
+            server.address(),
+            b"GET /api/v1/validation HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let status: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(status["phase"], "validating");
+        assert_eq!(status["target_height"], 10);
+        assert_eq!(status["validation_tip"], 4);
+        assert_eq!(status["validation_remaining"], 6);
 
         let unauthorized = http_request(
             server.address(),
@@ -4526,6 +5189,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4609,6 +5273,7 @@ mod tests {
             }),
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4671,6 +5336,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4749,6 +5415,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4798,6 +5465,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: Some(validation_dir.clone()),
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4843,6 +5511,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: Some(validation_dir),
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4928,6 +5597,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -4975,6 +5645,7 @@ mod tests {
                 validation_target: None,
                 complete_assumeutxo: None,
                 background_assumeutxo: Some(validation_dir.clone()),
+                cleanup_validation_dir: true,
                 validation_limits: ValidationLimits {
                     max_blocks_per_batch: 1,
                     pause_between_batches: Duration::ZERO,
@@ -4993,17 +5664,7 @@ mod tests {
         assert_eq!(active.execution().tip().unwrap().hash, second_hash);
         assert!(active.get(first_outpoint).unwrap().is_some());
         drop(active);
-        let validation =
-            RedbChainStore::open(validation_dir.join("chainstate.redb"), Network::Regtest).unwrap();
-        assert_eq!(validation.execution().tip().unwrap().height, 1);
-        assert_eq!(validation.execution().tip().unwrap().hash, first_hash);
-        assert_eq!(
-            validation.execution().validation_target().unwrap(),
-            Some(rbtc::execution_store::ExecutionTip {
-                height: 1,
-                hash: first_hash,
-            })
-        );
+        assert!(!validation_dir.exists());
     }
 
     #[tokio::test]
@@ -5071,6 +5732,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5143,6 +5805,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5173,6 +5836,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5234,6 +5898,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5289,6 +5954,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5378,6 +6044,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5510,6 +6177,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5606,6 +6274,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5674,6 +6343,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -5772,6 +6442,7 @@ mod tests {
                 validation_target: None,
                 complete_assumeutxo: None,
                 background_assumeutxo: None,
+                cleanup_validation_dir: false,
                 validation_limits: ValidationLimits::default(),
             },
             local_nonce,
@@ -5884,6 +6555,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
         .await
