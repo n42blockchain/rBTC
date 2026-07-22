@@ -26,17 +26,29 @@ use tokio::{
     net::TcpStream,
 };
 
-/// Maximum v1 P2P message size accepted before allocation (32 MiB).
-pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 32 * 1024 * 1024;
+/// Bitcoin Core 26's maximum accepted v1 P2P payload size (4,000,000 bytes).
+pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 4_000_000;
 const V1_HEADER_LEN: usize = 24;
 const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
+const MAX_USER_AGENT_LEN: usize = 256;
+const MAX_LOCATOR_HASHES: usize = 101;
 /// Maximum headers permitted in one protocol `headers` response.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 /// Maximum block bodies requested concurrently from one peer.
 pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
 const PROTOCOL_VERSION: u32 = 70_016;
 const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
+
+fn validate_user_agent(user_agent: &str) -> Result<(), P2pError> {
+    if user_agent.len() > MAX_USER_AGENT_LEN {
+        return Err(P2pError::OversizeUserAgent {
+            length: user_agent.len(),
+            limit: MAX_USER_AGENT_LEN,
+        });
+    }
+    Ok(())
+}
 
 /// Async v1 P2P framing error.
 #[derive(Debug, Error)]
@@ -101,6 +113,14 @@ pub enum P2pError {
         /// Minimum compatible version.
         minimum: u32,
     },
+    /// A local or remote version message contains an oversized user agent.
+    #[error("peer user agent length {length} exceeds limit {limit}")]
+    OversizeUserAgent {
+        /// UTF-8 byte length of the user-agent string.
+        length: usize,
+        /// Maximum accepted byte length.
+        limit: usize,
+    },
     /// The outbound connection reached another instance of this node.
     #[error("peer version nonce matches local nonce")]
     SelfConnection,
@@ -124,6 +144,12 @@ pub enum P2pError {
     /// A peer sent a block outside the outstanding batch.
     #[error("peer sent unsolicited block {0}")]
     UnsolicitedBlock(BlockHash),
+    /// A caller supplied more locator hashes than Bitcoin Core accepts.
+    #[error("getheaders locator contains {count} hashes; limit is {MAX_LOCATOR_HASHES}")]
+    TooManyLocatorHashes {
+        /// Number of supplied locator hashes.
+        count: usize,
+    },
 }
 
 /// An established Bitcoin peer session.
@@ -260,6 +286,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
                             minimum: MIN_PEER_PROTOCOL_VERSION,
                         });
                     }
+                    validate_user_agent(&version.user_agent)?;
                     if remote_version.replace(version).is_some() {
                         return Err(P2pError::DuplicateVersion);
                     }
@@ -317,6 +344,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         locator_hashes: Vec<BlockHash>,
         stop_hash: BlockHash,
     ) -> Result<(), P2pError> {
+        if locator_hashes.len() > MAX_LOCATOR_HASHES {
+            return Err(P2pError::TooManyLocatorHashes {
+                count: locator_hashes.len(),
+            });
+        }
         let request = GetHeadersMessage {
             version: PROTOCOL_VERSION,
             locator_hashes,
@@ -465,6 +497,7 @@ pub async fn connect_outbound(
     user_agent: String,
     start_height: i32,
 ) -> Result<PeerSession<TcpStream>, P2pError> {
+    validate_user_agent(&user_agent)?;
     let stream = TcpStream::connect(remote).await?;
     let local_address = stream.local_addr()?;
     let timestamp = SystemTime::now()
@@ -585,6 +618,24 @@ mod tests {
                 length: 1025,
                 limit: 1024
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_transport_matches_core_26_message_limit() {
+        let (mut writer, reader) = duplex(128);
+        let mut header = encode_v1(Magic::BITCOIN, NetworkMessage::Verack);
+        header[16..20].copy_from_slice(&(MAX_PROTOCOL_MESSAGE_LEN + 1).to_le_bytes());
+        writer.write_all(&header[..V1_HEADER_LEN]).await.unwrap();
+        drop(writer);
+
+        let mut transport = V1Transport::new(reader, Magic::BITCOIN);
+        assert!(matches!(
+            transport.read_message().await,
+            Err(P2pError::Oversize {
+                length,
+                limit: MAX_PROTOCOL_MESSAGE_LEN
+            }) if length == MAX_PROTOCOL_MESSAGE_LEN + 1
         ));
     }
 
@@ -832,6 +883,70 @@ mod tests {
             Err(P2pError::ObsoleteVersion { .. })
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_oversized_remote_and_local_user_agents() {
+        validate_user_agent(&"x".repeat(MAX_USER_AGENT_LEN)).unwrap();
+
+        let (client_stream, server_stream) = duplex(4096);
+        let client = tokio::spawn(async move {
+            let mut client = V1Transport::new(client_stream, Network::Regtest.magic());
+            client.handshake(version(1)).await
+        });
+        let server = tokio::spawn(async move {
+            let mut server = V1Transport::new(server_stream, Network::Regtest.magic());
+            server.read_message().await.unwrap();
+            let mut oversized = version(2);
+            oversized.user_agent = "x".repeat(MAX_USER_AGENT_LEN + 1);
+            server
+                .write_message(NetworkMessage::Version(oversized))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::OversizeUserAgent {
+                length,
+                limit: MAX_USER_AGENT_LEN
+            }) if length == MAX_USER_AGENT_LEN + 1
+        ));
+        server.await.unwrap();
+
+        let result = connect_outbound(
+            "127.0.0.1:1".parse().unwrap(),
+            Network::Regtest.magic(),
+            3,
+            "x".repeat(MAX_USER_AGENT_LEN + 1),
+            0,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(P2pError::OversizeUserAgent {
+                length,
+                limit: MAX_USER_AGENT_LEN
+            }) if length == MAX_USER_AGENT_LEN + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn getheaders_rejects_oversized_locator_before_writing() {
+        let (client_stream, _) = duplex(64);
+        let mut session = PeerSession {
+            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+            remote_version: version(1),
+        };
+        let result = session
+            .request_headers(
+                vec![BlockHash::all_zeros(); MAX_LOCATOR_HASHES + 1],
+                BlockHash::all_zeros(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(P2pError::TooManyLocatorHashes { count }) if count == MAX_LOCATOR_HASHES + 1
+        ));
     }
 
     #[tokio::test]

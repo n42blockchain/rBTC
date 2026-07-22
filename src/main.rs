@@ -127,9 +127,13 @@ async fn main() {
 }
 
 async fn run(options: Options) -> Result<(), String> {
+    run_with_nonce(options, rand::random()).await
+}
+
+async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
     let mut failures = Vec::with_capacity(options.remotes.len());
     for remote in options.remotes.iter().copied() {
-        match run_with_peer(&options, remote).await {
+        match run_with_peer(&options, remote, local_nonce).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 eprintln!("peer {remote} failed: {error}");
@@ -144,13 +148,17 @@ async fn run(options: Options) -> Result<(), String> {
     ))
 }
 
-async fn run_with_peer(options: &Options, remote: SocketAddr) -> Result<(), String> {
+async fn run_with_peer(
+    options: &Options,
+    remote: SocketAddr,
+    local_nonce: u64,
+) -> Result<(), String> {
     let mut session = timeout(
         PEER_TIMEOUT,
         connect_outbound(
             remote,
             options.network.magic(),
-            rand::random(),
+            local_nonce,
             USER_AGENT.to_owned(),
             0,
         ),
@@ -1078,13 +1086,14 @@ mod tests {
     async fn accept_peer(
         listener: TcpListener,
         version: VersionMessage,
-    ) -> V1Transport<tokio::net::TcpStream> {
+    ) -> (V1Transport<tokio::net::TcpStream>, VersionMessage) {
         let (stream, _) = listener.accept().await.unwrap();
         let mut peer = V1Transport::new(stream, Network::Regtest.magic());
-        assert!(matches!(
-            peer.read_message().await.unwrap().into_payload(),
-            NetworkMessage::Version(_)
-        ));
+        let NetworkMessage::Version(local_version) =
+            peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected version");
+        };
         peer.write_message(NetworkMessage::Version(version))
             .await
             .unwrap();
@@ -1093,7 +1102,7 @@ mod tests {
             NetworkMessage::Verack
         ));
         peer.write_message(NetworkMessage::Verack).await.unwrap();
-        peer
+        (peer, local_version)
     }
 
     fn mine_regtest_child(parent: BlockHash, time: u32) -> Header {
@@ -1706,14 +1715,16 @@ mod tests {
         let deficient_server = tokio::spawn(async move {
             let mut version = peer_version(10);
             version.services = ServiceFlags::NETWORK;
-            let _peer = accept_peer(deficient_listener, version).await;
+            let (_peer, local_version) = accept_peer(deficient_listener, version).await;
+            local_version.nonce
         });
 
         let interrupted_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let interrupted_remote = interrupted_listener.local_addr().unwrap();
         let interrupted_header = block.header;
         let interrupted_server = tokio::spawn(async move {
-            let mut peer = accept_peer(interrupted_listener, peer_version(11)).await;
+            let (mut peer, local_version) =
+                accept_peer(interrupted_listener, peer_version(11)).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);
@@ -1728,12 +1739,13 @@ mod tests {
                 NetworkMessage::GetData(inventory)
                     if inventory == vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(block_hash)]
             ));
+            local_version.nonce
         });
 
         let recovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let recovery_remote = recovery_listener.local_addr().unwrap();
         let recovery_server = tokio::spawn(async move {
-            let mut peer = accept_peer(recovery_listener, peer_version(12)).await;
+            let (mut peer, local_version) = accept_peer(recovery_listener, peer_version(12)).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes.first(), Some(&block_hash));
@@ -1751,25 +1763,33 @@ mod tests {
             peer.write_message(NetworkMessage::Block(block))
                 .await
                 .unwrap();
+            local_version.nonce
         });
 
         let directory = TempDir::new().unwrap();
-        run(Options {
-            remotes: vec![deficient_remote, interrupted_remote, recovery_remote],
-            network: Network::Regtest,
-            fetch_block: None,
-            headers_db: None,
-            data_dir: Some(directory.path().to_path_buf()),
-            once: true,
-            explorer_listen: None,
-            deployments: DeploymentConfig::for_network(Network::Regtest),
-            ibd_policy: IbdPolicy::for_network(Network::Regtest),
-        })
+        let local_nonce = 99;
+        run_with_nonce(
+            Options {
+                remotes: vec![deficient_remote, interrupted_remote, recovery_remote],
+                network: Network::Regtest,
+                fetch_block: None,
+                headers_db: None,
+                data_dir: Some(directory.path().to_path_buf()),
+                once: true,
+                explorer_listen: None,
+                deployments: DeploymentConfig::for_network(Network::Regtest),
+                ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            },
+            local_nonce,
+        )
         .await
         .unwrap();
-        deficient_server.await.unwrap();
-        interrupted_server.await.unwrap();
-        recovery_server.await.unwrap();
+        let deficient_nonce = deficient_server.await.unwrap();
+        let interrupted_nonce = interrupted_server.await.unwrap();
+        let recovery_nonce = recovery_server.await.unwrap();
+        assert_eq!(deficient_nonce, local_nonce);
+        assert_eq!(interrupted_nonce, local_nonce);
+        assert_eq!(recovery_nonce, local_nonce);
 
         let headers = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
         assert_eq!(
