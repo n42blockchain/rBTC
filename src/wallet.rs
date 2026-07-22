@@ -12,13 +12,23 @@ use std::{
 };
 
 use bdk_wallet::{
-    ChangeSet, KeychainKind, PersistedWallet, Wallet, WalletPersister,
+    ChangeSet, KeychainKind, PersistedWallet, Update, Wallet, WalletPersister,
     chain::BlockId,
     miniscript::{Descriptor, DescriptorPublicKey},
-    rusqlite::Connection,
+    rusqlite::{Connection, OptionalExtension, params},
 };
 use bitcoin::{Block, BlockHash, Network};
 use thiserror::Error;
+
+/// BIP44-style default number of consecutive unused scripts to scan.
+pub const DEFAULT_WALLET_GAP_LIMIT: u32 = 20;
+/// Defensive upper bound for descriptor scan lookahead.
+pub const MAX_WALLET_GAP_LIMIT: u32 = 1_000;
+const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
+const NEXT_RECEIVE_INDEX_KEY: &str = "next_receive_index";
+const SCAN_START_HEIGHT_KEY: &str = "scan_start_height";
+const MAX_WALLET_UTXO_PAGE_OFFSET: u32 = 10_000;
+const MAX_WALLET_UTXO_PAGE_READ: u32 = 101;
 
 /// A compact, serializable address response for the embedded wallet API.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -40,6 +50,23 @@ pub struct WalletBalance {
     pub untrusted_pending: u64,
     /// Coinbase funds that have not reached maturity.
     pub immature: u64,
+}
+
+/// A current unspent output controlled by the watch-only wallet.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletUtxo {
+    /// Transaction containing the output.
+    pub txid: String,
+    /// Output index within the transaction.
+    pub vout: u32,
+    /// Output value in satoshis.
+    pub value_sats: u64,
+    /// Receive or change descriptor keychain.
+    pub keychain: String,
+    /// Descriptor derivation index.
+    pub derivation_index: u32,
+    /// Confirmation height, or none for an unconfirmed transaction.
+    pub confirmed_height: Option<u32>,
 }
 
 /// A durable checkpoint in the wallet's view of the validated active chain.
@@ -78,6 +105,9 @@ pub enum WalletError {
     /// The supplied validated-chain transition did not connect to wallet state.
     #[error("wallet chain update: {0}")]
     Chain(String),
+    /// A wallet query exceeded its bounded read window.
+    #[error("wallet query exceeds bounded page limits")]
+    QueryLimit,
 }
 
 struct WalletState {
@@ -124,6 +154,7 @@ impl EmbeddedWallet {
                 },
                 Ok,
             )?;
+        initialize_metadata(&mut database, &wallet)?;
 
         Ok(Self {
             state: Mutex::new(WalletState { wallet, database }),
@@ -139,13 +170,102 @@ impl EmbeddedWallet {
     /// staged changes for a later persistence attempt.
     pub fn reveal_receive_address(&self) -> Result<WalletAddress, WalletError> {
         let mut state = self.state()?;
-        let address = state.wallet.reveal_next_address(KeychainKind::External);
         let WalletState { wallet, database } = &mut *state;
+        let index = reserve_receive_index(database)?;
+        wallet
+            .reveal_addresses_to(KeychainKind::External, index)
+            .for_each(drop);
+        let address = wallet.peek_address(KeychainKind::External, index);
         wallet.persist(database)?;
         Ok(WalletAddress {
             index: address.index,
             address: address.address.to_string(),
         })
+    }
+
+    /// Extends both descriptor keychains to maintain `gap_limit` unused scripts.
+    ///
+    /// Returns `true` when new scripts were revealed and historical blocks must
+    /// be replayed to determine whether the window needs extending again.
+    pub fn ensure_scan_lookahead(&self, gap_limit: u32) -> Result<bool, WalletError> {
+        if !(1..=MAX_WALLET_GAP_LIMIT).contains(&gap_limit) {
+            return Err(WalletError::Chain(format!(
+                "gap limit must be between 1 and {MAX_WALLET_GAP_LIMIT}"
+            )));
+        }
+        let mut state = self.state()?;
+        let mut changed = false;
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            let last_used = state.wallet.spk_index().last_used_index(keychain);
+            let target = last_used.map_or(gap_limit - 1, |index| {
+                index.saturating_add(gap_limit).min(MAX_DERIVATION_INDEX)
+            });
+            let last_revealed = state.wallet.spk_index().last_revealed_index(keychain);
+            if last_revealed.is_none_or(|index| index < target) {
+                state
+                    .wallet
+                    .reveal_addresses_to(keychain, target)
+                    .for_each(drop);
+                changed = true;
+            }
+        }
+        if changed {
+            let WalletState { wallet, database } = &mut *state;
+            wallet.persist(database)?;
+        }
+        Ok(changed)
+    }
+
+    /// Returns the earliest height covered by the last converged descriptor scan.
+    pub fn scan_start_height(&self) -> Result<Option<u32>, WalletError> {
+        let state = self.state()?;
+        read_metadata_u32(&state.database, SCAN_START_HEIGHT_KEY)
+    }
+
+    /// Records a successfully converged descriptor scan boundary.
+    pub fn record_scan_start_height(&self, height: u32) -> Result<(), WalletError> {
+        let state = self.state()?;
+        state.database.execute(
+            "INSERT INTO rbtc_wallet_metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = MIN(value, excluded.value)",
+            params![SCAN_START_HEIGHT_KEY, i64::from(height)],
+        )?;
+        Ok(())
+    }
+
+    /// Advances the wallet chain through already-validated headers without
+    /// scanning raw blocks before a configured descriptor birthday.
+    pub fn advance_checkpoint(&self, target: WalletTip) -> Result<(), WalletError> {
+        let mut state = self.state()?;
+        let current = state.wallet.latest_checkpoint();
+        if target.height <= current.height() {
+            let existing = current.get(target.height).ok_or_else(|| {
+                WalletError::Chain(format!("missing checkpoint at height {}", target.height))
+            })?;
+            if existing.hash() != target.hash {
+                return Err(WalletError::Chain(format!(
+                    "checkpoint hash mismatch at height {}",
+                    target.height
+                )));
+            }
+            return Ok(());
+        }
+        let update = current
+            .push(BlockId {
+                height: target.height,
+                hash: target.hash,
+            })
+            .map_err(|_| WalletError::Chain("checkpoint height did not advance".to_owned()))?;
+        state
+            .wallet
+            .apply_update(Update {
+                chain: Some(update),
+                ..Update::default()
+            })
+            .map_err(|error| WalletError::Chain(error.to_string()))?;
+        let WalletState { wallet, database } = &mut *state;
+        wallet.persist(database)?;
+        Ok(())
     }
 
     /// Returns the BDK balance categorization in satoshis.
@@ -158,6 +278,32 @@ impl EmbeddedWallet {
             untrusted_pending: balance.untrusted_pending.to_sat(),
             immature: balance.immature.to_sat(),
         })
+    }
+
+    /// Returns a bounded slice of current wallet UTXOs.
+    pub fn utxos(&self, offset: u32, limit: u32) -> Result<Vec<WalletUtxo>, WalletError> {
+        if offset > MAX_WALLET_UTXO_PAGE_OFFSET || limit == 0 || limit > MAX_WALLET_UTXO_PAGE_READ {
+            return Err(WalletError::QueryLimit);
+        }
+        let state = self.state()?;
+        Ok(state
+            .wallet
+            .list_unspent()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(|output| WalletUtxo {
+                txid: output.outpoint.txid.to_string(),
+                vout: output.outpoint.vout,
+                value_sats: output.txout.value.to_sat(),
+                keychain: match output.keychain {
+                    KeychainKind::External => "receive",
+                    KeychainKind::Internal => "change",
+                }
+                .to_owned(),
+                derivation_index: output.derivation_index,
+                confirmed_height: output.chain_position.confirmation_height_upper_bound(),
+            })
+            .collect())
     }
 
     /// Returns the latest persisted validated-chain checkpoint.
@@ -271,6 +417,73 @@ fn load_wallet(
         .ok_or_else(|| WalletError::Load("persisted wallet disappeared during reload".to_owned()))
 }
 
+fn initialize_metadata(
+    database: &mut Connection,
+    wallet: &PersistedWallet<Connection>,
+) -> Result<(), WalletError> {
+    database.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rbtc_wallet_metadata (
+            key TEXT PRIMARY KEY NOT NULL,
+            value INTEGER NOT NULL CHECK (value >= 0)
+        );",
+    )?;
+    let existing = database
+        .query_row(
+            "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
+            params![NEXT_RECEIVE_INDEX_KEY],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if existing.is_none() {
+        let next = wallet
+            .spk_index()
+            .last_revealed_index(KeychainKind::External)
+            .map_or(0, |index| index.saturating_add(1));
+        database.execute(
+            "INSERT INTO rbtc_wallet_metadata (key, value) VALUES (?1, ?2)",
+            params![NEXT_RECEIVE_INDEX_KEY, i64::from(next)],
+        )?;
+    }
+    Ok(())
+}
+
+fn reserve_receive_index(database: &mut Connection) -> Result<u32, WalletError> {
+    let transaction = database.transaction()?;
+    let raw = transaction.query_row(
+        "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
+        params![NEXT_RECEIVE_INDEX_KEY],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let index = u32::try_from(raw)
+        .ok()
+        .filter(|index| *index <= MAX_DERIVATION_INDEX)
+        .ok_or_else(|| WalletError::Chain("receive derivation index exhausted".to_owned()))?;
+    let next = index
+        .checked_add(1)
+        .ok_or_else(|| WalletError::Chain("receive derivation index exhausted".to_owned()))?;
+    transaction.execute(
+        "UPDATE rbtc_wallet_metadata SET value = ?1 WHERE key = ?2",
+        params![i64::from(next), NEXT_RECEIVE_INDEX_KEY],
+    )?;
+    transaction.commit()?;
+    Ok(index)
+}
+
+fn read_metadata_u32(database: &Connection, key: &str) -> Result<Option<u32>, WalletError> {
+    database
+        .query_row(
+            "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|raw| {
+            u32::try_from(raw)
+                .map_err(|_| WalletError::Chain(format!("wallet metadata {key} is out of range")))
+        })
+        .transpose()
+}
+
 fn public_descriptor(
     descriptor: &str,
     keychain: &'static str,
@@ -316,7 +529,8 @@ mod tests {
 
     use bitcoin::{
         Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        absolute::LockTime, blockdata::constants::genesis_block, transaction::Version,
+        absolute::LockTime, blockdata::constants::genesis_block, hashes::Hash,
+        transaction::Version,
     };
 
     use super::*;
@@ -407,6 +621,10 @@ mod tests {
             };
             assert_eq!(wallet.chain_tip().unwrap(), expected_tip);
             assert_eq!(wallet.balance().unwrap().immature, 42_000);
+            let utxos = wallet.utxos(0, 10).unwrap();
+            assert_eq!(utxos.len(), 1);
+            assert_eq!(utxos[0].value_sats, 42_000);
+            assert_eq!(utxos[0].confirmed_height, Some(1));
             (address, block, expected_tip)
         };
 
@@ -419,6 +637,7 @@ mod tests {
         .unwrap();
         assert_eq!(wallet.chain_tip().unwrap(), expected_tip);
         assert_eq!(wallet.balance().unwrap().immature, 42_000);
+        assert_eq!(wallet.utxos(1, 10).unwrap(), Vec::new());
         assert_eq!(
             block.txdata[0].output[0].script_pubkey,
             Address::from_str(&address.address)
@@ -470,6 +689,109 @@ mod tests {
         );
         assert_eq!(wallet.balance().unwrap().immature, 0);
         assert_eq!(wallet.reveal_receive_address().unwrap().index, 1);
+    }
+
+    #[test]
+    fn lookahead_scan_replays_older_blocks_without_advancing_issued_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("wallet.sqlite");
+        let wallet = EmbeddedWallet::open_or_create(
+            &database,
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap();
+        assert!(wallet.ensure_scan_lookahead(30).unwrap());
+        assert!(!wallet.ensure_scan_lookahead(30).unwrap());
+        let (address_zero, address_edge, address_beyond_lookahead) = {
+            let state = wallet.state().unwrap();
+            (
+                state
+                    .wallet
+                    .peek_address(KeychainKind::External, 0)
+                    .address
+                    .to_string(),
+                state
+                    .wallet
+                    .peek_address(KeychainKind::External, 29)
+                    .address
+                    .to_string(),
+                state
+                    .wallet
+                    .peek_address(KeychainKind::External, 60)
+                    .address
+                    .to_string(),
+            )
+        };
+        let genesis = genesis_block(Network::Testnet).block_hash();
+        let mut first = paying_block(genesis, &address_edge, 10_000);
+        first.txdata[0].output.push(TxOut {
+            value: Amount::from_sat(20_000),
+            script_pubkey: Address::from_str(&address_beyond_lookahead)
+                .unwrap()
+                .require_network(Network::Testnet)
+                .unwrap()
+                .script_pubkey(),
+        });
+        first.header.merkle_root = first.compute_merkle_root().unwrap();
+        let second = paying_block(first.block_hash(), &address_zero, 30_000);
+        wallet.apply_validated_block(&first, 1).unwrap();
+        wallet.apply_validated_block(&second, 2).unwrap();
+        assert_eq!(wallet.balance().unwrap().immature, 40_000);
+
+        assert!(wallet.ensure_scan_lookahead(30).unwrap());
+        wallet.apply_validated_block(&first, 1).unwrap();
+        wallet.apply_validated_block(&second, 2).unwrap();
+        assert_eq!(wallet.chain_tip().unwrap().height, 2);
+        assert_eq!(wallet.balance().unwrap().immature, 60_000);
+        assert!(wallet.ensure_scan_lookahead(30).unwrap());
+        wallet.apply_validated_block(&first, 1).unwrap();
+        wallet.apply_validated_block(&second, 2).unwrap();
+        assert!(!wallet.ensure_scan_lookahead(30).unwrap());
+
+        assert_eq!(wallet.reveal_receive_address().unwrap().index, 0);
+        assert_eq!(wallet.reveal_receive_address().unwrap().index, 1);
+    }
+
+    #[test]
+    fn sparse_birthday_checkpoint_persists_and_connects_next_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("wallet.sqlite");
+        let target = WalletTip {
+            height: 100,
+            hash: BlockHash::from_byte_array([7; 32]),
+        };
+        {
+            let wallet = EmbeddedWallet::open_or_create(
+                &database,
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap();
+            assert_eq!(wallet.scan_start_height().unwrap(), None);
+            wallet.record_scan_start_height(100).unwrap();
+            wallet.record_scan_start_height(200).unwrap();
+            wallet.record_scan_start_height(10).unwrap();
+            wallet.advance_checkpoint(target).unwrap();
+            assert_eq!(wallet.chain_tip().unwrap(), target);
+        }
+
+        let wallet = EmbeddedWallet::open_or_create(
+            &database,
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap();
+        assert_eq!(wallet.chain_tip().unwrap(), target);
+        assert_eq!(wallet.scan_start_height().unwrap(), Some(10));
+        let address = wallet.reveal_receive_address().unwrap();
+        let block = paying_block(target.hash, &address.address, 55_000);
+        wallet.apply_validated_block(&block, 101).unwrap();
+        assert_eq!(wallet.chain_tip().unwrap().height, 101);
+        assert_eq!(wallet.balance().unwrap().immature, 55_000);
     }
 
     #[test]

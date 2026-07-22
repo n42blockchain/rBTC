@@ -32,7 +32,7 @@ use rbtc::{
     peer_store::RedbPeerStore,
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
-    wallet::EmbeddedWallet,
+    wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
 };
 use tokio::time::timeout;
 
@@ -42,6 +42,7 @@ const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
+const MAX_WALLET_SCAN_PASSES: usize = 64;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
@@ -70,11 +71,22 @@ struct WalletApiFiles {
 struct WalletDescriptorFile {
     receive_descriptor: String,
     change_descriptor: String,
+    #[serde(default = "default_wallet_gap_limit")]
+    gap_limit: u32,
+    #[serde(default)]
+    birthday_height: u32,
 }
 
 struct WalletApiRuntime {
     wallet: Arc<EmbeddedWallet>,
     token: WalletAuthToken,
+    scan: WalletScanConfig,
+}
+
+#[derive(Clone, Copy)]
+struct WalletScanConfig {
+    gap_limit: u32,
+    birthday_height: u32,
 }
 
 struct ApiRuntime {
@@ -187,6 +199,11 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 serde_json::from_str(&descriptors).map_err(|_| {
                     "wallet descriptor file must contain the documented JSON object".to_owned()
                 })?;
+            if !(1..=MAX_WALLET_GAP_LIMIT).contains(&descriptors.gap_limit) {
+                return Err(format!(
+                    "wallet gap_limit must be between 1 and {MAX_WALLET_GAP_LIMIT}"
+                ));
+            }
             let token = read_owner_only_text_file(
                 &files.auth_token,
                 "wallet authentication token",
@@ -215,10 +232,18 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             Ok::<_, String>(WalletApiRuntime {
                 wallet: Arc::new(wallet),
                 token,
+                scan: WalletScanConfig {
+                    gap_limit: descriptors.gap_limit,
+                    birthday_height: descriptors.birthday_height,
+                },
             })
         })
         .transpose()?;
     Ok(Some(ApiRuntime { listen, wallet }))
+}
+
+const fn default_wallet_gap_limit() -> u32 {
+    DEFAULT_WALLET_GAP_LIMIT
 }
 
 fn read_owner_only_text_file(
@@ -569,9 +594,8 @@ async fn sync_validating_node(
         RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
             .map_err(|error| error.to_string())?,
     );
-    let wallet = api_runtime
-        .and_then(|api| api.wallet.as_ref())
-        .map(|runtime| runtime.wallet.as_ref());
+    let wallet_runtime = api_runtime.and_then(|api| api.wallet.as_ref());
+    let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
@@ -620,14 +644,15 @@ async fn sync_validating_node(
             &explorer,
         )
         .await?;
-        if let Some(wallet) = wallet {
+        if let Some(wallet) = wallet_runtime {
             reconcile_wallet(
                 session,
                 deployment_config,
                 &headers,
                 execution_store,
                 &ledger,
-                wallet,
+                &wallet.wallet,
+                wallet.scan,
             )
             .await?;
         }
@@ -684,10 +709,23 @@ async fn sync_validating_node(
                 wallet,
             )
             .await?;
+            if let Some(wallet) = wallet_runtime {
+                reconcile_wallet(
+                    session,
+                    deployment_config,
+                    &headers,
+                    execution_store,
+                    &ledger,
+                    &wallet.wallet,
+                    wallet.scan,
+                )
+                .await?;
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn reconcile_wallet(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: DeploymentConfig,
@@ -695,8 +733,12 @@ async fn reconcile_wallet(
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
     wallet: &EmbeddedWallet,
+    scan: WalletScanConfig,
 ) -> Result<(), String> {
     let execution_tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let initial_lookahead_changed = wallet
+        .ensure_scan_lookahead(scan.gap_limit)
+        .map_err(|error| error.to_string())?;
     let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
     let common = wallet
         .chain_checkpoints()
@@ -719,16 +761,102 @@ async fn reconcile_wallet(
         );
     }
 
-    loop {
-        let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
-        if wallet_tip.height >= execution_tip.height {
+    let configured_scan_start = scan.birthday_height.max(1);
+    let stored_scan_start = wallet
+        .scan_start_height()
+        .map_err(|error| error.to_string())?;
+    let scan_start = stored_scan_start.map_or(configured_scan_start, |stored| {
+        stored.min(configured_scan_start)
+    });
+    let skip_to = scan_start.saturating_sub(1).min(execution_tip.height);
+    let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
+    if wallet_tip.height < skip_to {
+        let header = headers
+            .active_header_at(skip_to)
+            .ok_or_else(|| format!("missing active header at wallet birthday {skip_to}"))?;
+        wallet
+            .advance_checkpoint(WalletTip {
+                height: header.height,
+                hash: header.hash,
+            })
+            .map_err(|error| error.to_string())?;
+    }
+
+    let normal_start = wallet
+        .chain_tip()
+        .map_err(|error| error.to_string())?
+        .height
+        .checked_add(1)
+        .ok_or_else(|| "wallet height overflow".to_owned())?;
+    replay_wallet_blocks(
+        session,
+        deployment_config,
+        headers,
+        ledger,
+        wallet,
+        normal_start,
+        execution_tip.height,
+    )
+    .await?;
+
+    let boundary_needs_rescan = stored_scan_start.map_or(normal_start > scan_start, |stored| {
+        configured_scan_start < stored
+    });
+    let mut scan_needed =
+        boundary_needs_rescan || (initial_lookahead_changed && normal_start > scan_start);
+    if !scan_needed {
+        scan_needed = wallet
+            .ensure_scan_lookahead(scan.gap_limit)
+            .map_err(|error| error.to_string())?;
+    }
+    for pass in 0..MAX_WALLET_SCAN_PASSES {
+        if !scan_needed {
+            wallet
+                .record_scan_start_height(scan_start)
+                .map_err(|error| error.to_string())?;
             return Ok(());
         }
-        let next_height = wallet_tip
-            .height
-            .checked_add(1)
-            .ok_or_else(|| "wallet height overflow".to_owned())?;
-        let remaining = execution_tip.height - wallet_tip.height;
+        replay_wallet_blocks(
+            session,
+            deployment_config,
+            headers,
+            ledger,
+            wallet,
+            scan_start,
+            execution_tip.height,
+        )
+        .await?;
+        scan_needed = wallet
+            .ensure_scan_lookahead(scan.gap_limit)
+            .map_err(|error| error.to_string())?;
+        if !scan_needed {
+            wallet
+                .record_scan_start_height(scan_start)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "wallet descriptor scan converged after {} pass(es)",
+                pass + 1
+            );
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "wallet descriptor scan exceeded {MAX_WALLET_SCAN_PASSES} lookahead passes"
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_wallet_blocks(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    deployment_config: DeploymentConfig,
+    headers: &HeaderDag,
+    ledger: &PrunedBlockLedger,
+    wallet: &EmbeddedWallet,
+    mut next_height: u32,
+    end_height: u32,
+) -> Result<(), String> {
+    while next_height <= end_height {
+        let remaining = end_height - next_height + 1;
         let batch_len = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(MAX_BLOCKS_IN_FLIGHT);
@@ -782,7 +910,18 @@ async fn reconcile_wallet(
                 .apply_validated_block(block, expected.height)
                 .map_err(|error| error.to_string())?;
         }
+        let last_height = expected
+            .last()
+            .expect("wallet replay batch is non-empty")
+            .height;
+        if last_height == end_height {
+            return Ok(());
+        }
+        next_height = last_height
+            .checked_add(1)
+            .ok_or_else(|| "wallet height overflow".to_owned())?;
     }
+    Ok(())
 }
 
 async fn reconcile_ledger(
@@ -1975,7 +2114,9 @@ mod tests {
             &descriptors,
             &serde_json::json!({
                 "receive_descriptor": RECEIVE_DESCRIPTOR,
-                "change_descriptor": CHANGE_DESCRIPTOR
+                "change_descriptor": CHANGE_DESCRIPTOR,
+                "gap_limit": 42,
+                "birthday_height": 100
             })
             .to_string(),
         );
@@ -1997,8 +2138,31 @@ mod tests {
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
-        assert!(runtime.wallet.is_some());
+        let wallet = runtime.wallet.as_ref().unwrap();
+        assert_eq!(wallet.scan.gap_limit, 42);
+        assert_eq!(wallet.scan.birthday_height, 100);
         assert!(directory.path().join("wallet.sqlite").exists());
+        drop(runtime);
+
+        write_owner_only(
+            &descriptors,
+            &serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR,
+                "gap_limit": 0
+            })
+            .to_string(),
+        );
+        let error = prepare_api_runtime(&options).err().unwrap();
+        assert!(error.contains("gap_limit"));
+        write_owner_only(
+            &descriptors,
+            &serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR
+            })
+            .to_string(),
+        );
 
         #[cfg(unix)]
         {
@@ -2029,6 +2193,10 @@ mod tests {
                 .unwrap(),
             ),
             token: WalletAuthToken::new(&token_text).unwrap(),
+            scan: WalletScanConfig {
+                gap_limit: DEFAULT_WALLET_GAP_LIMIT,
+                birthday_height: 0,
+            },
         };
         let server = ApiServer::bind("127.0.0.1:0".parse().unwrap(), index, Some(&wallet))
             .await
