@@ -16,7 +16,7 @@ use bitcoin::{
     },
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -354,6 +354,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 count: hashes.len(),
             });
         }
+        let mut unique = HashSet::with_capacity(hashes.len());
+        for hash in hashes {
+            if !unique.insert(*hash) {
+                return Err(P2pError::DuplicateBlockRequest(*hash));
+            }
+        }
         let inventory = hashes
             .iter()
             .copied()
@@ -509,8 +515,12 @@ mod tests {
             Address, Magic, ServiceFlags, message::NetworkMessage, message_network::VersionMessage,
         },
     };
+    use proptest::prelude::*;
     use std::net::SocketAddr;
-    use tokio::{io::duplex, net::TcpListener};
+    use tokio::{
+        io::{AsyncWriteExt, duplex},
+        net::TcpListener,
+    };
 
     fn version(nonce: u64) -> VersionMessage {
         let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
@@ -532,6 +542,67 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    proptest! {
+        #[test]
+        fn v1_ping_envelope_roundtrips_every_nonce(nonce in any::<u64>()) {
+            let message = encode_v1(Magic::BITCOIN, NetworkMessage::Ping(nonce));
+            let decoded = decode_v1(&message).unwrap();
+            prop_assert_eq!(decoded.magic(), &Magic::BITCOIN);
+            prop_assert!(matches!(decoded.into_payload(), NetworkMessage::Ping(value) if value == nonce));
+        }
+
+        #[test]
+        fn arbitrary_bounded_v1_input_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=4096)
+        ) {
+            let _ = decode_v1(&bytes);
+        }
+
+        #[test]
+        fn any_ping_payload_corruption_fails_checksum(
+            nonce in any::<u64>(), payload_byte in 0_usize..8
+        ) {
+            let mut message = encode_v1(Magic::BITCOIN, NetworkMessage::Ping(nonce));
+            message[V1_HEADER_LEN + payload_byte] ^= 1;
+            prop_assert!(decode_v1(&message).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_announced_oversize_before_reading_payload() {
+        let (mut writer, reader) = duplex(128);
+        let mut header = encode_v1(Magic::BITCOIN, NetworkMessage::Verack);
+        header[16..20].copy_from_slice(&(1025_u32).to_le_bytes());
+        writer.write_all(&header[..V1_HEADER_LEN]).await.unwrap();
+        drop(writer);
+
+        let mut transport = V1Transport::new(reader, Magic::BITCOIN).with_max_payload_len(1024);
+        assert!(matches!(
+            transport.read_message().await,
+            Err(P2pError::Oversize {
+                length: 1025,
+                limit: 1024
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_truncated_payload() {
+        let (mut writer, reader) = duplex(128);
+        let message = encode_v1(Magic::BITCOIN, NetworkMessage::Ping(42));
+        writer
+            .write_all(&message[..V1_HEADER_LEN + 3])
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut transport = V1Transport::new(reader, Magic::BITCOIN);
+        assert!(matches!(
+            transport.read_message().await,
+            Err(P2pError::Io(_))
+        ));
     }
 
     #[tokio::test]
@@ -637,6 +708,105 @@ mod tests {
         let blocks = client.await.unwrap();
         assert_eq!(blocks[0].block_hash(), expected[0]);
         assert_eq!(blocks[1].block_hash(), expected[1]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_request_rejects_oversize_and_duplicates_before_writing() {
+        let (client_stream, _) = duplex(64);
+        let mut session = PeerSession {
+            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+            remote_version: version(1),
+        };
+        let hash = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        assert!(matches!(
+            session
+                .request_witness_blocks(&[hash; MAX_BLOCKS_IN_FLIGHT + 1])
+                .await,
+            Err(P2pError::TooManyBlockRequests { .. })
+        ));
+        assert!(matches!(
+            session.request_witness_blocks(&[hash, hash]).await,
+            Err(P2pError::DuplicateBlockRequest(duplicate)) if duplicate == hash
+        ));
+    }
+
+    #[tokio::test]
+    async fn block_batch_rejects_unsolicited_and_notfound_responses() {
+        let expected = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let unsolicited = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
+        let expected_hash = expected.block_hash();
+        let unsolicited_hash = unsolicited.block_hash();
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_requested_blocks(&[expected_hash]).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::Block(unsolicited))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::UnsolicitedBlock(actual)) if actual == unsolicited_hash
+        ));
+        server.await.unwrap();
+
+        let (client_stream, server_stream) = duplex(4096);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_requested_blocks(&[expected_hash]).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::NotFound(vec![Inventory::WitnessBlock(
+                    expected_hash,
+                )]))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::BlockNotFound(actual)) if actual == expected_hash
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_response_rejects_more_than_protocol_maximum() {
+        let (client_stream, server_stream) = duplex(512 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.receive_headers().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            let header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+            transport
+                .write_message(NetworkMessage::Headers(vec![
+                    header;
+                    MAX_HEADERS_PER_RESPONSE + 1
+                ]))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::TooManyHeaders { count }) if count == MAX_HEADERS_PER_RESPONSE + 1
+        ));
         server.await.unwrap();
     }
 

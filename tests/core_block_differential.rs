@@ -3,6 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -27,11 +28,14 @@ use rbtc::{
 };
 use tempfile::TempDir;
 
+static CORE_NODE_LOCK: Mutex<()> = Mutex::new(());
+
 struct CoreNode {
     child: Option<Child>,
     cli: PathBuf,
     data_dir: PathBuf,
     rpc_port: u16,
+    _serial_guard: MutexGuard<'static, ()>,
 }
 
 impl CoreNode {
@@ -40,6 +44,9 @@ impl CoreNode {
     }
 
     fn start_with_args(bitcoind: &Path, extra_args: &[&str]) -> Self {
+        let serial_guard = CORE_NODE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cli = bitcoind.with_file_name("bitcoin-cli");
         assert!(cli.is_file(), "bitcoin-cli must be next to bitcoind");
         let data_dir = TempDir::new().unwrap().keep();
@@ -67,6 +74,7 @@ impl CoreNode {
             cli,
             data_dir,
             rpc_port,
+            _serial_guard: serial_guard,
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -193,12 +201,28 @@ fn coinbase_with_witness_commitment(height: u32, value: u64, valid: bool) -> Tra
 }
 
 fn spend(previous_output: OutPoint, sequence: Sequence, value: u64) -> Transaction {
+    spend_with_context(
+        previous_output,
+        sequence,
+        value,
+        LockTime::ZERO,
+        ScriptBuf::new(),
+    )
+}
+
+fn spend_with_context(
+    previous_output: OutPoint,
+    sequence: Sequence,
+    value: u64,
+    lock_time: LockTime,
+    script_sig: ScriptBuf,
+) -> Transaction {
     Transaction {
         version: Version::TWO,
-        lock_time: LockTime::ZERO,
+        lock_time,
         input: vec![TxIn {
             previous_output,
-            script_sig: ScriptBuf::new(),
+            script_sig,
             sequence,
             witness: Witness::new(),
         }],
@@ -207,6 +231,35 @@ fn spend(previous_output: OutPoint, sequence: Sequence, value: u64) -> Transacti
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     }
+}
+
+fn median_time_past(blocks: &[Block]) -> u32 {
+    let start = blocks.len().saturating_sub(11);
+    let mut times = blocks[start..]
+        .iter()
+        .map(|block| block.header.time)
+        .collect::<Vec<_>>();
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+fn mine_and_submit_prefix(
+    core: &CoreNode,
+    count: u32,
+    mut reward_at_height: impl FnMut(u32) -> Transaction,
+) -> Vec<Block> {
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let mut blocks = Vec::with_capacity(usize::try_from(count).unwrap());
+    let mut parent = genesis.block_hash();
+    let mut time = genesis.header.time;
+    for height in 1..=count {
+        time += 1;
+        let block = mine_block(parent, time, vec![reward_at_height(height)]);
+        assert!(core.submit(&block).is_empty());
+        parent = block.block_hash();
+        blocks.push(block);
+    }
+    blocks
 }
 
 fn mine_block(parent: BlockHash, time: u32, transactions: Vec<Transaction>) -> Block {
@@ -698,18 +751,10 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=csv@102"]);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments.apply_test_activation_height("csv@102").unwrap();
-    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
     let subsidy = block_subsidy_with_interval(1, 150);
-    let mut blocks = Vec::with_capacity(102);
-    let mut parent = genesis.block_hash();
-    let mut time = genesis.header.time;
-    for height in 1..=100_u32 {
-        time += 1;
-        let block = mine_block(parent, time, vec![coinbase(height, subsidy)]);
-        assert!(core.submit(&block).is_empty());
-        parent = block.block_hash();
-        blocks.push(block);
-    }
+    let mut blocks = mine_and_submit_prefix(&core, 100, |height| coinbase(height, subsidy));
+    let mut parent = blocks.last().unwrap().block_hash();
+    let mut time = blocks.last().unwrap().header.time;
 
     let first_coinbase = OutPoint::new(blocks[0].txdata[0].compute_txid(), 0);
     time += 1;
@@ -753,6 +798,203 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
         vec![
             coinbase(102, subsidy),
             spend(spendable, Sequence::from_height(1), subsidy),
+        ],
+    );
+    assert!(core.submit(&valid).is_empty());
+    blocks.push(valid);
+    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    assert!(accepted.accepted);
+    assert_eq!(accepted.tip_height, 102);
+    assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");
+}
+
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
+fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
+    let bitcoind = PathBuf::from(
+        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
+    );
+    let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=csv@102"]);
+    let mut deployments = DeploymentConfig::for_network(Network::Regtest);
+    deployments.apply_test_activation_height("csv@102").unwrap();
+    let subsidy = block_subsidy_with_interval(1, 150);
+    let mut blocks = mine_and_submit_prefix(&core, 100, |height| coinbase(height, subsidy));
+    let mut parent = blocks.last().unwrap().block_hash();
+    let mut time = blocks.last().unwrap().header.time;
+
+    let first_coinbase = OutPoint::new(blocks[0].txdata[0].compute_txid(), 0);
+    time += 1;
+    let pre_activation = mine_block(
+        parent,
+        time,
+        vec![
+            coinbase(101, subsidy),
+            spend(first_coinbase, Sequence::MAX, subsidy),
+        ],
+    );
+    assert!(core.submit(&pre_activation).is_empty());
+    let relative_prevout = OutPoint::new(pre_activation.txdata[1].compute_txid(), 0);
+    parent = pre_activation.block_hash();
+    blocks.push(pre_activation);
+    assert!(rbtc_outcome_with_config(&blocks, deployments).accepted);
+
+    let parent_mtp = median_time_past(&blocks);
+    let second_coinbase = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
+    let absolute_locked = mine_block(
+        parent,
+        time + 1,
+        vec![
+            coinbase(102, subsidy),
+            spend_with_context(
+                second_coinbase,
+                Sequence::ENABLE_RBF_NO_LOCKTIME,
+                subsidy,
+                LockTime::from_time(parent_mtp).unwrap(),
+                ScriptBuf::new(),
+            ),
+        ],
+    );
+    assert_eq!(core.submit(&absolute_locked), "bad-txns-nonfinal");
+    let mut rejected_chain = blocks.clone();
+    rejected_chain.push(absolute_locked);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.tip_height, 101);
+    assert!(!rejected.candidate_undo);
+    assert!(!rejected.candidate_output);
+
+    let relative_locked = mine_block(
+        parent,
+        time + 2,
+        vec![
+            coinbase(102, subsidy),
+            spend(
+                relative_prevout,
+                Sequence::from_512_second_intervals(1),
+                subsidy,
+            ),
+        ],
+    );
+    assert_eq!(core.submit(&relative_locked), "bad-txns-nonfinal");
+    let mut rejected_chain = blocks.clone();
+    rejected_chain.push(relative_locked);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.tip_height, 101);
+    assert!(!rejected.candidate_undo);
+    assert!(!rejected.candidate_output);
+
+    let valid = mine_block(
+        parent,
+        time + 3,
+        vec![
+            coinbase(102, subsidy),
+            spend_with_context(
+                second_coinbase,
+                Sequence::ENABLE_RBF_NO_LOCKTIME,
+                subsidy,
+                LockTime::from_time(parent_mtp - 1).unwrap(),
+                ScriptBuf::new(),
+            ),
+            spend(
+                relative_prevout,
+                Sequence::from_512_second_intervals(0),
+                subsidy,
+            ),
+        ],
+    );
+    assert!(core.submit(&valid).is_empty());
+    blocks.push(valid);
+    let accepted = rbtc_outcome_with_config(&blocks, deployments);
+    assert!(accepted.accepted);
+    assert_eq!(accepted.tip_height, 102);
+    assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");
+}
+
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
+fn core_26_and_rbtc_agree_on_bip147_nulldummy_boundary() {
+    let bitcoind = PathBuf::from(
+        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
+    );
+    let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=segwit@102"]);
+    let mut deployments = DeploymentConfig::for_network(Network::Regtest);
+    deployments
+        .apply_test_activation_height("segwit@102")
+        .unwrap();
+    let subsidy = block_subsidy_with_interval(1, 150);
+    let null_dummy_script = ScriptBuf::from_bytes(vec![0x00, 0x00, 0xae]);
+    let mut blocks = mine_and_submit_prefix(&core, 100, |height| {
+        let mut reward = coinbase(height, subsidy);
+        if height <= 2 {
+            reward.output[0].script_pubkey = null_dummy_script.clone();
+        }
+        reward
+    });
+    let mut parent = blocks.last().unwrap().block_hash();
+    let mut time = blocks.last().unwrap().header.time;
+
+    let first_coinbase = OutPoint::new(blocks[0].txdata[0].compute_txid(), 0);
+    time += 1;
+    let pre_activation = mine_block(
+        parent,
+        time,
+        vec![
+            coinbase(101, subsidy),
+            spend_with_context(
+                first_coinbase,
+                Sequence::MAX,
+                subsidy,
+                LockTime::ZERO,
+                ScriptBuf::from_bytes(vec![0x01, 0x01]),
+            ),
+        ],
+    );
+    assert!(core.submit(&pre_activation).is_empty());
+    parent = pre_activation.block_hash();
+    blocks.push(pre_activation);
+    assert!(rbtc_outcome_with_config(&blocks, deployments).accepted);
+
+    let second_coinbase = OutPoint::new(blocks[1].txdata[0].compute_txid(), 0);
+    let non_null_dummy = mine_block(
+        parent,
+        time + 1,
+        vec![
+            coinbase(102, subsidy),
+            spend_with_context(
+                second_coinbase,
+                Sequence::MAX,
+                subsidy,
+                LockTime::ZERO,
+                ScriptBuf::from_bytes(vec![0x01, 0x01]),
+            ),
+        ],
+    );
+    let core_rejection = core.submit(&non_null_dummy);
+    assert!(
+        !core_rejection.is_empty(),
+        "Core unexpectedly accepted the non-null BIP147 dummy"
+    );
+    let mut rejected_chain = blocks.clone();
+    rejected_chain.push(non_null_dummy);
+    let rejected = rbtc_outcome_with_config(&rejected_chain, deployments);
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.tip_height, 101);
+    assert!(!rejected.candidate_undo);
+    assert!(!rejected.candidate_output);
+
+    let valid = mine_block(
+        parent,
+        time + 2,
+        vec![
+            coinbase(102, subsidy),
+            spend_with_context(
+                second_coinbase,
+                Sequence::MAX,
+                subsidy,
+                LockTime::ZERO,
+                ScriptBuf::from_bytes(vec![0x00]),
+            ),
         ],
     );
     assert!(core.submit(&valid).is_empty());
