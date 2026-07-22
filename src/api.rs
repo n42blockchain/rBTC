@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    convert::Infallible,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -16,10 +17,15 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Semaphore, broadcast};
+use tokio_stream::{
+    StreamExt,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 
 use crate::wallet::{
     EmbeddedWallet, WalletAddress, WalletBalance, WalletStatus, WalletTransaction, WalletUtxo,
@@ -111,6 +117,7 @@ const MIN_WALLET_AUTH_TOKEN_LEN: usize = 32;
 const MAX_WALLET_AUTH_TOKEN_LEN: usize = 256;
 const WALLET_ADDRESS_BURST: u8 = 20;
 const WALLET_ADDRESS_REFILL_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_EXPLORER_EVENT_CLIENTS: usize = 64;
 
 /// In-memory bearer credential protecting every wallet route.
 ///
@@ -295,6 +302,88 @@ pub struct Health {
     pub status: &'static str,
 }
 
+/// How the persistent explorer moved to the reported active-chain tip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorerEventKind {
+    /// Initial state sent to a newly connected client.
+    Snapshot,
+    /// One validated active block was indexed.
+    Connected,
+    /// A stale explorer tip was removed during reorganization recovery.
+    Disconnected,
+    /// A snapshot-aware projection was rebuilt from current chainstate.
+    Rebased,
+}
+
+/// Durable explorer-tip change delivered over the local SSE feed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ExplorerEvent {
+    /// Process-local monotonic ordering for subscription-race handling.
+    pub sequence: u64,
+    /// Transition responsible for this event.
+    pub kind: ExplorerEventKind,
+    /// New persistent explorer height after the transition.
+    pub height: u32,
+    /// New persistent explorer hash after the transition.
+    pub hash: String,
+}
+
+/// Bounded fan-out for persistent explorer-tip notifications.
+///
+/// A newly subscribed client first receives the latest state. If it falls
+/// behind the bounded broadcast ring, the stream emits a `resync` event rather
+/// than pretending it observed every intermediate transition.
+#[derive(Clone)]
+pub struct ExplorerEventHub {
+    sender: broadcast::Sender<ExplorerEvent>,
+    latest: Arc<Mutex<ExplorerEvent>>,
+    clients: Arc<Semaphore>,
+}
+
+impl ExplorerEventHub {
+    /// Creates a feed whose initial snapshot matches the durable explorer tip.
+    pub fn new(height: u32, hash: impl Into<String>) -> Self {
+        let (sender, _) = broadcast::channel(128);
+        Self {
+            sender,
+            latest: Arc::new(Mutex::new(ExplorerEvent {
+                sequence: 0,
+                kind: ExplorerEventKind::Snapshot,
+                height,
+                hash: hash.into(),
+            })),
+            clients: Arc::new(Semaphore::new(MAX_EXPLORER_EVENT_CLIENTS)),
+        }
+    }
+
+    /// Publishes a transition after its explorer transaction has committed.
+    pub fn publish(&self, kind: ExplorerEventKind, height: u32, hash: impl Into<String>) {
+        let mut latest = self
+            .latest
+            .lock()
+            .expect("explorer event lock not poisoned");
+        let event = ExplorerEvent {
+            sequence: latest
+                .sequence
+                .checked_add(1)
+                .expect("explorer event sequence exhausted"),
+            kind,
+            height,
+            hash: hash.into(),
+        };
+        latest.clone_from(&event);
+        let _unused_when_no_clients = self.sender.send(event);
+    }
+
+    fn latest(&self) -> ExplorerEvent {
+        self.latest
+            .lock()
+            .expect("explorer event lock not poisoned")
+            .clone()
+    }
+}
+
 /// Creates REST routes for the embedded read-only block explorer.
 pub fn explorer_router<I: ExplorerIndex>(index: Arc<I>) -> Router {
     Router::new()
@@ -306,16 +395,58 @@ pub fn explorer_router<I: ExplorerIndex>(index: Arc<I>) -> Router {
         .with_state(index)
 }
 
+/// Creates the bounded SSE route for persistent explorer-tip transitions.
+pub fn explorer_events_router(events: ExplorerEventHub) -> Router {
+    Router::new()
+        .route("/api/v1/events", get(explorer_events))
+        .with_state(events)
+}
+
+async fn explorer_events(
+    State(events): State<ExplorerEventHub>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let permit = Arc::clone(&events.clients)
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let receiver = events.sender.subscribe();
+    let mut snapshot = events.latest();
+    snapshot.kind = ExplorerEventKind::Snapshot;
+    let snapshot_sequence = snapshot.sequence;
+    let initial = tokio_stream::once(Ok(tip_event(&snapshot)));
+    let updates = BroadcastStream::new(receiver).filter_map(move |update| {
+        let _keep_permit_for_stream_lifetime = &permit;
+        match update {
+            Ok(event) if event.sequence <= snapshot_sequence => None,
+            Ok(event) => Some(Ok(tip_event(&event))),
+            Err(BroadcastStreamRecvError::Lagged(missed)) => Some(Ok(Event::default()
+                .event("resync")
+                .data(format!(r#"{{"missed":{missed}}}"#)))),
+        }
+    });
+    Ok(Sse::new(initial.chain(updates)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
+fn tip_event(event: &ExplorerEvent) -> Event {
+    let data = serde_json::to_string(&event).unwrap_or_else(|_| {
+        r#"{"sequence":0,"kind":"snapshot","height":0,"hash":"serialization-error"}"#.to_owned()
+    });
+    Event::default().event("tip").data(data)
+}
+
 const EXPLORER_HTML: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>rBTC Explorer</title><style>
 :root{color-scheme:dark;background:#0b0f14;color:#d9e2ec;font:15px system-ui,sans-serif}body{max-width:900px;margin:0 auto;padding:32px 20px}h1{color:#f7931a}section{background:#131a22;border:1px solid #263241;border-radius:10px;padding:18px;margin:16px 0}form{display:flex;gap:8px}input{flex:1;background:#0b0f14;color:inherit;border:1px solid #405166;border-radius:6px;padding:10px}button{background:#f7931a;color:#111;border:0;border-radius:6px;padding:10px 16px;font-weight:700}pre{white-space:pre-wrap;word-break:break-word;min-height:24px}.muted{color:#91a4b7}</style></head>
-<body><h1>rBTC Explorer</h1><p class="muted">Local, read-only active-chain explorer</p>
+<body><h1>rBTC Explorer</h1><p class="muted">Local, read-only active-chain explorer · <span id="live-tip">connecting to live tip…</span></p>
 <section><h2>Block height</h2><form data-kind="blocks"><input inputmode="numeric" required placeholder="Height"><button>Search</button></form><pre></pre></section>
 <section><h2>Transaction</h2><form data-kind="tx"><input required placeholder="txid"><button>Search</button></form><pre></pre></section>
 <section><h2>Address UTXOs</h2><form data-kind="address"><input required placeholder="Checked Bitcoin address"><button>Search</button></form><pre></pre></section>
 <section><h2>Watch-only wallet</h2><p class="muted">Optional authenticated wallet; token stays only in this page's memory.</p><form id="wallet"><input type="password" autocomplete="off" required placeholder="Bearer token"><button value="status">Status</button><button value="balance">Balance</button><button value="transactions">Transactions</button><button value="utxos">UTXOs</button><button value="address">New address</button></form><pre></pre></section>
-<script>for(const f of document.querySelectorAll('form[data-kind]'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});const w=document.querySelector('#wallet');w.addEventListener('submit',async e=>{e.preventDefault();const t=w.querySelector('input').value,a=e.submitter.value,o=w.nextElementSibling;o.textContent='Loading…';try{const r=await fetch(`/api/v1/wallet/${a}`,{method:a==='address'?'POST':'GET',headers:{Authorization:`Bearer ${t}`}});o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
+<script>const live=document.querySelector('#live-tip'),events=new EventSource('/api/v1/events');events.addEventListener('tip',e=>{const t=JSON.parse(e.data);live.textContent=`${t.height}:${t.hash} (${t.kind})`});events.addEventListener('resync',()=>{live.textContent='event gap detected; reconnecting…';events.close();location.reload()});events.onerror=()=>{live.textContent='live tip disconnected'};for(const f of document.querySelectorAll('form[data-kind]'))f.addEventListener('submit',async e=>{e.preventDefault();const q=f.querySelector('input').value.trim(),k=f.dataset.kind,o=f.nextElementSibling;const u=k==='blocks'?`/api/v1/blocks/${encodeURIComponent(q)}`:k==='tx'?`/api/v1/tx/${encodeURIComponent(q)}`:`/api/v1/address/${encodeURIComponent(q)}/utxos`;o.textContent='Loading…';try{const r=await fetch(u);o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});const w=document.querySelector('#wallet');w.addEventListener('submit',async e=>{e.preventDefault();const t=w.querySelector('input').value,a=e.submitter.value,o=w.nextElementSibling;o.textContent='Loading…';try{const r=await fetch(`/api/v1/wallet/${a}`,{method:a==='address'?'POST':'GET',headers:{Authorization:`Bearer ${t}`}});o.textContent=r.ok?JSON.stringify(await r.json(),null,2):`HTTP ${r.status}`}catch(x){o.textContent=String(x)}});</script>
 </body></html>"#;
 
 async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
@@ -590,6 +721,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn explorer_events_start_with_snapshot_and_bound_slow_clients() {
+        let events = ExplorerEventHub::new(7, "initial-hash");
+        let mut receiver = events.sender.subscribe();
+        events.publish(ExplorerEventKind::Connected, 8, "connected-hash");
+        let connected = receiver.recv().await.unwrap();
+        assert_eq!(connected.sequence, 1);
+        assert_eq!(connected.kind, ExplorerEventKind::Connected);
+        assert_eq!(connected.height, 8);
+        assert_eq!(connected.hash, "connected-hash");
+        assert_eq!(events.latest(), connected);
+
+        let response = explorer_events_router(events.clone())
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let first = std::str::from_utf8(&first).unwrap();
+        assert!(first.contains("event: tip"));
+        assert!(first.contains(r#""sequence":1"#));
+        assert!(first.contains(r#""kind":"snapshot""#));
+        assert!(first.contains(r#""height":8"#));
+
+        let mut slow = events.sender.subscribe();
+        for height in 9..=140 {
+            events.publish(
+                ExplorerEventKind::Connected,
+                height,
+                format!("hash-{height}"),
+            );
+        }
+        assert!(matches!(
+            slow.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        assert_eq!(events.latest().height, 140);
+    }
+
+    #[tokio::test]
+    async fn explorer_events_cap_concurrent_streams() {
+        let app = explorer_events_router(ExplorerEventHub::new(0, "genesis"));
+        let mut active = Vec::with_capacity(MAX_EXPLORER_EVENT_CLIENTS);
+        for _ in 0..MAX_EXPLORER_EVENT_CLIENTS {
+            let response = app
+                .clone()
+                .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            active.push(response);
+        }
+        let exhausted = app
+            .clone()
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(exhausted.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        active.pop();
+        let recovered = app
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@
 - [x] In-memory explorer index implementation for embedded/regtest use.
 - [x] Persistent redb transaction/address/block indexes fed only by validated chain changes, restart-reconciled from the ledger or full-history peers, and correctly rolled back on reorg.
 - [x] Explorer UTXO pagination and endpoint input limits, enforced before bounded reads from the persistent index.
-- [ ] Explorer WebSocket/SSE notifications. The read-only REST routes, loopback-only daemon listener, CSP-constrained embedded static UI, and persistent backing index are implemented.
+- [x] Bounded explorer SSE notifications emitted only after persistent connect/disconnect/rebase commits, with an initial durable-tip snapshot, explicit lag/resync signaling, keepalives, a 64-client ceiling, and an embedded live-tip consumer.
 - [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, explicit rejection of secret descriptors, validated-block balance tracking, durable chain checkpoints, and reorg/restart reconciliation from retained blocks or a full-history peer.
 - [x] Descriptor birthday and bounded gap-limit scanning for imported watch-only wallets, including receive/change lookahead convergence, sparse pre-birthday checkpoints, persisted completed-scan boundaries, configuration-lowering rescans, and crash-safe address issuance independent of scan revelation.
 - [x] Authenticated wallet status, canonical transaction history, and current UTXO views with deterministic bounded pagination and reorg-safe confirmation state.

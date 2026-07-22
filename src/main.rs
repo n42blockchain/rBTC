@@ -19,7 +19,10 @@ use bitcoin::{
     hex::FromHex,
 };
 use rbtc::{
-    api::{WalletAuthToken, explorer_router, wallet_router},
+    api::{
+        ExplorerEventHub, ExplorerEventKind, WalletAuthToken, explorer_events_router,
+        explorer_router, wallet_router,
+    },
     block_execution::{
         BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
     },
@@ -398,6 +401,7 @@ impl ApiServer {
     async fn bind(
         address: SocketAddr,
         index: Arc<RedbExplorerIndex>,
+        explorer_events: ExplorerEventHub,
         wallet: Option<&WalletApiRuntime>,
         background_validation: Option<&BackgroundValidationStatus>,
     ) -> Result<Self, String> {
@@ -407,7 +411,7 @@ impl ApiServer {
         let bound = listener
             .local_addr()
             .map_err(|error| format!("read explorer address: {error}"))?;
-        let mut router = explorer_router(index);
+        let mut router = explorer_router(index).merge(explorer_events_router(explorer_events));
         if let Some(wallet) = wallet {
             router = router.merge(wallet_router(
                 Arc::clone(&wallet.wallet),
@@ -1723,6 +1727,8 @@ async fn sync_validating_node(
         RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
             .map_err(|error| error.to_string())?,
     );
+    let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
+    let explorer_events = ExplorerEventHub::new(explorer_tip.height, explorer_tip.hash.to_string());
     let wallet_runtime = api_runtime.and_then(|api| api.wallet.as_ref());
     let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
@@ -1822,6 +1828,7 @@ async fn sync_validating_node(
             &chainstate,
             &ledger,
             &explorer,
+            &explorer_events,
         )
         .await?;
         if let Some(wallet) = wallet_runtime {
@@ -1842,6 +1849,7 @@ async fn sync_validating_node(
                     ApiServer::bind(
                         api.listen,
                         Arc::clone(&explorer),
+                        explorer_events.clone(),
                         api.wallet.as_ref(),
                         background_validation,
                     )
@@ -1928,6 +1936,7 @@ async fn sync_validating_node(
                 &chainstate,
                 &ledger,
                 &explorer,
+                &explorer_events,
                 wallet,
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
@@ -2350,6 +2359,7 @@ async fn reconcile_explorer(
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
+    events: &ExplorerEventHub,
 ) -> Result<(), String> {
     let execution_store = chainstate.execution();
     let undo_store = chainstate.undos();
@@ -2370,6 +2380,7 @@ async fn reconcile_explorer(
             "initialized snapshot-aware explorer baseline at {}:{} with {count} current UTXOs",
             execution_tip.height, execution_tip.hash
         );
+        publish_explorer_event(events, ExplorerEventKind::Rebased, execution_tip);
     }
     loop {
         let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
@@ -2388,6 +2399,7 @@ async fn reconcile_explorer(
                 "rebased snapshot-aware explorer at {}:{} with {count} current UTXOs after reorganization",
                 execution_tip.height, execution_tip.hash
             );
+            publish_explorer_event(events, ExplorerEventKind::Rebased, execution_tip);
             break;
         }
         let rewound = explorer
@@ -2397,6 +2409,7 @@ async fn reconcile_explorer(
             "disconnected stale explorer tip; rewound to {}:{}",
             rewound.height, rewound.hash
         );
+        publish_explorer_event(events, ExplorerEventKind::Disconnected, rewound);
     }
 
     loop {
@@ -2476,6 +2489,14 @@ async fn reconcile_explorer(
                     },
                 )
                 .map_err(|error| error.to_string())?;
+            publish_explorer_event(
+                events,
+                ExplorerEventKind::Connected,
+                rbtc::execution_store::ExecutionTip {
+                    height: expected.height,
+                    hash: expected.hash,
+                },
+            );
         }
     }
 }
@@ -2488,6 +2509,7 @@ async fn download_execute_batch(
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
+    explorer_events: &ExplorerEventHub,
     wallet: Option<&EmbeddedWallet>,
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
@@ -2591,7 +2613,14 @@ async fn download_execute_batch(
         .map_err(|error| PeerRunError::block(&error))?
     };
     for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
-        index_validated_block(explorer, wallet, expected.height, block, applied)?;
+        index_validated_block(
+            explorer,
+            explorer_events,
+            wallet,
+            expected.height,
+            block,
+            applied,
+        )?;
         println!(
             "validated and executed block {}:{}",
             expected.height, expected.hash
@@ -2643,6 +2672,7 @@ fn validate_downloaded_block(
 
 fn index_validated_block(
     explorer: &RedbExplorerIndex,
+    explorer_events: &ExplorerEventHub,
     wallet: Option<&EmbeddedWallet>,
     height: u32,
     block: &Block,
@@ -2656,7 +2686,23 @@ fn index_validated_block(
             .apply_validated_block(block, height)
             .map_err(|error| error.to_string())?;
     }
+    publish_explorer_event(
+        explorer_events,
+        ExplorerEventKind::Connected,
+        rbtc::execution_store::ExecutionTip {
+            height,
+            hash: applied.hash,
+        },
+    );
     Ok(())
+}
+
+fn publish_explorer_event(
+    events: &ExplorerEventHub,
+    kind: ExplorerEventKind,
+    tip: rbtc::execution_store::ExecutionTip,
+) {
+    events.publish(kind, tip.height, tip.hash.to_string());
 }
 
 async fn request_headers(
@@ -3565,6 +3611,29 @@ mod tests {
         stream.write_all(request).await.unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    async fn http_stream_prefix(address: SocketAddr, request: &[u8], marker: &[u8]) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while response.len() < 16 * 1024
+                && !response
+                    .windows(marker.len())
+                    .any(|window| window == marker)
+            {
+                let mut buffer = [0_u8; 2048];
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buffer[..count]);
+            }
+        })
+        .await
+        .unwrap();
         String::from_utf8(response).unwrap()
     }
 
@@ -5096,6 +5165,7 @@ mod tests {
         let server = ApiServer::bind(
             "127.0.0.1:0".parse().unwrap(),
             index,
+            ExplorerEventHub::new(0, genesis.to_string()),
             Some(&wallet),
             Some(&validation),
         )
@@ -5110,6 +5180,20 @@ mod tests {
         assert!(response.contains("content-security-policy:"));
         assert!(response.contains("<title>rBTC Explorer</title>"));
         assert!(response.contains("Watch-only wallet"));
+
+        let event_marker = genesis.to_string();
+        let response = http_stream_prefix(
+            server.address(),
+            b"GET /api/v1/events HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            event_marker.as_bytes(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-type: text/event-stream"));
+        assert!(response.contains("event: tip"));
+        assert!(response.contains(r#""sequence":0"#));
+        assert!(response.contains(r#""kind":"snapshot""#));
+        assert!(response.contains(&event_marker));
 
         let response = http_request(
             server.address(),
