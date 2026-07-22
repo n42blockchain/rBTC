@@ -25,7 +25,7 @@ use rbtc::{
     },
     blockchain::{AppliedBlock, validate_block_structure_with_deployments},
     chain_store::RedbChainStore,
-    deployments::{DeploymentConfig, block_deployment_context_with_config, taproot_active},
+    deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
@@ -1304,13 +1304,15 @@ fn validate_archive_block(
             "archive block {actual} does not match active block {expected_hash} at height {height}"
         ));
     }
-    let deployments = block_deployment_context_with_config(
+    let deployments = block_deployment_context_for_headers(
         deployment_config,
+        headers,
         height,
         expected_hash,
         block.header.time,
         taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     validate_block_structure_with_deployments(
         block,
         height,
@@ -1495,14 +1497,16 @@ async fn download_execute_batch(
         .iter()
         .zip(&blocks)
         .map(|(expected, block)| {
-            Ok(block_deployment_context_with_config(
+            block_deployment_context_for_headers(
                 deployment_config,
+                headers,
                 expected.height,
                 expected.hash,
                 block.header.time,
                 taproot_active(headers, expected.height, deployment_config)
                     .map_err(|error| error.to_string())?,
-            ))
+            )
+            .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let now = u64::from(unix_time()?);
@@ -1557,13 +1561,15 @@ fn validate_downloaded_block(
     }
     let taproot = taproot_active(headers, height, deployment_config)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    let deployments = block_deployment_context_with_config(
+    let deployments = block_deployment_context_for_headers(
         deployment_config,
+        headers,
         height,
         expected_hash,
         block.header.time,
         taproot,
-    );
+    )
+    .map_err(|error| PeerRunError::transient(error.to_string()))?;
     validate_block_structure_with_deployments(
         block,
         height,

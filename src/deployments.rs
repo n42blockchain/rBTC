@@ -26,6 +26,7 @@ const BURIED_CONFIG_ENCODING_VERSION: u8 = 2;
 const CUSTOM_SIGNET_CONFIG_ENCODING_VERSION: u8 = 3;
 const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const REGTEST_HALVING_INTERVAL: u32 = 150;
+const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActivationHeights {
@@ -324,30 +325,66 @@ pub fn block_deployment_context_with_config(
     config: &DeploymentConfig,
     height: u32,
     block_hash: BlockHash,
+    block_time: u32,
+    taproot_active: bool,
+) -> BlockDeploymentContext {
+    block_deployment_context_with_bip34_anchor(
+        config,
+        height,
+        block_hash,
+        block_time,
+        taproot_active,
+        false,
+    )
+}
+
+/// Derives candidate flags using the active header chain for Core's BIP30 optimization.
+pub fn block_deployment_context_for_headers(
+    config: &DeploymentConfig,
+    headers: &HeaderDag,
+    height: u32,
+    block_hash: BlockHash,
+    block_time: u32,
+    taproot_active: bool,
+) -> Result<BlockDeploymentContext, DeploymentConfigError> {
+    if headers.network() != config.network {
+        return Err(DeploymentConfigError::NetworkMismatch);
+    }
+    let bip34_anchor_matches = bip34_anchor(config.network).is_some_and(|(anchor_height, hash)| {
+        headers
+            .active_header_at(anchor_height)
+            .is_some_and(|header| header.hash == hash)
+    });
+    Ok(block_deployment_context_with_bip34_anchor(
+        config,
+        height,
+        block_hash,
+        block_time,
+        taproot_active,
+        bip34_anchor_matches,
+    ))
+}
+
+fn block_deployment_context_with_bip34_anchor(
+    config: &DeploymentConfig,
+    height: u32,
+    block_hash: BlockHash,
     _block_time: u32,
     _taproot_active: bool,
+    bip34_anchor_matches: bool,
 ) -> BlockDeploymentContext {
     let network = config.network;
-    let bip30_exception = is_bip30_exception(network, height, block_hash);
+    let bip30_enforced = bip30_enforced(network, height, block_hash, bip34_anchor_matches);
     let subsidy_sats = block_subsidy_with_interval(height, halving_interval(network));
-    if let Some(script_flags) = script_flag_exception(network, block_hash) {
-        return BlockDeploymentContext {
-            script_flags,
-            bip34_active: height >= config.activation_heights.bip34,
-            csv_active: height >= config.activation_heights.csv,
-            segwit_active: height >= config.activation_heights.segwit,
-            signet_challenge: config.signet_challenge.clone(),
-            bip30_exception,
-            subsidy_sats,
-        };
-    }
     let heights = config.activation_heights;
     // Core 26 enables these mutually dependent interpreter flags for ordinary
     // blocks and handles their historical activation through the exceptions
     // above plus separate consensus gates such as the witness commitment check.
-    let mut script_flags = bitcoinconsensus::VERIFY_P2SH
-        | bitcoinconsensus::VERIFY_WITNESS
-        | bitcoinconsensus::VERIFY_TAPROOT;
+    let mut script_flags = script_flag_exception(network, block_hash).unwrap_or(
+        bitcoinconsensus::VERIFY_P2SH
+            | bitcoinconsensus::VERIFY_WITNESS
+            | bitcoinconsensus::VERIFY_TAPROOT,
+    );
     if height >= heights.bip66 {
         script_flags |= bitcoinconsensus::VERIFY_DERSIG;
     }
@@ -366,7 +403,7 @@ pub fn block_deployment_context_with_config(
         csv_active: height >= heights.csv,
         segwit_active: height >= heights.segwit,
         signet_challenge: config.signet_challenge.clone(),
-        bip30_exception,
+        bip30_enforced,
         subsidy_sats,
     }
 }
@@ -557,6 +594,38 @@ fn is_bip30_exception(network: Network, height: u32, hash: BlockHash) -> bool {
                     )))
 }
 
+fn bip30_enforced(
+    network: Network,
+    height: u32,
+    hash: BlockHash,
+    bip34_anchor_matches: bool,
+) -> bool {
+    if is_bip30_exception(network, height, hash) {
+        return false;
+    }
+    if height >= BIP34_IMPLIES_BIP30_LIMIT {
+        return true;
+    }
+    let above_bip34 =
+        bip34_anchor(network).is_some_and(|(anchor_height, _)| height > anchor_height);
+    !(above_bip34 && bip34_anchor_matches)
+}
+
+fn bip34_anchor(network: Network) -> Option<(u32, BlockHash)> {
+    let (height, hash) = match network {
+        Network::Bitcoin => (
+            227_931,
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
+        ),
+        Network::Testnet => (
+            21_111,
+            "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
+        ),
+        Network::Testnet4 | Network::Signet | Network::Regtest => return None,
+    };
+    Some((height, parse_hash(hash)))
+}
+
 fn parse_hash(hash: &str) -> BlockHash {
     BlockHash::from_str(hash).expect("hard-coded Bitcoin Core block hash")
 }
@@ -707,6 +776,34 @@ mod tests {
         assert!(segwit.segwit_active);
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_NULLDUMMY, 0);
+    }
+
+    #[test]
+    fn bip30_matches_core_anchor_optimization_exceptions_and_future_limit() {
+        let ordinary = BlockHash::all_zeros();
+        assert!(bip30_enforced(Network::Bitcoin, 227_931, ordinary, true));
+        assert!(!bip30_enforced(Network::Bitcoin, 227_932, ordinary, true));
+        assert!(bip30_enforced(Network::Bitcoin, 227_932, ordinary, false));
+        assert!(!bip30_enforced(Network::Testnet, 21_112, ordinary, true));
+        assert!(bip30_enforced(
+            Network::Bitcoin,
+            BIP34_IMPLIES_BIP30_LIMIT,
+            ordinary,
+            true
+        ));
+        assert!(bip30_enforced(Network::Regtest, 2, ordinary, true));
+        assert!(!bip30_enforced(
+            Network::Bitcoin,
+            91_842,
+            parse_hash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"),
+            false
+        ));
+        assert!(!bip30_enforced(
+            Network::Bitcoin,
+            91_880,
+            parse_hash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"),
+            false
+        ));
     }
 
     #[test]
@@ -932,6 +1029,22 @@ mod tests {
                 &HeaderDag::new(Network::Bitcoin),
                 1,
                 &DeploymentConfig::for_network(Network::Regtest),
+            ),
+            Err(DeploymentConfigError::NetworkMismatch)
+        );
+    }
+
+    #[test]
+    fn header_derived_block_context_rejects_another_network() {
+        let headers = HeaderDag::new(Network::Testnet);
+        assert_eq!(
+            block_deployment_context_for_headers(
+                &DeploymentConfig::for_network(Network::Bitcoin),
+                &headers,
+                1,
+                BlockHash::all_zeros(),
+                0,
+                false,
             ),
             Err(DeploymentConfigError::NetworkMismatch)
         );

@@ -22,7 +22,7 @@ use rbtc::{
     block_execution::connect_active_block,
     blockchain::block_subsidy_with_interval,
     chain_store::RedbChainStore,
-    deployments::{DeploymentConfig, block_deployment_context_with_config},
+    deployments::{DeploymentConfig, block_deployment_context_for_headers},
     headers::HeaderDag,
     utxo::{OutPointKey, UtxoStore},
 };
@@ -314,13 +314,15 @@ fn rbtc_outcome_with_config(blocks: &[Block], deployments: &DeploymentConfig) ->
             accepted = false;
             break;
         }
-        let context = block_deployment_context_with_config(
+        let context = block_deployment_context_for_headers(
             deployments,
+            &headers,
             height,
             block.block_hash(),
             block.header.time,
             true,
-        );
+        )
+        .unwrap();
         if connect_active_block(
             &store,
             &headers,

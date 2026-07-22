@@ -32,8 +32,8 @@ pub struct BlockDeploymentContext {
     pub segwit_active: bool,
     /// BIP325 challenge script for the selected default or custom Signet.
     pub signet_challenge: Option<Arc<[u8]>>,
-    /// Whether this is one of the two historical mainnet BIP30 exceptions.
-    pub bip30_exception: bool,
+    /// Whether Core requires collision checks for this block's transaction outputs.
+    pub bip30_enforced: bool,
     /// Maximum proof-of-work subsidy for this candidate height.
     pub subsidy_sats: u64,
 }
@@ -373,7 +373,7 @@ fn validate_active_block<S: UtxoStore>(
     let collisions = block_output_collisions(&overlay, block)?;
     let exception_undo = if collisions.is_empty() {
         None
-    } else if deployments.bip30_exception {
+    } else if !deployments.bip30_enforced {
         Some(overlay.apply_with_undo(&collisions, &[])?)
     } else {
         return Err(BlockExecutionError::Bip30Collision(collisions[0]));
@@ -1083,7 +1083,7 @@ mod tests {
             1,
             60,
             &BlockDeploymentContext {
-                bip30_exception: true,
+                bip30_enforced: false,
                 ..deployments(1)
             },
         )
