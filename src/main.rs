@@ -19,17 +19,19 @@ use bitcoin::{
 };
 use rbtc::{
     api::{WalletAuthToken, explorer_router, wallet_router},
-    block_execution::{connect_active_block, connect_active_blocks, disconnect_execution_tip},
+    block_execution::{
+        BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
+    },
     blockchain::{AppliedBlock, validate_block_structure_with_deployments},
     chain_store::RedbChainStore,
     deployments::{DeploymentConfig, block_deployment_context_with_config, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
     header_store::RedbHeaderStore,
-    headers::HeaderDag,
+    headers::{HeaderDag, HeaderError},
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
-    p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, connect_outbound},
+    p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, connect_outbound},
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
@@ -71,6 +73,74 @@ struct Options {
 struct DnsSeed {
     host: String,
     port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerFailureKind {
+    Transient,
+    ProtocolViolation,
+}
+
+#[derive(Debug)]
+struct PeerRunError {
+    kind: PeerFailureKind,
+    message: String,
+}
+
+impl PeerRunError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: PeerFailureKind::Transient,
+            message: message.into(),
+        }
+    }
+
+    fn p2p(error: &P2pError) -> Self {
+        let kind = if error.is_protocol_violation() {
+            PeerFailureKind::ProtocolViolation
+        } else {
+            PeerFailureKind::Transient
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            kind: PeerFailureKind::ProtocolViolation,
+            message: message.into(),
+        }
+    }
+
+    fn header(error: &HeaderError) -> Self {
+        if error.is_peer_invalid() {
+            Self::protocol(error.to_string())
+        } else {
+            Self::transient(error.to_string())
+        }
+    }
+
+    fn block(error: &BlockExecutionError) -> Self {
+        if error.is_peer_invalid() {
+            Self::protocol(error.to_string())
+        } else {
+            Self::transient(error.to_string())
+        }
+    }
+}
+
+impl From<String> for PeerRunError {
+    fn from(message: String) -> Self {
+        Self::transient(message)
+    }
+}
+
+impl std::fmt::Display for PeerRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 struct WalletApiFiles {
@@ -294,6 +364,7 @@ fn read_owner_only_text_file(
     Ok(contents)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
     if let Some(data_dir) = &options.data_dir {
         fs::create_dir_all(data_dir)
@@ -309,6 +380,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     } else {
         None
     };
+    let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
     let mut remotes = options.remotes.clone();
     if let Some(store) = &peer_store {
         for learned in store
@@ -335,9 +407,20 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if completed_validating_session(&options) {
+                    record_peer_session_success(peer_store.as_ref(), remote);
+                }
+                return Ok(());
+            }
             Err(error) => {
                 eprintln!("peer {remote} failed: {error}");
+                record_peer_failure(
+                    peer_store.as_ref(),
+                    remote,
+                    error.kind,
+                    manual_remotes.contains(&remote),
+                );
                 failures.push(format!("{remote}: {error}"));
             }
         }
@@ -346,8 +429,17 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     let seeds = selected_dns_seeds(&options);
     if !seeds.is_empty() && attempted.len() < MAX_CONFIGURED_PEERS {
         let remaining = MAX_CONFIGURED_PEERS - attempted.len();
+        let mut dns_excluded = attempted.clone();
+        if let Some(store) = &peer_store {
+            for discouraged in store
+                .discouraged_addresses(unix_time()?)
+                .map_err(|error| error.to_string())?
+            {
+                dns_excluded.insert(discouraged);
+            }
+        }
         let (resolved, resolution_failures, rejected) =
-            resolve_dns_candidates(options.network, &seeds, &attempted, remaining).await;
+            resolve_dns_candidates(options.network, &seeds, &dns_excluded, remaining).await;
         for failure in resolution_failures {
             eprintln!("DNS seed failed: {failure}");
         }
@@ -368,9 +460,15 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             )
             .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if completed_validating_session(&options) {
+                        record_peer_session_success(peer_store.as_ref(), remote);
+                    }
+                    return Ok(());
+                }
                 Err(error) => {
                     eprintln!("peer {remote} failed: {error}");
+                    record_peer_failure(peer_store.as_ref(), remote, error.kind, false);
                     failures.push(format!("{remote}: {error}"));
                 }
             }
@@ -389,13 +487,17 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     ))
 }
 
+fn completed_validating_session(options: &Options) -> bool {
+    options.fetch_block.is_none() && (options.data_dir.is_some() || options.headers_db.is_some())
+}
+
 async fn run_with_peer(
     options: &Options,
     remote: SocketAddr,
     local_nonce: u64,
     peer_store: Option<&RedbPeerStore>,
     api_runtime: Option<&ApiRuntime>,
-) -> Result<(), String> {
+) -> Result<(), PeerRunError> {
     record_peer_attempt(peer_store, remote);
     let mut session = timeout(
         PEER_TIMEOUT,
@@ -409,12 +511,12 @@ async fn run_with_peer(
     )
     .await
     .map_err(|_| {
-        format!(
+        PeerRunError::transient(format!(
             "peer handshake timed out after {} seconds",
             PEER_TIMEOUT.as_secs()
-        )
+        ))
     })?
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| PeerRunError::p2p(&error))?;
 
     let remote_version = session.remote_version();
     println!(
@@ -425,20 +527,20 @@ async fn run_with_peer(
     if let Some(hash) = options.fetch_block {
         session
             .ensure_full_witness_block_relay()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PeerRunError::p2p(&error))?;
         timeout(PEER_TIMEOUT, session.request_witness_blocks(&[hash]))
             .await
-            .map_err(|_| "getdata request timed out".to_owned())?
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| PeerRunError::transient("getdata request timed out"))?
+            .map_err(|error| PeerRunError::p2p(&error))?;
         let block = timeout(PEER_TIMEOUT, session.receive_requested_block(hash))
             .await
             .map_err(|_| {
-                format!(
+                PeerRunError::transient(format!(
                     "block response timed out after {} seconds",
                     PEER_TIMEOUT.as_secs()
-                )
+                ))
             })?
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PeerRunError::p2p(&error))?;
         println!(
             "received block {} ({} transactions); not applied: IBD chainstate integration is pending",
             block.block_hash(),
@@ -450,7 +552,7 @@ async fn run_with_peer(
     if let Some(path) = &options.data_dir {
         session
             .ensure_full_witness_block_relay()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PeerRunError::p2p(&error))?;
         if let Some(store) = peer_store {
             record_verified_peer(store, remote, remote_version.services);
             discover_peer_addresses(&mut session, store, remote).await;
@@ -472,7 +574,7 @@ async fn run_with_peer(
         let status = options
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
         println!(
             "minimum chainwork reached at height {}; full script validation remains required",
             status.height
@@ -503,6 +605,49 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
     };
     if let Err(error) = store.record_attempt(remote, now) {
         eprintln!("peer attempt history for {remote} failed: {error}");
+    }
+}
+
+fn record_peer_failure(
+    store: Option<&RedbPeerStore>,
+    remote: SocketAddr,
+    kind: PeerFailureKind,
+    manual: bool,
+) {
+    if kind != PeerFailureKind::ProtocolViolation || manual {
+        return;
+    }
+    let Some(store) = store else {
+        return;
+    };
+    let now = match unix_time() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("protocol cooldown for {remote} skipped: {error}");
+            return;
+        }
+    };
+    match store.record_protocol_violation(remote, now) {
+        Ok(until) => println!(
+            "discouraged peer {remote} after an objective protocol violation until Unix time {until}"
+        ),
+        Err(error) => eprintln!("protocol cooldown for {remote} failed: {error}"),
+    }
+}
+
+fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+    let Some(store) = store else {
+        return;
+    };
+    let now = match unix_time() {
+        Ok(now) => now,
+        Err(error) => {
+            eprintln!("peer session success for {remote} skipped: {error}");
+            return;
+        }
+    };
+    if let Err(error) = store.record_session_success(remote, now) {
+        eprintln!("peer session success for {remote} failed: {error}");
     }
 }
 
@@ -565,11 +710,12 @@ async fn sync_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployments: DeploymentConfig,
     path: PathBuf,
-) -> Result<HeaderDag, String> {
-    let store = RedbHeaderStore::open(path).map_err(|error| error.to_string())?;
+) -> Result<HeaderDag, PeerRunError> {
+    let store =
+        RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
     let mut dag = store
-        .load_dag_with_deployments(deployments, unix_time()?)
-        .map_err(|error| error.to_string())?;
+        .load_dag_with_deployments(deployments, unix_time().map_err(PeerRunError::transient)?)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
     println!(
         "resuming headers-first sync from height {} (local-clock fallback until network-time aggregation lands)",
         dag.active_tip().height
@@ -583,11 +729,11 @@ async fn sync_headers(
             break;
         }
         let (candidate, _) = dag
-            .validate_batch_contextual(&headers, unix_time()?)
-            .map_err(|error| error.to_string())?;
+            .validate_batch_contextual(&headers, unix_time().map_err(PeerRunError::transient)?)
+            .map_err(|error| PeerRunError::header(&error))?;
         store
             .append_batch(&headers)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
         dag = candidate;
         println!(
             "validated and persisted {count} headers; active height {}",
@@ -626,12 +772,11 @@ async fn sync_validating_node(
     data_dir: PathBuf,
     once: bool,
     api_runtime: Option<&ApiRuntime>,
-) -> Result<(), String> {
+) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
-        return Err(
-            "block execution is currently safety-gated to regtest and default signet until mainnet/testnet activation coverage is complete"
-                .to_owned(),
-        );
+        return Err(PeerRunError::transient(
+            "block execution is currently safety-gated to regtest and default signet until mainnet/testnet activation coverage is complete",
+        ));
     }
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
@@ -747,7 +892,7 @@ async fn sync_validating_node(
                         .ensure_minimum_chainwork(&headers)
                         .expect_err("status is below minimum chainwork");
                     if once {
-                        return Err(error.to_string());
+                        return Err(PeerRunError::transient(error.to_string()));
                     }
                     println!("remaining in IBD: {error}");
                 }
@@ -1265,7 +1410,7 @@ async fn reconcile_explorer(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: DeploymentConfig,
@@ -1274,7 +1419,7 @@ async fn download_execute_batch(
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
     wallet: Option<&EmbeddedWallet>,
-) -> Result<(), String> {
+) -> Result<(), PeerRunError> {
     let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     let next_height = tip
@@ -1302,14 +1447,18 @@ async fn download_execute_batch(
         .collect::<Vec<_>>();
     timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
         .await
-        .map_err(|_| format!("getdata timed out for {batch_len} blocks"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| PeerRunError::transient(format!("getdata timed out for {batch_len} blocks")))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
     let blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
         .await
-        .map_err(|_| format!("block batch response timed out for {batch_len} blocks"))?
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "block batch response timed out for {batch_len} blocks"
+            ))
+        })?
+        .map_err(|error| PeerRunError::p2p(&error))?;
     for (expected, block) in expected.iter().zip(&blocks) {
-        validate_archive_block(
+        validate_downloaded_block(
             deployment_config,
             headers,
             expected.height,
@@ -1346,7 +1495,7 @@ async fn download_execute_batch(
                 DEFAULT_HOT_WINDOW_SECS,
                 deployment_contexts[0],
             )
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| PeerRunError::block(&error))?,
         ]
     } else {
         connect_active_blocks(
@@ -1357,7 +1506,7 @@ async fn download_execute_batch(
             DEFAULT_HOT_WINDOW_SECS,
             &deployment_contexts,
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|error| PeerRunError::block(&error))?
     };
     for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
         index_validated_block(explorer, wallet, expected.height, block, applied)?;
@@ -1370,6 +1519,42 @@ async fn download_execute_batch(
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn validate_downloaded_block(
+    deployment_config: DeploymentConfig,
+    headers: &HeaderDag,
+    height: u32,
+    expected_hash: BlockHash,
+    block: &Block,
+) -> Result<(), PeerRunError> {
+    let actual = block.block_hash();
+    if actual != expected_hash {
+        return Err(PeerRunError::protocol(format!(
+            "downloaded block {actual} does not match active block {expected_hash} at height {height}"
+        )));
+    }
+    let taproot = taproot_active(headers, height, deployment_config)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let deployments = block_deployment_context_with_config(
+        deployment_config,
+        height,
+        expected_hash,
+        block.header.time,
+        taproot,
+    );
+    validate_block_structure_with_deployments(
+        block,
+        height,
+        deployments.bip34_active,
+        deployments.segwit_active,
+        deployments.signet,
+    )
+    .map_err(|error| {
+        PeerRunError::protocol(format!(
+            "downloaded block structure at height {height}: {error}"
+        ))
+    })
 }
 
 fn index_validated_block(
@@ -1393,28 +1578,28 @@ fn index_validated_block(
 async fn request_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     locator: Vec<BlockHash>,
-) -> Result<(), String> {
+) -> Result<(), PeerRunError> {
     timeout(
         PEER_TIMEOUT,
         session.request_headers(locator, BlockHash::all_zeros()),
     )
     .await
-    .map_err(|_| "getheaders request timed out".to_owned())?
-    .map_err(|error| error.to_string())
+    .map_err(|_| PeerRunError::transient("getheaders request timed out"))?
+    .map_err(|error| PeerRunError::p2p(&error))
 }
 
 async fn receive_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-) -> Result<Vec<bitcoin::block::Header>, String> {
+) -> Result<Vec<bitcoin::block::Header>, PeerRunError> {
     timeout(PEER_TIMEOUT, session.receive_headers())
         .await
         .map_err(|_| {
-            format!(
+            PeerRunError::transient(format!(
                 "headers response timed out after {} seconds",
                 PEER_TIMEOUT.as_secs()
-            )
+            ))
         })?
-        .map_err(|error| error.to_string())
+        .map_err(|error| PeerRunError::p2p(&error))
 }
 
 fn unix_time() -> Result<u32, String> {
@@ -2063,6 +2248,7 @@ mod tests {
             DeploymentConfig::for_network(Network::Regtest)
         );
         assert_eq!(options.ibd_policy, IbdPolicy::for_network(Network::Regtest));
+        assert!(!completed_validating_session(&options));
 
         let served = parse_options(
             [
@@ -2103,6 +2289,7 @@ mod tests {
             DeploymentConfig::for_network(Network::Regtest)
         );
         assert_eq!(served.deployments.consensus_id().len(), 49);
+        assert!(completed_validating_session(&served));
         assert!(
             parse_options(
                 [
@@ -2792,6 +2979,11 @@ mod tests {
             reopened.candidates(unix_time().unwrap(), 16).unwrap(),
             vec![live_remote]
         );
+        assert!(
+            !reopened
+                .is_discouraged(failed_remote, unix_time().unwrap())
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2870,6 +3062,209 @@ mod tests {
         .await
         .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn daemon_persists_protocol_discouragement_but_exempts_manual_peers() {
+        let learned_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let learned_remote = learned_listener.local_addr().unwrap();
+        let learned_server = tokio::spawn(async move {
+            let (stream, _) = learned_listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(41)))
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Version(peer_version(42)))
+                .await
+                .unwrap();
+        });
+
+        let directory = TempDir::new().unwrap();
+        let now = unix_time().unwrap();
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        peers
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[PeerAddress {
+                    socket: learned_remote,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    last_seen: now,
+                }],
+                now,
+            )
+            .unwrap();
+        drop(peers);
+
+        let error = run(Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("duplicate version"));
+        learned_server.await.unwrap();
+
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(
+            peers
+                .is_discouraged(learned_remote, unix_time().unwrap())
+                .unwrap()
+        );
+        assert!(
+            peers
+                .candidates(unix_time().unwrap(), 16)
+                .unwrap()
+                .is_empty()
+        );
+        drop(peers);
+
+        let manual_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manual_remote = manual_listener.local_addr().unwrap();
+        let manual_server = tokio::spawn(async move {
+            let (stream, _) = manual_listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            peer.write_message(NetworkMessage::Version(peer_version(43)))
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Version(peer_version(44)))
+                .await
+                .unwrap();
+        });
+        let error = run(Options {
+            remotes: vec![manual_remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("duplicate version"));
+        manual_server.await.unwrap();
+
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(
+            !peers
+                .is_discouraged(manual_remote, unix_time().unwrap())
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_discourages_a_learned_peer_serving_an_invalid_block() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let mut invalid_block = regtest_block(genesis.block_hash(), genesis.time + 1);
+        let expected_hash = invalid_block.block_hash();
+        let valid_header = invalid_block.header;
+        invalid_block.txdata[0].output[0].value = Amount::from_sat(1);
+        assert_ne!(
+            invalid_block.compute_merkle_root().unwrap(),
+            valid_header.merkle_root
+        );
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(51)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(vec![valid_header]))
+                    .await
+                    .unwrap(),
+                message => panic!("expected invalid-block getheaders, got {message:?}"),
+            }
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                            expected_hash
+                        )]
+                    );
+                    peer.write_message(NetworkMessage::Block(invalid_block))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected invalid-block getdata, got {message:?}"),
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        let now = unix_time().unwrap();
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        peers
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[PeerAddress {
+                    socket: remote,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    last_seen: now,
+                }],
+                now,
+            )
+            .unwrap();
+        drop(peers);
+
+        let error = run(Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("merkle root mismatch"));
+        server.await.unwrap();
+
+        let peers =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(peers.is_discouraged(remote, unix_time().unwrap()).unwrap());
+        assert!(
+            peers
+                .candidates(unix_time().unwrap(), 16)
+                .unwrap()
+                .is_empty()
+        );
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+        assert!(chainstate.undos().get(expected_hash).unwrap().is_none());
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ use crate::p2p::PeerAddress;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_metadata");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_addresses");
+const PENALTIES: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_penalties");
 const GENESIS_KEY: &str = "genesis";
 const MAX_STORED_PEERS: usize = 4_096;
 const MAX_PEERS_PER_SOURCE_GROUP: usize = 64;
@@ -21,6 +22,13 @@ const MAX_FUTURE_SECS: u32 = 10 * 60;
 const MIN_REASONABLE_TIMESTAMP: u32 = 100_000_000;
 const INITIAL_RETRY_BACKOFF_SECS: u32 = 60;
 const MAX_RETRY_BACKOFF_SECS: u32 = 6 * 60 * 60;
+const INITIAL_PROTOCOL_COOLDOWN_SECS: u32 = 60 * 60;
+const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
+const PROTOCOL_VIOLATION_DECAY_SECS: u32 = 7 * 24 * 60 * 60;
+const MAX_STORED_PENALTIES: usize = 1_024;
+
+type PeerPriority = (u8, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>);
+type PrioritizedPeer = (PeerPriority, std::net::SocketAddr);
 
 /// Peer-address persistence failures.
 #[derive(Debug, Error)]
@@ -64,6 +72,13 @@ struct StoredPeer {
     consecutive_failures: u8,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredPenalty {
+    violations: u8,
+    last_violation: u32,
+    discouraged_until: u32,
+}
+
 /// Result counters for one learned-address batch.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PeerInsertStats {
@@ -98,6 +113,7 @@ impl RedbPeerStore {
                 meta.insert(GENESIS_KEY, genesis.as_slice())?;
             }
             let _peers = transaction.open_table(PEERS)?;
+            let _penalties = transaction.open_table(PENALTIES)?;
         }
         transaction.commit()?;
         Ok(Self {
@@ -219,6 +235,7 @@ impl RedbPeerStore {
         limit: usize,
     ) -> Result<Vec<std::net::SocketAddr>, PeerStoreError> {
         let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let penalties = self.load_penalties()?;
         let mut candidates = self
             .load_records()?
             .into_iter()
@@ -229,12 +246,20 @@ impl RedbPeerStore {
                     && is_acceptable_peer_address(socket, self.network)
                     && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
                     && retry_ready(&record, now))
-                .then_some((peer_priority(&record), socket))
+                .then_some((record, socket))
+                .filter(|_| {
+                    penalties
+                        .get(&address)
+                        .is_none_or(|penalty| penalty.discouraged_until <= now)
+                })
+                .map(|(record, socket)| (peer_priority(&record), socket))
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|candidate| *candidate);
-        candidates.truncate(limit.min(MAX_STORED_PEERS));
-        Ok(candidates.into_iter().map(|(_, socket)| socket).collect())
+        Ok(diversify_candidates(
+            candidates,
+            limit.min(MAX_STORED_PEERS),
+        ))
     }
 
     /// Durably records a connection attempt before network I/O starts.
@@ -262,6 +287,88 @@ impl RedbPeerStore {
             record.last_success = now;
             record.consecutive_failures = 0;
         })
+    }
+
+    /// Records a completed synchronization session and forgives prior protocol violations.
+    pub fn record_session_success(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let updated = self.record_success(address, now)?;
+        self.clear_penalty(address)?;
+        Ok(updated)
+    }
+
+    /// Durably discourages a non-manual peer after an objective wire-protocol violation.
+    ///
+    /// Repeated violations double the cooldown from one hour up to one day. The violation
+    /// count decays after seven quiet days, and the table is bounded independently from addrman.
+    pub fn record_protocol_violation(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<u32, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut penalties = self.load_penalties()?;
+        penalties.retain(|_, penalty| {
+            now.saturating_sub(penalty.last_violation) <= PROTOCOL_VIOLATION_DECAY_SECS
+        });
+        let key = address.to_string();
+        let violations = penalties
+            .get(&key)
+            .map_or(1, |penalty| penalty.violations.saturating_add(1));
+        let exponent = u32::from(violations.saturating_sub(1)).min(5);
+        let cooldown = INITIAL_PROTOCOL_COOLDOWN_SECS
+            .saturating_mul(1_u32 << exponent)
+            .min(MAX_PROTOCOL_COOLDOWN_SECS);
+        let discouraged_until = now.saturating_add(cooldown);
+        penalties.insert(
+            key,
+            StoredPenalty {
+                violations,
+                last_violation: now,
+                discouraged_until,
+            },
+        );
+        let mut penalties = penalties.into_iter().collect::<Vec<_>>();
+        penalties.sort_unstable_by_key(|(_, penalty)| {
+            (
+                std::cmp::Reverse(penalty.discouraged_until),
+                std::cmp::Reverse(penalty.last_violation),
+            )
+        });
+        penalties.truncate(MAX_STORED_PENALTIES);
+        self.replace_penalties(&penalties)?;
+        Ok(discouraged_until)
+    }
+
+    /// Returns all addresses whose objective protocol cooldown is still active.
+    pub fn discouraged_addresses(
+        &self,
+        now: u32,
+    ) -> Result<Vec<std::net::SocketAddr>, PeerStoreError> {
+        Ok(self
+            .load_penalties()?
+            .into_iter()
+            .filter_map(|(address, penalty)| {
+                (penalty.discouraged_until > now)
+                    .then(|| std::net::SocketAddr::from_str(&address).ok())
+                    .flatten()
+            })
+            .collect())
+    }
+
+    /// Returns whether the address is under an active protocol-violation cooldown.
+    pub fn is_discouraged(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        Ok(self
+            .load_penalties()?
+            .get(&address.to_string())
+            .is_some_and(|penalty| penalty.discouraged_until > now))
     }
 
     /// Returns the number of persisted records.
@@ -305,6 +412,32 @@ impl RedbPeerStore {
         Ok(records)
     }
 
+    fn load_penalties(&self) -> Result<HashMap<String, StoredPenalty>, PeerStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(PENALTIES)?;
+        let mut penalties = HashMap::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let key = key.value().to_owned();
+            if std::net::SocketAddr::from_str(&key).is_err() {
+                return Err(PeerStoreError::Malformed("peer penalty address key"));
+            }
+            penalties.insert(key, serde_json::from_slice(value.value())?);
+        }
+        Ok(penalties)
+    }
+
+    fn clear_penalty(&self, address: std::net::SocketAddr) -> Result<(), PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(PENALTIES)?;
+            table.remove(address.to_string().as_str())?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn replace_all(&self, records: &[(String, StoredPeer)]) -> Result<(), PeerStoreError> {
         let transaction = self.db.begin_write()?;
         {
@@ -318,6 +451,29 @@ impl RedbPeerStore {
             }
             for (key, record) in records {
                 let encoded = serde_json::to_vec(record)?;
+                table.insert(key.as_str(), encoded.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn replace_penalties(
+        &self,
+        penalties: &[(String, StoredPenalty)],
+    ) -> Result<(), PeerStoreError> {
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(PENALTIES)?;
+            let keys = table
+                .iter()?
+                .map(|row| row.map(|(key, _)| key.value().to_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            for (key, penalty) in penalties {
+                let encoded = serde_json::to_vec(penalty)?;
                 table.insert(key.as_str(), encoded.as_slice())?;
             }
         }
@@ -348,7 +504,7 @@ fn retry_ready(record: &StoredPeer, now: u32) -> bool {
     now.saturating_sub(record.last_attempt) >= delay
 }
 
-fn peer_priority(record: &StoredPeer) -> (u8, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>) {
+fn peer_priority(record: &StoredPeer) -> PeerPriority {
     (
         record.consecutive_failures,
         std::cmp::Reverse(record.last_success),
@@ -365,6 +521,38 @@ fn retain_best(records: HashMap<String, StoredPeer>, limit: usize) -> Vec<(Strin
     });
     ordered.truncate(limit);
     ordered
+}
+
+fn diversify_candidates(ordered: Vec<PrioritizedPeer>, limit: usize) -> Vec<std::net::SocketAddr> {
+    let mut group_indexes = HashMap::new();
+    let mut groups: Vec<Vec<std::net::SocketAddr>> = Vec::new();
+    for (_, address) in ordered {
+        let group = source_group(address.ip());
+        let index = *group_indexes.entry(group).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[index].push(address);
+    }
+
+    let mut selected = Vec::with_capacity(limit.min(groups.len()));
+    let mut offset = 0;
+    while selected.len() < limit {
+        let before = selected.len();
+        for group in &groups {
+            if let Some(address) = group.get(offset) {
+                selected.push(*address);
+                if selected.len() == limit {
+                    break;
+                }
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+        offset += 1;
+    }
+    selected
 }
 
 fn source_group(ip: IpAddr) -> String {
@@ -629,6 +817,101 @@ mod tests {
             now + MAX_RETRY_BACKOFF_SECS - 1
         ));
         assert!(retry_ready(&maximally_failed, now + MAX_RETRY_BACKOFF_SECS));
+    }
+
+    #[test]
+    fn protocol_discouragement_persists_expires_escalates_and_clears_on_success() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let now: u32 = 1_800_000_000;
+        let address = "127.0.0.1:18444".parse().unwrap();
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        store
+            .insert_verified(address, services, now.saturating_sub(1))
+            .unwrap();
+
+        let first_until = store.record_protocol_violation(address, now).unwrap();
+        assert_eq!(first_until, now + INITIAL_PROTOCOL_COOLDOWN_SECS);
+        assert!(store.is_discouraged(address, now).unwrap());
+        assert!(store.candidates(now, 16).unwrap().is_empty());
+        drop(store);
+
+        let reopened = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        assert!(reopened.is_discouraged(address, now + 1).unwrap());
+        assert_eq!(
+            reopened
+                .candidates(now + INITIAL_PROTOCOL_COOLDOWN_SECS, 16)
+                .unwrap(),
+            vec![address]
+        );
+        let second_at = now + INITIAL_PROTOCOL_COOLDOWN_SECS;
+        let second_until = reopened
+            .record_protocol_violation(address, second_at)
+            .unwrap();
+        assert_eq!(second_until, second_at + 2 * INITIAL_PROTOCOL_COOLDOWN_SECS);
+        assert!(
+            reopened
+                .discouraged_addresses(second_at)
+                .unwrap()
+                .contains(&address)
+        );
+
+        let after_decay = second_at + PROTOCOL_VIOLATION_DECAY_SECS + 1;
+        assert_eq!(
+            reopened
+                .record_protocol_violation(address, after_decay)
+                .unwrap(),
+            after_decay + INITIAL_PROTOCOL_COOLDOWN_SECS
+        );
+        assert_eq!(
+            reopened.load_penalties().unwrap()[&address.to_string()].violations,
+            1
+        );
+        reopened
+            .insert_verified(address, services, after_decay + 1)
+            .unwrap();
+        assert!(reopened.is_discouraged(address, after_decay + 1).unwrap());
+        reopened
+            .record_session_success(address, after_decay + 1)
+            .unwrap();
+        assert!(!reopened.is_discouraged(address, after_decay + 1).unwrap());
+        assert!(reopened.load_penalties().unwrap().is_empty());
+    }
+
+    #[test]
+    fn candidate_selection_round_robins_target_network_groups() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Signet).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        store
+            .insert_discovered(
+                "8.8.8.8:38333".parse().unwrap(),
+                &[
+                    learned("1.1.1.1:38333", services, now),
+                    learned("1.1.2.1:38333", services, now - 1),
+                    learned("1.1.3.1:38333", services, now - 2),
+                    learned("2.2.2.2:38333", services, now - 3),
+                    learned("3.3.3.3:38333", services, now - 4),
+                ],
+                now,
+            )
+            .unwrap();
+
+        let selected = store.candidates(now, 3).unwrap();
+        assert_eq!(selected[0], "1.1.1.1:38333".parse().unwrap());
+        assert!(selected.contains(&"2.2.2.2:38333".parse().unwrap()));
+        assert!(selected.contains(&"3.3.3.3:38333".parse().unwrap()));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|address| source_group(address.ip()))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
     }
 
     #[test]

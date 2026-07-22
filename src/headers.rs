@@ -99,6 +99,25 @@ pub enum HeaderError {
     },
 }
 
+impl HeaderError {
+    /// Returns whether the header is objectively invalid consensus data from a peer.
+    ///
+    /// Future-time headers, disconnected/duplicate batches, and local DAG consistency failures
+    /// are not attributed as malicious peer behavior.
+    #[must_use]
+    pub const fn is_peer_invalid(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidTarget
+                | Self::InvalidProofOfWork(_)
+                | Self::TimeTooOld { .. }
+                | Self::UnexpectedDifficulty { .. }
+                | Self::CheckpointMismatch { .. }
+                | Self::ObsoleteVersion { .. }
+        )
+    }
+}
+
 /// In-memory header DAG with the best-work tip selected independently of arrival order.
 #[derive(Clone)]
 pub struct HeaderDag {
@@ -456,6 +475,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn peer_invalid_classification_exempts_future_and_disconnected_headers() {
+        assert!(HeaderError::InvalidTarget.is_peer_invalid());
+        assert!(
+            HeaderError::UnexpectedDifficulty {
+                expected: 1,
+                actual: 2,
+            }
+            .is_peer_invalid()
+        );
+        assert!(
+            !HeaderError::TimeTooNew {
+                time: 2,
+                maximum: 1,
+            }
+            .is_peer_invalid()
+        );
+        assert!(!HeaderError::UnknownParent(BlockHash::all_zeros()).is_peer_invalid());
+    }
 
     fn mine_child(parent: BlockHash, time: u32) -> Header {
         let target = Params::new(Network::Regtest).max_attainable_target;

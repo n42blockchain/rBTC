@@ -167,6 +167,42 @@ pub enum P2pError {
     },
 }
 
+impl P2pError {
+    /// Returns whether the error proves that the remote peer violated a bounded wire rule.
+    ///
+    /// Timeouts, I/O failures, obsolete capabilities, unavailable blocks, and caller-side
+    /// request mistakes are deliberately not classified as peer misbehavior.
+    #[must_use]
+    pub const fn is_protocol_violation(&self) -> bool {
+        match self {
+            Self::Io(_)
+            | Self::Message(EncodeError::Io(_))
+            | Self::HandshakeIncomplete
+            | Self::HeadersResponseIncomplete
+            | Self::AddressResponseIncomplete
+            | Self::BlockResponseIncomplete { .. }
+            | Self::BlockNotFound(_)
+            | Self::ObsoleteVersion { .. }
+            | Self::SelfConnection
+            | Self::MissingServices { .. }
+            | Self::TooManyBlockRequests { .. }
+            | Self::DuplicateBlockRequest(_)
+            | Self::TooManyLocatorHashes { .. } => false,
+            Self::Message(_)
+            | Self::WrongMagic
+            | Self::Oversize { .. }
+            | Self::DuplicateVersion
+            | Self::PostHandshakeVersion
+            | Self::VerackBeforeVersion
+            | Self::TooManyHeaders { .. }
+            | Self::UnexpectedBlock { .. }
+            | Self::OversizeUserAgent { .. }
+            | Self::UnsolicitedBlock(_)
+            | Self::TooManyAddresses { .. } => true,
+        }
+    }
+}
+
 /// A directly connectable IPv4 or IPv6 address learned from `addr`/`addrv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerAddress {
@@ -679,6 +715,50 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn only_objective_remote_wire_failures_are_protocol_violations() {
+        let hash = BlockHash::all_zeros();
+        for error in [
+            P2pError::WrongMagic,
+            P2pError::Oversize {
+                length: MAX_PROTOCOL_MESSAGE_LEN + 1,
+                limit: MAX_PROTOCOL_MESSAGE_LEN,
+            },
+            P2pError::DuplicateVersion,
+            P2pError::PostHandshakeVersion,
+            P2pError::VerackBeforeVersion,
+            P2pError::TooManyHeaders {
+                count: MAX_HEADERS_PER_RESPONSE + 1,
+            },
+            P2pError::UnsolicitedBlock(hash),
+            P2pError::TooManyAddresses {
+                count: MAX_ADDRESSES_PER_MESSAGE + 1,
+            },
+        ] {
+            assert!(error.is_protocol_violation(), "{error}");
+        }
+
+        for error in [
+            P2pError::HandshakeIncomplete,
+            P2pError::HeadersResponseIncomplete,
+            P2pError::BlockNotFound(hash),
+            P2pError::ObsoleteVersion {
+                actual: MIN_PEER_PROTOCOL_VERSION - 1,
+                minimum: MIN_PEER_PROTOCOL_VERSION,
+            },
+            P2pError::SelfConnection,
+            P2pError::MissingServices {
+                required: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                offered: ServiceFlags::NETWORK,
+            },
+            P2pError::TooManyBlockRequests {
+                count: MAX_BLOCKS_IN_FLIGHT + 1,
+            },
+        ] {
+            assert!(!error.is_protocol_violation(), "{error}");
+        }
     }
 
     proptest! {

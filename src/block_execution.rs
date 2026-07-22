@@ -111,6 +111,18 @@ pub enum BlockExecutionError {
     },
 }
 
+impl BlockExecutionError {
+    /// Returns whether a freshly downloaded block is objectively invalid peer data.
+    #[must_use]
+    pub const fn is_peer_invalid(&self) -> bool {
+        match self {
+            Self::UnexpectedBlock { .. } => true,
+            Self::Block(error) => error.is_peer_invalid(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingUtxoState {
     Before,
@@ -658,12 +670,29 @@ mod tests {
 
     use super::*;
     use crate::{
-        blockchain::block_subsidy,
+        blockchain::{BlockError, block_subsidy},
         chain_store::RedbChainStore,
         deployments::block_deployment_context,
         headers::HeaderDag,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
+
+    #[test]
+    fn only_downloaded_consensus_failures_are_peer_invalid() {
+        assert!(BlockExecutionError::Block(BlockError::Empty).is_peer_invalid());
+        assert!(
+            BlockExecutionError::UnexpectedBlock {
+                expected: BlockHash::all_zeros(),
+                actual: BlockHash::from_byte_array([1; 32]),
+            }
+            .is_peer_invalid()
+        );
+        assert!(
+            !BlockExecutionError::Block(BlockError::Rollback(UtxoError::Malformed("test")))
+                .is_peer_invalid()
+        );
+        assert!(!BlockExecutionError::NoNextHeader(0).is_peer_invalid());
+    }
 
     fn coinbase(height: u32) -> Transaction {
         let mut height_prefix = match height {

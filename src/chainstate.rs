@@ -103,6 +103,33 @@ pub enum ChainstateError {
     Oversize,
 }
 
+impl ChainstateError {
+    /// Returns whether the failure proves a freshly downloaded transaction is invalid.
+    #[must_use]
+    pub const fn is_peer_invalid(&self) -> bool {
+        match self {
+            Self::Utxo(error) => matches!(
+                error,
+                UtxoError::Duplicate(_) | UtxoError::Missing(_) | UtxoError::DuplicateSpend(_)
+            ),
+            Self::Script(_)
+            | Self::ValueOverflow
+            | Self::Inflation
+            | Self::ImmatureCoinbase { .. }
+            | Self::CoinbaseScriptSize
+            | Self::NoInputs
+            | Self::NoOutputs
+            | Self::MoneyRange
+            | Self::NonFinalLockTime { .. }
+            | Self::RelativeHeightLock { .. }
+            | Self::RelativeTimeLock { .. }
+            | Self::DuplicateInput(_)
+            | Self::NullPrevout
+            | Self::Oversize => true,
+        }
+    }
+}
+
 /// Applies one transaction to a UTXO store after accounting and script checks.
 ///
 /// `script_flags` must reflect the candidate block's active BIP deployments.

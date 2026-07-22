@@ -108,6 +108,32 @@ pub enum BlockError {
     Rollback(#[source] UtxoError),
 }
 
+impl BlockError {
+    /// Returns whether the failure proves a freshly downloaded block is invalid.
+    #[must_use]
+    pub const fn is_peer_invalid(&self) -> bool {
+        match self {
+            Self::Transaction { source, .. } => source.is_peer_invalid(),
+            Self::Rollback(_) => false,
+            Self::Empty
+            | Self::MissingCoinbase
+            | Self::MultipleCoinbase
+            | Self::MerkleRoot
+            | Self::MutatedMerkleTree
+            | Self::WitnessCommitment
+            | Self::UnexpectedWitness
+            | Self::Signet(_)
+            | Self::Bip34Height { .. }
+            | Self::Weight { .. }
+            | Self::ExcessCoinbase { .. }
+            | Self::FeeOutOfRange { .. }
+            | Self::FeeOverflow
+            | Self::SigopCost { .. }
+            | Self::SigopOverflow => true,
+        }
+    }
+}
+
 /// Validates and atomically applies a block's transaction effects.
 ///
 /// Header DAG, difficulty, and timestamp validation must be completed before
