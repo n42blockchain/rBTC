@@ -25,10 +25,12 @@ retrieved from the public mempool.space Signet block API. Its SHA-256 is:
 f32129863bddc391dce28f83a546079fa7fa14ed590269eee55033985e52bb6f  signet-block-1.hex
 ```
 
-The historical mainnet blocks were retrieved through Blockstream's public
-[Esplora API](https://github.com/Blockstream/esplora/blob/master/API.md). The decoded consensus serialization is checked against
-the block hash embedded in each filename, its claimed proof of work, and its
-Merkle root. `.zst.hex` is hex-encoded zstd data; `.zst` is binary zstd data.
+The historical mainnet blocks were retrieved through public Esplora-compatible
+APIs operated by [Blockstream](https://github.com/Blockstream/esplora/blob/master/API.md)
+and [mempool.space](https://github.com/mempool/mempool/tree/master/backend).
+The decoded consensus serialization is checked against the block hash embedded
+in each filename, its claimed proof of work, and its Merkle root. `.zst.hex` is
+hex-encoded zstd data; `.zst` is binary zstd data.
 The committed-file SHA-256 digests are:
 
 ```text
@@ -39,6 +41,29 @@ a7d5215251bc8cf0a9a4b755f0106b24ad4d9e848ce534bea49836a7a69fbd44  mainnet-000000
 cd1ad1ec6abcd8b8dcedbe69c8c59745bfff0a3dd0bb514feefae3998c0b45d0  mainnet-00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931.hex
 e8676ddf7e5750d00851a2811f8ad3410f6fece9d4778d88e3039a95eaf3a4d7  mainnet-000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0.zst
 8313e74bb995a8db3cbcb6d6c844560bd747c902eb0c9e5f4e5498461bc486b9  mainnet-000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5.zst
+879350abe1ba10d15ef832abb7d470f3ad5e1a5bfc6b97a1a68893f3c80bcab4  mainnet-0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893.zst
+2ab7b8e86995c1893be8dd9add535b654f5705eb9e60316743df9f0d3d9b4c1d  mainnet-0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad.zst
+5a30cda5c9a6a0f2b21c9d4061c0af55a8186c112720774111c2d3e86836bec3  mainnet-0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244.zst
+```
+
+The `.utxos.json.zst` files are compact minimal external UTXO views generated
+from the same Esplora block transaction responses. Tests prove that their keys
+are exactly the non-coinbase inputs not created earlier in the same block. They
+provide every amount and script needed for full script, fee, sigop, lock-time,
+and block-undo execution. Real creation heights are retained for every input
+that enables BIP68; no fixture has a time-relative input. Other heights and all
+coinbase-origin flags are deliberately normalized because these views are
+activation regression corpora, not substitutes for prior chainstate. Coinbase
+maturity is covered independently. The three smaller authenticated transaction
+fixtures below provide raw-prev-tx/Merkle evidence for representative amounts
+and scripts. Snapshot digests are:
+
+```text
+fa39d1ca6f696edc2f5dd77ac734c8996077f4690db6d4357db6ec818370ac7b  mainnet-000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0.utxos.json.zst
+d0096fefee718fb02f8a9f8288db048d460820b9f8729e41244f573e9bdaa51c  mainnet-000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5.utxos.json.zst
+e285c24f2e99ac30ea964d98151cc6d8743788c60aa1d1e1a856c6eeaf481c05  mainnet-0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893.utxos.json.zst
+b8551489f6d956455febc740866e1142d6f8932576aa136efb11da1b6f2e3419  mainnet-0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad.utxos.json.zst
+bebfab849ab705e5c2356c363af43ae6d0e76a5ad68defacbae3b79a8dfce45f  mainnet-0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244.utxos.json.zst
 ```
 
 `authenticated-historical-transactions.json` contains a real SegWit activation

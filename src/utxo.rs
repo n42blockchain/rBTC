@@ -186,6 +186,16 @@ impl UtxoUndo {
         Self { spent, created }
     }
 
+    /// Constructs logical undo data for an external [`UtxoStore`] implementation.
+    ///
+    /// `spent` contains the exact records removed by the mutation and `created`
+    /// contains every outpoint inserted by it. Implementations must reject
+    /// missing/duplicate mutations before constructing this value.
+    #[must_use]
+    pub fn from_parts(spent: Vec<(OutPointKey, Utxo)>, created: Vec<OutPointKey>) -> Self {
+        Self { spent, created }
+    }
+
     /// Returns the spent outputs that must be restored on disconnect.
     #[must_use]
     pub fn spent(&self) -> &[(OutPointKey, Utxo)] {
