@@ -6,7 +6,7 @@ use std::{
 };
 
 use bitcoin::{BlockHash, hashes::Hash};
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use thiserror::Error;
 
 use crate::{
@@ -210,6 +210,14 @@ pub(crate) fn remove_transaction(
 ) -> Result<bool, UndoStoreError> {
     let mut table = transaction.open_table(BLOCK_UNDOS)?;
     Ok(table.remove(block.to_byte_array().as_slice())?.is_some())
+}
+
+pub(crate) fn tables_empty_transaction(
+    transaction: &WriteTransaction,
+) -> Result<bool, UndoStoreError> {
+    let undos = transaction.open_table(BLOCK_UNDOS)?;
+    let pending = transaction.open_table(PENDING_TRANSITION)?;
+    Ok(undos.is_empty()? && pending.is_empty()?)
 }
 
 fn encode_tip(tip: ExecutionTip, bytes: &mut Vec<u8>) {

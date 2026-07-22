@@ -14,15 +14,17 @@ use thiserror::Error;
 use crate::{
     execution_store::{
         ExecutionStoreError, ExecutionTip, RedbExecutionStore, advance_transaction,
-        metadata_exists as execution_metadata_exists, rewind_transaction,
+        assume_snapshot_transaction, metadata_exists as execution_metadata_exists,
+        rewind_transaction,
     },
     undo_store::{
         RedbUndoStore, UndoStoreError, insert_transaction as insert_undo_transaction,
         remove_transaction as remove_undo_transaction,
+        tables_empty_transaction as undo_tables_empty_transaction,
     },
     utxo::{
         OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo,
-        apply_with_undo_transaction,
+        apply_with_undo_transaction, replace_all_transaction, tables_empty_transaction,
     },
 };
 
@@ -66,6 +68,9 @@ pub enum ChainStoreError {
     /// Execution metadata operation failed.
     #[error("execution store: {0}")]
     Execution(#[from] ExecutionStoreError),
+    /// Snapshot activation would overwrite previously initialized chain state.
+    #[error("assumed snapshot activation requires empty UTXO and undo tables")]
+    SnapshotNotFresh,
 }
 
 /// One physical redb database containing UTXOs, block undo, and execution metadata.
@@ -143,6 +148,32 @@ impl RedbChainStore {
     /// Read/write access to execution metadata outside block transitions.
     pub fn execution(&self) -> &RedbExecutionStore {
         &self.execution
+    }
+
+    /// Atomically initializes an empty chainstate from an externally trusted UTXO snapshot.
+    ///
+    /// The execution tip and persistent assumed-state marker become visible in the
+    /// same commit as every UTXO. Existing UTXOs, undo, pending transitions, an
+    /// advanced tip, or an earlier snapshot marker make the operation fail closed.
+    pub fn assume_snapshot(
+        &self,
+        anchor: ExecutionTip,
+        records_sha256: &[u8; 32],
+        entries: &BTreeMap<OutPointKey, Utxo>,
+        now: u64,
+        hot_window_secs: u64,
+    ) -> Result<(), ChainStoreError> {
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        if !tables_empty_transaction(&transaction)? || !undo_tables_empty_transaction(&transaction)?
+        {
+            return Err(ChainStoreError::SnapshotNotFresh);
+        }
+        assume_snapshot_transaction(&transaction, anchor, records_sha256)?;
+        replace_all_transaction(&transaction, entries, now, hot_window_secs)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically applies UTXOs, records block undo, and advances the execution tip.
@@ -262,11 +293,13 @@ impl UtxoStore for RedbChainStore {
 
     fn replace_all(
         &self,
-        entries: &BTreeMap<OutPointKey, Utxo>,
-        now: u64,
-        hot_window_secs: u64,
+        _entries: &BTreeMap<OutPointKey, Utxo>,
+        _now: u64,
+        _hot_window_secs: u64,
     ) -> Result<(), UtxoError> {
-        self.utxos.replace_all(entries, now, hot_window_secs)
+        Err(UtxoError::Malformed(
+            "unified chainstate requires trusted assumed snapshot activation",
+        ))
     }
 
     fn tier_stats(&self) -> Result<TierStats, UtxoError> {
@@ -458,6 +491,143 @@ mod tests {
         assert_eq!(reopened.get(key(1)).unwrap(), Some(coin(10)));
         assert!(reopened.get(key(2)).unwrap().is_none());
         assert!(reopened.undos().get(next.hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn assumed_snapshot_utxos_tip_and_marker_survive_reopen_together() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let anchor = ExecutionTip {
+            height: 144,
+            hash: BlockHash::from_byte_array([44; 32]),
+        };
+        let entries = BTreeMap::from([(key(1), coin(10)), (key(2), coin(20))]);
+        store
+            .assume_snapshot(anchor, &[1; 32], &entries, 100, 60)
+            .unwrap();
+        assert_eq!(store.execution().tip().unwrap(), anchor);
+        assert_eq!(
+            store.execution().assumed_snapshot_base().unwrap(),
+            Some(anchor)
+        );
+        assert_eq!(
+            store.execution().assumed_snapshot_records_sha256().unwrap(),
+            Some([1; 32])
+        );
+        assert_eq!(store.snapshot_entries().unwrap(), entries);
+        drop(store);
+
+        let reopened = RedbChainStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution().tip().unwrap(), anchor);
+        assert_eq!(
+            reopened.execution().assumed_snapshot_base().unwrap(),
+            Some(anchor)
+        );
+        assert_eq!(
+            reopened
+                .execution()
+                .assumed_snapshot_records_sha256()
+                .unwrap(),
+            Some([1; 32])
+        );
+        assert_eq!(reopened.snapshot_entries().unwrap(), entries);
+    }
+
+    #[test]
+    fn assumed_snapshot_refuses_to_overwrite_any_existing_utxo() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let anchor = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([45; 32]),
+        };
+        assert!(matches!(
+            store.assume_snapshot(
+                anchor,
+                &[2; 32],
+                &BTreeMap::from([(key(2), coin(20))]),
+                100,
+                60
+            ),
+            Err(ChainStoreError::SnapshotNotFresh)
+        ));
+        assert_eq!(store.execution().tip().unwrap(), genesis);
+        assert_eq!(store.execution().assumed_snapshot_base().unwrap(), None);
+        assert_eq!(
+            store.execution().assumed_snapshot_records_sha256().unwrap(),
+            None
+        );
+        assert_eq!(
+            store.snapshot_entries().unwrap(),
+            BTreeMap::from([(key(1), coin(10))])
+        );
+        assert!(matches!(
+            store.replace_all(&BTreeMap::from([(key(3), coin(30))]), 100, 60),
+            Err(UtxoError::Malformed(
+                "unified chainstate requires trusted assumed snapshot activation"
+            ))
+        ));
+        assert_eq!(store.execution().tip().unwrap(), genesis);
+        assert_eq!(
+            store.snapshot_entries().unwrap(),
+            BTreeMap::from([(key(1), coin(10))])
+        );
+    }
+
+    #[test]
+    fn disk_full_snapshot_activation_never_exposes_utxos_without_its_tip() {
+        let backend = QuotaBackend {
+            bytes: Arc::new(RwLock::new(Vec::new())),
+            full: Arc::new(AtomicBool::new(false)),
+        };
+        let database = Arc::new(
+            Database::builder()
+                .create_with_backend(backend.clone())
+                .unwrap(),
+        );
+        let store =
+            RedbChainStore::from_database(database, Network::Regtest, ChainStoreOptions::default())
+                .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        let anchor = ExecutionTip {
+            height: 10,
+            hash: BlockHash::from_byte_array([46; 32]),
+        };
+        backend.full.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .assume_snapshot(
+                    anchor,
+                    &[3; 32],
+                    &BTreeMap::from([(key(1), coin(10))]),
+                    100,
+                    60
+                )
+                .is_err()
+        );
+        backend.full.store(false, Ordering::SeqCst);
+        drop(store);
+
+        let reopened = RedbChainStore::from_database(
+            Arc::new(Database::builder().create_with_backend(backend).unwrap()),
+            Network::Regtest,
+            ChainStoreOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.execution().tip().unwrap(), genesis);
+        assert_eq!(reopened.execution().assumed_snapshot_base().unwrap(), None);
+        assert_eq!(
+            reopened
+                .execution()
+                .assumed_snapshot_records_sha256()
+                .unwrap(),
+            None
+        );
+        assert!(reopened.snapshot_entries().unwrap().is_empty());
     }
 
     #[test]

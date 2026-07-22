@@ -15,7 +15,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::utxo::{OutPointKey, Utxo, UtxoError, UtxoStore};
+use bitcoin::{BlockHash, Network};
+
+use crate::{
+    chain_store::{ChainStoreError, RedbChainStore},
+    execution_store::ExecutionTip,
+    headers::HeaderDag,
+    utxo::{OutPointKey, Utxo, UtxoError, UtxoStore},
+};
 
 const MAGIC: &[u8; 8] = b"RBTCUTXO";
 const VERSION: u16 = 2;
@@ -32,12 +39,60 @@ pub enum SnapshotError {
     /// Chainstate access failed.
     #[error("utxo: {0}")]
     Utxo(#[from] UtxoError),
+    /// Unified chainstate activation failed.
+    #[error("chainstate: {0}")]
+    ChainStore(#[from] ChainStoreError),
     /// The snapshot does not obey the rBTC snapshot format.
     #[error("invalid snapshot: {0}")]
     Invalid(&'static str),
     /// The caller's validated header anchor does not match the snapshot.
     #[error("snapshot anchor does not match validated chain")]
     AnchorMismatch,
+    /// The snapshot was created for a different Bitcoin network.
+    #[error("snapshot network does not match selected network")]
+    NetworkMismatch,
+    /// The manifest does not match the independently supplied trust anchor.
+    #[error("snapshot manifest does not match trusted identity")]
+    TrustMismatch,
+}
+
+/// Independently distributed identity required before an assumed snapshot can run.
+///
+/// A checksum copied from the snapshot's own manifest is not a trust anchor. The
+/// operator must obtain this tuple from release metadata or another authenticated
+/// channel, analogous to Bitcoin Core's compiled AssumeUTXO parameters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotTrustAnchor {
+    network: Network,
+    height: u32,
+    block_hash: BlockHash,
+    records_sha256: String,
+}
+
+impl SnapshotTrustAnchor {
+    /// Constructs a trusted snapshot identity from authenticated metadata.
+    pub fn new(
+        network: Network,
+        height: u32,
+        block_hash: BlockHash,
+        records_sha256: impl Into<String>,
+    ) -> Result<Self, SnapshotError> {
+        let records_sha256 = records_sha256.into();
+        if height == 0
+            || records_sha256.len() != 64
+            || !records_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SnapshotError::Invalid("trusted snapshot identity"));
+        }
+        Ok(Self {
+            network,
+            height,
+            block_hash,
+            records_sha256,
+        })
+    }
 }
 
 /// Metadata stored before the compressed records and covered by the record hash.
@@ -84,6 +139,50 @@ impl VerifiedSnapshot {
             return Err(SnapshotError::AnchorMismatch);
         }
         store.replace_all(&self.entries, now, hot_window_secs)?;
+        Ok(self.manifest)
+    }
+
+    /// Atomically starts a fresh unified chainstate at a trusted active-header anchor.
+    ///
+    /// This persists an assumed-state marker; successful block connection above
+    /// the base must not be presented as independent genesis-to-tip validation.
+    pub fn assume_into(
+        self,
+        store: &RedbChainStore,
+        headers: &HeaderDag,
+        trusted: &SnapshotTrustAnchor,
+        now: u64,
+        hot_window_secs: u64,
+    ) -> Result<SnapshotManifest, SnapshotError> {
+        if headers.network() != trusted.network
+            || self.manifest.network != trusted.network.to_string()
+        {
+            return Err(SnapshotError::NetworkMismatch);
+        }
+        if self.manifest.height != trusted.height
+            || self.manifest.block_hash != trusted.block_hash.to_string()
+            || self.manifest.records_sha256 != trusted.records_sha256
+        {
+            return Err(SnapshotError::TrustMismatch);
+        }
+        if headers
+            .active_header_at(trusted.height)
+            .is_none_or(|header| header.hash != trusted.block_hash)
+        {
+            return Err(SnapshotError::AnchorMismatch);
+        }
+        let records_sha256 = decode_sha256(&trusted.records_sha256)
+            .expect("SnapshotTrustAnchor constructor validated the digest");
+        store.assume_snapshot(
+            ExecutionTip {
+                height: trusted.height,
+                hash: trusted.block_hash,
+            },
+            &records_sha256,
+            &self.entries,
+            now,
+            hot_window_secs,
+        )?;
         Ok(self.manifest)
     }
 }
@@ -217,11 +316,31 @@ fn hex_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
+    }
+    Some(digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utxo::{RedbUtxoStore, Utxo};
-    use bitcoin::{OutPoint, Txid, hashes::Hash};
+    use crate::{
+        block_execution::{BlockExecutionError, connect_active_block, disconnect_execution_tip},
+        deployments::block_deployment_context,
+        utxo::{RedbUtxoStore, Utxo},
+    };
+    use bitcoin::{
+        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid,
+        Witness, absolute::LockTime, block::Header, block::Version as HeaderVersion, hashes::Hash,
+        pow::Target, transaction::Version,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -274,5 +393,181 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         fs::write(&snapshot_file, bytes).unwrap();
         assert!(verify_snapshot(&snapshot_file).is_err());
+    }
+
+    fn block(parent: BlockHash, time: u32, height: u8) -> Block {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x50 + height, 0]),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: HeaderVersion::from_consensus(4),
+                prev_blockhash: parent,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time,
+                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while block
+            .header
+            .validate_pow(Target::MAX_ATTAINABLE_REGTEST)
+            .is_err()
+        {
+            block.header.nonce += 1;
+        }
+        block
+    }
+
+    #[test]
+    fn trusted_snapshot_connects_the_next_active_block_and_retains_assumed_marker() {
+        let directory = TempDir::new().unwrap();
+        let source = RedbUtxoStore::open(directory.path().join("source.redb")).unwrap();
+        let source_key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([7; 32]), 0));
+        source
+            .apply(
+                &[],
+                &[(
+                    source_key,
+                    Utxo {
+                        value_sats: 42,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 1,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51],
+                    },
+                )],
+            )
+            .unwrap();
+
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = block(genesis.hash, genesis.header.time + 1, 1);
+        let first_info = headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let path = directory.path().join("snapshot.rbtc");
+        let manifest = export_snapshot(
+            &source,
+            &path,
+            Network::Regtest.to_string(),
+            1,
+            first_info.hash.to_string(),
+        )
+        .unwrap();
+        let trusted = SnapshotTrustAnchor::new(
+            Network::Regtest,
+            1,
+            first_info.hash,
+            manifest.records_sha256.clone(),
+        )
+        .unwrap();
+        let chainstate_path = directory.path().join("chainstate.redb");
+        let chainstate = RedbChainStore::open(&chainstate_path, Network::Regtest).unwrap();
+        verify_snapshot(&path)
+            .unwrap()
+            .assume_into(&chainstate, &headers, &trusted, 100, 60)
+            .unwrap();
+        assert_eq!(chainstate.get(source_key).unwrap().unwrap().value_sats, 42);
+        assert_eq!(
+            chainstate.execution().assumed_snapshot_base().unwrap(),
+            Some(ExecutionTip {
+                height: 1,
+                hash: first_info.hash
+            })
+        );
+        assert_eq!(
+            chainstate
+                .execution()
+                .assumed_snapshot_records_sha256()
+                .unwrap(),
+            Some(decode_sha256(&manifest.records_sha256).unwrap())
+        );
+
+        let second = block(first_info.hash, first.header.time + 1, 2);
+        let second_info = headers
+            .insert_contextual(second.header, second.header.time)
+            .unwrap();
+        let context = block_deployment_context(
+            Network::Regtest,
+            2,
+            second_info.hash,
+            second.header.time,
+            true,
+        );
+        connect_active_block(&chainstate, &headers, &second, 101, 60, &context).unwrap();
+        drop(chainstate);
+
+        let reopened = RedbChainStore::open(chainstate_path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution().tip().unwrap().height, 2);
+        assert_eq!(
+            reopened.execution().assumed_snapshot_base().unwrap(),
+            Some(ExecutionTip {
+                height: 1,
+                hash: first_info.hash
+            })
+        );
+        assert!(reopened.undos().get(second_info.hash).unwrap().is_some());
+        assert_eq!(
+            disconnect_execution_tip(&reopened, &headers, 102, 60).unwrap(),
+            ExecutionTip {
+                height: 1,
+                hash: first_info.hash
+            }
+        );
+        assert!(matches!(
+            disconnect_execution_tip(&reopened, &headers, 103, 60),
+            Err(BlockExecutionError::DisconnectAssumedSnapshotBase {
+                height: 1,
+                hash
+            }) if hash == first_info.hash
+        ));
+    }
+
+    #[test]
+    fn snapshot_assumption_rejects_untrusted_digest_without_mutation() {
+        let directory = TempDir::new().unwrap();
+        let source = RedbUtxoStore::open(directory.path().join("source.redb")).unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = block(genesis.hash, genesis.header.time + 1, 1);
+        let first_info = headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let path = directory.path().join("snapshot.rbtc");
+        export_snapshot(&source, &path, "regtest", 1, first_info.hash.to_string()).unwrap();
+        let trusted =
+            SnapshotTrustAnchor::new(Network::Regtest, 1, first_info.hash, "00".repeat(32))
+                .unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let genesis_tip = chainstate.execution().tip().unwrap();
+        assert!(matches!(
+            verify_snapshot(path)
+                .unwrap()
+                .assume_into(&chainstate, &headers, &trusted, 100, 60),
+            Err(SnapshotError::TrustMismatch)
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap(), genesis_tip);
+        assert_eq!(
+            chainstate.execution().assumed_snapshot_base().unwrap(),
+            None
+        );
+        assert!(chainstate.snapshot_entries().unwrap().is_empty());
     }
 }

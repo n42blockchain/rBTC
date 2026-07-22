@@ -84,6 +84,14 @@ pub enum BlockExecutionError {
     /// The genesis execution tip cannot be disconnected.
     #[error("cannot disconnect genesis execution tip")]
     DisconnectGenesis,
+    /// Assumed snapshot UTXOs have no block undo below their trusted base.
+    #[error("cannot disconnect assumed snapshot base {height}:{hash}")]
+    DisconnectAssumedSnapshotBase {
+        /// Snapshot base height.
+        height: u32,
+        /// Snapshot base block hash.
+        hash: BlockHash,
+    },
     /// Durable undo data is missing for an executed block.
     #[error("missing durable undo for executed block {0}")]
     MissingUndo(BlockHash),
@@ -623,6 +631,12 @@ pub fn disconnect_execution_tip(
     let current = chainstate.execution().tip()?;
     if current.height == 0 {
         return Err(BlockExecutionError::DisconnectGenesis);
+    }
+    if chainstate.execution().assumed_snapshot_base()? == Some(current) {
+        return Err(BlockExecutionError::DisconnectAssumedSnapshotBase {
+            height: current.height,
+            hash: current.hash,
+        });
     }
     let current_header = headers
         .get(&current.hash)

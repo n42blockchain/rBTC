@@ -34,6 +34,7 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, connect_outbound},
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
+    snapshot::{SnapshotTrustAnchor, verify_snapshot},
     undo_store::RedbUndoStore,
     utxo::DEFAULT_HOT_WINDOW_SECS,
     wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
@@ -68,6 +69,14 @@ struct Options {
     wallet_api_files: Option<WalletApiFiles>,
     deployments: DeploymentConfig,
     ibd_policy: IbdPolicy,
+    snapshot: Option<SnapshotActivationOptions>,
+}
+
+struct SnapshotActivationOptions {
+    path: PathBuf,
+    height: u32,
+    block_hash: BlockHash,
+    records_sha256: String,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -370,6 +379,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if let Some(data_dir) = &options.data_dir {
         preflight_data_dir(data_dir, options.network, &options.deployments)?;
     }
+    if options.snapshot.is_some() {
+        return activate_assumed_snapshot(&options);
+    }
     let api_runtime = prepare_api_runtime(&options)?;
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(
@@ -484,6 +496,48 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         failures.len(),
         failures.join("; ")
     ))
+}
+
+fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
+    let snapshot = options
+        .snapshot
+        .as_ref()
+        .expect("caller checked snapshot activation mode");
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("snapshot parser requires data directory");
+    let header_store =
+        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
+    let headers = header_store
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    let trusted = SnapshotTrustAnchor::new(
+        options.network,
+        snapshot.height,
+        snapshot.block_hash,
+        snapshot.records_sha256.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    let now = u64::from(unix_time()?);
+    let manifest = verify_snapshot(&snapshot.path)
+        .and_then(|verified| {
+            verified.assume_into(
+                &chainstate,
+                &headers,
+                &trusted,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    println!(
+        "activated assumed UTXO snapshot at {}:{} with {} entries; background genesis validation remains required",
+        manifest.height, manifest.block_hash, manifest.utxo_count
+    );
+    Ok(())
 }
 
 fn preflight_data_dir(
@@ -1847,6 +1901,10 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut assume_valid = None;
     let mut signet_challenges = Vec::new();
     let mut signet_seed_values = Vec::new();
+    let mut snapshot_path = None;
+    let mut snapshot_height = None;
+    let mut snapshot_block_hash = None;
+    let mut snapshot_records_sha256 = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -1953,6 +2011,49 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             "--assumevalid" | "--assume-valid" => {
                 assume_valid = Some(required_option_value(&mut args, "--assumevalid")?);
             }
+            "--assumeutxo-snapshot" => {
+                if snapshot_path.is_some() {
+                    return Err(
+                        "--assumeutxo-snapshot cannot be supplied more than once".to_owned()
+                    );
+                }
+                snapshot_path = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--assumeutxo-snapshot",
+                )?));
+            }
+            "--snapshot-height" => {
+                if snapshot_height.is_some() {
+                    return Err("--snapshot-height cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--snapshot-height")?;
+                snapshot_height = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid snapshot height: {value}"))?,
+                );
+            }
+            "--snapshot-blockhash" => {
+                if snapshot_block_hash.is_some() {
+                    return Err("--snapshot-blockhash cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--snapshot-blockhash")?;
+                snapshot_block_hash = Some(
+                    BlockHash::from_str(&value)
+                        .map_err(|_| format!("invalid snapshot block hash: {value}"))?,
+                );
+            }
+            "--snapshot-records-sha256" => {
+                if snapshot_records_sha256.is_some() {
+                    return Err(
+                        "--snapshot-records-sha256 cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_records_sha256 = Some(required_option_value(
+                    &mut args,
+                    "--snapshot-records-sha256",
+                )?);
+            }
             _ => return Err(format!("unknown option: {argument}")),
         }
     }
@@ -1994,6 +2095,46 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         _ => {
             return Err(
                 "--wallet-descriptors and --wallet-auth-token-file must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
+    let snapshot = match (
+        snapshot_path,
+        snapshot_height,
+        snapshot_block_hash,
+        snapshot_records_sha256,
+    ) {
+        (None, None, None, None) => None,
+        (Some(path), Some(height), Some(block_hash), Some(records_sha256)) => {
+            SnapshotTrustAnchor::new(network, height, block_hash, records_sha256.clone())
+                .map_err(|error| error.to_string())?;
+            if data_dir.is_none() {
+                return Err("--assumeutxo-snapshot requires --data-dir".to_owned());
+            }
+            if fetch_block.is_some()
+                || headers_db.is_some()
+                || once
+                || explorer_listen.is_some()
+                || !remotes.is_empty()
+                || !dns_seed_values.is_empty()
+                || no_dns_seeds
+            {
+                return Err(
+                    "snapshot activation is offline and conflicts with peer, fetch, headers-db, once, explorer, and wallet modes"
+                        .to_owned(),
+                );
+            }
+            Some(SnapshotActivationOptions {
+                path,
+                height,
+                block_hash,
+                records_sha256,
+            })
+        }
+        _ => {
+            return Err(
+                "--assumeutxo-snapshot requires --snapshot-height, --snapshot-blockhash, and --snapshot-records-sha256"
                     .to_owned(),
             );
         }
@@ -2060,6 +2201,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         wallet_api_files,
         deployments,
         ibd_policy,
+        snapshot,
     }))
 }
 
@@ -2124,7 +2266,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-records-sha256 HEX\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2133,7 +2275,7 @@ fn print_usage() {
 mod tests {
     use super::*;
     use bitcoin::{
-        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
+        Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid,
         Witness,
         absolute::LockTime,
         block::{Header, Version},
@@ -2149,7 +2291,8 @@ mod tests {
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
         p2p::{PeerAddress, V1Transport},
-        utxo::{OutPointKey, UtxoStore},
+        snapshot::export_snapshot,
+        utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2318,6 +2461,7 @@ mod tests {
             DeploymentConfig::for_network(Network::Regtest)
         );
         assert_eq!(options.ibd_policy, IbdPolicy::for_network(Network::Regtest));
+        assert!(options.snapshot.is_none());
         assert!(!completed_validating_session(&options));
 
         let served = parse_options(
@@ -2462,6 +2606,133 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_only_complete_offline_snapshot_activation_identity() {
+        let hash = "0f9188f13cb7b2c9e5f00a9d96e2d3f36b2f78438cbcd220c9f3b9a3e56e3426";
+        let digest = "ab".repeat(32);
+        let options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                "/tmp/rbtc-snapshot-parser".to_owned(),
+                "--assumeutxo-snapshot".to_owned(),
+                "/tmp/base.rbtc".to_owned(),
+                "--snapshot-height".to_owned(),
+                "100".to_owned(),
+                "--snapshot-blockhash".to_owned(),
+                hash.to_owned(),
+                "--snapshot-records-sha256".to_owned(),
+                digest.clone(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        let snapshot = options.snapshot.unwrap();
+        assert_eq!(snapshot.path, PathBuf::from("/tmp/base.rbtc"));
+        assert_eq!(snapshot.height, 100);
+        assert_eq!(snapshot.block_hash, BlockHash::from_str(hash).unwrap());
+        assert_eq!(snapshot.records_sha256, digest);
+
+        for arguments in [
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-snapshot-parser",
+                "--assumeutxo-snapshot",
+                "/tmp/base.rbtc",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-snapshot-parser",
+                "--connect",
+                "127.0.0.1:18444",
+                "--assumeutxo-snapshot",
+                "/tmp/base.rbtc",
+                "--snapshot-height",
+                "100",
+                "--snapshot-blockhash",
+                hash,
+                "--snapshot-records-sha256",
+                "abababababababababababababababababababababababababababababababab",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_snapshot_cli_activates_and_reopens_the_assumed_base() {
+        let directory = TempDir::new().unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let header = mine_regtest_child(genesis.hash, genesis.header.time + 1);
+        let info = headers.insert_contextual(header, header.time).unwrap();
+        RedbHeaderStore::open(directory.path().join("headers.redb"))
+            .unwrap()
+            .append(header)
+            .unwrap();
+
+        let source = RedbUtxoStore::open(directory.path().join("source.redb")).unwrap();
+        let outpoint = OutPointKey::from(OutPoint::new(Txid::from_byte_array([88; 32]), 0));
+        source
+            .apply(
+                &[],
+                &[(
+                    outpoint,
+                    Utxo {
+                        value_sats: 123,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 1,
+                        creation_mtp: genesis.header.time,
+                        script_pubkey: vec![0x51],
+                    },
+                )],
+            )
+            .unwrap();
+        let path = directory.path().join("base.rbtc");
+        let manifest =
+            export_snapshot(&source, &path, "regtest", 1, info.hash.to_string()).unwrap();
+        drop(source);
+
+        run(Options {
+            remotes: vec![],
+            dns_seeds: None,
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: Some(SnapshotActivationOptions {
+                path,
+                height: 1,
+                block_hash: info.hash,
+                records_sha256: manifest.records_sha256,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let reopened =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(reopened.execution().tip().unwrap().height, 1);
+        assert_eq!(
+            reopened.execution().assumed_snapshot_base().unwrap(),
+            Some(reopened.execution().tip().unwrap())
+        );
+        assert_eq!(reopened.get(outpoint).unwrap().unwrap().value_sats, 123);
     }
 
     #[test]
@@ -2877,6 +3148,7 @@ mod tests {
             }),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap_err();
@@ -2917,6 +3189,7 @@ mod tests {
             }),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -3053,6 +3326,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3129,6 +3403,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3195,6 +3470,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3219,6 +3495,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3274,6 +3551,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap_err();
@@ -3323,6 +3601,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap_err();
@@ -3406,6 +3685,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap_err();
@@ -3532,6 +3812,7 @@ mod tests {
             }),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3622,6 +3903,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3684,6 +3966,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
         })
         .await
         .unwrap();
@@ -3776,6 +4059,7 @@ mod tests {
                 wallet_api_files: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
+                snapshot: None,
             },
             local_nonce,
         )
@@ -3882,6 +4166,7 @@ mod tests {
             wallet_api_files: None,
             deployments: DeploymentConfig::for_network(Network::Signet),
             ibd_policy,
+            snapshot: None,
         })
         .await
         .unwrap();

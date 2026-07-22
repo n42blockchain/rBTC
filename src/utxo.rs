@@ -7,7 +7,7 @@ use std::{
 };
 
 use bitcoin::{OutPoint, Txid, hashes::Hash};
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use thiserror::Error;
 
 /// The number of seconds in the default hot window (60 days).
@@ -486,28 +486,8 @@ impl UtxoStore for RedbUtxoStore {
         hot_window_secs: u64,
     ) -> Result<(), UtxoError> {
         let _guard = self.lock();
-        let cutoff = now.saturating_sub(hot_window_secs);
         let transaction = self.db.begin_write()?;
-        {
-            let mut hot = transaction.open_table(HOT_TABLE)?;
-            hot.retain(|_, _| false)?;
-        }
-        {
-            let mut cold = transaction.open_table(COLD_TABLE)?;
-            cold.retain(|_, _| false)?;
-        }
-        {
-            let mut hot = transaction.open_table(HOT_TABLE)?;
-            let mut cold = transaction.open_table(COLD_TABLE)?;
-            for (key, value) in entries {
-                let encoded = value.encode()?;
-                if value.last_touched < cutoff {
-                    cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
-                } else {
-                    hot.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
-                }
-            }
-        }
+        replace_all_transaction(&transaction, entries, now, hot_window_secs)?;
         transaction.commit()?;
         Ok(())
     }
@@ -527,6 +507,40 @@ impl UtxoStore for RedbUtxoStore {
             cold: count(COLD_TABLE)?,
         })
     }
+}
+
+pub(crate) fn tables_empty_transaction(transaction: &WriteTransaction) -> Result<bool, UtxoError> {
+    let hot = transaction.open_table(HOT_TABLE)?;
+    let cold = transaction.open_table(COLD_TABLE)?;
+    Ok(hot.is_empty()? && cold.is_empty()?)
+}
+
+pub(crate) fn replace_all_transaction(
+    transaction: &WriteTransaction,
+    entries: &BTreeMap<OutPointKey, Utxo>,
+    now: u64,
+    hot_window_secs: u64,
+) -> Result<(), UtxoError> {
+    let cutoff = now.saturating_sub(hot_window_secs);
+    {
+        let mut hot = transaction.open_table(HOT_TABLE)?;
+        hot.retain(|_, _| false)?;
+    }
+    {
+        let mut cold = transaction.open_table(COLD_TABLE)?;
+        cold.retain(|_, _| false)?;
+    }
+    let mut hot = transaction.open_table(HOT_TABLE)?;
+    let mut cold = transaction.open_table(COLD_TABLE)?;
+    for (key, value) in entries {
+        let encoded = value.encode()?;
+        if value.last_touched < cutoff {
+            cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+        } else {
+            hot.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn apply_with_undo_transaction(

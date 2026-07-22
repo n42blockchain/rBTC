@@ -13,6 +13,8 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("execution_metad
 const GENESIS_KEY: &str = "genesis";
 const TIP_KEY: &str = "tip";
 const CONSENSUS_CONFIG_KEY: &str = "consensus_config";
+const ASSUMED_SNAPSHOT_BASE_KEY: &str = "assumed_snapshot_base";
+const ASSUMED_SNAPSHOT_RECORDS_KEY: &str = "assumed_snapshot_records_sha256";
 
 /// Last block whose UTXO transition is recorded as complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +70,9 @@ pub enum ExecutionStoreError {
         /// Persisted current hash.
         current_hash: BlockHash,
     },
+    /// An assumed UTXO snapshot can only initialize an untouched genesis state.
+    #[error("assumed snapshot requires a fresh genesis chainstate")]
+    SnapshotRequiresFreshChainstate,
 }
 
 /// redb-backed execution tip initialized to the selected network's genesis.
@@ -130,6 +135,29 @@ impl RedbExecutionStore {
             .get(TIP_KEY)?
             .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
         decode_tip(value.value())
+    }
+
+    /// Returns the UTXO snapshot base that still requires background validation.
+    pub fn assumed_snapshot_base(&self) -> Result<Option<ExecutionTip>, ExecutionStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        meta.get(ASSUMED_SNAPSHOT_BASE_KEY)?
+            .map(|value| decode_tip(value.value()))
+            .transpose()
+    }
+
+    /// Returns the authenticated canonical-record digest of the assumed snapshot.
+    pub fn assumed_snapshot_records_sha256(&self) -> Result<Option<[u8; 32]>, ExecutionStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        meta.get(ASSUMED_SNAPSHOT_RECORDS_KEY)?
+            .map(|value| {
+                value
+                    .value()
+                    .try_into()
+                    .map_err(|_| ExecutionStoreError::Malformed("assumed snapshot digest length"))
+            })
+            .transpose()
     }
 
     /// Binds this execution database to a canonical consensus configuration.
@@ -233,6 +261,37 @@ pub(crate) fn advance_transaction(
     }
     drop(current_value);
     meta.insert(TIP_KEY, encode_tip(next).as_slice())?;
+    Ok(())
+}
+
+pub(crate) fn assume_snapshot_transaction(
+    transaction: &WriteTransaction,
+    anchor: ExecutionTip,
+    records_sha256: &[u8; 32],
+) -> Result<(), ExecutionStoreError> {
+    if anchor.height == 0 {
+        return Err(ExecutionStoreError::SnapshotRequiresFreshChainstate);
+    }
+    let mut meta = transaction.open_table(META)?;
+    let current_value = meta
+        .get(TIP_KEY)?
+        .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+    let current = decode_tip(current_value.value())?;
+    let genesis_value = meta
+        .get(GENESIS_KEY)?
+        .ok_or(ExecutionStoreError::Malformed("missing genesis hash"))?;
+    let genesis = decode_hash(genesis_value.value(), "genesis hash")?;
+    let has_snapshot = meta.get(ASSUMED_SNAPSHOT_BASE_KEY)?.is_some();
+    let has_snapshot_digest = meta.get(ASSUMED_SNAPSHOT_RECORDS_KEY)?.is_some();
+    if current.height != 0 || current.hash != genesis || has_snapshot || has_snapshot_digest {
+        return Err(ExecutionStoreError::SnapshotRequiresFreshChainstate);
+    }
+    drop(current_value);
+    drop(genesis_value);
+    let encoded = encode_tip(anchor);
+    meta.insert(TIP_KEY, encoded.as_slice())?;
+    meta.insert(ASSUMED_SNAPSHOT_BASE_KEY, encoded.as_slice())?;
+    meta.insert(ASSUMED_SNAPSHOT_RECORDS_KEY, records_sha256.as_slice())?;
     Ok(())
 }
 
