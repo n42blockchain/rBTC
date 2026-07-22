@@ -20,6 +20,7 @@ pub mod ibd;
 pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
+pub mod merkle_proof;
 pub mod p2p;
 pub mod peer_store;
 pub mod signet;
