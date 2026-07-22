@@ -226,6 +226,15 @@ impl RedbChainStore {
         &self.execution
     }
 
+    /// Returns one sorted, cursor-based page from the complete hot/cold UTXO set.
+    pub fn utxo_snapshot_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, UtxoError> {
+        self.utxos.snapshot_page(after, limit)
+    }
+
     /// Atomically initializes an empty chainstate from an externally trusted UTXO snapshot.
     ///
     /// The execution tip and persistent assumed-state marker become visible in the
@@ -850,6 +859,7 @@ mod tests {
         assert_eq!(finalized.utxo_count, 2);
         assert_eq!(finalized.records_bytes, snapshot_bytes(&entries));
         assert_eq!(active.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(active.execution().snapshot_origin().unwrap(), Some(anchor));
         assert_eq!(active.execution().tip().unwrap(), active_tip);
         assert_eq!(active.snapshot_entries().unwrap(), entries);
         assert!(matches!(
@@ -860,6 +870,10 @@ mod tests {
         let reopened =
             RedbChainStore::open(directory.path().join("active.redb"), Network::Regtest).unwrap();
         assert_eq!(reopened.execution().assumed_snapshot().unwrap(), None);
+        assert_eq!(
+            reopened.execution().snapshot_origin().unwrap(),
+            Some(anchor)
+        );
         assert_eq!(reopened.execution().tip().unwrap(), active_tip);
         assert_eq!(reopened.snapshot_entries().unwrap(), entries);
     }

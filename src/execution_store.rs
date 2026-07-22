@@ -18,6 +18,7 @@ const ASSUMED_SNAPSHOT_RECORDS_KEY: &str = "assumed_snapshot_records_sha256";
 const ASSUMED_SNAPSHOT_COUNT_KEY: &str = "assumed_snapshot_utxo_count";
 const ASSUMED_SNAPSHOT_BYTES_KEY: &str = "assumed_snapshot_records_bytes";
 const ASSUMED_SNAPSHOT_UTXO_SET_KEY: &str = "assumed_snapshot_utxo_set_sha256";
+const SNAPSHOT_ORIGIN_KEY: &str = "snapshot_origin";
 const VALIDATION_TARGET_KEY: &str = "validation_target";
 
 /// Last block whose UTXO transition is recorded as complete.
@@ -209,6 +210,20 @@ impl RedbExecutionStore {
         let transaction = self.db.begin_read()?;
         let meta = transaction.open_table(META)?;
         decode_assumed_snapshot(&meta)
+    }
+
+    /// Returns the durable snapshot origin, retained after independent validation.
+    pub fn snapshot_origin(&self) -> Result<Option<ExecutionTip>, ExecutionStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        let origin = meta
+            .get(SNAPSHOT_ORIGIN_KEY)?
+            .map(|value| decode_tip(value.value()))
+            .transpose()?;
+        origin.map_or_else(
+            || decode_assumed_snapshot(&meta).map(|snapshot| snapshot.map(|value| value.base)),
+            |origin| Ok(Some(origin)),
+        )
     }
 
     /// Returns the consensus configuration bound to this execution database.
@@ -433,6 +448,7 @@ pub(crate) fn assume_snapshot_transaction(
         ASSUMED_SNAPSHOT_COUNT_KEY,
         ASSUMED_SNAPSHOT_BYTES_KEY,
         ASSUMED_SNAPSHOT_UTXO_SET_KEY,
+        SNAPSHOT_ORIGIN_KEY,
         VALIDATION_TARGET_KEY,
     ]
     .into_iter()
@@ -447,6 +463,7 @@ pub(crate) fn assume_snapshot_transaction(
     let encoded = encode_tip(anchor);
     meta.insert(TIP_KEY, encoded.as_slice())?;
     meta.insert(ASSUMED_SNAPSHOT_BASE_KEY, encoded.as_slice())?;
+    meta.insert(SNAPSHOT_ORIGIN_KEY, encoded.as_slice())?;
     meta.insert(
         ASSUMED_SNAPSHOT_RECORDS_KEY,
         snapshot.records_sha256.as_slice(),
@@ -473,6 +490,9 @@ pub(crate) fn clear_assumed_snapshot_transaction(
     let mut meta = transaction.open_table(META)?;
     if decode_assumed_snapshot(&meta)? != Some(expected) {
         return Err(ExecutionStoreError::AssumedSnapshotChanged);
+    }
+    if meta.get(SNAPSHOT_ORIGIN_KEY)?.is_none() {
+        meta.insert(SNAPSHOT_ORIGIN_KEY, encode_tip(expected.base).as_slice())?;
     }
     for key in [
         ASSUMED_SNAPSHOT_BASE_KEY,

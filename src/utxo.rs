@@ -420,6 +420,74 @@ impl RedbUtxoStore {
         }
         Ok((count, records_bytes, digest.finalize().into()))
     }
+
+    /// Returns one sorted page across both physical tiers without materializing
+    /// the complete UTXO set. `after` is an exclusive cursor.
+    pub fn snapshot_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, UtxoError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_read()?;
+        let hot = transaction.open_table(HOT_TABLE)?;
+        let cold = transaction.open_table(COLD_TABLE)?;
+        let after_bytes = after.map(|outpoint| *outpoint.as_bytes());
+        let mut hot_rows = if let Some(bytes) = &after_bytes {
+            hot.range(bytes.as_slice()..)?
+        } else {
+            hot.iter()?
+        };
+        let mut cold_rows = if let Some(bytes) = &after_bytes {
+            cold.range(bytes.as_slice()..)?
+        } else {
+            cold.iter()?
+        };
+        let next_row = |rows: &mut redb::Range<'_, &[u8], &[u8]>| {
+            loop {
+                let row = rows
+                    .next()
+                    .transpose()?
+                    .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+                if row.as_ref().is_none_or(|(key, _)| {
+                    after.is_none_or(|after| key.as_slice() > after.as_bytes().as_slice())
+                }) {
+                    return Ok::<_, UtxoError>(row);
+                }
+            }
+        };
+        let mut hot_next = next_row(&mut hot_rows)?;
+        let mut cold_next = next_row(&mut cold_rows)?;
+        let mut page = Vec::with_capacity(limit);
+        while page.len() < limit && (hot_next.is_some() || cold_next.is_some()) {
+            let take_hot = match (&hot_next, &cold_next) {
+                (Some((hot_key, _)), Some((cold_key, _))) => match hot_key.cmp(cold_key) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => {
+                        return Err(UtxoError::Malformed("outpoint in both tiers"));
+                    }
+                },
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (key, value) = if take_hot {
+                let row = hot_next.take().expect("selected populated hot iterator");
+                hot_next = next_row(&mut hot_rows)?;
+                row
+            } else {
+                let row = cold_next.take().expect("selected populated cold iterator");
+                cold_next = next_row(&mut cold_rows)?;
+                row
+            };
+            page.push((OutPointKey::from_bytes(&key)?, Utxo::decode(&value)?));
+        }
+        Ok(page)
+    }
 }
 
 impl UtxoStore for RedbUtxoStore {
@@ -767,6 +835,34 @@ mod tests {
         assert_eq!(store.tier_stats().unwrap(), TierStats { hot: 1, cold: 1 });
         store.apply(&[key(1)], &[]).unwrap();
         assert!(store.get(key(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_pages_merge_hot_and_cold_with_exclusive_cursor() {
+        let (_dir, store) = store();
+        store
+            .apply(
+                &[],
+                &[(key(3), coin(100)), (key(1), coin(10)), (key(2), coin(100))],
+            )
+            .unwrap();
+        assert_eq!(store.age_to_cold(100, 60).unwrap(), 1);
+        let first = store.snapshot_page(None, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![key(1), key(2)]
+        );
+        let second = store.snapshot_page(Some(first[1].0), 2).unwrap();
+        assert_eq!(
+            second.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![key(3)]
+        );
+        assert!(
+            store
+                .snapshot_page(Some(second[0].0), 2)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

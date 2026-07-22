@@ -16,9 +16,10 @@ use crate::{
         MAX_UTXO_PAGE_SIZE,
     },
     blockchain::AppliedBlock,
+    chain_store::RedbChainStore,
     chainstate::is_unspendable,
     execution_store::ExecutionTip,
-    utxo::OutPointKey,
+    utxo::{OutPointKey, UtxoError},
 };
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("explorer_metadata");
@@ -28,6 +29,8 @@ const ADDRESS_UTXOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("explo
 const BLOCK_UNDOS: TableDefinition<u32, &[u8]> = TableDefinition::new("explorer_block_undos");
 const GENESIS_KEY: &str = "genesis";
 const TIP_KEY: &str = "tip";
+const BASELINE_KEY: &str = "utxo_baseline";
+const BASELINE_PAGE_SIZE: usize = 4_096;
 
 /// Persistent explorer projection errors.
 #[derive(Debug, Error)]
@@ -50,6 +53,9 @@ pub enum ExplorerStoreError {
     /// Projection serialization failed.
     #[error("explorer encoding: {0}")]
     Encoding(#[from] serde_json::Error),
+    /// Reading the chainstate UTXO baseline failed.
+    #[error("explorer UTXO baseline: {0}")]
+    Utxo(#[from] UtxoError),
     /// The selected network does not match the database.
     #[error("explorer database belongs to another Bitcoin network")]
     NetworkMismatch,
@@ -125,6 +131,85 @@ impl RedbExplorerIndex {
             .get(TIP_KEY)?
             .ok_or(ExplorerStoreError::Invalid("missing explorer tip"))?;
         decode_tip(value.value())
+    }
+
+    /// Returns the lowest tip whose current UTXO projection was imported
+    /// without historical block and transaction rows.
+    pub fn baseline(&self) -> Result<Option<ExecutionTip>, ExplorerStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        meta.get(BASELINE_KEY)?
+            .map(|value| decode_tip(value.value()))
+            .transpose()
+    }
+
+    /// Atomically replaces all projections with a cursor-streamed UTXO baseline.
+    ///
+    /// This is used when execution began from a trusted snapshot: historical
+    /// blocks before `tip` remain unavailable, while current address UTXOs and
+    /// every subsequently validated block remain fully queryable and reversible.
+    pub fn replace_with_chainstate_baseline(
+        &self,
+        tip: ExecutionTip,
+        chainstate: &RedbChainStore,
+    ) -> Result<u64, ExplorerStoreError> {
+        let _guard = self.write_guard.lock().expect("explorer lock not poisoned");
+        let transaction = self.db.begin_write()?;
+        let mut count = 0_u64;
+        {
+            let mut blocks = transaction.open_table(BLOCKS)?;
+            let mut transactions = transaction.open_table(TRANSACTIONS)?;
+            let mut utxos = transaction.open_table(ADDRESS_UTXOS)?;
+            let mut undos = transaction.open_table(BLOCK_UNDOS)?;
+            blocks.retain(|_, _| false)?;
+            transactions.retain(|_, _| false)?;
+            utxos.retain(|_, _| false)?;
+            undos.retain(|_, _| false)?;
+            let mut cursor = None;
+            loop {
+                let page = chainstate.utxo_snapshot_page(cursor, BASELINE_PAGE_SIZE)?;
+                if page.is_empty() {
+                    break;
+                }
+                for (outpoint, utxo) in &page {
+                    if is_unspendable(bitcoin::Script::from_bytes(&utxo.script_pubkey)) {
+                        continue;
+                    }
+                    let bitcoin_outpoint = outpoint.to_outpoint();
+                    let key = address_utxo_key(&utxo.script_pubkey, *outpoint);
+                    if utxos
+                        .insert(
+                            key.as_slice(),
+                            serde_json::to_vec(&ExplorerUtxo {
+                                txid: bitcoin_outpoint.txid.to_string(),
+                                vout: bitcoin_outpoint.vout,
+                                value_sats: utxo.value_sats,
+                                height: utxo.height,
+                            })?
+                            .as_slice(),
+                        )?
+                        .is_some()
+                    {
+                        return Err(ExplorerStoreError::Invalid(
+                            "duplicate baseline explorer UTXO",
+                        ));
+                    }
+                    count = count
+                        .checked_add(1)
+                        .ok_or(ExplorerStoreError::Invalid("baseline UTXO count"))?;
+                }
+                cursor = page.last().map(|(outpoint, _)| *outpoint);
+                if page.len() < BASELINE_PAGE_SIZE {
+                    break;
+                }
+            }
+            let mut meta = transaction.open_table(META)?;
+            let encoded = encode_tip(tip);
+            meta.insert(TIP_KEY, encoded.as_slice())?;
+            meta.insert(BASELINE_KEY, encoded.as_slice())?;
+        }
+        transaction.commit()?;
+        Ok(count)
     }
 
     /// Atomically indexes one fully validated child block.
@@ -298,6 +383,16 @@ impl RedbExplorerIndex {
             drop(current_value);
             if current.height == 0 {
                 return Err(ExplorerStoreError::Invalid("cannot disconnect genesis"));
+            }
+            if meta
+                .get(BASELINE_KEY)?
+                .map(|value| decode_tip(value.value()))
+                .transpose()?
+                == Some(current)
+            {
+                return Err(ExplorerStoreError::Invalid(
+                    "cannot disconnect explorer UTXO baseline",
+                ));
             }
             let mut blocks = transaction.open_table(BLOCKS)?;
             let mut transactions = transaction.open_table(TRANSACTIONS)?;
@@ -483,7 +578,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::utxo::{Utxo, UtxoUndo};
+    use crate::utxo::{Utxo, UtxoStore, UtxoUndo};
 
     fn transaction(previous: Option<OutPoint>, script: ScriptBuf) -> Transaction {
         Transaction {
@@ -530,6 +625,61 @@ mod tests {
                 0,
             ))],
         )
+    }
+
+    #[test]
+    fn snapshot_baseline_streams_current_utxos_and_survives_reopen() {
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let script = ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([7; 20]));
+        let address = Address::from_script(&script, Network::Regtest).unwrap();
+        let outpoint = OutPointKey::from(OutPoint::new(Txid::from_byte_array([8; 32]), 3));
+        chainstate
+            .apply(
+                &[],
+                &[(
+                    outpoint,
+                    Utxo {
+                        value_sats: 99,
+                        height: 50,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: script.into_bytes(),
+                    },
+                )],
+            )
+            .unwrap();
+        let baseline = ExecutionTip {
+            height: 50,
+            hash: BlockHash::from_byte_array([9; 32]),
+        };
+        let path = directory.path().join("explorer.redb");
+        let index = RedbExplorerIndex::open(&path, Network::Regtest).unwrap();
+        assert_eq!(
+            index
+                .replace_with_chainstate_baseline(baseline, &chainstate)
+                .unwrap(),
+            1
+        );
+        assert_eq!(index.tip().unwrap(), baseline);
+        assert_eq!(index.baseline().unwrap(), Some(baseline));
+        assert_eq!(
+            index.address_utxos(&address.to_string(), 0, 10).unwrap()[0].value_sats,
+            99
+        );
+        assert!(matches!(
+            index.disconnect_tip(),
+            Err(ExplorerStoreError::Invalid(
+                "cannot disconnect explorer UTXO baseline"
+            ))
+        ));
+        drop(index);
+        let reopened = RedbExplorerIndex::open(path, Network::Regtest).unwrap();
+        assert_eq!(reopened.tip().unwrap(), baseline);
+        assert_eq!(reopened.baseline().unwrap(), Some(baseline));
     }
 
     #[test]
