@@ -71,6 +71,7 @@ struct Options {
     ibd_policy: IbdPolicy,
     snapshot: Option<SnapshotActivationOptions>,
     finalize_assumeutxo: Option<PathBuf>,
+    validation_target: Option<ValidationTarget>,
 }
 
 struct SnapshotActivationOptions {
@@ -80,6 +81,12 @@ struct SnapshotActivationOptions {
     utxo_count: u64,
     records_bytes: u64,
     records_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidationTarget {
+    height: u32,
+    block_hash: BlockHash,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -703,6 +710,7 @@ async fn run_with_peer(
             options.ibd_policy,
             path.clone(),
             options.once,
+            options.validation_target,
             api_runtime,
         )
         .await;
@@ -905,7 +913,7 @@ fn reject_legacy_split_chainstate(data_dir: &std::path::Path) -> Result<(), Stri
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     network: Network,
@@ -913,6 +921,7 @@ async fn sync_validating_node(
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
     once: bool,
+    validation_target: Option<ValidationTarget>,
     api_runtime: Option<&ApiRuntime>,
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
@@ -928,6 +937,16 @@ async fn sync_validating_node(
         .map_err(|error| error.to_string())?;
     let undo_store = chainstate.undos();
     let execution_store = chainstate.execution();
+    if validation_target.is_some()
+        && execution_store
+            .assumed_snapshot()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err(PeerRunError::transient(
+            "bounded genesis validation requires a non-assumed chainstate",
+        ));
+    }
     execution_store
         .bind_consensus_config(
             &deployment_config.consensus_id(),
@@ -945,6 +964,20 @@ async fn sync_validating_node(
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
     'resync: loop {
+        if let Some(target) = validation_target {
+            let active = headers.active_header_at(target.height).ok_or_else(|| {
+                PeerRunError::transient(format!(
+                    "validation target height {} is above the available active header chain",
+                    target.height
+                ))
+            })?;
+            if active.hash != target.block_hash {
+                return Err(PeerRunError::transient(format!(
+                    "validation target {}:{} is not on the active header chain",
+                    target.height, target.block_hash
+                )));
+            }
+        }
         if let Some(server) = &mut api_server {
             server.ensure_running().await?;
         }
@@ -970,6 +1003,21 @@ async fn sync_validating_node(
                 "disconnected stale execution tip; rewound to {}:{}",
                 rewound.height, rewound.hash
             );
+        }
+        if let Some(target) = validation_target {
+            let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if tip.height > target.height {
+                return Err(PeerRunError::transient(format!(
+                    "validation chainstate tip {}:{} is already above target {}:{}",
+                    tip.height, tip.hash, target.height, target.block_hash
+                )));
+            }
+            if tip.height == target.height && tip.hash != target.block_hash {
+                return Err(PeerRunError::transient(format!(
+                    "validation chainstate tip {}:{} does not match target {}:{}",
+                    tip.height, tip.hash, target.height, target.block_hash
+                )));
+            }
         }
 
         reconcile_ledger(
@@ -1015,6 +1063,27 @@ async fn sync_validating_node(
                 server.ensure_running().await?;
             }
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            if let Some(target) = validation_target {
+                if tip.height > target.height {
+                    return Err(PeerRunError::transient(format!(
+                        "validation chainstate tip {}:{} is already above target {}:{}",
+                        tip.height, tip.hash, target.height, target.block_hash
+                    )));
+                }
+                if tip.height == target.height {
+                    if tip.hash != target.block_hash {
+                        return Err(PeerRunError::transient(format!(
+                            "validation chainstate tip {}:{} does not match target {}:{}",
+                            tip.height, tip.hash, target.height, target.block_hash
+                        )));
+                    }
+                    println!(
+                        "independent genesis validation stopped exactly at {}:{}",
+                        tip.height, tip.hash
+                    );
+                    return Ok(());
+                }
+            }
             if tip.height >= headers.active_tip().height {
                 println!("block execution caught up at height {}", tip.height);
                 let ibd_status = ibd_policy
@@ -1053,6 +1122,7 @@ async fn sync_validating_node(
                 &ledger,
                 &explorer,
                 wallet,
+                validation_target.map(|target| target.height),
             )
             .await?;
             if let Some(wallet) = wallet_runtime {
@@ -1563,6 +1633,7 @@ async fn download_execute_batch(
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
     wallet: Option<&EmbeddedWallet>,
+    maximum_height: Option<u32>,
 ) -> Result<(), PeerRunError> {
     let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -1570,7 +1641,15 @@ async fn download_execute_batch(
         .height
         .checked_add(1)
         .ok_or_else(|| "execution height overflow".to_owned())?;
-    let remaining = headers.active_tip().height - tip.height;
+    let execution_ceiling = maximum_height
+        .unwrap_or_else(|| headers.active_tip().height)
+        .min(headers.active_tip().height);
+    let remaining = execution_ceiling.checked_sub(tip.height).ok_or_else(|| {
+        PeerRunError::transient(format!(
+            "execution tip {} is above requested ceiling {execution_ceiling}",
+            tip.height
+        ))
+    })?;
     let batch_len = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(MAX_BLOCKS_IN_FLIGHT);
@@ -1975,6 +2054,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut snapshot_records_bytes = None;
     let mut snapshot_records_sha256 = None;
     let mut finalize_assumeutxo = None;
+    let mut validation_height = None;
+    let mut validation_block_hash = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -2102,6 +2183,33 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     &mut args,
                     "--finalize-assumeutxo",
                 )?));
+            }
+            "--validate-until-height" => {
+                if validation_height.is_some() {
+                    return Err(
+                        "--validate-until-height cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--validate-until-height")?;
+                let height = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid validation target height: {value}"))?;
+                if height == 0 {
+                    return Err("validation target height must be above genesis".to_owned());
+                }
+                validation_height = Some(height);
+            }
+            "--validate-until-blockhash" => {
+                if validation_block_hash.is_some() {
+                    return Err(
+                        "--validate-until-blockhash cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--validate-until-blockhash")?;
+                validation_block_hash = Some(
+                    BlockHash::from_str(&value)
+                        .map_err(|_| format!("invalid validation target block hash: {value}"))?,
+                );
             }
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
@@ -2283,6 +2391,32 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
+    let validation_target = match (validation_height, validation_block_hash) {
+        (None, None) => None,
+        (Some(height), Some(block_hash)) => {
+            if data_dir.is_none() {
+                return Err("bounded genesis validation requires --data-dir".to_owned());
+            }
+            if snapshot.is_some()
+                || finalize_assumeutxo.is_some()
+                || fetch_block.is_some()
+                || headers_db.is_some()
+                || explorer_listen.is_some()
+            {
+                return Err(
+                    "bounded genesis validation conflicts with snapshot, finalization, fetch, headers-db, explorer, and wallet modes"
+                        .to_owned(),
+                );
+            }
+            Some(ValidationTarget { height, block_hash })
+        }
+        _ => {
+            return Err(
+                "--validate-until-height and --validate-until-blockhash must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
     if data_dir.is_some() && !supports_block_execution(network) {
         return Err(
             "--data-dir block execution currently supports only regtest and Signet".to_owned(),
@@ -2347,6 +2481,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         ibd_policy,
         snapshot,
         finalize_assumeutxo,
+        validation_target,
     }))
 }
 
@@ -2411,7 +2546,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -2879,6 +3014,7 @@ mod tests {
                 records_sha256: manifest.records_sha256,
             }),
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -2935,6 +3071,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: Some(validation_dir),
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -2986,6 +3123,66 @@ mod tests {
                 "--finalize-assumeutxo",
                 "/tmp/v",
                 "--once",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_only_complete_bounded_genesis_validation_target() {
+        let hash = BlockHash::from_byte_array([42; 32]);
+        let options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                "/tmp/rbtc-validation".to_owned(),
+                "--connect".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+                "--validate-until-height".to_owned(),
+                "100".to_owned(),
+                "--validate-until-blockhash".to_owned(),
+                hash.to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.validation_target,
+            Some(ValidationTarget {
+                height: 100,
+                block_hash: hash,
+            })
+        );
+        let hash_text = hash.to_string();
+        for arguments in [
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/v",
+                "--validate-until-height",
+                "1",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/v",
+                "--validate-until-height",
+                "0",
+                "--validate-until-blockhash",
+                hash_text.as_str(),
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--validate-until-height",
+                "1",
+                "--validate-until-blockhash",
+                hash_text.as_str(),
             ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
@@ -3407,6 +3604,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap_err();
@@ -3449,6 +3647,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -3587,6 +3786,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -3601,6 +3801,136 @@ mod tests {
                 .hash,
             child_hash
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bounded_genesis_validation_never_downloads_or_commits_above_target() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let first = regtest_block(genesis.block_hash(), genesis.time + 1);
+        let first_hash = first.block_hash();
+        let mut second = regtest_block(first_hash, first.header.time + 1);
+        second.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![0x52, 0x00]);
+        second.header.merkle_root = second.compute_merkle_root().unwrap();
+        second.header.nonce = 0;
+        while second
+            .header
+            .validate_pow(Target::MAX_ATTAINABLE_REGTEST)
+            .is_err()
+        {
+            second.header.nonce = second.header.nonce.checked_add(1).unwrap();
+        }
+        let second_hash = second.block_hash();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(61)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(vec![first.header, second.header]))
+                    .await
+                    .unwrap(),
+                message => panic!("expected bounded-validation getheaders, got {message:?}"),
+            }
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                            first_hash
+                        )]
+                    );
+                    peer.write_message(NetworkMessage::Block(first))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected one bounded-validation block, got {message:?}"),
+            }
+        });
+        let directory = TempDir::new().unwrap();
+        run(Options {
+            remotes: vec![remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: Some(ValidationTarget {
+                height: 1,
+                block_hash: first_hash,
+            }),
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert_eq!(chainstate.execution().tip().unwrap().hash, first_hash);
+        assert_eq!(chainstate.execution().assumed_snapshot().unwrap(), None);
+        drop(chainstate);
+        let headers = RedbHeaderStore::open(directory.path().join("headers.redb"))
+            .unwrap()
+            .load_dag(Network::Regtest, unix_time().unwrap())
+            .unwrap();
+        assert_eq!(headers.active_tip().height, 2);
+        assert_eq!(headers.active_tip().hash, second_hash);
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+        drop(ledger);
+
+        let restart_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let restart_remote = restart_listener.local_addr().unwrap();
+        let restart_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(restart_listener, peer_version(62)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(Vec::new()))
+                    .await
+                    .unwrap(),
+                message => panic!("expected restart getheaders, got {message:?}"),
+            }
+        });
+        run(Options {
+            remotes: vec![restart_remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(directory.path().to_path_buf()),
+            once: false,
+            explorer_listen: None,
+            wallet_api_files: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: Some(ValidationTarget {
+                height: 1,
+                block_hash: first_hash,
+            }),
+        })
+        .await
+        .unwrap();
+        restart_server.await.unwrap();
+        let reopened =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(reopened.execution().tip().unwrap().height, 1);
+        assert_eq!(reopened.execution().tip().unwrap().hash, first_hash);
     }
 
     #[tokio::test]
@@ -3665,6 +3995,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -3733,6 +4064,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -3759,6 +4091,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -3816,6 +4149,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap_err();
@@ -3867,6 +4201,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap_err();
@@ -3952,6 +4287,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap_err();
@@ -4080,6 +4416,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -4172,6 +4509,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -4236,6 +4574,7 @@ mod tests {
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
@@ -4330,6 +4669,7 @@ mod tests {
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
                 snapshot: None,
                 finalize_assumeutxo: None,
+                validation_target: None,
             },
             local_nonce,
         )
@@ -4438,6 +4778,7 @@ mod tests {
             ibd_policy,
             snapshot: None,
             finalize_assumeutxo: None,
+            validation_target: None,
         })
         .await
         .unwrap();
