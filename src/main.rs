@@ -1,7 +1,7 @@
 //! Command line entry point for the rBTC node daemon.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env, fs,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
@@ -1009,10 +1009,10 @@ async fn run_peer_pool(
 ) -> Result<(), String> {
     let api_runtime = prepare_api_runtime(options)?;
     let peer_store = if let Some(data_dir) = &options.data_dir {
-        Some(
+        Some(Arc::new(
             RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
                 .map_err(|error| error.to_string())?,
-        )
+        ))
     } else {
         None
     };
@@ -1033,35 +1033,20 @@ async fn run_peer_pool(
     }
     let mut attempted = remotes.iter().copied().collect::<HashSet<_>>();
     let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS);
-    for remote in remotes {
-        match run_with_peer(
-            options,
-            remote,
-            local_nonce,
-            peer_store.as_ref(),
-            api_runtime.as_ref(),
-            background_validation,
-            validation_scheduler,
-        )
-        .await
-        {
-            Ok(()) => {
-                if completed_validating_session(options) {
-                    record_peer_session_success(peer_store.as_ref(), remote);
-                }
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("peer {remote} failed: {error}");
-                record_peer_failure(
-                    peer_store.as_ref(),
-                    remote,
-                    error.kind,
-                    manual_remotes.contains(&remote),
-                );
-                failures.push(format!("{remote}: {error}"));
-            }
-        }
+    if try_peer_candidates(
+        options,
+        &remotes,
+        local_nonce,
+        peer_store.as_ref(),
+        api_runtime.as_ref(),
+        background_validation,
+        validation_scheduler,
+        &manual_remotes,
+        &mut failures,
+    )
+    .await
+    {
+        return Ok(());
     }
 
     let seeds = selected_dns_seeds(options);
@@ -1087,31 +1072,21 @@ async fn run_peer_pool(
                 resolved.len()
             );
         }
-        for remote in resolved {
-            attempted.insert(remote);
-            match run_with_peer(
-                options,
-                remote,
-                local_nonce,
-                peer_store.as_ref(),
-                api_runtime.as_ref(),
-                background_validation,
-                validation_scheduler,
-            )
-            .await
-            {
-                Ok(()) => {
-                    if completed_validating_session(options) {
-                        record_peer_session_success(peer_store.as_ref(), remote);
-                    }
-                    return Ok(());
-                }
-                Err(error) => {
-                    eprintln!("peer {remote} failed: {error}");
-                    record_peer_failure(peer_store.as_ref(), remote, error.kind, false);
-                    failures.push(format!("{remote}: {error}"));
-                }
-            }
+        attempted.extend(resolved.iter().copied());
+        if try_peer_candidates(
+            options,
+            &resolved,
+            local_nonce,
+            peer_store.as_ref(),
+            api_runtime.as_ref(),
+            background_validation,
+            validation_scheduler,
+            &manual_remotes,
+            &mut failures,
+        )
+        .await
+        {
+            return Ok(());
         }
     }
     if attempted.is_empty() {
@@ -1781,22 +1756,26 @@ async fn negotiate_peer_preferences(
         .map_err(|error| PeerRunError::p2p(&error))
 }
 
-async fn run_with_peer(
-    options: &Options,
+struct ConnectedPeer {
+    remote: SocketAddr,
+    session: PeerSession<tokio::net::TcpStream>,
+}
+
+type PendingPeer = tokio::task::JoinHandle<Result<ConnectedPeer, PeerRunError>>;
+
+async fn connect_peer(
+    deployments: DeploymentConfig,
     remote: SocketAddr,
     local_nonce: u64,
-    peer_store: Option<&RedbPeerStore>,
-    api_runtime: Option<&ApiRuntime>,
-    background_validation: Option<&BackgroundValidationStatus>,
-    validation_scheduler: Option<&BackgroundValidationStatus>,
-) -> Result<(), PeerRunError> {
-    record_peer_attempt(peer_store, remote);
+    require_full_services: bool,
+    peer_store: Option<Arc<RedbPeerStore>>,
+) -> Result<ConnectedPeer, PeerRunError> {
     let handshake_started = Instant::now();
     let mut session = timeout(
         PEER_TIMEOUT,
         connect_outbound(
             remote,
-            options.deployments.message_start(),
+            deployments.message_start(),
             local_nonce,
             USER_AGENT.to_owned(),
             0,
@@ -1820,17 +1799,128 @@ async fn run_with_peer(
     );
     negotiate_peer_preferences(&mut session).await?;
 
+    if require_full_services {
+        session
+            .ensure_full_witness_block_relay()
+            .map_err(|error| PeerRunError::p2p(&error))?;
+        if let Some(store) = peer_store {
+            record_verified_peer(store.as_ref(), remote, remote_services, handshake_millis);
+        }
+    }
+    Ok(ConnectedPeer { remote, session })
+}
+
+fn spawn_peer_connections(
+    options: &Options,
+    remotes: &[SocketAddr],
+    local_nonce: u64,
+    peer_store: Option<&Arc<RedbPeerStore>>,
+) -> VecDeque<(SocketAddr, PendingPeer)> {
+    remotes
+        .iter()
+        .copied()
+        .map(|remote| {
+            record_peer_attempt(peer_store.map(Arc::as_ref), remote);
+            let deployments = options.deployments.clone();
+            let peer_store = peer_store.cloned();
+            let require_full_services = options.data_dir.is_some();
+            let pending = tokio::spawn(connect_peer(
+                deployments,
+                remote,
+                local_nonce,
+                require_full_services,
+                peer_store,
+            ));
+            (remote, pending)
+        })
+        .collect()
+}
+
+async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPeer)>) {
+    for (_, connection) in pending.iter() {
+        connection.abort();
+    }
+    while let Some((_, connection)) = pending.pop_front() {
+        let _ = connection.await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_peer_candidates(
+    options: &Options,
+    remotes: &[SocketAddr],
+    local_nonce: u64,
+    peer_store: Option<&Arc<RedbPeerStore>>,
+    api_runtime: Option<&ApiRuntime>,
+    background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
+    manual_remotes: &HashSet<SocketAddr>,
+    failures: &mut Vec<String>,
+) -> bool {
+    let mut pending = spawn_peer_connections(options, remotes, local_nonce, peer_store);
+    while let Some((remote, connection)) = pending.pop_front() {
+        let connected = match connection.await {
+            Ok(result) => result,
+            Err(error) => Err(PeerRunError::transient(format!(
+                "peer connection task failed: {error}"
+            ))),
+        };
+        let result = match connected {
+            Ok(connected) => {
+                run_connected_peer(
+                    options,
+                    connected,
+                    peer_store.map(Arc::as_ref),
+                    api_runtime,
+                    background_validation,
+                    validation_scheduler,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                if completed_validating_session(options) {
+                    record_peer_session_success(peer_store.map(Arc::as_ref), remote);
+                }
+                abort_pending_connections(&mut pending).await;
+                return true;
+            }
+            Err(error) => {
+                eprintln!("peer {remote} failed: {error}");
+                record_peer_failure(
+                    peer_store.map(Arc::as_ref),
+                    remote,
+                    error.kind,
+                    manual_remotes.contains(&remote),
+                );
+                failures.push(format!("{remote}: {error}"));
+            }
+        }
+    }
+    false
+}
+
+async fn run_connected_peer(
+    options: &Options,
+    connected: ConnectedPeer,
+    peer_store: Option<&RedbPeerStore>,
+    api_runtime: Option<&ApiRuntime>,
+    background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
+) -> Result<(), PeerRunError> {
+    let ConnectedPeer {
+        remote,
+        mut session,
+    } = connected;
     if let Some(hash) = options.fetch_block {
         fetch_requested_block(&mut session, hash).await?;
         return Ok(());
     }
 
     if let Some(path) = &options.data_dir {
-        session
-            .ensure_full_witness_block_relay()
-            .map_err(|error| PeerRunError::p2p(&error))?;
         if let Some(store) = peer_store {
-            record_verified_peer(store, remote, remote_services, handshake_millis);
             discover_peer_addresses(&mut session, store, remote).await;
         }
         let transfer_before = session.block_transfer_stats();
@@ -4440,6 +4530,68 @@ mod tests {
         receive_client_negotiation(&mut peer).await;
         peer.write_message(NetworkMessage::Verack).await.unwrap();
         (peer, local_version)
+    }
+
+    #[tokio::test]
+    async fn candidate_handshakes_run_concurrently_without_reordering_the_queue() {
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_remote = stalled_listener.local_addr().unwrap();
+        let (release_stalled, stalled_release) = tokio::sync::oneshot::channel();
+        let stalled_server = tokio::spawn(async move {
+            let (stream, _) = stalled_listener.accept().await.unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            let _ = stalled_release.await;
+        });
+
+        let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready_remote = ready_listener.local_addr().unwrap();
+        let (ready, ready_received) = tokio::sync::oneshot::channel();
+        let ready_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(ready_listener, peer_version(101)).await;
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendHeaders
+            ));
+            ready.send(()).unwrap();
+        });
+
+        let options = Options {
+            remotes: vec![stalled_remote, ready_remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: None,
+            once: true,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: None,
+            cleanup_validation_dir: false,
+            validation_limits: ValidationLimits::default(),
+        };
+        let mut pending = spawn_peer_connections(&options, &options.remotes, 100, None);
+        timeout(Duration::from_secs(2), ready_received)
+            .await
+            .expect("later candidate should handshake while first candidate is stalled")
+            .unwrap();
+        assert_eq!(pending.front().unwrap().0, stalled_remote);
+        assert_eq!(pending.back().unwrap().0, ready_remote);
+
+        abort_pending_connections(&mut pending).await;
+        release_stalled.send(()).unwrap();
+        stalled_server.await.unwrap();
+        ready_server.await.unwrap();
     }
 
     fn wallet_broadcast_transaction() -> Transaction {
