@@ -2351,6 +2351,7 @@ async fn run_connected_peer(
         mut session,
         validated_header_height,
     } = connected;
+    let orphan_source = session.remote_version().nonce;
     if let Some(height) = validated_header_height {
         println!("activated peer {remote} after standby validation through height {height}");
     }
@@ -2398,6 +2399,16 @@ async fn run_connected_peer(
                 remote,
                 transfer_before,
                 session.block_transfer_stats(),
+            );
+        }
+        let removed_orphans = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_orphans_from(orphan_source);
+        if removed_orphans > 0 {
+            println!(
+                "removed {removed_orphans} orphan transaction{} after peer {remote} disconnected",
+                if removed_orphans == 1 { "" } else { "s" }
             );
         }
         return result;
@@ -3172,7 +3183,11 @@ fn admit_pending_peer_transactions(
                     candidate.remove_orphans(&txid_set);
                 }
                 Err(error) if error.is_missing_input() => {
-                    let retained = candidate.retain_orphans(&retained_package, now);
+                    let retained = candidate.retain_orphans(
+                        &retained_package,
+                        now,
+                        session.remote_version().nonce,
+                    );
                     if retained > 0 {
                         deferred_messages.push(format!(
                             "retained {retained} missing-parent peer transaction{} for bounded retry",

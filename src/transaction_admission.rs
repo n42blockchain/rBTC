@@ -238,6 +238,7 @@ struct OrphanTransaction {
     transaction: Transaction,
     serialized_len: usize,
     expires_at: u32,
+    source: u64,
 }
 
 #[derive(Default)]
@@ -330,7 +331,7 @@ impl TransactionAdmissionPool {
     }
 
     /// Retains missing-parent transactions under independent count and byte bounds.
-    pub fn retain_orphans(&mut self, transactions: &[Transaction], now: u32) -> usize {
+    pub fn retain_orphans(&mut self, transactions: &[Transaction], now: u32, source: u64) -> usize {
         self.prune_orphans(now);
         let mut retained = 0;
         for transaction in transactions {
@@ -366,6 +367,7 @@ impl TransactionAdmissionPool {
                 transaction: transaction.clone(),
                 serialized_len,
                 expires_at: now.saturating_add(ORPHAN_EXPIRY_SECS),
+                source,
             });
             retained += 1;
         }
@@ -399,6 +401,18 @@ impl TransactionAdmissionPool {
         let before = self.orphans.len();
         self.orphans
             .retain(|orphan| !txids.contains(&orphan.transaction.compute_txid()));
+        self.orphan_bytes = self
+            .orphans
+            .iter()
+            .map(|orphan| orphan.serialized_len)
+            .sum();
+        before.saturating_sub(self.orphans.len())
+    }
+
+    /// Removes every orphan attributed to one disconnected peer session.
+    pub fn remove_orphans_from(&mut self, source: u64) -> usize {
+        let before = self.orphans.len();
+        self.orphans.retain(|orphan| orphan.source != source);
         self.orphan_bytes = self
             .orphans
             .iter()
@@ -1771,7 +1785,7 @@ mod tests {
         let mut pool = TransactionAdmissionPool::default();
         let transactions = (1_u8..=65).map(|index| spend(index).2).collect::<Vec<_>>();
         let first_txid = transactions[0].compute_txid();
-        assert_eq!(pool.retain_orphans(&transactions, 100), 65);
+        assert_eq!(pool.retain_orphans(&transactions, 100, 1), 65);
         assert_eq!(pool.orphan_len(), MAX_ORPHAN_TRANSACTIONS);
         assert!(pool.orphan_bytes() <= MAX_ORPHAN_TRANSACTION_BYTES);
         assert!(
@@ -1780,7 +1794,7 @@ mod tests {
                 .iter()
                 .any(|orphan| orphan.transaction.compute_txid() == first_txid)
         );
-        assert_eq!(pool.retain_orphans(&transactions[1..2], 200), 0);
+        assert_eq!(pool.retain_orphans(&transactions[1..2], 200, 2), 0);
         assert_eq!(pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS - 1), 0);
         assert_eq!(
             pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS),
@@ -1801,7 +1815,7 @@ mod tests {
         let grandchild_txid = grandchild.compute_txid();
         let mut pool = TransactionAdmissionPool::default();
         assert_eq!(
-            pool.retain_orphans(&[grandchild.clone(), child_transaction.clone()], 100),
+            pool.retain_orphans(&[grandchild.clone(), child_transaction.clone()], 100, 1,),
             2
         );
 
@@ -1830,6 +1844,23 @@ mod tests {
         pool.remove_orphans(&BTreeSet::from([grandchild_txid]));
         assert_eq!(pool.len(), 3);
         assert_eq!(pool.orphan_len(), 0);
+    }
+
+    #[test]
+    fn orphan_disconnect_cleanup_is_isolated_by_source() {
+        let mut pool = TransactionAdmissionPool::default();
+        let first = spend(82).2;
+        let second = spend(83).2;
+        assert_eq!(pool.retain_orphans(&[first], 100, 11), 1);
+        assert_eq!(pool.retain_orphans(&[second], 100, 12), 1);
+        let before_bytes = pool.orphan_bytes();
+
+        assert_eq!(pool.remove_orphans_from(11), 1);
+        assert_eq!(pool.orphan_len(), 1);
+        assert!(pool.orphan_bytes() < before_bytes);
+        assert_eq!(pool.remove_orphans_from(11), 0);
+        assert_eq!(pool.remove_orphans_from(12), 1);
+        assert_eq!(pool.orphan_bytes(), 0);
     }
 
     #[test]
