@@ -1,7 +1,7 @@
 //! Bounded local admission for independently received transactions.
 //!
 //! Confirmed inputs and outputs of already-admitted parents are available to a
-//! bounded package overlay. Replacement remains a separate policy layer.
+//! bounded package overlay. Opt-in replacement follows BIP125 policy.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -25,6 +25,12 @@ pub const MAX_ADMITTED_TRANSACTION_BYTES: usize = 4_000_000;
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
 pub const MAX_PACKAGE_VBYTES: usize = 101_000;
+/// Maximum original transactions and descendants replaced in one admission.
+pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
+/// Additional relay fee charged for every replacement virtual byte.
+pub const INCREMENTAL_RELAY_FEE_SAT_VB: u64 = 1;
+
+const MAX_NON_RBF_SEQUENCE: u32 = 0xffff_fffe;
 
 /// Chain context used for read-only transaction validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +54,8 @@ pub enum TransactionAdmissionOutcome {
         txid: Txid,
         /// Number of oldest entries evicted to preserve hard resource bounds.
         evicted: usize,
+        /// Original conflicts and descendants removed by BIP125 replacement.
+        replaced: usize,
     },
     /// The same witness transaction was already retained.
     AlreadyPresent(Wtxid),
@@ -90,6 +98,40 @@ pub enum TransactionAdmissionError {
     /// Capacity cannot be recovered without evicting the new package or one of its ancestors.
     #[error("transaction package cannot fit without evicting a required ancestor")]
     PackageCapacity,
+    /// A directly conflicting transaction did not opt in, including through an ancestor.
+    #[error("directly conflicting transaction {0} does not signal BIP125 replaceability")]
+    NonReplaceable(Txid),
+    /// A replacement package added an input from an unrelated unconfirmed transaction.
+    #[error("replacement adds unconfirmed input {0}")]
+    ReplacementAddsUnconfirmedInput(OutPoint),
+    /// A replacement did not pay more than all transactions it would remove.
+    #[error(
+        "replacement fee {replacement_fee_sats} sat does not exceed conflicting fee {conflicts_fee_sats} sat"
+    )]
+    InsufficientReplacementFee {
+        /// Aggregate replacement-package fee.
+        replacement_fee_sats: u64,
+        /// Aggregate fee of all conflicts and descendants.
+        conflicts_fee_sats: u64,
+    },
+    /// A replacement did not pay the incremental relay fee for its own bandwidth.
+    #[error(
+        "replacement additional fee {additional_fee_sats} sat is below required incremental fee {required_fee_sats} sat"
+    )]
+    InsufficientReplacementRelayFee {
+        /// Fee above the transactions being removed.
+        additional_fee_sats: u64,
+        /// Incremental relay fee required by replacement virtual size.
+        required_fee_sats: u64,
+    },
+    /// A replacement would remove more transactions than BIP125 permits.
+    #[error("replacement would evict {count} transactions; limit is {limit}")]
+    TooManyReplacementEvictions {
+        /// Original conflicts plus their descendants.
+        count: usize,
+        /// BIP125 eviction limit.
+        limit: usize,
+    },
 }
 
 /// Result of an atomic package admission attempt.
@@ -101,12 +143,21 @@ pub struct PackageAdmissionOutcome {
     pub already_present: usize,
     /// Existing oldest transactions and descendants evicted for capacity.
     pub evicted: usize,
+    /// Original conflicts and descendants removed by BIP125 replacement.
+    pub replaced: usize,
 }
 
 #[derive(Clone)]
 struct AdmittedTransaction {
     transaction: Transaction,
     serialized_len: usize,
+    fee_sats: u64,
+}
+
+#[derive(Default)]
+struct ReplacementPlan {
+    txids: BTreeSet<Txid>,
+    conflicts_fee_sats: u64,
 }
 
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
@@ -148,8 +199,8 @@ impl TransactionAdmissionPool {
     /// Validates and retains one transaction without mutating chainstate.
     ///
     /// Inputs may be confirmed UTXOs or outputs of already-admitted parents.
-    /// An input already reserved by another retained transaction is rejected;
-    /// replacement is intentionally deferred to the RBF layer.
+    /// Conflicts may replace BIP125-signaling entries when every replacement
+    /// rule is satisfied.
     pub fn admit<S: UtxoStore>(
         &mut self,
         store: &S,
@@ -169,6 +220,7 @@ impl TransactionAdmissionPool {
         Ok(TransactionAdmissionOutcome::Accepted {
             txid,
             evicted: outcome.evicted,
+            replaced: outcome.replaced,
         })
     }
 
@@ -197,11 +249,48 @@ impl TransactionAdmissionPool {
         transactions: Vec<Transaction>,
         context: TransactionAdmissionContext,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
-        let overlay = AdmissionUtxoOverlay::new(store);
-        for entry in &self.entries {
-            apply_to_overlay(&overlay, &entry.transaction, context)?;
+        let (already_present, package) = self.collect_new_package(transactions)?;
+        if package.is_empty() {
+            return Ok(PackageAdmissionOutcome {
+                accepted: Vec::new(),
+                already_present,
+                evicted: 0,
+                replaced: 0,
+            });
         }
 
+        let ordered = topological_package_order(package)?;
+        let replacement_vbytes = ordered.iter().fold(0_usize, |total, transaction| {
+            total.saturating_add(transaction.vsize())
+        });
+        let replacement = self.prepare_replacement(&ordered)?;
+
+        let overlay = AdmissionUtxoOverlay::new(store);
+        for entry in &self.entries {
+            let _ = apply_to_overlay(&overlay, &entry.transaction, context)?;
+        }
+        let (accepted, replacement_fee_sats) =
+            self.append_ordered_package(&overlay, ordered, context)?;
+        validate_replacement_fees(
+            replacement_fee_sats,
+            replacement.conflicts_fee_sats,
+            replacement_vbytes,
+            !replacement.txids.is_empty(),
+        )?;
+        let protected = accepted.iter().copied().collect::<BTreeSet<_>>();
+        let evicted = self.evict_to_capacity(&protected)?;
+        Ok(PackageAdmissionOutcome {
+            accepted,
+            already_present,
+            evicted,
+            replaced: replacement.txids.len(),
+        })
+    }
+
+    fn collect_new_package(
+        &self,
+        transactions: Vec<Transaction>,
+    ) -> Result<(usize, BTreeMap<Txid, Transaction>), TransactionAdmissionError> {
         let mut already_present = 0;
         let mut package = BTreeMap::new();
         for transaction in transactions {
@@ -224,30 +313,105 @@ impl TransactionAdmissionPool {
                 return Err(TransactionAdmissionError::DuplicatePackageTransaction(txid));
             }
         }
-        if package.is_empty() {
-            return Ok(PackageAdmissionOutcome {
-                accepted: Vec::new(),
-                already_present,
-                evicted: 0,
+        Ok((already_present, package))
+    }
+
+    fn prepare_replacement(
+        &mut self,
+        ordered: &[Transaction],
+    ) -> Result<ReplacementPlan, TransactionAdmissionError> {
+        let direct_conflicts = ordered
+            .iter()
+            .flat_map(|transaction| transaction.input.iter())
+            .filter_map(|input| self.spent.get(&input.previous_output).copied())
+            .collect::<BTreeSet<_>>();
+        if direct_conflicts.is_empty() {
+            return Ok(ReplacementPlan::default());
+        }
+        let mut txids = BTreeSet::new();
+        for txid in &direct_conflicts {
+            if !self.transaction_is_replaceable(*txid) {
+                return Err(TransactionAdmissionError::NonReplaceable(*txid));
+            }
+            txids.extend(self.descendant_closure(*txid));
+        }
+        if txids.len() > MAX_REPLACEMENT_EVICTIONS {
+            return Err(TransactionAdmissionError::TooManyReplacementEvictions {
+                count: txids.len(),
+                limit: MAX_REPLACEMENT_EVICTIONS,
             });
         }
+        self.validate_replacement_inputs(ordered, &direct_conflicts)?;
+        let conflicts_fee_sats = self
+            .entries
+            .iter()
+            .filter(|entry| txids.contains(&entry.transaction.compute_txid()))
+            .fold(0_u64, |total, entry| total.saturating_add(entry.fee_sats));
+        self.entries
+            .retain(|entry| !txids.contains(&entry.transaction.compute_txid()));
+        self.rebuild_indexes();
+        Ok(ReplacementPlan {
+            txids,
+            conflicts_fee_sats,
+        })
+    }
 
-        let ordered = topological_package_order(package)?;
+    fn validate_replacement_inputs(
+        &self,
+        ordered: &[Transaction],
+        direct_conflicts: &BTreeSet<Txid>,
+    ) -> Result<(), TransactionAdmissionError> {
+        let allowed = self
+            .entries
+            .iter()
+            .filter(|entry| direct_conflicts.contains(&entry.transaction.compute_txid()))
+            .flat_map(|entry| {
+                entry
+                    .transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output)
+            })
+            .collect::<BTreeSet<_>>();
+        let pool_txids = self
+            .entries
+            .iter()
+            .map(|entry| entry.transaction.compute_txid())
+            .collect::<BTreeSet<_>>();
+        if let Some(outpoint) = ordered
+            .iter()
+            .flat_map(|transaction| transaction.input.iter())
+            .map(|input| input.previous_output)
+            .find(|outpoint| pool_txids.contains(&outpoint.txid) && !allowed.contains(outpoint))
+        {
+            return Err(TransactionAdmissionError::ReplacementAddsUnconfirmedInput(
+                outpoint,
+            ));
+        }
+        Ok(())
+    }
+
+    fn append_ordered_package<S: UtxoStore>(
+        &mut self,
+        overlay: &AdmissionUtxoOverlay<'_, S>,
+        ordered: Vec<Transaction>,
+        context: TransactionAdmissionContext,
+    ) -> Result<(Vec<Txid>, u64), TransactionAdmissionError> {
         let mut package_spent = BTreeSet::new();
         let mut accepted = Vec::with_capacity(ordered.len());
+        let mut replacement_fee_sats = 0_u64;
         for transaction in ordered {
             if let Some(conflict) = transaction
                 .input
                 .iter()
                 .map(|input| input.previous_output)
-                .find(|outpoint| {
-                    self.spent.contains_key(outpoint) || !package_spent.insert(*outpoint)
-                })
+                .find(|outpoint| !package_spent.insert(*outpoint))
             {
                 return Err(TransactionPolicyError::Conflict(conflict).into());
             }
             let txid = transaction.compute_txid();
-            apply_to_overlay(&overlay, &transaction, context)?;
+            let fee_sats = apply_to_overlay(overlay, &transaction, context)?;
+            replacement_fee_sats = replacement_fee_sats.saturating_add(fee_sats);
             let serialized_len = serialize(&transaction).len();
             for input in &transaction.input {
                 self.spent.insert(input.previous_output, txid);
@@ -259,16 +423,11 @@ impl TransactionAdmissionPool {
             self.entries.push_back(AdmittedTransaction {
                 transaction,
                 serialized_len,
+                fee_sats,
             });
             accepted.push(txid);
         }
-        let protected = accepted.iter().copied().collect::<BTreeSet<_>>();
-        let evicted = self.evict_to_capacity(&protected)?;
-        Ok(PackageAdmissionOutcome {
-            accepted,
-            already_present,
-            evicted,
-        })
+        Ok((accepted, replacement_fee_sats))
     }
 
     /// Revalidates every entry after an active-chain change.
@@ -341,6 +500,38 @@ impl TransactionAdmissionPool {
         removed
     }
 
+    fn transaction_is_replaceable(&self, txid: Txid) -> bool {
+        let mut pending = vec![txid];
+        let mut visited = BTreeSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate) {
+                continue;
+            }
+            let Some(transaction) = self
+                .entries
+                .iter()
+                .find(|entry| entry.transaction.compute_txid() == candidate)
+                .map(|entry| &entry.transaction)
+            else {
+                continue;
+            };
+            if transaction
+                .input
+                .iter()
+                .any(|input| input.sequence.to_consensus_u32() < MAX_NON_RBF_SEQUENCE)
+            {
+                return true;
+            }
+            pending.extend(
+                transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.txid),
+            );
+        }
+        false
+    }
+
     fn rebuild_indexes(&mut self) {
         self.spent.clear();
         self.retained_bytes = 0;
@@ -355,6 +546,34 @@ impl TransactionAdmissionPool {
                 .expect("bounded admitted transaction bytes fit usize");
         }
     }
+}
+
+fn validate_replacement_fees(
+    replacement_fee_sats: u64,
+    conflicts_fee_sats: u64,
+    replacement_vbytes: usize,
+    is_replacement: bool,
+) -> Result<(), TransactionAdmissionError> {
+    if !is_replacement {
+        return Ok(());
+    }
+    if replacement_fee_sats <= conflicts_fee_sats {
+        return Err(TransactionAdmissionError::InsufficientReplacementFee {
+            replacement_fee_sats,
+            conflicts_fee_sats,
+        });
+    }
+    let additional_fee_sats = replacement_fee_sats - conflicts_fee_sats;
+    let required_fee_sats = u64::try_from(replacement_vbytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(INCREMENTAL_RELAY_FEE_SAT_VB);
+    if additional_fee_sats < required_fee_sats {
+        return Err(TransactionAdmissionError::InsufficientReplacementRelayFee {
+            additional_fee_sats,
+            required_fee_sats,
+        });
+    }
+    Ok(())
 }
 
 fn validate_package_bounds(transactions: &[Transaction]) -> Result<(), TransactionAdmissionError> {
@@ -410,7 +629,7 @@ fn apply_to_overlay<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
     context: TransactionAdmissionContext,
-) -> Result<(), TransactionAdmissionError> {
+) -> Result<u64, TransactionAdmissionError> {
     let applied = apply_transaction_with_context(
         overlay,
         transaction,
@@ -426,7 +645,7 @@ fn apply_to_overlay<S: UtxoStore>(
         .checked_sub(applied.output_value_sats)
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction(transaction, fee_sats)?;
-    Ok(())
+    Ok(fee_sats)
 }
 
 struct AdmissionUtxoOverlay<'a, S> {
@@ -682,6 +901,17 @@ mod tests {
         }
     }
 
+    fn signal_rbf(transaction: &mut Transaction) {
+        transaction.input[0].sequence = Sequence(0xffff_fffd);
+    }
+
+    fn txids(pool: &TransactionAdmissionPool) -> Vec<Txid> {
+        pool.snapshot()
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect()
+    }
+
     #[test]
     fn admission_checks_scripts_and_policy_without_mutating_chainstate() {
         let (_directory, store) = store();
@@ -701,7 +931,11 @@ mod tests {
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert_eq!(
             pool.admit(&store, transaction.clone(), context()).unwrap(),
-            TransactionAdmissionOutcome::Accepted { txid, evicted: 0 }
+            TransactionAdmissionOutcome::Accepted {
+                txid,
+                evicted: 0,
+                replaced: 0,
+            }
         );
         assert_eq!(
             pool.admit(&store, transaction, context()).unwrap(),
@@ -713,22 +947,160 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_spend_is_rejected_until_replacement_policy_exists() {
+    fn non_signaling_conflict_is_rejected_without_mutating_the_pool() {
         let (_directory, store) = store();
         let (outpoint, utxo, first) = spend(2);
         store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
         let mut second = first.clone();
         second.output[0].value = Amount::from_sat(89_000);
+        let first_txid = first.compute_txid();
         let mut pool = TransactionAdmissionPool::default();
         pool.admit(&store, first, context()).unwrap();
 
         assert!(matches!(
             pool.admit(&store, second, context()),
-            Err(TransactionAdmissionError::Policy(
-                TransactionPolicyError::Conflict(conflict)
-            )) if conflict == outpoint
+            Err(TransactionAdmissionError::NonReplaceable(conflict))
+                if conflict == first_txid
         ));
-        assert_eq!(pool.len(), 1);
+        assert_eq!(txids(&pool), vec![first_txid]);
+    }
+
+    #[test]
+    fn signaling_conflict_replaces_the_original_atomically() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut original) = spend(72);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        signal_rbf(&mut original);
+        let original_txid = original.compute_txid();
+        let mut replacement = original.clone();
+        replacement.output[0].value = Amount::from_sat(80_000);
+        let replacement_txid = replacement.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, original, context()).unwrap();
+
+        let outcome = pool
+            .admit_package(&store, vec![replacement], context())
+            .unwrap();
+        assert_eq!(outcome.accepted, vec![replacement_txid]);
+        assert_eq!(outcome.replaced, 1);
+        assert_eq!(outcome.evicted, 0);
+        assert_eq!(txids(&pool), vec![replacement_txid]);
+        assert!(!txids(&pool).contains(&original_txid));
+    }
+
+    #[test]
+    fn inherited_rbf_signal_allows_replacing_a_non_signaling_child() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(73);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        signal_rbf(&mut parent);
+        let original_child = child(&parent, 80_000);
+        let mut replacement = child(&parent, 70_000);
+        replacement.version = Version::ONE;
+        let parent_txid = parent.compute_txid();
+        let replacement_txid = replacement.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit_package(&store, vec![original_child, parent], context())
+            .unwrap();
+
+        let outcome = pool
+            .admit_package(&store, vec![replacement], context())
+            .unwrap();
+        assert_eq!(outcome.replaced, 1);
+        assert_eq!(txids(&pool), vec![parent_txid, replacement_txid]);
+    }
+
+    #[test]
+    fn replacement_removes_conflict_descendants_and_pays_their_fees() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut original) = spend(74);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        signal_rbf(&mut original);
+        let descendant = child(&original, 80_000);
+        let mut replacement = original.clone();
+        replacement.output[0].value = Amount::from_sat(60_000);
+        let replacement_txid = replacement.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit_package(&store, vec![descendant, original], context())
+            .unwrap();
+
+        let outcome = pool
+            .admit_package(&store, vec![replacement], context())
+            .unwrap();
+        assert_eq!(outcome.replaced, 2);
+        assert_eq!(txids(&pool), vec![replacement_txid]);
+    }
+
+    #[test]
+    fn replacement_cannot_add_an_unrelated_unconfirmed_input() {
+        let (_directory, store) = store();
+        let (first_outpoint, first_utxo, mut original) = spend(75);
+        let (second_outpoint, second_utxo, unrelated) = spend(76);
+        store
+            .apply(
+                &[],
+                &[
+                    (first_outpoint.into(), first_utxo),
+                    (second_outpoint.into(), second_utxo),
+                ],
+            )
+            .unwrap();
+        signal_rbf(&mut original);
+        let original_txid = original.compute_txid();
+        let unrelated_txid = unrelated.compute_txid();
+        let mut replacement = original.clone();
+        replacement.input.push(TxIn {
+            previous_output: OutPoint::new(unrelated_txid, 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: replacement.input[0].witness.clone(),
+        });
+        replacement.output[0].value = Amount::from_sat(160_000);
+        let added = replacement.input[1].previous_output;
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, original, context()).unwrap();
+        pool.admit(&store, unrelated, context()).unwrap();
+        let before = txids(&pool);
+
+        assert!(matches!(
+            pool.admit(&store, replacement, context()),
+            Err(TransactionAdmissionError::ReplacementAddsUnconfirmedInput(outpoint))
+                if outpoint == added
+        ));
+        assert_eq!(txids(&pool), before);
+        assert_eq!(before, vec![original_txid, unrelated_txid]);
+    }
+
+    #[test]
+    fn replacement_fee_rules_fail_atomically() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut original) = spend(77);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        signal_rbf(&mut original);
+        let original_txid = original.compute_txid();
+        let mut lower_fee = original.clone();
+        lower_fee.output[0].value = Amount::from_sat(90_001);
+        let mut insufficient_increment = original.clone();
+        insufficient_increment.output[0].value = Amount::from_sat(89_999);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, original, context()).unwrap();
+
+        assert!(matches!(
+            pool.admit(&store, lower_fee, context()),
+            Err(TransactionAdmissionError::InsufficientReplacementFee {
+                replacement_fee_sats: 9_999,
+                conflicts_fee_sats: 10_000,
+            })
+        ));
+        assert_eq!(txids(&pool), vec![original_txid]);
+        assert!(matches!(
+            pool.admit(&store, insufficient_increment, context()),
+            Err(TransactionAdmissionError::InsufficientReplacementRelayFee {
+                additional_fee_sats: 1,
+                required_fee_sats,
+            }) if required_fee_sats > 1
+        ));
+        assert_eq!(txids(&pool), vec![original_txid]);
     }
 
     #[test]

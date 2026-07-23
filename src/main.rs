@@ -2918,6 +2918,22 @@ fn admit_pending_peer_transactions(
             .collect::<Vec<_>>();
         match pool.admit_package(chainstate, package, context) {
             Ok(outcome) if !outcome.accepted.is_empty() => {
+                let mut effects = Vec::new();
+                if outcome.replaced > 0 {
+                    effects.push(format!(
+                        "replacing {} BIP125 conflict{} or descendant{}",
+                        outcome.replaced,
+                        if outcome.replaced == 1 { "" } else { "s" },
+                        if outcome.replaced == 1 { "" } else { "s" }
+                    ));
+                }
+                if outcome.evicted > 0 {
+                    effects.push(format!(
+                        "evicting {} oldest entr{} or descendants",
+                        outcome.evicted,
+                        if outcome.evicted == 1 { "y" } else { "ies" }
+                    ));
+                }
                 println!(
                     "admitted peer transaction package [{}] into the bounded local pool{}",
                     outcome
@@ -2926,13 +2942,10 @@ fn admit_pending_peer_transactions(
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", "),
-                    if outcome.evicted == 0 {
+                    if effects.is_empty() {
                         String::new()
                     } else {
-                        format!(
-                            " after evicting {} oldest entries or descendants",
-                            outcome.evicted
-                        )
+                        format!(" after {}", effects.join(" and "))
                     }
                 );
             }
