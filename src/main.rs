@@ -81,6 +81,7 @@ const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
+const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
@@ -2908,12 +2909,40 @@ fn relay_selected_transactions(
     relay: &broadcast::Sender<Transaction>,
     transactions: &[Transaction],
     selected: &HashSet<bitcoin::Txid>,
-) {
+) -> Vec<bitcoin::Txid> {
+    let mut relayed = Vec::new();
     for transaction in transactions {
-        if selected.contains(&transaction.compute_txid()) {
-            let _ = relay.send(transaction.clone());
+        let txid = transaction.compute_txid();
+        if selected.contains(&txid) && relay.send(transaction.clone()).is_ok() {
+            relayed.push(txid);
         }
     }
+    relayed
+}
+
+fn relay_due_peer_transactions(
+    store: &RedbTransactionPoolStore,
+    relay: &broadcast::Sender<Transaction>,
+    now: u32,
+) -> Result<usize, String> {
+    let due = store
+        .due_relay(
+            now,
+            PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS,
+            WALLET_BROADCAST_QUEUE_CAPACITY,
+        )
+        .map_err(|error| error.to_string())?;
+    let selected = due
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    let relayed = relay_selected_transactions(relay, &due, &selected);
+    if !relayed.is_empty() {
+        store
+            .record_relay_attempts(&relayed, now)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(relayed.len())
 }
 
 fn transaction_admission_context(
@@ -3010,7 +3039,7 @@ async fn fetch_announced_peer_transactions(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -3022,11 +3051,16 @@ fn admit_pending_peer_transactions(
     deployment_config: &DeploymentConfig,
 ) -> Result<(), String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config)?;
-    let mut pending = transaction_store
+    let persisted = transaction_store
         .map(RedbTransactionPoolStore::transactions)
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    let persisted_txids = persisted
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    let mut pending = persisted;
     if disconnected_transactions.is_empty() {
         pending.extend(
             transaction_store
@@ -3054,7 +3088,13 @@ fn admit_pending_peer_transactions(
             .collect::<Vec<_>>();
         match candidate.admit_package(chainstate, package, context) {
             Ok(outcome) if !outcome.accepted.is_empty() => {
-                accepted_for_relay.extend(outcome.accepted.iter().copied());
+                accepted_for_relay.extend(
+                    outcome
+                        .accepted
+                        .iter()
+                        .copied()
+                        .filter(|txid| !persisted_txids.contains(txid)),
+                );
                 let mut effects = Vec::new();
                 if outcome.replaced > 0 {
                     effects.push(format!(
@@ -3107,7 +3147,15 @@ fn admit_pending_peer_transactions(
     let relay_snapshot = candidate.snapshot();
     *pool = candidate;
     drop(pool);
-    relay_selected_transactions(transaction_relay, &relay_snapshot, &accepted_for_relay);
+    let relayed =
+        relay_selected_transactions(transaction_relay, &relay_snapshot, &accepted_for_relay);
+    if !relayed.is_empty() {
+        if let Some(store) = transaction_store {
+            store
+                .record_relay_attempts(&relayed, unix_time()?)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     if removed > 0 {
         println!("removed {removed} local transactions after active-chain reconciliation");
     }
@@ -3459,6 +3507,16 @@ async fn sync_validating_node(
                         &headers,
                         deployment_config,
                     )?;
+                    if let Some(store) = transaction_store.as_ref() {
+                        let relayed =
+                            relay_due_peer_transactions(store, transaction_relay, unix_time()?)?;
+                        if relayed > 0 {
+                            println!(
+                                "republished {relayed} due peer transaction{} to hot standbys",
+                                if relayed == 1 { "" } else { "s" }
+                            );
+                        }
+                    }
                     disconnected_transactions.clear();
                     println!(
                         "minimum chainwork reached; full script validation remains enabled{}",
@@ -6071,17 +6129,53 @@ mod tests {
         second.input[0].previous_output.txid = Txid::from_byte_array([42; 32]);
         let (relay, mut receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
 
-        relay_selected_transactions(
+        let relayed = relay_selected_transactions(
             &relay,
             &[first, second.clone()],
             &HashSet::from([second.compute_txid()]),
         );
 
+        assert_eq!(relayed, vec![second.compute_txid()]);
         assert_eq!(receiver.try_recv().unwrap(), second);
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn peer_transaction_rebroadcast_is_due_persistent_and_requires_a_standby() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbTransactionPoolStore::open(directory.path().join("mempool.redb"), Network::Regtest)
+                .unwrap();
+        let transaction = wallet_broadcast_transaction();
+        store.replace(std::slice::from_ref(&transaction)).unwrap();
+        let (relay, receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        drop(receiver);
+
+        assert_eq!(relay_due_peer_transactions(&store, &relay, 100).unwrap(), 0);
+        let mut receiver = relay.subscribe();
+        assert_eq!(relay_due_peer_transactions(&store, &relay, 101).unwrap(), 1);
+        assert_eq!(receiver.try_recv().unwrap(), transaction);
+        assert_eq!(
+            relay_due_peer_transactions(
+                &store,
+                &relay,
+                101 + PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS - 1
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            relay_due_peer_transactions(
+                &store,
+                &relay,
+                101 + PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

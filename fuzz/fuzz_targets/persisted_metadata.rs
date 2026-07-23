@@ -6,7 +6,10 @@ use rbtc::{
         validate_stored_peer_penalty, validate_stored_peer_record, validate_stored_tried_collisions,
     },
     rebroadcast_store::validate_persisted_rebroadcast_entry,
-    transaction_pool_store::validate_persisted_transaction_pool_snapshot,
+    transaction_pool_store::{
+        validate_persisted_transaction_pool_snapshot,
+        validate_persisted_transaction_relay_attempts,
+    },
     validation_owner::parse_validation_directory_owner,
 };
 
@@ -17,7 +20,7 @@ fuzz_target!(|input: &[u8]| {
     if value.len() > 257 * 1024 {
         return;
     }
-    match kind % 6 {
+    match kind % 7 {
         0 => {
             if value.len() <= 8 * 1024 {
                 let _ = parse_validation_directory_owner(value);
@@ -43,8 +46,11 @@ fuzz_target!(|input: &[u8]| {
             let (key, value) = value.split_at(split);
             let _ = validate_persisted_rebroadcast_entry(key, value);
         }
-        _ => {
+        5 => {
             let _ = validate_persisted_transaction_pool_snapshot(value);
+        }
+        _ => {
+            let _ = validate_persisted_transaction_relay_attempts(value);
         }
     }
 });

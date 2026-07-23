@@ -1,7 +1,7 @@
 //! Bounded, network-bound persistence for the peer transaction admission pool.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::Path,
     sync::Mutex,
@@ -22,10 +22,16 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("transactio
 const GENESIS_KEY: &str = "genesis";
 const SNAPSHOT_KEY: &str = "active";
 const DISCONNECTED_KEY: &str = "disconnected";
+const RELAY_ATTEMPTS_KEY: &str = "relay_attempts";
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
 const MAX_SNAPSHOT_BYTES: usize =
     SNAPSHOT_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * 4 + MAX_ADMITTED_TRANSACTION_BYTES;
+const RELAY_ATTEMPTS_VERSION: u8 = 1;
+const RELAY_ATTEMPTS_HEADER_BYTES: usize = 5;
+const RELAY_ATTEMPT_BYTES: usize = 36;
+const MAX_RELAY_ATTEMPTS_BYTES: usize =
+    RELAY_ATTEMPTS_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * RELAY_ATTEMPT_BYTES;
 
 /// Durable transaction-pool failures.
 #[derive(Debug, Error)]
@@ -71,6 +77,13 @@ pub fn validate_persisted_transaction_pool_snapshot(
     decode_snapshot(bytes).map(|_| ())
 }
 
+/// Validates raw persisted peer-transaction relay metadata without opening a database.
+pub fn validate_persisted_transaction_relay_attempts(
+    bytes: &[u8],
+) -> Result<(), TransactionPoolStoreError> {
+    decode_relay_attempts(bytes).map(|_| ())
+}
+
 impl RedbTransactionPoolStore {
     /// Opens or creates an owner-only store and validates the persisted snapshot.
     pub fn open(
@@ -100,6 +113,28 @@ impl RedbTransactionPoolStore {
                     let empty = encode_snapshot(&[])?;
                     snapshots.insert(key, empty.as_slice())?;
                 }
+            }
+            let active = decode_snapshot(
+                snapshots
+                    .get(SNAPSHOT_KEY)?
+                    .expect("active snapshot was initialized above")
+                    .value(),
+            )?
+            .into_iter()
+            .map(|transaction| transaction.compute_txid())
+            .collect::<HashSet<_>>();
+            if let Some(attempts) = snapshots.get(RELAY_ATTEMPTS_KEY)? {
+                if !decode_relay_attempts(attempts.value())?
+                    .keys()
+                    .all(|txid| active.contains(txid))
+                {
+                    return Err(TransactionPoolStoreError::Malformed(
+                        "relay attempt references a non-pool transaction",
+                    ));
+                }
+            } else {
+                let empty = encode_relay_attempts(&BTreeMap::new())?;
+                snapshots.insert(RELAY_ATTEMPTS_KEY, empty.as_slice())?;
             }
         }
         write.commit()?;
@@ -136,7 +171,7 @@ impl RedbTransactionPoolStore {
     /// Atomically replaces the durable snapshot after validating every invariant.
     pub fn replace(&self, transactions: &[Transaction]) -> Result<(), TransactionPoolStoreError> {
         let encoded = encode_snapshot(transactions)?;
-        self.replace_encoded(SNAPSHOT_KEY, &encoded)
+        self.replace_active_encoded(&encoded, transactions)
     }
 
     /// Atomically replaces the bounded disconnected-block candidate snapshot.
@@ -166,13 +201,11 @@ impl RedbTransactionPoolStore {
         Ok(())
     }
 
-    /// Atomically publishes the admitted pool and clears recovered reorg candidates.
-    pub fn replace_and_clear_disconnected(
+    fn replace_active_encoded(
         &self,
+        encoded: &[u8],
         transactions: &[Transaction],
     ) -> Result<(), TransactionPoolStoreError> {
-        let encoded = encode_snapshot(transactions)?;
-        let empty = encode_snapshot(&[])?;
         let _guard = self
             .write_guard
             .lock()
@@ -180,11 +213,160 @@ impl RedbTransactionPoolStore {
         let write = self.db.begin_write()?;
         {
             let mut snapshots = write.open_table(SNAPSHOTS)?;
-            snapshots.insert(SNAPSHOT_KEY, encoded.as_slice())?;
-            snapshots.insert(DISCONNECTED_KEY, empty.as_slice())?;
+            let mut attempts = {
+                let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
+                )?;
+                decode_relay_attempts(stored.value())?
+            };
+            let active = transactions
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<HashSet<_>>();
+            attempts.retain(|txid, _| active.contains(txid));
+            let attempts = encode_relay_attempts(&attempts)?;
+            snapshots.insert(SNAPSHOT_KEY, encoded)?;
+            snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
         }
         write.commit()?;
         Ok(())
+    }
+
+    /// Atomically publishes the admitted pool and clears recovered reorg candidates.
+    pub fn replace_and_clear_disconnected(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), TransactionPoolStoreError> {
+        let encoded = encode_snapshot(transactions)?;
+        let empty = encode_snapshot(&[])?;
+        self.replace_active_and_disconnected_encoded(&encoded, &empty, transactions)
+    }
+
+    fn replace_active_and_disconnected_encoded(
+        &self,
+        active_encoded: &[u8],
+        disconnected_encoded: &[u8],
+        transactions: &[Transaction],
+    ) -> Result<(), TransactionPoolStoreError> {
+        let _guard = self
+            .write_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let write = self.db.begin_write()?;
+        {
+            let mut snapshots = write.open_table(SNAPSHOTS)?;
+            let mut attempts = {
+                let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
+                )?;
+                decode_relay_attempts(stored.value())?
+            };
+            let active = transactions
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<HashSet<_>>();
+            attempts.retain(|txid, _| active.contains(txid));
+            let attempts = encode_relay_attempts(&attempts)?;
+            snapshots.insert(SNAPSHOT_KEY, active_encoded)?;
+            snapshots.insert(DISCONNECTED_KEY, disconnected_encoded)?;
+            snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Returns parent-ordered transactions whose last successful standby publication is due.
+    pub fn due_relay(
+        &self,
+        now: u32,
+        interval_secs: u32,
+        limit: usize,
+    ) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
+        let read = self.db.begin_read()?;
+        let snapshots = read.open_table(SNAPSHOTS)?;
+        let transactions = decode_snapshot(
+            snapshots
+                .get(SNAPSHOT_KEY)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction-pool snapshot",
+                ))?
+                .value(),
+        )?;
+        let attempts = decode_relay_attempts(
+            snapshots
+                .get(RELAY_ATTEMPTS_KEY)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction relay attempts",
+                ))?
+                .value(),
+        )?;
+        Ok(transactions
+            .into_iter()
+            .filter(|transaction| {
+                attempts
+                    .get(&transaction.compute_txid())
+                    .is_none_or(|attempt| now.saturating_sub(*attempt) >= interval_secs)
+            })
+            .take(limit.min(MAX_ADMITTED_TRANSACTIONS))
+            .collect())
+    }
+
+    /// Atomically records successful publication attempts for active pool transactions.
+    pub fn record_relay_attempts(
+        &self,
+        txids: &[Txid],
+        now: u32,
+    ) -> Result<usize, TransactionPoolStoreError> {
+        if txids.len() > MAX_ADMITTED_TRANSACTIONS {
+            return Err(TransactionPoolStoreError::Malformed(
+                "too many transaction relay attempts",
+            ));
+        }
+        let requested = txids.iter().copied().collect::<HashSet<_>>();
+        if requested.len() != txids.len() {
+            return Err(TransactionPoolStoreError::Malformed(
+                "duplicate transaction relay attempt",
+            ));
+        }
+        let _guard = self
+            .write_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let write = self.db.begin_write()?;
+        let recorded = {
+            let mut snapshots = write.open_table(SNAPSHOTS)?;
+            let active =
+                {
+                    let stored = snapshots.get(SNAPSHOT_KEY)?.ok_or(
+                        TransactionPoolStoreError::Malformed("missing transaction-pool snapshot"),
+                    )?;
+                    decode_snapshot(stored.value())?
+                        .into_iter()
+                        .map(|transaction| transaction.compute_txid())
+                        .collect::<HashSet<_>>()
+                };
+            if !requested.is_subset(&active) {
+                return Err(TransactionPoolStoreError::Malformed(
+                    "relay attempt references a non-pool transaction",
+                ));
+            }
+            let mut attempts = {
+                let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
+                )?;
+                decode_relay_attempts(stored.value())?
+            };
+            attempts.retain(|txid, _| active.contains(txid));
+            for txid in requested {
+                attempts.insert(txid, now);
+            }
+            let recorded = attempts.len();
+            let encoded = encode_relay_attempts(&attempts)?;
+            snapshots.insert(RELAY_ATTEMPTS_KEY, encoded.as_slice())?;
+            recorded
+        };
+        write.commit()?;
+        Ok(recorded)
     }
 }
 
@@ -346,6 +528,75 @@ fn validate_transactions(transactions: &[Transaction]) -> Result<(), Transaction
     Ok(())
 }
 
+fn encode_relay_attempts(
+    attempts: &BTreeMap<Txid, u32>,
+) -> Result<Vec<u8>, TransactionPoolStoreError> {
+    if attempts.len() > MAX_ADMITTED_TRANSACTIONS {
+        return Err(TransactionPoolStoreError::Malformed(
+            "too many transaction relay attempts",
+        ));
+    }
+    let count = u32::try_from(attempts.len())
+        .map_err(|_| TransactionPoolStoreError::Malformed("relay attempt count overflow"))?;
+    let mut encoded =
+        Vec::with_capacity(RELAY_ATTEMPTS_HEADER_BYTES + attempts.len() * RELAY_ATTEMPT_BYTES);
+    encoded.push(RELAY_ATTEMPTS_VERSION);
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for (txid, attempted_at) in attempts {
+        encoded.extend_from_slice(&txid.to_byte_array());
+        encoded.extend_from_slice(&attempted_at.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+fn decode_relay_attempts(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
+    if bytes.len() < RELAY_ATTEMPTS_HEADER_BYTES || bytes.len() > MAX_RELAY_ATTEMPTS_BYTES {
+        return Err(TransactionPoolStoreError::Malformed(
+            "invalid transaction relay attempts length",
+        ));
+    }
+    if bytes[0] != RELAY_ATTEMPTS_VERSION {
+        return Err(TransactionPoolStoreError::Malformed(
+            "unsupported transaction relay attempts version",
+        ));
+    }
+    let count = usize::try_from(u32::from_le_bytes(
+        bytes[1..RELAY_ATTEMPTS_HEADER_BYTES]
+            .try_into()
+            .expect("relay attempts header has exact length"),
+    ))
+    .map_err(|_| TransactionPoolStoreError::Malformed("relay attempt count overflow"))?;
+    if count > MAX_ADMITTED_TRANSACTIONS
+        || bytes.len() != RELAY_ATTEMPTS_HEADER_BYTES + count * RELAY_ATTEMPT_BYTES
+    {
+        return Err(TransactionPoolStoreError::Malformed(
+            "invalid transaction relay attempt count",
+        ));
+    }
+    let mut attempts = BTreeMap::new();
+    let mut cursor = RELAY_ATTEMPTS_HEADER_BYTES;
+    for _ in 0..count {
+        let txid = Txid::from_byte_array(
+            bytes[cursor..cursor + 32]
+                .try_into()
+                .expect("relay txid has exact length"),
+        );
+        cursor += 32;
+        let attempted_at = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .expect("relay timestamp has exact length"),
+        );
+        cursor += 4;
+        if attempts.insert(txid, attempted_at).is_some() {
+            return Err(TransactionPoolStoreError::Malformed(
+                "duplicate transaction relay attempt",
+            ));
+        }
+    }
+    Ok(attempts)
+}
+
 fn genesis_hash(network: Network) -> [u8; 32] {
     bitcoin::blockdata::constants::genesis_block(network)
         .block_hash()
@@ -486,6 +737,118 @@ mod tests {
             RedbTransactionPoolStore::open(&path, Network::Signet),
             Err(TransactionPoolStoreError::NetworkMismatch)
         ));
+    }
+
+    #[test]
+    fn peer_relay_schedule_is_due_persistent_and_pruned_with_the_pool() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        let first = transaction(31);
+        let second = transaction(32);
+        let first_txid = first.compute_txid();
+        let second_txid = second.compute_txid();
+        let interval = 12 * 60 * 60;
+        {
+            let store = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
+            store.replace(&[first.clone(), second.clone()]).unwrap();
+            assert_eq!(
+                store.due_relay(100, interval, 64).unwrap(),
+                vec![first.clone(), second.clone()]
+            );
+            assert_eq!(store.record_relay_attempts(&[first_txid], 100).unwrap(), 1);
+            assert_eq!(
+                store.due_relay(100 + interval - 1, interval, 64).unwrap(),
+                vec![second.clone()]
+            );
+            assert_eq!(store.record_relay_attempts(&[second_txid], 101).unwrap(), 2);
+            assert!(store.due_relay(102, interval, 64).unwrap().is_empty());
+        }
+
+        let reopened = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(
+            reopened.due_relay(100 + interval, interval, 1).unwrap(),
+            vec![first]
+        );
+        reopened.replace(std::slice::from_ref(&second)).unwrap();
+        assert!(matches!(
+            reopened.record_relay_attempts(&[first_txid], 200),
+            Err(TransactionPoolStoreError::Malformed(
+                "relay attempt references a non-pool transaction"
+            ))
+        ));
+        assert!(reopened.due_relay(102, interval, 64).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_store_without_relay_schedule_migrates_to_immediately_due() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        let transaction = transaction(33);
+        {
+            let store = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
+            store.replace(std::slice::from_ref(&transaction)).unwrap();
+        }
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
+                snapshots.remove(RELAY_ATTEMPTS_KEY).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let migrated = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(migrated.due_relay(1, 1, 64).unwrap(), vec![transaction]);
+    }
+
+    #[test]
+    fn relay_schedule_parser_rejects_duplicates_and_bad_lengths() {
+        let txid = transaction(34).compute_txid();
+        let valid = encode_relay_attempts(&BTreeMap::from([(txid, 1)])).unwrap();
+        assert_eq!(decode_relay_attempts(&valid).unwrap()[&txid], 1);
+        assert!(decode_relay_attempts(&valid[..valid.len() - 1]).is_err());
+        let mut duplicate = valid.clone();
+        duplicate[1..5].copy_from_slice(&2_u32.to_le_bytes());
+        duplicate.extend_from_slice(&txid.to_byte_array());
+        duplicate.extend_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            decode_relay_attempts(&duplicate),
+            Err(TransactionPoolStoreError::Malformed(
+                "duplicate transaction relay attempt"
+            ))
+        ));
+    }
+
+    #[test]
+    fn relay_schedule_rejects_non_pool_txids_without_rewriting() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        {
+            let store = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
+            store.replace(&[transaction(35)]).unwrap();
+        }
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
+                let unknown = BTreeMap::from([(transaction(36).compute_txid(), 1_800_000_000_u32)]);
+                let encoded = encode_relay_attempts(&unknown).unwrap();
+                snapshots
+                    .insert(RELAY_ATTEMPTS_KEY, encoded.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            RedbTransactionPoolStore::open(&path, Network::Regtest),
+            Err(TransactionPoolStoreError::Malformed(
+                "relay attempt references a non-pool transaction"
+            ))
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]
