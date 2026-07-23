@@ -111,6 +111,7 @@ struct Options {
     validation_target: Option<ValidationTarget>,
     complete_assumeutxo: Option<PathBuf>,
     background_assumeutxo: Option<PathBuf>,
+    mempool_full_rbf: bool,
     cleanup_validation_dir: bool,
     validation_limits: ValidationLimits,
 }
@@ -1060,6 +1061,9 @@ fn read_owner_only_text_file(
 
 #[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
+    if options.mempool_full_rbf {
+        println!("peer transaction admission full-RBF policy enabled");
+    }
     if let Some(data_dir) = &options.data_dir {
         preflight_data_dir(data_dir, options.network, &options.deployments)?;
     }
@@ -2379,6 +2383,7 @@ async fn run_connected_peer(
                 options.once,
                 options.validation_target,
                 options.validation_limits,
+                options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
                 validation_scheduler,
@@ -2482,6 +2487,7 @@ async fn complete_assumeutxo_validation(
             block_hash: assumed.base.hash,
         }),
         options.validation_limits,
+        options.mempool_full_rbf,
         None,
         None,
         None,
@@ -2949,6 +2955,7 @@ fn transaction_admission_context(
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
+    full_rbf: bool,
 ) -> Result<TransactionAdmissionContext, String> {
     let tip = chainstate
         .execution()
@@ -2981,6 +2988,7 @@ fn transaction_admission_context(
         parent_mtp,
         script_flags: deployments.script_flags,
         csv_active: deployments.csv_active,
+        full_rbf,
     })
 }
 
@@ -3049,8 +3057,9 @@ fn admit_pending_peer_transactions(
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
+    full_rbf: bool,
 ) -> Result<(), String> {
-    let context = transaction_admission_context(chainstate, headers, deployment_config)?;
+    let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let persisted = transaction_store
         .map(RedbTransactionPoolStore::transactions)
         .transpose()
@@ -3178,6 +3187,7 @@ async fn sync_validating_node(
     once: bool,
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
+    mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
@@ -3506,6 +3516,7 @@ async fn sync_validating_node(
                         &chainstate,
                         &headers,
                         deployment_config,
+                        mempool_full_rbf,
                     )?;
                     if let Some(store) = transaction_store.as_ref() {
                         let relayed =
@@ -4655,6 +4666,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut validation_block_hash = None;
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
+    let mut mempool_full_rbf = false;
     let mut cleanup_validation_dir = false;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
@@ -4841,6 +4853,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     "--background-assumeutxo",
                 )?));
             }
+            "--mempool-full-rbf" => mempool_full_rbf = true,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
@@ -5139,6 +5152,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 .to_owned(),
         );
     }
+    if mempool_full_rbf && data_dir.is_none() {
+        return Err("--mempool-full-rbf requires --data-dir".to_owned());
+    }
     let validation_limits = ValidationLimits {
         max_blocks_per_batch: validation_batch_size.unwrap_or(MAX_BLOCKS_IN_FLIGHT),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
@@ -5211,6 +5227,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         validation_target,
         complete_assumeutxo,
         background_assumeutxo,
+        mempool_full_rbf,
         cleanup_validation_dir,
         validation_limits,
     }))
@@ -5277,7 +5294,20 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        concat!(
+            "rbtcd {}\n\nUSAGE:\n",
+            "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
+            "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
+            "  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n",
+            "  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n",
+            "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
+            "PEER OPTIONS:\n",
+            "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
+        ),
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -5569,6 +5599,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         };
@@ -6604,6 +6635,7 @@ mod tests {
                 "--validate-until-blockhash",
                 "--complete-assumeutxo",
                 "--background-assumeutxo",
+                "--mempool-full-rbf",
                 "--cleanup-validation-dir",
                 "--validation-batch-size",
                 "--validation-pause-ms",
@@ -6660,6 +6692,7 @@ mod tests {
         assert!(options.fetch_block.is_none());
         assert!(options.headers_db.is_none());
         assert!(options.data_dir.is_none());
+        assert!(!options.mempool_full_rbf);
         assert!(!options.once);
         assert!(options.explorer_listen.is_none());
         assert!(options.wallet_api_files.is_none());
@@ -6670,6 +6703,39 @@ mod tests {
         assert_eq!(options.ibd_policy, IbdPolicy::for_network(Network::Regtest));
         assert!(options.snapshot.is_none());
         assert!(!completed_validating_session(&options));
+
+        assert_eq!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "regtest",
+                    "--mempool-full-rbf",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .err()
+            .unwrap(),
+            "--mempool-full-rbf requires --data-dir"
+        );
+        let full_rbf = parse_options(
+            [
+                "--connect",
+                "127.0.0.1:18444",
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-full-rbf-parse-only",
+                "--mempool-full-rbf",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(full_rbf.mempool_full_rbf);
 
         let served = parse_options(
             [
@@ -6968,6 +7034,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -7030,6 +7097,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8055,6 +8123,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8106,6 +8175,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         };
@@ -8478,6 +8548,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8563,6 +8634,7 @@ mod tests {
             }),
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8627,6 +8699,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8707,6 +8780,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8758,6 +8832,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: Some(validation_dir.clone()),
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8805,6 +8880,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: Some(validation_dir),
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8892,6 +8968,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -8941,6 +9018,7 @@ mod tests {
                 validation_target: None,
                 complete_assumeutxo: None,
                 background_assumeutxo: Some(validation_dir.clone()),
+                mempool_full_rbf: false,
                 cleanup_validation_dir: true,
                 validation_limits: ValidationLimits {
                     max_blocks_per_batch: 1,
@@ -9029,6 +9107,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9103,6 +9182,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9135,6 +9215,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9187,6 +9268,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9233,6 +9315,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9324,6 +9407,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9471,6 +9555,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9569,6 +9654,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9639,6 +9725,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })
@@ -9745,6 +9832,7 @@ mod tests {
                 validation_target: None,
                 complete_assumeutxo: None,
                 background_assumeutxo: None,
+                mempool_full_rbf: false,
                 cleanup_validation_dir: false,
                 validation_limits: ValidationLimits::default(),
             }),
@@ -9881,6 +9969,7 @@ mod tests {
                 validation_target: None,
                 complete_assumeutxo: None,
                 background_assumeutxo: None,
+                mempool_full_rbf: false,
                 cleanup_validation_dir: false,
                 validation_limits: ValidationLimits::default(),
             },
@@ -9995,6 +10084,7 @@ mod tests {
             validation_target: None,
             complete_assumeutxo: None,
             background_assumeutxo: None,
+            mempool_full_rbf: false,
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         })

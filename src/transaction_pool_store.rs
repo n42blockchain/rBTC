@@ -706,6 +706,7 @@ mod tests {
             parent_mtp: 1_700_000_000,
             script_flags: bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
             csv_active: true,
+            full_rbf: false,
         }
     }
 

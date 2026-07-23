@@ -1,7 +1,8 @@
 //! Bounded local admission for independently received transactions.
 //!
 //! Confirmed inputs and outputs of already-admitted parents are available to a
-//! bounded package overlay. Opt-in replacement follows BIP125 policy.
+//! bounded package overlay. Replacement follows BIP125 policy by default;
+//! explicit full-RBF mode bypasses only the signaling requirement.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -43,6 +44,8 @@ pub struct TransactionAdmissionContext {
     pub script_flags: u32,
     /// Whether BIP68/BIP113 relative and absolute lock semantics are active.
     pub csv_active: bool,
+    /// Whether conflicts may be replaced without BIP125 signaling.
+    pub full_rbf: bool,
 }
 
 /// Result of one local admission attempt.
@@ -263,7 +266,7 @@ impl TransactionAdmissionPool {
         let replacement_vbytes = ordered.iter().fold(0_usize, |total, transaction| {
             total.saturating_add(transaction.vsize())
         });
-        let replacement = self.prepare_replacement(&ordered)?;
+        let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
 
         let overlay = AdmissionUtxoOverlay::new(store);
         for entry in &self.entries {
@@ -319,6 +322,7 @@ impl TransactionAdmissionPool {
     fn prepare_replacement(
         &mut self,
         ordered: &[Transaction],
+        full_rbf: bool,
     ) -> Result<ReplacementPlan, TransactionAdmissionError> {
         let direct_conflicts = ordered
             .iter()
@@ -330,7 +334,7 @@ impl TransactionAdmissionPool {
         }
         let mut txids = BTreeSet::new();
         for txid in &direct_conflicts {
-            if !self.transaction_is_replaceable(*txid) {
+            if !full_rbf && !self.transaction_is_replaceable(*txid) {
                 return Err(TransactionAdmissionError::NonReplaceable(*txid));
             }
             txids.extend(self.descendant_closure(*txid));
@@ -846,6 +850,7 @@ mod tests {
             parent_mtp: 1_700_000_000,
             script_flags: bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
             csv_active: true,
+            full_rbf: false,
         }
     }
 
@@ -963,6 +968,37 @@ mod tests {
                 if conflict == first_txid
         ));
         assert_eq!(txids(&pool), vec![first_txid]);
+    }
+
+    #[test]
+    fn full_rbf_replaces_non_signaling_conflicts_without_weakening_fee_rules() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, original) = spend(71);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let original_txid = original.compute_txid();
+        let mut insufficient_fee = original.clone();
+        insufficient_fee.output[0].value = Amount::from_sat(90_001);
+        let mut replacement = original.clone();
+        replacement.output[0].value = Amount::from_sat(89_000);
+        let replacement_txid = replacement.compute_txid();
+        let mut full_rbf = context();
+        full_rbf.full_rbf = true;
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, original, context()).unwrap();
+
+        assert!(matches!(
+            pool.admit(&store, insufficient_fee, full_rbf),
+            Err(TransactionAdmissionError::InsufficientReplacementFee {
+                replacement_fee_sats: 9_999,
+                conflicts_fee_sats: 10_000,
+            })
+        ));
+        assert_eq!(txids(&pool), vec![original_txid]);
+        let outcome = pool
+            .admit_package(&store, vec![replacement], full_rbf)
+            .unwrap();
+        assert_eq!(outcome.replaced, 1);
+        assert_eq!(txids(&pool), vec![replacement_txid]);
     }
 
     #[test]
