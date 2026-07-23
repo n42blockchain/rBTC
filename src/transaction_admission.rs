@@ -293,8 +293,8 @@ pub struct TransactionAdmissionPool {
     retained_bytes: usize,
     orphans: VecDeque<OrphanTransaction>,
     orphan_bytes: usize,
-    orphan_children_by_parent: BTreeMap<Txid, BTreeSet<Txid>>,
     orphans_by_outpoint: BTreeMap<OutPoint, BTreeSet<Txid>>,
+    orphan_work_by_source: BTreeMap<u64, BTreeSet<Txid>>,
     rolling_minimum_fee_sat_kvb: u64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
@@ -419,25 +419,77 @@ impl TransactionAdmissionPool {
         inserted.intersection(&retained).count()
     }
 
-    /// Returns untried orphans directly spending any newly accepted parent.
+    /// Schedules live children of newly accepted parents for their source peer.
+    pub fn schedule_orphan_children(&mut self, parents: &BTreeSet<Txid>) -> usize {
+        let mut child_txids = BTreeSet::<Txid>::new();
+        for parent in parents {
+            let Some(transaction) = self
+                .entries
+                .iter()
+                .find(|entry| entry.transaction.compute_txid() == *parent)
+                .map(|entry| &entry.transaction)
+            else {
+                continue;
+            };
+            for vout in 0..transaction.output.len() {
+                let Ok(vout) = u32::try_from(vout) else {
+                    break;
+                };
+                if let Some(children) = self.orphans_by_outpoint.get(&OutPoint {
+                    txid: *parent,
+                    vout,
+                }) {
+                    child_txids.extend(children.iter().copied());
+                }
+            }
+        }
+        let mut scheduled = 0;
+        for orphan in &self.orphans {
+            let txid = orphan.transaction.compute_txid();
+            if child_txids.contains(&txid)
+                && self
+                    .orphan_work_by_source
+                    .entry(orphan.source)
+                    .or_default()
+                    .insert(txid)
+            {
+                scheduled += 1;
+            }
+        }
+        scheduled
+    }
+
+    /// Pops one scheduled orphan for a peer, leaving other work for later passes.
+    pub fn take_orphan_work(&mut self, source: u64) -> Option<Transaction> {
+        loop {
+            let txid = self
+                .orphan_work_by_source
+                .get(&source)
+                .and_then(|work| work.first().copied())?;
+            let work = self
+                .orphan_work_by_source
+                .get_mut(&source)
+                .expect("selected orphan work source remains present");
+            work.remove(&txid);
+            if work.is_empty() {
+                self.orphan_work_by_source.remove(&source);
+            }
+            if let Some(orphan) = self
+                .orphans
+                .iter()
+                .find(|orphan| orphan.source == source && orphan.transaction.compute_txid() == txid)
+            {
+                return Some(orphan.transaction.clone());
+            }
+        }
+    }
+
+    /// Returns whether a peer has another scheduled orphan validation unit.
     #[must_use]
-    pub fn orphan_children(
-        &self,
-        parents: &BTreeSet<Txid>,
-        already_tried: &BTreeSet<Txid>,
-    ) -> Vec<Transaction> {
-        let child_txids = parents
-            .iter()
-            .filter_map(|parent| self.orphan_children_by_parent.get(parent))
-            .flatten()
-            .filter(|txid| !already_tried.contains(*txid))
-            .copied()
-            .collect::<BTreeSet<_>>();
-        self.orphans
-            .iter()
-            .filter(|orphan| child_txids.contains(&orphan.transaction.compute_txid()))
-            .map(|orphan| orphan.transaction.clone())
-            .collect()
+    pub fn has_orphan_work(&self, source: u64) -> bool {
+        self.orphan_work_by_source
+            .get(&source)
+            .is_some_and(|work| !work.is_empty())
     }
 
     /// Removes exact orphan IDs after successful admission or terminal rejection.
@@ -478,21 +530,22 @@ impl TransactionAdmissionPool {
             .iter()
             .map(|orphan| orphan.serialized_len)
             .sum();
-        self.orphan_children_by_parent.clear();
         self.orphans_by_outpoint.clear();
+        let mut orphan_sources = BTreeMap::new();
         for orphan in &self.orphans {
             let txid = orphan.transaction.compute_txid();
+            orphan_sources.insert(txid, orphan.source);
             for input in &orphan.transaction.input {
-                self.orphan_children_by_parent
-                    .entry(input.previous_output.txid)
-                    .or_default()
-                    .insert(txid);
                 self.orphans_by_outpoint
                     .entry(input.previous_output)
                     .or_default()
                     .insert(txid);
             }
         }
+        self.orphan_work_by_source.retain(|source, work| {
+            work.retain(|txid| orphan_sources.get(txid) == Some(source));
+            !work.is_empty()
+        });
     }
 
     /// Clones admitted transactions in oldest-to-newest order.
@@ -2378,7 +2431,8 @@ mod tests {
         );
         assert_eq!(pool.orphan_len(), MAX_ORPHAN_TRANSACTIONS);
         assert!(pool.orphan_bytes() <= MAX_ORPHAN_TRANSACTION_BYTES);
-        assert_eq!(pool.retain_orphans(&transactions[1..2], 200, 2), 0);
+        let retained = pool.orphans.front().unwrap().transaction.clone();
+        assert_eq!(pool.retain_orphans(&[retained], 200, 2), 0);
         assert_eq!(pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS - 1), 0);
         assert_eq!(
             pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS),
@@ -2404,26 +2458,24 @@ mod tests {
         );
 
         pool.admit(&store, parent, context()).unwrap();
-        let children = pool.orphan_children(&BTreeSet::from([parent_txid]), &BTreeSet::new());
         assert_eq!(
-            children
-                .iter()
-                .map(Transaction::compute_txid)
-                .collect::<Vec<_>>(),
-            vec![child_txid]
+            pool.schedule_orphan_children(&BTreeSet::from([parent_txid])),
+            1
         );
-        pool.admit_package(&store, children, context()).unwrap();
+        let child_work = pool.take_orphan_work(1).unwrap();
+        assert_eq!(child_work.compute_txid(), child_txid);
+        assert!(pool.take_orphan_work(1).is_none());
+        pool.admit_package(&store, vec![child_work], context())
+            .unwrap();
         pool.remove_orphans(&BTreeSet::from([child_txid]));
 
-        let grandchildren = pool.orphan_children(&BTreeSet::from([child_txid]), &BTreeSet::new());
         assert_eq!(
-            grandchildren
-                .iter()
-                .map(Transaction::compute_txid)
-                .collect::<Vec<_>>(),
-            vec![grandchild_txid]
+            pool.schedule_orphan_children(&BTreeSet::from([child_txid])),
+            1
         );
-        pool.admit_package(&store, grandchildren, context())
+        let grandchild_work = pool.take_orphan_work(1).unwrap();
+        assert_eq!(grandchild_work.compute_txid(), grandchild_txid);
+        pool.admit_package(&store, vec![grandchild_work], context())
             .unwrap();
         pool.remove_orphans(&BTreeSet::from([grandchild_txid]));
         assert_eq!(pool.len(), 3);
@@ -2438,16 +2490,65 @@ mod tests {
         assert_eq!(pool.retain_orphans(&[first], 100, 11), 1);
         assert_eq!(pool.retain_orphans(&[second], 100, 12), 1);
         let before_bytes = pool.orphan_bytes();
-        assert_eq!(pool.orphan_children_by_parent.len(), 2);
+        assert_eq!(pool.orphans_by_outpoint.len(), 2);
 
         assert_eq!(pool.remove_orphans_from(11), 1);
         assert_eq!(pool.orphan_len(), 1);
         assert!(pool.orphan_bytes() < before_bytes);
-        assert_eq!(pool.orphan_children_by_parent.len(), 1);
+        assert_eq!(pool.orphans_by_outpoint.len(), 1);
         assert_eq!(pool.remove_orphans_from(11), 0);
         assert_eq!(pool.remove_orphans_from(12), 1);
         assert_eq!(pool.orphan_bytes(), 0);
-        assert!(pool.orphan_children_by_parent.is_empty());
+        assert!(pool.orphans_by_outpoint.is_empty());
+    }
+
+    #[test]
+    fn orphan_work_is_deduplicated_ordered_and_isolated_by_source() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, parent) = spend(87);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let parent_txid = parent.compute_txid();
+        let mut first = child(&parent, 80_000);
+        let mut second = first.clone();
+        let third = first.clone();
+        let mut invalid_vout = first.clone();
+        first.output[0].value = Amount::from_sat(79_999);
+        second.output[0].value = Amount::from_sat(79_998);
+        invalid_vout.input[0].previous_output.vout = 1;
+        let first_txid = first.compute_txid();
+        let second_txid = second.compute_txid();
+        let third_txid = third.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        assert_eq!(pool.retain_orphans(&[second, first], 100, 11), 2);
+        assert_eq!(pool.retain_orphans(&[third], 100, 12), 1);
+        assert_eq!(pool.retain_orphans(&[invalid_vout], 100, 13), 1);
+        pool.admit(&store, parent, context()).unwrap();
+
+        let parents = BTreeSet::from([parent_txid]);
+        assert_eq!(pool.schedule_orphan_children(&parents), 3);
+        assert_eq!(pool.schedule_orphan_children(&parents), 0);
+        assert!(!pool.has_orphan_work(13));
+        let first_work = pool.take_orphan_work(11).unwrap().compute_txid();
+        assert!(pool.has_orphan_work(11));
+        let second_work = pool.take_orphan_work(11).unwrap().compute_txid();
+        assert!(pool.take_orphan_work(11).is_none());
+        assert!(!pool.has_orphan_work(11));
+        let mut source_eleven = vec![first_work, second_work];
+        source_eleven.sort_unstable();
+        let mut expected = vec![first_txid, second_txid];
+        expected.sort_unstable();
+        assert_eq!(source_eleven, expected);
+
+        assert!(pool.has_orphan_work(12));
+        assert_eq!(pool.remove_orphans_from(12), 1);
+        assert!(pool.take_orphan_work(12).is_none());
+        assert!(!pool.has_orphan_work(12));
+        assert!(
+            !pool
+                .orphans
+                .iter()
+                .any(|orphan| orphan.transaction.compute_txid() == third_txid)
+        );
     }
 
     #[test]

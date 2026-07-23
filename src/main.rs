@@ -2383,7 +2383,7 @@ async fn run_connected_peer(
         mut session,
         validated_header_height,
     } = connected;
-    let orphan_source = session.remote_version().nonce;
+    let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
         println!("activated peer {remote} after standby validation through height {height}");
     }
@@ -3145,6 +3145,16 @@ fn transaction_inventory_is_known(inventory: Inventory, known: &[Transaction]) -
     })
 }
 
+fn peer_orphan_candidates(
+    package: Vec<Transaction>,
+    peer_txids: &HashSet<bitcoin::Txid>,
+) -> Vec<Transaction> {
+    package
+        .into_iter()
+        .filter(|transaction| peer_txids.contains(&transaction.compute_txid()))
+        .collect()
+}
+
 async fn fetch_announced_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -3202,7 +3212,7 @@ fn admit_pending_peer_transactions(
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
     full_rbf: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let now = unix_time()?;
     let expired = transaction_store
@@ -3236,7 +3246,12 @@ fn admit_pending_peer_transactions(
     } else {
         pending.extend(disconnected_transactions.iter().cloned());
     }
-    pending.extend(session.take_pending_transactions());
+    let peer_pending = session.take_pending_transactions();
+    let peer_txids = peer_pending
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    pending.extend(peer_pending);
     let mut pool = transaction_pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3256,11 +3271,15 @@ fn admit_pending_peer_transactions(
     let mut deferred_messages = Vec::new();
     let mut rejected_messages = Vec::new();
     let mut accepted_for_relay = HashSet::new();
-    let mut packages = VecDeque::from(dependency_packages(pending));
+    let mut packages = dependency_packages(pending)
+        .into_iter()
+        .map(|package| (package, false))
+        .collect::<VecDeque<_>>();
     let mut accepted_parents = BTreeSet::new();
-    let mut tried_orphans = BTreeSet::new();
+    let orphan_source = session.local_id();
+    let mut processed_orphan_work = false;
     loop {
-        while let Some(package) = packages.pop_front() {
+        while let Some((package, is_orphan_work)) = packages.pop_front() {
             let retained_package = package.clone();
             let txid_set = package
                 .iter()
@@ -3316,11 +3335,12 @@ fn admit_pending_peer_transactions(
                     candidate.remove_orphans(&txid_set);
                 }
                 Err(error) if error.is_missing_input() => {
-                    let retained = candidate.retain_orphans(
-                        &retained_package,
-                        now,
-                        session.remote_version().nonce,
-                    );
+                    let peer_package = peer_orphan_candidates(retained_package, &peer_txids);
+                    let retained = if is_orphan_work || peer_package.is_empty() {
+                        0
+                    } else {
+                        candidate.retain_orphans(&peer_package, now, orphan_source)
+                    };
                     if retained > 0 {
                         deferred_messages.push(format!(
                             "retained {retained} missing-parent peer transaction{} for bounded retry",
@@ -3341,13 +3361,18 @@ fn admit_pending_peer_transactions(
                 }
             }
         }
-        if accepted_parents.is_empty() {
+        if !accepted_parents.is_empty() {
+            let triggers = std::mem::take(&mut accepted_parents);
+            candidate.schedule_orphan_children(&triggers);
+        }
+        if processed_orphan_work {
             break;
         }
-        let triggers = std::mem::take(&mut accepted_parents);
-        let children = candidate.orphan_children(&triggers, &tried_orphans);
-        tried_orphans.extend(children.iter().map(Transaction::compute_txid));
-        packages.extend(dependency_packages(children));
+        let Some(orphan) = candidate.take_orphan_work(orphan_source) else {
+            break;
+        };
+        processed_orphan_work = true;
+        packages.push_back((vec![orphan], true));
     }
     let relay_snapshot = candidate.relay_snapshot();
     if let Some(store) = transaction_store {
@@ -3375,6 +3400,7 @@ fn admit_pending_peer_transactions(
             .track_pool(&tracks, context.height)
             .map_err(|error| error.to_string())?;
     }
+    let more_orphan_work = candidate.has_orphan_work(orphan_source);
     *pool = candidate;
     drop(pool);
     let relayed =
@@ -3415,7 +3441,7 @@ fn admit_pending_peer_transactions(
     for message in rejected_messages {
         eprintln!("{message}");
     }
-    Ok(())
+    Ok(more_orphan_work)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3757,18 +3783,24 @@ async fn sync_validating_node(
                 if ibd_status.minimum_chainwork_reached {
                     fetch_announced_peer_transactions(session, transaction_pool, wallet_runtime)
                         .await?;
-                    admit_pending_peer_transactions(
-                        session,
-                        transaction_pool,
-                        transaction_store.as_ref(),
-                        fee_estimator.as_deref(),
-                        &disconnected_transactions,
-                        transaction_relay,
-                        &chainstate,
-                        &headers,
-                        deployment_config,
-                        mempool_full_rbf,
-                    )?;
+                    loop {
+                        let more_orphan_work = admit_pending_peer_transactions(
+                            session,
+                            transaction_pool,
+                            transaction_store.as_ref(),
+                            fee_estimator.as_deref(),
+                            &disconnected_transactions,
+                            transaction_relay,
+                            &chainstate,
+                            &headers,
+                            deployment_config,
+                            mempool_full_rbf,
+                        )?;
+                        if !more_orphan_work {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
                     if let Some(store) = transaction_store.as_ref() {
                         let active = transaction_pool
                             .lock()
@@ -6647,6 +6679,22 @@ mod tests {
             Inventory::Transaction(Txid::from_byte_array([99; 32])),
             &[transaction]
         ));
+    }
+
+    #[test]
+    fn peer_orphan_provenance_excludes_persisted_and_reorg_candidates() {
+        let mut peer = wallet_broadcast_transaction();
+        peer.input[0].previous_output.txid = Txid::from_byte_array([91; 32]);
+        let mut persisted = wallet_broadcast_transaction();
+        persisted.input[0].previous_output.txid = Txid::from_byte_array([92; 32]);
+        let mut recovered = wallet_broadcast_transaction();
+        recovered.input[0].previous_output.txid = Txid::from_byte_array([93; 32]);
+        let selected = peer_orphan_candidates(
+            vec![persisted, peer.clone(), recovered],
+            &HashSet::from([peer.compute_txid()]),
+        );
+
+        assert_eq!(selected, vec![peer]);
     }
 
     #[tokio::test]

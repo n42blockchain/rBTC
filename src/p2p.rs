@@ -21,7 +21,10 @@ use bitcoin::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -63,6 +66,13 @@ pub const MAX_COMPACT_BLOCK_TRANSACTIONS: usize = 16_666;
 const PROTOCOL_VERSION: u32 = 70_016;
 const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
 const MAX_MONEY_SATS: i64 = 21_000_000 * 100_000_000;
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_session_id() -> u64 {
+    NEXT_SESSION_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("process-local peer session ID space exhausted")
+}
 
 fn validate_user_agent(user_agent: &str) -> Result<(), P2pError> {
     if user_agent.len() > MAX_USER_AGENT_LEN {
@@ -568,6 +578,7 @@ impl CompactBlockReconstruction {
 /// order for header and block synchronisation.
 pub struct PeerSession<S> {
     transport: V1Transport<S>,
+    local_id: u64,
     remote_version: VersionMessage,
     wtxid_relay: bool,
     fee_filter_sat_kvb: u64,
@@ -589,6 +600,7 @@ impl<S> PeerSession<S> {
         let wtxid_relay = transport.peer_wtxid_relay;
         Self {
             transport,
+            local_id: next_session_id(),
             remote_version,
             wtxid_relay,
             fee_filter_sat_kvb: 0,
@@ -610,6 +622,12 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn remote_version(&self) -> &VersionMessage {
         &self.remote_version
+    }
+
+    /// Returns this established session's process-local, peer-independent ID.
+    #[must_use]
+    pub const fn local_id(&self) -> u64 {
+        self.local_id
     }
 
     /// Returns cumulative measurements for fully received requested block batches.
@@ -1873,6 +1891,23 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn local_session_ids_do_not_trust_or_reuse_remote_nonces() {
+        let (first_stream, _) = duplex(64);
+        let (second_stream, _) = duplex(64);
+        let first = PeerSession::new(
+            V1Transport::new(first_stream, Network::Regtest.magic()),
+            version(42),
+        );
+        let second = PeerSession::new(
+            V1Transport::new(second_stream, Network::Regtest.magic()),
+            version(42),
+        );
+
+        assert_eq!(first.remote_version().nonce, second.remote_version().nonce);
+        assert_ne!(first.local_id(), second.local_id());
     }
 
     #[test]
