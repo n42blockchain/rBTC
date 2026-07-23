@@ -55,6 +55,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
@@ -1761,7 +1762,11 @@ struct ConnectedPeer {
     session: PeerSession<tokio::net::TcpStream>,
 }
 
-type PendingPeer = tokio::task::JoinHandle<Result<ConnectedPeer, PeerRunError>>;
+struct PendingPeer {
+    ready: tokio::sync::oneshot::Receiver<()>,
+    activate: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<ConnectedPeer, PeerRunError>>,
+}
 
 async fn connect_peer(
     deployments: DeploymentConfig,
@@ -1810,6 +1815,62 @@ async fn connect_peer(
     Ok(ConnectedPeer { remote, session })
 }
 
+async fn maintain_standby(
+    mut connected: ConnectedPeer,
+    mut activate: tokio::sync::oneshot::Receiver<()>,
+    keepalive_interval: Duration,
+    mut ping_nonce: u64,
+) -> Result<ConnectedPeer, PeerRunError> {
+    let mut keepalive = tokio::time::interval(keepalive_interval);
+    keepalive.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            activated = &mut activate => {
+                activated.map_err(|_| {
+                    PeerRunError::transient("peer standby activation channel closed")
+                })?;
+                return Ok(connected);
+            }
+            _ = keepalive.tick() => {}
+        }
+        timeout(PEER_TIMEOUT, connected.session.ping(ping_nonce))
+            .await
+            .map_err(|_| {
+                PeerRunError::transient(format!(
+                    "peer standby keepalive timed out after {} seconds",
+                    PEER_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| PeerRunError::p2p(&error))?;
+        ping_nonce = ping_nonce.wrapping_add(1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_and_maintain_standby(
+    deployments: DeploymentConfig,
+    remote: SocketAddr,
+    local_nonce: u64,
+    require_full_services: bool,
+    peer_store: Option<Arc<RedbPeerStore>>,
+    ready: tokio::sync::oneshot::Sender<()>,
+    activate: tokio::sync::oneshot::Receiver<()>,
+) -> Result<ConnectedPeer, PeerRunError> {
+    let connected = connect_peer(
+        deployments,
+        remote,
+        local_nonce,
+        require_full_services,
+        peer_store,
+    )
+    .await?;
+    ready
+        .send(())
+        .map_err(|()| PeerRunError::transient("peer standby readiness channel closed"))?;
+    maintain_standby(connected, activate, STANDBY_KEEPALIVE_INTERVAL, local_nonce).await
+}
+
 fn spawn_peer_connections(
     options: &Options,
     remotes: &[SocketAddr],
@@ -1824,24 +1885,51 @@ fn spawn_peer_connections(
             let deployments = options.deployments.clone();
             let peer_store = peer_store.cloned();
             let require_full_services = options.data_dir.is_some();
-            let pending = tokio::spawn(connect_peer(
+            let (ready_sender, ready) = tokio::sync::oneshot::channel();
+            let (activate, activate_receiver) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
                 local_nonce,
                 require_full_services,
                 peer_store,
+                ready_sender,
+                activate_receiver,
             ));
-            (remote, pending)
+            (
+                remote,
+                PendingPeer {
+                    ready,
+                    activate: Some(activate),
+                    task,
+                },
+            )
         })
         .collect()
 }
 
 async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPeer)>) {
     for (_, connection) in pending.iter() {
-        connection.abort();
+        connection.task.abort();
     }
     while let Some((_, connection)) = pending.pop_front() {
-        let _ = connection.await;
+        let _ = connection.task.await;
+    }
+}
+
+async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer, PeerRunError> {
+    if pending.ready.await.is_ok() {
+        let _ = pending
+            .activate
+            .take()
+            .expect("pending peer has one activation sender")
+            .send(());
+    }
+    match pending.task.await {
+        Ok(result) => result,
+        Err(error) => Err(PeerRunError::transient(format!(
+            "peer connection task failed: {error}"
+        ))),
     }
 }
 
@@ -1859,12 +1947,7 @@ async fn try_peer_candidates(
 ) -> bool {
     let mut pending = spawn_peer_connections(options, remotes, local_nonce, peer_store);
     while let Some((remote, connection)) = pending.pop_front() {
-        let connected = match connection.await {
-            Ok(result) => result,
-            Err(error) => Err(PeerRunError::transient(format!(
-                "peer connection task failed: {error}"
-            ))),
-        };
+        let connected = activate_pending_peer(connection).await;
         let result = match connected {
             Ok(connected) => {
                 run_connected_peer(
@@ -4592,6 +4675,59 @@ mod tests {
         release_stalled.send(()).unwrap();
         stalled_server.await.unwrap();
         ready_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standby_session_is_kept_alive_and_can_be_activated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let (ping_seen, ping_received) = tokio::sync::oneshot::channel();
+        let (release_server, server_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(202)).await;
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendHeaders
+            ));
+            let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected standby ping");
+            };
+            assert_eq!(nonce, 201);
+            peer.write_message(NetworkMessage::Pong(nonce))
+                .await
+                .unwrap();
+            ping_seen.send(()).unwrap();
+            server_release.await.unwrap();
+        });
+
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            remote,
+            200,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let (activate, activation) = tokio::sync::oneshot::channel();
+        let standby = tokio::spawn(maintain_standby(
+            connected,
+            activation,
+            Duration::from_millis(10),
+            201,
+        ));
+        timeout(Duration::from_secs(2), ping_received)
+            .await
+            .expect("standby should send a bounded keepalive")
+            .unwrap();
+        activate.send(()).unwrap();
+        let activated = standby.await.unwrap().unwrap();
+        assert_eq!(activated.remote, remote);
+
+        drop(activated);
+        release_server.send(()).unwrap();
+        server.await.unwrap();
     }
 
     fn wallet_broadcast_transaction() -> Transaction {
