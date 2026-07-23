@@ -31,6 +31,10 @@ pub const MAX_ADMITTED_TRANSACTION_BYTES: usize = 4_000_000;
 pub const MAX_ORPHAN_TRANSACTIONS: usize = 64;
 /// Maximum witness-serialized bytes retained by the orphan pool.
 pub const MAX_ORPHAN_TRANSACTION_BYTES: usize = 4_000_000;
+/// Maximum distinct blind parent requests retained across the orphanage.
+pub const MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
+/// Maximum exact witness-independent transaction rejects remembered per chain tip.
+pub const MAX_RECENT_REJECTED_TXIDS: usize = 1_024;
 /// Core-compatible orphan lifetime of twenty minutes.
 pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Core's twelve-hour rolling mempool minimum-fee half-life.
@@ -295,6 +299,9 @@ pub struct TransactionAdmissionPool {
     orphan_bytes: usize,
     orphans_by_outpoint: BTreeMap<OutPoint, BTreeSet<Txid>>,
     orphan_work_by_source: BTreeMap<u64, BTreeSet<Txid>>,
+    orphan_parent_requests_by_source: BTreeMap<u64, BTreeSet<Txid>>,
+    recent_rejected_txids: VecDeque<Txid>,
+    recent_rejected_txid_set: BTreeSet<Txid>,
     rolling_minimum_fee_sat_kvb: u64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
@@ -340,6 +347,8 @@ impl TransactionAdmissionPool {
         {
             self.rolling_fee_decay_enabled = true;
             self.rolling_fee_last_update = now;
+            self.recent_rejected_txids.clear();
+            self.recent_rejected_txid_set.clear();
         }
         self.observed_chain_tip = Some(tip);
     }
@@ -421,6 +430,10 @@ impl TransactionAdmissionPool {
 
     /// Schedules live children of newly accepted parents for their source peer.
     pub fn schedule_orphan_children(&mut self, parents: &BTreeSet<Txid>) -> usize {
+        self.orphan_parent_requests_by_source.retain(|_, requests| {
+            requests.retain(|txid| !parents.contains(txid));
+            !requests.is_empty()
+        });
         let mut child_txids = BTreeSet::<Txid>::new();
         for parent in parents {
             let Some(transaction) = self
@@ -492,6 +505,92 @@ impl TransactionAdmissionPool {
             .is_some_and(|work| !work.is_empty())
     }
 
+    /// Returns whether the active pool or orphanage already knows a txid.
+    #[must_use]
+    pub fn knows_transaction(&self, txid: Txid) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.transaction.compute_txid() == txid)
+            || self
+                .orphans
+                .iter()
+                .any(|orphan| orphan.transaction.compute_txid() == txid)
+    }
+
+    /// Returns whether a witness-independent rejection is remembered at this tip.
+    #[must_use]
+    pub fn is_recently_rejected(&self, txid: Txid) -> bool {
+        self.recent_rejected_txid_set.contains(&txid)
+    }
+
+    /// Remembers one exact txid rejection under a bounded oldest-first cache.
+    pub fn remember_rejected_txid(&mut self, txid: Txid) -> bool {
+        if !self.recent_rejected_txid_set.insert(txid) {
+            return false;
+        }
+        self.recent_rejected_txids.push_back(txid);
+        while self.recent_rejected_txids.len() > MAX_RECENT_REJECTED_TXIDS {
+            let removed = self
+                .recent_rejected_txids
+                .pop_front()
+                .expect("over-capacity recent reject cache is non-empty");
+            self.recent_rejected_txid_set.remove(&removed);
+        }
+        true
+    }
+
+    /// Caches terminal failures only when every witness variant has the same result.
+    pub fn remember_terminal_rejection(
+        &mut self,
+        transaction: &Transaction,
+        error: &TransactionAdmissionError,
+    ) -> bool {
+        let txid = transaction.compute_txid();
+        let witness_independent = txid.to_raw_hash() == transaction.compute_wtxid().to_raw_hash()
+            || matches!(
+                error,
+                TransactionAdmissionError::Policy(
+                    TransactionPolicyError::InputScript(_)
+                        | TransactionPolicyError::P2shRedeemScript(_)
+                        | TransactionPolicyError::P2shSigops { .. }
+                )
+            );
+        witness_independent && self.remember_rejected_txid(txid)
+    }
+
+    /// Selects one bounded, deduplicated batch of not-yet-requested parent txids.
+    pub fn select_orphan_parent_requests(
+        &mut self,
+        source: u64,
+        candidates: &BTreeSet<Txid>,
+    ) -> Vec<Txid> {
+        let mut remaining = MAX_ORPHAN_PARENT_REQUESTS.saturating_sub(
+            self.orphan_parent_requests_by_source
+                .values()
+                .map(BTreeSet::len)
+                .sum(),
+        );
+        let mut selected = Vec::new();
+        for txid in candidates {
+            if remaining == 0
+                || self.is_recently_rejected(*txid)
+                || self
+                    .orphan_parent_requests_by_source
+                    .values()
+                    .any(|requests| requests.contains(txid))
+            {
+                continue;
+            }
+            self.orphan_parent_requests_by_source
+                .entry(source)
+                .or_default()
+                .insert(*txid);
+            selected.push(*txid);
+            remaining -= 1;
+        }
+        selected
+    }
+
     /// Removes exact orphan IDs after successful admission or terminal rejection.
     pub fn remove_orphans(&mut self, txids: &BTreeSet<Txid>) -> usize {
         let before = self.orphans.len();
@@ -532,10 +631,15 @@ impl TransactionAdmissionPool {
             .sum();
         self.orphans_by_outpoint.clear();
         let mut orphan_sources = BTreeMap::new();
+        let mut live_parents_by_source = BTreeMap::<u64, BTreeSet<Txid>>::new();
         for orphan in &self.orphans {
             let txid = orphan.transaction.compute_txid();
             orphan_sources.insert(txid, orphan.source);
             for input in &orphan.transaction.input {
+                live_parents_by_source
+                    .entry(orphan.source)
+                    .or_default()
+                    .insert(input.previous_output.txid);
                 self.orphans_by_outpoint
                     .entry(input.previous_output)
                     .or_default()
@@ -546,6 +650,15 @@ impl TransactionAdmissionPool {
             work.retain(|txid| orphan_sources.get(txid) == Some(source));
             !work.is_empty()
         });
+        self.orphan_parent_requests_by_source
+            .retain(|source, requests| {
+                requests.retain(|txid| {
+                    live_parents_by_source
+                        .get(source)
+                        .is_some_and(|parents| parents.contains(txid))
+                });
+                !requests.is_empty()
+            });
     }
 
     /// Clones admitted transactions in oldest-to-newest order.
@@ -2522,10 +2635,15 @@ mod tests {
         assert_eq!(pool.retain_orphans(&[second, first], 100, 11), 2);
         assert_eq!(pool.retain_orphans(&[third], 100, 12), 1);
         assert_eq!(pool.retain_orphans(&[invalid_vout], 100, 13), 1);
+        assert_eq!(
+            pool.select_orphan_parent_requests(11, &BTreeSet::from([parent_txid])),
+            vec![parent_txid]
+        );
         pool.admit(&store, parent, context()).unwrap();
 
         let parents = BTreeSet::from([parent_txid]);
         assert_eq!(pool.schedule_orphan_children(&parents), 3);
+        assert!(pool.orphan_parent_requests_by_source.is_empty());
         assert_eq!(pool.schedule_orphan_children(&parents), 0);
         assert!(!pool.has_orphan_work(13));
         let first_work = pool.take_orphan_work(11).unwrap().compute_txid();
@@ -2549,6 +2667,95 @@ mod tests {
                 .iter()
                 .any(|orphan| orphan.transaction.compute_txid() == third_txid)
         );
+    }
+
+    #[test]
+    fn orphan_parent_requests_are_bounded_deduplicated_and_pruned() {
+        fn marker_txid(marker: u32) -> Txid {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&marker.to_le_bytes());
+            Txid::from_byte_array(bytes)
+        }
+
+        let mut orphan = spend(90).2;
+        let input = orphan.input[0].clone();
+        let parents = (0..=u32::try_from(MAX_ORPHAN_PARENT_REQUESTS).unwrap())
+            .map(marker_txid)
+            .collect::<BTreeSet<_>>();
+        orphan.input = parents
+            .iter()
+            .map(|txid| TxIn {
+                previous_output: OutPoint::new(*txid, 0),
+                ..input.clone()
+            })
+            .collect();
+        let mut pool = TransactionAdmissionPool::default();
+        assert_eq!(pool.retain_orphans(&[orphan], 100, 21), 1);
+        let rejected = *parents.first().unwrap();
+        assert!(pool.remember_rejected_txid(rejected));
+
+        let selected = pool.select_orphan_parent_requests(21, &parents);
+        assert_eq!(selected.len(), MAX_ORPHAN_PARENT_REQUESTS);
+        assert!(!selected.contains(&rejected));
+        assert!(pool.select_orphan_parent_requests(21, &parents).is_empty());
+        assert_eq!(
+            pool.orphan_parent_requests_by_source
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            MAX_ORPHAN_PARENT_REQUESTS
+        );
+
+        assert_eq!(pool.remove_orphans_from(21), 1);
+        assert!(pool.orphan_parent_requests_by_source.is_empty());
+    }
+
+    #[test]
+    fn recent_rejects_are_witness_safe_bounded_and_reset_on_tip_change() {
+        fn marker_txid(marker: u32) -> Txid {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&marker.to_le_bytes());
+            Txid::from_byte_array(bytes)
+        }
+
+        let mut pool = TransactionAdmissionPool::default();
+        let witness_transaction = spend(91).2;
+        let witness_dependent = TransactionAdmissionError::Policy(TransactionPolicyError::Dust {
+            index: 0,
+            value_sats: 1,
+            minimum_sats: 2,
+        });
+        assert!(!pool.remember_terminal_rejection(&witness_transaction, &witness_dependent));
+        assert!(!pool.is_recently_rejected(witness_transaction.compute_txid()));
+        let input_standardness =
+            TransactionAdmissionError::Policy(TransactionPolicyError::InputScript(0));
+        assert!(pool.remember_terminal_rejection(&witness_transaction, &input_standardness));
+        assert!(pool.is_recently_rejected(witness_transaction.compute_txid()));
+
+        let mut legacy_transaction = spend(92).2;
+        legacy_transaction.input[0].witness = Witness::new();
+        assert!(pool.remember_terminal_rejection(&legacy_transaction, &witness_dependent));
+        assert!(pool.is_recently_rejected(legacy_transaction.compute_txid()));
+
+        let mut bounded = TransactionAdmissionPool::default();
+        let tip = BlockHash::from_byte_array([1; 32]);
+        bounded.observe_chain_tip(tip, 100);
+        for marker in 0..=u32::try_from(MAX_RECENT_REJECTED_TXIDS).unwrap() {
+            assert!(bounded.remember_rejected_txid(marker_txid(marker)));
+        }
+        assert_eq!(
+            bounded.recent_rejected_txids.len(),
+            MAX_RECENT_REJECTED_TXIDS
+        );
+        assert!(!bounded.is_recently_rejected(marker_txid(0)));
+        assert!(bounded.is_recently_rejected(marker_txid(
+            u32::try_from(MAX_RECENT_REJECTED_TXIDS).unwrap()
+        )));
+        bounded.observe_chain_tip(tip, 101);
+        assert!(!bounded.recent_rejected_txids.is_empty());
+        bounded.observe_chain_tip(BlockHash::from_byte_array([2; 32]), 102);
+        assert!(bounded.recent_rejected_txids.is_empty());
+        assert!(bounded.recent_rejected_txid_set.is_empty());
     }
 
     #[test]
