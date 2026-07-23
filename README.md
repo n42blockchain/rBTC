@@ -87,6 +87,8 @@ The P2P session can write one non-coinbase transaction only when it fits Core's 
 
 Failed hot standbys are reaped and classified while the active session is still running, so objective violations enter persistent discouragement promptly without waiting for failover. At most eight ready automatic hot standbys are retained: the existing manual/persistent-reputation queue order protects stronger peers and evicts from its tail as slower handshakes complete. Manual peers do not consume that soft capacity, every stage remains under the 16-connection hard ceiling, and a local capacity eviction is not recorded as a remote failure. Manual peers and transient failures retain their existing discouragement exemptions.
 
+Unsolicited `tx` frames that arrive while a peer is serving a bounded headers, address, or block response are no longer discarded. Each session retains their wire order in an independent 64-transaction/4 MB FIFO, drops the oldest entry under pressure, and exposes an explicit drain for the forthcoming consensus/policy admission pass. Queueing is not admission: these unverified transactions never enter compact-block candidates or relay state.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

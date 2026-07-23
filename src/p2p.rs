@@ -35,6 +35,9 @@ const V1_HEADER_LEN: usize = 24;
 const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
 const MAX_PENDING_MESSAGE_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
+/// Maximum unsolicited transactions retained from one peer between admission passes.
+pub const MAX_PENDING_TRANSACTIONS: usize = 64;
+const MAX_PENDING_TRANSACTION_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
@@ -495,6 +498,8 @@ pub struct PeerSession<S> {
     requested_compact_blocks: bool,
     pending_messages: VecDeque<(NetworkMessage, usize)>,
     pending_message_bytes: usize,
+    pending_transactions: VecDeque<(Transaction, usize)>,
+    pending_transaction_bytes: usize,
     block_transfer_stats: BlockTransferStats,
 }
 
@@ -507,6 +512,8 @@ impl<S> PeerSession<S> {
             requested_compact_blocks: false,
             pending_messages: VecDeque::new(),
             pending_message_bytes: 0,
+            pending_transactions: VecDeque::new(),
+            pending_transaction_bytes: 0,
             block_transfer_stats: BlockTransferStats::default(),
         }
     }
@@ -527,6 +534,20 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn compact_block_version(&self) -> Option<u64> {
         self.compact_block_version
+    }
+
+    /// Drains unsolicited transactions captured while another bounded response was in flight.
+    ///
+    /// The queue preserves wire order, holds at most [`MAX_PENDING_TRANSACTIONS`],
+    /// and is independently bounded by one maximum protocol payload. Overflow
+    /// drops the oldest transaction; callers must still perform full local
+    /// consensus and relay-policy admission.
+    pub fn take_pending_transactions(&mut self) -> Vec<Transaction> {
+        self.pending_transaction_bytes = 0;
+        self.pending_transactions
+            .drain(..)
+            .map(|(transaction, _)| transaction)
+            .collect()
     }
 
     /// Returns the underlying framed transport.
@@ -690,6 +711,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
+    fn retain_pending_transaction(&mut self, transaction: Transaction, payload_len: usize) {
+        if payload_len > MAX_PENDING_TRANSACTION_BYTES {
+            return;
+        }
+        while self.pending_transactions.len() >= MAX_PENDING_TRANSACTIONS
+            || self.pending_transaction_bytes.saturating_add(payload_len)
+                > MAX_PENDING_TRANSACTION_BYTES
+        {
+            let Some((_, removed_len)) = self.pending_transactions.pop_front() else {
+                break;
+            };
+            self.pending_transaction_bytes = self
+                .pending_transaction_bytes
+                .checked_sub(removed_len)
+                .expect("queued transaction charge matches pending byte total");
+        }
+        self.pending_transactions
+            .push_back((transaction, payload_len));
+        self.pending_transaction_bytes = self
+            .pending_transaction_bytes
+            .checked_add(payload_len)
+            .expect("bounded transaction payload total fits usize");
+    }
+
     async fn read_wire_response_message(
         &mut self,
     ) -> Result<Option<(NetworkMessage, usize)>, P2pError> {
@@ -871,6 +916,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     pub async fn receive_addresses(&mut self) -> Result<Vec<PeerAddress>, P2pError> {
         for _ in 0..MAX_RESPONSE_MESSAGES {
             match self.read_bounded_response_message().await? {
+                Some(NetworkMessage::Tx(transaction)) => {
+                    let payload_len = serialize(&transaction).len();
+                    self.retain_pending_transaction(transaction, payload_len);
+                }
                 Some(NetworkMessage::Addr(addresses)) => {
                     if addresses.len() > MAX_ADDRESSES_PER_MESSAGE {
                         return Err(P2pError::TooManyAddresses {
@@ -919,15 +968,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// contextual consensus validation before storage.
     pub async fn receive_headers(&mut self) -> Result<Vec<bitcoin::block::Header>, P2pError> {
         for _ in 0..MAX_RESPONSE_MESSAGES {
-            if let Some(NetworkMessage::Headers(headers)) =
-                self.read_bounded_response_message().await?
-            {
-                if headers.len() > MAX_HEADERS_PER_RESPONSE {
-                    return Err(P2pError::TooManyHeaders {
-                        count: headers.len(),
-                    });
+            match self.read_bounded_response_message().await? {
+                Some(NetworkMessage::Tx(transaction)) => {
+                    let payload_len = serialize(&transaction).len();
+                    self.retain_pending_transaction(transaction, payload_len);
                 }
-                return Ok(headers);
+                Some(NetworkMessage::Headers(headers)) => {
+                    if headers.len() > MAX_HEADERS_PER_RESPONSE {
+                        return Err(P2pError::TooManyHeaders {
+                            count: headers.len(),
+                        });
+                    }
+                    return Ok(headers);
+                }
+                _ => {}
             }
         }
         Err(P2pError::HeadersResponseIncomplete)
@@ -1106,6 +1160,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     }) {
                         return Err(P2pError::BlockNotFound(hash));
                     }
+                }
+                Some((NetworkMessage::Tx(transaction), payload_len)) => {
+                    self.retain_pending_transaction(transaction, payload_len);
                 }
                 _ => {}
             }
@@ -2101,6 +2158,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_wait_retains_unsolicited_transactions_for_admission() {
+        let expected = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let expected_hash = expected.block_hash();
+        let transaction =
+            bitcoin::blockdata::constants::genesis_block(Network::Bitcoin).txdata[0].clone();
+        let retained = transaction.clone();
+        let (client_stream, server_stream) = duplex(32 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            let block = session
+                .receive_requested_block(expected_hash)
+                .await
+                .unwrap();
+            (block, session.take_pending_transactions())
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::Tx(transaction))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Block(expected))
+                .await
+                .unwrap();
+        });
+
+        let (block, transactions) = client.await.unwrap();
+        assert_eq!(block.block_hash(), expected_hash);
+        assert_eq!(transactions, vec![retained]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn header_response_rejects_more_than_protocol_maximum() {
         let (client_stream, server_stream) = duplex(512 * 1024);
         let client = tokio::spawn(async move {
@@ -2126,6 +2220,73 @@ mod tests {
             Err(P2pError::TooManyHeaders { count }) if count == MAX_HEADERS_PER_RESPONSE + 1
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn header_wait_retains_unsolicited_transactions_for_admission() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let transaction =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let expected = transaction.clone();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            let headers = session.receive_headers().await.unwrap();
+            (headers, session.take_pending_transactions())
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            transport
+                .write_message(NetworkMessage::Tx(transaction))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+        });
+
+        let (headers, transactions) = client.await.unwrap();
+        assert!(headers.is_empty());
+        assert_eq!(transactions, vec![expected]);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn pending_transaction_queue_drops_oldest_and_rejects_oversized_entries() {
+        let (stream, _peer) = duplex(64);
+        let mut session = PeerSession::new(
+            V1Transport::new(stream, Network::Regtest.magic()),
+            version(1),
+        );
+        let template =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        session.retain_pending_transaction(
+            template.clone(),
+            MAX_PENDING_TRANSACTION_BYTES.saturating_add(1),
+        );
+        assert!(session.take_pending_transactions().is_empty());
+
+        let values = (0..MAX_PENDING_TRANSACTIONS + 2)
+            .map(|offset| template.output[0].value.to_sat() - u64::try_from(offset).unwrap())
+            .collect::<Vec<_>>();
+        for value in &values {
+            let mut transaction = template.clone();
+            transaction.output[0].value = Amount::from_sat(*value);
+            let payload_len = serialize(&transaction).len();
+            session.retain_pending_transaction(transaction, payload_len);
+        }
+
+        let retained = session.take_pending_transactions();
+        assert_eq!(retained.len(), MAX_PENDING_TRANSACTIONS);
+        assert_eq!(retained[0].output[0].value.to_sat(), values[2]);
+        assert_eq!(
+            retained.last().unwrap().output[0].value.to_sat(),
+            *values.last().unwrap()
+        );
+        assert_eq!(session.pending_transaction_bytes, 0);
     }
 
     #[tokio::test]
