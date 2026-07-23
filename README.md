@@ -77,6 +77,8 @@ The lower-level two-step interface remains available: build with `rbtcd --data-d
 
 Post-handshake routing centrally caps `inv`/`getdata`/`notfound` at 50,000 entries, locators at 101 hashes, headers at 2,000, and address messages at 1,000. These limits also apply to unrelated frames injected while another response is pending. Peers supporting BIP130 receive `sendheaders` immediately after handshake so announcements remain headers-first. During ordinary 30-second caught-up polling, the daemon requires a nonce-matched pong within the same 32-frame total response budget before requesting more headers; crossed peer pings are answered without extending it, and a header announcement arriving before the pong is retained for the following sync pass.
 
+The P2P session can write one non-coinbase transaction only when it fits Core's 400,000-weight-unit standard relay ceiling. This primitive reports socket delivery only; it is not yet connected to the wallet API and does not claim peer mempool acceptance or multi-peer propagation.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

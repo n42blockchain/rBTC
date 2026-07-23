@@ -6,7 +6,7 @@
 //! follow-up because it changes the encrypted session handshake, not messages.
 
 use bitcoin::{
-    BlockHash,
+    BlockHash, Transaction,
     consensus::{deserialize, encode::Error as EncodeError, serialize},
     p2p::{
         Address, Magic, ServiceFlags,
@@ -187,6 +187,17 @@ pub enum P2pError {
     /// A matching pong did not arrive within the shared response-frame budget.
     #[error("peer did not provide the requested pong within {MAX_RESPONSE_MESSAGES} messages")]
     PongResponseIncomplete,
+    /// A local caller attempted to relay a coinbase transaction.
+    #[error("coinbase transactions cannot be relayed")]
+    OutboundCoinbaseTransaction,
+    /// A local caller attempted to relay a transaction above the standardness limit.
+    #[error("transaction weight {weight} exceeds relay limit {limit}")]
+    OutboundTransactionTooHeavy {
+        /// Transaction weight in weight units.
+        weight: u64,
+        /// Maximum standard transaction weight in weight units.
+        limit: u64,
+    },
 }
 
 impl P2pError {
@@ -210,7 +221,9 @@ impl P2pError {
             | Self::TooManyBlockRequests { .. }
             | Self::DuplicateBlockRequest(_)
             | Self::TooManyLocatorHashes { .. }
-            | Self::PongResponseIncomplete => false,
+            | Self::PongResponseIncomplete
+            | Self::OutboundCoinbaseTransaction
+            | Self::OutboundTransactionTooHeavy { .. } => false,
             Self::Message(_)
             | Self::WrongMagic
             | Self::Oversize { .. }
@@ -470,6 +483,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
         self.transport
             .write_message(NetworkMessage::SendHeaders)
+            .await
+    }
+
+    /// Sends one standard-weight non-coinbase transaction to the connected peer.
+    ///
+    /// A successful write only proves delivery to this peer's socket. It does
+    /// not imply mempool acceptance or wider network propagation.
+    pub async fn broadcast_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<(), P2pError> {
+        if transaction.is_coinbase() {
+            return Err(P2pError::OutboundCoinbaseTransaction);
+        }
+        let weight = transaction.weight().to_wu();
+        let limit = u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT);
+        if weight > limit {
+            return Err(P2pError::OutboundTransactionTooHeavy { weight, limit });
+        }
+        self.transport
+            .write_message(NetworkMessage::Tx(transaction.clone()))
             .await
     }
 
@@ -889,6 +923,11 @@ mod tests {
                 count: MAX_BLOCKS_IN_FLIGHT + 1,
             },
             P2pError::PongResponseIncomplete,
+            P2pError::OutboundCoinbaseTransaction,
+            P2pError::OutboundTransactionTooHeavy {
+                weight: u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT) + 1,
+                limit: u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT),
+            },
         ] {
             assert!(!error.is_protocol_violation(), "{error}");
         }
@@ -1552,6 +1591,59 @@ mod tests {
             remote,
         );
         session.prefer_headers_announcements().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                server_stream.read_u8()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_broadcast_is_bounded_and_uses_tx_message() {
+        let coinbase =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        let mut transaction = coinbase.clone();
+        transaction.input[0].previous_output.vout = 0;
+
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let expected = transaction.clone();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.broadcast_transaction(&transaction).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+        });
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let (client_stream, mut server_stream) = duplex(64);
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            version(1),
+        );
+        assert!(matches!(
+            session.broadcast_transaction(&coinbase).await,
+            Err(P2pError::OutboundCoinbaseTransaction)
+        ));
+
+        let mut oversized = coinbase;
+        oversized.input[0].previous_output.vout = 0;
+        oversized.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0; 100_001]);
+        assert!(matches!(
+            session.broadcast_transaction(&oversized).await,
+            Err(P2pError::OutboundTransactionTooHeavy { .. })
+        ));
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),
