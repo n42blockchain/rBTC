@@ -99,6 +99,8 @@ In addition to the 25-transaction/101,000-vB incoming package bound, every newly
 
 The same active snapshot stores a complete versioned map from txid to its first admission time. Transactions expire once older than Core's default 336-hour lifetime; an expired parent is removed with every retained descendant before caught-up revalidation. Ordinary snapshot replacement preserves surviving times and prunes removed rows. If an expired transaction is independently received or recovered from a reorganization and passes admission again, its time is reset in the same commit that republishes the pool. Legacy snapshots without this map migrate every active entry as newly admitted, while malformed, duplicate, missing, or non-pool rows fail closed and join the persisted-metadata fuzz surface.
 
+Transactions that fail admission only because an input is unavailable enter a separate process-shared orphan pool instead of being discarded. It retains at most 64 transactions and 4 MB, rejects any orphan above the 400,000-weight-unit standard ceiling, deduplicates txid/wtxid variants, evicts oldest first under pressure, and expires entries after Core's 20-minute lifetime. Admission of any parent selects its direct orphan children; dependency grouping and the unchanged atomic admission path then validate complete multi-generation chains one generation at a time. A still-missing orphan remains eligible for a later parent, while any terminal consensus, policy, conflict, package, or topology failure removes the attempted orphan. The orphan pool is intentionally memory-only and does not survive process restart.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

@@ -22,6 +22,12 @@ use crate::{
 pub const MAX_ADMITTED_TRANSACTIONS: usize = 64;
 /// Maximum witness-serialized bytes retained by the local admission pool.
 pub const MAX_ADMITTED_TRANSACTION_BYTES: usize = 4_000_000;
+/// Maximum number of missing-parent transactions retained across peer failover.
+pub const MAX_ORPHAN_TRANSACTIONS: usize = 64;
+/// Maximum witness-serialized bytes retained by the orphan pool.
+pub const MAX_ORPHAN_TRANSACTION_BYTES: usize = 4_000_000;
+/// Core-compatible orphan lifetime of twenty minutes.
+pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
@@ -185,6 +191,17 @@ pub enum TransactionAdmissionError {
     },
 }
 
+impl TransactionAdmissionError {
+    /// Returns whether admission failed only because an input is not yet available.
+    #[must_use]
+    pub const fn is_missing_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Chainstate(ChainstateError::Utxo(UtxoError::Missing(_)))
+        )
+    }
+}
+
 /// Result of an atomic package admission attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageAdmissionOutcome {
@@ -205,6 +222,13 @@ struct AdmittedTransaction {
     fee_sats: u64,
 }
 
+#[derive(Clone)]
+struct OrphanTransaction {
+    transaction: Transaction,
+    serialized_len: usize,
+    expires_at: u32,
+}
+
 #[derive(Default)]
 struct ReplacementPlan {
     txids: BTreeSet<Txid>,
@@ -217,6 +241,8 @@ pub struct TransactionAdmissionPool {
     entries: VecDeque<AdmittedTransaction>,
     spent: BTreeMap<OutPoint, Txid>,
     retained_bytes: usize,
+    orphans: VecDeque<OrphanTransaction>,
+    orphan_bytes: usize,
 }
 
 impl TransactionAdmissionPool {
@@ -236,6 +262,108 @@ impl TransactionAdmissionPool {
     #[must_use]
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Returns the number of missing-parent transactions retained in memory.
+    #[must_use]
+    pub fn orphan_len(&self) -> usize {
+        self.orphans.len()
+    }
+
+    /// Returns witness-serialized bytes charged to the orphan pool.
+    #[must_use]
+    pub const fn orphan_bytes(&self) -> usize {
+        self.orphan_bytes
+    }
+
+    /// Removes orphan transactions whose twenty-minute lifetime has elapsed.
+    pub fn prune_orphans(&mut self, now: u32) -> usize {
+        let before = self.orphans.len();
+        self.orphans.retain(|orphan| orphan.expires_at > now);
+        self.orphan_bytes = self
+            .orphans
+            .iter()
+            .map(|orphan| orphan.serialized_len)
+            .sum();
+        before.saturating_sub(self.orphans.len())
+    }
+
+    /// Retains missing-parent transactions under independent count and byte bounds.
+    pub fn retain_orphans(&mut self, transactions: &[Transaction], now: u32) -> usize {
+        self.prune_orphans(now);
+        let mut retained = 0;
+        for transaction in transactions {
+            let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
+            if transaction.is_coinbase()
+                || transaction.weight().to_wu() > u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT)
+                || self
+                    .entries
+                    .iter()
+                    .any(|entry| entry.transaction.compute_txid() == txid)
+                || self.orphans.iter().any(|orphan| {
+                    orphan.transaction.compute_txid() == txid
+                        || orphan.transaction.compute_wtxid() == wtxid
+                })
+            {
+                continue;
+            }
+            let serialized_len = serialize(transaction).len();
+            if serialized_len > MAX_ORPHAN_TRANSACTION_BYTES {
+                continue;
+            }
+            while self.orphans.len() >= MAX_ORPHAN_TRANSACTIONS
+                || self.orphan_bytes.saturating_add(serialized_len) > MAX_ORPHAN_TRANSACTION_BYTES
+            {
+                let Some(removed) = self.orphans.pop_front() else {
+                    break;
+                };
+                self.orphan_bytes = self.orphan_bytes.saturating_sub(removed.serialized_len);
+            }
+            self.orphan_bytes = self.orphan_bytes.saturating_add(serialized_len);
+            self.orphans.push_back(OrphanTransaction {
+                transaction: transaction.clone(),
+                serialized_len,
+                expires_at: now.saturating_add(ORPHAN_EXPIRY_SECS),
+            });
+            retained += 1;
+        }
+        retained
+    }
+
+    /// Returns untried orphans directly spending any newly accepted parent.
+    #[must_use]
+    pub fn orphan_children(
+        &self,
+        parents: &BTreeSet<Txid>,
+        already_tried: &BTreeSet<Txid>,
+    ) -> Vec<Transaction> {
+        self.orphans
+            .iter()
+            .filter(|orphan| {
+                let txid = orphan.transaction.compute_txid();
+                !already_tried.contains(&txid)
+                    && orphan
+                        .transaction
+                        .input
+                        .iter()
+                        .any(|input| parents.contains(&input.previous_output.txid))
+            })
+            .map(|orphan| orphan.transaction.clone())
+            .collect()
+    }
+
+    /// Removes exact orphan IDs after successful admission or terminal rejection.
+    pub fn remove_orphans(&mut self, txids: &BTreeSet<Txid>) -> usize {
+        let before = self.orphans.len();
+        self.orphans
+            .retain(|orphan| !txids.contains(&orphan.transaction.compute_txid()));
+        self.orphan_bytes = self
+            .orphans
+            .iter()
+            .map(|orphan| orphan.serialized_len)
+            .sum();
+        before.saturating_sub(self.orphans.len())
     }
 
     /// Clones admitted transactions in oldest-to-newest order.
@@ -1499,6 +1627,72 @@ mod tests {
         pool.admit(&store, parent, context()).unwrap();
         pool.admit(&store, child, context()).unwrap();
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn orphan_pool_is_deduplicated_bounded_and_expires_at_twenty_minutes() {
+        let mut pool = TransactionAdmissionPool::default();
+        let transactions = (1_u8..=65).map(|index| spend(index).2).collect::<Vec<_>>();
+        let first_txid = transactions[0].compute_txid();
+        assert_eq!(pool.retain_orphans(&transactions, 100), 65);
+        assert_eq!(pool.orphan_len(), MAX_ORPHAN_TRANSACTIONS);
+        assert!(pool.orphan_bytes() <= MAX_ORPHAN_TRANSACTION_BYTES);
+        assert!(
+            !pool
+                .orphans
+                .iter()
+                .any(|orphan| orphan.transaction.compute_txid() == first_txid)
+        );
+        assert_eq!(pool.retain_orphans(&transactions[1..2], 200), 0);
+        assert_eq!(pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS - 1), 0);
+        assert_eq!(
+            pool.prune_orphans(100 + ORPHAN_EXPIRY_SECS),
+            MAX_ORPHAN_TRANSACTIONS
+        );
+        assert_eq!(pool.orphan_bytes(), 0);
+    }
+
+    #[test]
+    fn newly_admitted_parents_unlock_orphans_one_generation_at_a_time() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, parent) = spend(66);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let child_transaction = child(&parent, 80_000);
+        let grandchild = child(&child_transaction, 70_000);
+        let parent_txid = parent.compute_txid();
+        let child_txid = child_transaction.compute_txid();
+        let grandchild_txid = grandchild.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        assert_eq!(
+            pool.retain_orphans(&[grandchild.clone(), child_transaction.clone()], 100),
+            2
+        );
+
+        pool.admit(&store, parent, context()).unwrap();
+        let children = pool.orphan_children(&BTreeSet::from([parent_txid]), &BTreeSet::new());
+        assert_eq!(
+            children
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>(),
+            vec![child_txid]
+        );
+        pool.admit_package(&store, children, context()).unwrap();
+        pool.remove_orphans(&BTreeSet::from([child_txid]));
+
+        let grandchildren = pool.orphan_children(&BTreeSet::from([child_txid]), &BTreeSet::new());
+        assert_eq!(
+            grandchildren
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>(),
+            vec![grandchild_txid]
+        );
+        pool.admit_package(&store, grandchildren, context())
+            .unwrap();
+        pool.remove_orphans(&BTreeSet::from([grandchild_txid]));
+        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.orphan_len(), 0);
     }
 
     #[test]

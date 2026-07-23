@@ -1,7 +1,7 @@
 //! Command line entry point for the rBTC node daemon.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     env, fs,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
@@ -3099,66 +3099,99 @@ fn admit_pending_peer_transactions(
     let mut candidate = pool.clone();
     let expired_removed = candidate.remove_with_descendants(&expired);
     let reconciled_removed = candidate.reconcile(chainstate, context);
+    let expired_orphans = candidate.prune_orphans(now);
     let mut accepted_messages = Vec::new();
+    let mut deferred_messages = Vec::new();
     let mut rejected_messages = Vec::new();
     let mut accepted_for_relay = HashSet::new();
-    for package in dependency_packages(pending) {
-        let txids = package
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
-        match candidate.admit_package(chainstate, package, context) {
-            Ok(outcome) if !outcome.accepted.is_empty() => {
-                accepted_for_relay.extend(
-                    outcome
-                        .accepted
-                        .iter()
-                        .copied()
-                        .filter(|txid| !persisted_txids.contains(txid)),
-                );
-                let mut effects = Vec::new();
-                if outcome.replaced > 0 {
-                    effects.push(format!(
-                        "replacing {} BIP125 conflict{} or descendant{}",
-                        outcome.replaced,
-                        if outcome.replaced == 1 { "" } else { "s" },
-                        if outcome.replaced == 1 { "" } else { "s" }
-                    ));
-                }
-                if outcome.evicted > 0 {
-                    effects.push(format!(
-                        "evicting {} oldest entr{} or descendants",
-                        outcome.evicted,
-                        if outcome.evicted == 1 { "y" } else { "ies" }
-                    ));
-                }
-                accepted_messages.push(format!(
-                    "admitted peer transaction package [{}] into the bounded local pool{}",
-                    outcome
-                        .accepted
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if effects.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" after {}", effects.join(" and "))
+    let mut packages = VecDeque::from(dependency_packages(pending));
+    let mut accepted_parents = BTreeSet::new();
+    let mut tried_orphans = BTreeSet::new();
+    loop {
+        while let Some(package) = packages.pop_front() {
+            let retained_package = package.clone();
+            let txid_set = package
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<BTreeSet<_>>();
+            let txids = package
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>();
+            match candidate.admit_package(chainstate, package, context) {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    candidate.remove_orphans(&txid_set);
+                    accepted_parents.extend(outcome.accepted.iter().copied());
+                    accepted_for_relay.extend(
+                        outcome
+                            .accepted
+                            .iter()
+                            .copied()
+                            .filter(|txid| !persisted_txids.contains(txid)),
+                    );
+                    let mut effects = Vec::new();
+                    if outcome.replaced > 0 {
+                        effects.push(format!(
+                            "replacing {} BIP125 conflict{} or descendant{}",
+                            outcome.replaced,
+                            if outcome.replaced == 1 { "" } else { "s" },
+                            if outcome.replaced == 1 { "" } else { "s" }
+                        ));
                     }
-                ));
-            }
-            Ok(_) => {}
-            Err(error) => {
-                rejected_messages.push(format!(
-                    "rejected peer transaction package [{}]: {error}",
-                    txids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                    if outcome.evicted > 0 {
+                        effects.push(format!(
+                            "evicting {} oldest entr{} or descendants",
+                            outcome.evicted,
+                            if outcome.evicted == 1 { "y" } else { "ies" }
+                        ));
+                    }
+                    accepted_messages.push(format!(
+                        "admitted peer transaction package [{}] into the bounded local pool{}",
+                        outcome
+                            .accepted
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if effects.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" after {}", effects.join(" and "))
+                        }
+                    ));
+                }
+                Ok(_) => {
+                    candidate.remove_orphans(&txid_set);
+                }
+                Err(error) if error.is_missing_input() => {
+                    let retained = candidate.retain_orphans(&retained_package, now);
+                    if retained > 0 {
+                        deferred_messages.push(format!(
+                            "retained {retained} missing-parent peer transaction{} for bounded retry",
+                            if retained == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Err(error) => {
+                    candidate.remove_orphans(&txid_set);
+                    rejected_messages.push(format!(
+                        "rejected peer transaction package [{}]: {error}",
+                        txids
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
             }
         }
+        if accepted_parents.is_empty() {
+            break;
+        }
+        let triggers = std::mem::take(&mut accepted_parents);
+        let children = candidate.orphan_children(&triggers, &tried_orphans);
+        tried_orphans.extend(children.iter().map(Transaction::compute_txid));
+        packages.extend(dependency_packages(children));
     }
     if let Some(store) = transaction_store {
         store
@@ -3196,6 +3229,15 @@ fn admit_pending_peer_transactions(
         );
     }
     for message in accepted_messages {
+        println!("{message}");
+    }
+    if expired_orphans > 0 {
+        println!(
+            "expired {expired_orphans} missing-parent transaction{} after 20 minutes",
+            if expired_orphans == 1 { "" } else { "s" }
+        );
+    }
+    for message in deferred_messages {
         println!("{message}");
     }
     for message in rejected_messages {
