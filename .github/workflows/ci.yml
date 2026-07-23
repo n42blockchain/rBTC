@@ -30,7 +30,7 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.8.7
       - run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info --fail-under-lines 90
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: lcov-report
@@ -53,7 +53,7 @@ jobs:
       - run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check
       - name: Generate CycloneDX SBOM
         run: SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" cargo cyclonedx --all-features --format json --spec-version 1.5 --override-filename rbtc.cdx
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cyclonedx-sbom
           path: rbtc.cdx.json
