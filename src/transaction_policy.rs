@@ -1,6 +1,6 @@
 //! Local transaction relay policy kept separate from consensus validation.
 
-use bitcoin::{OutPoint, Transaction};
+use bitcoin::{OutPoint, Script, ScriptBuf, Transaction};
 use thiserror::Error;
 
 /// Core 26's minimum non-witness transaction size used by standardness policy.
@@ -11,6 +11,16 @@ pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 pub const MAX_STANDARD_OP_RETURN_SIZE: usize = 83;
 /// Default minimum relay fee used by the local wallet admission path.
 pub const DEFAULT_MIN_RELAY_FEE_SAT_VB: u64 = 1;
+/// Maximum accurate sigops in a standard P2SH redeem script.
+pub const MAX_STANDARD_P2SH_SIGOPS: usize = 15;
+/// Maximum witness script bytes in a standard P2WSH spend.
+pub const MAX_STANDARD_P2WSH_SCRIPT_SIZE: usize = 3_600;
+/// Maximum argument items before the witness script in a standard P2WSH spend.
+pub const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
+/// Maximum bytes in each P2WSH argument stack item.
+pub const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
+/// Maximum bytes in each tapscript argument stack item.
+pub const MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE: usize = 80;
 
 /// A transaction failed local relay policy after consensus verification.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -63,6 +73,53 @@ pub enum TransactionPolicyError {
     /// A transaction input conflicts with a locally retained transaction.
     #[error("input {0} conflicts with a locally retained transaction")]
     Conflict(OutPoint),
+    /// A spent output is not a standard input template.
+    #[error("input {0} spends a non-standard output script")]
+    InputScript(usize),
+    /// A P2SH input has no parseable final redeem-script push.
+    #[error("input {0} has no parseable P2SH redeem script")]
+    P2shRedeemScript(usize),
+    /// A P2SH redeem script exceeds the accurate sigop ceiling.
+    #[error("input {index} P2SH redeem script has {sigops} sigops; limit is {limit}")]
+    P2shSigops {
+        /// Zero-based input index.
+        index: usize,
+        /// Accurate redeem-script sigop count.
+        sigops: usize,
+        /// Standard policy ceiling.
+        limit: usize,
+    },
+    /// Witness data is attached to a non-witness input.
+    #[error("input {0} has witness data for a non-witness program")]
+    UnexpectedWitness(usize),
+    /// A P2WSH witness script exceeds the standard byte ceiling.
+    #[error("input {0} P2WSH script exceeds the standard size limit")]
+    WitnessScriptSize(usize),
+    /// A P2WSH witness has too many argument items.
+    #[error("input {0} P2WSH stack has too many items")]
+    WitnessStackItems(usize),
+    /// A P2WSH argument item exceeds the standard byte ceiling.
+    #[error("input {input} P2WSH stack item {item} exceeds the standard size limit")]
+    WitnessStackItemSize {
+        /// Zero-based input index.
+        input: usize,
+        /// Zero-based witness argument index.
+        item: usize,
+    },
+    /// Taproot annexes have no standard relay semantics.
+    #[error("input {0} contains a non-standard Taproot annex")]
+    TaprootAnnex(usize),
+    /// A Taproot script-path spend has an empty control block.
+    #[error("input {0} has an empty Taproot control block")]
+    TaprootControlBlock(usize),
+    /// A tapscript argument item exceeds the standard byte ceiling.
+    #[error("input {input} tapscript stack item {item} exceeds the standard size limit")]
+    TapscriptStackItemSize {
+        /// Zero-based input index.
+        input: usize,
+        /// Zero-based tapscript argument index.
+        item: usize,
+    },
 }
 
 /// Applies bounded Core-like relay policy to a consensus-verified transaction.
@@ -137,6 +194,114 @@ pub fn validate_standard_transaction(
     Ok(())
 }
 
+/// Applies Core 26 prevout-dependent input and witness standardness policy.
+pub fn validate_standard_inputs(
+    transaction: &Transaction,
+    prevout_scripts: &[ScriptBuf],
+) -> Result<(), TransactionPolicyError> {
+    for (index, input) in transaction.input.iter().enumerate() {
+        let prevout = prevout_scripts
+            .get(index)
+            .ok_or(TransactionPolicyError::InputScript(index))?;
+        if !(prevout.is_p2pk()
+            || prevout.is_p2pkh()
+            || prevout.is_p2sh()
+            || prevout.is_p2wpkh()
+            || prevout.is_p2wsh()
+            || prevout.is_p2tr()
+            || prevout.is_multisig())
+        {
+            return Err(TransactionPolicyError::InputScript(index));
+        }
+        let redeem_script = prevout
+            .is_p2sh()
+            .then(|| pushed_redeem_script(&input.script_sig, index))
+            .transpose()?;
+        if let Some(redeem_script) = &redeem_script {
+            let sigops = redeem_script.count_sigops();
+            if sigops > MAX_STANDARD_P2SH_SIGOPS {
+                return Err(TransactionPolicyError::P2shSigops {
+                    index,
+                    sigops,
+                    limit: MAX_STANDARD_P2SH_SIGOPS,
+                });
+            }
+        }
+        if input.witness.is_empty() {
+            continue;
+        }
+        let witness_program = redeem_script.as_deref().unwrap_or(prevout.as_script());
+        if !witness_program.is_witness_program() {
+            return Err(TransactionPolicyError::UnexpectedWitness(index));
+        }
+        if witness_program.is_p2wsh() {
+            let witness_script = input
+                .witness
+                .last()
+                .expect("non-empty witness has a final script");
+            if witness_script.len() > MAX_STANDARD_P2WSH_SCRIPT_SIZE {
+                return Err(TransactionPolicyError::WitnessScriptSize(index));
+            }
+            let arguments = input.witness.len().saturating_sub(1);
+            if arguments > MAX_STANDARD_P2WSH_STACK_ITEMS {
+                return Err(TransactionPolicyError::WitnessStackItems(index));
+            }
+            for (item, value) in input.witness.iter().take(arguments).enumerate() {
+                if value.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE {
+                    return Err(TransactionPolicyError::WitnessStackItemSize {
+                        input: index,
+                        item,
+                    });
+                }
+            }
+        }
+        if witness_program.is_p2tr() && !prevout.is_p2sh() {
+            let stack = input.witness.iter().collect::<Vec<_>>();
+            if stack.len() >= 2
+                && stack.last().is_some_and(|item| {
+                    item.first() == Some(&bitcoin::taproot::TAPROOT_ANNEX_PREFIX)
+                })
+            {
+                return Err(TransactionPolicyError::TaprootAnnex(index));
+            }
+            if stack.len() >= 2 {
+                let control = stack.last().expect("script path has a control block");
+                if control.is_empty() {
+                    return Err(TransactionPolicyError::TaprootControlBlock(index));
+                }
+                if control[0] & 0xfe == bitcoin::taproot::TAPROOT_LEAF_TAPSCRIPT {
+                    for (item, value) in stack[..stack.len() - 2].iter().enumerate() {
+                        if value.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE {
+                            return Err(TransactionPolicyError::TapscriptStackItemSize {
+                                input: index,
+                                item,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pushed_redeem_script(
+    script_sig: &Script,
+    input: usize,
+) -> Result<ScriptBuf, TransactionPolicyError> {
+    script_sig
+        .instructions()
+        .last()
+        .and_then(Result::ok)
+        .and_then(|instruction| match instruction {
+            bitcoin::script::Instruction::PushBytes(bytes) => {
+                Some(ScriptBuf::from_bytes(bytes.as_bytes().to_vec()))
+            }
+            bitcoin::script::Instruction::Op(_) => None,
+        })
+        .ok_or(TransactionPolicyError::P2shRedeemScript(input))
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::{
@@ -144,6 +309,7 @@ mod tests {
         absolute::LockTime,
         blockdata::{opcodes, script::Builder},
         hashes::Hash,
+        script::PushBytesBuf,
         transaction::Version,
     };
 
@@ -261,6 +427,128 @@ mod tests {
                 fee_sats: minimum - 1,
                 minimum_sats: minimum,
             })
+        );
+    }
+
+    #[test]
+    fn enforces_accurate_p2sh_sigop_limit() {
+        let mut transaction = standard_transaction();
+        transaction.input[0].witness = Witness::new();
+        for (sigops, expected) in [
+            (15, Ok(())),
+            (
+                16,
+                Err(TransactionPolicyError::P2shSigops {
+                    index: 0,
+                    sigops: 16,
+                    limit: MAX_STANDARD_P2SH_SIGOPS,
+                }),
+            ),
+        ] {
+            let redeem_script = Builder::new()
+                .push_int(sigops)
+                .push_opcode(opcodes::all::OP_CHECKMULTISIG)
+                .into_script();
+            let redeem_push = PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap();
+            transaction.input[0].script_sig = Builder::new().push_slice(redeem_push).into_script();
+            let prevout = ScriptBuf::new_p2sh(&redeem_script.script_hash());
+            assert_eq!(validate_standard_inputs(&transaction, &[prevout]), expected);
+        }
+    }
+
+    #[test]
+    fn enforces_p2wsh_script_stack_and_item_limits() {
+        let mut transaction = standard_transaction();
+        transaction.input[0].script_sig = ScriptBuf::new();
+        let witness_script = ScriptBuf::from_bytes(vec![0; MAX_STANDARD_P2WSH_SCRIPT_SIZE]);
+        let prevout = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        let boundary_items =
+            vec![vec![0; MAX_STANDARD_P2WSH_STACK_ITEM_SIZE]; MAX_STANDARD_P2WSH_STACK_ITEMS];
+        let mut witness = boundary_items.clone();
+        witness.push(witness_script.as_bytes().to_vec());
+        transaction.input[0].witness = Witness::from_slice(&witness);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Ok(())
+        );
+
+        let mut too_many = boundary_items.clone();
+        too_many.push(Vec::new());
+        too_many.push(witness_script.as_bytes().to_vec());
+        transaction.input[0].witness = Witness::from_slice(&too_many);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::WitnessStackItems(0))
+        );
+
+        transaction.input[0].witness = Witness::from_slice(&[
+            vec![0; MAX_STANDARD_P2WSH_STACK_ITEM_SIZE + 1],
+            witness_script.as_bytes().to_vec(),
+        ]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::WitnessStackItemSize { input: 0, item: 0 })
+        );
+
+        let oversized_script = ScriptBuf::from_bytes(vec![0; MAX_STANDARD_P2WSH_SCRIPT_SIZE + 1]);
+        transaction.input[0].witness = Witness::from_slice(&[oversized_script.as_bytes().to_vec()]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, &[prevout]),
+            Err(TransactionPolicyError::WitnessScriptSize(0))
+        );
+    }
+
+    #[test]
+    fn rejects_taproot_annex_and_oversized_tapscript_arguments() {
+        let mut transaction = standard_transaction();
+        transaction.input[0].script_sig = ScriptBuf::new();
+        let mut program = vec![0x51, 0x20];
+        program.extend([2; 32]);
+        let prevout = ScriptBuf::from_bytes(program);
+        assert!(prevout.is_p2tr());
+
+        transaction.input[0].witness = Witness::from_slice(&[vec![1], vec![0x50]]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::TaprootAnnex(0))
+        );
+
+        transaction.input[0].witness = Witness::from_slice(&[vec![0x51], Vec::new()]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::TaprootControlBlock(0))
+        );
+
+        transaction.input[0].witness = Witness::from_slice(&[
+            vec![0; MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE + 1],
+            vec![0x51],
+            vec![bitcoin::taproot::TAPROOT_LEAF_TAPSCRIPT],
+        ]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, &[prevout]),
+            Err(TransactionPolicyError::TapscriptStackItemSize { input: 0, item: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_nonstandard_prevouts_and_unexpected_witness_data() {
+        let transaction = standard_transaction();
+        let nonstandard = Builder::new()
+            .push_opcode(opcodes::all::OP_DUP)
+            .into_script();
+        assert_eq!(
+            validate_standard_inputs(&transaction, &[nonstandard]),
+            Err(TransactionPolicyError::InputScript(0))
+        );
+
+        let bare_key = Builder::new()
+            .push_slice([2; 33])
+            .push_opcode(opcodes::all::OP_CHECKSIG)
+            .into_script();
+        assert!(bare_key.is_p2pk());
+        assert_eq!(
+            validate_standard_inputs(&transaction, &[bare_key]),
+            Err(TransactionPolicyError::UnexpectedWitness(0))
         );
     }
 }

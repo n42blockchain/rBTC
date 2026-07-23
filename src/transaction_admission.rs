@@ -9,13 +9,17 @@ use std::{
     sync::Mutex,
 };
 
-use bitcoin::{BlockHash, OutPoint, Transaction, Txid, Wtxid, consensus::encode::serialize};
+use bitcoin::{
+    BlockHash, OutPoint, ScriptBuf, Transaction, Txid, Wtxid, consensus::encode::serialize,
+};
 use rand::Rng;
 use thiserror::Error;
 
 use crate::{
     chainstate::{ChainstateError, apply_transaction_with_context},
-    transaction_policy::{TransactionPolicyError, validate_standard_transaction},
+    transaction_policy::{
+        TransactionPolicyError, validate_standard_inputs, validate_standard_transaction,
+    },
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -1097,6 +1101,18 @@ fn apply_to_overlay<S: UtxoStore>(
     transaction: &Transaction,
     context: TransactionAdmissionContext,
 ) -> Result<u64, TransactionAdmissionError> {
+    let prevout_scripts = transaction
+        .input
+        .iter()
+        .map(|input| {
+            let outpoint = OutPointKey::from(input.previous_output);
+            overlay
+                .get(outpoint)
+                .map_err(ChainstateError::from)?
+                .ok_or(ChainstateError::Utxo(UtxoError::Missing(outpoint)))
+                .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey))
+        })
+        .collect::<Result<Vec<_>, ChainstateError>>()?;
     let applied = apply_transaction_with_context(
         overlay,
         transaction,
@@ -1112,6 +1128,7 @@ fn apply_to_overlay<S: UtxoStore>(
         .checked_sub(applied.output_value_sats)
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction(transaction, fee_sats)?;
+    validate_standard_inputs(transaction, &prevout_scripts)?;
     Ok(fee_sats)
 }
 
@@ -1456,6 +1473,33 @@ mod tests {
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert_eq!(pool.len(), 1);
         assert!(pool.retained_bytes() > 0);
+    }
+
+    #[test]
+    fn input_policy_rejection_does_not_mutate_chainstate_or_pool() {
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut transaction) = spend(86);
+        let witness_script = Builder::new()
+            .push_opcode(opcodes::all::OP_DROP)
+            .push_opcode(opcodes::OP_TRUE)
+            .into_script();
+        utxo.script_pubkey = ScriptBuf::new_p2wsh(&witness_script.wscript_hash()).into_bytes();
+        transaction.input[0].witness = Witness::from_slice(&[
+            vec![0; crate::transaction_policy::MAX_STANDARD_P2WSH_STACK_ITEM_SIZE + 1],
+            witness_script.as_bytes().to_vec(),
+        ]);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit(&store, transaction, context()),
+            Err(TransactionAdmissionError::Policy(
+                TransactionPolicyError::WitnessStackItemSize { input: 0, item: 0 }
+            ))
+        ));
+        assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+        assert!(pool.is_empty());
+        assert_eq!(pool.retained_bytes(), 0);
     }
 
     #[test]
