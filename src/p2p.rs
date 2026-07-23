@@ -38,6 +38,8 @@ const MAX_PENDING_MESSAGE_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 /// Maximum unsolicited transactions retained from one peer between admission passes.
 pub const MAX_PENDING_TRANSACTIONS: usize = 64;
 const MAX_PENDING_TRANSACTION_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
+const MAX_ANNOUNCED_TRANSACTIONS: usize = 64;
+const MAX_ANNOUNCED_TRANSACTION_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
@@ -494,26 +496,33 @@ impl CompactBlockReconstruction {
 pub struct PeerSession<S> {
     transport: V1Transport<S>,
     remote_version: VersionMessage,
+    wtxid_relay: bool,
     compact_block_version: Option<u64>,
     requested_compact_blocks: bool,
     pending_messages: VecDeque<(NetworkMessage, usize)>,
     pending_message_bytes: usize,
     pending_transactions: VecDeque<(Transaction, usize)>,
     pending_transaction_bytes: usize,
+    announced_transactions: VecDeque<(Inventory, Transaction, usize)>,
+    announced_transaction_bytes: usize,
     block_transfer_stats: BlockTransferStats,
 }
 
 impl<S> PeerSession<S> {
     fn new(transport: V1Transport<S>, remote_version: VersionMessage) -> Self {
+        let wtxid_relay = transport.peer_wtxid_relay;
         Self {
             transport,
             remote_version,
+            wtxid_relay,
             compact_block_version: None,
             requested_compact_blocks: false,
             pending_messages: VecDeque::new(),
             pending_message_bytes: 0,
             pending_transactions: VecDeque::new(),
             pending_transaction_bytes: 0,
+            announced_transactions: VecDeque::new(),
+            announced_transaction_bytes: 0,
             block_transfer_stats: BlockTransferStats::default(),
         }
     }
@@ -574,6 +583,7 @@ pub struct V1Transport<S> {
     stream: S,
     magic: Magic,
     max_payload_len: u32,
+    peer_wtxid_relay: bool,
 }
 
 impl<S> V1Transport<S> {
@@ -584,6 +594,7 @@ impl<S> V1Transport<S> {
             stream,
             magic,
             max_payload_len: MAX_PROTOCOL_MESSAGE_LEN,
+            peer_wtxid_relay: false,
         }
     }
 
@@ -694,6 +705,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
                     }
                     received_verack = true;
                 }
+                NetworkMessage::WtxidRelay
+                    if remote_version
+                        .as_ref()
+                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+                {
+                    self.peer_wtxid_relay = true;
+                }
                 NetworkMessage::Ping(nonce) => {
                     self.write_message(NetworkMessage::Pong(nonce)).await?;
                 }
@@ -711,6 +729,72 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
+    fn validate_outbound_transaction(transaction: &Transaction) -> Result<(), P2pError> {
+        if transaction.is_coinbase() {
+            return Err(P2pError::OutboundCoinbaseTransaction);
+        }
+        let weight = transaction.weight().to_wu();
+        let limit = u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT);
+        if weight > limit {
+            return Err(P2pError::OutboundTransactionTooHeavy { weight, limit });
+        }
+        Ok(())
+    }
+
+    fn transaction_inventory(&self, transaction: &Transaction) -> Inventory {
+        if self.wtxid_relay {
+            Inventory::WTx(transaction.compute_wtxid())
+        } else {
+            Inventory::Transaction(transaction.compute_txid())
+        }
+    }
+
+    fn inventory_matches(announced: Inventory, requested: Inventory) -> bool {
+        match (announced, requested) {
+            (Inventory::WTx(announced), Inventory::WTx(requested)) => announced == requested,
+            (
+                Inventory::Transaction(announced),
+                Inventory::Transaction(requested) | Inventory::WitnessTransaction(requested),
+            ) => announced == requested,
+            _ => false,
+        }
+    }
+
+    async fn serve_transaction_requests(
+        &mut self,
+        requests: Vec<Inventory>,
+    ) -> Result<(), P2pError> {
+        let mut served = HashSet::new();
+        let mut transactions = Vec::new();
+        let mut not_found = Vec::new();
+        for request in requests {
+            if !served.insert(request) {
+                continue;
+            }
+            let transaction = self
+                .announced_transactions
+                .iter()
+                .find(|(announced, _, _)| Self::inventory_matches(*announced, request))
+                .map(|(_, transaction, _)| transaction.clone());
+            if let Some(transaction) = transaction {
+                transactions.push(transaction);
+            } else if request != Inventory::Error {
+                not_found.push(request);
+            }
+        }
+        for transaction in transactions {
+            self.transport
+                .write_message(NetworkMessage::Tx(transaction))
+                .await?;
+        }
+        if !not_found.is_empty() {
+            self.transport
+                .write_message(NetworkMessage::NotFound(not_found))
+                .await?;
+        }
+        Ok(())
+    }
+
     fn retain_pending_transaction(&mut self, transaction: Transaction, payload_len: usize) {
         if payload_len > MAX_PENDING_TRANSACTION_BYTES {
             return;
@@ -755,6 +839,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 self.transport
                     .write_message(NetworkMessage::Pong(nonce))
                     .await?;
+                Ok(None)
+            }
+            NetworkMessage::GetData(requests) if !self.announced_transactions.is_empty() => {
+                self.serve_transaction_requests(requests).await?;
                 Ok(None)
             }
             NetworkMessage::Version(_) => Err(P2pError::PostHandshakeVersion),
@@ -852,17 +940,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         &mut self,
         transaction: &Transaction,
     ) -> Result<(), P2pError> {
-        if transaction.is_coinbase() {
-            return Err(P2pError::OutboundCoinbaseTransaction);
-        }
-        let weight = transaction.weight().to_wu();
-        let limit = u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT);
-        if weight > limit {
-            return Err(P2pError::OutboundTransactionTooHeavy { weight, limit });
-        }
+        Self::validate_outbound_transaction(transaction)?;
         self.transport
             .write_message(NetworkMessage::Tx(transaction.clone()))
             .await
+    }
+
+    /// Announces one transaction and services a peer's optional `getdata` request.
+    ///
+    /// The announcement uses BIP339 wtxid inventory when both peers negotiated it,
+    /// otherwise it uses legacy txid inventory while accepting a witness-aware
+    /// `getdata` request. A bounded ping completes the exchange without treating a
+    /// peer that already has the transaction as a failure. Repeated announcements
+    /// of the same retained transaction are suppressed.
+    pub async fn relay_transaction(
+        &mut self,
+        transaction: &Transaction,
+        ping_nonce: u64,
+    ) -> Result<(), P2pError> {
+        Self::validate_outbound_transaction(transaction)?;
+        let inventory = self.transaction_inventory(transaction);
+        if !self
+            .announced_transactions
+            .iter()
+            .any(|(announced, _, _)| *announced == inventory)
+        {
+            let payload_len = serialize(transaction).len();
+            while self.announced_transactions.len() >= MAX_ANNOUNCED_TRANSACTIONS
+                || self.announced_transaction_bytes.saturating_add(payload_len)
+                    > MAX_ANNOUNCED_TRANSACTION_BYTES
+            {
+                let Some((_, _, removed_len)) = self.announced_transactions.pop_front() else {
+                    break;
+                };
+                self.announced_transaction_bytes = self
+                    .announced_transaction_bytes
+                    .checked_sub(removed_len)
+                    .expect("queued transaction charge matches announced byte total");
+            }
+            self.announced_transactions
+                .push_back((inventory, transaction.clone(), payload_len));
+            self.announced_transaction_bytes = self
+                .announced_transaction_bytes
+                .checked_add(payload_len)
+                .expect("bounded announced transaction payload total fits usize");
+            self.transport
+                .write_message(NetworkMessage::Inv(vec![inventory]))
+                .await?;
+        }
+        self.ping(ping_nonce).await
     }
 
     /// Reads the next application message, answering P2P keepalive pings.
@@ -1396,6 +1522,13 @@ mod tests {
         block.txdata.push(second);
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         block
+    }
+
+    fn relay_test_transaction() -> Transaction {
+        let mut transaction =
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].clone();
+        transaction.input[0].previous_output.vout = 0;
+        transaction
     }
 
     #[test]
@@ -2635,6 +2768,181 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_transaction_relay_announces_txid_and_serves_witness_request() {
+        let transaction = relay_test_transaction();
+        let txid = transaction.compute_txid();
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let expected = transaction.clone();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.relay_transaction(&transaction, 41).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![Inventory::Transaction(txid)])
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(41)
+            );
+            transport
+                .write_message(NetworkMessage::GetData(vec![
+                    Inventory::WitnessTransaction(txid),
+                ]))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(41))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wtxid_relay_services_getdata_and_preserves_crossed_messages() {
+        let transaction = relay_test_transaction();
+        let inventory = Inventory::WTx(transaction.compute_wtxid());
+        let unknown = Inventory::Transaction(bitcoin::Txid::from_byte_array([9; 32]));
+        let expected = transaction.clone();
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
+            transport.peer_wtxid_relay = true;
+            let mut session = PeerSession::new(transport, version(1));
+            session.relay_transaction(&transaction, 42).await.unwrap();
+            session.read_message().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![inventory])
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(42)
+            );
+            transport
+                .write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::GetData(vec![inventory, unknown]))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::NotFound(vec![unknown])
+            );
+            transport
+                .write_message(NetworkMessage::Pong(42))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(client.await.unwrap(), NetworkMessage::Headers(Vec::new()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn uninterested_peer_completes_relay_and_duplicate_inv_is_suppressed() {
+        let transaction = relay_test_transaction();
+        let inventory = Inventory::Transaction(transaction.compute_txid());
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.relay_transaction(&transaction, 43).await.unwrap();
+            session.relay_transaction(&transaction, 44).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![inventory])
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(43)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(43))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(44)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(44))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_relay_rejects_oversized_getdata_before_serving() {
+        let transaction = relay_test_transaction();
+        let inventory = Inventory::Transaction(transaction.compute_txid());
+        let (client_stream, server_stream) = duplex(4 * 1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.relay_transaction(&transaction, 45).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(_)
+            ));
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(45)
+            );
+            transport
+                .write_message(NetworkMessage::GetData(vec![
+                    inventory;
+                    MAX_INVENTORY_ENTRIES + 1
+                ]))
+                .await
+                .unwrap();
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::TooManyInventoryEntries {
+                command: "getdata",
+                count
+            }) if count == MAX_INVENTORY_ENTRIES + 1
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

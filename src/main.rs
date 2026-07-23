@@ -1995,7 +1995,9 @@ async fn maintain_standby(
             StandbyAction::Relay(Ok(transaction)) => {
                 timeout(
                     PEER_TIMEOUT,
-                    connected.session.broadcast_transaction(&transaction),
+                    connected
+                        .session
+                        .relay_transaction(&transaction, ping_nonce),
                 )
                 .await
                 .map_err(|_| {
@@ -2005,6 +2007,7 @@ async fn maintain_standby(
                     ))
                 })?
                 .map_err(|error| PeerRunError::p2p(&error))?;
+                ping_nonce = ping_nonce.wrapping_add(1);
             }
             StandbyAction::Relay(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                 return Err(PeerRunError::transient(format!(
@@ -5394,6 +5397,9 @@ mod tests {
             .await
             .unwrap();
         receive_client_negotiation(&mut peer).await;
+        peer.write_message(NetworkMessage::WtxidRelay)
+            .await
+            .unwrap();
         peer.write_message(NetworkMessage::Verack).await.unwrap();
         (peer, local_version)
     }
@@ -5779,10 +5785,25 @@ mod tests {
     async fn expect_standby_transaction(listener: TcpListener, expected: Transaction) {
         let (mut peer, _) = accept_peer(listener, peer_version(rand::random())).await;
         receive_client_preferences(&mut peer).await;
+        let expected_inventory =
+            bitcoin::p2p::message_blockdata::Inventory::WTx(expected.compute_wtxid());
+        assert_eq!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Inv(vec![expected_inventory])
+        );
+        let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload() else {
+            panic!("expected transaction relay ping");
+        };
+        peer.write_message(NetworkMessage::GetData(vec![expected_inventory]))
+            .await
+            .unwrap();
         assert_eq!(
             peer.read_message().await.unwrap().into_payload(),
             NetworkMessage::Tx(expected)
         );
+        peer.write_message(NetworkMessage::Pong(nonce))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
