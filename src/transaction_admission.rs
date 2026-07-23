@@ -37,6 +37,8 @@ pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 pub const ROLLING_FEE_HALFLIFE_SECS: u32 = 12 * 60 * 60;
 const SATOSHIS_PER_KVB: u64 = 1_000;
 const DEFAULT_BYTES_PER_SIGOP: usize = 20;
+/// Core 26's per-transaction standard sigop cost ceiling.
+pub const MAX_STANDARD_TRANSACTION_SIGOP_COST: u64 = 16_000;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
@@ -205,6 +207,14 @@ pub enum TransactionAdmissionError {
         fee_sats: u64,
         /// Fee required at the current rolling rate.
         minimum_sats: u64,
+    },
+    /// A transaction exceeds Core's standard per-transaction sigop budget.
+    #[error("transaction sigop cost {cost} exceeds standard limit {limit}")]
+    TooManySigops {
+        /// Consensus-derived transaction sigop cost.
+        cost: u64,
+        /// Standard policy ceiling.
+        limit: u64,
     },
 }
 
@@ -1143,6 +1153,12 @@ fn apply_to_overlay<S: UtxoStore>(
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction(transaction, fee_sats)?;
     validate_standard_inputs(transaction, &prevout_scripts)?;
+    if applied.sigop_cost > MAX_STANDARD_TRANSACTION_SIGOP_COST {
+        return Err(TransactionAdmissionError::TooManySigops {
+            cost: applied.sigop_cost,
+            limit: MAX_STANDARD_TRANSACTION_SIGOP_COST,
+        });
+    }
     Ok(AppliedAdmission {
         fee_sats,
         policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
@@ -1585,6 +1601,66 @@ mod tests {
         ));
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn standard_transaction_sigop_cost_is_capped_atomically() {
+        let (_directory, store) = store();
+        let mut builder = Builder::new().push_int(0).push_opcode(opcodes::all::OP_IF);
+        for _ in 0..198 {
+            builder = builder.push_opcode(opcodes::all::OP_CHECKMULTISIG);
+        }
+        let witness_script = builder
+            .push_opcode(opcodes::all::OP_ENDIF)
+            .push_opcode(opcodes::OP_TRUE)
+            .into_script();
+        let script_pubkey = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        let mut created = Vec::new();
+        let mut inputs = Vec::new();
+        for index in 90..95 {
+            let outpoint = OutPoint::new(Txid::from_byte_array([index; 32]), 0);
+            created.push((
+                outpoint.into(),
+                Utxo {
+                    value_sats: 100_000,
+                    height: 1,
+                    is_coinbase: false,
+                    last_touched: 0,
+                    creation_mtp: 1,
+                    script_pubkey: script_pubkey.clone().into_bytes(),
+                },
+            ));
+            inputs.push(TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[witness_script.as_bytes()]),
+            });
+        }
+        store.apply(&[], &created).unwrap();
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: vec![TxOut {
+                value: Amount::from_sat(350_000),
+                script_pubkey,
+            }],
+        };
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert_eq!(transaction_policy_vsize(&transaction, 19_800), 99_000);
+        assert!(matches!(
+            pool.admit(&store, transaction, context()),
+            Err(TransactionAdmissionError::TooManySigops {
+                cost: 19_800,
+                limit: MAX_STANDARD_TRANSACTION_SIGOP_COST,
+            })
+        ));
+        assert!(pool.is_empty());
+        for (outpoint, _) in created {
+            assert!(store.get(outpoint).unwrap().is_some());
+        }
     }
 
     #[test]
