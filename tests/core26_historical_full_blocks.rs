@@ -9,6 +9,7 @@ use std::{
 use bitcoin::{Block, Network, Txid, consensus::deserialize, hex::FromHex};
 use rbtc::{
     blockchain::{BlockError, apply_block_with_deployments},
+    chainstate::{COINBASE_MATURITY, ChainstateError},
     deployments::block_deployment_context,
     utxo::{OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -54,6 +55,7 @@ struct ActivationCase {
     block: &'static [u8],
     utxos: &'static [u8],
     expected_utxos: usize,
+    expected_coinbase_origins: usize,
 }
 
 fn cases() -> [ActivationCase; 5] {
@@ -66,6 +68,7 @@ fn cases() -> [ActivationCase; 5] {
             block: BIP65_BLOCK,
             utxos: BIP65_UTXOS,
             expected_utxos: 1_576,
+            expected_coinbase_origins: 5,
         },
         ActivationCase {
             name: "CSV",
@@ -75,6 +78,7 @@ fn cases() -> [ActivationCase; 5] {
             block: CSV_BLOCK,
             utxos: CSV_UTXOS,
             expected_utxos: 4_398,
+            expected_coinbase_origins: 0,
         },
         ActivationCase {
             name: "SegWit",
@@ -84,6 +88,7 @@ fn cases() -> [ActivationCase; 5] {
             block: SEGWIT_BLOCK,
             utxos: SEGWIT_UTXOS,
             expected_utxos: 4_897,
+            expected_coinbase_origins: 2,
         },
         ActivationCase {
             name: "Taproot",
@@ -93,6 +98,7 @@ fn cases() -> [ActivationCase; 5] {
             block: TAPROOT_BLOCK,
             utxos: TAPROOT_UTXOS,
             expected_utxos: 6_303,
+            expected_coinbase_origins: 1,
         },
         ActivationCase {
             name: "Taproot exception",
@@ -102,6 +108,7 @@ fn cases() -> [ActivationCase; 5] {
             block: TAPROOT_EXCEPTION_BLOCK,
             utxos: TAPROOT_EXCEPTION_UTXOS,
             expected_utxos: 6_157,
+            expected_coinbase_origins: 0,
         },
     ]
 }
@@ -300,6 +307,36 @@ fn assert_complete_external_view(
     );
 }
 
+fn assert_exact_origin_metadata(case: &ActivationCase, entries: &BTreeMap<OutPointKey, Utxo>) {
+    assert_eq!(
+        entries.values().filter(|utxo| utxo.is_coinbase).count(),
+        case.expected_coinbase_origins,
+        "{} coinbase origins",
+        case.name
+    );
+    for (outpoint, utxo) in entries {
+        assert!(
+            (1..case.height).contains(&utxo.height),
+            "{} {outpoint} has invalid origin height {}",
+            case.name,
+            utxo.height
+        );
+        assert!(
+            (1..=case.parent_mtp).contains(&utxo.creation_mtp),
+            "{} {outpoint} has invalid origin parent MTP {}",
+            case.name,
+            utxo.creation_mtp
+        );
+        if utxo.is_coinbase {
+            assert!(
+                case.height >= utxo.height.saturating_add(COINBASE_MATURITY),
+                "{} {outpoint} spends an immature fixture coinbase",
+                case.name
+            );
+        }
+    }
+}
+
 fn execute(
     case: &ActivationCase,
     block: &Block,
@@ -367,6 +404,7 @@ fn complete_mainnet_activation_blocks_execute_and_undo_from_external_utxos() {
         transaction_count += block.txdata.len();
         external_utxo_count += before.len();
         assert_complete_external_view(&case, &block, &before);
+        assert_exact_origin_metadata(&case, &before);
         let store = MemoryUtxoStore::from_entries(before.clone());
         let applied = execute(&case, &block, &store).unwrap_or_else(|error| {
             panic!("{} activation block execution failed: {error}", case.name)
@@ -382,6 +420,92 @@ fn complete_mainnet_activation_blocks_execute_and_undo_from_external_utxos() {
     }
     assert_eq!(transaction_count, 8_997);
     assert_eq!(external_utxo_count, 23_331);
+}
+
+#[test]
+fn exact_coinbase_origin_rejects_a_spend_one_block_before_maturity() {
+    let (case, block, mut before, outpoint) = cases()
+        .into_iter()
+        .find_map(|case| {
+            let block = block(&case);
+            let before = utxos(&case, &block);
+            let outpoint = before
+                .iter()
+                .find_map(|(outpoint, utxo)| utxo.is_coinbase.then_some(*outpoint))?;
+            Some((case, block, before, outpoint))
+        })
+        .expect("at least one historical block spends an external coinbase");
+    before.get_mut(&outpoint).unwrap().height = case.height - (COINBASE_MATURITY - 1);
+    let store = MemoryUtxoStore::from_entries(before.clone());
+    assert!(matches!(
+        execute(&case, &block, &store),
+        Err(BlockError::Transaction {
+            source: ChainstateError::ImmatureCoinbase {
+                outpoint: rejected,
+                matures_at,
+            },
+            ..
+        }) if rejected == outpoint && matures_at == case.height + 1
+    ));
+    assert_eq!(store.snapshot_entries().unwrap(), before);
+}
+
+#[test]
+fn exact_bip68_origin_height_drives_the_relative_lock_boundary() {
+    let (case, block, mut before, transaction_index, outpoint, relative) = cases()
+        .into_iter()
+        .filter(|case| case.height >= 419_328)
+        .find_map(|case| {
+            let block = block(&case);
+            let before = utxos(&case, &block);
+            let mut candidate = None;
+            for (index, transaction) in block.txdata.iter().enumerate().skip(1) {
+                if transaction.version.0 < 2 {
+                    continue;
+                }
+                for input in &transaction.input {
+                    let outpoint = OutPointKey::from(input.previous_output);
+                    let Some(utxo) = before.get(&outpoint) else {
+                        continue;
+                    };
+                    let sequence = input.sequence;
+                    let relative = sequence.to_consensus_u32() & 0x0000_FFFF;
+                    if sequence.is_relative_lock_time()
+                        && sequence.is_height_locked()
+                        && relative > 0
+                        && case.height >= utxo.height.saturating_add(relative)
+                    {
+                        let slack = case
+                            .height
+                            .saturating_sub(utxo.height.saturating_add(relative));
+                        if candidate
+                            .as_ref()
+                            .is_none_or(|(_, _, _, best_slack)| slack < *best_slack)
+                        {
+                            candidate = Some((index, outpoint, relative, slack));
+                        }
+                    }
+                }
+            }
+            let (transaction_index, outpoint, relative, _) = candidate?;
+            Some((case, block, before, transaction_index, outpoint, relative))
+        })
+        .expect("a historical complete block has a height-relative external spend");
+    before.get_mut(&outpoint).unwrap().height = case.height - relative + 1;
+    let store = MemoryUtxoStore::from_entries(before.clone());
+    assert!(matches!(
+        execute(&case, &block, &store),
+        Err(BlockError::Transaction {
+            index,
+            source: ChainstateError::RelativeHeightLock {
+                outpoint: rejected,
+                minimum_height,
+            },
+        }) if index == transaction_index
+            && rejected == outpoint
+            && minimum_height == case.height
+    ));
+    assert_eq!(store.snapshot_entries().unwrap(), before);
 }
 
 #[test]

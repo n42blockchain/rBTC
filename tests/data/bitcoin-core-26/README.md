@@ -50,20 +50,32 @@ The `.utxos.json.zst` files are compact minimal external UTXO views generated
 from the same Esplora block transaction responses. Tests prove that their keys
 are exactly the non-coinbase inputs not created earlier in the same block. They
 provide every amount and script needed for full script, fee, sigop, lock-time,
-and block-undo execution. Real creation heights are retained for every input
-that enables BIP68; no fixture has a time-relative input. Other heights and all
-coinbase-origin flags are deliberately normalized because these views are
-activation regression corpora, not substitutes for prior chainstate. Coinbase
-maturity is covered independently. The three smaller authenticated transaction
-fixtures below provide raw-prev-tx/Merkle evidence for representative amounts
-and scripts. Snapshot digests are:
+and block-undo execution. Every entry carries its exact origin height, the
+origin block's parent median-time-past, and whether its creating transaction was
+coinbase. `scripts/enrich-historical-utxos.py` reconstructs those fields from
+Esplora Merkle proofs and block metadata, verifies every proof against its
+origin block's Merkle root, reconstructs every referenced header to verify its
+hash and claimed proof of work, verifies the 11-header ancestry window,
+recomputes the parent median-time-past, and refuses to change any previously
+pinned BIP68 height. The ignored
+`target/historical-utxo-metadata` cache makes rebuilds resumable:
+
+```sh
+scripts/enrich-historical-utxos.py --api https://mempool.space/api --jobs 16
+scripts/enrich-historical-utxos.py --api https://mempool.space/api --verify-only
+```
+
+These compact views are activation regression corpora, not substitutes for
+prior chainstate. The three smaller authenticated transaction fixtures below
+provide raw-prev-tx/Merkle evidence for representative amounts and scripts.
+Snapshot digests are:
 
 ```text
-fa39d1ca6f696edc2f5dd77ac734c8996077f4690db6d4357db6ec818370ac7b  mainnet-000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0.utxos.json.zst
-d0096fefee718fb02f8a9f8288db048d460820b9f8729e41244f573e9bdaa51c  mainnet-000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5.utxos.json.zst
-e285c24f2e99ac30ea964d98151cc6d8743788c60aa1d1e1a856c6eeaf481c05  mainnet-0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893.utxos.json.zst
-b8551489f6d956455febc740866e1142d6f8932576aa136efb11da1b6f2e3419  mainnet-0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad.utxos.json.zst
-bebfab849ab705e5c2356c363af43ae6d0e76a5ad68defacbae3b79a8dfce45f  mainnet-0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244.utxos.json.zst
+c4a61807a51026482582eae639b4ea6d6336acfbeefe3759fd5f527d523f0eb1  mainnet-000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0.utxos.json.zst
+2644f0d29a419b9301413ef20c14bd50da30859ba1fd257af3e8ae0d6627b649  mainnet-000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5.utxos.json.zst
+a0498cb52b230da6a3e9fc2f4c8125a0cb06b5a4a577cd33915ef9cf32564280  mainnet-0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893.utxos.json.zst
+d970beddc7492a90ae73a3c2bfb336cab544918c1ff0f943e503c26f8f2492fa  mainnet-0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad.utxos.json.zst
+61b2d71641a93a43718efaf98aa8588c6ab8805abbbff1dbf8a7ff4bb17d19b0  mainnet-0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244.utxos.json.zst
 ```
 
 `authenticated-historical-transactions.json` contains a real SegWit activation
