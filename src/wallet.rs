@@ -18,9 +18,15 @@ use bdk_wallet::{
     miniscript::{Descriptor, DescriptorPublicKey},
     psbt::PsbtUtils,
     rusqlite::{Connection, OptionalExtension, params},
+    signer::SignOptions,
 };
-use bitcoin::{Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, ScriptBuf, Txid};
+use bitcoin::{
+    Address, Amount, Block, BlockHash, EcdsaSighashType, FeeRate, Network, OutPoint, Psbt,
+    ScriptBuf, TapSighashType, Txid, consensus::serialize, hex::DisplayHex,
+};
 use thiserror::Error;
+
+use crate::{consensus::verify_transaction_scripts_with_flags, utxo::Utxo};
 
 /// BIP44-style default number of consecutive unused scripts to scan.
 pub const DEFAULT_WALLET_GAP_LIMIT: u32 = 20;
@@ -30,6 +36,8 @@ pub const MAX_WALLET_GAP_LIMIT: u32 = 1_000;
 pub const MAX_WALLET_DESCRIPTOR_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum accepted wallet PSBT creation request body.
 pub const MAX_WALLET_PSBT_REQUEST_BYTES: usize = 32 * 1024;
+/// Maximum accepted JSON body containing an externally signed PSBT.
+pub const MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES: usize = 768 * 1024;
 /// Maximum recipients in one wallet-created PSBT.
 pub const MAX_WALLET_PSBT_RECIPIENTS: usize = 16;
 /// Maximum wallet inputs considered or explicitly selected for one PSBT.
@@ -179,6 +187,31 @@ pub struct WalletPsbt {
     pub output_count: u32,
 }
 
+/// Strict request containing one externally signed, non-final PSBT.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletPsbtFinalizeRequest {
+    /// Base64 BIP174 PSBT created by this watch-only wallet and signed elsewhere.
+    pub psbt: String,
+}
+
+/// Fully signed transaction verified by the pinned Bitcoin Core script engine.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletFinalizedTransaction {
+    /// Base64 BIP174 object with final script fields populated.
+    pub psbt: String,
+    /// Consensus-encoded transaction in lowercase hexadecimal.
+    pub transaction_hex: String,
+    /// Legacy transaction identifier.
+    pub txid: String,
+    /// Witness transaction identifier.
+    pub wtxid: String,
+    /// Exact fee derived from current wallet prevouts.
+    pub fee_sats: u64,
+    /// Final virtual transaction size.
+    pub vbytes: u64,
+}
+
 /// Parses one strict, size-bounded unsigned-PSBT creation request.
 ///
 /// Semantic address/network, amount, fee, and coin-control checks run inside
@@ -190,6 +223,17 @@ pub fn parse_wallet_psbt_request(input: &[u8]) -> Result<WalletPsbtRequest, Wall
     }
     serde_json::from_slice(input)
         .map_err(|_| WalletError::Psbt("expected the documented strict JSON object"))
+}
+
+/// Parses one strict, size-bounded external-signature finalization request.
+pub fn parse_wallet_psbt_finalize_request(
+    input: &[u8],
+) -> Result<WalletPsbtFinalizeRequest, WalletError> {
+    if input.len() > MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES {
+        return Err(WalletError::Psbt("finalize request exceeds 786432 bytes"));
+    }
+    serde_json::from_slice(input)
+        .map_err(|_| WalletError::Psbt("expected the documented strict finalize JSON object"))
 }
 
 /// Validated watch-only descriptor configuration loaded by the daemon.
@@ -653,6 +697,85 @@ impl EmbeddedWallet {
         })
     }
 
+    /// Finalizes and consensus-verifies a PSBT signed by an external device.
+    ///
+    /// Every input must still be an unspent output in this wallet and its
+    /// submitted `witness_utxo` must match the local transaction graph. The
+    /// watch-only wallet never signs; BDK assembles final scripts from partial
+    /// signatures and Bitcoin Core's consensus engine verifies the result.
+    pub fn finalize_psbt(
+        &self,
+        request: &WalletPsbtFinalizeRequest,
+    ) -> Result<WalletFinalizedTransaction, WalletError> {
+        if request.psbt.len() > MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES {
+            return Err(WalletError::Psbt("encoded PSBT exceeds request bound"));
+        }
+        let mut psbt = Psbt::from_str(&request.psbt)
+            .map_err(|_| WalletError::Psbt("PSBT is not valid base64 BIP174"))?;
+        if psbt.serialize().len() > MAX_WALLET_PSBT_BYTES
+            || !(1..=MAX_WALLET_PSBT_INPUTS).contains(&psbt.inputs.len())
+            || !(1..=MAX_WALLET_PSBT_RECIPIENTS + 1).contains(&psbt.outputs.len())
+            || psbt.inputs.iter().any(|input| {
+                input.non_witness_utxo.is_some()
+                    || input.final_script_sig.is_some()
+                    || input.final_script_witness.is_some()
+            })
+        {
+            return Err(WalletError::Psbt(
+                "PSBT size, input/output count, or finalization state is invalid",
+            ));
+        }
+        if !psbt_uses_safe_sighashes(&psbt) {
+            return Err(WalletError::Psbt(
+                "PSBT signatures must use SIGHASH_ALL or Taproot default",
+            ));
+        }
+
+        let state = self.state()?;
+        let (prevouts, fee_sats) = validated_wallet_prevouts(&state, &psbt)?;
+
+        let finalized = state
+            .wallet
+            .finalize_psbt(&mut psbt, SignOptions::default())
+            .map_err(|_| WalletError::Psbt("PSBT signatures cannot be finalized"))?;
+        if !finalized
+            || psbt.inputs.iter().any(|input| {
+                input.final_script_sig.is_none() && input.final_script_witness.is_none()
+            })
+        {
+            return Err(WalletError::Psbt(
+                "PSBT does not contain sufficient valid partial signatures",
+            ));
+        }
+        let transaction = psbt
+            .clone()
+            .extract_tx()
+            .map_err(|_| WalletError::Psbt("finalized transaction fee is unsafe"))?;
+        let vbytes = u64::try_from(transaction.vsize()).unwrap_or(u64::MAX);
+        let maximum_fee = vbytes
+            .checked_mul(MAX_WALLET_PSBT_FEE_RATE)
+            .and_then(|fee| fee.checked_add(1_000))
+            .ok_or(WalletError::Psbt("finalized transaction fee is unsafe"))?;
+        if fee_sats == 0 || fee_sats > maximum_fee {
+            return Err(WalletError::Psbt("finalized transaction fee is unsafe"));
+        }
+        verify_transaction_scripts_with_flags(
+            &transaction,
+            &prevouts,
+            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT,
+        )
+        .map_err(|_| WalletError::Psbt("finalized transaction signatures are invalid"))?;
+
+        Ok(WalletFinalizedTransaction {
+            psbt: psbt.to_string(),
+            transaction_hex: serialize(&transaction).to_lower_hex_string(),
+            txid: transaction.compute_txid().to_string(),
+            wtxid: transaction.compute_wtxid().to_string(),
+            fee_sats,
+            vbytes,
+        })
+    }
+
     /// Returns the latest persisted validated-chain checkpoint.
     pub fn chain_tip(&self) -> Result<WalletTip, WalletError> {
         let state = self.state()?;
@@ -807,6 +930,95 @@ fn validate_psbt_outpoints(request: &WalletPsbtRequest) -> Result<Vec<OutPoint>,
             Ok(outpoint)
         })
         .collect()
+}
+
+fn validated_wallet_prevouts(
+    state: &WalletState,
+    psbt: &Psbt,
+) -> Result<(Vec<Utxo>, u64), WalletError> {
+    let mut seen = HashSet::with_capacity(psbt.unsigned_tx.input.len());
+    let mut prevouts = Vec::with_capacity(psbt.unsigned_tx.input.len());
+    let mut input_value = 0_u64;
+    for (transaction_input, psbt_input) in psbt.unsigned_tx.input.iter().zip(&psbt.inputs) {
+        let outpoint = transaction_input.previous_output;
+        if !seen.insert(outpoint) {
+            return Err(WalletError::Psbt("PSBT inputs must be unique"));
+        }
+        let local = state.wallet.get_utxo(outpoint).ok_or(WalletError::Psbt(
+            "PSBT input is not a current wallet output",
+        ))?;
+        if psbt_input.witness_utxo.as_ref() != Some(&local.txout) {
+            return Err(WalletError::Psbt(
+                "PSBT witness UTXO does not match current wallet state",
+            ));
+        }
+        let confirmation_height = local
+            .chain_position
+            .confirmation_height_upper_bound()
+            .unwrap_or(0);
+        let is_coinbase = state
+            .wallet
+            .get_tx(outpoint.txid)
+            .is_some_and(|transaction| transaction.tx_node.tx.is_coinbase());
+        if is_coinbase
+            && state.wallet.latest_checkpoint().height() < confirmation_height.saturating_add(100)
+        {
+            return Err(WalletError::Psbt(
+                "PSBT input is an immature coinbase output",
+            ));
+        }
+        input_value = input_value
+            .checked_add(local.txout.value.to_sat())
+            .filter(|value| *value <= MAX_BITCOIN_MONEY_SATS)
+            .ok_or(WalletError::Psbt("PSBT input value exceeds MoneyRange"))?;
+        prevouts.push(Utxo {
+            value_sats: local.txout.value.to_sat(),
+            height: confirmation_height,
+            is_coinbase,
+            last_touched: 0,
+            creation_mtp: 0,
+            script_pubkey: local.txout.script_pubkey.into_bytes(),
+        });
+    }
+    let output_value = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .try_fold(0_u64, |total, output| {
+            total
+                .checked_add(output.value.to_sat())
+                .filter(|value| *value <= MAX_BITCOIN_MONEY_SATS)
+                .ok_or(WalletError::Psbt("PSBT output value exceeds MoneyRange"))
+        })?;
+    let fee = input_value
+        .checked_sub(output_value)
+        .ok_or(WalletError::Psbt("PSBT outputs exceed wallet inputs"))?;
+    Ok((prevouts, fee))
+}
+
+fn psbt_uses_safe_sighashes(psbt: &Psbt) -> bool {
+    psbt.inputs.iter().all(|input| {
+        let declared = input.sighash_type;
+        (declared.is_none()
+            || declared == Some(EcdsaSighashType::All.into())
+            || declared == Some(TapSighashType::Default.into()))
+            && input
+                .partial_sigs
+                .values()
+                .all(|signature| signature.sighash_type == EcdsaSighashType::All)
+            && input.tap_key_sig.as_ref().is_none_or(|signature| {
+                matches!(
+                    signature.sighash_type,
+                    TapSighashType::Default | TapSighashType::All
+                )
+            })
+            && input.tap_script_sigs.values().all(|signature| {
+                matches!(
+                    signature.sighash_type,
+                    TapSighashType::Default | TapSighashType::All
+                )
+            })
+    })
 }
 
 fn wallet_tip(block: BlockId) -> WalletTip {
@@ -976,6 +1188,18 @@ mod tests {
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
     const PRIVATE_DESCRIPTOR: &str = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+
+    fn signing_descriptors() -> (String, String, String, String) {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let receive = bitcoin::PrivateKey::from_slice(&[1; 32], Network::Testnet).unwrap();
+        let change = bitcoin::PrivateKey::from_slice(&[2; 32], Network::Testnet).unwrap();
+        (
+            format!("wpkh({receive})"),
+            format!("wpkh({change})"),
+            format!("wpkh({})", receive.public_key(&secp)),
+            format!("wpkh({})", change.public_key(&secp)),
+        )
+    }
 
     fn paying_block(parent: BlockHash, address: &str, value: u64) -> Block {
         let script_pubkey = Address::from_str(address)
@@ -1559,6 +1783,180 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn externally_signed_psbt_is_finalized_and_consensus_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("wallet.sqlite");
+        let (private_receive, private_change, public_receive, public_change) =
+            signing_descriptors();
+        let wallet = EmbeddedWallet::open_or_create(
+            &database,
+            &public_receive,
+            &public_change,
+            Network::Testnet,
+        )
+        .unwrap();
+        let funded = wallet.reveal_receive_address().unwrap();
+        let block = paying_block(
+            genesis_block(Network::Testnet).block_hash(),
+            &funded.address,
+            100_000,
+        );
+        wallet.apply_validated_block(&block, 1).unwrap();
+        wallet
+            .advance_checkpoint(WalletTip {
+                height: 101,
+                hash: BlockHash::from_byte_array([8; 32]),
+            })
+            .unwrap();
+        let created = wallet
+            .create_psbt(&WalletPsbtRequest {
+                recipients: vec![WalletPsbtRecipient {
+                    address: funded.address,
+                    value_sats: 50_000,
+                }],
+                fee_rate_sat_vb: 2,
+                selected_utxos: Vec::new(),
+            })
+            .unwrap();
+        let mut partial = Psbt::from_str(&created.psbt).unwrap();
+        let signer = Wallet::create(private_receive, private_change)
+            .network(Network::Testnet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let complete = signer
+            .sign(
+                &mut partial,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    try_finalize: false,
+                    ..SignOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!complete);
+        assert!(partial.inputs.iter().all(|input| {
+            !input.partial_sigs.is_empty()
+                && input.final_script_sig.is_none()
+                && input.final_script_witness.is_none()
+        }));
+
+        let finalized = wallet
+            .finalize_psbt(&WalletPsbtFinalizeRequest {
+                psbt: partial.to_string(),
+            })
+            .unwrap();
+        let final_psbt = Psbt::from_str(&finalized.psbt).unwrap();
+        let transaction = final_psbt.extract_tx().unwrap();
+        assert_eq!(finalized.txid, transaction.compute_txid().to_string());
+        assert_eq!(finalized.wtxid, transaction.compute_wtxid().to_string());
+        assert_eq!(
+            finalized.transaction_hex,
+            serialize(&transaction).to_lower_hex_string()
+        );
+        assert_eq!(finalized.fee_sats, created.fee_sats);
+        assert_eq!(
+            finalized.vbytes,
+            u64::try_from(transaction.vsize()).unwrap()
+        );
+        assert!(
+            transaction
+                .input
+                .iter()
+                .all(|input| !input.witness.is_empty())
+        );
+    }
+
+    #[test]
+    fn finalized_psbt_rejects_tampering_and_untrusted_prevouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (private_receive, private_change, public_receive, public_change) =
+            signing_descriptors();
+        let wallet = EmbeddedWallet::open_or_create(
+            directory.path().join("wallet.sqlite"),
+            &public_receive,
+            &public_change,
+            Network::Testnet,
+        )
+        .unwrap();
+        let funded = wallet.reveal_receive_address().unwrap();
+        let block = paying_block(
+            genesis_block(Network::Testnet).block_hash(),
+            &funded.address,
+            100_000,
+        );
+        wallet.apply_validated_block(&block, 1).unwrap();
+        wallet
+            .advance_checkpoint(WalletTip {
+                height: 101,
+                hash: BlockHash::from_byte_array([7; 32]),
+            })
+            .unwrap();
+        let created = wallet
+            .create_psbt(&WalletPsbtRequest {
+                recipients: vec![WalletPsbtRecipient {
+                    address: funded.address,
+                    value_sats: 50_000,
+                }],
+                fee_rate_sat_vb: 2,
+                selected_utxos: Vec::new(),
+            })
+            .unwrap();
+        let mut partial = Psbt::from_str(&created.psbt).unwrap();
+        Wallet::create(private_receive, private_change)
+            .network(Network::Testnet)
+            .create_wallet_no_persist()
+            .unwrap()
+            .sign(
+                &mut partial,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    try_finalize: false,
+                    ..SignOptions::default()
+                },
+            )
+            .unwrap();
+
+        let mut wrong_prevout = partial.clone();
+        wrong_prevout.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::from_sat(1);
+        assert!(matches!(
+            wallet.finalize_psbt(&WalletPsbtFinalizeRequest {
+                psbt: wrong_prevout.to_string()
+            }),
+            Err(WalletError::Psbt(
+                "PSBT witness UTXO does not match current wallet state"
+            ))
+        ));
+
+        let mut unsafe_sighash = partial.clone();
+        unsafe_sighash.inputs[0]
+            .partial_sigs
+            .values_mut()
+            .next()
+            .unwrap()
+            .sighash_type = EcdsaSighashType::None;
+        assert!(matches!(
+            wallet.finalize_psbt(&WalletPsbtFinalizeRequest {
+                psbt: unsafe_sighash.to_string()
+            }),
+            Err(WalletError::Psbt(
+                "PSBT signatures must use SIGHASH_ALL or Taproot default"
+            ))
+        ));
+
+        let mut damaged_signature = partial;
+        damaged_signature.unsigned_tx.output[0].value -= Amount::from_sat(1);
+        assert!(matches!(
+            wallet.finalize_psbt(&WalletPsbtFinalizeRequest {
+                psbt: damaged_signature.to_string()
+            }),
+            Err(WalletError::Psbt(
+                "finalized transaction signatures are invalid"
+            ))
+        ));
+    }
+
+    #[test]
     fn strict_wallet_psbt_request_parser_is_bounded() {
         let request = parse_wallet_psbt_request(
             br#"{"recipients":[{"address":"tb1qexample","value_sats":50000}],"fee_rate_sat_vb":2}"#,
@@ -1571,6 +1969,21 @@ mod tests {
                 .is_err()
         );
         assert!(parse_wallet_psbt_request(&vec![b' '; MAX_WALLET_PSBT_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn strict_wallet_psbt_finalize_parser_is_bounded() {
+        let request =
+            parse_wallet_psbt_finalize_request(br#"{"psbt":"cHNidP8BAAoCAAAA"}"#).unwrap();
+        assert_eq!(request.psbt, "cHNidP8BAAoCAAAA");
+        assert!(parse_wallet_psbt_finalize_request(br#"{"psbt":"x","unknown":true}"#).is_err());
+        assert!(
+            parse_wallet_psbt_finalize_request(&vec![
+                b' ';
+                MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES + 1
+            ])
+            .is_err()
+        );
     }
 
     #[test]

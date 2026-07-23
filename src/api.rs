@@ -32,9 +32,10 @@ use tokio_stream::{
 };
 
 use crate::wallet::{
-    EmbeddedWallet, MAX_WALLET_PSBT_REQUEST_BYTES, WalletAddress, WalletBalance, WalletError,
-    WalletPsbt, WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
-    parse_wallet_psbt_request,
+    EmbeddedWallet, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES, MAX_WALLET_PSBT_REQUEST_BYTES,
+    WalletAddress, WalletBalance, WalletError, WalletFinalizedTransaction, WalletPsbt,
+    WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
+    parse_wallet_psbt_finalize_request, parse_wallet_psbt_request,
 };
 
 /// Explorer block summary returned by the embedded API.
@@ -992,9 +993,17 @@ pub fn wallet_router(
         .route("/api/v1/wallet/transactions", get(wallet_transactions))
         .route("/api/v1/wallet/utxos", get(wallet_utxos))
         .route("/api/v1/wallet/address", post(next_address))
-        .route("/api/v1/wallet/psbt", post(create_wallet_psbt))
+        .route(
+            "/api/v1/wallet/psbt",
+            post(create_wallet_psbt).layer(DefaultBodyLimit::max(MAX_WALLET_PSBT_REQUEST_BYTES)),
+        )
+        .route(
+            "/api/v1/wallet/psbt/finalize",
+            post(finalize_wallet_psbt).layer(DefaultBodyLimit::max(
+                MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES,
+            )),
+        )
         .with_state(state)
-        .layer(DefaultBodyLimit::max(MAX_WALLET_PSBT_REQUEST_BYTES))
         .route_layer(middleware::from_fn_with_state(
             LocalRouteSecurity { token, audit },
             require_local_auth,
@@ -1134,6 +1143,28 @@ async fn create_wallet_psbt(
     state
         .wallet
         .create_psbt(&request)
+        .map_err(|error| match error {
+            WalletError::Psbt(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+        .map(Json)
+}
+async fn finalize_wallet_psbt(
+    State(state): State<Arc<WalletApiState>>,
+    body: Bytes,
+) -> ApiResult<WalletFinalizedTransaction> {
+    let request = parse_wallet_psbt_finalize_request(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let allowed = state
+        .psbt_limiter
+        .lock()
+        .map_err(internal)?
+        .take(Instant::now());
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .wallet
+        .finalize_psbt(&request)
         .map_err(|error| match error {
             WalletError::Psbt(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1691,6 +1722,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let invalid_finalize = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt/finalize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"psbt":"not-base64"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_finalize.status(), StatusCode::BAD_REQUEST);
+        let unknown_finalize_field = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt/finalize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"psbt":"x","unknown":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_finalize_field.status(), StatusCode::BAD_REQUEST);
+        let oversized_finalize = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt/finalize")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![
+                        b' ';
+                        MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized_finalize.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
         let address = app
             .clone()
