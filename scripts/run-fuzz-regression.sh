@@ -21,6 +21,8 @@ cargo +nightly fuzz run snapshot_decode fuzz/corpus/snapshot_decode -- \
     -runs="$runs" -max_len=1048576 -dict=fuzz/dictionaries/container.dict
 cargo +nightly fuzz run explorer_request fuzz/corpus/explorer_request -- \
     -runs="$runs" -max_len=4096
+cargo +nightly fuzz run local_rpc fuzz/corpus/local_rpc -- \
+    -runs="$runs" -max_len=65537
 cargo +nightly fuzz run config_parsers fuzz/corpus/config_parsers -- \
     -runs="$runs" -max_len=4096
 cargo +nightly fuzz run wallet_auth fuzz/corpus/wallet_auth -- \

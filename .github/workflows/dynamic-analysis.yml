@@ -24,6 +24,7 @@ jobs:
       - run: cargo miri test --locked --lib deployments::tests::buried_overrides_are_strict_regtest_only_and_last_value_wins
       - run: cargo miri test --locked --lib peer_store::tests::persisted_record_parsers_are_strict_bounded_and_semantic
       - run: cargo miri test --locked --lib api::tests::wallet_auth_token_rejects_short_or_non_graphic_values
+      - run: cargo miri test --locked --lib api::tests::strict_rpc_envelope_parser_is_bounded_and_rejects_extensions
 
   address-sanitizer:
     runs-on: ubuntu-latest

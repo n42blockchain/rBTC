@@ -1,8 +1,9 @@
 //! Embedded REST routes for the explorer and descriptor wallet.
 //!
-//! Bind this router only to loopback. Watch-only wallet routes enforce bearer
-//! authentication, no-store responses, and address-revelation rate limits;
-//! TLS termination and broader authorization remain daemon deployment concerns.
+//! Bind these routers only to loopback. The strict read-only JSON-RPC and
+//! watch-only wallet routes enforce scoped bearer authentication, synchronized
+//! audit records, and no-store responses; wallet address revelation also has a
+//! bounded rate limit. TLS termination remains a deployment concern.
 
 use std::{
     collections::HashMap,
@@ -16,7 +17,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response, Sse, sse::Event},
@@ -120,22 +122,32 @@ const MAX_WALLET_AUTH_TOKEN_LEN: usize = 256;
 const WALLET_ADDRESS_BURST: u8 = 20;
 const WALLET_ADDRESS_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXPLORER_EVENT_CLIENTS: usize = 64;
-/// Maximum on-disk wallet authorization audit log size.
-pub const MAX_WALLET_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum on-disk local authorization audit log size.
+pub const MAX_AUTHORIZATION_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
+/// Backwards-compatible wallet audit capacity name.
+pub const MAX_WALLET_AUDIT_BYTES: u64 = MAX_AUTHORIZATION_AUDIT_BYTES;
+/// Maximum accepted JSON-RPC request body size.
+pub const MAX_RPC_BODY_BYTES: usize = 64 * 1024;
 
-/// Rotatable in-memory bearer credential protecting every wallet route.
+/// Rotatable in-memory bearer credential protecting a local API surface.
 ///
 /// The value is intentionally not printable through `Debug` or `Display`.
 #[derive(Clone)]
-pub struct WalletAuthToken(Arc<RwLock<Option<Arc<[u8]>>>>);
+pub struct LocalAuthToken(Arc<RwLock<Option<Arc<[u8]>>>>);
 
-/// Append-only, owner-only authorization audit log shared by wallet routes.
+/// Backwards-compatible name for the wallet bearer credential.
+pub type WalletAuthToken = LocalAuthToken;
+
+/// Append-only, owner-only authorization audit log shared by local API routes.
 ///
 /// Records contain only a timestamp, method, path without a query string, and
 /// authorization result. Credentials, query values, bodies, and responses are
 /// deliberately excluded.
 #[derive(Clone)]
-pub struct WalletAuditLog(Arc<Mutex<WalletAuditWriter>>);
+pub struct AuthorizationAuditLog(Arc<Mutex<WalletAuditWriter>>);
+
+/// Backwards-compatible name for the wallet authorization audit log.
+pub type WalletAuditLog = AuthorizationAuditLog;
 
 struct WalletAuditWriter {
     file: File,
@@ -152,9 +164,9 @@ struct WalletAuditRecord<'a> {
 }
 
 #[derive(Clone)]
-struct WalletRouteSecurity {
-    token: WalletAuthToken,
-    audit: WalletAuditLog,
+struct LocalRouteSecurity {
+    token: LocalAuthToken,
+    audit: AuthorizationAuditLog,
 }
 
 struct WalletApiState {
@@ -197,7 +209,7 @@ impl AddressRateLimiter {
     }
 }
 
-impl WalletAuthToken {
+impl LocalAuthToken {
     /// Validates an ASCII token read from an owner-only file.
     pub fn new(token: impl AsRef<str>) -> Result<Self, &'static str> {
         Ok(Self(Arc::new(RwLock::new(Some(Self::validate(token)?)))))
@@ -208,7 +220,7 @@ impl WalletAuthToken {
         if !(MIN_WALLET_AUTH_TOKEN_LEN..=MAX_WALLET_AUTH_TOKEN_LEN).contains(&token.len())
             || !token.iter().all(u8::is_ascii_graphic)
         {
-            return Err("wallet API token must be 32-256 printable ASCII bytes");
+            return Err("local API token must be 32-256 printable ASCII bytes");
         }
         Ok(Arc::from(token))
     }
@@ -219,7 +231,7 @@ impl WalletAuthToken {
         *self
             .0
             .write()
-            .map_err(|_| "wallet API token lock poisoned")? = Some(token);
+            .map_err(|_| "local API token lock poisoned")? = Some(token);
         Ok(())
     }
 
@@ -254,7 +266,7 @@ impl WalletAuthToken {
     }
 }
 
-impl WalletAuditLog {
+impl AuthorizationAuditLog {
     /// Opens or creates a bounded append-only audit file.
     ///
     /// Existing files must be regular, owner-only, single-link files on Unix.
@@ -265,14 +277,23 @@ impl WalletAuditLog {
             Ok(file) => (file, true),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let before = std::fs::symlink_metadata(path).map_err(|error| {
-                    format!("inspect wallet API audit log {}: {error}", path.display())
+                    format!(
+                        "inspect local authorization audit log {}: {error}",
+                        path.display()
+                    )
                 })?;
                 validate_wallet_audit_metadata(path, &before)?;
                 let file = wallet_audit_open_options().open(path).map_err(|error| {
-                    format!("open wallet API audit log {}: {error}", path.display())
+                    format!(
+                        "open local authorization audit log {}: {error}",
+                        path.display()
+                    )
                 })?;
                 let after = file.metadata().map_err(|error| {
-                    format!("inspect wallet API audit log {}: {error}", path.display())
+                    format!(
+                        "inspect local authorization audit log {}: {error}",
+                        path.display()
+                    )
                 })?;
                 validate_wallet_audit_metadata(path, &after)?;
                 validate_wallet_audit_identity(path, &before, &after)?;
@@ -280,14 +301,17 @@ impl WalletAuditLog {
             }
             Err(error) => {
                 return Err(format!(
-                    "create wallet API audit log {}: {error}",
+                    "create local authorization audit log {}: {error}",
                     path.display()
                 ));
             }
         };
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("inspect wallet API audit log {}: {error}", path.display()))?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "inspect local authorization audit log {}: {error}",
+                path.display()
+            )
+        })?;
         validate_wallet_audit_metadata(path, &metadata)?;
         validate_wallet_audit_tail(path, &file, metadata.len())?;
         if created {
@@ -311,16 +335,16 @@ impl WalletAuditLog {
             path,
             authorization: if authorized { "accepted" } else { "rejected" },
         })
-        .map_err(|error| format!("serialize wallet API audit record: {error}"))?;
+        .map_err(|error| format!("serialize local authorization audit record: {error}"))?;
         line.push(b'\n');
         let line_len = u64::try_from(line.len())
-            .map_err(|_| "wallet API audit record too large".to_owned())?;
+            .map_err(|_| "local authorization audit record too large".to_owned())?;
         let mut writer = self
             .0
             .lock()
-            .map_err(|_| "wallet API audit log lock poisoned".to_owned())?;
-        if writer.bytes.saturating_add(line_len) > MAX_WALLET_AUDIT_BYTES {
-            return Err("wallet API audit log reached its size limit".to_owned());
+            .map_err(|_| "local authorization audit log lock poisoned".to_owned())?;
+        if writer.bytes.saturating_add(line_len) > MAX_AUTHORIZATION_AUDIT_BYTES {
+            return Err("local authorization audit log reached its size limit".to_owned());
         }
         let previous_bytes = writer.bytes;
         if let Err(error) = writer
@@ -332,11 +356,11 @@ impl WalletAuditLog {
                 .file
                 .set_len(previous_bytes)
                 .and_then(|()| writer.file.sync_data());
-            writer.bytes = MAX_WALLET_AUDIT_BYTES;
+            writer.bytes = MAX_AUTHORIZATION_AUDIT_BYTES;
             return match rollback {
-                Ok(()) => Err(format!("write wallet API audit record: {error}")),
+                Ok(()) => Err(format!("write local authorization audit record: {error}")),
                 Err(rollback) => Err(format!(
-                    "write wallet API audit record: {error}; rollback failed: {rollback}"
+                    "write local authorization audit record: {error}; rollback failed: {rollback}"
                 )),
             };
         }
@@ -360,9 +384,12 @@ fn validate_wallet_audit_tail(path: &FsPath, file: &File, bytes: u64) -> Result<
     if bytes == 0 {
         return Ok(());
     }
-    let mut reader = file
-        .try_clone()
-        .map_err(|error| format!("inspect wallet API audit log {}: {error}", path.display()))?;
+    let mut reader = file.try_clone().map_err(|error| {
+        format!(
+            "inspect local authorization audit log {}: {error}",
+            path.display()
+        )
+    })?;
     reader
         .seek(SeekFrom::Start(bytes - 1))
         .and_then(|_| {
@@ -377,7 +404,12 @@ fn validate_wallet_audit_tail(path: &FsPath, file: &File, bytes: u64) -> Result<
                 ))
             }
         })
-        .map_err(|error| format!("validate wallet API audit log {}: {error}", path.display()))
+        .map_err(|error| {
+            format!(
+                "validate local authorization audit log {}: {error}",
+                path.display()
+            )
+        })
 }
 
 #[cfg(unix)]
@@ -390,7 +422,7 @@ fn sync_wallet_audit_parent(path: &FsPath) -> Result<(), String> {
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
             format!(
-                "sync wallet API audit log directory {}: {error}",
+                "sync local authorization audit log directory {}: {error}",
                 parent.display()
             )
         })
@@ -407,13 +439,13 @@ fn validate_wallet_audit_metadata(
 ) -> Result<(), String> {
     if !metadata.file_type().is_file() {
         return Err(format!(
-            "wallet API audit log {} must be a regular file",
+            "local authorization audit log {} must be a regular file",
             path.display()
         ));
     }
-    if metadata.len() > MAX_WALLET_AUDIT_BYTES {
+    if metadata.len() > MAX_AUTHORIZATION_AUDIT_BYTES {
         return Err(format!(
-            "wallet API audit log {} exceeds {MAX_WALLET_AUDIT_BYTES} bytes",
+            "local authorization audit log {} exceeds {MAX_AUTHORIZATION_AUDIT_BYTES} bytes",
             path.display()
         ));
     }
@@ -422,13 +454,13 @@ fn validate_wallet_audit_metadata(
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(format!(
-                "wallet API audit log {} permissions must not grant group or other access",
+                "local authorization audit log {} permissions must not grant group or other access",
                 path.display()
             ));
         }
         if metadata.nlink() != 1 {
             return Err(format!(
-                "wallet API audit log {} must have exactly one hard link",
+                "local authorization audit log {} must have exactly one hard link",
                 path.display()
             ));
         }
@@ -445,7 +477,7 @@ fn validate_wallet_audit_identity(
     use std::os::unix::fs::MetadataExt;
     if before.dev() != after.dev() || before.ino() != after.ino() {
         return Err(format!(
-            "wallet API audit log {} changed while it was opened",
+            "local authorization audit log {} changed while it was opened",
             path.display()
         ));
     }
@@ -673,6 +705,210 @@ pub fn explorer_events_router(events: ExplorerEventHub) -> Router {
         .with_state(events)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalRpcRequest {
+    jsonrpc: String,
+    id: serde_json::Value,
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+/// Creates an authenticated, audited JSON-RPC 2.0 route over the explorer index.
+///
+/// The initial read-only method set is `help`, `getblockhash`,
+/// `rbtc.getblocksummary`, `rbtc.gettransaction`, and
+/// `rbtc.getaddressutxos`. Request bodies, identifiers, parameters, and result
+/// sizes are bounded.
+pub fn rpc_router<I: ExplorerIndex>(
+    index: Arc<I>,
+    token: LocalAuthToken,
+    audit: AuthorizationAuditLog,
+) -> Router {
+    Router::new()
+        .route("/rpc", post(rpc_call::<I>))
+        .with_state(index)
+        .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
+        .route_layer(middleware::from_fn_with_state(
+            LocalRouteSecurity { token, audit },
+            require_local_auth,
+        ))
+}
+
+async fn rpc_call<I: ExplorerIndex>(
+    State(index): State<Arc<I>>,
+    body: Bytes,
+) -> Json<serde_json::Value> {
+    let Ok(request) = parse_local_rpc_request(&body) else {
+        return rpc_error(&serde_json::Value::Null, -32600, "Invalid Request");
+    };
+    let id = request.id;
+    match execute_rpc(index.as_ref(), &request.method, &request.params) {
+        Ok(result) => Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })),
+        Err((code, message)) => rpc_error(&id, code, message),
+    }
+}
+
+/// Checks the strict, size-bounded JSON-RPC 2.0 request envelope.
+///
+/// This parser does not execute a method or retain any supplied identifier or
+/// parameter and is suitable for bounded parser regression and fuzz tests.
+#[must_use]
+pub fn is_well_formed_local_rpc_request(input: &[u8]) -> bool {
+    parse_local_rpc_request(input).is_ok()
+}
+
+fn parse_local_rpc_request(input: &[u8]) -> Result<LocalRpcRequest, ()> {
+    if input.len() > MAX_RPC_BODY_BYTES {
+        return Err(());
+    }
+    let request = serde_json::from_slice::<LocalRpcRequest>(input).map_err(|_| ())?;
+    if request.jsonrpc != "2.0"
+        || !valid_rpc_id(&request.id)
+        || request.method.is_empty()
+        || request.method.len() > 64
+        || request.method.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(());
+    }
+    Ok(request)
+}
+
+fn valid_rpc_id(id: &serde_json::Value) -> bool {
+    match id {
+        serde_json::Value::String(value) => value.len() <= 128,
+        serde_json::Value::Number(_) | serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn execute_rpc<I: ExplorerIndex>(
+    index: &I,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, (i64, &'static str)> {
+    match method {
+        "help" => {
+            if !params.is_null() && params.as_array().is_none_or(|params| !params.is_empty()) {
+                return Err((-32602, "Invalid params"));
+            }
+            Ok(serde_json::json!([
+                "getblockhash",
+                "rbtc.getblocksummary",
+                "rbtc.gettransaction",
+                "rbtc.getaddressutxos"
+            ]))
+        }
+        "getblockhash" => {
+            let (height,) = rpc_one_u32(params)?;
+            let block = index
+                .block(height)
+                .map_err(|_| (-32603, "Internal error"))?
+                .ok_or((-32001, "Block not found"))?;
+            Ok(serde_json::Value::String(block.hash))
+        }
+        "rbtc.getblocksummary" => {
+            let (height,) = rpc_one_u32(params)?;
+            let block = index
+                .block(height)
+                .map_err(|_| (-32603, "Internal error"))?
+                .ok_or((-32001, "Block not found"))?;
+            serde_json::to_value(block).map_err(|_| (-32603, "Internal error"))
+        }
+        "rbtc.gettransaction" => {
+            let txid = rpc_one_string(params, 64)?;
+            if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err((-32602, "Invalid params"));
+            }
+            let transaction = index
+                .transaction(txid)
+                .map_err(|_| (-32603, "Internal error"))?
+                .ok_or((-32002, "Transaction not found"))?;
+            serde_json::to_value(transaction).map_err(|_| (-32603, "Internal error"))
+        }
+        "rbtc.getaddressutxos" => rpc_address_utxos(index, params),
+        _ => Err((-32601, "Method not found")),
+    }
+}
+
+fn rpc_one_u32(params: &serde_json::Value) -> Result<(u32,), (i64, &'static str)> {
+    serde_json::from_value(params.clone()).map_err(|_| (-32602, "Invalid params"))
+}
+
+fn rpc_one_string(
+    params: &serde_json::Value,
+    maximum_len: usize,
+) -> Result<&str, (i64, &'static str)> {
+    let values = params.as_array().ok_or((-32602, "Invalid params"))?;
+    if values.len() != 1 {
+        return Err((-32602, "Invalid params"));
+    }
+    values[0]
+        .as_str()
+        .filter(|value| value.len() <= maximum_len)
+        .ok_or((-32602, "Invalid params"))
+}
+
+fn rpc_address_utxos<I: ExplorerIndex>(
+    index: &I,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, (i64, &'static str)> {
+    let values = params.as_array().ok_or((-32602, "Invalid params"))?;
+    if !(1..=3).contains(&values.len()) {
+        return Err((-32602, "Invalid params"));
+    }
+    let address = values[0]
+        .as_str()
+        .filter(|address| address.len() <= 128)
+        .ok_or((-32602, "Invalid params"))?;
+    let offset = values
+        .get(1)
+        .map_or(Some(0), serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|offset| *offset <= MAX_UTXO_PAGE_OFFSET)
+        .ok_or((-32602, "Invalid params"))?;
+    let limit = values
+        .get(2)
+        .map_or(
+            Some(DEFAULT_UTXO_PAGE_SIZE.into()),
+            serde_json::Value::as_u64,
+        )
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|limit| (1..=MAX_UTXO_PAGE_SIZE).contains(limit))
+        .ok_or((-32602, "Invalid params"))?;
+    index
+        .validate_address(address)
+        .map_err(|_| (-32602, "Invalid params"))?;
+    let mut utxos = index
+        .address_utxos(address, offset, limit + 1)
+        .map_err(|_| (-32603, "Internal error"))?;
+    let has_more = utxos.len() > usize::try_from(limit).expect("bounded limit fits usize");
+    utxos.truncate(usize::try_from(limit).expect("bounded limit fits usize"));
+    serde_json::to_value(ExplorerUtxoPage {
+        utxos,
+        offset,
+        limit,
+        has_more,
+    })
+    .map_err(|_| (-32603, "Internal error"))
+}
+
+fn rpc_error(id: &serde_json::Value, code: i64, message: &'static str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    }))
+}
+
 async fn explorer_events(
     State(events): State<ExplorerEventHub>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
@@ -738,8 +974,8 @@ async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
 /// Creates wallet routes whose every authorization attempt is durably audited.
 pub fn wallet_router(
     wallet: Arc<EmbeddedWallet>,
-    token: WalletAuthToken,
-    audit: WalletAuditLog,
+    token: LocalAuthToken,
+    audit: AuthorizationAuditLog,
 ) -> Router {
     let state = Arc::new(WalletApiState {
         wallet,
@@ -753,13 +989,13 @@ pub fn wallet_router(
         .route("/api/v1/wallet/address", post(next_address))
         .with_state(state)
         .route_layer(middleware::from_fn_with_state(
-            WalletRouteSecurity { token, audit },
-            require_wallet_auth,
+            LocalRouteSecurity { token, audit },
+            require_local_auth,
         ))
 }
 
-async fn require_wallet_auth(
-    State(security): State<WalletRouteSecurity>,
+async fn require_local_auth(
+    State(security): State<LocalRouteSecurity>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -788,7 +1024,7 @@ async fn require_wallet_auth(
     let mut response = StatusCode::UNAUTHORIZED.into_response();
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"rbtc-wallet\""),
+        HeaderValue::from_static("Bearer realm=\"rbtc-local\""),
     );
     response
         .headers_mut()
@@ -1165,6 +1401,159 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn rpc_requires_independent_auth_and_serves_bounded_read_methods() {
+        let directory = tempfile::tempdir().unwrap();
+        let audit_path = directory.path().join("api-auth-audit.jsonl");
+        let token = "r".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
+        let app = rpc_router(
+            Arc::new(TestIndex),
+            LocalAuthToken::new(&token).unwrap(),
+            AuthorizationAuditLog::open(&audit_path).unwrap(),
+        );
+        let unauthenticated_body = br#"{"jsonrpc":"2.0","id":1,"method":"help","params":["body-secret-must-not-be-audited"]}"#;
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::post("/rpc")
+                    .body(Body::from(unauthenticated_body.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let block_hash = app
+            .clone()
+            .oneshot(
+                Request::post("/rpc")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"block","method":"getblockhash","params":[1]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(block_hash.status(), StatusCode::OK);
+        assert_eq!(block_hash.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(block_hash.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], "block");
+        assert_eq!(body["result"], "00");
+
+        let utxos = app
+            .oneshot(
+                Request::post("/rpc")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"rbtc.getaddressutxos","params":["bcrt1test",1,1]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(utxos.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(utxos.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["result"]["utxos"][0]["vout"], 1);
+        assert_eq!(body["result"]["has_more"], true);
+
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert!(audit.contains(r#""path":"/rpc""#));
+        assert!(audit.contains(r#""authorization":"accepted""#));
+        assert!(audit.contains(r#""authorization":"rejected""#));
+        assert!(!audit.contains(&token));
+        assert!(!audit.contains("body-secret-must-not-be-audited"));
+        assert!(!audit.contains("bcrt1test"));
+    }
+
+    #[tokio::test]
+    async fn rpc_rejects_malformed_unbounded_and_unknown_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let token = "r".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
+        let app = rpc_router(
+            Arc::new(TestIndex),
+            LocalAuthToken::new(&token).unwrap(),
+            AuthorizationAuditLog::open(directory.path().join("api-auth-audit.jsonl")).unwrap(),
+        );
+        for (body, expected_code) in [
+            (r#"{"jsonrpc":"1.0","id":1,"method":"help"}"#, -32600),
+            (
+                r#"{"jsonrpc":"2.0","id":[],"method":"help","params":[]}"#,
+                -32600,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"help","unexpected":true}"#,
+                -32600,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"unknown","params":[]}"#,
+                -32601,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"getblockhash","params":[1,2]}"#,
+                -32602,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"rbtc.getaddressutxos","params":["invalid"]}"#,
+                -32602,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/rpc")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{body}");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], expected_code);
+        }
+
+        let oversized = app
+            .oneshot(
+                Request::post("/rpc")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(vec![b' '; MAX_RPC_BODY_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn strict_rpc_envelope_parser_is_bounded_and_rejects_extensions() {
+        assert!(is_well_formed_local_rpc_request(
+            br#"{"jsonrpc":"2.0","id":1,"method":"help"}"#
+        ));
+        for input in [
+            br#"{"jsonrpc":"1.0","id":1,"method":"help"}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"help"}"#,
+            br#"{"jsonrpc":"2.0","id":[],"method":"help"}"#,
+            br#"{"jsonrpc":"2.0","id":1,"method":"help","extra":true}"#,
+            br#"[{"jsonrpc":"2.0","id":1,"method":"help"}]"#,
+        ] {
+            assert!(!is_well_formed_local_rpc_request(input));
+        }
+        assert!(!is_well_formed_local_rpc_request(&vec![
+            b' ';
+            MAX_RPC_BODY_BYTES
+                + 1
+        ]));
     }
 
     #[tokio::test]

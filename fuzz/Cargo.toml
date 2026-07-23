@@ -59,6 +59,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "local_rpc"
+path = "fuzz_targets/local_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "config_parsers"
 path = "fuzz_targets/config_parsers.rs"
 test = false

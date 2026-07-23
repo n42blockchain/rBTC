@@ -20,8 +20,8 @@ use bitcoin::{
 };
 use rbtc::{
     api::{
-        ExplorerEventHub, ExplorerEventKind, WalletAuditLog, WalletAuthToken,
-        explorer_events_router, explorer_router, wallet_router,
+        AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
+        explorer_events_router, explorer_router, rpc_router, wallet_router,
     },
     block_execution::{
         BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
@@ -56,13 +56,13 @@ const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
-const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
+const MAX_LOCAL_AUTH_TOKEN_FILE_LEN: u64 = 1024;
 #[cfg(not(test))]
-const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
-const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
+const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
-const WALLET_AUDIT_FILE: &str = "wallet-api-audit.jsonl";
+const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
@@ -83,6 +83,7 @@ struct Options {
     once: bool,
     explorer_listen: Option<SocketAddr>,
     wallet_api_files: Option<WalletApiFiles>,
+    rpc_auth_token_file: Option<PathBuf>,
     deployments: DeploymentConfig,
     ibd_policy: IbdPolicy,
     snapshot: Option<SnapshotActivationOptions>,
@@ -207,10 +208,16 @@ struct WalletApiFiles {
 
 struct WalletApiRuntime {
     wallet: Arc<EmbeddedWallet>,
-    token: WalletAuthToken,
+    token: LocalAuthToken,
     token_path: PathBuf,
-    audit: WalletAuditLog,
+    audit: AuthorizationAuditLog,
     scan: WalletScanConfig,
+}
+
+struct RpcApiRuntime {
+    token: LocalAuthToken,
+    token_path: PathBuf,
+    audit: AuthorizationAuditLog,
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +229,7 @@ struct WalletScanConfig {
 struct ApiRuntime {
     listen: SocketAddr,
     wallet: Option<WalletApiRuntime>,
+    rpc: Option<RpcApiRuntime>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -594,7 +602,7 @@ struct ApiServer {
     #[cfg(test)]
     address: SocketAddr,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
-    token_task: Option<tokio::task::JoinHandle<()>>,
+    token_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ApiServer {
@@ -604,6 +612,7 @@ impl ApiServer {
         explorer_events: ExplorerEventHub,
         node_status: NodeStatus,
         wallet: Option<&WalletApiRuntime>,
+        rpc: Option<&RpcApiRuntime>,
         background_validation: Option<&BackgroundValidationStatus>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
@@ -612,19 +621,34 @@ impl ApiServer {
         let bound = listener
             .local_addr()
             .map_err(|error| format!("read explorer address: {error}"))?;
-        let mut router = explorer_router(index)
+        let mut router = explorer_router(Arc::clone(&index))
             .merge(explorer_events_router(explorer_events))
             .merge(node_status_router(node_status));
-        let token_task = wallet.map(|wallet| {
+        let mut token_tasks = Vec::new();
+        if let Some(wallet) = wallet {
             let token = wallet.token.clone();
             let token_path = wallet.token_path.clone();
-            tokio::spawn(watch_wallet_auth_token(token_path, token))
-        });
+            token_tasks.push(tokio::spawn(watch_local_auth_token(
+                token_path, token, "wallet",
+            )));
+        }
         if let Some(wallet) = wallet {
             router = router.merge(wallet_router(
                 Arc::clone(&wallet.wallet),
                 wallet.token.clone(),
                 wallet.audit.clone(),
+            ));
+        }
+        if let Some(rpc) = rpc {
+            let token = rpc.token.clone();
+            let token_path = rpc.token_path.clone();
+            token_tasks.push(tokio::spawn(watch_local_auth_token(
+                token_path, token, "RPC",
+            )));
+            router = router.merge(rpc_router(
+                Arc::clone(&index),
+                rpc.token.clone(),
+                rpc.audit.clone(),
             ));
         }
         if let Some(status) = background_validation {
@@ -640,7 +664,7 @@ impl ApiServer {
             #[cfg(test)]
             address: bound,
             task: Some(task),
-            token_task,
+            token_tasks,
         })
     }
 
@@ -669,7 +693,7 @@ impl Drop for ApiServer {
         if let Some(task) = &self.task {
             task.abort();
         }
-        if let Some(task) = &self.token_task {
+        for task in &self.token_tasks {
             task.abort();
         }
     }
@@ -757,10 +781,36 @@ async fn run(options: Options) -> Result<(), String> {
     run_with_nonce(options, rand::random()).await
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> {
     let Some(listen) = options.explorer_listen else {
         return Ok(None);
     };
+    if let (Some(rpc_token), Some(wallet)) = (
+        options.rpc_auth_token_file.as_ref(),
+        options.wallet_api_files.as_ref(),
+    ) {
+        if same_file(rpc_token, &wallet.auth_token)? {
+            return Err(
+                "RPC and wallet authentication token files must be distinct regular files"
+                    .to_owned(),
+            );
+        }
+    }
+    let rpc_token = options
+        .rpc_auth_token_file
+        .as_ref()
+        .map(|path| {
+            let token = read_owner_only_text_file(
+                path,
+                "RPC authentication token",
+                MAX_LOCAL_AUTH_TOKEN_FILE_LEN,
+            )?;
+            let token =
+                LocalAuthToken::new(token.trim_end_matches(['\r', '\n'])).map_err(str::to_owned)?;
+            Ok::<_, String>((path.clone(), token))
+        })
+        .transpose()?;
     let wallet = options
         .wallet_api_files
         .as_ref()
@@ -776,15 +826,15 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             let token = read_owner_only_text_file(
                 &files.auth_token,
                 "wallet authentication token",
-                MAX_WALLET_TOKEN_FILE_LEN,
+                MAX_LOCAL_AUTH_TOKEN_FILE_LEN,
             )?;
-            let token = WalletAuthToken::new(token.trim_end_matches(['\r', '\n']))
+            let token = LocalAuthToken::new(token.trim_end_matches(['\r', '\n']))
                 .map_err(str::to_owned)?;
             let data_dir = options
                 .data_dir
                 .as_ref()
                 .expect("wallet API parser requires data directory");
-            let audit = WalletAuditLog::open(data_dir.join(WALLET_AUDIT_FILE))?;
+            let audit = AuthorizationAuditLog::open(data_dir.join(API_AUDIT_FILE))?;
             let wallet = EmbeddedWallet::open_or_create(
                 data_dir.join("wallet.sqlite"),
                 descriptors.receive_descriptor,
@@ -811,18 +861,45 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             })
         })
         .transpose()?;
-    Ok(Some(ApiRuntime { listen, wallet }))
+    let rpc = rpc_token
+        .map(|(token_path, token)| {
+            let audit = wallet.as_ref().map_or_else(
+                || {
+                    let data_dir = options
+                        .data_dir
+                        .as_ref()
+                        .expect("RPC parser requires data directory");
+                    AuthorizationAuditLog::open(data_dir.join(API_AUDIT_FILE))
+                },
+                |wallet| Ok(wallet.audit.clone()),
+            )?;
+            println!(
+                "authenticated read-only JSON-RPC enabled; token file {}",
+                token_path.display()
+            );
+            Ok::<_, String>(RpcApiRuntime {
+                token,
+                token_path,
+                audit,
+            })
+        })
+        .transpose()?;
+    Ok(Some(ApiRuntime {
+        listen,
+        wallet,
+        rpc,
+    }))
 }
 
-async fn watch_wallet_auth_token(path: PathBuf, token: WalletAuthToken) {
-    let mut interval = tokio::time::interval(WALLET_TOKEN_RELOAD_INTERVAL);
+async fn watch_local_auth_token(path: PathBuf, token: LocalAuthToken, surface: &'static str) {
+    let mut interval = tokio::time::interval(LOCAL_AUTH_TOKEN_RELOAD_INTERVAL);
     let mut enabled = true;
     loop {
         interval.tick().await;
         let result = read_owner_only_text_file(
             &path,
-            "wallet authentication token",
-            MAX_WALLET_TOKEN_FILE_LEN,
+            &format!("{surface} authentication token"),
+            MAX_LOCAL_AUTH_TOKEN_FILE_LEN,
         )
         .and_then(|contents| {
             token
@@ -832,7 +909,7 @@ async fn watch_wallet_auth_token(path: PathBuf, token: WalletAuthToken) {
         match result {
             Ok(()) if !enabled => {
                 eprintln!(
-                    "wallet authentication token restored from owner-only file {}",
+                    "{surface} authentication token restored from owner-only file {}",
                     path.display()
                 );
                 enabled = true;
@@ -840,7 +917,7 @@ async fn watch_wallet_auth_token(path: PathBuf, token: WalletAuthToken) {
             Ok(()) => {}
             Err(error) if enabled => {
                 token.invalidate();
-                eprintln!("wallet authentication disabled until token file is valid: {error}");
+                eprintln!("{surface} authentication disabled until token file is valid: {error}");
                 enabled = false;
             }
             Err(_) => {
@@ -2234,6 +2311,7 @@ async fn sync_validating_node(
                             .expect("API runtime has node status")
                             .clone(),
                         api.wallet.as_ref(),
+                        api.rpc.as_ref(),
                         background_validation,
                     )
                     .await?,
@@ -3340,6 +3418,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut explorer_listen = None;
     let mut wallet_descriptors = None;
     let mut wallet_auth_token_file = None;
+    let mut rpc_auth_token_file = None;
     let mut vbparams = Vec::new();
     let mut test_activation_heights = Vec::new();
     let mut minimum_chainwork = None;
@@ -3421,7 +3500,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     .map_err(|_| format!("invalid explorer listen address: {value}"))?;
                 if !address.ip().is_loopback() {
                     return Err(
-                        "--explorer-listen must use a loopback IP until authentication is enabled"
+                        "--explorer-listen must use a loopback IP because explorer REST routes are unauthenticated"
                             .to_owned(),
                     );
                 }
@@ -3437,6 +3516,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 wallet_auth_token_file = Some(PathBuf::from(required_option_value(
                     &mut args,
                     "--wallet-auth-token-file",
+                )?));
+            }
+            "--rpc-auth-token-file" => {
+                rpc_auth_token_file = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--rpc-auth-token-file",
                 )?));
             }
             "--vbparams" => {
@@ -3675,6 +3760,11 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     };
+    if rpc_auth_token_file.is_some() && (explorer_listen.is_none() || data_dir.is_none()) {
+        return Err(
+            "--rpc-auth-token-file requires --data-dir and loopback --explorer-listen".to_owned(),
+        );
+    }
     let snapshot = match (
         snapshot_path,
         snapshot_height,
@@ -3894,6 +3984,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         once,
         explorer_listen,
         wallet_api_files,
+        rpc_auth_token_file,
         deployments,
         ibd_policy,
         snapshot,
@@ -3967,7 +4058,7 @@ fn parse_ibd_policy(
 
 fn print_usage() {
     println!(
-        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/WALLET OPTIONS]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
+        "rbtcd {}\n\nUSAGE:\n  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\nPEER OPTIONS:\n  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -4312,6 +4403,7 @@ mod tests {
                 "--explorer-listen",
                 "--wallet-descriptors",
                 "--wallet-auth-token-file",
+                "--rpc-auth-token-file",
                 "--vbparams",
                 "--testactivationheight",
                 "--signetchallenge",
@@ -4406,6 +4498,8 @@ mod tests {
                 "/tmp/rbtc-wallet.json",
                 "--wallet-auth-token-file",
                 "/tmp/rbtc-wallet.token",
+                "--rpc-auth-token-file",
+                "/tmp/rbtc-rpc.token",
                 "--vbparams",
                 "taproot:-2:0:432",
                 "--testactivationheight",
@@ -4426,6 +4520,10 @@ mod tests {
             wallet_files.auth_token,
             PathBuf::from("/tmp/rbtc-wallet.token")
         );
+        assert_eq!(
+            served.rpc_auth_token_file,
+            Some(PathBuf::from("/tmp/rbtc-rpc.token"))
+        );
         assert_ne!(
             served.deployments,
             DeploymentConfig::for_network(Network::Regtest)
@@ -4441,6 +4539,23 @@ mod tests {
                     "/tmp/rbtc-test",
                     "--explorer-listen",
                     "0.0.0.0:3000",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_options(
+                [
+                    "--connect",
+                    "127.0.0.1:18444",
+                    "--network",
+                    "regtest",
+                    "--data-dir",
+                    "/tmp/rbtc-test",
+                    "--rpc-auth-token-file",
+                    "/tmp/rbtc-rpc.token",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -4651,6 +4766,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: Some(SnapshotActivationOptions {
@@ -4719,6 +4835,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -5743,6 +5860,7 @@ mod tests {
                 descriptors,
                 auth_token,
             }),
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -5762,10 +5880,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn wallet_runtime_loads_only_owner_only_bounded_configuration_files() {
         let directory = TempDir::new().unwrap();
         let descriptors = directory.path().join("wallet.json");
         let auth_token = directory.path().join("wallet.token");
+        let rpc_token = directory.path().join("rpc.token");
         write_owner_only(
             &descriptors,
             &serde_json::json!({
@@ -5777,6 +5897,7 @@ mod tests {
             .to_string(),
         );
         write_owner_only(&auth_token, &format!("{}\n", "a".repeat(32)));
+        write_owner_only(&rpc_token, &format!("{}\n", "b".repeat(32)));
         let options = Options {
             remotes: vec!["127.0.0.1:1".parse().unwrap()],
             dns_seeds: None,
@@ -5790,6 +5911,7 @@ mod tests {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
             }),
+            rpc_auth_token_file: Some(rpc_token.clone()),
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -5805,13 +5927,21 @@ mod tests {
         let wallet = runtime.wallet.as_ref().unwrap();
         assert_eq!(wallet.scan.gap_limit, 42);
         assert_eq!(wallet.scan.birthday_height, 100);
+        assert!(
+            runtime
+                .rpc
+                .as_ref()
+                .unwrap()
+                .token
+                .authorizes(format!("Bearer {}", "b".repeat(32)).as_bytes())
+        );
         assert!(directory.path().join("wallet.sqlite").exists());
-        assert!(directory.path().join(WALLET_AUDIT_FILE).exists());
+        assert!(directory.path().join(API_AUDIT_FILE).exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                fs::metadata(directory.path().join(WALLET_AUDIT_FILE))
+                fs::metadata(directory.path().join(API_AUDIT_FILE))
                     .unwrap()
                     .permissions()
                     .mode()
@@ -5820,6 +5950,11 @@ mod tests {
             );
         }
         drop(runtime);
+
+        let mut aliased = options.clone();
+        aliased.rpc_auth_token_file = Some(auth_token.clone());
+        let error = prepare_api_runtime(&aliased).err().unwrap();
+        assert!(error.contains("must be distinct"));
 
         write_owner_only(
             &descriptors,
@@ -5848,6 +5983,12 @@ mod tests {
             let error = prepare_api_runtime(&options).err().unwrap();
             assert!(error.contains("permissions"));
             assert!(!error.contains(&"a".repeat(32)));
+
+            fs::set_permissions(&auth_token, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&rpc_token, fs::Permissions::from_mode(0o644)).unwrap();
+            let error = prepare_api_runtime(&options).err().unwrap();
+            assert!(error.contains("permissions"));
+            assert!(!error.contains(&"b".repeat(32)));
         }
     }
 
@@ -5862,6 +6003,10 @@ mod tests {
         let token_text = "a".repeat(32);
         let token_path = directory.path().join("wallet.token");
         write_owner_only(&token_path, &token_text);
+        let rpc_token_text = "c".repeat(32);
+        let rpc_token_path = directory.path().join("rpc.token");
+        write_owner_only(&rpc_token_path, &rpc_token_text);
+        let audit = AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap();
         let wallet = WalletApiRuntime {
             wallet: Arc::new(
                 EmbeddedWallet::open_or_create(
@@ -5872,13 +6017,18 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            token: WalletAuthToken::new(&token_text).unwrap(),
+            token: LocalAuthToken::new(&token_text).unwrap(),
             token_path: token_path.clone(),
-            audit: WalletAuditLog::open(directory.path().join(WALLET_AUDIT_FILE)).unwrap(),
+            audit: audit.clone(),
             scan: WalletScanConfig {
                 gap_limit: DEFAULT_WALLET_GAP_LIMIT,
                 birthday_height: 0,
             },
+        };
+        let rpc = RpcApiRuntime {
+            token: LocalAuthToken::new(&rpc_token_text).unwrap(),
+            token_path: rpc_token_path.clone(),
+            audit,
         };
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
         let validation = BackgroundValidationStatus::new(
@@ -5898,6 +6048,7 @@ mod tests {
             ExplorerEventHub::new(0, genesis.to_string()),
             node_status,
             Some(&wallet),
+            Some(&rpc),
             Some(&validation),
         )
         .await
@@ -5941,6 +6092,63 @@ mod tests {
         assert_eq!(status["validation_tip"], 4);
         assert_eq!(status["validation_remaining"], 6);
 
+        let rpc_body = r#"{"jsonrpc":"2.0","id":7,"method":"help","params":[]}"#;
+        let wrong_rpc_scope = http_request(
+            server.address(),
+            format!(
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rpc_body}",
+                rpc_body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(wrong_rpc_scope.starts_with("HTTP/1.1 401 Unauthorized"));
+        let rpc_response = http_request(
+            server.address(),
+            format!(
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {rpc_token_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rpc_body}",
+                rpc_body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(rpc_response.starts_with("HTTP/1.1 200 OK"));
+        let rpc_result: serde_json::Value =
+            serde_json::from_str(rpc_response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(rpc_result["id"], 7);
+        assert!(
+            rpc_result["result"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("getblockhash"))
+        );
+
+        let rotated_rpc_text = "d".repeat(32);
+        let replacement = directory.path().join("rpc.token.next");
+        write_owner_only(&replacement, &rotated_rpc_text);
+        fs::rename(replacement, &rpc_token_path).unwrap();
+        tokio::time::sleep(LOCAL_AUTH_TOKEN_RELOAD_INTERVAL * 2).await;
+        let old_rpc = http_request(
+            server.address(),
+            format!(
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {rpc_token_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rpc_body}",
+                rpc_body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(old_rpc.starts_with("HTTP/1.1 401 Unauthorized"));
+        let rotated_rpc = http_request(
+            server.address(),
+            format!(
+                "POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {rotated_rpc_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{rpc_body}",
+                rpc_body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(rotated_rpc.starts_with("HTTP/1.1 200 OK"));
+
         let unauthorized = http_request(
             server.address(),
             b"GET /api/v1/wallet/balance HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -5960,7 +6168,7 @@ mod tests {
         let replacement = directory.path().join("wallet.token.next");
         write_owner_only(&replacement, &rotated_text);
         fs::rename(replacement, &token_path).unwrap();
-        tokio::time::sleep(WALLET_TOKEN_RELOAD_INTERVAL * 2).await;
+        tokio::time::sleep(LOCAL_AUTH_TOKEN_RELOAD_INTERVAL * 2).await;
         let old = http_request(
             server.address(),
             format!(
@@ -5981,7 +6189,7 @@ mod tests {
         assert!(rotated.starts_with("HTTP/1.1 200 OK"));
 
         write_owner_only(&token_path, "invalid");
-        tokio::time::sleep(WALLET_TOKEN_RELOAD_INTERVAL * 2).await;
+        tokio::time::sleep(LOCAL_AUTH_TOKEN_RELOAD_INTERVAL * 2).await;
         let disabled = http_request(
             server.address(),
             format!(
@@ -5992,11 +6200,14 @@ mod tests {
         .await;
         assert!(disabled.starts_with("HTTP/1.1 401 Unauthorized"));
 
-        let audit = fs::read_to_string(directory.path().join(WALLET_AUDIT_FILE)).unwrap();
+        let audit = fs::read_to_string(directory.path().join(API_AUDIT_FILE)).unwrap();
         assert!(audit.contains(r#""authorization":"accepted""#));
         assert!(audit.contains(r#""authorization":"rejected""#));
         assert!(!audit.contains(&token_text));
         assert!(!audit.contains(&rotated_text));
+        assert!(!audit.contains(&rpc_token_text));
+        assert!(!audit.contains(&rotated_rpc_text));
+        assert!(!audit.contains(r#""method":"help""#));
     }
 
     #[tokio::test]
@@ -6041,6 +6252,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6122,6 +6334,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6188,6 +6401,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6260,6 +6474,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: Some(SnapshotActivationOptions {
@@ -6317,6 +6532,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6363,6 +6579,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6442,6 +6659,7 @@ mod tests {
             once: false,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: Some(SnapshotActivationOptions {
@@ -6497,6 +6715,7 @@ mod tests {
                 once: true,
                 explorer_listen: None,
                 wallet_api_files: None,
+                rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
                 snapshot: None,
@@ -6584,6 +6803,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6657,6 +6877,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6688,6 +6909,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6739,6 +6961,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6784,6 +7007,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -6874,6 +7098,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -7007,6 +7232,7 @@ mod tests {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
             }),
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -7104,6 +7330,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -7173,6 +7400,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
             snapshot: None,
@@ -7278,6 +7506,7 @@ mod tests {
                 once: true,
                 explorer_listen: None,
                 wallet_api_files: None,
+                rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
                 snapshot: None,
@@ -7413,6 +7642,7 @@ mod tests {
                 once: true,
                 explorer_listen: None,
                 wallet_api_files: None,
+                rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 ibd_policy: IbdPolicy::for_network(Network::Regtest),
                 snapshot: None,
@@ -7526,6 +7756,7 @@ mod tests {
             once: true,
             explorer_listen: None,
             wallet_api_files: None,
+            rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Signet),
             ibd_policy,
             snapshot: None,
