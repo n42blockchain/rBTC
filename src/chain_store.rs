@@ -71,6 +71,9 @@ pub enum ChainStoreError {
     /// Transaction commit failed.
     #[error("redb commit: {0}")]
     Commit(#[from] redb::CommitError),
+    /// Offline database compaction failed.
+    #[error("redb compaction: {0}")]
+    Compaction(#[from] redb::CompactionError),
     /// UTXO operation failed.
     #[error("UTXO store: {0}")]
     Utxo(#[from] UtxoError),
@@ -190,6 +193,19 @@ impl RedbChainStore {
             .map_err(|_| ChainStoreError::Damaged)??;
         let db = Arc::new(database);
         Self::from_database(db, network, options)
+    }
+
+    /// Compacts a closed chainstate database and reports whether maintenance work ran.
+    ///
+    /// The daemon and every other [`RedbChainStore`] handle for this path must be
+    /// closed first. redb performs the maintenance commits with its two-phase
+    /// protocol; a structurally damaged file is rejected rather than rewritten.
+    pub fn compact_file(path: impl AsRef<Path>) -> Result<bool, ChainStoreError> {
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut database = Database::open(path)?;
+            Ok(database.compact()?)
+        }))
+        .map_err(|_| ChainStoreError::Damaged)?
     }
 
     fn from_database(
@@ -669,6 +685,30 @@ mod tests {
             bytes[offset..end].copy_from_slice(data);
             Ok(())
         }
+    }
+
+    #[test]
+    fn offline_compaction_preserves_chainstate_tip_utxos_and_undo() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let first = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([11; 32]),
+        };
+        store
+            .commit_connect(genesis.hash, first, &[key(1)], &[(key(2), coin(9))], &[])
+            .unwrap();
+        drop(store);
+
+        let _compacted = RedbChainStore::compact_file(&path).unwrap();
+        let reopened = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution().tip().unwrap(), first);
+        assert_eq!(reopened.get(key(2)).unwrap(), Some(coin(9)));
+        assert!(reopened.get(key(1)).unwrap().is_none());
+        assert!(reopened.undos().get(first.hash).unwrap().is_some());
     }
 
     #[test]

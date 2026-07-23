@@ -91,6 +91,15 @@ struct BackendResult {
     mutation: Timings,
     lookup: Timings,
     database_bytes: u64,
+    compaction: Option<CompactionResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactionResult {
+    elapsed_ns: u64,
+    performed: bool,
+    before_bytes: u64,
+    after_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,9 +285,33 @@ fn run_redb(workload: Workload, quick_repair: bool) -> BackendResult {
         &mut mutation_samples,
     );
     let lookup = run_lookups(&store, workload);
-    let database_bytes = fs::metadata(database_path)
+    let database_bytes = fs::metadata(&database_path)
         .expect("benchmark database metadata")
         .len();
+    drop(store);
+    let compaction_started = Instant::now();
+    let performed =
+        RedbChainStore::compact_file(&database_path).expect("compact benchmark chainstate");
+    let compaction_elapsed = compaction_started.elapsed();
+    let after_bytes = fs::metadata(&database_path)
+        .expect("compacted benchmark database metadata")
+        .len();
+    let reopened = RedbChainStore::open(&database_path, bitcoin::Network::Regtest)
+        .expect("reopen compacted benchmark chainstate");
+    assert_eq!(
+        reopened
+            .execution()
+            .tip()
+            .expect("read compacted execution tip")
+            .height,
+        workload.blocks
+    );
+    let compaction = CompactionResult {
+        elapsed_ns: duration_ns(compaction_elapsed),
+        performed,
+        before_bytes: database_bytes,
+        after_bytes,
+    };
     BackendResult {
         backend: "redb-chainstate",
         quick_repair: Some(quick_repair),
@@ -286,6 +319,7 @@ fn run_redb(workload: Workload, quick_repair: bool) -> BackendResult {
         mutation,
         lookup,
         database_bytes,
+        compaction: Some(compaction),
     }
 }
 
@@ -307,6 +341,7 @@ fn run_mdbx(workload: Workload) -> BackendResult {
         mutation,
         lookup,
         database_bytes: directory_bytes(&path),
+        compaction: None,
     }
 }
 
@@ -400,7 +435,7 @@ fn reproducible_storage_workload() {
     #[cfg(feature = "mdbx")]
     backends.push(run_mdbx(workload));
     write_report(&BenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         generated_fixture: true,
         workload,
         backends,

@@ -50,7 +50,9 @@ versioned. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
 set `RBTC_BENCH_REPORT` to retain the JSON report. The manual Storage benchmark
 workflow uploads that report together with runner CPU, filesystem, and block
 device metadata so NVMe and HDD runs can be compared without confusing runner
-differences with backend results.
+differences with backend results. redb results also measure explicit offline
+compaction, report file sizes before and after it, and reopen the compacted
+chainstate to verify the execution tip before accepting the result.
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character
