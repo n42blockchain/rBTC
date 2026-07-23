@@ -717,6 +717,7 @@ impl ApiServer {
                     wallet.broadcast_sender.clone(),
                     Arc::clone(&wallet.rebroadcast),
                 )),
+                fee_estimator.map(Arc::clone),
             ));
         }
         if let Some(rpc) = rpc {

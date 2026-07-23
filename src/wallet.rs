@@ -165,8 +165,13 @@ pub struct WalletPsbtOutPoint {
 pub struct WalletPsbtRequest {
     /// One to sixteen recipient outputs.
     pub recipients: Vec<WalletPsbtRecipient>,
-    /// Fee rate from 1 through 1,000 sat/vB.
+    /// Exact fee rate from 1 through 1,000 sat/vB, or zero when a confirmation
+    /// target must first be resolved by the authenticated API.
+    #[serde(default)]
     pub fee_rate_sat_vb: u64,
+    /// Optional empirical confirmation target from 1 through 1,008 blocks.
+    #[serde(default)]
+    pub confirmation_target: Option<u16>,
     /// Optional exclusive wallet-UTXO selection. Empty uses automatic selection.
     #[serde(default)]
     pub selected_utxos: Vec<WalletPsbtOutPoint>,
@@ -655,6 +660,11 @@ impl EmbeddedWallet {
     pub fn create_psbt(&self, request: &WalletPsbtRequest) -> Result<WalletPsbt, WalletError> {
         let recipients = validate_psbt_recipients(self.network, request)?;
         let selected = validate_psbt_outpoints(request)?;
+        if request.confirmation_target.is_some() {
+            return Err(WalletError::Psbt(
+                "confirmation target must be resolved before wallet construction",
+            ));
+        }
         let fee_rate = FeeRate::from_sat_per_vb(request.fee_rate_sat_vb)
             .filter(|_| (1..=MAX_WALLET_PSBT_FEE_RATE).contains(&request.fee_rate_sat_vb))
             .ok_or(WalletError::Psbt(
@@ -1673,6 +1683,7 @@ mod tests {
                         value_sats: 50_000,
                     }],
                     fee_rate_sat_vb: 2,
+                    confirmation_target: None,
                     selected_utxos: Vec::new(),
                 },
                 WalletPsbtOutPoint {
@@ -1760,6 +1771,7 @@ mod tests {
                 value_sats: 1,
             }],
             fee_rate_sat_vb: 0,
+            confirmation_target: None,
             selected_utxos: Vec::new(),
         };
         assert!(matches!(
@@ -1768,6 +1780,14 @@ mod tests {
                 "fee rate must be between 1 and 1000 sat/vB"
             ))
         ));
+        request.confirmation_target = Some(6);
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "confirmation target must be resolved before wallet construction"
+            ))
+        ));
+        request.confirmation_target = None;
         request.fee_rate_sat_vb = 1;
         request.recipients.clear();
         assert!(matches!(
@@ -1832,6 +1852,7 @@ mod tests {
                 value_sats: 50_000,
             }],
             fee_rate_sat_vb: 2,
+            confirmation_target: None,
             selected_utxos: Vec::new(),
         };
 
@@ -1877,6 +1898,7 @@ mod tests {
                     value_sats: 50_000,
                 }],
                 fee_rate_sat_vb: 2,
+                confirmation_target: None,
                 selected_utxos: Vec::new(),
             })
             .unwrap();
@@ -1960,6 +1982,7 @@ mod tests {
                     value_sats: 50_000,
                 }],
                 fee_rate_sat_vb: 2,
+                confirmation_target: None,
                 selected_utxos: Vec::new(),
             })
             .unwrap();
@@ -2024,7 +2047,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request.recipients.len(), 1);
+        assert_eq!(request.confirmation_target, None);
         assert!(request.selected_utxos.is_empty());
+        let target = parse_wallet_psbt_request(
+            br#"{"recipients":[{"address":"tb1qexample","value_sats":50000}],"confirmation_target":6}"#,
+        )
+        .unwrap();
+        assert_eq!(target.fee_rate_sat_vb, 0);
+        assert_eq!(target.confirmation_target, Some(6));
         assert!(
             parse_wallet_psbt_request(br#"{"recipients":[],"fee_rate_sat_vb":1,"unknown":true}"#)
                 .is_err()

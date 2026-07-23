@@ -36,10 +36,11 @@ use crate::{
     rebroadcast_store::{RebroadcastStoreError, RedbRebroadcastStore},
     transaction_policy::validate_standard_transaction,
     wallet::{
-        EmbeddedWallet, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES, MAX_WALLET_PSBT_REQUEST_BYTES,
-        WalletAddress, WalletBalance, WalletError, WalletFinalizedTransaction, WalletPsbt,
-        WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
-        parse_wallet_psbt_finalize_request, parse_wallet_psbt_request,
+        EmbeddedWallet, MAX_WALLET_PSBT_FEE_RATE, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES,
+        MAX_WALLET_PSBT_REQUEST_BYTES, WalletAddress, WalletBalance, WalletError,
+        WalletFinalizedTransaction, WalletPsbt, WalletPsbtRequest, WalletPublicDescriptors,
+        WalletStatus, WalletTransaction, WalletUtxo, parse_wallet_psbt_finalize_request,
+        parse_wallet_psbt_request,
     },
 };
 
@@ -182,6 +183,7 @@ struct LocalRouteSecurity {
 
 struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
+    fee_estimator: Option<Arc<RedbFeeEstimator>>,
     address_limiter: Mutex<AddressRateLimiter>,
     psbt_limiter: Mutex<AddressRateLimiter>,
     broadcast: Option<WalletBroadcastSink>,
@@ -1124,6 +1126,7 @@ pub fn wallet_router(
         token,
         audit,
         broadcast.map(WalletBroadcastSink::ephemeral),
+        None,
     )
 }
 
@@ -1133,9 +1136,11 @@ pub fn wallet_router_with_sink(
     token: LocalAuthToken,
     audit: AuthorizationAuditLog,
     broadcast: Option<WalletBroadcastSink>,
+    fee_estimator: Option<Arc<RedbFeeEstimator>>,
 ) -> Router {
     let state = Arc::new(WalletApiState {
         wallet,
+        fee_estimator,
         address_limiter: Mutex::new(AddressRateLimiter::new()),
         psbt_limiter: Mutex::new(AddressRateLimiter::new()),
         broadcast,
@@ -1292,6 +1297,7 @@ async fn create_wallet_psbt(
     body: Bytes,
 ) -> ApiResult<WalletPsbt> {
     let request = parse_wallet_psbt_request(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let request = resolve_wallet_psbt_fee(request, state.fee_estimator.as_deref())?;
     let allowed = state
         .psbt_limiter
         .lock()
@@ -1308,6 +1314,29 @@ async fn create_wallet_psbt(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })
         .map(Json)
+}
+
+fn resolve_wallet_psbt_fee(
+    mut request: WalletPsbtRequest,
+    estimator: Option<&RedbFeeEstimator>,
+) -> Result<WalletPsbtRequest, StatusCode> {
+    match (request.fee_rate_sat_vb, request.confirmation_target) {
+        (rate, None) if (1..=MAX_WALLET_PSBT_FEE_RATE).contains(&rate) => Ok(request),
+        (0, Some(target @ 1..=1_008)) => {
+            let estimate = estimator
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+                .estimate(target)
+                .map_err(internal)?
+                .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+            if !(1..=MAX_WALLET_PSBT_FEE_RATE).contains(&estimate.fee_rate_sat_vb) {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            request.fee_rate_sat_vb = estimate.fee_rate_sat_vb;
+            request.confirmation_target = None;
+            Ok(request)
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
 }
 async fn finalize_wallet_psbt(
     State(state): State<Arc<WalletApiState>>,
@@ -1905,6 +1934,33 @@ mod tests {
         .unwrap();
         assert_eq!(response["blocks"], 1);
         assert_eq!(response["feerate"], 0.00005);
+
+        let target_request =
+            parse_wallet_psbt_request(br#"{"recipients":[],"confirmation_target":1}"#).unwrap();
+        let resolved = resolve_wallet_psbt_fee(target_request, Some(&estimator)).unwrap();
+        assert_eq!(resolved.fee_rate_sat_vb, 5);
+        assert_eq!(resolved.confirmation_target, None);
+        let exact = parse_wallet_psbt_request(br#"{"recipients":[],"fee_rate_sat_vb":7}"#).unwrap();
+        assert_eq!(
+            resolve_wallet_psbt_fee(exact, Some(&estimator))
+                .unwrap()
+                .fee_rate_sat_vb,
+            7
+        );
+        let ambiguous = parse_wallet_psbt_request(
+            br#"{"recipients":[],"fee_rate_sat_vb":7,"confirmation_target":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_wallet_psbt_fee(ambiguous, Some(&estimator)),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let unavailable =
+            parse_wallet_psbt_request(br#"{"recipients":[],"confirmation_target":1}"#).unwrap();
+        assert_eq!(
+            resolve_wallet_psbt_fee(unavailable, None),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
 
         let insufficient = execute_rpc(
             &TestIndex,
