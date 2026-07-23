@@ -32,6 +32,7 @@ pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 4_000_000;
 const V1_HEADER_LEN: usize = 24;
 const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
+const MAX_PENDING_MESSAGE_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
@@ -187,6 +188,14 @@ pub enum P2pError {
     /// A matching pong did not arrive within the shared response-frame budget.
     #[error("peer did not provide the requested pong within {MAX_RESPONSE_MESSAGES} messages")]
     PongResponseIncomplete,
+    /// Messages retained while waiting for a response exceeded the session memory budget.
+    #[error("pending peer messages require {bytes} bytes; limit is {limit}")]
+    PendingMessagesTooLarge {
+        /// Aggregate encoded payload bytes that would have been retained.
+        bytes: usize,
+        /// Maximum aggregate encoded payload bytes.
+        limit: usize,
+    },
     /// A local caller attempted to relay a coinbase transaction.
     #[error("coinbase transactions cannot be relayed")]
     OutboundCoinbaseTransaction,
@@ -222,6 +231,7 @@ impl P2pError {
             | Self::DuplicateBlockRequest(_)
             | Self::TooManyLocatorHashes { .. }
             | Self::PongResponseIncomplete
+            | Self::PendingMessagesTooLarge { .. }
             | Self::OutboundCoinbaseTransaction
             | Self::OutboundTransactionTooHeavy { .. } => false,
             Self::Message(_)
@@ -259,7 +269,8 @@ pub struct PeerAddress {
 pub struct PeerSession<S> {
     transport: V1Transport<S>,
     remote_version: VersionMessage,
-    pending_messages: VecDeque<NetworkMessage>,
+    pending_messages: VecDeque<(NetworkMessage, usize)>,
+    pending_message_bytes: usize,
 }
 
 impl<S> PeerSession<S> {
@@ -268,6 +279,7 @@ impl<S> PeerSession<S> {
             transport,
             remote_version,
             pending_messages: VecDeque::new(),
+            pending_message_bytes: 0,
         }
     }
 
@@ -335,6 +347,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
     ///
     /// Returns I/O, framing/checksum, network-magic, or message-size errors.
     pub async fn read_message(&mut self) -> Result<RawNetworkMessage, P2pError> {
+        self.read_message_with_payload_len()
+            .await
+            .map(|(message, _)| message)
+    }
+
+    async fn read_message_with_payload_len(
+        &mut self,
+    ) -> Result<(RawNetworkMessage, usize), P2pError> {
         let mut header = [0_u8; V1_HEADER_LEN];
         self.stream.read_exact(&mut header).await?;
         if header[..4] != self.magic.to_bytes() {
@@ -354,7 +374,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
         self.stream
             .read_exact(&mut message[V1_HEADER_LEN..])
             .await?;
-        Ok(decode_v1(&message)?)
+        Ok((decode_v1(&message)?, payload_len))
     }
 
     /// Writes one complete protocol-compatible Bitcoin v1 envelope.
@@ -430,8 +450,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
-    async fn read_wire_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
-        let message = self.transport.read_message().await?.into_payload();
+    async fn read_wire_response_message(
+        &mut self,
+    ) -> Result<Option<(NetworkMessage, usize)>, P2pError> {
+        let (message, payload_len) = self.transport.read_message_with_payload_len().await?;
+        let message = message.into_payload();
         validate_post_handshake_message(&message)?;
         match message {
             NetworkMessage::Ping(nonce) => {
@@ -441,15 +464,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 Ok(None)
             }
             NetworkMessage::Version(_) => Err(P2pError::PostHandshakeVersion),
-            message => Ok(Some(message)),
+            message => Ok(Some((message, payload_len))),
         }
     }
 
     async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
-        if let Some(message) = self.pending_messages.pop_front() {
+        if let Some((message, payload_len)) = self.pending_messages.pop_front() {
+            self.pending_message_bytes = self
+                .pending_message_bytes
+                .checked_sub(payload_len)
+                .expect("queued payload charge matches pending byte total");
             return Ok(Some(message));
         }
-        self.read_wire_response_message().await
+        self.read_wire_response_message()
+            .await
+            .map(|message| message.map(|(message, _)| message))
     }
 
     /// Sends an application-level keepalive and waits for its matching pong.
@@ -464,9 +493,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .await?;
         for _ in 0..MAX_RESPONSE_MESSAGES {
             match self.read_wire_response_message().await? {
-                Some(NetworkMessage::Pong(received)) if received == nonce => return Ok(()),
-                Some(NetworkMessage::Pong(_)) | None => {}
-                Some(message) => self.pending_messages.push_back(message),
+                Some((NetworkMessage::Pong(received), _)) if received == nonce => return Ok(()),
+                Some((NetworkMessage::Pong(_), _)) | None => {}
+                Some((message, payload_len)) => {
+                    let pending = self.pending_message_bytes.checked_add(payload_len).ok_or(
+                        P2pError::PendingMessagesTooLarge {
+                            bytes: usize::MAX,
+                            limit: MAX_PENDING_MESSAGE_BYTES,
+                        },
+                    )?;
+                    if pending > MAX_PENDING_MESSAGE_BYTES {
+                        return Err(P2pError::PendingMessagesTooLarge {
+                            bytes: pending,
+                            limit: MAX_PENDING_MESSAGE_BYTES,
+                        });
+                    }
+                    self.pending_messages.push_back((message, payload_len));
+                    self.pending_message_bytes = pending;
+                }
             }
         }
         Err(P2pError::PongResponseIncomplete)
@@ -923,6 +967,10 @@ mod tests {
                 count: MAX_BLOCKS_IN_FLIGHT + 1,
             },
             P2pError::PongResponseIncomplete,
+            P2pError::PendingMessagesTooLarge {
+                bytes: MAX_PENDING_MESSAGE_BYTES + 1,
+                limit: MAX_PENDING_MESSAGE_BYTES,
+            },
             P2pError::OutboundCoinbaseTransaction,
             P2pError::OutboundTransactionTooHeavy {
                 weight: u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT) + 1,
@@ -1507,7 +1555,8 @@ mod tests {
                 version(1),
             );
             session.ping(42).await.unwrap();
-            session.receive_headers().await.unwrap()
+            let headers = session.receive_headers().await.unwrap();
+            (headers, session.pending_message_bytes)
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -1525,7 +1574,39 @@ mod tests {
                 .unwrap();
         });
 
-        assert_eq!(client.await.unwrap(), vec![expected]);
+        assert_eq!(client.await.unwrap(), (vec![expected], 0));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_ping_caps_retained_payload_bytes() {
+        let (client_stream, server_stream) = duplex(5 * 1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.ping(42).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(42)
+            ));
+            for _ in 0..2 {
+                transport
+                    .write_message(NetworkMessage::Alert(vec![0; 2_100_000]))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::PendingMessagesTooLarge { bytes, limit })
+                if bytes > limit && limit == MAX_PENDING_MESSAGE_BYTES
+        ));
         server.await.unwrap();
     }
 
