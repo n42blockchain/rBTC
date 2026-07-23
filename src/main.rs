@@ -1846,6 +1846,7 @@ async fn negotiate_peer_preferences(
 struct ConnectedPeer {
     remote: SocketAddr,
     session: PeerSession<tokio::net::TcpStream>,
+    validated_header_height: Option<u32>,
 }
 
 struct PendingPeer {
@@ -1898,7 +1899,11 @@ async fn connect_peer(
             record_verified_peer(store.as_ref(), remote, remote_services, handshake_millis);
         }
     }
-    Ok(ConnectedPeer { remote, session })
+    Ok(ConnectedPeer {
+        remote,
+        session,
+        validated_header_height: None,
+    })
 }
 
 async fn maintain_standby(
@@ -1907,6 +1912,7 @@ async fn maintain_standby(
     keepalive_interval: Duration,
     mut ping_nonce: u64,
     mut transaction_relay: Option<broadcast::Receiver<Transaction>>,
+    mut header_dag: Option<HeaderDag>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     enum StandbyAction {
         Activate,
@@ -1945,6 +1951,20 @@ async fn maintain_standby(
                     })?
                     .map_err(|error| PeerRunError::p2p(&error))?;
                 ping_nonce = ping_nonce.wrapping_add(1);
+                if let Some(dag) = header_dag.as_mut() {
+                    request_headers(&mut connected.session, dag.block_locator()).await?;
+                    let headers = receive_headers(&mut connected.session).await?;
+                    if !headers.is_empty() {
+                        let (candidate, _) = dag
+                            .validate_batch_contextual(
+                                &headers,
+                                unix_time().map_err(PeerRunError::transient)?,
+                            )
+                            .map_err(|error| PeerRunError::header(&error))?;
+                        *dag = candidate;
+                    }
+                    connected.validated_header_height = Some(dag.active_tip().height);
+                }
             }
             StandbyAction::Relay(Ok(transaction)) => {
                 timeout(
@@ -1982,6 +2002,7 @@ async fn connect_and_maintain_standby(
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
     transaction_relay: Option<broadcast::Receiver<Transaction>>,
+    header_dag: Option<HeaderDag>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let connected = connect_peer(
         deployments,
@@ -2000,8 +2021,30 @@ async fn connect_and_maintain_standby(
         STANDBY_KEEPALIVE_INTERVAL,
         local_nonce,
         transaction_relay,
+        header_dag,
     )
     .await
+}
+
+fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
+    let path = options
+        .data_dir
+        .as_ref()
+        .map(|directory| directory.join("headers.redb"))
+        .or_else(|| options.headers_db.clone());
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(Some(HeaderDag::with_deployments(
+            options.deployments.clone(),
+        )));
+    }
+    let store = RedbHeaderStore::open(path).map_err(|error| error.to_string())?;
+    store
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn spawn_peer_connections(
@@ -2010,8 +2053,9 @@ fn spawn_peer_connections(
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     standby_relay: Option<&broadcast::Sender<Transaction>>,
-) -> VecDeque<(SocketAddr, PendingPeer)> {
-    remotes
+) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
+    let header_seed = standby_header_seed(options)?;
+    Ok(remotes
         .iter()
         .copied()
         .map(|remote| {
@@ -2022,6 +2066,7 @@ fn spawn_peer_connections(
             let (ready_sender, ready) = tokio::sync::oneshot::channel();
             let (activate, activate_receiver) = tokio::sync::oneshot::channel();
             let transaction_relay = standby_relay.map(broadcast::Sender::subscribe);
+            let header_dag = header_seed.clone();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -2031,6 +2076,7 @@ fn spawn_peer_connections(
                 ready_sender,
                 activate_receiver,
                 transaction_relay,
+                header_dag,
             ));
             (
                 remote,
@@ -2041,7 +2087,7 @@ fn spawn_peer_connections(
                 },
             )
         })
-        .collect()
+        .collect())
 }
 
 async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPeer)>) {
@@ -2085,7 +2131,13 @@ async fn try_peer_candidates(
         .and_then(|runtime| runtime.wallet.as_ref())
         .map(|wallet| &wallet.standby_relay);
     let mut pending =
-        spawn_peer_connections(options, remotes, local_nonce, peer_store, standby_relay);
+        match spawn_peer_connections(options, remotes, local_nonce, peer_store, standby_relay) {
+            Ok(pending) => pending,
+            Err(error) => {
+                failures.push(format!("standby header seed: {error}"));
+                return false;
+            }
+        };
     while let Some((remote, connection)) = pending.pop_front() {
         let connected = activate_pending_peer(connection).await;
         let result = match connected {
@@ -2136,7 +2188,11 @@ async fn run_connected_peer(
     let ConnectedPeer {
         remote,
         mut session,
+        validated_header_height,
     } = connected;
+    if let Some(height) = validated_header_height {
+        println!("activated peer {remote} after standby validation through height {height}");
+    }
     if let Some(hash) = options.fetch_block {
         fetch_requested_block(&mut session, hash).await?;
         return Ok(());
@@ -4959,7 +5015,8 @@ mod tests {
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         };
-        let mut pending = spawn_peer_connections(&options, &options.remotes, 100, None, None);
+        let mut pending =
+            spawn_peer_connections(&options, &options.remotes, 100, None, None).unwrap();
         timeout(Duration::from_secs(2), ready_received)
             .await
             .expect("later candidate should handshake while first candidate is stalled")
@@ -5010,6 +5067,7 @@ mod tests {
             Duration::from_millis(10),
             201,
             None,
+            None,
         ));
         timeout(Duration::from_secs(2), ping_received)
             .await
@@ -5021,6 +5079,121 @@ mod tests {
 
         drop(activated);
         release_server.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standby_validates_headers_continuously_before_activation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let child = mine_regtest_child(genesis.block_hash(), genesis.time + 1);
+        let (second_poll_seen, second_poll) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(212)).await;
+            receive_client_preferences(&mut peer).await;
+            for response in [vec![child], Vec::new()] {
+                let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+                else {
+                    panic!("expected standby ping");
+                };
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetHeaders(_)
+                ));
+                peer.write_message(NetworkMessage::Headers(response))
+                    .await
+                    .unwrap();
+            }
+            second_poll_seen.send(()).unwrap();
+        });
+
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            remote,
+            210,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let (activate, activation) = tokio::sync::oneshot::channel();
+        let standby = tokio::spawn(maintain_standby(
+            connected,
+            activation,
+            Duration::from_millis(10),
+            211,
+            None,
+            Some(HeaderDag::new(Network::Regtest)),
+        ));
+        timeout(Duration::from_secs(2), second_poll)
+            .await
+            .expect("standby should complete two independent header polls")
+            .unwrap();
+        activate.send(()).unwrap();
+        let activated = standby.await.unwrap().unwrap();
+        assert_eq!(activated.validated_header_height, Some(1));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standby_evicts_a_peer_that_announces_invalid_proof_of_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let mut invalid = mine_regtest_child(genesis.block_hash(), genesis.time + 1);
+        while invalid.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_ok() {
+            invalid.nonce = invalid.nonce.wrapping_add(1);
+        }
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(222)).await;
+            receive_client_preferences(&mut peer).await;
+            let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected standby ping");
+            };
+            peer.write_message(NetworkMessage::Pong(nonce))
+                .await
+                .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetHeaders(_)
+            ));
+            peer.write_message(NetworkMessage::Headers(vec![invalid]))
+                .await
+                .unwrap();
+        });
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            remote,
+            220,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_activate, activation) = tokio::sync::oneshot::channel();
+        let result = timeout(
+            Duration::from_secs(2),
+            maintain_standby(
+                connected,
+                activation,
+                Duration::from_millis(10),
+                221,
+                None,
+                Some(HeaderDag::new(Network::Regtest)),
+            ),
+        )
+        .await
+        .expect("invalid standby header should terminate the peer");
+        let error = match result {
+            Ok(_) => panic!("invalid standby header must evict the peer"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, PeerFailureKind::ProtocolViolation);
         server.await.unwrap();
     }
 
@@ -5075,6 +5248,7 @@ mod tests {
             Duration::from_secs(60),
             303,
             Some(relay.subscribe()),
+            None,
         ));
         let second_standby = tokio::spawn(maintain_standby(
             second,
@@ -5082,6 +5256,7 @@ mod tests {
             Duration::from_secs(60),
             304,
             Some(relay.subscribe()),
+            None,
         ));
 
         assert_eq!(relay.send(transaction).unwrap(), 2);
@@ -5129,6 +5304,7 @@ mod tests {
             Duration::from_secs(60),
             402,
             Some(receiver),
+            None,
         )
         .await
         {
