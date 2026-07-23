@@ -52,7 +52,10 @@ workflow uploads that report together with runner CPU, filesystem, and block
 device metadata so NVMe and HDD runs can be compared without confusing runner
 differences with backend results. redb results also measure explicit offline
 compaction, report file sizes before and after it, and reopen the compacted
-chainstate to verify the execution tip before accepting the result.
+chainstate to verify the execution tip before accepting the result. The same
+workflow runs `RBTC_BENCH_IBD_BLOCKS` generated regtest blocks through the
+production v1 handshake, headers-first download, script execution, atomic
+chainstate, ledger, and explorer path and retains a separate JSON report.
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character

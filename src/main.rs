@@ -4197,17 +4197,24 @@ mod tests {
     }
 
     fn regtest_block(parent: BlockHash, time: u32) -> Block {
+        regtest_block_at_height(parent, time, 1)
+    }
+
+    fn regtest_block_at_height(parent: BlockHash, time: u32, height: u32) -> Block {
         let coinbase = Transaction {
             version: TransactionVersion::ONE,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x00]),
+                script_sig: bitcoin::script::Builder::new()
+                    .push_int(i64::from(height))
+                    .push_opcode(bitcoin::opcodes::all::OP_PUSHBYTES_0)
+                    .into_script(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(1)),
+                value: Amount::from_sat(block_subsidy(height)),
                 script_pubkey: ScriptBuf::new(),
             }],
         };
@@ -7067,6 +7074,147 @@ mod tests {
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
         assert_eq!(backfilled_ledger.retained_ranges().unwrap(), vec![(1, 1)]);
+    }
+
+    #[tokio::test]
+    #[ignore = "run explicitly with cargo test --release --bin rbtcd tests::reproducible_end_to_end_ibd_workload -- --ignored --exact --nocapture"]
+    #[allow(clippy::too_many_lines)]
+    async fn reproducible_end_to_end_ibd_workload() {
+        const DEFAULT_BLOCKS: u32 = 100;
+        const MAX_BLOCKS: u32 = 1_000;
+
+        let block_count = std::env::var("RBTC_BENCH_IBD_BLOCKS").map_or(DEFAULT_BLOCKS, |value| {
+            value
+                .parse::<u32>()
+                .expect("RBTC_BENCH_IBD_BLOCKS must be an unsigned 32-bit integer")
+        });
+        assert!(
+            (1..=MAX_BLOCKS).contains(&block_count),
+            "RBTC_BENCH_IBD_BLOCKS must be in 1..={MAX_BLOCKS}"
+        );
+
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let mut parent = genesis.block_hash();
+        let mut blocks = Vec::with_capacity(block_count as usize);
+        for height in 1..=block_count {
+            let block =
+                regtest_block_at_height(parent, genesis.time.saturating_add(height), height);
+            parent = block.block_hash();
+            blocks.push(block);
+        }
+        let expected_tip = parent;
+        let serialized_block_bytes = blocks
+            .iter()
+            .map(|block| u64::try_from(serialize(block).len()).unwrap())
+            .sum::<u64>();
+        let headers = blocks.iter().map(|block| block.header).collect::<Vec<_>>();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(80)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(_) => peer
+                    .write_message(NetworkMessage::Headers(headers))
+                    .await
+                    .unwrap(),
+                message => panic!("expected benchmark getheaders, got {message:?}"),
+            }
+
+            let mut sent = 0_usize;
+            while sent < blocks.len() {
+                let NetworkMessage::GetData(inventory) =
+                    peer.read_message().await.unwrap().into_payload()
+                else {
+                    panic!("expected benchmark getdata");
+                };
+                let end = sent.checked_add(inventory.len()).unwrap();
+                assert!(end <= blocks.len());
+                let expected = blocks[sent..end]
+                    .iter()
+                    .map(|block| {
+                        bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(block.block_hash())
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(inventory, expected);
+                for block in &blocks[sent..end] {
+                    peer.write_message(NetworkMessage::Block(block.clone()))
+                        .await
+                        .unwrap();
+                }
+                sent = end;
+            }
+        });
+
+        let directory = TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+        timeout(
+            Duration::from_secs(120),
+            run(Options {
+                remotes: vec![remote],
+                dns_seeds: Some(Vec::new()),
+                network: Network::Regtest,
+                fetch_block: None,
+                headers_db: None,
+                data_dir: Some(directory.path().to_path_buf()),
+                once: true,
+                explorer_listen: None,
+                wallet_api_files: None,
+                deployments: DeploymentConfig::for_network(Network::Regtest),
+                ibd_policy: IbdPolicy::for_network(Network::Regtest),
+                snapshot: None,
+                finalize_assumeutxo: None,
+                validation_target: None,
+                complete_assumeutxo: None,
+                background_assumeutxo: None,
+                cleanup_validation_dir: false,
+                validation_limits: ValidationLimits::default(),
+            }),
+        )
+        .await
+        .expect("bounded IBD benchmark timed out")
+        .unwrap();
+        let elapsed = started.elapsed();
+        server.await.unwrap();
+
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, block_count);
+        assert_eq!(chainstate.execution().tip().unwrap().hash, expected_tip);
+        let explorer =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(explorer.tip().unwrap().height, block_count);
+        assert_eq!(explorer.tip().unwrap().hash, expected_tip);
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, block_count)]);
+
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "generated_fixture": true,
+            "blocks": block_count,
+            "serialized_block_bytes": serialized_block_bytes,
+            "elapsed_ns": elapsed_ns,
+            "nanoseconds_per_block": elapsed_ns / u64::from(block_count),
+            "tip_hash": expected_tip.to_string(),
+        });
+        let report = serde_json::to_string_pretty(&report).unwrap();
+        println!("{report}");
+        if let Ok(output) = std::env::var("RBTC_BENCH_IBD_REPORT") {
+            let output = PathBuf::from(output);
+            if let Some(parent) = output
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(output, format!("{report}\n")).unwrap();
+        }
     }
 
     #[tokio::test]

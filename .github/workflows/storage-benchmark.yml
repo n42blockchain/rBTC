@@ -19,6 +19,10 @@ on:
         description: Deterministic hit/miss lookups
         required: true
         default: "20000"
+      ibd_blocks:
+        description: Generated blocks for end-to-end local IBD
+        required: true
+        default: "100"
 
 permissions:
   contents: read
@@ -33,6 +37,8 @@ jobs:
       RBTC_BENCH_UTXOS: ${{ inputs.utxos }}
       RBTC_BENCH_LOOKUPS: ${{ inputs.lookups }}
       RBTC_BENCH_REPORT: target/storage-benchmark.json
+      RBTC_BENCH_IBD_BLOCKS: ${{ inputs.ibd_blocks }}
+      RBTC_BENCH_IBD_REPORT: target/ibd-benchmark.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # stable
@@ -49,10 +55,13 @@ jobs:
           } > target/storage-benchmark-environment.txt
       - name: Run deterministic generated workload
         run: cargo test --locked --release --all-features --test storage_bench reproducible_storage_workload -- --ignored --exact --nocapture
+      - name: Run production-path local IBD workload
+        run: cargo test --locked --release --all-features --bin rbtcd tests::reproducible_end_to_end_ibd_workload -- --ignored --exact --nocapture
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: storage-benchmark-${{ github.run_id }}
           path: |
             target/storage-benchmark.json
+            target/ibd-benchmark.json
             target/storage-benchmark-environment.txt
           if-no-files-found: error
