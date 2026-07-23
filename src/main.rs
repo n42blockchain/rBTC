@@ -65,6 +65,7 @@ const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
+const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const MAX_LOCAL_AUTH_TOKEN_FILE_LEN: u64 = 1024;
@@ -1855,8 +1856,21 @@ struct ConnectedPeer {
 
 struct PendingPeer {
     ready: tokio::sync::oneshot::Receiver<()>,
+    ready_observed: bool,
     activate: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<ConnectedPeer, PeerRunError>>,
+}
+
+impl PendingPeer {
+    fn observe_ready(&mut self) -> bool {
+        if self.ready_observed {
+            return true;
+        }
+        if self.ready.try_recv().is_ok() {
+            self.ready_observed = true;
+        }
+        self.ready_observed
+    }
 }
 
 async fn connect_peer(
@@ -2086,6 +2100,7 @@ fn spawn_peer_connections(
                 remote,
                 PendingPeer {
                     ready,
+                    ready_observed: false,
                     activate: Some(activate),
                     task,
                 },
@@ -2104,7 +2119,7 @@ async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPe
 }
 
 async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer, PeerRunError> {
-    if pending.ready.await.is_ok() {
+    if pending.ready_observed || pending.ready.await.is_ok() {
         let _ = pending
             .activate
             .take()
@@ -2117,6 +2132,65 @@ async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer
             "peer connection task failed: {error}"
         ))),
     }
+}
+
+async fn evict_excess_ready_standbys(
+    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    peer_store: Option<&RedbPeerStore>,
+    manual_remotes: &HashSet<SocketAddr>,
+    failures: &mut Vec<String>,
+) -> Vec<SocketAddr> {
+    let ready_automatic = pending
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, (remote, connection))| {
+            (!manual_remotes.contains(remote) && connection.observe_ready()).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let excess = ready_automatic
+        .len()
+        .saturating_sub(MAX_AUTOMATIC_HOT_STANDBYS);
+    let mut victims = ready_automatic
+        .into_iter()
+        .rev()
+        .take(excess)
+        .collect::<Vec<_>>();
+    let mut evicted = Vec::with_capacity(victims.len());
+    for index in victims.drain(..) {
+        let (remote, connection) = pending
+            .remove(index)
+            .expect("ready standby eviction index remains in the queue");
+        connection.task.abort();
+        match connection.task.await {
+            Err(error) if error.is_cancelled() => {
+                println!(
+                    "evicted standby peer {remote} under the {MAX_AUTOMATIC_HOT_STANDBYS}-peer automatic hot-standby capacity"
+                );
+                evicted.push(remote);
+            }
+            outcome => {
+                let error = match outcome {
+                    Ok(Err(error)) => error,
+                    Err(error) => PeerRunError::transient(format!(
+                        "peer connection task failed during standby eviction: {error}"
+                    )),
+                    Ok(Ok(_)) => {
+                        PeerRunError::transient("peer standby exited before capacity eviction")
+                    }
+                };
+                eprintln!("standby peer {remote} failed during capacity eviction: {error}");
+                record_peer_failure(
+                    peer_store,
+                    remote,
+                    error.kind,
+                    manual_remotes.contains(&remote),
+                );
+                failures.push(format!("{remote}: {error}"));
+            }
+        }
+    }
+    evicted.reverse();
+    evicted
 }
 
 async fn reap_finished_standbys(
@@ -2191,6 +2265,12 @@ async fn try_peer_candidates(
                         result = &mut active => break result,
                         _ = standby_reaper.tick() => {
                             reap_finished_standbys(
+                                &mut pending,
+                                peer_store.map(Arc::as_ref),
+                                manual_remotes,
+                                failures,
+                            ).await;
+                            evict_excess_ready_standbys(
                                 &mut pending,
                                 peer_store.map(Arc::as_ref),
                                 manual_remotes,
@@ -5086,6 +5166,7 @@ mod tests {
             let task = tokio::spawn(async move { Err::<ConnectedPeer, _>(error) });
             PendingPeer {
                 ready,
+                ready_observed: false,
                 activate: Some(activate),
                 task,
             }
@@ -5139,6 +5220,93 @@ mod tests {
         assert!(store.is_discouraged(protocol_remote, now).unwrap());
         assert!(!store.is_discouraged(manual_remote, now).unwrap());
         assert!(!store.is_discouraged(transient_remote, now).unwrap());
+    }
+
+    #[tokio::test]
+    async fn automatic_hot_standby_capacity_evicts_the_lowest_priority_ready_peers() {
+        fn ready_pending() -> PendingPeer {
+            let (ready_sender, ready) = tokio::sync::oneshot::channel();
+            ready_sender.send(()).unwrap();
+            let (activate, _activation) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(std::future::pending::<Result<ConnectedPeer, PeerRunError>>());
+            PendingPeer {
+                ready,
+                ready_observed: false,
+                activate: Some(activate),
+                task,
+            }
+        }
+
+        let automatic = (0..MAX_AUTOMATIC_HOT_STANDBYS + 2)
+            .map(|offset| {
+                (
+                    format!("127.0.0.1:{}", 18_500 + offset).parse().unwrap(),
+                    ready_pending(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let manual = [
+            ("127.0.0.1:18600".parse().unwrap(), ready_pending()),
+            ("127.0.0.1:18601".parse().unwrap(), ready_pending()),
+        ];
+        let manual_remotes = manual.iter().map(|(remote, _)| *remote).collect();
+        let mut pending = automatic.into_iter().chain(manual).collect::<VecDeque<_>>();
+        let mut failures = Vec::new();
+
+        let evicted =
+            evict_excess_ready_standbys(&mut pending, None, &manual_remotes, &mut failures).await;
+
+        assert!(failures.is_empty());
+        assert_eq!(
+            evicted,
+            vec![
+                "127.0.0.1:18508".parse().unwrap(),
+                "127.0.0.1:18509".parse().unwrap(),
+            ]
+        );
+        assert_eq!(pending.len(), MAX_AUTOMATIC_HOT_STANDBYS + 2);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|(remote, _)| *remote)
+                .collect::<Vec<_>>(),
+            (18_500_usize..18_500 + MAX_AUTOMATIC_HOT_STANDBYS)
+                .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
+                .chain([
+                    "127.0.0.1:18600".parse().unwrap(),
+                    "127.0.0.1:18601".parse().unwrap(),
+                ])
+                .collect::<Vec<_>>()
+        );
+
+        abort_pending_connections(&mut pending).await;
+    }
+
+    #[tokio::test]
+    async fn observed_standby_readiness_remains_activatable() {
+        let (ready_sender, ready) = tokio::sync::oneshot::channel();
+        ready_sender.send(()).unwrap();
+        let (activate, activation) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            activation.await.unwrap();
+            Err::<ConnectedPeer, _>(PeerRunError::transient("activated after readiness poll"))
+        });
+        let mut pending = PendingPeer {
+            ready,
+            ready_observed: false,
+            activate: Some(activate),
+            task,
+        };
+
+        assert!(pending.observe_ready());
+        let result = timeout(Duration::from_secs(1), activate_pending_peer(pending))
+            .await
+            .expect("observed ready standby should still receive activation");
+        let error = match result {
+            Ok(_) => panic!("synthetic activated standby must return its test error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "activated after readiness poll");
     }
 
     #[tokio::test]
