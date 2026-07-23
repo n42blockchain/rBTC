@@ -29,7 +29,14 @@ const MAX_STORED_PENALTIES: usize = 1_024;
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 
-type PeerPriority = (u8, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>);
+type PeerPriority = (
+    u8,
+    u8,
+    std::cmp::Reverse<u32>,
+    std::cmp::Reverse<u32>,
+    std::cmp::Reverse<u32>,
+    std::cmp::Reverse<u32>,
+);
 type PrioritizedPeer = (PeerPriority, std::net::SocketAddr);
 
 /// Peer-address persistence failures.
@@ -73,6 +80,10 @@ struct StoredPeer {
     last_success: u32,
     #[serde(default)]
     consecutive_failures: u8,
+    #[serde(default)]
+    last_session_success: u32,
+    #[serde(default)]
+    successful_sessions: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -178,18 +189,26 @@ impl RedbPeerStore {
             if existing.is_none() {
                 group_count += 1;
             }
-            let (source_group, last_attempt, last_success, consecutive_failures) = existing
-                .map_or_else(
-                    || (group.clone(), 0, 0, 0),
-                    |record| {
-                        (
-                            record.source_group.clone(),
-                            record.last_attempt,
-                            record.last_success,
-                            record.consecutive_failures,
-                        )
-                    },
-                );
+            let (
+                source_group,
+                last_attempt,
+                last_success,
+                consecutive_failures,
+                last_session_success,
+                successful_sessions,
+            ) = existing.map_or_else(
+                || (group.clone(), 0, 0, 0, 0, 0),
+                |record| {
+                    (
+                        record.source_group.clone(),
+                        record.last_attempt,
+                        record.last_success,
+                        record.consecutive_failures,
+                        record.last_session_success,
+                        record.successful_sessions,
+                    )
+                },
+            );
             records.insert(
                 key,
                 StoredPeer {
@@ -199,6 +218,8 @@ impl RedbPeerStore {
                     last_attempt,
                     last_success,
                     consecutive_failures,
+                    last_session_success,
+                    successful_sessions,
                 },
             );
             stats.accepted += 1;
@@ -299,7 +320,12 @@ impl RedbPeerStore {
         address: std::net::SocketAddr,
         now: u32,
     ) -> Result<bool, PeerStoreError> {
-        let updated = self.record_success(address, now)?;
+        let updated = self.update_existing(address, |record| {
+            record.last_success = now;
+            record.consecutive_failures = 0;
+            record.last_session_success = now;
+            record.successful_sessions = record.successful_sessions.saturating_add(1);
+        })?;
         self.clear_penalty(address)?;
         Ok(updated)
     }
@@ -494,6 +520,11 @@ fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
     if !valid_source_group(&record.source_group) {
         return Err(PeerStoreError::Malformed("peer source group"));
     }
+    if (record.last_session_success == 0) != (record.successful_sessions == 0)
+        || record.last_session_success > record.last_success
+    {
+        return Err(PeerStoreError::Malformed("peer session success history"));
+    }
     Ok(record)
 }
 
@@ -576,6 +607,9 @@ fn retry_ready(record: &StoredPeer, now: u32) -> bool {
 fn peer_priority(record: &StoredPeer) -> PeerPriority {
     (
         record.consecutive_failures,
+        u8::from(record.last_session_success == 0),
+        std::cmp::Reverse(record.last_session_success),
+        std::cmp::Reverse(record.successful_sessions),
         std::cmp::Reverse(record.last_success),
         std::cmp::Reverse(record.last_seen),
     )
@@ -698,7 +732,7 @@ mod tests {
     fn persists_network_bound_fresh_full_service_candidates() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("peers.redb");
-        let now = 1_800_000_000;
+        let now: u32 = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
         let stats = store
@@ -880,6 +914,8 @@ mod tests {
             last_attempt: now,
             last_success: 0,
             consecutive_failures: u8::MAX,
+            last_session_success: 0,
+            successful_sessions: 0,
         };
         assert!(!retry_ready(
             &maximally_failed,
@@ -946,6 +982,10 @@ mod tests {
             .unwrap();
         assert!(!reopened.is_discouraged(address, after_decay + 1).unwrap());
         assert!(reopened.load_penalties().unwrap().is_empty());
+        let records = reopened.load_records().unwrap();
+        let record = &records[&address.to_string()];
+        assert_eq!(record.last_session_success, after_decay + 1);
+        assert_eq!(record.successful_sessions, 1);
     }
 
     #[test]
@@ -981,6 +1021,42 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn completed_session_reputation_persists_and_outranks_newer_handshakes() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let proven = "1.1.1.1:38333".parse().unwrap();
+        let handshake_only = "2.2.2.2:38333".parse().unwrap();
+        store
+            .insert_verified(proven, services, now.saturating_sub(100))
+            .unwrap();
+        store
+            .record_session_success(proven, now.saturating_sub(90))
+            .unwrap();
+        store
+            .insert_verified(handshake_only, services, now)
+            .unwrap();
+        assert_eq!(
+            store.candidates(now, 2).unwrap(),
+            vec![proven, handshake_only]
+        );
+        store.record_session_success(proven, now + 1).unwrap();
+        drop(store);
+
+        let reopened = RedbPeerStore::open(path, Network::Signet).unwrap();
+        assert_eq!(
+            reopened.candidates(now + 1, 2).unwrap(),
+            vec![proven, handshake_only]
+        );
+        let records = reopened.load_records().unwrap();
+        let record = &records[&proven.to_string()];
+        assert_eq!(record.last_session_success, now + 1);
+        assert_eq!(record.successful_sessions, 2);
     }
 
     #[test]
@@ -1032,6 +1108,8 @@ mod tests {
             br#"{"services":9,"last_seen":1,"source_group":"v4:01:2"}"#.as_slice(),
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","extra":true}"#,
             br#"{"services":9,"last_seen":1,"source_group":"other:1:2"}"#,
+            br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":1,"successful_sessions":0}"#,
+            br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":2,"successful_sessions":1}"#,
         ] {
             assert!(validate_stored_peer_record(invalid).is_err());
         }
@@ -1079,6 +1157,8 @@ mod tests {
             last_attempt: 0,
             last_success,
             consecutive_failures,
+            last_session_success: 0,
+            successful_sessions: 0,
         };
         let records = HashMap::from([
             ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),
