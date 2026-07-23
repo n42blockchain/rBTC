@@ -33,6 +33,7 @@ use rbtc::{
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
+    fee_estimator::{FeeEstimatorError, FeeTrack, RedbFeeEstimator},
     header_store::RedbHeaderStore,
     headers::{HeaderDag, HeaderError},
     ibd::IbdPolicy,
@@ -679,6 +680,7 @@ struct ApiServer {
 }
 
 impl ApiServer {
+    #[allow(clippy::too_many_arguments)]
     async fn bind(
         address: SocketAddr,
         index: Arc<RedbExplorerIndex>,
@@ -686,6 +688,7 @@ impl ApiServer {
         node_status: NodeStatus,
         wallet: Option<&WalletApiRuntime>,
         rpc: Option<&RpcApiRuntime>,
+        fee_estimator: Option<&Arc<RedbFeeEstimator>>,
         background_validation: Option<&BackgroundValidationStatus>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
@@ -724,6 +727,7 @@ impl ApiServer {
             )));
             router = router.merge(rpc_router(
                 Arc::clone(&index),
+                fee_estimator.map(Arc::clone),
                 rpc.token.clone(),
                 rpc.audit.clone(),
             ));
@@ -2973,6 +2977,95 @@ fn relay_due_peer_transactions(
     Ok(relayed.len())
 }
 
+fn reconcile_fee_estimator(
+    estimator: &RedbFeeEstimator,
+    headers: &HeaderDag,
+    execution_tip: rbtc::execution_store::ExecutionTip,
+    ledger: &PrunedBlockLedger,
+) -> Result<(), String> {
+    loop {
+        let (height, hash) = estimator.tip().map_err(|error| error.to_string())?;
+        if height <= execution_tip.height
+            && headers
+                .active_header_at(height)
+                .is_some_and(|header| header.hash == hash)
+        {
+            break;
+        }
+        match estimator.disconnect_tip(hash) {
+            Ok(restored) => {
+                if restored > 0 {
+                    println!(
+                        "restored {restored} fee observation{} after estimator-tip disconnection",
+                        if restored == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            Err(FeeEstimatorError::Malformed("estimator history does not retain the tip")) => {
+                estimator
+                    .reset_tip(execution_tip.height, execution_tip.hash)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "reset fee-estimator history at {}:{} after a reorganization deeper than its retained journal",
+                    execution_tip.height, execution_tip.hash
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    loop {
+        let (height, hash) = estimator.tip().map_err(|error| error.to_string())?;
+        if height >= execution_tip.height {
+            return Ok(());
+        }
+        let next_height = height
+            .checked_add(1)
+            .ok_or_else(|| "fee-estimator height overflow".to_owned())?;
+        let expected = headers
+            .active_header_at(next_height)
+            .ok_or_else(|| format!("missing active fee-estimator header at {next_height}"))?;
+        let Some(raw) = ledger
+            .read_block(next_height)
+            .map_err(|error| error.to_string())?
+        else {
+            estimator
+                .reset_tip(execution_tip.height, execution_tip.hash)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "initialized fee-estimator tip at {}:{} because retained blocks do not reach its prior tip",
+                execution_tip.height, execution_tip.hash
+            );
+            return Ok(());
+        };
+        let block = deserialize::<Block>(&raw)
+            .map_err(|error| format!("decode fee-estimator block at {next_height}: {error}"))?;
+        if block.block_hash() != expected.hash {
+            return Err(format!(
+                "retained fee-estimator block at {next_height} has hash {}, expected {}",
+                block.block_hash(),
+                expected.hash
+            ));
+        }
+        let transaction_ids = block
+            .txdata
+            .iter()
+            .skip(1)
+            .map(Transaction::compute_txid)
+            .collect::<BTreeSet<_>>();
+        let confirmed = estimator
+            .connect_block(next_height, expected.hash, hash, &transaction_ids)
+            .map_err(|error| error.to_string())?;
+        if confirmed > 0 {
+            println!(
+                "recorded {confirmed} confirmed fee observation{} at block {next_height}",
+                if confirmed == 1 { "" } else { "s" }
+            );
+        }
+    }
+}
+
 fn transaction_admission_context(
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
@@ -3074,6 +3167,7 @@ fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_store: Option<&RedbTransactionPoolStore>,
+    fee_estimator: Option<&RedbFeeEstimator>,
     disconnected_transactions: &VecDeque<Transaction>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     chainstate: &RedbChainStore,
@@ -3227,6 +3321,7 @@ fn admit_pending_peer_transactions(
         tried_orphans.extend(children.iter().map(Transaction::compute_txid));
         packages.extend(dependency_packages(children));
     }
+    let relay_snapshot = candidate.relay_snapshot();
     if let Some(store) = transaction_store {
         store
             .replace_and_clear_disconnected_at(
@@ -3236,7 +3331,22 @@ fn admit_pending_peer_transactions(
             )
             .map_err(|error| error.to_string())?;
     }
-    let relay_snapshot = candidate.relay_snapshot();
+    if let Some(estimator) = fee_estimator {
+        let tracks = relay_snapshot
+            .iter()
+            .map(|entry| {
+                Ok(FeeTrack {
+                    txid: entry.transaction.compute_txid(),
+                    fee_sats: entry.fee_sats,
+                    policy_vsize: u32::try_from(entry.policy_vsize)
+                        .map_err(|_| "transaction policy vsize exceeds u32".to_owned())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        estimator
+            .track_pool(&tracks, context.height)
+            .map_err(|error| error.to_string())?;
+    }
     *pool = candidate;
     drop(pool);
     let relayed =
@@ -3334,6 +3444,11 @@ async fn sync_validating_node(
     let transaction_store = validation_target
         .is_none()
         .then(|| RedbTransactionPoolStore::open(data_dir.join("mempool.redb"), network))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let fee_estimator = validation_target
+        .is_none()
+        .then(|| RedbFeeEstimator::open(data_dir.join("fee_estimates.redb"), network).map(Arc::new))
         .transpose()
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
@@ -3552,6 +3667,7 @@ async fn sync_validating_node(
                             .clone(),
                         api.wallet.as_ref(),
                         api.rpc.as_ref(),
+                        fee_estimator.as_ref(),
                         background_validation,
                     )
                     .await?,
@@ -3604,6 +3720,9 @@ async fn sync_validating_node(
             }
             if tip.height >= headers.active_tip().height {
                 println!("block execution caught up at height {}", tip.height);
+                if let Some(estimator) = fee_estimator.as_ref() {
+                    reconcile_fee_estimator(estimator, &headers, tip, &ledger)?;
+                }
                 let ibd_status = ibd_policy
                     .status(&headers)
                     .map_err(|error| error.to_string())?;
@@ -3614,6 +3733,7 @@ async fn sync_validating_node(
                         session,
                         transaction_pool,
                         transaction_store.as_ref(),
+                        fee_estimator.as_deref(),
                         &disconnected_transactions,
                         transaction_relay,
                         &chainstate,
@@ -8491,6 +8611,7 @@ mod tests {
             node_status,
             Some(&wallet),
             Some(&rpc),
+            None,
             Some(&validation),
         )
         .await

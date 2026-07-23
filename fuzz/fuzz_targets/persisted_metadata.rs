@@ -2,6 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use rbtc::{
+    fee_estimator::validate_persisted_fee_estimator_state,
     peer_store::{
         validate_stored_peer_penalty, validate_stored_peer_record, validate_stored_tried_collisions,
     },
@@ -21,7 +22,7 @@ fuzz_target!(|input: &[u8]| {
     if value.len() > 257 * 1024 {
         return;
     }
-    match kind % 8 {
+    match kind % 9 {
         0 => {
             if value.len() <= 8 * 1024 {
                 let _ = parse_validation_directory_owner(value);
@@ -53,8 +54,11 @@ fuzz_target!(|input: &[u8]| {
         6 => {
             let _ = validate_persisted_transaction_relay_attempts(value);
         }
-        _ => {
+        7 => {
             let _ = validate_persisted_transaction_admission_times(value);
+        }
+        _ => {
+            let _ = validate_persisted_fee_estimator_state(value);
         }
     }
 });

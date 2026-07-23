@@ -32,6 +32,7 @@ use tokio_stream::{
 };
 
 use crate::{
+    fee_estimator::RedbFeeEstimator,
     rebroadcast_store::{RebroadcastStoreError, RedbRebroadcastStore},
     transaction_policy::validate_standard_transaction,
     wallet::{
@@ -800,16 +801,20 @@ struct LocalRpcRequest {
 ///
 /// The initial read-only method set is `help`, `getblockhash`,
 /// `rbtc.getblocksummary`, `rbtc.gettransaction`, and
-/// `rbtc.getaddressutxos`. Request bodies, identifiers, parameters, and result
-/// sizes are bounded.
+/// `rbtc.getaddressutxos`, and `estimatesmartfee`. Request bodies, identifiers,
+/// parameters, and result sizes are bounded.
 pub fn rpc_router<I: ExplorerIndex>(
     index: Arc<I>,
+    fee_estimator: Option<Arc<RedbFeeEstimator>>,
     token: LocalAuthToken,
     audit: AuthorizationAuditLog,
 ) -> Router {
     Router::new()
         .route("/rpc", post(rpc_call::<I>))
-        .with_state(index)
+        .with_state(RpcState {
+            index,
+            fee_estimator,
+        })
         .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
             LocalRouteSecurity { token, audit },
@@ -817,15 +822,34 @@ pub fn rpc_router<I: ExplorerIndex>(
         ))
 }
 
+struct RpcState<I> {
+    index: Arc<I>,
+    fee_estimator: Option<Arc<RedbFeeEstimator>>,
+}
+
+impl<I> Clone for RpcState<I> {
+    fn clone(&self) -> Self {
+        Self {
+            index: Arc::clone(&self.index),
+            fee_estimator: self.fee_estimator.as_ref().map(Arc::clone),
+        }
+    }
+}
+
 async fn rpc_call<I: ExplorerIndex>(
-    State(index): State<Arc<I>>,
+    State(state): State<RpcState<I>>,
     body: Bytes,
 ) -> Json<serde_json::Value> {
     let Ok(request) = parse_local_rpc_request(&body) else {
         return rpc_error(&serde_json::Value::Null, -32600, "Invalid Request");
     };
     let id = request.id;
-    match execute_rpc(index.as_ref(), &request.method, &request.params) {
+    match execute_rpc(
+        state.index.as_ref(),
+        state.fee_estimator.as_deref(),
+        &request.method,
+        &request.params,
+    ) {
         Ok(result) => Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -870,6 +894,7 @@ fn valid_rpc_id(id: &serde_json::Value) -> bool {
 
 fn execute_rpc<I: ExplorerIndex>(
     index: &I,
+    fee_estimator: Option<&RedbFeeEstimator>,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, (i64, &'static str)> {
@@ -880,6 +905,7 @@ fn execute_rpc<I: ExplorerIndex>(
             }
             Ok(serde_json::json!([
                 "getblockhash",
+                "estimatesmartfee",
                 "rbtc.getblocksummary",
                 "rbtc.gettransaction",
                 "rbtc.getaddressutxos"
@@ -892,6 +918,32 @@ fn execute_rpc<I: ExplorerIndex>(
                 .map_err(|_| (-32603, "Internal error"))?
                 .ok_or((-32001, "Block not found"))?;
             Ok(serde_json::Value::String(block.hash))
+        }
+        "estimatesmartfee" => {
+            let (target,) = rpc_one_u32(params)?;
+            let target = u16::try_from(target)
+                .ok()
+                .filter(|target| (1..=1_008).contains(target))
+                .ok_or((-32602, "Invalid params"))?;
+            let estimate = fee_estimator
+                .map(|estimator| estimator.estimate(target))
+                .transpose()
+                .map_err(|_| (-32603, "Internal error"))?
+                .flatten();
+            Ok(estimate.map_or_else(
+                || {
+                    serde_json::json!({
+                        "errors": ["Insufficient data or no feerate found"],
+                        "blocks": target
+                    })
+                },
+                |estimate| {
+                    serde_json::json!({
+                        "feerate": fee_rate_btc_kvb(estimate.fee_rate_sat_vb),
+                        "blocks": estimate.target_blocks
+                    })
+                },
+            ))
         }
         "rbtc.getblocksummary" => {
             let (height,) = rpc_one_u32(params)?;
@@ -915,6 +967,14 @@ fn execute_rpc<I: ExplorerIndex>(
         "rbtc.getaddressutxos" => rpc_address_utxos(index, params),
         _ => Err((-32601, "Method not found")),
     }
+}
+
+fn fee_rate_btc_kvb(rate_sat_vb: u64) -> serde_json::Number {
+    let whole = rate_sat_vb / 100_000;
+    let fractional = rate_sat_vb % 100_000;
+    format!("{whole}.{fractional:05}")
+        .parse()
+        .expect("bounded integer fee rate always forms a JSON number")
 }
 
 fn rpc_one_u32(params: &serde_json::Value) -> Result<(u32,), (i64, &'static str)> {
@@ -1736,6 +1796,7 @@ mod tests {
         let token = "r".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
         let app = rpc_router(
             Arc::new(TestIndex),
+            None,
             LocalAuthToken::new(&token).unwrap(),
             AuthorizationAuditLog::open(&audit_path).unwrap(),
         );
@@ -1799,12 +1860,84 @@ mod tests {
         assert!(!audit.contains("bcrt1test"));
     }
 
+    #[test]
+    fn rpc_fee_estimate_requires_mature_observations_and_returns_core_units() {
+        use std::collections::BTreeSet;
+
+        use bitcoin::{BlockHash, Txid, hashes::Hash};
+
+        use crate::fee_estimator::FeeTrack;
+
+        let directory = tempfile::tempdir().unwrap();
+        let estimator = RedbFeeEstimator::open(
+            directory.path().join("fee_estimates.redb"),
+            Network::Regtest,
+        )
+        .unwrap();
+        let tip = BlockHash::from_byte_array([9; 32]);
+        estimator.reset_tip(100, tip).unwrap();
+        let tracks = (1..=3)
+            .map(|marker| FeeTrack {
+                txid: Txid::from_byte_array([marker; 32]),
+                fee_sats: 500,
+                policy_vsize: 100,
+            })
+            .collect::<Vec<_>>();
+        estimator.track_pool(&tracks, 101).unwrap();
+        estimator
+            .connect_block(
+                101,
+                BlockHash::from_byte_array([10; 32]),
+                tip,
+                &tracks
+                    .iter()
+                    .map(|track| track.txid)
+                    .collect::<BTreeSet<_>>(),
+            )
+            .unwrap();
+
+        let response = execute_rpc(
+            &TestIndex,
+            Some(&estimator),
+            "estimatesmartfee",
+            &serde_json::json!([1]),
+        )
+        .unwrap();
+        assert_eq!(response["blocks"], 1);
+        assert_eq!(response["feerate"], 0.00005);
+
+        let insufficient = execute_rpc(
+            &TestIndex,
+            None,
+            "estimatesmartfee",
+            &serde_json::json!([1]),
+        )
+        .unwrap();
+        assert_eq!(insufficient["blocks"], 1);
+        assert!(
+            insufficient["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("Insufficient data")
+        );
+        assert!(
+            execute_rpc(
+                &TestIndex,
+                Some(&estimator),
+                "estimatesmartfee",
+                &serde_json::json!([0]),
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn rpc_rejects_malformed_unbounded_and_unknown_requests() {
         let directory = tempfile::tempdir().unwrap();
         let token = "r".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
         let app = rpc_router(
             Arc::new(TestIndex),
+            None,
             LocalAuthToken::new(&token).unwrap(),
             AuthorizationAuditLog::open(directory.path().join("api-auth-audit.jsonl")).unwrap(),
         );
