@@ -219,6 +219,7 @@ struct WalletApiRuntime {
     scan: WalletScanConfig,
     broadcast_sender: mpsc::Sender<WalletBroadcastRequest>,
     broadcast_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WalletBroadcastRequest>>>,
+    pending_broadcast: Arc<tokio::sync::Mutex<Option<WalletBroadcastRequest>>>,
 }
 
 struct RpcApiRuntime {
@@ -870,6 +871,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 },
                 broadcast_sender,
                 broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+                pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
             })
         })
         .transpose()?;
@@ -2186,7 +2188,9 @@ async fn wait_for_peer_poll(
         return Ok(());
     };
     loop {
-        let request = {
+        let request = if let Some(request) = wallet.pending_broadcast.lock().await.take() {
+            Some(request)
+        } else {
             let mut receiver = wallet.broadcast_receiver.lock().await;
             tokio::select! {
                 () = &mut sleep => return Ok(()),
@@ -2211,16 +2215,26 @@ async fn wait_for_peer_poll(
             }
             Ok(Err(error)) => {
                 let peer_error = PeerRunError::p2p(&error);
-                let _ = request.result.send(Err(()));
+                retain_wallet_broadcast(wallet, request).await;
                 return Err(peer_error);
             }
             Err(_) => {
-                let _ = request.result.send(Err(()));
+                retain_wallet_broadcast(wallet, request).await;
                 return Err(PeerRunError::transient(
                     "wallet transaction broadcast timed out",
                 ));
             }
         }
+    }
+}
+
+async fn retain_wallet_broadcast(wallet: &WalletApiRuntime, request: WalletBroadcastRequest) {
+    if request.result.is_closed() {
+        return;
+    }
+    let replaced = wallet.pending_broadcast.lock().await.replace(request);
+    if let Some(replaced) = replaced {
+        let _ = replaced.result.send(Err(()));
     }
 }
 
@@ -4428,11 +4442,8 @@ mod tests {
         (peer, local_version)
     }
 
-    #[tokio::test]
-    async fn wallet_broadcast_queue_writes_the_verified_transaction_to_the_peer() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = listener.local_addr().unwrap();
-        let transaction = Transaction {
+    fn wallet_broadcast_transaction() -> Transaction {
+        Transaction {
             version: TransactionVersion::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
@@ -4448,7 +4459,14 @@ mod tests {
                 value: Amount::from_sat(1_000),
                 script_pubkey: ScriptBuf::new(),
             }],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_broadcast_queue_retries_before_writing_to_the_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let transaction = wallet_broadcast_transaction();
         let expected = transaction.clone();
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(listener, peer_version(2)).await;
@@ -4488,12 +4506,15 @@ mod tests {
             },
             broadcast_sender: broadcast_sender.clone(),
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+            pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
         };
-        let (result, completion) = tokio::sync::oneshot::channel();
+        let (result, mut completion) = tokio::sync::oneshot::channel();
         let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
         drop(abandoned_completion);
         let mut abandoned = transaction.clone();
         abandoned.output[0].value = Amount::from_sat(999);
+        let mut retry = transaction.clone();
+        retry.input[0].previous_output = OutPoint::null();
         assert!(
             broadcast_sender
                 .try_send(WalletBroadcastRequest {
@@ -4505,12 +4526,28 @@ mod tests {
         assert!(
             broadcast_sender
                 .try_send(WalletBroadcastRequest {
-                    transaction,
+                    transaction: retry,
                     result,
                 })
                 .is_ok()
         );
 
+        assert!(
+            wait_for_peer_poll(&mut session, Duration::from_millis(10), Some(&wallet))
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        wallet
+            .pending_broadcast
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .transaction = transaction;
         wait_for_peer_poll(&mut session, Duration::from_millis(10), Some(&wallet))
             .await
             .unwrap();
@@ -6290,6 +6327,7 @@ mod tests {
             },
             broadcast_sender,
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+            pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),
