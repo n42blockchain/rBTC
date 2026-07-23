@@ -28,6 +28,7 @@ pub mod signet;
 pub mod snapshot;
 pub mod transaction_admission;
 pub mod transaction_policy;
+pub mod transaction_pool_store;
 pub mod undo_store;
 pub mod utxo;
 pub mod validation_owner;

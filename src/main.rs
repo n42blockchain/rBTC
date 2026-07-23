@@ -46,6 +46,7 @@ use rbtc::{
     transaction_admission::{
         TransactionAdmissionContext, TransactionAdmissionPool, dependency_packages,
     },
+    transaction_pool_store::RedbTransactionPoolStore,
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
     validation_owner::{
         MAX_VALIDATION_OWNER_BYTES, ValidationDirectoryOwner, parse_validation_directory_owner,
@@ -2898,25 +2899,31 @@ fn transaction_admission_context(
 fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    transaction_store: Option<&RedbTransactionPoolStore>,
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
 ) -> Result<(), String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config)?;
-    let pending = session.take_pending_transactions();
+    let mut pending = transaction_store
+        .map(RedbTransactionPoolStore::transactions)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    pending.extend(session.take_pending_transactions());
     let mut pool = transaction_pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let removed = pool.reconcile(chainstate, context);
-    if removed > 0 {
-        println!("removed {removed} local transactions after active-chain reconciliation");
-    }
+    let mut candidate = pool.clone();
+    let removed = candidate.reconcile(chainstate, context);
+    let mut accepted_messages = Vec::new();
+    let mut rejected_messages = Vec::new();
     for package in dependency_packages(pending) {
         let txids = package
             .iter()
             .map(Transaction::compute_txid)
             .collect::<Vec<_>>();
-        match pool.admit_package(chainstate, package, context) {
+        match candidate.admit_package(chainstate, package, context) {
             Ok(outcome) if !outcome.accepted.is_empty() => {
                 let mut effects = Vec::new();
                 if outcome.replaced > 0 {
@@ -2934,7 +2941,7 @@ fn admit_pending_peer_transactions(
                         if outcome.evicted == 1 { "y" } else { "ies" }
                     ));
                 }
-                println!(
+                accepted_messages.push(format!(
                     "admitted peer transaction package [{}] into the bounded local pool{}",
                     outcome
                         .accepted
@@ -2947,20 +2954,36 @@ fn admit_pending_peer_transactions(
                     } else {
                         format!(" after {}", effects.join(" and "))
                     }
-                );
+                ));
             }
             Ok(_) => {}
             Err(error) => {
-                eprintln!(
+                rejected_messages.push(format!(
                     "rejected peer transaction package [{}]: {error}",
                     txids
                         .iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
-                );
+                ));
             }
         }
+    }
+    if let Some(store) = transaction_store {
+        store
+            .replace(&candidate.snapshot())
+            .map_err(|error| error.to_string())?;
+    }
+    *pool = candidate;
+    drop(pool);
+    if removed > 0 {
+        println!("removed {removed} local transactions after active-chain reconciliation");
+    }
+    for message in accepted_messages {
+        println!("{message}");
+    }
+    for message in rejected_messages {
+        eprintln!("{message}");
     }
     Ok(())
 }
@@ -3014,6 +3037,11 @@ async fn sync_validating_node(
             block_hash: target.hash,
         })
         .or(validation_target);
+    let transaction_store = validation_target
+        .is_none()
+        .then(|| RedbTransactionPoolStore::open(data_dir.join("mempool.redb"), network))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
     let explorer = Arc::new(
@@ -3247,6 +3275,7 @@ async fn sync_validating_node(
                     admit_pending_peer_transactions(
                         session,
                         transaction_pool,
+                        transaction_store.as_ref(),
                         &chainstate,
                         &headers,
                         deployment_config,
