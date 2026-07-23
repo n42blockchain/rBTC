@@ -1503,6 +1503,35 @@ mod tests {
     }
 
     #[test]
+    fn output_policy_rejection_does_not_mutate_chainstate_or_pool() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut transaction) = spend(87);
+        let mut builder = Builder::new().push_int(1);
+        for _ in 0..=crate::transaction_policy::MAX_STANDARD_BARE_MULTISIG_KEYS {
+            builder = builder.push_slice([2; 33]);
+        }
+        transaction.output[0].script_pubkey = builder
+            .push_int(
+                i64::try_from(crate::transaction_policy::MAX_STANDARD_BARE_MULTISIG_KEYS + 1)
+                    .unwrap(),
+            )
+            .push_opcode(opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit(&store, transaction, context()),
+            Err(TransactionAdmissionError::Policy(
+                TransactionPolicyError::OutputScript(0)
+            ))
+        ));
+        assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+        assert!(pool.is_empty());
+        assert_eq!(pool.retained_bytes(), 0);
+    }
+
+    #[test]
     fn non_signaling_conflict_is_rejected_without_mutating_the_pool() {
         let (_directory, store) = store();
         let (outpoint, utxo, first) = spend(2);
