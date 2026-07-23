@@ -13,7 +13,7 @@ use std::{
 };
 
 use bitcoin::{
-    Block, BlockHash, Network,
+    Block, BlockHash, Network, Transaction,
     consensus::{deserialize, serialize},
     hashes::Hash,
     hex::FromHex,
@@ -51,7 +51,7 @@ use rbtc::{
         parse_wallet_descriptor_config,
     },
 };
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -221,6 +221,7 @@ struct WalletApiRuntime {
     broadcast_sender: mpsc::Sender<WalletBroadcastRequest>,
     broadcast_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WalletBroadcastRequest>>>,
     pending_broadcast: Arc<tokio::sync::Mutex<Option<WalletBroadcastRequest>>>,
+    standby_relay: broadcast::Sender<Transaction>,
 }
 
 struct RpcApiRuntime {
@@ -861,6 +862,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             );
             let (broadcast_sender, broadcast_receiver) =
                 mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+            let (standby_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
             Ok::<_, String>(WalletApiRuntime {
                 wallet: Arc::new(wallet),
                 token,
@@ -873,6 +875,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 broadcast_sender,
                 broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
                 pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
+                standby_relay,
             })
         })
         .transpose()?;
@@ -1835,30 +1838,69 @@ async fn maintain_standby(
     mut activate: tokio::sync::oneshot::Receiver<()>,
     keepalive_interval: Duration,
     mut ping_nonce: u64,
+    mut transaction_relay: Option<broadcast::Receiver<Transaction>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
+    enum StandbyAction {
+        Activate,
+        Keepalive,
+        Relay(Result<Transaction, broadcast::error::RecvError>),
+    }
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.tick().await;
     loop {
-        tokio::select! {
+        let action = tokio::select! {
             biased;
             activated = &mut activate => {
                 activated.map_err(|_| {
                     PeerRunError::transient("peer standby activation channel closed")
                 })?;
-                return Ok(connected);
+                StandbyAction::Activate
             }
-            _ = keepalive.tick() => {}
+            _ = keepalive.tick() => StandbyAction::Keepalive,
+            transaction = async {
+                match transaction_relay.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => StandbyAction::Relay(transaction),
+        };
+        match action {
+            StandbyAction::Activate => return Ok(connected),
+            StandbyAction::Keepalive => {
+                timeout(PEER_TIMEOUT, connected.session.ping(ping_nonce))
+                    .await
+                    .map_err(|_| {
+                        PeerRunError::transient(format!(
+                            "peer standby keepalive timed out after {} seconds",
+                            PEER_TIMEOUT.as_secs()
+                        ))
+                    })?
+                    .map_err(|error| PeerRunError::p2p(&error))?;
+                ping_nonce = ping_nonce.wrapping_add(1);
+            }
+            StandbyAction::Relay(Ok(transaction)) => {
+                timeout(
+                    PEER_TIMEOUT,
+                    connected.session.broadcast_transaction(&transaction),
+                )
+                .await
+                .map_err(|_| {
+                    PeerRunError::transient(format!(
+                        "peer standby transaction relay timed out after {} seconds",
+                        PEER_TIMEOUT.as_secs()
+                    ))
+                })?
+                .map_err(|error| PeerRunError::p2p(&error))?;
+            }
+            StandbyAction::Relay(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                return Err(PeerRunError::transient(format!(
+                    "peer standby transaction relay lagged by {skipped} messages"
+                )));
+            }
+            StandbyAction::Relay(Err(broadcast::error::RecvError::Closed)) => {
+                transaction_relay = None;
+            }
         }
-        timeout(PEER_TIMEOUT, connected.session.ping(ping_nonce))
-            .await
-            .map_err(|_| {
-                PeerRunError::transient(format!(
-                    "peer standby keepalive timed out after {} seconds",
-                    PEER_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|error| PeerRunError::p2p(&error))?;
-        ping_nonce = ping_nonce.wrapping_add(1);
     }
 }
 
@@ -1871,6 +1913,7 @@ async fn connect_and_maintain_standby(
     peer_store: Option<Arc<RedbPeerStore>>,
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
+    transaction_relay: Option<broadcast::Receiver<Transaction>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let connected = connect_peer(
         deployments,
@@ -1883,7 +1926,14 @@ async fn connect_and_maintain_standby(
     ready
         .send(())
         .map_err(|()| PeerRunError::transient("peer standby readiness channel closed"))?;
-    maintain_standby(connected, activate, STANDBY_KEEPALIVE_INTERVAL, local_nonce).await
+    maintain_standby(
+        connected,
+        activate,
+        STANDBY_KEEPALIVE_INTERVAL,
+        local_nonce,
+        transaction_relay,
+    )
+    .await
 }
 
 fn spawn_peer_connections(
@@ -1891,6 +1941,7 @@ fn spawn_peer_connections(
     remotes: &[SocketAddr],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
+    standby_relay: Option<&broadcast::Sender<Transaction>>,
 ) -> VecDeque<(SocketAddr, PendingPeer)> {
     remotes
         .iter()
@@ -1902,6 +1953,7 @@ fn spawn_peer_connections(
             let require_full_services = options.data_dir.is_some();
             let (ready_sender, ready) = tokio::sync::oneshot::channel();
             let (activate, activate_receiver) = tokio::sync::oneshot::channel();
+            let transaction_relay = standby_relay.map(broadcast::Sender::subscribe);
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -1910,6 +1962,7 @@ fn spawn_peer_connections(
                 peer_store,
                 ready_sender,
                 activate_receiver,
+                transaction_relay,
             ));
             (
                 remote,
@@ -1960,7 +2013,11 @@ async fn try_peer_candidates(
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
 ) -> bool {
-    let mut pending = spawn_peer_connections(options, remotes, local_nonce, peer_store);
+    let standby_relay = api_runtime
+        .and_then(|runtime| runtime.wallet.as_ref())
+        .map(|wallet| &wallet.standby_relay);
+    let mut pending =
+        spawn_peer_connections(options, remotes, local_nonce, peer_store, standby_relay);
     while let Some((remote, connection)) = pending.pop_front() {
         let connected = activate_pending_peer(connection).await;
         let result = match connected {
@@ -2405,6 +2462,7 @@ async fn wait_for_peer_poll(
         .await
         {
             Ok(Ok(())) => {
+                let _ = wallet.standby_relay.send(request.transaction.clone());
                 let _ = request.result.send(Ok(()));
             }
             Ok(Err(error)) => {
@@ -4698,7 +4756,7 @@ mod tests {
             cleanup_validation_dir: false,
             validation_limits: ValidationLimits::default(),
         };
-        let mut pending = spawn_peer_connections(&options, &options.remotes, 100, None);
+        let mut pending = spawn_peer_connections(&options, &options.remotes, 100, None, None);
         timeout(Duration::from_secs(2), ready_received)
             .await
             .expect("later candidate should handshake while first candidate is stalled")
@@ -4748,6 +4806,7 @@ mod tests {
             activation,
             Duration::from_millis(10),
             201,
+            None,
         ));
         timeout(Duration::from_secs(2), ping_received)
             .await
@@ -4758,6 +4817,123 @@ mod tests {
         assert_eq!(activated.remote, remote);
 
         drop(activated);
+        release_server.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    async fn expect_standby_transaction(listener: TcpListener, expected: Transaction) {
+        let (mut peer, _) = accept_peer(listener, peer_version(rand::random())).await;
+        receive_client_preferences(&mut peer).await;
+        assert_eq!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Tx(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_transaction_is_relayed_to_every_hot_standby() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_remote = first_listener.local_addr().unwrap();
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_remote = second_listener.local_addr().unwrap();
+        let transaction = wallet_broadcast_transaction();
+        let first_server = tokio::spawn(expect_standby_transaction(
+            first_listener,
+            transaction.clone(),
+        ));
+        let second_server = tokio::spawn(expect_standby_transaction(
+            second_listener,
+            transaction.clone(),
+        ));
+        let first = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            first_remote,
+            301,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            second_remote,
+            302,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let (relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let (activate_first, first_activation) = tokio::sync::oneshot::channel();
+        let (activate_second, second_activation) = tokio::sync::oneshot::channel();
+        let first_standby = tokio::spawn(maintain_standby(
+            first,
+            first_activation,
+            Duration::from_secs(60),
+            303,
+            Some(relay.subscribe()),
+        ));
+        let second_standby = tokio::spawn(maintain_standby(
+            second,
+            second_activation,
+            Duration::from_secs(60),
+            304,
+            Some(relay.subscribe()),
+        ));
+
+        assert_eq!(relay.send(transaction).unwrap(), 2);
+        timeout(Duration::from_secs(2), first_server)
+            .await
+            .expect("first standby transaction relay timed out")
+            .unwrap();
+        timeout(Duration::from_secs(2), second_server)
+            .await
+            .expect("second standby transaction relay timed out")
+            .unwrap();
+
+        activate_first.send(()).unwrap();
+        activate_second.send(()).unwrap();
+        assert_eq!(first_standby.await.unwrap().unwrap().remote, first_remote);
+        assert_eq!(second_standby.await.unwrap().unwrap().remote, second_remote);
+    }
+
+    #[tokio::test]
+    async fn lagging_transaction_relay_removes_hot_standby() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let (release_server, server_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(401)).await;
+            receive_client_preferences(&mut peer).await;
+            server_release.await.unwrap();
+        });
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            remote,
+            400,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let (relay, receiver) = broadcast::channel(1);
+        assert_eq!(relay.send(wallet_broadcast_transaction()).unwrap(), 1);
+        assert_eq!(relay.send(wallet_broadcast_transaction()).unwrap(), 1);
+        let (_activate, activation) = tokio::sync::oneshot::channel();
+        let error = match maintain_standby(
+            connected,
+            activation,
+            Duration::from_secs(60),
+            402,
+            Some(receiver),
+        )
+        .await
+        {
+            Ok(_) => panic!("lagging standby must be removed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("lagged by 1 messages"));
+
         release_server.send(()).unwrap();
         server.await.unwrap();
     }
@@ -4807,6 +4983,8 @@ mod tests {
 
         let directory = TempDir::new().unwrap();
         let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let (standby_relay, mut standby_receiver) =
+            broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         let wallet = WalletApiRuntime {
             wallet: Arc::new(
                 EmbeddedWallet::open_or_create(
@@ -4827,6 +5005,7 @@ mod tests {
             broadcast_sender: broadcast_sender.clone(),
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
+            standby_relay,
         };
         let (result, mut completion) = tokio::sync::oneshot::channel();
         let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
@@ -4867,11 +5046,12 @@ mod tests {
             .await
             .as_mut()
             .unwrap()
-            .transaction = transaction;
+            .transaction = transaction.clone();
         wait_for_peer_poll(&mut session, Duration::from_millis(10), Some(&wallet))
             .await
             .unwrap();
         assert_eq!(completion.await.unwrap(), Ok(()));
+        assert_eq!(standby_receiver.recv().await.unwrap(), transaction);
         server.await.unwrap();
     }
 
@@ -6628,6 +6808,7 @@ mod tests {
         write_owner_only(&rpc_token_path, &rpc_token_text);
         let audit = AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap();
         let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let (standby_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         let wallet = WalletApiRuntime {
             wallet: Arc::new(
                 EmbeddedWallet::open_or_create(
@@ -6648,6 +6829,7 @@ mod tests {
             broadcast_sender,
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
+            standby_relay,
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),
