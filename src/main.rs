@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     process,
@@ -39,6 +39,9 @@ use rbtc::{
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
+    validation_owner::{
+        MAX_VALIDATION_OWNER_BYTES, ValidationDirectoryOwner, parse_validation_directory_owner,
+    },
     wallet::{
         EmbeddedWallet, MAX_WALLET_DESCRIPTOR_CONFIG_BYTES, WalletTip,
         parse_wallet_descriptor_config,
@@ -58,7 +61,6 @@ const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
-const MAX_VALIDATION_OWNER_BYTES: u64 = 4_096;
 
 const fn supports_block_execution(network: Network) -> bool {
     matches!(network, Network::Regtest | Network::Signet)
@@ -311,15 +313,6 @@ struct NodeStatusResponse {
     ledger_bytes: u64,
     ledger_first_height: Option<u32>,
     ledger_tip_height: Option<u32>,
-}
-
-#[derive(Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct ValidationDirectoryOwner {
-    version: u32,
-    network: String,
-    target_height: u32,
-    target_block_hash: String,
 }
 
 impl BackgroundValidationStatus {
@@ -1319,12 +1312,8 @@ fn prepare_assumeutxo_validation(
         .assumed_snapshot()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "active chainstate has no assumed UTXO snapshot to validate".to_owned())?;
-    let owner = ValidationDirectoryOwner {
-        version: 1,
-        network: options.network.to_string(),
-        target_height: assumed.base.height,
-        target_block_hash: assumed.base.hash.to_string(),
-    };
+    let owner =
+        ValidationDirectoryOwner::new(options.network, assumed.base.height, assumed.base.hash);
     ensure_validation_directory_owner(
         &validation_dir,
         &owner,
@@ -1340,14 +1329,30 @@ fn ensure_validation_directory_owner(
     claimable: bool,
     cleanup_requested: bool,
 ) -> Result<(), String> {
+    ensure_validation_directory_owner_with_sync(
+        validation_dir,
+        expected,
+        claimable,
+        cleanup_requested,
+        sync_directory,
+    )
+}
+
+fn ensure_validation_directory_owner_with_sync(
+    validation_dir: &std::path::Path,
+    expected: &ValidationDirectoryOwner,
+    claimable: bool,
+    cleanup_requested: bool,
+    mut sync_dir: impl FnMut(&std::path::Path) -> io::Result<()>,
+) -> Result<(), String> {
     let marker = validation_dir.join(VALIDATION_OWNER_FILE);
     if marker.exists() {
         let contents = read_owner_only_text_file(
             &marker,
             "validation directory owner",
-            MAX_VALIDATION_OWNER_BYTES,
+            MAX_VALIDATION_OWNER_BYTES as u64,
         )?;
-        let actual: ValidationDirectoryOwner = serde_json::from_str(&contents)
+        let actual = parse_validation_directory_owner(contents.as_bytes())
             .map_err(|_| "validation directory owner marker is malformed".to_owned())?;
         if actual != *expected {
             return Err(
@@ -1389,9 +1394,7 @@ fn ensure_validation_directory_owner(
                 marker.display()
             )
         })?;
-    #[cfg(unix)]
-    fs::File::open(validation_dir)
-        .and_then(|directory| directory.sync_all())
+    sync_dir(validation_dir)
         .map_err(|error| format!("sync validation owner marker directory: {error}"))?;
     Ok(())
 }
@@ -1416,12 +1419,7 @@ fn cleanup_completed_validation_dir(
                 .to_owned(),
         );
     }
-    let owner = ValidationDirectoryOwner {
-        version: 1,
-        network: network.to_string(),
-        target_height: expected.height,
-        target_block_hash: expected.block_hash.to_string(),
-    };
+    let owner = ValidationDirectoryOwner::new(network, expected.height, expected.block_hash);
     ensure_validation_directory_owner(&validation_dir, &owner, false, true)?;
     let validation = RedbChainStore::open(validation_dir.join("chainstate.redb"), network)
         .map_err(|error| error.to_string())?;
@@ -1478,6 +1476,13 @@ fn cleanup_completed_validation_dir(
 }
 
 fn quarantine_and_remove_validation_dir(validation_dir: &std::path::Path) -> Result<(), String> {
+    quarantine_and_remove_validation_dir_with_sync(validation_dir, sync_directory)
+}
+
+fn quarantine_and_remove_validation_dir_with_sync(
+    validation_dir: &std::path::Path,
+    mut sync_parent: impl FnMut(&std::path::Path) -> io::Result<()>,
+) -> Result<(), String> {
     let parent = validation_dir
         .parent()
         .ok_or_else(|| "validation directory has no parent".to_owned())?;
@@ -1495,25 +1500,47 @@ fn quarantine_and_remove_validation_dir(validation_dir: &std::path::Path) -> Res
             validation_dir.display()
         )
     })?;
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync validation directory parent: {error}"))?;
+    if let Err(sync_error) = sync_parent(parent) {
+        return match fs::rename(&tombstone, validation_dir) {
+            Ok(()) => match sync_parent(parent) {
+                Ok(()) => Err(format!(
+                    "sync validation directory parent: {sync_error}; quarantine was rolled back"
+                )),
+                Err(rollback_sync_error) => Err(format!(
+                    "sync validation directory parent: {sync_error}; quarantine was rolled back but syncing the rollback failed: {rollback_sync_error}"
+                )),
+            },
+            Err(rollback_error) => Err(format!(
+                "sync validation directory parent: {sync_error}; validation directory remains quarantined at {} because rollback failed: {rollback_error}",
+                tombstone.display()
+            )),
+        };
+    }
     fs::remove_dir_all(&tombstone).map_err(|error| {
         format!(
             "validation directory was quarantined at {} but removal failed: {error}",
             tombstone.display()
         )
     })?;
-    #[cfg(unix)]
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    sync_parent(parent)
         .map_err(|error| format!("sync removed validation directory parent: {error}"))?;
     println!(
         "removed completed validation directory {} after owner and target revalidation; recovery is no longer possible",
         validation_dir.display()
     );
     Ok(())
+}
+
+fn sync_directory(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn reject_directory_symlink(path: &std::path::Path, label: &str) -> Result<(), String> {
@@ -5037,12 +5064,7 @@ mod tests {
         };
         ensure_validation_directory_owner(
             &validation_dir,
-            &ValidationDirectoryOwner {
-                version: 1,
-                network: Network::Regtest.to_string(),
-                target_height: target.height,
-                target_block_hash: target.block_hash.to_string(),
-            },
+            &ValidationDirectoryOwner::new(Network::Regtest, target.height, target.block_hash),
             true,
             true,
         )
@@ -5080,6 +5102,89 @@ mod tests {
         assert!(error.contains("not an rBTC validation artifact"));
         assert!(validation_dir.is_dir());
         assert_eq!(fs::read(unknown).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn owner_marker_directory_sync_failure_preserves_a_reusable_marker() {
+        let directory = TempDir::new().unwrap();
+        let validation_dir = directory.path().join("validation");
+        fs::create_dir(&validation_dir).unwrap();
+        let owner = ValidationDirectoryOwner::new(
+            Network::Regtest,
+            42,
+            BlockHash::from_byte_array([9; 32]),
+        );
+        let error = ensure_validation_directory_owner_with_sync(
+            &validation_dir,
+            &owner,
+            true,
+            false,
+            |_| Err(io::Error::other("injected owner directory sync failure")),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected owner directory sync failure"));
+
+        let marker = fs::read(validation_dir.join(VALIDATION_OWNER_FILE)).unwrap();
+        assert_eq!(parse_validation_directory_owner(&marker).unwrap(), owner);
+        ensure_validation_directory_owner_with_sync(&validation_dir, &owner, true, false, |_| {
+            panic!("an existing owner marker must not rewrite or resync")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cleanup_parent_sync_failure_rolls_back_quarantine_before_removal() {
+        let directory = TempDir::new().unwrap();
+        let validation_dir = directory.path().join("validation");
+        fs::create_dir(&validation_dir).unwrap();
+        fs::write(validation_dir.join("chainstate.redb"), b"preserve").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let error = quarantine_and_remove_validation_dir_with_sync(&validation_dir, |_| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                Err(io::Error::other("injected quarantine sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("quarantine was rolled back"));
+        assert_eq!(
+            fs::read(validation_dir.join("chainstate.redb")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("rbtc-cleanup")
+        }));
+    }
+
+    #[test]
+    fn cleanup_reports_final_parent_sync_failure_after_completed_removal() {
+        let directory = TempDir::new().unwrap();
+        let validation_dir = directory.path().join("validation");
+        fs::create_dir(&validation_dir).unwrap();
+        fs::write(validation_dir.join("chainstate.redb"), b"remove").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let error = quarantine_and_remove_validation_dir_with_sync(&validation_dir, |_| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 1 {
+                Err(io::Error::other("injected removal sync failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("injected removal sync failure"));
+        assert!(!validation_dir.exists());
+        assert_eq!(calls.get(), 2);
+        assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
     }
 
     #[test]

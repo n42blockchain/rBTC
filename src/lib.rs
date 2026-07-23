@@ -27,6 +27,7 @@ pub mod signet;
 pub mod snapshot;
 pub mod undo_store;
 pub mod utxo;
+pub mod validation_owner;
 pub mod wallet;
 
 pub use utxo::{OutPointKey, Utxo, UtxoStore};

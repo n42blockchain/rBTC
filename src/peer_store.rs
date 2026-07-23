@@ -26,6 +26,8 @@ const INITIAL_PROTOCOL_COOLDOWN_SECS: u32 = 60 * 60;
 const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 const PROTOCOL_VIOLATION_DECAY_SECS: u32 = 7 * 24 * 60 * 60;
 const MAX_STORED_PENALTIES: usize = 1_024;
+const MAX_STORED_PEER_BYTES: usize = 1_024;
+const MAX_STORED_PENALTY_BYTES: usize = 256;
 
 type PeerPriority = (u8, std::cmp::Reverse<u32>, std::cmp::Reverse<u32>);
 type PrioritizedPeer = (PeerPriority, std::net::SocketAddr);
@@ -60,6 +62,7 @@ pub enum PeerStoreError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredPeer {
     services: u64,
     last_seen: u32,
@@ -73,6 +76,7 @@ struct StoredPeer {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct StoredPenalty {
     violations: u8,
     last_violation: u32,
@@ -407,7 +411,7 @@ impl RedbPeerStore {
             if std::net::SocketAddr::from_str(&key).is_err() {
                 return Err(PeerStoreError::Malformed("peer address key"));
             }
-            records.insert(key, serde_json::from_slice(value.value())?);
+            records.insert(key, decode_stored_peer(value.value())?);
         }
         Ok(records)
     }
@@ -422,7 +426,7 @@ impl RedbPeerStore {
             if std::net::SocketAddr::from_str(&key).is_err() {
                 return Err(PeerStoreError::Malformed("peer penalty address key"));
             }
-            penalties.insert(key, serde_json::from_slice(value.value())?);
+            penalties.insert(key, decode_stored_penalty(value.value())?);
         }
         Ok(penalties)
     }
@@ -479,6 +483,71 @@ impl RedbPeerStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+}
+
+fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
+    if input.len() > MAX_STORED_PEER_BYTES {
+        return Err(PeerStoreError::Malformed("peer record exceeds size limit"));
+    }
+    let record: StoredPeer = serde_json::from_slice(input)?;
+    if !valid_source_group(&record.source_group) {
+        return Err(PeerStoreError::Malformed("peer source group"));
+    }
+    Ok(record)
+}
+
+fn decode_stored_penalty(input: &[u8]) -> Result<StoredPenalty, PeerStoreError> {
+    if input.len() > MAX_STORED_PENALTY_BYTES {
+        return Err(PeerStoreError::Malformed(
+            "peer penalty record exceeds size limit",
+        ));
+    }
+    let penalty: StoredPenalty = serde_json::from_slice(input)?;
+    if penalty.violations == 0 || penalty.discouraged_until < penalty.last_violation {
+        return Err(PeerStoreError::Malformed("peer penalty values"));
+    }
+    Ok(penalty)
+}
+
+/// Validates one untrusted persisted peer-address JSON value.
+pub fn validate_stored_peer_record(input: &[u8]) -> Result<(), PeerStoreError> {
+    decode_stored_peer(input).map(drop)
+}
+
+/// Validates one untrusted persisted protocol-penalty JSON value.
+pub fn validate_stored_peer_penalty(input: &[u8]) -> Result<(), PeerStoreError> {
+    decode_stored_penalty(input).map(drop)
+}
+
+fn valid_source_group(group: &str) -> bool {
+    let mut parts = group.split(':');
+    let Some(family) = parts.next() else {
+        return false;
+    };
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    match family {
+        "v4" => {
+            first
+                .parse::<u8>()
+                .is_ok_and(|value| value.to_string() == first)
+                && second
+                    .parse::<u8>()
+                    .is_ok_and(|value| value.to_string() == second)
+        }
+        "v6" => {
+            u16::from_str_radix(first, 16).is_ok_and(|value| format!("{value:x}") == first)
+                && u16::from_str_radix(second, 16).is_ok_and(|value| format!("{value:x}") == second)
+        }
+        _ => false,
     }
 }
 
@@ -939,6 +1008,66 @@ mod tests {
         assert_eq!(store.candidates(now, 16).unwrap(), vec![socket]);
         assert!(store.record_attempt(socket, now).unwrap());
         assert!(store.candidates(now, 16).unwrap().is_empty());
+    }
+
+    #[test]
+    fn persisted_record_parsers_are_strict_bounded_and_semantic() {
+        let services = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
+        let valid_peer = serde_json::to_vec(&serde_json::json!({
+            "services": services,
+            "last_seen": 1_800_000_000_u32,
+            "source_group": "v4:127:0",
+            "last_attempt": 0,
+            "last_success": 0,
+            "consecutive_failures": 0
+        }))
+        .unwrap();
+        validate_stored_peer_record(&valid_peer).unwrap();
+        validate_stored_peer_penalty(
+            br#"{"violations":1,"last_violation":1800000000,"discouraged_until":1800003600}"#,
+        )
+        .unwrap();
+
+        for invalid in [
+            br#"{"services":9,"last_seen":1,"source_group":"v4:01:2"}"#.as_slice(),
+            br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","extra":true}"#,
+            br#"{"services":9,"last_seen":1,"source_group":"other:1:2"}"#,
+        ] {
+            assert!(validate_stored_peer_record(invalid).is_err());
+        }
+        for invalid in [
+            br#"{"violations":0,"last_violation":1,"discouraged_until":2}"#.as_slice(),
+            br#"{"violations":1,"last_violation":2,"discouraged_until":1}"#,
+            br#"{"violations":1,"last_violation":1,"discouraged_until":2,"extra":true}"#,
+        ] {
+            assert!(validate_stored_peer_penalty(invalid).is_err());
+        }
+        assert!(validate_stored_peer_record(&vec![b' '; MAX_STORED_PEER_BYTES + 1]).is_err());
+        assert!(validate_stored_peer_penalty(&vec![b' '; MAX_STORED_PENALTY_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn malformed_persisted_records_fail_without_rewriting_the_store() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let address = "127.0.0.1:18444";
+        let malformed =
+            br#"{"services":9,"last_seen":1800000000,"source_group":"v4:127:0","unknown":1}"#;
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(PEERS).unwrap();
+            table.insert(address, malformed.as_slice()).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        assert!(matches!(
+            store.candidates(1_800_000_000, 16),
+            Err(PeerStoreError::Encoding(_))
+        ));
+        let transaction = store.db.begin_read().unwrap();
+        let table = transaction.open_table(PEERS).unwrap();
+        assert_eq!(table.get(address).unwrap().unwrap().value(), malformed);
     }
 
     #[test]

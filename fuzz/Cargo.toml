@@ -79,5 +79,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "persisted_metadata"
+path = "fuzz_targets/persisted_metadata.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
