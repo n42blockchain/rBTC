@@ -17,7 +17,7 @@ use bitcoin::{
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -246,9 +246,18 @@ pub struct PeerAddress {
 pub struct PeerSession<S> {
     transport: V1Transport<S>,
     remote_version: VersionMessage,
+    pending_messages: VecDeque<NetworkMessage>,
 }
 
 impl<S> PeerSession<S> {
+    fn new(transport: V1Transport<S>, remote_version: VersionMessage) -> Self {
+        Self {
+            transport,
+            remote_version,
+            pending_messages: VecDeque::new(),
+        }
+    }
+
     /// Returns the peer's negotiated `version` message.
     #[must_use]
     pub const fn remote_version(&self) -> &VersionMessage {
@@ -408,7 +417,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
-    async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
+    async fn read_wire_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
         let message = self.transport.read_message().await?.into_payload();
         validate_post_handshake_message(&message)?;
         match message {
@@ -423,21 +432,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
     }
 
+    async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
+        if let Some(message) = self.pending_messages.pop_front() {
+            return Ok(Some(message));
+        }
+        self.read_wire_response_message().await
+    }
+
     /// Sends an application-level keepalive and waits for its matching pong.
     ///
     /// Stale pongs and unrelated messages consume the same fixed response
-    /// budget used by header and block requests. Concurrent inbound pings are
-    /// answered without resetting that budget.
+    /// budget used by header and block requests. Non-pong application messages
+    /// are retained in wire order for the next response consumer. Concurrent
+    /// inbound pings are answered without resetting that budget.
     pub async fn ping(&mut self, nonce: u64) -> Result<(), P2pError> {
         self.transport
             .write_message(NetworkMessage::Ping(nonce))
             .await?;
         for _ in 0..MAX_RESPONSE_MESSAGES {
-            if matches!(
-                self.read_bounded_response_message().await?,
-                Some(NetworkMessage::Pong(received)) if received == nonce
-            ) {
-                return Ok(());
+            match self.read_wire_response_message().await? {
+                Some(NetworkMessage::Pong(received)) if received == nonce => return Ok(()),
+                Some(NetworkMessage::Pong(_)) | None => {}
+                Some(message) => self.pending_messages.push_back(message),
             }
         }
         Err(P2pError::PongResponseIncomplete)
@@ -769,10 +785,7 @@ pub async fn connect_outbound(
     if remote_version.nonce == nonce {
         return Err(P2pError::SelfConnection);
     }
-    Ok(PeerSession {
-        transport,
-        remote_version,
-    })
+    Ok(PeerSession::new(transport, remote_version))
 }
 
 /// Builds a protocol-compatible v1 P2P envelope.
@@ -1051,10 +1064,10 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let expected: SocketAddr = "1.2.3.4:8333".parse().unwrap();
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.request_addresses().await.unwrap();
             session.receive_addresses().await.unwrap()
         });
@@ -1112,10 +1125,10 @@ mod tests {
         let ipv4: SocketAddr = "8.8.8.8:8333".parse().unwrap();
         let ipv6: SocketAddr = "[2001:4860:4860::8888]:8333".parse().unwrap();
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_addresses().await.unwrap()
         });
         let server = tokio::spawn(async move {
@@ -1150,10 +1163,10 @@ mod tests {
     async fn address_response_rejects_more_than_core_limit() {
         let (client_stream, server_stream) = duplex(128 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_addresses().await
         });
         let server = tokio::spawn(async move {
@@ -1181,10 +1194,10 @@ mod tests {
     #[test]
     fn full_block_ibd_requires_network_and_witness_services() {
         let (stream, _) = duplex(64);
-        let session = PeerSession {
-            transport: V1Transport::new(stream, Network::Regtest.magic()),
-            remote_version: version(1),
-        };
+        let session = PeerSession::new(
+            V1Transport::new(stream, Network::Regtest.magic()),
+            version(1),
+        );
         assert!(matches!(
             session.ensure_full_witness_block_relay(),
             Err(P2pError::MissingServices { .. })
@@ -1193,10 +1206,7 @@ mod tests {
         let (stream, _) = duplex(64);
         let mut remote = version(2);
         remote.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let session = PeerSession {
-            transport: V1Transport::new(stream, Network::Regtest.magic()),
-            remote_version: remote,
-        };
+        let session = PeerSession::new(V1Transport::new(stream, Network::Regtest.magic()), remote);
         session.ensure_full_witness_block_relay().unwrap();
     }
 
@@ -1207,10 +1217,10 @@ mod tests {
         let second = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
         let expected = [first.block_hash(), second.block_hash()];
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.request_witness_blocks(&expected).await.unwrap();
             session.receive_requested_blocks(&expected).await.unwrap()
         });
@@ -1238,10 +1248,10 @@ mod tests {
     #[tokio::test]
     async fn block_request_rejects_oversize_and_duplicates_before_writing() {
         let (client_stream, _) = duplex(64);
-        let mut session = PeerSession {
-            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-            remote_version: version(1),
-        };
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            version(1),
+        );
         let hash = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
         assert!(matches!(
             session
@@ -1263,10 +1273,10 @@ mod tests {
         let unsolicited_hash = unsolicited.block_hash();
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_requested_blocks(&[expected_hash]).await
         });
         let server = tokio::spawn(async move {
@@ -1284,10 +1294,10 @@ mod tests {
 
         let (client_stream, server_stream) = duplex(4096);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_requested_blocks(&[expected_hash]).await
         });
         let server = tokio::spawn(async move {
@@ -1310,10 +1320,10 @@ mod tests {
     async fn header_response_rejects_more_than_protocol_maximum() {
         let (client_stream, server_stream) = duplex(512 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_headers().await
         });
         let server = tokio::spawn(async move {
@@ -1338,10 +1348,10 @@ mod tests {
     async fn keepalive_pings_consume_the_bounded_response_budget() {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_headers().await
         });
         let server = tokio::spawn(async move {
@@ -1414,10 +1424,10 @@ mod tests {
     async fn active_ping_matches_nonce_and_answers_crossed_keepalive() {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.ping(42).await
         });
         let server = tokio::spawn(async move {
@@ -1449,13 +1459,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_ping_preserves_a_headers_announcement() {
+        let expected = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.ping(42).await.unwrap();
+            session.receive_headers().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(42)
+            ));
+            transport
+                .write_message(NetworkMessage::Headers(vec![expected]))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Pong(42))
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(client.await.unwrap(), vec![expected]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn active_ping_has_a_total_frame_budget() {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.ping(42).await
         });
         let server = tokio::spawn(async move {
@@ -1485,10 +1527,10 @@ mod tests {
         let client = tokio::spawn(async move {
             let mut remote = version(1);
             remote.version = SENDHEADERS_VERSION;
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: remote,
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
             session.prefer_headers_announcements().await
         });
         let server = tokio::spawn(async move {
@@ -1505,10 +1547,10 @@ mod tests {
         let (client_stream, mut server_stream) = duplex(1024);
         let mut remote = version(1);
         remote.version = SENDHEADERS_VERSION - 1;
-        let mut session = PeerSession {
-            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-            remote_version: remote,
-        };
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            remote,
+        );
         session.prefer_headers_announcements().await.unwrap();
         assert!(
             tokio::time::timeout(
@@ -1525,10 +1567,10 @@ mod tests {
         let expected = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_requested_block(expected).await
         });
         let server = tokio::spawn(async move {
@@ -1556,10 +1598,10 @@ mod tests {
     async fn response_rejects_version_after_handshake() {
         let (client_stream, server_stream) = duplex(4096);
         let client = tokio::spawn(async move {
-            let mut session = PeerSession {
-                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-                remote_version: version(1),
-            };
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
             session.receive_headers().await
         });
         let server = tokio::spawn(async move {
@@ -1649,10 +1691,10 @@ mod tests {
     #[tokio::test]
     async fn getheaders_rejects_oversized_locator_before_writing() {
         let (client_stream, _) = duplex(64);
-        let mut session = PeerSession {
-            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
-            remote_version: version(1),
-        };
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            version(1),
+        );
         let result = session
             .request_headers(
                 vec![BlockHash::all_zeros(); MAX_LOCATOR_HASHES + 1],
