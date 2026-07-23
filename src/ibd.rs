@@ -165,6 +165,16 @@ impl IbdPolicy {
 }
 
 fn parse_work(value: &str) -> Result<Work, ()> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty()
+        || digits.len() > 64
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(());
+    }
     Work::from_hex(value)
         .or_else(|_| Work::from_unprefixed_hex(value))
         .map_err(|_| ())
@@ -294,6 +304,22 @@ mod tests {
             regtest.set_minimum_chainwork("not-hex"),
             Err(IbdPolicyError::MinimumChainwork("not-hex".to_owned()))
         );
+        let before = regtest;
+        let overlong = "1".repeat(65);
+        for invalid in [
+            "0taproot:+9Ǽ999:1$9999root:+9Ǽ999:1$999999",
+            "",
+            "0x",
+            "0X",
+            overlong.as_str(),
+        ] {
+            assert_eq!(
+                regtest.set_minimum_chainwork(invalid),
+                Err(IbdPolicyError::MinimumChainwork(invalid.to_owned()))
+            );
+            assert_eq!(regtest, before);
+        }
+        regtest.set_minimum_chainwork("0x01").unwrap();
         assert_eq!(
             regtest.set_assume_valid("not-a-hash"),
             Err(IbdPolicyError::AssumeValid("not-a-hash".to_owned()))
