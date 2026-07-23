@@ -9,7 +9,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 - Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots with bounded-memory two-pass import, in-transaction SHA-256/count verification, mandatory trusted active-header anchors, atomic publication, and an AssumeUTXO-style background-validation contract.
 - Immutable zstd block archives with 4 MiB piece hashes, authenticated uncompressed-length limits, and legacy-v1 read compatibility, ready for a BitTorrent/webseed transport adapter.
-- Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; only old block archives rotate, while UTXO state and headers are retained.
+- Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; archive-slot renames are directory-synced before their indexes are published, and only old block archives rotate while UTXO state and headers are retained.
 - Embedded block-explorer UI and REST API plus an optional authenticated, transactionally persisted BDK watch-only descriptor wallet panel/API.
 
 ## Important safety status

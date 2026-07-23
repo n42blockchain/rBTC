@@ -5,9 +5,9 @@
 
 use std::{
     fs::{self, File},
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -109,11 +109,48 @@ pub struct PrunedBlockLedger {
     root: PathBuf,
     retention: LedgerRetention,
     write_guard: Mutex<()>,
+    durability: Arc<dyn LedgerDurability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LedgerSyncPoint {
+    StagedArchive,
+    StagedPublish,
+    StagedRemoval,
+    SlotArchive,
+    SlotPublish,
+    IndexFile,
+    IndexPublish,
+    TruncateIntentFile,
+    TruncateIntentPublish,
+    TruncateArchive,
+    TruncateMutation,
+    TruncateIntentRemoval,
+}
+
+trait LedgerDurability: Send + Sync {
+    fn sync(&self, point: LedgerSyncPoint, path: &Path) -> io::Result<()>;
+}
+
+struct OsLedgerDurability;
+
+impl LedgerDurability for OsLedgerDurability {
+    fn sync(&self, _point: LedgerSyncPoint, path: &Path) -> io::Result<()> {
+        File::open(path)?.sync_all()
+    }
 }
 
 impl PrunedBlockLedger {
     /// Opens a ledger rooted in an application-specific directory.
     pub fn open(root: impl AsRef<Path>, retention: LedgerRetention) -> Result<Self, LedgerError> {
+        Self::open_with_durability(root, retention, Arc::new(OsLedgerDurability))
+    }
+
+    fn open_with_durability(
+        root: impl AsRef<Path>,
+        retention: LedgerRetention,
+        durability: Arc<dyn LedgerDurability>,
+    ) -> Result<Self, LedgerError> {
         if retention.max_blocks == 0 || retention.max_bytes == 0 || retention.slots == 0 {
             return Err(LedgerError::Invalid(
                 "all retention limits must be non-zero",
@@ -124,6 +161,7 @@ impl PrunedBlockLedger {
             root: root.as_ref().to_path_buf(),
             retention,
             write_guard: Mutex::new(()),
+            durability,
         };
         ledger.recover_index()?;
         ledger.recover_truncation()?;
@@ -174,9 +212,9 @@ impl PrunedBlockLedger {
             fs::remove_file(temporary)?;
             return Err(LedgerError::Invalid("staged segment exceeds maximum bytes"));
         }
-        File::open(&temporary)?.sync_all()?;
+        self.sync(LedgerSyncPoint::StagedArchive, &temporary)?;
         fs::rename(temporary, self.staged_path())?;
-        self.sync_directory()
+        self.sync_directory(LedgerSyncPoint::StagedPublish)
     }
 
     /// Returns the checksum-verified segment awaiting publication, if any.
@@ -230,14 +268,14 @@ impl PrunedBlockLedger {
             }
         }
         fs::remove_file(self.staged_path())?;
-        self.sync_directory()
+        self.sync_directory(LedgerSyncPoint::StagedRemoval)
     }
 
     /// Removes an uncommitted staged segment, if one exists.
     pub fn discard_staged(&self) -> Result<(), LedgerError> {
         let _guard = self.lock();
         match fs::remove_file(self.staged_path()) {
-            Ok(()) => self.sync_directory(),
+            Ok(()) => self.sync_directory(LedgerSyncPoint::StagedRemoval),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -279,8 +317,9 @@ impl PrunedBlockLedger {
             fs::remove_file(temporary)?;
             return Err(LedgerError::Invalid("single segment exceeds maximum bytes"));
         }
-        File::open(&temporary)?.sync_all()?;
+        self.sync(LedgerSyncPoint::SlotArchive, &temporary)?;
         fs::rename(&temporary, &destination)?;
+        self.sync_directory(LedgerSyncPoint::SlotPublish)?;
         index.segments.push(Segment {
             first_height,
             block_count,
@@ -395,10 +434,10 @@ impl PrunedBlockLedger {
         let temporary = self.root.join("ledger-index.json.new");
         let mut file = File::create(&temporary)?;
         file.write_all(&serde_json::to_vec(index)?)?;
-        file.sync_all()?;
+        drop(file);
+        self.sync(LedgerSyncPoint::IndexFile, &temporary)?;
         fs::rename(&temporary, self.index_path())?;
-        File::open(&self.root)?.sync_all()?;
-        Ok(())
+        self.sync_directory(LedgerSyncPoint::IndexPublish)
     }
 
     fn recover_index(&self) -> Result<(), LedgerError> {
@@ -482,14 +521,15 @@ impl PrunedBlockLedger {
         let temporary = self.root.join("ledger-truncate.new");
         let mut file = File::create(&temporary)?;
         file.write_all(&height.to_le_bytes())?;
-        file.sync_all()?;
+        drop(file);
+        self.sync(LedgerSyncPoint::TruncateIntentFile, &temporary)?;
         fs::rename(&temporary, self.truncate_path())?;
-        self.sync_directory()
+        self.sync_directory(LedgerSyncPoint::TruncateIntentPublish)
     }
 
     fn clear_truncate_intent(&self) -> Result<(), LedgerError> {
         match fs::remove_file(self.truncate_path()) {
-            Ok(()) => self.sync_directory(),
+            Ok(()) => self.sync_directory(LedgerSyncPoint::TruncateIntentRemoval),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -518,16 +558,20 @@ impl PrunedBlockLedger {
                 blocks.truncate(keep);
                 let temporary = path.with_extension("rblk.truncate");
                 write_archive(&temporary, manifest.first_height, &blocks)?;
-                File::open(&temporary)?.sync_all()?;
+                self.sync(LedgerSyncPoint::TruncateArchive, &temporary)?;
                 fs::rename(temporary, path)?;
             }
         }
-        self.sync_directory()?;
+        self.sync_directory(LedgerSyncPoint::TruncateMutation)?;
         self.recover_index()
     }
 
-    fn sync_directory(&self) -> Result<(), LedgerError> {
-        File::open(&self.root)?.sync_all()?;
+    fn sync_directory(&self, point: LedgerSyncPoint) -> Result<(), LedgerError> {
+        self.sync(point, &self.root)
+    }
+
+    fn sync(&self, point: LedgerSyncPoint, path: &Path) -> Result<(), LedgerError> {
+        self.durability.sync(point, path)?;
         Ok(())
     }
 
@@ -674,7 +718,49 @@ fn exceeds(segments: &[Segment], retention: LedgerRetention) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    struct FailOnceDurability {
+        target: LedgerSyncPoint,
+        armed: AtomicBool,
+        failed: AtomicBool,
+    }
+
+    impl FailOnceDurability {
+        fn new(target: LedgerSyncPoint) -> Self {
+            Self {
+                target,
+                armed: AtomicBool::new(false),
+                failed: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn did_fail(&self) -> bool {
+            self.failed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl LedgerDurability for FailOnceDurability {
+        fn sync(&self, point: LedgerSyncPoint, path: &Path) -> io::Result<()> {
+            if self.armed.load(Ordering::SeqCst)
+                && point == self.target
+                && self
+                    .failed
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return Err(io::Error::other(format!(
+                    "injected ledger sync failure at {point:?}"
+                )));
+            }
+            OsLedgerDurability.sync(point, path)
+        }
+    }
 
     #[test]
     fn rotates_to_retention_window() {
@@ -983,5 +1069,161 @@ mod tests {
             ))
         ));
         assert_eq!(ledger.retained_tip().unwrap(), None);
+    }
+
+    #[test]
+    fn staged_archive_sync_failures_reopen_to_a_complete_state() {
+        for point in [
+            LedgerSyncPoint::StagedArchive,
+            LedgerSyncPoint::StagedPublish,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let durability = Arc::new(FailOnceDurability::new(point));
+            let ledger = PrunedBlockLedger::open_with_durability(
+                dir.path(),
+                LedgerRetention::default(),
+                durability.clone(),
+            )
+            .unwrap();
+            durability.arm();
+
+            assert!(matches!(
+                ledger.stage(10, &[vec![10], vec![11]]),
+                Err(LedgerError::Io(_))
+            ));
+            assert!(durability.did_fail());
+            drop(ledger);
+
+            let recovered =
+                PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+            match point {
+                LedgerSyncPoint::StagedArchive => {
+                    assert!(recovered.staged().unwrap().is_none());
+                }
+                LedgerSyncPoint::StagedPublish => {
+                    assert_eq!(
+                        recovered.staged().unwrap().unwrap().blocks,
+                        vec![vec![10], vec![11]]
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(recovered.retained_tip().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn wrapped_slot_sync_failures_recover_the_old_or_published_ring() {
+        let retention = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 2,
+        };
+        for point in [
+            LedgerSyncPoint::SlotArchive,
+            LedgerSyncPoint::SlotPublish,
+            LedgerSyncPoint::IndexFile,
+            LedgerSyncPoint::IndexPublish,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let durability = Arc::new(FailOnceDurability::new(point));
+            let ledger =
+                PrunedBlockLedger::open_with_durability(dir.path(), retention, durability.clone())
+                    .unwrap();
+            ledger.append(10, &[vec![10]]).unwrap();
+            ledger.append(11, &[vec![11]]).unwrap();
+            durability.arm();
+
+            assert!(matches!(
+                ledger.append(12, &[vec![12]]),
+                Err(LedgerError::Io(_))
+            ));
+            assert!(durability.did_fail());
+            drop(ledger);
+
+            let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+            if point == LedgerSyncPoint::SlotArchive {
+                assert_eq!(
+                    recovered.retained_ranges().unwrap(),
+                    vec![(10, 10), (11, 11)]
+                );
+                assert_eq!(recovered.read_block(10).unwrap(), Some(vec![10]));
+                assert_eq!(recovered.read_block(12).unwrap(), None);
+            } else {
+                assert_eq!(
+                    recovered.retained_ranges().unwrap(),
+                    vec![(11, 11), (12, 12)]
+                );
+                assert_eq!(recovered.read_block(10).unwrap(), None);
+                assert_eq!(recovered.read_block(12).unwrap(), Some(vec![12]));
+            }
+        }
+    }
+
+    #[test]
+    fn staged_removal_sync_failure_keeps_the_published_prefix_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let durability = Arc::new(FailOnceDurability::new(LedgerSyncPoint::StagedRemoval));
+        let ledger = PrunedBlockLedger::open_with_durability(
+            dir.path(),
+            LedgerRetention::default(),
+            durability.clone(),
+        )
+        .unwrap();
+        ledger.stage(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        durability.arm();
+
+        assert!(matches!(ledger.commit_staged(2), Err(LedgerError::Io(_))));
+        assert!(durability.did_fail());
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert!(recovered.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn truncation_sync_failures_resume_or_preserve_the_old_ring() {
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        for point in [
+            LedgerSyncPoint::TruncateIntentFile,
+            LedgerSyncPoint::TruncateIntentPublish,
+            LedgerSyncPoint::TruncateArchive,
+            LedgerSyncPoint::TruncateMutation,
+            LedgerSyncPoint::IndexFile,
+            LedgerSyncPoint::IndexPublish,
+            LedgerSyncPoint::TruncateIntentRemoval,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let durability = Arc::new(FailOnceDurability::new(point));
+            let ledger =
+                PrunedBlockLedger::open_with_durability(dir.path(), retention, durability.clone())
+                    .unwrap();
+            ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+            ledger.append(13, &[vec![13], vec![14]]).unwrap();
+            durability.arm();
+
+            assert!(matches!(ledger.truncate_from(12), Err(LedgerError::Io(_))));
+            assert!(durability.did_fail());
+            drop(ledger);
+
+            let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+            if point == LedgerSyncPoint::TruncateIntentFile {
+                assert_eq!(
+                    recovered.retained_ranges().unwrap(),
+                    vec![(10, 12), (13, 14)]
+                );
+                assert_eq!(recovered.read_block(14).unwrap(), Some(vec![14]));
+            } else {
+                assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+                assert_eq!(recovered.read_block(11).unwrap(), Some(vec![11]));
+                assert_eq!(recovered.read_block(12).unwrap(), None);
+                assert!(!recovered.truncate_path().exists());
+            }
+        }
     }
 }
