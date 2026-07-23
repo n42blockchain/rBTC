@@ -257,6 +257,7 @@ pub struct TransactionAdmissionPool {
     orphans: VecDeque<OrphanTransaction>,
     orphan_bytes: usize,
     orphan_children_by_parent: BTreeMap<Txid, BTreeSet<Txid>>,
+    orphans_by_outpoint: BTreeMap<OutPoint, BTreeSet<Txid>>,
     rolling_minimum_fee_sat_kvb: u64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
@@ -419,6 +420,21 @@ impl TransactionAdmissionPool {
         before.saturating_sub(self.orphans.len())
     }
 
+    /// Removes orphans included or made impossible by newly connected block transactions.
+    pub fn remove_orphans_for_block_transactions<'a>(
+        &mut self,
+        transactions: impl IntoIterator<Item = &'a Transaction>,
+    ) -> usize {
+        let removed = transactions
+            .into_iter()
+            .flat_map(|transaction| transaction.input.iter())
+            .filter_map(|input| self.orphans_by_outpoint.get(&input.previous_output))
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        self.remove_orphans(&removed)
+    }
+
     fn rebuild_orphan_indexes(&mut self) {
         self.orphan_bytes = self
             .orphans
@@ -426,16 +442,16 @@ impl TransactionAdmissionPool {
             .map(|orphan| orphan.serialized_len)
             .sum();
         self.orphan_children_by_parent.clear();
+        self.orphans_by_outpoint.clear();
         for orphan in &self.orphans {
             let txid = orphan.transaction.compute_txid();
-            for parent in orphan
-                .transaction
-                .input
-                .iter()
-                .map(|input| input.previous_output.txid)
-            {
+            for input in &orphan.transaction.input {
                 self.orphan_children_by_parent
-                    .entry(parent)
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .insert(txid);
+                self.orphans_by_outpoint
+                    .entry(input.previous_output)
                     .or_default()
                     .insert(txid);
             }
@@ -1881,6 +1897,40 @@ mod tests {
         assert_eq!(pool.remove_orphans_from(12), 1);
         assert_eq!(pool.orphan_bytes(), 0);
         assert!(pool.orphan_children_by_parent.is_empty());
+    }
+
+    #[test]
+    fn connected_block_removes_exact_outpoint_conflicts_only() {
+        let mut pool = TransactionAdmissionPool::default();
+        let first = spend(84).2;
+        let reannounced_after_reorg = first.clone();
+        let first_txid = first.compute_txid();
+        let mut other_output = first.clone();
+        other_output.input[0].previous_output.vout = 1;
+        let other_output_txid = other_output.compute_txid();
+        let unrelated = spend(85).2;
+        let unrelated_txid = unrelated.compute_txid();
+        assert_eq!(
+            pool.retain_orphans(&[first.clone(), other_output.clone(), unrelated], 100, 1,),
+            3
+        );
+        let mut block_transaction = first;
+        block_transaction.output[0].value = Amount::from_sat(89_999);
+
+        assert_eq!(
+            pool.remove_orphans_for_block_transactions([&block_transaction]),
+            1
+        );
+        let retained = pool
+            .orphans
+            .iter()
+            .map(|orphan| orphan.transaction.compute_txid())
+            .collect::<BTreeSet<_>>();
+        assert!(!retained.contains(&first_txid));
+        assert!(retained.contains(&other_output_txid));
+        assert!(retained.contains(&unrelated_txid));
+        assert_eq!(pool.orphans_by_outpoint.len(), 2);
+        assert_eq!(pool.retain_orphans(&[reannounced_after_reorg], 200, 2), 1);
     }
 
     #[test]

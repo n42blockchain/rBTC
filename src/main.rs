@@ -3676,6 +3676,7 @@ async fn sync_validating_node(
                 explorer_events.as_ref(),
                 wallet,
                 &compact_candidates,
+                transaction_pool,
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
             )
@@ -4298,6 +4299,7 @@ async fn download_execute_batch(
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
     compact_candidates: &[Transaction],
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
 ) -> Result<(), PeerRunError> {
@@ -4402,6 +4404,16 @@ async fn download_execute_batch(
         )
         .map_err(|error| PeerRunError::block(&error))?
     };
+    let removed_orphans = transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove_orphans_for_block_transactions(blocks.iter().flat_map(|block| block.txdata.iter()));
+    if removed_orphans > 0 {
+        println!(
+            "removed {removed_orphans} orphan transaction{} included or conflicted by connected blocks",
+            if removed_orphans == 1 { "" } else { "s" }
+        );
+    }
     for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
         index_validated_block(
             explorer,
