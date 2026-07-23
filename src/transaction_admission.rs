@@ -210,6 +210,14 @@ pub enum TransactionAdmissionError {
         /// Fee required at the current rolling rate.
         minimum_sats: u64,
     },
+    /// A child-with-parents package is below the rolling mempool minimum.
+    #[error("package fee {fee_sats} is below rolling mempool minimum {minimum_sats}")]
+    PackageRollingMinimumFee {
+        /// Aggregate package fee.
+        fee_sats: u64,
+        /// Aggregate fee required at the current rolling rate.
+        minimum_sats: u64,
+    },
     /// A transaction exceeds Core's standard per-transaction sigop budget.
     #[error("transaction sigop cost {cost} exceeds standard limit {limit}")]
     TooManySigops {
@@ -573,14 +581,16 @@ impl TransactionAdmissionPool {
         }
 
         let ordered = topological_package_order(package)?;
+        let child_with_parents = is_child_with_parents(&ordered);
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
+        let use_package_feerate = child_with_parents && replacement.txids.is_empty();
 
         let overlay = AdmissionUtxoOverlay::new(store);
         for entry in &self.entries {
             let _ = apply_to_overlay(&overlay, &entry.transaction, context)?;
         }
         let (accepted, replacement_fee_sats, replacement_vbytes) =
-            self.append_ordered_package(&overlay, ordered, context)?;
+            self.append_ordered_package(&overlay, ordered, context, use_package_feerate)?;
         if replacement_vbytes > MAX_PACKAGE_VBYTES {
             return Err(TransactionAdmissionError::PackageTooLarge {
                 vbytes: replacement_vbytes,
@@ -714,11 +724,15 @@ impl TransactionAdmissionPool {
         overlay: &AdmissionUtxoOverlay<'_, S>,
         ordered: Vec<Transaction>,
         context: TransactionAdmissionContext,
+        use_package_feerate: bool,
     ) -> Result<(Vec<Txid>, u64, usize), TransactionAdmissionError> {
         let mut package_spent = BTreeSet::new();
         let mut accepted = Vec::with_capacity(ordered.len());
         let mut replacement_fee_sats = 0_u64;
         let mut replacement_vbytes = 0_usize;
+        let rolling_rate = self
+            .effective_rolling_minimum_fee_sat_kvb()
+            .max(SATOSHIS_PER_KVB);
         for transaction in ordered {
             if let Some(conflict) = transaction
                 .input
@@ -730,11 +744,12 @@ impl TransactionAdmissionPool {
             }
             let txid = transaction.compute_txid();
             let applied = apply_to_overlay(overlay, &transaction, context)?;
-            let minimum_sats = fee_for_rate(
-                self.effective_rolling_minimum_fee_sat_kvb()
-                    .max(SATOSHIS_PER_KVB),
-                applied.policy_vsize,
-            );
+            let individual_rate = if use_package_feerate {
+                SATOSHIS_PER_KVB
+            } else {
+                rolling_rate
+            };
+            let minimum_sats = fee_for_rate(individual_rate, applied.policy_vsize);
             if applied.fee_sats < minimum_sats {
                 return Err(TransactionAdmissionError::RollingMinimumFee {
                     fee_sats: applied.fee_sats,
@@ -758,6 +773,15 @@ impl TransactionAdmissionPool {
                 policy_vsize: applied.policy_vsize,
             });
             accepted.push(txid);
+        }
+        if use_package_feerate {
+            let minimum_sats = fee_for_rate(rolling_rate, replacement_vbytes);
+            if replacement_fee_sats < minimum_sats {
+                return Err(TransactionAdmissionError::PackageRollingMinimumFee {
+                    fee_sats: replacement_fee_sats,
+                    minimum_sats,
+                });
+            }
         }
         Ok((accepted, replacement_fee_sats, replacement_vbytes))
     }
@@ -1136,6 +1160,23 @@ fn topological_package_order(
         );
     }
     Ok(ordered)
+}
+
+fn is_child_with_parents(transactions: &[Transaction]) -> bool {
+    let Some((child, parents)) = transactions.split_last() else {
+        return false;
+    };
+    if parents.is_empty() {
+        return false;
+    }
+    let child_inputs = child
+        .input
+        .iter()
+        .map(|input| input.previous_output.txid)
+        .collect::<BTreeSet<_>>();
+    parents
+        .iter()
+        .all(|parent| child_inputs.contains(&parent.compute_txid()))
 }
 
 struct AppliedAdmission {
@@ -2096,6 +2137,179 @@ mod tests {
             vec![parent_txid, child_txid]
         );
         assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
+    fn child_with_parents_uses_aggregate_rolling_minimum_fee() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(98);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let parent_vbytes = parent.vsize();
+        let parent_fee = u64::try_from(parent_vbytes).unwrap();
+        parent.output[0].value = Amount::from_sat(100_000 - parent_fee);
+        let mut child = child(&parent, 80_000);
+        let package_vbytes = parent_vbytes + child.vsize();
+        let package_minimum = fee_for_rate(5_000, package_vbytes);
+        let child_fee = package_minimum - parent_fee;
+        child.output[0].value =
+            Amount::from_sat(parent.output[0].value.to_sat().saturating_sub(child_fee));
+        assert!(parent_fee < fee_for_rate(5_000, parent_vbytes));
+
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 5_000,
+            ..TransactionAdmissionPool::default()
+        };
+        let outcome = pool
+            .admit_package(&store, vec![child.clone(), parent.clone()], context())
+            .unwrap();
+        assert_eq!(outcome.accepted.len(), 2);
+
+        let mut insufficient_child = child;
+        insufficient_child.output[0].value =
+            Amount::from_sat(insufficient_child.output[0].value.to_sat() + 1);
+        let mut insufficient_pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 5_000,
+            ..TransactionAdmissionPool::default()
+        };
+        assert!(matches!(
+            insufficient_pool.admit_package(
+                &store,
+                vec![insufficient_child, parent],
+                context(),
+            ),
+            Err(TransactionAdmissionError::PackageRollingMinimumFee {
+                fee_sats,
+                minimum_sats,
+            }) if fee_sats + 1 == minimum_sats && minimum_sats == package_minimum
+        ));
+        assert!(insufficient_pool.is_empty());
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
+    fn package_feerate_never_bypasses_individual_minimum_relay() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(99);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let parent_minimum = u64::try_from(parent.vsize()).unwrap();
+        parent.output[0].value = Amount::from_sat(100_000 - (parent_minimum - 1));
+        let child = child(
+            &parent,
+            parent.output[0].value.to_sat().saturating_sub(10_000),
+        );
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 5_000,
+            ..TransactionAdmissionPool::default()
+        };
+
+        assert!(matches!(
+            pool.admit_package(&store, vec![child, parent], context()),
+            Err(TransactionAdmissionError::Policy(
+                TransactionPolicyError::FeeRate {
+                    fee_sats,
+                    minimum_sats,
+                }
+            )) if fee_sats + 1 == minimum_sats && minimum_sats == parent_minimum
+        ));
+        assert!(pool.is_empty());
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
+    fn aggregate_rolling_fee_does_not_apply_to_deeper_packages() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(100);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let parent_fee = u64::try_from(parent.vsize()).unwrap();
+        parent.output[0].value = Amount::from_sat(100_000 - parent_fee);
+        let middle = child(
+            &parent,
+            parent.output[0].value.to_sat().saturating_sub(5_000),
+        );
+        let last = child(
+            &middle,
+            middle.output[0].value.to_sat().saturating_sub(5_000),
+        );
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 5_000,
+            ..TransactionAdmissionPool::default()
+        };
+
+        assert!(!is_child_with_parents(&[
+            parent.clone(),
+            middle.clone(),
+            last.clone(),
+        ]));
+        assert!(matches!(
+            pool.admit_package(&store, vec![last, parent, middle], context()),
+            Err(TransactionAdmissionError::RollingMinimumFee {
+                fee_sats,
+                minimum_sats,
+            }) if fee_sats == parent_fee && minimum_sats > parent_fee
+        ));
+        assert!(pool.is_empty());
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
+    fn aggregate_rolling_fee_does_not_apply_to_partial_or_replacement_packages() {
+        let (_directory, store) = store();
+        let (partial_outpoint, partial_utxo, mut existing_parent) = spend(101);
+        existing_parent.output[0].value = Amount::from_sat(99_000);
+        store
+            .apply(&[], &[(partial_outpoint.into(), partial_utxo)])
+            .unwrap();
+        let existing_parent_txid = existing_parent.compute_txid();
+        let mut partial_pool = TransactionAdmissionPool::default();
+        partial_pool
+            .admit(&store, existing_parent.clone(), context())
+            .unwrap();
+        let mut later_child = child(&existing_parent, 80_000);
+        let child_fee = u64::try_from(later_child.vsize()).unwrap();
+        later_child.output[0].value =
+            Amount::from_sat(existing_parent.output[0].value.to_sat() - child_fee);
+        partial_pool.rolling_minimum_fee_sat_kvb = 5_000;
+
+        assert!(matches!(
+            partial_pool.admit(&store, later_child, context()),
+            Err(TransactionAdmissionError::RollingMinimumFee {
+                fee_sats,
+                minimum_sats,
+            }) if fee_sats == child_fee && minimum_sats > child_fee
+        ));
+        assert_eq!(txids(&partial_pool), vec![existing_parent_txid]);
+
+        let (replacement_outpoint, replacement_utxo, mut original) = spend(102);
+        signal_rbf(&mut original);
+        store
+            .apply(&[], &[(replacement_outpoint.into(), replacement_utxo)])
+            .unwrap();
+        let original_txid = original.compute_txid();
+        let mut replacement_pool = TransactionAdmissionPool::default();
+        replacement_pool
+            .admit(&store, original.clone(), context())
+            .unwrap();
+        replacement_pool.rolling_minimum_fee_sat_kvb = 200_000;
+        let mut replacement = original;
+        replacement.output[0].value = Amount::from_sat(89_000);
+        let replacement_child = child(&replacement, 40_000);
+        assert!(is_child_with_parents(&[
+            replacement.clone(),
+            replacement_child.clone(),
+        ]));
+
+        assert!(matches!(
+            replacement_pool.admit_package(
+                &store,
+                vec![replacement_child, replacement],
+                context(),
+            ),
+            Err(TransactionAdmissionError::RollingMinimumFee {
+                fee_sats: 11_000,
+                minimum_sats,
+            }) if minimum_sats > 11_000
+        ));
+        assert_eq!(txids(&replacement_pool), vec![original_txid]);
     }
 
     #[test]
