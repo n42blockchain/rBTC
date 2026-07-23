@@ -21,6 +21,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("transaction_poo
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("transaction_pool_snapshots");
 const GENESIS_KEY: &str = "genesis";
 const SNAPSHOT_KEY: &str = "active";
+const DISCONNECTED_KEY: &str = "disconnected";
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
 const MAX_SNAPSHOT_BYTES: usize =
@@ -92,11 +93,13 @@ impl RedbTransactionPoolStore {
                 meta.insert(GENESIS_KEY, genesis.as_slice())?;
             }
             let mut snapshots = write.open_table(SNAPSHOTS)?;
-            if let Some(snapshot) = snapshots.get(SNAPSHOT_KEY)? {
-                decode_snapshot(snapshot.value())?;
-            } else {
-                let empty = encode_snapshot(&[])?;
-                snapshots.insert(SNAPSHOT_KEY, empty.as_slice())?;
+            for key in [SNAPSHOT_KEY, DISCONNECTED_KEY] {
+                if let Some(snapshot) = snapshots.get(key)? {
+                    decode_snapshot(snapshot.value())?;
+                } else {
+                    let empty = encode_snapshot(&[])?;
+                    snapshots.insert(key, empty.as_slice())?;
+                }
             }
         }
         write.commit()?;
@@ -108,12 +111,24 @@ impl RedbTransactionPoolStore {
 
     /// Loads the complete bounded snapshot in parent-before-child insertion order.
     pub fn transactions(&self) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
+        self.read_snapshot(SNAPSHOT_KEY)
+    }
+
+    /// Loads bounded transactions recovered from disconnected active-chain blocks.
+    pub fn disconnected_transactions(&self) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
+        self.read_snapshot(DISCONNECTED_KEY)
+    }
+
+    fn read_snapshot(
+        &self,
+        key: &'static str,
+    ) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
         let read = self.db.begin_read()?;
         let snapshots = read.open_table(SNAPSHOTS)?;
         let snapshot = snapshots
-            .get(SNAPSHOT_KEY)?
+            .get(key)?
             .ok_or(TransactionPoolStoreError::Malformed(
-                "missing active transaction-pool snapshot",
+                "missing transaction-pool snapshot",
             ))?;
         decode_snapshot(snapshot.value())
     }
@@ -121,6 +136,43 @@ impl RedbTransactionPoolStore {
     /// Atomically replaces the durable snapshot after validating every invariant.
     pub fn replace(&self, transactions: &[Transaction]) -> Result<(), TransactionPoolStoreError> {
         let encoded = encode_snapshot(transactions)?;
+        self.replace_encoded(SNAPSHOT_KEY, &encoded)
+    }
+
+    /// Atomically replaces the bounded disconnected-block candidate snapshot.
+    pub fn replace_disconnected(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), TransactionPoolStoreError> {
+        let encoded = encode_snapshot(transactions)?;
+        self.replace_encoded(DISCONNECTED_KEY, &encoded)
+    }
+
+    fn replace_encoded(
+        &self,
+        key: &'static str,
+        encoded: &[u8],
+    ) -> Result<(), TransactionPoolStoreError> {
+        let _guard = self
+            .write_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let write = self.db.begin_write()?;
+        {
+            let mut snapshots = write.open_table(SNAPSHOTS)?;
+            snapshots.insert(key, encoded)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Atomically publishes the admitted pool and clears recovered reorg candidates.
+    pub fn replace_and_clear_disconnected(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), TransactionPoolStoreError> {
+        let encoded = encode_snapshot(transactions)?;
+        let empty = encode_snapshot(&[])?;
         let _guard = self
             .write_guard
             .lock()
@@ -129,6 +181,7 @@ impl RedbTransactionPoolStore {
         {
             let mut snapshots = write.open_table(SNAPSHOTS)?;
             snapshots.insert(SNAPSHOT_KEY, encoded.as_slice())?;
+            snapshots.insert(DISCONNECTED_KEY, empty.as_slice())?;
         }
         write.commit()?;
         Ok(())
@@ -414,6 +467,9 @@ mod tests {
         {
             let store = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
             store.replace(&[parent.clone(), child.clone()]).unwrap();
+            store
+                .replace_disconnected(std::slice::from_ref(&parent))
+                .unwrap();
             assert_eq!(
                 store.transactions().unwrap(),
                 vec![parent.clone(), child.clone()]
@@ -421,6 +477,10 @@ mod tests {
         }
         let reopened = RedbTransactionPoolStore::open(&path, Network::Regtest).unwrap();
         assert_eq!(reopened.transactions().unwrap(), vec![parent, child]);
+        assert_eq!(reopened.disconnected_transactions().unwrap().len(), 1);
+        let admitted = reopened.transactions().unwrap();
+        reopened.replace_and_clear_disconnected(&admitted).unwrap();
+        assert!(reopened.disconnected_transactions().unwrap().is_empty());
         drop(reopened);
         assert!(matches!(
             RedbTransactionPoolStore::open(&path, Network::Signet),

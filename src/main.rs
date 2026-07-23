@@ -44,7 +44,8 @@ use rbtc::{
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     transaction_admission::{
-        TransactionAdmissionContext, TransactionAdmissionPool, dependency_packages,
+        MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS, TransactionAdmissionContext,
+        TransactionAdmissionPool, dependency_packages,
     },
     transaction_pool_store::RedbTransactionPoolStore,
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
@@ -2857,6 +2858,30 @@ fn compact_transaction_candidates(
     candidates
 }
 
+fn retain_disconnected_block_transactions(pending: &mut VecDeque<Transaction>, block: &Block) {
+    for transaction in block
+        .txdata
+        .iter()
+        .skip(1)
+        .rev()
+        .filter(|transaction| !transaction.is_coinbase())
+    {
+        if serialize(transaction).len() > MAX_ADMITTED_TRANSACTION_BYTES {
+            continue;
+        }
+        pending.push_front(transaction.clone());
+        while pending.len() > MAX_ADMITTED_TRANSACTIONS
+            || pending
+                .iter()
+                .map(|transaction| serialize(transaction).len())
+                .sum::<usize>()
+                > MAX_ADMITTED_TRANSACTION_BYTES
+        {
+            let _ = pending.pop_back();
+        }
+    }
+}
+
 fn transaction_admission_context(
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
@@ -2900,6 +2925,7 @@ fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_store: Option<&RedbTransactionPoolStore>,
+    disconnected_transactions: &VecDeque<Transaction>,
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
@@ -2910,6 +2936,17 @@ fn admit_pending_peer_transactions(
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    if disconnected_transactions.is_empty() {
+        pending.extend(
+            transaction_store
+                .map(RedbTransactionPoolStore::disconnected_transactions)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default(),
+        );
+    } else {
+        pending.extend(disconnected_transactions.iter().cloned());
+    }
     pending.extend(session.take_pending_transactions());
     let mut pool = transaction_pool
         .lock()
@@ -2971,7 +3008,7 @@ fn admit_pending_peer_transactions(
     }
     if let Some(store) = transaction_store {
         store
-            .replace(&candidate.snapshot())
+            .replace_and_clear_disconnected(&candidate.snapshot())
             .map_err(|error| error.to_string())?;
     }
     *pool = candidate;
@@ -3060,6 +3097,7 @@ async fn sync_validating_node(
     let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+    let mut disconnected_transactions = VecDeque::new();
     let node_status = api_runtime
         .map(|_| {
             collect_node_status(
@@ -3126,6 +3164,47 @@ async fn sync_validating_node(
                 .is_some_and(|header| header.hash == tip.hash)
             {
                 break;
+            }
+            match ledger
+                .read_block(tip.height)
+                .map_err(|error| error.to_string())?
+            {
+                Some(raw) => {
+                    let disconnected = deserialize::<Block>(&raw).map_err(|error| {
+                        PeerRunError::transient(format!(
+                            "decode retained stale block at height {}: {error}",
+                            tip.height
+                        ))
+                    })?;
+                    if disconnected.block_hash() != tip.hash {
+                        return Err(PeerRunError::transient(format!(
+                            "retained stale block at height {} has hash {}, expected {}",
+                            tip.height,
+                            disconnected.block_hash(),
+                            tip.hash
+                        )));
+                    }
+                    retain_disconnected_block_transactions(
+                        &mut disconnected_transactions,
+                        &disconnected,
+                    );
+                    if let Some(store) = &transaction_store {
+                        store
+                            .replace_disconnected(
+                                &disconnected_transactions
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "retained stale block at height {} is unavailable; its transactions cannot be reconsidered",
+                        tip.height
+                    );
+                }
             }
             let rewound = disconnect_execution_tip(
                 &chainstate,
@@ -3276,10 +3355,12 @@ async fn sync_validating_node(
                         session,
                         transaction_pool,
                         transaction_store.as_ref(),
+                        &disconnected_transactions,
                         &chainstate,
                         &headers,
                         deployment_config,
                     )?;
+                    disconnected_transactions.clear();
                     println!(
                         "minimum chainwork reached; full script validation remains enabled{}",
                         ibd_status
@@ -5825,6 +5906,39 @@ mod tests {
             deduplicated.last().unwrap().compute_wtxid(),
             snapshot[0].compute_wtxid()
         );
+    }
+
+    #[test]
+    fn disconnected_block_queue_excludes_coinbase_and_preserves_lower_height_parents() {
+        let mut pending = VecDeque::new();
+        let mut higher = regtest_block(BlockHash::all_zeros(), 1);
+        for marker in 101..=110 {
+            let mut transaction = wallet_broadcast_transaction();
+            transaction.input[0].previous_output.txid = Txid::from_byte_array([marker; 32]);
+            higher.txdata.push(transaction);
+        }
+        retain_disconnected_block_transactions(&mut pending, &higher);
+        assert_eq!(pending.len(), 10);
+
+        let mut lower = regtest_block(BlockHash::all_zeros(), 2);
+        let mut expected = Vec::new();
+        for marker in 1..=u8::try_from(MAX_ADMITTED_TRANSACTIONS).unwrap() {
+            let mut transaction = wallet_broadcast_transaction();
+            transaction.input[0].previous_output.txid = Txid::from_byte_array([marker; 32]);
+            expected.push(transaction.compute_txid());
+            lower.txdata.push(transaction);
+        }
+        retain_disconnected_block_transactions(&mut pending, &lower);
+
+        assert_eq!(pending.len(), MAX_ADMITTED_TRANSACTIONS);
+        assert_eq!(
+            pending
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(pending.iter().all(|transaction| !transaction.is_coinbase()));
     }
 
     #[tokio::test]
