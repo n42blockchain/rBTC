@@ -11,6 +11,7 @@ use std::{
 
 use bitcoin::{
     BlockHash, OutPoint, ScriptBuf, Transaction, Txid, Wtxid, consensus::encode::serialize,
+    hashes::sha256d,
 };
 use rand::Rng;
 use thiserror::Error;
@@ -35,6 +36,8 @@ pub const MAX_ORPHAN_TRANSACTION_BYTES: usize = 4_000_000;
 pub const MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
 /// Maximum exact witness-independent transaction rejects remembered per chain tip.
 pub const MAX_RECENT_REJECTED_TXIDS: usize = 1_024;
+/// Core 26's rolling-filter capacity for recently confirmed txid/wtxid identifiers.
+pub const MAX_RECENT_CONFIRMED_TRANSACTION_IDS: usize = 48_000;
 /// Core-compatible orphan lifetime of twenty minutes.
 pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Core's twelve-hour rolling mempool minimum-fee half-life.
@@ -302,6 +305,8 @@ pub struct TransactionAdmissionPool {
     orphan_parent_requests_by_source: BTreeMap<u64, BTreeSet<Txid>>,
     recent_rejected_txids: VecDeque<Txid>,
     recent_rejected_txid_set: BTreeSet<Txid>,
+    recent_confirmed_ids: VecDeque<sha256d::Hash>,
+    recent_confirmed_id_set: BTreeSet<sha256d::Hash>,
     rolling_minimum_fee_sat_kvb: u64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
@@ -505,7 +510,7 @@ impl TransactionAdmissionPool {
             .is_some_and(|work| !work.is_empty())
     }
 
-    /// Returns whether the active pool or orphanage already knows a txid.
+    /// Returns whether the active pool, orphanage, or recent chain knows a txid.
     #[must_use]
     pub fn knows_transaction(&self, txid: Txid) -> bool {
         self.entries
@@ -515,6 +520,64 @@ impl TransactionAdmissionPool {
                 .orphans
                 .iter()
                 .any(|orphan| orphan.transaction.compute_txid() == txid)
+            || self.is_recently_confirmed_txid(txid)
+    }
+
+    /// Returns whether a recently connected block contained this txid.
+    #[must_use]
+    pub fn is_recently_confirmed_txid(&self, txid: Txid) -> bool {
+        self.recent_confirmed_id_set.contains(&txid.to_raw_hash())
+    }
+
+    /// Returns whether a recently connected block contained this wtxid.
+    #[must_use]
+    pub fn is_recently_confirmed_wtxid(&self, wtxid: Wtxid) -> bool {
+        self.recent_confirmed_id_set.contains(&wtxid.to_raw_hash())
+    }
+
+    /// Adds connected-block identifiers under Core's 48,000-entry filter capacity.
+    pub fn remember_confirmed_transactions<'a>(
+        &mut self,
+        transactions: impl IntoIterator<Item = &'a Transaction>,
+    ) -> usize {
+        let mut inserted = 0;
+        let mut confirmed_txids = BTreeSet::new();
+        for transaction in transactions {
+            let txid = transaction.compute_txid();
+            confirmed_txids.insert(txid);
+            let txid_hash = txid.to_raw_hash();
+            inserted += usize::from(self.remember_recent_confirmed_id(txid_hash));
+            let wtxid_hash = transaction.compute_wtxid().to_raw_hash();
+            if wtxid_hash != txid_hash {
+                inserted += usize::from(self.remember_recent_confirmed_id(wtxid_hash));
+            }
+        }
+        self.orphan_parent_requests_by_source.retain(|_, requests| {
+            requests.retain(|txid| !confirmed_txids.contains(txid));
+            !requests.is_empty()
+        });
+        inserted
+    }
+
+    fn remember_recent_confirmed_id(&mut self, id: sha256d::Hash) -> bool {
+        if !self.recent_confirmed_id_set.insert(id) {
+            return false;
+        }
+        self.recent_confirmed_ids.push_back(id);
+        while self.recent_confirmed_ids.len() > MAX_RECENT_CONFIRMED_TRANSACTION_IDS {
+            let removed = self
+                .recent_confirmed_ids
+                .pop_front()
+                .expect("over-capacity recent confirmed cache is non-empty");
+            self.recent_confirmed_id_set.remove(&removed);
+        }
+        true
+    }
+
+    /// Clears the recent-confirmed cache after any active-chain disconnection.
+    pub fn clear_recent_confirmed_transactions(&mut self) {
+        self.recent_confirmed_ids.clear();
+        self.recent_confirmed_id_set.clear();
     }
 
     /// Returns whether a witness-independent rejection is remembered at this tip.
@@ -2756,6 +2819,52 @@ mod tests {
         bounded.observe_chain_tip(BlockHash::from_byte_array([2; 32]), 102);
         assert!(bounded.recent_rejected_txids.is_empty());
         assert!(bounded.recent_rejected_txid_set.is_empty());
+    }
+
+    #[test]
+    fn recent_confirmed_ids_are_bounded_disconnect_scoped_and_prune_requests() {
+        fn marker_hash(marker: u32) -> sha256d::Hash {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&marker.to_le_bytes());
+            sha256d::Hash::from_byte_array(bytes)
+        }
+
+        let confirmed = spend(93).2;
+        assert_ne!(
+            confirmed.compute_txid().to_raw_hash(),
+            confirmed.compute_wtxid().to_raw_hash()
+        );
+        let mut orphan = spend(94).2;
+        orphan.input[0].previous_output = OutPoint::new(confirmed.compute_txid(), 0);
+        let mut pool = TransactionAdmissionPool::default();
+        assert_eq!(pool.retain_orphans(&[orphan], 100, 31), 1);
+        assert_eq!(
+            pool.select_orphan_parent_requests(31, &BTreeSet::from([confirmed.compute_txid()])),
+            vec![confirmed.compute_txid()]
+        );
+
+        assert_eq!(pool.remember_confirmed_transactions([&confirmed]), 2);
+        assert!(pool.knows_transaction(confirmed.compute_txid()));
+        assert!(pool.is_recently_confirmed_wtxid(confirmed.compute_wtxid()));
+        assert!(pool.orphan_parent_requests_by_source.is_empty());
+        pool.observe_chain_tip(BlockHash::from_byte_array([1; 32]), 100);
+        pool.observe_chain_tip(BlockHash::from_byte_array([2; 32]), 101);
+        assert!(pool.is_recently_confirmed_txid(confirmed.compute_txid()));
+        pool.clear_recent_confirmed_transactions();
+        assert!(!pool.is_recently_confirmed_txid(confirmed.compute_txid()));
+        assert!(!pool.is_recently_confirmed_wtxid(confirmed.compute_wtxid()));
+
+        for marker in 0..=u32::try_from(MAX_RECENT_CONFIRMED_TRANSACTION_IDS).unwrap() {
+            assert!(pool.remember_recent_confirmed_id(marker_hash(marker)));
+        }
+        assert_eq!(
+            pool.recent_confirmed_ids.len(),
+            MAX_RECENT_CONFIRMED_TRANSACTION_IDS
+        );
+        assert!(!pool.recent_confirmed_id_set.contains(&marker_hash(0)));
+        assert!(pool.recent_confirmed_id_set.contains(&marker_hash(
+            u32::try_from(MAX_RECENT_CONFIRMED_TRANSACTION_IDS).unwrap()
+        )));
     }
 
     #[test]

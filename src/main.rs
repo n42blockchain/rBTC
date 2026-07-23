@@ -3135,14 +3135,26 @@ fn transaction_admission_context(
     })
 }
 
-fn transaction_inventory_is_known(inventory: Inventory, known: &[Transaction]) -> bool {
-    known.iter().any(|transaction| match inventory {
-        Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
+fn transaction_inventory_is_known(
+    inventory: Inventory,
+    known: &[Transaction],
+    pool: &TransactionAdmissionPool,
+) -> bool {
+    match inventory {
+        Inventory::WTx(wtxid) => {
+            pool.is_recently_confirmed_wtxid(wtxid)
+                || known
+                    .iter()
+                    .any(|transaction| transaction.compute_wtxid() == wtxid)
+        }
         Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-            transaction.compute_txid() == txid
+            pool.is_recently_confirmed_txid(txid)
+                || known
+                    .iter()
+                    .any(|transaction| transaction.compute_txid() == txid)
         }
         _ => false,
-    })
+    }
 }
 
 fn peer_orphan_candidates(
@@ -3199,18 +3211,20 @@ async fn fetch_announced_peer_transactions(
     if announced.is_empty() {
         return Ok(());
     }
-    let mut known = transaction_pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .snapshot();
-    if let Some(wallet) = wallet {
-        known.extend(wallet.compact_candidates.snapshot());
-    }
-    let requested = announced
-        .into_iter()
-        .filter(|inventory| !transaction_inventory_is_known(*inventory, &known))
-        .take(MAX_PENDING_TRANSACTION_INVENTORY)
-        .collect::<Vec<_>>();
+    let requested = {
+        let pool = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut known = pool.snapshot();
+        if let Some(wallet) = wallet {
+            known.extend(wallet.compact_candidates.snapshot());
+        }
+        announced
+            .into_iter()
+            .filter(|inventory| !transaction_inventory_is_known(*inventory, &known, &pool))
+            .take(MAX_PENDING_TRANSACTION_INVENTORY)
+            .collect::<Vec<_>>()
+    };
     if requested.is_empty() {
         return Ok(());
     }
@@ -3738,6 +3752,10 @@ async fn sync_validating_node(
                 DEFAULT_HOT_WINDOW_SECS,
             )
             .map_err(|error| error.to_string())?;
+            transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_recent_confirmed_transactions();
             println!(
                 "disconnected stale execution tip; rewound to {}:{}",
                 rewound.height, rewound.hash
@@ -4714,10 +4732,15 @@ async fn download_execute_batch(
         )
         .map_err(|error| PeerRunError::block(&error))?
     };
-    let removed_orphans = transaction_pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove_orphans_for_block_transactions(blocks.iter().flat_map(|block| block.txdata.iter()));
+    let removed_orphans = {
+        let mut pool = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = pool
+            .remove_orphans_for_block_transactions(blocks.iter().flat_map(|block| &block.txdata));
+        pool.remember_confirmed_transactions(blocks.iter().flat_map(|block| &block.txdata));
+        removed
+    };
     if removed_orphans > 0 {
         println!(
             "removed {removed_orphans} orphan transaction{} included or conflicted by connected blocks",
@@ -6811,21 +6834,39 @@ mod tests {
     #[test]
     fn known_transaction_inventory_is_not_downloaded_again() {
         let transaction = wallet_broadcast_transaction();
+        let mut confirmed = wallet_broadcast_transaction();
+        confirmed.input[0].previous_output.txid = Txid::from_byte_array([98; 32]);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.remember_confirmed_transactions([&confirmed]);
         assert!(transaction_inventory_is_known(
             Inventory::Transaction(transaction.compute_txid()),
-            std::slice::from_ref(&transaction)
+            std::slice::from_ref(&transaction),
+            &pool,
         ));
         assert!(transaction_inventory_is_known(
             Inventory::WitnessTransaction(transaction.compute_txid()),
-            std::slice::from_ref(&transaction)
+            std::slice::from_ref(&transaction),
+            &pool,
         ));
         assert!(transaction_inventory_is_known(
             Inventory::WTx(transaction.compute_wtxid()),
-            std::slice::from_ref(&transaction)
+            std::slice::from_ref(&transaction),
+            &pool,
+        ));
+        assert!(transaction_inventory_is_known(
+            Inventory::Transaction(confirmed.compute_txid()),
+            &[],
+            &pool,
+        ));
+        assert!(transaction_inventory_is_known(
+            Inventory::WTx(confirmed.compute_wtxid()),
+            &[],
+            &pool,
         ));
         assert!(!transaction_inventory_is_known(
             Inventory::Transaction(Txid::from_byte_array([99; 32])),
-            &[transaction]
+            &[transaction],
+            &pool,
         ));
     }
 
@@ -6875,6 +6916,8 @@ mod tests {
         known_parent.input[0].previous_output.txid = Txid::from_byte_array([95; 32]);
         let mut submitted_parent = wallet_broadcast_transaction();
         submitted_parent.input[0].previous_output.txid = Txid::from_byte_array([96; 32]);
+        let mut recently_confirmed_parent = wallet_broadcast_transaction();
+        recently_confirmed_parent.input[0].previous_output.txid = Txid::from_byte_array([97; 32]);
         let missing = Txid::from_byte_array([97; 32]);
         let input = wallet_broadcast_transaction().input[0].clone();
         let mut child = wallet_broadcast_transaction();
@@ -6882,6 +6925,7 @@ mod tests {
             confirmed,
             OutPoint::new(known_parent.compute_txid(), 0),
             OutPoint::new(submitted_parent.compute_txid(), 0),
+            OutPoint::new(recently_confirmed_parent.compute_txid(), 0),
             OutPoint::new(missing, 0),
         ]
         .into_iter()
@@ -6892,6 +6936,7 @@ mod tests {
         .collect();
         let mut pool = TransactionAdmissionPool::default();
         assert_eq!(pool.retain_orphans(&[known_parent], 100, 1), 1);
+        pool.remember_confirmed_transactions([&recently_confirmed_parent]);
 
         assert_eq!(
             unavailable_parent_txids(
