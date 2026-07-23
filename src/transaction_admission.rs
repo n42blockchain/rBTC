@@ -36,6 +36,7 @@ pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Core's twelve-hour rolling mempool minimum-fee half-life.
 pub const ROLLING_FEE_HALFLIFE_SECS: u32 = 12 * 60 * 60;
 const SATOSHIS_PER_KVB: u64 = 1_000;
+const DEFAULT_BYTES_PER_SIGOP: usize = 20;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
@@ -236,6 +237,7 @@ struct AdmittedTransaction {
     transaction: Transaction,
     serialized_len: usize,
     fee_sats: u64,
+    policy_vsize: usize,
 }
 
 #[derive(Clone)]
@@ -558,17 +560,20 @@ impl TransactionAdmissionPool {
         }
 
         let ordered = topological_package_order(package)?;
-        let replacement_vbytes = ordered.iter().fold(0_usize, |total, transaction| {
-            total.saturating_add(transaction.vsize())
-        });
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
 
         let overlay = AdmissionUtxoOverlay::new(store);
         for entry in &self.entries {
             let _ = apply_to_overlay(&overlay, &entry.transaction, context)?;
         }
-        let (accepted, replacement_fee_sats) =
+        let (accepted, replacement_fee_sats, replacement_vbytes) =
             self.append_ordered_package(&overlay, ordered, context)?;
+        if replacement_vbytes > MAX_PACKAGE_VBYTES {
+            return Err(TransactionAdmissionError::PackageTooLarge {
+                vbytes: replacement_vbytes,
+                limit: MAX_PACKAGE_VBYTES,
+            });
+        }
         self.validate_topology_limits(&accepted)?;
         validate_replacement_fees(
             replacement_fee_sats,
@@ -696,10 +701,11 @@ impl TransactionAdmissionPool {
         overlay: &AdmissionUtxoOverlay<'_, S>,
         ordered: Vec<Transaction>,
         context: TransactionAdmissionContext,
-    ) -> Result<(Vec<Txid>, u64), TransactionAdmissionError> {
+    ) -> Result<(Vec<Txid>, u64, usize), TransactionAdmissionError> {
         let mut package_spent = BTreeSet::new();
         let mut accepted = Vec::with_capacity(ordered.len());
         let mut replacement_fee_sats = 0_u64;
+        let mut replacement_vbytes = 0_usize;
         for transaction in ordered {
             if let Some(conflict) = transaction
                 .input
@@ -710,18 +716,20 @@ impl TransactionAdmissionPool {
                 return Err(TransactionPolicyError::Conflict(conflict).into());
             }
             let txid = transaction.compute_txid();
-            let fee_sats = apply_to_overlay(overlay, &transaction, context)?;
+            let applied = apply_to_overlay(overlay, &transaction, context)?;
             let minimum_sats = fee_for_rate(
-                self.effective_rolling_minimum_fee_sat_kvb(),
-                transaction.vsize(),
+                self.effective_rolling_minimum_fee_sat_kvb()
+                    .max(SATOSHIS_PER_KVB),
+                applied.policy_vsize,
             );
-            if fee_sats < minimum_sats {
+            if applied.fee_sats < minimum_sats {
                 return Err(TransactionAdmissionError::RollingMinimumFee {
-                    fee_sats,
+                    fee_sats: applied.fee_sats,
                     minimum_sats,
                 });
             }
-            replacement_fee_sats = replacement_fee_sats.saturating_add(fee_sats);
+            replacement_fee_sats = replacement_fee_sats.saturating_add(applied.fee_sats);
+            replacement_vbytes = replacement_vbytes.saturating_add(applied.policy_vsize);
             let serialized_len = serialize(&transaction).len();
             for input in &transaction.input {
                 self.spent.insert(input.previous_output, txid);
@@ -733,11 +741,12 @@ impl TransactionAdmissionPool {
             self.entries.push_back(AdmittedTransaction {
                 transaction,
                 serialized_len,
-                fee_sats,
+                fee_sats: applied.fee_sats,
+                policy_vsize: applied.policy_vsize,
             });
             accepted.push(txid);
         }
-        Ok((accepted, replacement_fee_sats))
+        Ok((accepted, replacement_fee_sats, replacement_vbytes))
     }
 
     /// Revalidates every entry after an active-chain change.
@@ -803,7 +812,7 @@ impl TransactionAdmissionPool {
                 .fold((0_u64, 0_usize), |(fees, vbytes), entry| {
                     (
                         fees.saturating_add(entry.fee_sats),
-                        vbytes.saturating_add(entry.transaction.vsize()),
+                        vbytes.saturating_add(entry.policy_vsize),
                     )
                 });
             let removed_rate = u64::try_from(
@@ -915,7 +924,7 @@ impl TransactionAdmissionPool {
             .iter()
             .filter(|entry| txids.contains(&entry.transaction.compute_txid()))
             .fold(0_usize, |total, entry| {
-                total.saturating_add(entry.transaction.vsize())
+                total.saturating_add(entry.policy_vsize)
             })
     }
 
@@ -1096,11 +1105,16 @@ fn topological_package_order(
     Ok(ordered)
 }
 
+struct AppliedAdmission {
+    fee_sats: u64,
+    policy_vsize: usize,
+}
+
 fn apply_to_overlay<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
     context: TransactionAdmissionContext,
-) -> Result<u64, TransactionAdmissionError> {
+) -> Result<AppliedAdmission, TransactionAdmissionError> {
     let prevout_scripts = transaction
         .input
         .iter()
@@ -1129,7 +1143,18 @@ fn apply_to_overlay<S: UtxoStore>(
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction(transaction, fee_sats)?;
     validate_standard_inputs(transaction, &prevout_scripts)?;
-    Ok(fee_sats)
+    Ok(AppliedAdmission {
+        fee_sats,
+        policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
+    })
+}
+
+fn transaction_policy_vsize(transaction: &Transaction, sigop_cost: u64) -> usize {
+    let weight = usize::try_from(transaction.weight().to_wu()).unwrap_or(usize::MAX);
+    let sigop_weight = usize::try_from(sigop_cost)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(DEFAULT_BYTES_PER_SIGOP);
+    weight.max(sigop_weight).saturating_add(3) / 4
 }
 
 struct AdmissionUtxoOverlay<'a, S> {
@@ -1421,6 +1446,7 @@ mod tests {
         for transaction in transactions {
             let serialized_len = serialize(&transaction).len();
             pool.entries.push_back(AdmittedTransaction {
+                policy_vsize: transaction.vsize(),
                 transaction,
                 serialized_len,
                 fee_sats: 0,
@@ -1529,6 +1555,36 @@ mod tests {
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert!(pool.is_empty());
         assert_eq!(pool.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn sigop_adjusted_vsize_enforces_the_minimum_relay_fee() {
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut transaction) = spend(88);
+        let mut builder = Builder::new().push_int(0).push_opcode(opcodes::all::OP_IF);
+        for _ in 0..100 {
+            builder = builder.push_opcode(opcodes::all::OP_CHECKSIG);
+        }
+        let witness_script = builder
+            .push_opcode(opcodes::all::OP_ENDIF)
+            .push_opcode(opcodes::OP_TRUE)
+            .into_script();
+        utxo.script_pubkey = ScriptBuf::new_p2wsh(&witness_script.wscript_hash()).into_bytes();
+        transaction.input[0].witness = Witness::from_slice(&[witness_script.as_bytes()]);
+        transaction.output[0].value = Amount::from_sat(99_800);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(transaction.vsize() < 200);
+        assert!(matches!(
+            pool.admit(&store, transaction, context()),
+            Err(TransactionAdmissionError::RollingMinimumFee {
+                fee_sats: 200,
+                minimum_sats: 500,
+            })
+        ));
+        assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -2026,6 +2082,69 @@ mod tests {
             Err(TransactionAdmissionError::DuplicatePackageTransaction(_))
         ));
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn sigop_adjusted_package_size_is_enforced_atomically() {
+        let (_directory, store) = store();
+        let mut builder = Builder::new().push_int(0).push_opcode(opcodes::all::OP_IF);
+        for _ in 0..198 {
+            builder = builder.push_opcode(opcodes::all::OP_CHECKMULTISIG);
+        }
+        let witness_script = builder
+            .push_opcode(opcodes::all::OP_ENDIF)
+            .push_opcode(opcodes::OP_TRUE)
+            .into_script();
+        let script_pubkey = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        let confirmed = OutPoint::new(Txid::from_byte_array([89; 32]), 0);
+        store
+            .apply(
+                &[],
+                &[(
+                    confirmed.into(),
+                    Utxo {
+                        value_sats: 1_000_000,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 1,
+                        script_pubkey: script_pubkey.clone().into_bytes(),
+                    },
+                )],
+            )
+            .unwrap();
+        let mut package = Vec::new();
+        let mut previous_output = confirmed;
+        let mut value_sats = 1_000_000;
+        for _ in 0..6 {
+            value_sats -= 25_000;
+            let transaction = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[witness_script.as_bytes()]),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(value_sats),
+                    script_pubkey: script_pubkey.clone(),
+                }],
+            };
+            previous_output = OutPoint::new(transaction.compute_txid(), 0);
+            package.push(transaction);
+        }
+        assert!(package.iter().map(Transaction::vsize).sum::<usize>() < MAX_PACKAGE_VBYTES);
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit_package(&store, package, context()),
+            Err(TransactionAdmissionError::PackageTooLarge { vbytes, limit })
+                if vbytes > limit && limit == MAX_PACKAGE_VBYTES
+        ));
+        assert!(pool.is_empty());
+        assert!(store.get(confirmed.into()).unwrap().is_some());
     }
 
     #[test]
