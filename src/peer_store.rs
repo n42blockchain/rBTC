@@ -1,6 +1,12 @@
 //! Bounded, network-bound persistence for peer addresses learned over P2P.
 
-use std::{collections::HashMap, net::IpAddr, path::Path, str::FromStr, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    net::IpAddr,
+    path::Path,
+    str::FromStr,
+    sync::Mutex,
+};
 
 use bitcoin::{
     Network,
@@ -27,6 +33,7 @@ const TRIED_BUCKET_COUNT: u16 = 256;
 const BUCKET_CAPACITY: usize = 64;
 const NEW_BUCKETS_PER_SOURCE_GROUP: u64 = 64;
 const TRIED_BUCKETS_PER_ADDRESS_GROUP: u64 = 8;
+const MAX_NEW_REFERENCES: usize = 8;
 const ADDRESS_HORIZON_SECS: u32 = 30 * 24 * 60 * 60;
 const ADDRESS_TIME_PENALTY_SECS: u32 = 2 * 60 * 60;
 const BAD_TIMESTAMP_REPLACEMENT_AGE_SECS: u32 = 5 * 24 * 60 * 60;
@@ -110,6 +117,8 @@ struct StoredPeer {
     block_throughput_bps: u32,
     #[serde(default)]
     in_new_table: bool,
+    #[serde(default)]
+    new_source_groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -197,6 +206,7 @@ impl RedbPeerStore {
     }
 
     /// Atomically filters and stores one peer-sourced address batch.
+    #[allow(clippy::too_many_lines)]
     pub fn insert_discovered(
         &self,
         source: std::net::SocketAddr,
@@ -240,8 +250,21 @@ impl RedbPeerStore {
                 stats.rejected += 1;
                 continue;
             }
-            if existing.is_some_and(|record| record.last_seen >= last_seen) {
-                stats.rejected += 1;
+            if let Some(existing) = existing.filter(|record| record.last_seen >= last_seen) {
+                let mut updated = existing.clone();
+                let before = updated.new_source_groups.len();
+                maybe_add_new_reference(
+                    &updated.source_group,
+                    !record_is_tried(&updated),
+                    &group,
+                    &mut updated.new_source_groups,
+                );
+                if updated.new_source_groups.len() == before {
+                    stats.rejected += 1;
+                } else {
+                    records.insert(key, updated);
+                    stats.accepted += 1;
+                }
                 continue;
             }
             if existing.is_none() {
@@ -257,8 +280,9 @@ impl RedbPeerStore {
                 handshake_millis,
                 block_throughput_bps,
                 in_new_table,
+                mut new_source_groups,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0, 0, 0, false),
+                || (group.clone(), 0, 0, 0, 0, 0, 0, 0, false, Vec::new()),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -270,8 +294,15 @@ impl RedbPeerStore {
                         record.handshake_millis,
                         record.block_throughput_bps,
                         record.in_new_table,
+                        record.new_source_groups.clone(),
                     )
                 },
+            );
+            maybe_add_new_reference(
+                &source_group,
+                last_success == 0 || in_new_table,
+                &group,
+                &mut new_source_groups,
             );
             records.insert(
                 key,
@@ -287,6 +318,7 @@ impl RedbPeerStore {
                     handshake_millis,
                     block_throughput_bps,
                     in_new_table,
+                    new_source_groups,
                 },
             );
             stats.accepted += 1;
@@ -335,6 +367,7 @@ impl RedbPeerStore {
             handshake_millis: 0,
             block_throughput_bps: 0,
             in_new_table: false,
+            new_source_groups: Vec::new(),
         });
         record.services = services.to_u64();
         record.last_seen = normalize_last_seen(now, now).max(record.last_seen);
@@ -344,32 +377,23 @@ impl RedbPeerStore {
         collisions.retain(|collision| collision.challenger != key);
         if already_tried {
             record.in_new_table = false;
+            record.new_source_groups.clear();
         } else {
-            let bucket = tried_bucket(&self.bucket_key, address);
+            let position = tried_position(&self.bucket_key, address);
             let incumbent = records
                 .iter()
                 .filter_map(|(stored_address, stored)| {
                     let socket = std::net::SocketAddr::from_str(stored_address).ok()?;
-                    (record_is_tried(stored) && tried_bucket(&self.bucket_key, socket) == bucket)
+                    (record_is_tried(stored)
+                        && tried_position(&self.bucket_key, socket) == position)
                         .then_some((peer_priority(stored), stored_address))
                 })
-                .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
-            let tried_count = records
-                .iter()
-                .filter(|(stored_address, stored)| {
-                    record_is_tried(stored)
-                        && std::net::SocketAddr::from_str(stored_address)
-                            .is_ok_and(|socket| tried_bucket(&self.bucket_key, socket) == bucket)
-                })
-                .count();
-            if tried_count == BUCKET_CAPACITY {
+                .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+            if let Some((_, incumbent)) = incumbent {
                 record.in_new_table = true;
                 collisions.push(StoredTriedCollision {
                     challenger: key.clone(),
-                    incumbent: incumbent
-                        .expect("full tried bucket has an incumbent")
-                        .1
-                        .clone(),
+                    incumbent: incumbent.clone(),
                     created_at: now,
                 });
                 collisions.sort_unstable_by(|left, right| {
@@ -382,6 +406,7 @@ impl RedbPeerStore {
                 }
             } else {
                 record.in_new_table = false;
+                record.new_source_groups.clear();
             }
         }
         records.insert(key.clone(), record);
@@ -484,6 +509,7 @@ impl RedbPeerStore {
                 record.last_success = now;
                 record.consecutive_failures = 0;
                 record.in_new_table = false;
+                record.new_source_groups.clear();
             }
         } else {
             let winner = matching
@@ -501,6 +527,7 @@ impl RedbPeerStore {
             if let Some(winner) = winner {
                 if let Some(record) = records.get_mut(&winner) {
                     record.in_new_table = false;
+                    record.new_source_groups.clear();
                 }
             }
         }
@@ -535,6 +562,7 @@ impl RedbPeerStore {
         self.update_existing(address, |record| {
             record.last_success = now;
             record.consecutive_failures = 0;
+            record.new_source_groups.clear();
         })
     }
 
@@ -817,6 +845,15 @@ fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
     if record.in_new_table && record.last_success == 0 {
         return Err(PeerStoreError::Malformed("peer table membership"));
     }
+    let mut references = HashSet::new();
+    if record.new_source_groups.len() >= MAX_NEW_REFERENCES
+        || record.new_source_groups.iter().any(|group| {
+            group == &record.source_group || !valid_source_group(group) || !references.insert(group)
+        })
+        || (record_is_tried(&record) && !record.new_source_groups.is_empty())
+    {
+        return Err(PeerStoreError::Malformed("peer new-table references"));
+    }
     Ok(record)
 }
 
@@ -997,6 +1034,44 @@ fn new_bucket(
     .expect("new bucket index fits u16")
 }
 
+fn new_buckets(
+    key: &[u8; BUCKET_KEY_LEN],
+    address: std::net::SocketAddr,
+    record: &StoredPeer,
+) -> Vec<u16> {
+    std::iter::once(record.source_group.as_str())
+        .chain(record.new_source_groups.iter().map(String::as_str))
+        .map(|source| new_bucket(key, address, source))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn accept_new_reference(reference_count: usize) -> bool {
+    accept_new_reference_roll(reference_count, rand::random())
+}
+
+fn maybe_add_new_reference(
+    primary: &str,
+    remains_new: bool,
+    candidate: &str,
+    references: &mut Vec<String>,
+) {
+    if remains_new
+        && candidate != primary
+        && !references.iter().any(|group| group == candidate)
+        && 1 + references.len() < MAX_NEW_REFERENCES
+        && accept_new_reference(1 + references.len())
+    {
+        references.push(candidate.to_owned());
+    }
+}
+
+fn accept_new_reference_roll(reference_count: usize, roll: u64) -> bool {
+    let denominator = 1_u64 << reference_count.min(MAX_NEW_REFERENCES);
+    roll % denominator == 0
+}
+
 fn tried_bucket(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> u16 {
     let address_key = address_bucket_key(address);
     let address_group = source_group(address.ip());
@@ -1008,6 +1083,17 @@ fn tried_bucket(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> u1
             % u64::from(TRIED_BUCKET_COUNT),
     )
     .expect("tried bucket index fits u16")
+}
+
+fn tried_position(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> (u16, u8) {
+    let bucket = tried_bucket(key, address);
+    let address_key = address_bucket_key(address);
+    let slot = bucket_hash(key, b"tried-slot", &[&bucket.to_le_bytes(), &address_key])
+        % u64::try_from(BUCKET_CAPACITY).expect("bucket capacity fits u64");
+    (
+        bucket,
+        u8::try_from(slot).expect("tried slot index fits u8"),
+    )
 }
 
 fn peer_bucket(
@@ -1049,7 +1135,7 @@ fn sanitize_tried_collisions(
             };
             !record_is_tried(challenger)
                 && record_is_tried(incumbent)
-                && tried_bucket(key, challenger_address) == tried_bucket(key, incumbent_address)
+                && tried_position(key, challenger_address) == tried_position(key, incumbent_address)
         })
         .collect()
 }
@@ -1065,17 +1151,30 @@ fn retain_bucketed(
             .cmp(&peer_priority(right))
             .then_with(|| left_address.cmp(right_address))
     });
-    let mut bucket_counts = HashMap::new();
+    let mut new_bucket_counts = HashMap::new();
+    let mut tried_positions = HashSet::new();
     let mut retained = Vec::with_capacity(limit.min(ordered.len()));
     for (address, record) in ordered {
         let socket = std::net::SocketAddr::from_str(&address)
             .expect("stored peer address was validated before retention");
-        let bucket = peer_bucket(key, socket, &record);
-        let count = bucket_counts.entry(bucket).or_insert(0_usize);
-        if *count == BUCKET_CAPACITY {
-            continue;
+        if record_is_tried(&record) {
+            if !tried_positions.insert(tried_position(key, socket)) {
+                continue;
+            }
+        } else {
+            let available = new_buckets(key, socket, &record)
+                .into_iter()
+                .filter(|bucket| {
+                    new_bucket_counts.get(bucket).copied().unwrap_or(0) < BUCKET_CAPACITY
+                })
+                .collect::<Vec<_>>();
+            if available.is_empty() {
+                continue;
+            }
+            for bucket in available {
+                *new_bucket_counts.entry(bucket).or_insert(0_usize) += 1;
+            }
         }
-        *count += 1;
         retained.push((address, record));
         if retained.len() == limit {
             break;
@@ -1219,22 +1318,32 @@ mod tests {
         }
     }
 
-    fn same_tried_bucket_addresses(
+    fn tried_collision_pairs(
         key: &[u8; BUCKET_KEY_LEN],
         count: usize,
-    ) -> Vec<std::net::SocketAddr> {
-        let mut by_bucket: HashMap<u16, Vec<std::net::SocketAddr>> = HashMap::new();
+    ) -> Vec<(std::net::SocketAddr, std::net::SocketAddr)> {
+        let mut incumbents = HashMap::new();
+        let mut used_positions = HashSet::new();
+        let mut pairs = Vec::new();
         for third in 0_u8..=u8::MAX {
             for fourth in 1_u8..=u8::MAX {
                 let address = format!("1.1.{third}.{fourth}:8333").parse().unwrap();
-                let addresses = by_bucket.entry(tried_bucket(key, address)).or_default();
-                addresses.push(address);
-                if addresses.len() == count {
-                    return addresses.clone();
+                let position = tried_position(key, address);
+                if used_positions.contains(&position) {
+                    continue;
+                }
+                if let Some(incumbent) = incumbents.remove(&position) {
+                    used_positions.insert(position);
+                    pairs.push((incumbent, address));
+                    if pairs.len() == count {
+                        return pairs;
+                    }
+                } else {
+                    incumbents.insert(position, address);
                 }
             }
         }
-        panic!("test address space should fill one tried bucket");
+        panic!("test address space should produce enough tried-slot collisions");
     }
 
     #[test]
@@ -1495,6 +1604,7 @@ mod tests {
             handshake_millis: 0,
             block_throughput_bps: 0,
             in_new_table: false,
+            new_source_groups: Vec::new(),
         };
         assert!(!retry_ready(
             &maximally_failed,
@@ -1822,6 +1932,7 @@ mod tests {
             handshake_millis: 0,
             block_throughput_bps: 0,
             in_new_table: false,
+            new_source_groups: Vec::new(),
         };
         let records = HashMap::from([
             ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),
@@ -1843,11 +1954,8 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let addresses = same_tried_bucket_addresses(&store.bucket_key, BUCKET_CAPACITY + 1);
-        for address in &addresses[..BUCKET_CAPACITY] {
-            assert!(store.insert_verified(*address, services, now).unwrap());
-        }
-        let challenger = addresses[BUCKET_CAPACITY];
+        let (incumbent, challenger) = tried_collision_pairs(&store.bucket_key, 1)[0];
+        assert!(store.insert_verified(incumbent, services, now).unwrap());
         assert!(
             store
                 .insert_verified(challenger, services, now + 1)
@@ -1856,7 +1964,7 @@ mod tests {
         let collisions = store.tried_collisions().unwrap();
         assert_eq!(collisions.len(), 1);
         assert_eq!(collisions[0].challenger, challenger);
-        let incumbent = collisions[0].incumbent;
+        assert_eq!(collisions[0].incumbent, incumbent);
         let records = store.load_records().unwrap();
         assert!(!record_is_tried(&records[&challenger.to_string()]));
         assert!(record_is_tried(&records[&incumbent.to_string()]));
@@ -1889,17 +1997,17 @@ mod tests {
         let records = reopened.load_records().unwrap();
         assert!(!record_is_tried(&records[&second_incumbent.to_string()]));
         assert!(record_is_tried(&records[&challenger.to_string()]));
-        let tried_in_bucket = records
+        let tried_at_position = records
             .iter()
             .filter(|(address, record)| {
                 record_is_tried(record)
                     && std::net::SocketAddr::from_str(address).is_ok_and(|address| {
-                        tried_bucket(&reopened.bucket_key, address)
-                            == tried_bucket(&reopened.bucket_key, challenger)
+                        tried_position(&reopened.bucket_key, address)
+                            == tried_position(&reopened.bucket_key, challenger)
                     })
             })
             .count();
-        assert_eq!(tried_in_bucket, BUCKET_CAPACITY);
+        assert_eq!(tried_at_position, 1);
     }
 
     #[test]
@@ -1909,16 +2017,17 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let addresses = same_tried_bucket_addresses(
-            &store.bucket_key,
-            BUCKET_CAPACITY + MAX_TRIED_COLLISIONS + 1,
-        );
-        for address in &addresses[..BUCKET_CAPACITY] {
-            store.insert_verified(*address, services, now).unwrap();
+        let pairs = tried_collision_pairs(&store.bucket_key, MAX_TRIED_COLLISIONS + 1);
+        for (incumbent, _) in &pairs {
+            store.insert_verified(*incumbent, services, now).unwrap();
         }
-        for (offset, address) in addresses[BUCKET_CAPACITY..].iter().enumerate() {
+        for (offset, (_, challenger)) in pairs.iter().enumerate() {
             store
-                .insert_verified(*address, services, now + 1 + u32::try_from(offset).unwrap())
+                .insert_verified(
+                    *challenger,
+                    services,
+                    now + 1 + u32::try_from(offset).unwrap(),
+                )
                 .unwrap();
         }
         let collisions = store.tried_collisions().unwrap();
@@ -1926,7 +2035,7 @@ mod tests {
         assert!(
             !collisions
                 .iter()
-                .any(|collision| collision.challenger == addresses[BUCKET_CAPACITY])
+                .any(|collision| collision.challenger == pairs[0].1)
         );
 
         let transaction = store.db.begin_write().unwrap();
@@ -1943,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn keyed_new_and_tried_buckets_enforce_independent_capacity() {
+    fn keyed_new_capacity_and_exact_tried_slots_are_independent() {
         let key = [11; BUCKET_KEY_LEN];
         let services = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
         let make_record = |last_success| StoredPeer {
@@ -1958,37 +2067,21 @@ mod tests {
             handshake_millis: 0,
             block_throughput_bps: 0,
             in_new_table: false,
+            new_source_groups: Vec::new(),
         };
 
-        let mut tried_by_bucket: HashMap<u16, Vec<std::net::SocketAddr>> = HashMap::new();
-        for third in 0_u8..=u8::MAX {
-            for fourth in 1_u8..=u8::MAX {
-                let address = format!("1.1.{third}.{fourth}:8333").parse().unwrap();
-                let bucket = tried_bucket(&key, address);
-                let addresses = tried_by_bucket.entry(bucket).or_default();
-                addresses.push(address);
-                if addresses.len() > BUCKET_CAPACITY {
-                    break;
-                }
-            }
-            if tried_by_bucket
-                .values()
-                .any(|addresses| addresses.len() > BUCKET_CAPACITY)
-            {
-                break;
-            }
-        }
-        let tried = tried_by_bucket
-            .into_values()
-            .find(|addresses| addresses.len() > BUCKET_CAPACITY)
-            .unwrap();
-        let tried_records = tried
+        let (incumbent, challenger) = tried_collision_pairs(&key, 1)[0];
+        assert_eq!(
+            tried_position(&key, incumbent),
+            tried_position(&key, challenger)
+        );
+        let tried_records = [incumbent, challenger]
             .into_iter()
             .map(|address| (address.to_string(), make_record(1_799_999_999)))
             .collect();
         assert_eq!(
             retain_bucketed(tried_records, MAX_STORED_PEERS, &key).len(),
-            BUCKET_CAPACITY
+            1
         );
 
         let mut new_by_bucket: HashMap<u16, Vec<std::net::SocketAddr>> = HashMap::new();
@@ -2020,6 +2113,104 @@ mod tests {
         assert_eq!(
             retain_bucketed(new_records, MAX_STORED_PEERS, &key).len(),
             BUCKET_CAPACITY
+        );
+    }
+
+    #[test]
+    fn new_table_references_are_stochastic_bounded_and_backward_compatible() {
+        let key = [12; BUCKET_KEY_LEN];
+        let address = "2.2.2.2:8333".parse().unwrap();
+        let mut record = StoredPeer {
+            services: (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64(),
+            last_seen: 1_800_000_000,
+            source_group: "v4:8:8".to_owned(),
+            last_attempt: 0,
+            last_success: 0,
+            consecutive_failures: 0,
+            last_session_success: 0,
+            successful_sessions: 0,
+            handshake_millis: 0,
+            block_throughput_bps: 0,
+            in_new_table: false,
+            new_source_groups: Vec::new(),
+        };
+        let mut buckets = HashSet::from([new_bucket(&key, address, &record.source_group)]);
+        for first in 9_u8..=u8::MAX {
+            let group = format!("v4:{first}:1");
+            let bucket = new_bucket(&key, address, &group);
+            if buckets.insert(bucket) {
+                record.new_source_groups.push(group);
+                if record.new_source_groups.len() == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(new_buckets(&key, address, &record).len(), 3);
+        assert!(accept_new_reference_roll(1, 0));
+        assert!(!accept_new_reference_roll(1, 1));
+        assert!(accept_new_reference_roll(3, 8));
+        assert!(!accept_new_reference_roll(3, 7));
+        decode_stored_peer(&serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let mut tried_with_references = record.clone();
+        tried_with_references.last_success = 1;
+        assert!(matches!(
+            decode_stored_peer(&serde_json::to_vec(&tried_with_references).unwrap()),
+            Err(PeerStoreError::Malformed("peer new-table references"))
+        ));
+        record.new_source_groups = (0_u8..u8::try_from(MAX_NEW_REFERENCES).unwrap())
+            .map(|value| format!("v4:9:{value}"))
+            .collect();
+        assert!(matches!(
+            decode_stored_peer(&serde_json::to_vec(&record).unwrap()),
+            Err(PeerStoreError::Malformed("peer new-table references"))
+        ));
+
+        validate_stored_peer_record(
+            br#"{"services":9,"last_seen":1800000000,"source_group":"v4:8:8"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn repeated_independent_sources_persist_additional_new_references() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let address = learned("127.0.0.1:18444", services, now);
+        store
+            .insert_discovered(
+                "127.1.0.1:18444".parse().unwrap(),
+                std::slice::from_ref(&address),
+                now,
+            )
+            .unwrap();
+        for source in ["127.2.0.1:18444", "127.3.0.1:18444"] {
+            for _ in 0..1_000 {
+                store
+                    .insert_discovered(source.parse().unwrap(), std::slice::from_ref(&address), now)
+                    .unwrap();
+                if store.load_records().unwrap()[&address.socket.to_string()]
+                    .new_source_groups
+                    .contains(&source_group(
+                        source.parse::<std::net::SocketAddr>().unwrap().ip(),
+                    ))
+                {
+                    break;
+                }
+            }
+        }
+        let record = &store.load_records().unwrap()[&address.socket.to_string()];
+        assert_eq!(record.new_source_groups.len(), 2);
+        drop(store);
+        let reopened = RedbPeerStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(
+            reopened.load_records().unwrap()[&address.socket.to_string()]
+                .new_source_groups
+                .len(),
+            2
         );
     }
 
