@@ -1,0 +1,38 @@
+[package]
+name = "rbtc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bitcoin = "=0.32.8"
+libfuzzer-sys = "=0.4.13"
+rbtc = { path = "..", version = "=0.1.0" }
+
+[[bin]]
+name = "p2p_decode_v1"
+path = "fuzz_targets/p2p_decode_v1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merkle_proof"
+path = "fuzz_targets/merkle_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signet_block"
+path = "fuzz_targets/signet_block.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

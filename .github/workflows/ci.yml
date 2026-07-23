@@ -21,6 +21,7 @@ jobs:
           toolchain: 1.85.0
           components: rustfmt, clippy, llvm-tools-preview
       - run: cargo fmt --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: bash -n scripts/*.sh
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
@@ -46,7 +47,9 @@ jobs:
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-cyclonedx@0.5.9
       - run: cargo audit --deny warnings
+      - run: cargo audit --deny warnings --file fuzz/Cargo.lock
       - run: cargo deny check
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check
       - name: Generate CycloneDX SBOM
         run: SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" cargo cyclonedx --all-features --format json --spec-version 1.5 --override-filename rbtc.cdx
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

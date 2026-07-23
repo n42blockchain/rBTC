@@ -3,3 +3,5 @@
 *.rblk
 ledger-index.json
 /rbtc.cdx.json
+/fuzz/artifacts/
+/fuzz/target/
