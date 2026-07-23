@@ -21,6 +21,7 @@ use bitcoin::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -47,6 +48,7 @@ const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
 const FEEFILTER_VERSION: u32 = 70_013;
 const SENDCMPCT_VERSION: u32 = 70_014;
+const MEMPOOL_VERSION: u32 = 60_002;
 const COMPACT_BLOCK_VERSION: u64 = 2;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
 const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
@@ -359,6 +361,31 @@ pub struct TransactionRelay {
     pub policy_vsize: usize,
 }
 
+/// Cloneable, read-only source for the node's current validated mempool.
+///
+/// The callback is evaluated for every BIP35 request so sessions never retain
+/// a stale pool snapshot across confirmation, replacement, reorg, or eviction.
+#[derive(Clone)]
+pub struct MempoolRelaySource {
+    snapshot: Arc<dyn Fn() -> Vec<TransactionRelay> + Send + Sync>,
+}
+
+impl MempoolRelaySource {
+    /// Wraps a bounded snapshot callback shared by active and standby sessions.
+    pub fn new<F>(snapshot: F) -> Self
+    where
+        F: Fn() -> Vec<TransactionRelay> + Send + Sync + 'static,
+    {
+        Self {
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<TransactionRelay> {
+        (self.snapshot)()
+    }
+}
+
 struct CompactBlockReconstruction {
     header: bitcoin::block::Header,
     transactions: Vec<Option<Transaction>>,
@@ -553,6 +580,7 @@ pub struct PeerSession<S> {
     pending_transaction_inventory: VecDeque<Inventory>,
     announced_transactions: VecDeque<(Inventory, Transaction, usize)>,
     announced_transaction_bytes: usize,
+    mempool_relay_source: Option<MempoolRelaySource>,
     block_transfer_stats: BlockTransferStats,
 }
 
@@ -573,6 +601,7 @@ impl<S> PeerSession<S> {
             pending_transaction_inventory: VecDeque::new(),
             announced_transactions: VecDeque::new(),
             announced_transaction_bytes: 0,
+            mempool_relay_source: None,
             block_transfer_stats: BlockTransferStats::default(),
         }
     }
@@ -599,6 +628,14 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn fee_filter_sat_kvb(&self) -> u64 {
         self.fee_filter_sat_kvb
+    }
+
+    /// Attaches the current validated mempool used to answer BIP35 requests.
+    ///
+    /// Header-only and one-shot transport users leave this unset and therefore
+    /// do not answer `mempool` with transaction inventory.
+    pub fn set_mempool_relay_source(&mut self, source: MempoolRelaySource) {
+        self.mempool_relay_source = Some(source);
     }
 
     /// Drains unsolicited transactions captured while another bounded response was in flight.
@@ -835,6 +872,98 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
     }
 
+    fn retain_announced_transaction(
+        &mut self,
+        inventory: Inventory,
+        transaction: Transaction,
+        payload_len: usize,
+    ) {
+        if let Some(position) = self
+            .announced_transactions
+            .iter()
+            .position(|(announced, _, _)| *announced == inventory)
+        {
+            let (_, _, removed_len) = self
+                .announced_transactions
+                .remove(position)
+                .expect("located announcement remains in the relay cache");
+            self.announced_transaction_bytes = self
+                .announced_transaction_bytes
+                .checked_sub(removed_len)
+                .expect("queued transaction charge matches announced byte total");
+        }
+        while self.announced_transactions.len() >= MAX_ANNOUNCED_TRANSACTIONS
+            || self.announced_transaction_bytes.saturating_add(payload_len)
+                > MAX_ANNOUNCED_TRANSACTION_BYTES
+        {
+            let Some((_, _, removed_len)) = self.announced_transactions.pop_front() else {
+                break;
+            };
+            self.announced_transaction_bytes = self
+                .announced_transaction_bytes
+                .checked_sub(removed_len)
+                .expect("queued transaction charge matches announced byte total");
+        }
+        self.announced_transactions
+            .push_back((inventory, transaction, payload_len));
+        self.announced_transaction_bytes = self
+            .announced_transaction_bytes
+            .checked_add(payload_len)
+            .expect("bounded announced transaction payload total fits usize");
+    }
+
+    async fn serve_mempool_request(&mut self) -> Result<(), P2pError> {
+        if self.remote_version.version < MEMPOOL_VERSION {
+            return Ok(());
+        }
+        let Some(source) = self.mempool_relay_source.clone() else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        let mut retained_bytes = 0usize;
+        let mut selected = Vec::new();
+        for relay in source.snapshot() {
+            if selected.len() == MAX_ANNOUNCED_TRANSACTIONS {
+                break;
+            }
+            let transaction = relay.transaction;
+            if Self::validate_outbound_transaction(&transaction).is_err() {
+                continue;
+            }
+            let inventory = self.transaction_inventory(&transaction);
+            if !seen.insert(inventory) {
+                continue;
+            }
+            let vbytes = relay.policy_vsize.max(transaction.vsize());
+            if relay
+                .fee_sats
+                .is_some_and(|fee_sats| fee_sats < fee_for_filter(self.fee_filter_sat_kvb, vbytes))
+            {
+                continue;
+            }
+            let payload_len = serialize(&transaction).len();
+            let Some(next_bytes) = retained_bytes.checked_add(payload_len) else {
+                break;
+            };
+            if next_bytes > MAX_ANNOUNCED_TRANSACTION_BYTES {
+                break;
+            }
+            retained_bytes = next_bytes;
+            selected.push((inventory, transaction, payload_len));
+        }
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let mut inventory = Vec::with_capacity(selected.len());
+        for (entry, transaction, payload_len) in selected {
+            self.retain_announced_transaction(entry, transaction, payload_len);
+            inventory.push(entry);
+        }
+        self.transport
+            .write_message(NetworkMessage::Inv(inventory))
+            .await
+    }
+
     fn retain_transaction_inventory(&mut self, entries: Vec<Inventory>) {
         for inventory in entries {
             let supported = matches!(inventory, Inventory::Transaction(_))
@@ -961,7 +1090,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     .await?;
                 Ok(None)
             }
-            NetworkMessage::GetData(requests) if !self.announced_transactions.is_empty() => {
+            NetworkMessage::MemPool => {
+                self.serve_mempool_request().await?;
+                Ok(None)
+            }
+            NetworkMessage::GetData(requests) => {
                 self.serve_transaction_requests(requests).await?;
                 Ok(None)
             }
@@ -1083,24 +1216,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 .any(|(announced, _, _)| *announced == inventory)
         {
             let payload_len = serialize(transaction).len();
-            while self.announced_transactions.len() >= MAX_ANNOUNCED_TRANSACTIONS
-                || self.announced_transaction_bytes.saturating_add(payload_len)
-                    > MAX_ANNOUNCED_TRANSACTION_BYTES
-            {
-                let Some((_, _, removed_len)) = self.announced_transactions.pop_front() else {
-                    break;
-                };
-                self.announced_transaction_bytes = self
-                    .announced_transaction_bytes
-                    .checked_sub(removed_len)
-                    .expect("queued transaction charge matches announced byte total");
-            }
-            self.announced_transactions
-                .push_back((inventory, transaction.clone(), payload_len));
-            self.announced_transaction_bytes = self
-                .announced_transaction_bytes
-                .checked_add(payload_len)
-                .expect("bounded announced transaction payload total fits usize");
+            self.retain_announced_transaction(inventory, transaction.clone(), payload_len);
             self.transport
                 .write_message(NetworkMessage::Inv(vec![inventory]))
                 .await?;
@@ -3244,6 +3360,294 @@ mod tests {
 
         client.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bip35_mempool_applies_feefilter_and_bip339_then_serves_getdata() {
+        let low_fee_transaction = relay_test_transaction();
+        let mut high_fee_transaction = low_fee_transaction.clone();
+        high_fee_transaction.output[0].value = Amount::from_sat(
+            high_fee_transaction.output[0]
+                .value
+                .to_sat()
+                .saturating_sub(1),
+        );
+        let low_fee_inventory = Inventory::WTx(low_fee_transaction.compute_wtxid());
+        let high_fee_inventory = Inventory::WTx(high_fee_transaction.compute_wtxid());
+        let expected = high_fee_transaction.clone();
+        let low_fee_relay = TransactionRelay {
+            fee_sats: Some(u64::try_from(low_fee_transaction.vsize()).unwrap()),
+            policy_vsize: low_fee_transaction.vsize(),
+            transaction: low_fee_transaction,
+        };
+        let high_fee_relay = relay_entry(high_fee_transaction);
+        let source =
+            MempoolRelaySource::new(move || vec![low_fee_relay.clone(), high_fee_relay.clone()]);
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
+            transport.peer_wtxid_relay = true;
+            let mut remote = version(1);
+            remote.version = PROTOCOL_VERSION;
+            let mut session = PeerSession::new(transport, remote);
+            session.set_mempool_relay_source(source);
+            session.ping(70).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(70)
+            );
+            transport
+                .write_message(NetworkMessage::FeeFilter(2_000))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::MemPool)
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![high_fee_inventory])
+            );
+            transport
+                .write_message(NetworkMessage::GetData(vec![
+                    high_fee_inventory,
+                    low_fee_inventory,
+                ]))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::NotFound(vec![low_fee_inventory])
+            );
+            transport
+                .write_message(NetworkMessage::Pong(70))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bip35_mempool_uses_a_fresh_bounded_snapshot_for_each_request() {
+        let first = relay_test_transaction();
+        let mut second = first.clone();
+        second.output[0].value =
+            Amount::from_sat(second.output[0].value.to_sat().saturating_sub(2));
+        let first_inventory = Inventory::Transaction(first.compute_txid());
+        let second_inventory = Inventory::Transaction(second.compute_txid());
+        let snapshot = Arc::new(std::sync::Mutex::new(vec![relay_entry(first)]));
+        let source_snapshot = Arc::clone(&snapshot);
+        let source = MempoolRelaySource::new(move || {
+            source_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        let server_snapshot = Arc::clone(&snapshot);
+        let expected = second.clone();
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = PROTOCOL_VERSION;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.set_mempool_relay_source(source);
+            session.ping(71).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(71)
+            );
+            transport
+                .write_message(NetworkMessage::MemPool)
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![first_inventory])
+            );
+            *server_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![relay_entry(second)];
+            transport
+                .write_message(NetworkMessage::MemPool)
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![second_inventory])
+            );
+            transport
+                .write_message(NetworkMessage::GetData(vec![second_inventory]))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(71))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bip35_mempool_inventory_is_hard_bounded() {
+        let entries = (0..=MAX_ANNOUNCED_TRANSACTIONS)
+            .map(|index| {
+                let mut transaction = relay_test_transaction();
+                transaction.output[0].value = Amount::from_sat(
+                    transaction.output[0]
+                        .value
+                        .to_sat()
+                        .saturating_sub(u64::try_from(index).unwrap()),
+                );
+                relay_entry(transaction)
+            })
+            .collect::<Vec<_>>();
+        let source = MempoolRelaySource::new(move || entries.clone());
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = PROTOCOL_VERSION;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.set_mempool_relay_source(source);
+            session.ping(72).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(72)
+            );
+            transport
+                .write_message(NetworkMessage::MemPool)
+                .await
+                .unwrap();
+            let NetworkMessage::Inv(inventory) =
+                transport.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected mempool inventory");
+            };
+            assert_eq!(inventory.len(), MAX_ANNOUNCED_TRANSACTIONS);
+            transport
+                .write_message(NetworkMessage::Pong(72))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_bip35_peer_cannot_trigger_mempool_inventory() {
+        let source = MempoolRelaySource::new(|| vec![relay_entry(relay_test_transaction())]);
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = MEMPOOL_VERSION - 1;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.set_mempool_relay_source(source);
+            session.ping(73).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(73)
+            );
+            transport
+                .write_message(NetworkMessage::MemPool)
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Pong(73))
+                .await
+                .unwrap();
+            assert!(!matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    transport.read_message()
+                )
+                .await,
+                Ok(Ok(_))
+            ));
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bip35_empty_or_unattached_mempool_is_silent() {
+        for source in [
+            None,
+            Some(MempoolRelaySource::new(Vec::<TransactionRelay>::new)),
+        ] {
+            let (client_stream, server_stream) = duplex(1024 * 1024);
+            let client = tokio::spawn(async move {
+                let mut remote = version(1);
+                remote.version = PROTOCOL_VERSION;
+                let mut session = PeerSession::new(
+                    V1Transport::new(client_stream, Network::Regtest.magic()),
+                    remote,
+                );
+                if let Some(source) = source {
+                    session.set_mempool_relay_source(source);
+                }
+                session.ping(74).await
+            });
+            let server = tokio::spawn(async move {
+                let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+                assert_eq!(
+                    transport.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::Ping(74)
+                );
+                transport
+                    .write_message(NetworkMessage::MemPool)
+                    .await
+                    .unwrap();
+                transport
+                    .write_message(NetworkMessage::Pong(74))
+                    .await
+                    .unwrap();
+                assert!(!matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        transport.read_message()
+                    )
+                    .await,
+                    Ok(Ok(_))
+                ));
+            });
+
+            client.await.unwrap().unwrap();
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

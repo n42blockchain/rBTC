@@ -40,8 +40,8 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
-        MAX_PENDING_TRANSACTION_INVENTORY, P2pError, PeerSession, TransactionRelay,
-        connect_outbound,
+        MAX_PENDING_TRANSACTION_INVENTORY, MempoolRelaySource, P2pError, PeerSession,
+        TransactionRelay, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
@@ -1101,6 +1101,20 @@ async fn run_peer_pool(
 ) -> Result<(), String> {
     let api_runtime = prepare_api_runtime(options)?;
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let mempool_pool = Arc::clone(&transaction_pool);
+    let mempool_relay_source = MempoolRelaySource::new(move || {
+        mempool_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relay_snapshot()
+            .into_iter()
+            .map(|entry| TransactionRelay {
+                transaction: entry.transaction,
+                fee_sats: Some(entry.fee_sats),
+                policy_vsize: entry.policy_vsize,
+            })
+            .collect()
+    });
     let (transaction_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
@@ -1155,6 +1169,7 @@ async fn run_peer_pool(
         validation_scheduler,
         &transaction_pool,
         &transaction_relay,
+        &mempool_relay_source,
         &manual_remotes,
         &mut failures,
     )
@@ -1197,6 +1212,7 @@ async fn run_peer_pool(
             validation_scheduler,
             &transaction_pool,
             &transaction_relay,
+            &mempool_relay_source,
             &manual_remotes,
             &mut failures,
         )
@@ -2050,8 +2066,9 @@ async fn connect_and_maintain_standby(
     activate: tokio::sync::oneshot::Receiver<()>,
     transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     header_dag: Option<HeaderDag>,
+    mempool_relay_source: Option<MempoolRelaySource>,
 ) -> Result<ConnectedPeer, PeerRunError> {
-    let connected = connect_peer(
+    let mut connected = connect_peer(
         deployments,
         remote,
         local_nonce,
@@ -2059,6 +2076,9 @@ async fn connect_and_maintain_standby(
         peer_store,
     )
     .await?;
+    if let Some(source) = mempool_relay_source {
+        connected.session.set_mempool_relay_source(source);
+    }
     ready
         .send(())
         .map_err(|()| PeerRunError::transient("peer standby readiness channel closed"))?;
@@ -2100,6 +2120,7 @@ fn spawn_peer_connections(
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
+    mempool_relay_source: Option<&MempoolRelaySource>,
 ) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
@@ -2114,6 +2135,9 @@ fn spawn_peer_connections(
             let (activate, activate_receiver) = tokio::sync::oneshot::channel();
             let transaction_relay = standby_relay.map(broadcast::Sender::subscribe);
             let header_dag = header_seed.clone();
+            let mempool_relay_source = require_full_services
+                .then(|| mempool_relay_source.cloned())
+                .flatten();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -2124,6 +2148,7 @@ fn spawn_peer_connections(
                 activate_receiver,
                 transaction_relay,
                 header_dag,
+                mempool_relay_source,
             ));
             (
                 remote,
@@ -2264,6 +2289,7 @@ async fn try_peer_candidates(
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
+    mempool_relay_source: &MempoolRelaySource,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
 ) -> bool {
@@ -2273,6 +2299,7 @@ async fn try_peer_candidates(
         local_nonce,
         peer_store,
         Some(transaction_relay),
+        Some(mempool_relay_source),
     ) {
         Ok(pending) => pending,
         Err(error) => {
@@ -5848,7 +5875,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
         };
         let mut pending =
-            spawn_peer_connections(&options, &options.remotes, 100, None, None).unwrap();
+            spawn_peer_connections(&options, &options.remotes, 100, None, None, None).unwrap();
         timeout(Duration::from_secs(2), ready_received)
             .await
             .expect("later candidate should handshake while first candidate is stalled")
@@ -6062,6 +6089,61 @@ mod tests {
 
         drop(activated);
         release_server.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_service_standby_retains_mempool_request_source_after_activation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let transaction = wallet_broadcast_transaction();
+        let expected_inventory = Inventory::WTx(transaction.compute_wtxid());
+        let expected_transaction = transaction.clone();
+        let relay = transaction_relay(transaction);
+        let source = MempoolRelaySource::new(move || vec![relay.clone()]);
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(212)).await;
+            receive_client_preferences(&mut peer).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(211)
+            );
+            peer.write_message(NetworkMessage::MemPool).await.unwrap();
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![expected_inventory])
+            );
+            peer.write_message(NetworkMessage::GetData(vec![expected_inventory]))
+                .await
+                .unwrap();
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected_transaction)
+            );
+            peer.write_message(NetworkMessage::Pong(211)).await.unwrap();
+        });
+
+        let (ready_sender, ready) = tokio::sync::oneshot::channel();
+        let (activate, activation) = tokio::sync::oneshot::channel();
+        let connection = tokio::spawn(connect_and_maintain_standby(
+            DeploymentConfig::for_network(Network::Regtest),
+            remote,
+            210,
+            true,
+            None,
+            ready_sender,
+            activation,
+            None,
+            None,
+            Some(source),
+        ));
+        timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("full-service standby should become ready")
+            .unwrap();
+        activate.send(()).unwrap();
+        let mut connected = connection.await.unwrap().unwrap();
+        connected.session.ping(211).await.unwrap();
         server.await.unwrap();
     }
 
