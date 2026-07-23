@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
 use tokio_stream::{
     StreamExt,
     wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
@@ -131,6 +131,9 @@ pub const MAX_AUTHORIZATION_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_WALLET_AUDIT_BYTES: u64 = MAX_AUTHORIZATION_AUDIT_BYTES;
 /// Maximum accepted JSON-RPC request body size.
 pub const MAX_RPC_BODY_BYTES: usize = 64 * 1024;
+/// Maximum wallet broadcasts waiting for the active peer session.
+pub const WALLET_BROADCAST_QUEUE_CAPACITY: usize = 8;
+const WALLET_BROADCAST_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Rotatable in-memory bearer credential protecting a local API surface.
 ///
@@ -176,6 +179,15 @@ struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
     address_limiter: Mutex<AddressRateLimiter>,
     psbt_limiter: Mutex<AddressRateLimiter>,
+    broadcast: Option<mpsc::Sender<WalletBroadcastRequest>>,
+}
+
+/// One consensus-verified wallet transaction awaiting a peer socket write.
+pub struct WalletBroadcastRequest {
+    /// Exact transaction returned by wallet finalization.
+    pub transaction: bitcoin::Transaction,
+    /// Completion signal sent only after the active peer write finishes.
+    pub result: oneshot::Sender<Result<(), ()>>,
 }
 
 struct AddressRateLimiter {
@@ -980,11 +992,13 @@ pub fn wallet_router(
     wallet: Arc<EmbeddedWallet>,
     token: LocalAuthToken,
     audit: AuthorizationAuditLog,
+    broadcast: Option<mpsc::Sender<WalletBroadcastRequest>>,
 ) -> Router {
     let state = Arc::new(WalletApiState {
         wallet,
         address_limiter: Mutex::new(AddressRateLimiter::new()),
         psbt_limiter: Mutex::new(AddressRateLimiter::new()),
+        broadcast,
     });
     Router::new()
         .route("/api/v1/wallet/status", get(wallet_status))
@@ -1000,6 +1014,12 @@ pub fn wallet_router(
         .route(
             "/api/v1/wallet/psbt/finalize",
             post(finalize_wallet_psbt).layer(DefaultBodyLimit::max(
+                MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/api/v1/wallet/psbt/broadcast",
+            post(broadcast_wallet_psbt).layer(DefaultBodyLimit::max(
                 MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES,
             )),
         )
@@ -1170,6 +1190,43 @@ async fn finalize_wallet_psbt(
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })
         .map(Json)
+}
+
+async fn broadcast_wallet_psbt(
+    State(state): State<Arc<WalletApiState>>,
+    body: Bytes,
+) -> ApiResult<WalletFinalizedTransaction> {
+    let request = parse_wallet_psbt_finalize_request(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let allowed = state
+        .psbt_limiter
+        .lock()
+        .map_err(internal)?
+        .take(Instant::now());
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let (response, transaction) = state
+        .wallet
+        .finalize_psbt_with_transaction(&request)
+        .map_err(|error| match error {
+            WalletError::Psbt(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    let broadcast = state
+        .broadcast
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let (result, completion) = oneshot::channel();
+    broadcast
+        .try_send(WalletBroadcastRequest {
+            transaction,
+            result,
+        })
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    match tokio::time::timeout(WALLET_BROADCAST_TIMEOUT, completion).await {
+        Ok(Ok(Ok(()))) => Ok(Json(response)),
+        Ok(Ok(Err(())) | Err(_)) | Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 async fn wallet_transactions(
     State(state): State<Arc<WalletApiState>>,
@@ -1639,6 +1696,7 @@ mod tests {
             wallet,
             WalletAuthToken::new(&token).unwrap(),
             WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+            None,
         );
 
         for authorization in [None, Some("Bearer wrong-token")] {
@@ -1735,6 +1793,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invalid_finalize.status(), StatusCode::BAD_REQUEST);
+        let invalid_broadcast = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt/broadcast")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"psbt":"not-base64"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_broadcast.status(), StatusCode::BAD_REQUEST);
         let unknown_finalize_field = app
             .clone()
             .oneshot(
@@ -1821,7 +1891,7 @@ mod tests {
         let audit_path = directory.path().join("wallet-api-audit.jsonl");
         let audit = WalletAuditLog::open(&audit_path).unwrap();
         let token = "audit-token-that-must-never-be-written".to_owned();
-        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap(), audit);
+        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap(), audit, None);
 
         let rejected = app
             .clone()
@@ -1905,6 +1975,7 @@ mod tests {
             Arc::clone(&wallet),
             WalletAuthToken::new(&token).unwrap(),
             audit,
+            None,
         );
         let response = app
             .oneshot(
@@ -1990,6 +2061,7 @@ mod tests {
             wallet,
             WalletAuthToken::new(&token).unwrap(),
             WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+            None,
         );
         for route in ["utxos", "transactions"] {
             for query in ["limit=0", "limit=101", "offset=10001"] {
@@ -2025,6 +2097,7 @@ mod tests {
             wallet,
             WalletAuthToken::new(&token).unwrap(),
             WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+            None,
         );
         let request = |path: &'static str| {
             Request::get(path)

@@ -21,7 +21,8 @@ use bitcoin::{
 use rbtc::{
     api::{
         AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
-        explorer_events_router, explorer_router, rpc_router, wallet_router,
+        WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, explorer_events_router,
+        explorer_router, rpc_router, wallet_router,
     },
     block_execution::{
         BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
@@ -47,6 +48,7 @@ use rbtc::{
         parse_wallet_descriptor_config,
     },
 };
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -212,6 +214,8 @@ struct WalletApiRuntime {
     token_path: PathBuf,
     audit: AuthorizationAuditLog,
     scan: WalletScanConfig,
+    broadcast_sender: mpsc::Sender<WalletBroadcastRequest>,
+    broadcast_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WalletBroadcastRequest>>>,
 }
 
 struct RpcApiRuntime {
@@ -637,6 +641,7 @@ impl ApiServer {
                 Arc::clone(&wallet.wallet),
                 wallet.token.clone(),
                 wallet.audit.clone(),
+                Some(wallet.broadcast_sender.clone()),
             ));
         }
         if let Some(rpc) = rpc {
@@ -849,6 +854,8 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 "authenticated watch-only wallet API enabled; token file {}",
                 files.auth_token.display()
             );
+            let (broadcast_sender, broadcast_receiver) =
+                mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
             Ok::<_, String>(WalletApiRuntime {
                 wallet: Arc::new(wallet),
                 token,
@@ -858,6 +865,8 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                     gap_limit: descriptors.gap_limit,
                     birthday_height: descriptors.birthday_height,
                 },
+                broadcast_sender,
+                broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
             })
         })
         .transpose()?;
@@ -2106,6 +2115,56 @@ fn reject_legacy_split_chainstate(data_dir: &std::path::Path) -> Result<(), Stri
     Ok(())
 }
 
+async fn wait_for_peer_poll(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    duration: Duration,
+    wallet: Option<&WalletApiRuntime>,
+) -> Result<(), PeerRunError> {
+    let sleep = tokio::time::sleep(duration);
+    tokio::pin!(sleep);
+    let Some(wallet) = wallet else {
+        sleep.await;
+        return Ok(());
+    };
+    loop {
+        let request = {
+            let mut receiver = wallet.broadcast_receiver.lock().await;
+            tokio::select! {
+                () = &mut sleep => return Ok(()),
+                request = receiver.recv() => request,
+            }
+        };
+        let Some(request) = request else {
+            sleep.await;
+            return Ok(());
+        };
+        if request.result.is_closed() {
+            continue;
+        }
+        match timeout(
+            PEER_TIMEOUT,
+            session.broadcast_transaction(&request.transaction),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                let _ = request.result.send(Ok(()));
+            }
+            Ok(Err(error)) => {
+                let peer_error = PeerRunError::p2p(&error);
+                let _ = request.result.send(Err(()));
+                return Err(peer_error);
+            }
+            Err(_) => {
+                let _ = request.result.send(Err(()));
+                return Err(PeerRunError::transient(
+                    "wallet transaction broadcast timed out",
+                ));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
@@ -2404,7 +2463,8 @@ async fn sync_validating_node(
                 } else {
                     30
                 };
-                tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+                wait_for_peer_poll(session, Duration::from_secs(poll_seconds), wallet_runtime)
+                    .await?;
                 if background_validation.is_none() {
                     timeout(PEER_TIMEOUT, session.ping(rand::random()))
                         .await
@@ -4276,6 +4336,96 @@ mod tests {
         (peer, local_version)
     }
 
+    #[tokio::test]
+    async fn wallet_broadcast_queue_writes_the_verified_transaction_to_the_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let transaction = Transaction {
+            version: TransactionVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([1; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let expected = transaction.clone();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(2)).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected)
+            );
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            1,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let wallet = WalletApiRuntime {
+            wallet: Arc::new(
+                EmbeddedWallet::open_or_create(
+                    directory.path().join("wallet.sqlite"),
+                    RECEIVE_DESCRIPTOR,
+                    CHANGE_DESCRIPTOR,
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            token: LocalAuthToken::new("a".repeat(32)).unwrap(),
+            token_path: directory.path().join("wallet.token"),
+            audit: AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap(),
+            scan: WalletScanConfig {
+                gap_limit: DEFAULT_WALLET_GAP_LIMIT,
+                birthday_height: 0,
+            },
+            broadcast_sender: broadcast_sender.clone(),
+            broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+        };
+        let (result, completion) = tokio::sync::oneshot::channel();
+        let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
+        drop(abandoned_completion);
+        let mut abandoned = transaction.clone();
+        abandoned.output[0].value = Amount::from_sat(999);
+        assert!(
+            broadcast_sender
+                .try_send(WalletBroadcastRequest {
+                    transaction: abandoned,
+                    result: abandoned_result,
+                })
+                .is_ok()
+        );
+        assert!(
+            broadcast_sender
+                .try_send(WalletBroadcastRequest {
+                    transaction,
+                    result,
+                })
+                .is_ok()
+        );
+
+        wait_for_peer_poll(&mut session, Duration::from_millis(10), Some(&wallet))
+            .await
+            .unwrap();
+        assert_eq!(completion.await.unwrap(), Ok(()));
+        server.await.unwrap();
+    }
+
     async fn serve_duplicate_version_peer(
         listener: TcpListener,
         first_nonce: u64,
@@ -6028,6 +6178,7 @@ mod tests {
         let rpc_token_path = directory.path().join("rpc.token");
         write_owner_only(&rpc_token_path, &rpc_token_text);
         let audit = AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap();
+        let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         let wallet = WalletApiRuntime {
             wallet: Arc::new(
                 EmbeddedWallet::open_or_create(
@@ -6045,6 +6196,8 @@ mod tests {
                 gap_limit: DEFAULT_WALLET_GAP_LIMIT,
                 birthday_height: 0,
             },
+            broadcast_sender,
+            broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),

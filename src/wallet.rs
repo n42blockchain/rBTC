@@ -707,6 +707,18 @@ impl EmbeddedWallet {
         &self,
         request: &WalletPsbtFinalizeRequest,
     ) -> Result<WalletFinalizedTransaction, WalletError> {
+        self.finalize_psbt_with_transaction(request)
+            .map(|(response, _)| response)
+    }
+
+    /// Finalizes a PSBT and also returns its consensus-verified transaction.
+    ///
+    /// This is the handoff used by an external relay layer so it cannot
+    /// substitute different bytes after wallet and consensus verification.
+    pub fn finalize_psbt_with_transaction(
+        &self,
+        request: &WalletPsbtFinalizeRequest,
+    ) -> Result<(WalletFinalizedTransaction, bitcoin::Transaction), WalletError> {
         if request.psbt.len() > MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES {
             return Err(WalletError::Psbt("encoded PSBT exceeds request bound"));
         }
@@ -766,14 +778,15 @@ impl EmbeddedWallet {
         )
         .map_err(|_| WalletError::Psbt("finalized transaction signatures are invalid"))?;
 
-        Ok(WalletFinalizedTransaction {
+        let response = WalletFinalizedTransaction {
             psbt: psbt.to_string(),
             transaction_hex: serialize(&transaction).to_lower_hex_string(),
             txid: transaction.compute_txid().to_string(),
             wtxid: transaction.compute_wtxid().to_string(),
             fee_sats,
             vbytes,
-        })
+        };
+        Ok((response, transaction))
     }
 
     /// Returns the latest persisted validated-chain checkpoint.
