@@ -1758,6 +1758,15 @@ fn completed_validating_session(options: &Options) -> bool {
     options.fetch_block.is_none() && (options.data_dir.is_some() || options.headers_db.is_some())
 }
 
+async fn negotiate_peer_preferences(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+) -> Result<(), PeerRunError> {
+    timeout(PEER_TIMEOUT, session.prefer_headers_announcements())
+        .await
+        .map_err(|_| PeerRunError::transient("sendheaders negotiation timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))
+}
+
 async fn run_with_peer(
     options: &Options,
     remote: SocketAddr,
@@ -1788,10 +1797,12 @@ async fn run_with_peer(
     .map_err(|error| PeerRunError::p2p(&error))?;
 
     let remote_version = session.remote_version();
+    let remote_services = remote_version.services;
     println!(
         "connected to {}: version={}, height={}, agent={}",
         remote, remote_version.version, remote_version.start_height, remote_version.user_agent
     );
+    negotiate_peer_preferences(&mut session).await?;
 
     if let Some(hash) = options.fetch_block {
         session
@@ -1823,7 +1834,7 @@ async fn run_with_peer(
             .ensure_full_witness_block_relay()
             .map_err(|error| PeerRunError::p2p(&error))?;
         if let Some(store) = peer_store {
-            record_verified_peer(store, remote, remote_version.services);
+            record_verified_peer(store, remote, remote_services);
             discover_peer_addresses(&mut session, store, remote).await;
         }
         if let Some(validation_dir) = &options.complete_assumeutxo {
@@ -2394,6 +2405,12 @@ async fn sync_validating_node(
                     30
                 };
                 tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
+                if background_validation.is_none() {
+                    timeout(PEER_TIMEOUT, session.ping(rand::random()))
+                        .await
+                        .map_err(|_| PeerRunError::transient("peer ping timed out"))?
+                        .map_err(|error| PeerRunError::p2p(&error))?;
+                }
                 headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
                 continue 'resync;
             }
@@ -4227,6 +4244,10 @@ mod tests {
         peer: &mut V1Transport<tokio::net::TcpStream>,
         addresses: Vec<bitcoin::p2p::address::AddrV2Message>,
     ) {
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::SendHeaders
+        ));
         assert!(matches!(
             peer.read_message().await.unwrap().into_payload(),
             NetworkMessage::GetAddr
@@ -6247,6 +6268,10 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendHeaders
+            ));
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);

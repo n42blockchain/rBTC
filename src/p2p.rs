@@ -34,6 +34,7 @@ const MAX_HANDSHAKE_MESSAGES: usize = 8;
 const MAX_RESPONSE_MESSAGES: usize = 32;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
+const SENDHEADERS_VERSION: u32 = 70_012;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
 const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
 /// Maximum inventory entries accepted in `inv`, `getdata`, or `notfound`.
@@ -440,6 +441,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             }
         }
         Err(P2pError::PongResponseIncomplete)
+    }
+
+    /// Requests header announcements instead of unsolicited block inventory.
+    ///
+    /// The node still validates and explicitly downloads every announced
+    /// header/block; this preference only selects the lower-overhead
+    /// headers-first announcement mode defined by BIP130.
+    pub async fn prefer_headers_announcements(&mut self) -> Result<(), P2pError> {
+        if self.remote_version.version < SENDHEADERS_VERSION {
+            return Ok(());
+        }
+        self.transport
+            .write_message(NetworkMessage::SendHeaders)
+            .await
     }
 
     /// Reads the next application message, answering P2P keepalive pings.
@@ -1462,6 +1477,47 @@ mod tests {
             Err(P2pError::PongResponseIncomplete)
         ));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headers_first_announcement_preference_uses_bip130_message() {
+        let (client_stream, server_stream) = duplex(1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = SENDHEADERS_VERSION;
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: remote,
+            };
+            session.prefer_headers_announcements().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendHeaders
+            ));
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let (client_stream, mut server_stream) = duplex(1024);
+        let mut remote = version(1);
+        remote.version = SENDHEADERS_VERSION - 1;
+        let mut session = PeerSession {
+            transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+            remote_version: remote,
+        };
+        session.prefer_headers_announcements().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                server_stream.read_u8()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
