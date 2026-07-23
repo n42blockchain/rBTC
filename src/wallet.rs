@@ -6,6 +6,7 @@
 //! transactional SQLite persister before returning it.
 
 use std::{
+    collections::HashSet,
     path::Path,
     str::FromStr,
     sync::{Mutex, MutexGuard},
@@ -15,9 +16,10 @@ use bdk_wallet::{
     ChangeSet, KeychainKind, PersistedWallet, Update, Wallet, WalletPersister,
     chain::{BlockId, ChainPosition},
     miniscript::{Descriptor, DescriptorPublicKey},
+    psbt::PsbtUtils,
     rusqlite::{Connection, OptionalExtension, params},
 };
-use bitcoin::{Block, BlockHash, Network};
+use bitcoin::{Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, ScriptBuf, Txid};
 use thiserror::Error;
 
 /// BIP44-style default number of consecutive unused scripts to scan.
@@ -26,8 +28,19 @@ pub const DEFAULT_WALLET_GAP_LIMIT: u32 = 20;
 pub const MAX_WALLET_GAP_LIMIT: u32 = 1_000;
 /// Maximum accepted JSON descriptor configuration size.
 pub const MAX_WALLET_DESCRIPTOR_CONFIG_BYTES: usize = 64 * 1024;
+/// Maximum accepted wallet PSBT creation request body.
+pub const MAX_WALLET_PSBT_REQUEST_BYTES: usize = 32 * 1024;
+/// Maximum recipients in one wallet-created PSBT.
+pub const MAX_WALLET_PSBT_RECIPIENTS: usize = 16;
+/// Maximum wallet inputs considered or explicitly selected for one PSBT.
+pub const MAX_WALLET_PSBT_INPUTS: usize = 100;
+/// Maximum accepted fee rate in satoshis per virtual byte.
+pub const MAX_WALLET_PSBT_FEE_RATE: u64 = 1_000;
+const MAX_BITCOIN_MONEY_SATS: u64 = 2_100_000_000_000_000;
+const MAX_WALLET_PSBT_BYTES: usize = 512 * 1024;
 const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
 const NEXT_RECEIVE_INDEX_KEY: &str = "next_receive_index";
+const NEXT_CHANGE_INDEX_KEY: &str = "next_change_index";
 const SCAN_START_HEIGHT_KEY: &str = "scan_start_height";
 const MAX_WALLET_PAGE_OFFSET: u32 = 10_000;
 const MAX_WALLET_PAGE_READ: u32 = 101;
@@ -118,6 +131,67 @@ pub struct WalletPublicDescriptors {
     pub change_descriptor: String,
 }
 
+/// One address/value output requested for an unsigned wallet PSBT.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletPsbtRecipient {
+    /// Network-checked Bitcoin address.
+    pub address: String,
+    /// Output value in satoshis.
+    pub value_sats: u64,
+}
+
+/// One current wallet outpoint selected for exclusive coin control.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletPsbtOutPoint {
+    /// Transaction ID containing the selected output.
+    pub txid: String,
+    /// Output index within the transaction.
+    pub vout: u32,
+}
+
+/// Strict request for a bounded, unsigned PSBT.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletPsbtRequest {
+    /// One to sixteen recipient outputs.
+    pub recipients: Vec<WalletPsbtRecipient>,
+    /// Fee rate from 1 through 1,000 sat/vB.
+    pub fee_rate_sat_vb: u64,
+    /// Optional exclusive wallet-UTXO selection. Empty uses automatic selection.
+    #[serde(default)]
+    pub selected_utxos: Vec<WalletPsbtOutPoint>,
+}
+
+/// Unsigned PSBT created from validated wallet state.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletPsbt {
+    /// Base64 BIP174 PSBT.
+    pub psbt: String,
+    /// Transaction ID of the unsigned transaction.
+    pub unsigned_txid: String,
+    /// Exact input value minus output value.
+    pub fee_sats: u64,
+    /// Number of selected transaction inputs.
+    pub input_count: u32,
+    /// Number of recipient plus optional change outputs.
+    pub output_count: u32,
+}
+
+/// Parses one strict, size-bounded unsigned-PSBT creation request.
+///
+/// Semantic address/network, amount, fee, and coin-control checks run inside
+/// [`EmbeddedWallet::create_psbt`], where the selected wallet network and UTXO
+/// set are available.
+pub fn parse_wallet_psbt_request(input: &[u8]) -> Result<WalletPsbtRequest, WalletError> {
+    if input.len() > MAX_WALLET_PSBT_REQUEST_BYTES {
+        return Err(WalletError::Psbt("request exceeds 32768 bytes"));
+    }
+    serde_json::from_slice(input)
+        .map_err(|_| WalletError::Psbt("expected the documented strict JSON object"))
+}
+
 /// Validated watch-only descriptor configuration loaded by the daemon.
 #[derive(Clone, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +247,9 @@ pub enum WalletError {
     /// A wallet query exceeded its bounded read window.
     #[error("wallet query exceeds bounded page limits")]
     QueryLimit,
+    /// An unsigned PSBT request was invalid or cannot be funded.
+    #[error("wallet PSBT: {0}")]
+    Psbt(&'static str),
     /// The descriptor configuration container is malformed or unbounded.
     #[error("wallet descriptor configuration: {0}")]
     Configuration(&'static str),
@@ -478,6 +555,104 @@ impl EmbeddedWallet {
         }
     }
 
+    /// Creates and persists change derivation for a bounded unsigned PSBT.
+    ///
+    /// A non-empty `selected_utxos` list is exclusive: automatic coin
+    /// selection cannot add other wallet outputs. The PSBT is returned only
+    /// after BDK's change revelation is committed to SQLite.
+    pub fn create_psbt(&self, request: &WalletPsbtRequest) -> Result<WalletPsbt, WalletError> {
+        let recipients = validate_psbt_recipients(self.network, request)?;
+        let selected = validate_psbt_outpoints(request)?;
+        let fee_rate = FeeRate::from_sat_per_vb(request.fee_rate_sat_vb)
+            .filter(|_| (1..=MAX_WALLET_PSBT_FEE_RATE).contains(&request.fee_rate_sat_vb))
+            .ok_or(WalletError::Psbt(
+                "fee rate must be between 1 and 1000 sat/vB",
+            ))?;
+        if self
+            .receive_descriptor
+            .desc_type()
+            .segwit_version()
+            .is_none()
+            || self
+                .change_descriptor
+                .desc_type()
+                .segwit_version()
+                .is_none()
+        {
+            return Err(WalletError::Psbt(
+                "PSBT creation requires SegWit or Taproot wallet descriptors",
+            ));
+        }
+        let mut state = self.state()?;
+        if selected.is_empty()
+            && state
+                .wallet
+                .list_unspent()
+                .take(MAX_WALLET_PSBT_INPUTS + 1)
+                .count()
+                > MAX_WALLET_PSBT_INPUTS
+        {
+            return Err(WalletError::Psbt(
+                "automatic coin selection exceeds the 100-input wallet bound",
+            ));
+        }
+        let psbt = {
+            let WalletState { wallet, database } = &mut *state;
+            let change_index = reserve_change_index(database)?;
+            wallet
+                .reveal_addresses_to(KeychainKind::Internal, change_index)
+                .for_each(drop);
+            let change_script = wallet
+                .peek_address(KeychainKind::Internal, change_index)
+                .address
+                .script_pubkey();
+            wallet.persist(database)?;
+            let mut builder = wallet.build_tx();
+            builder.fee_rate(fee_rate);
+            builder.drain_to(change_script);
+            builder.only_witness_utxo();
+            for (script, amount) in recipients {
+                builder.add_recipient(script, amount);
+            }
+            if !selected.is_empty() {
+                builder.add_utxos(&selected).map_err(|_| {
+                    WalletError::Psbt("selected UTXO is not a current wallet output")
+                })?;
+                builder.manually_selected_only();
+            }
+            builder.finish().map_err(|_| {
+                WalletError::Psbt("transaction cannot be funded under the requested policy")
+            })?
+        };
+        if psbt.inputs.len() > MAX_WALLET_PSBT_INPUTS
+            || psbt.serialize().len() > MAX_WALLET_PSBT_BYTES
+            || psbt.inputs.iter().any(|input| {
+                !input.partial_sigs.is_empty()
+                    || input.final_script_sig.is_some()
+                    || input.final_script_witness.is_some()
+            })
+        {
+            return Err(WalletError::Psbt(
+                "constructed PSBT exceeds bounds or is not unsigned",
+            ));
+        }
+        let WalletState { wallet, database } = &mut *state;
+        wallet.persist(database)?;
+        let fee_sats = psbt
+            .fee_amount()
+            .ok_or(WalletError::Psbt(
+                "constructed PSBT is missing input values",
+            ))?
+            .to_sat();
+        Ok(WalletPsbt {
+            psbt: psbt.to_string(),
+            unsigned_txid: psbt.unsigned_tx.compute_txid().to_string(),
+            fee_sats,
+            input_count: u32::try_from(psbt.inputs.len()).expect("PSBT input bound fits u32"),
+            output_count: u32::try_from(psbt.outputs.len()).expect("PSBT output bound fits u32"),
+        })
+    }
+
     /// Returns the latest persisted validated-chain checkpoint.
     pub fn chain_tip(&self) -> Result<WalletTip, WalletError> {
         let state = self.state()?;
@@ -567,6 +742,73 @@ impl EmbeddedWallet {
     }
 }
 
+fn validate_psbt_recipients(
+    network: Network,
+    request: &WalletPsbtRequest,
+) -> Result<Vec<(ScriptBuf, Amount)>, WalletError> {
+    if !(1..=MAX_WALLET_PSBT_RECIPIENTS).contains(&request.recipients.len()) {
+        return Err(WalletError::Psbt(
+            "recipient count must be between 1 and 16",
+        ));
+    }
+    let mut total = 0_u64;
+    request
+        .recipients
+        .iter()
+        .map(|recipient| {
+            if recipient.address.len() > 128
+                || recipient.value_sats == 0
+                || recipient.value_sats > MAX_BITCOIN_MONEY_SATS
+            {
+                return Err(WalletError::Psbt("recipient address or value is invalid"));
+            }
+            total = total
+                .checked_add(recipient.value_sats)
+                .filter(|total| *total <= MAX_BITCOIN_MONEY_SATS)
+                .ok_or(WalletError::Psbt("recipient total exceeds MoneyRange"))?;
+            let address = Address::from_str(&recipient.address)
+                .ok()
+                .and_then(|address| address.require_network(network).ok())
+                .ok_or(WalletError::Psbt(
+                    "recipient address is invalid for the wallet network",
+                ))?;
+            Ok((
+                address.script_pubkey(),
+                Amount::from_sat(recipient.value_sats),
+            ))
+        })
+        .collect()
+}
+
+fn validate_psbt_outpoints(request: &WalletPsbtRequest) -> Result<Vec<OutPoint>, WalletError> {
+    if request.selected_utxos.len() > MAX_WALLET_PSBT_INPUTS {
+        return Err(WalletError::Psbt(
+            "selected UTXO count exceeds the 100-input bound",
+        ));
+    }
+    let mut unique = HashSet::with_capacity(request.selected_utxos.len());
+    request
+        .selected_utxos
+        .iter()
+        .map(|selected| {
+            if selected.txid.len() != 64
+                || !selected.txid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(WalletError::Psbt("selected UTXO outpoint is invalid"));
+            }
+            let outpoint = OutPoint {
+                txid: Txid::from_str(&selected.txid)
+                    .map_err(|_| WalletError::Psbt("selected UTXO outpoint is invalid"))?,
+                vout: selected.vout,
+            };
+            if !unique.insert(outpoint) {
+                return Err(WalletError::Psbt("selected UTXOs must be unique"));
+            }
+            Ok(outpoint)
+        })
+        .collect()
+}
+
 fn wallet_tip(block: BlockId) -> WalletTip {
     WalletTip {
         height: block.height,
@@ -599,43 +841,60 @@ fn initialize_metadata(
             value INTEGER NOT NULL CHECK (value >= 0)
         );",
     )?;
-    let existing = database
-        .query_row(
-            "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
-            params![NEXT_RECEIVE_INDEX_KEY],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if existing.is_none() {
-        let next = wallet
-            .spk_index()
-            .last_revealed_index(KeychainKind::External)
-            .map_or(0, |index| index.saturating_add(1));
-        database.execute(
-            "INSERT INTO rbtc_wallet_metadata (key, value) VALUES (?1, ?2)",
-            params![NEXT_RECEIVE_INDEX_KEY, i64::from(next)],
-        )?;
+    for (key, keychain) in [
+        (NEXT_RECEIVE_INDEX_KEY, KeychainKind::External),
+        (NEXT_CHANGE_INDEX_KEY, KeychainKind::Internal),
+    ] {
+        let existing = database
+            .query_row(
+                "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if existing.is_none() {
+            let next = wallet
+                .spk_index()
+                .last_revealed_index(keychain)
+                .map_or(0, |index| index.saturating_add(1));
+            database.execute(
+                "INSERT INTO rbtc_wallet_metadata (key, value) VALUES (?1, ?2)",
+                params![key, i64::from(next)],
+            )?;
+        }
     }
     Ok(())
 }
 
 fn reserve_receive_index(database: &mut Connection) -> Result<u32, WalletError> {
+    reserve_derivation_index(database, NEXT_RECEIVE_INDEX_KEY, "receive")
+}
+
+fn reserve_change_index(database: &mut Connection) -> Result<u32, WalletError> {
+    reserve_derivation_index(database, NEXT_CHANGE_INDEX_KEY, "change")
+}
+
+fn reserve_derivation_index(
+    database: &mut Connection,
+    key: &str,
+    label: &'static str,
+) -> Result<u32, WalletError> {
     let transaction = database.transaction()?;
     let raw = transaction.query_row(
         "SELECT value FROM rbtc_wallet_metadata WHERE key = ?1",
-        params![NEXT_RECEIVE_INDEX_KEY],
+        params![key],
         |row| row.get::<_, i64>(0),
     )?;
     let index = u32::try_from(raw)
         .ok()
         .filter(|index| *index <= MAX_DERIVATION_INDEX)
-        .ok_or_else(|| WalletError::Chain("receive derivation index exhausted".to_owned()))?;
+        .ok_or_else(|| WalletError::Chain(format!("{label} derivation index exhausted")))?;
     let next = index
         .checked_add(1)
-        .ok_or_else(|| WalletError::Chain("receive derivation index exhausted".to_owned()))?;
+        .ok_or_else(|| WalletError::Chain(format!("{label} derivation index exhausted")))?;
     transaction.execute(
         "UPDATE rbtc_wallet_metadata SET value = ?1 WHERE key = ?2",
-        params![i64::from(next), NEXT_RECEIVE_INDEX_KEY],
+        params![i64::from(next), key],
     )?;
     transaction.commit()?;
     Ok(index)
@@ -707,7 +966,7 @@ mod tests {
     use std::collections::HashSet;
 
     use bitcoin::{
-        Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
         absolute::LockTime, blockdata::constants::genesis_block, hashes::Hash,
         transaction::Version,
     };
@@ -1087,6 +1346,231 @@ mod tests {
         assert_eq!(imported.gap_limit, DEFAULT_WALLET_GAP_LIMIT);
         assert_eq!(imported.birthday_height, 0);
         assert!(!String::from_utf8(encoded).unwrap().contains("prv"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unsigned_psbt_coin_control_persists_unique_change_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("wallet.sqlite");
+        let (request, selected_outpoint, recipient_script) = {
+            let wallet = EmbeddedWallet::open_or_create(
+                &database,
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap();
+            let funded = wallet.reveal_receive_address().unwrap();
+            let block = paying_block(
+                genesis_block(Network::Testnet).block_hash(),
+                &funded.address,
+                100_000,
+            );
+            wallet.apply_validated_block(&block, 1).unwrap();
+            wallet
+                .advance_checkpoint(WalletTip {
+                    height: 101,
+                    hash: BlockHash::from_byte_array([9; 32]),
+                })
+                .unwrap();
+            let recipient = wallet.reveal_receive_address().unwrap();
+            let recipient_script = Address::from_str(&recipient.address)
+                .unwrap()
+                .require_network(Network::Testnet)
+                .unwrap()
+                .script_pubkey();
+            let selected = wallet.utxos(0, 1).unwrap().remove(0);
+            (
+                WalletPsbtRequest {
+                    recipients: vec![WalletPsbtRecipient {
+                        address: recipient.address,
+                        value_sats: 50_000,
+                    }],
+                    fee_rate_sat_vb: 2,
+                    selected_utxos: Vec::new(),
+                },
+                WalletPsbtOutPoint {
+                    txid: selected.txid,
+                    vout: selected.vout,
+                },
+                recipient_script,
+            )
+        };
+
+        let first = EmbeddedWallet::open_or_create(
+            &database,
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap()
+        .create_psbt(&request)
+        .unwrap();
+        let first_psbt = Psbt::from_str(&first.psbt).unwrap();
+        assert_eq!(
+            first.unsigned_txid,
+            first_psbt.unsigned_tx.compute_txid().to_string()
+        );
+        assert_eq!(first.input_count, 1);
+        assert_eq!(first.output_count, 2);
+        assert!(first.fee_sats > 0);
+        assert!(
+            first_psbt
+                .inputs
+                .iter()
+                .all(|input| input.partial_sigs.is_empty()
+                    && input.final_script_sig.is_none()
+                    && input.final_script_witness.is_none()
+                    && input.witness_utxo.is_some()
+                    && input.non_witness_utxo.is_none())
+        );
+        let first_change = first_psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .find(|output| output.script_pubkey != recipient_script)
+            .unwrap()
+            .script_pubkey
+            .clone();
+        drop(first_psbt);
+
+        let mut selected_request = request.clone();
+        selected_request.selected_utxos.push(selected_outpoint);
+        let second = EmbeddedWallet::open_or_create(
+            &database,
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap()
+        .create_psbt(&selected_request)
+        .unwrap();
+        let second_psbt = Psbt::from_str(&second.psbt).unwrap();
+        let second_change = second_psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .find(|output| output.script_pubkey != recipient_script)
+            .unwrap()
+            .script_pubkey
+            .clone();
+        assert_ne!(first_change, second_change);
+    }
+
+    #[test]
+    fn unsigned_psbt_rejects_unbounded_invalid_and_unknown_coin_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = EmbeddedWallet::open_or_create(
+            directory.path().join("wallet.sqlite"),
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap();
+        let recipient = wallet.reveal_receive_address().unwrap();
+        let mut request = WalletPsbtRequest {
+            recipients: vec![WalletPsbtRecipient {
+                address: recipient.address,
+                value_sats: 1,
+            }],
+            fee_rate_sat_vb: 0,
+            selected_utxos: Vec::new(),
+        };
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "fee rate must be between 1 and 1000 sat/vB"
+            ))
+        ));
+        request.fee_rate_sat_vb = 1;
+        request.recipients.clear();
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "recipient count must be between 1 and 16"
+            ))
+        ));
+        request.recipients.push(WalletPsbtRecipient {
+            address: "1BitcoinEaterAddressDontSendf59kuE".to_owned(),
+            value_sats: 1,
+        });
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "recipient address is invalid for the wallet network"
+            ))
+        ));
+        request.recipients[0].address = wallet.reveal_receive_address().unwrap().address;
+        request.selected_utxos = vec![WalletPsbtOutPoint {
+            txid: Txid::all_zeros().to_string(),
+            vout: 0,
+        }];
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "selected UTXO is not a current wallet output"
+            ))
+        ));
+
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(parse_wallet_psbt_request(&encoded).unwrap(), request);
+        assert!(
+            parse_wallet_psbt_request(br#"{"recipients":[],"fee_rate_sat_vb":1,"unknown":true}"#)
+                .is_err()
+        );
+        assert!(parse_wallet_psbt_request(&vec![b' '; MAX_WALLET_PSBT_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn unsigned_psbt_rejects_legacy_descriptors_before_coin_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let receive = RECEIVE_DESCRIPTOR
+            .split_once('#')
+            .map_or(RECEIVE_DESCRIPTOR, |(descriptor, _)| descriptor)
+            .replacen("wpkh(", "pkh(", 1);
+        let change = CHANGE_DESCRIPTOR
+            .split_once('#')
+            .map_or(CHANGE_DESCRIPTOR, |(descriptor, _)| descriptor)
+            .replacen("wpkh(", "pkh(", 1);
+        let wallet = EmbeddedWallet::open_or_create(
+            directory.path().join("wallet.sqlite"),
+            receive,
+            change,
+            Network::Testnet,
+        )
+        .unwrap();
+        let recipient = wallet.reveal_receive_address().unwrap();
+        let request = WalletPsbtRequest {
+            recipients: vec![WalletPsbtRecipient {
+                address: recipient.address,
+                value_sats: 50_000,
+            }],
+            fee_rate_sat_vb: 2,
+            selected_utxos: Vec::new(),
+        };
+
+        assert!(matches!(
+            wallet.create_psbt(&request),
+            Err(WalletError::Psbt(
+                "PSBT creation requires SegWit or Taproot wallet descriptors"
+            ))
+        ));
+    }
+
+    #[test]
+    fn strict_wallet_psbt_request_parser_is_bounded() {
+        let request = parse_wallet_psbt_request(
+            br#"{"recipients":[{"address":"tb1qexample","value_sats":50000}],"fee_rate_sat_vb":2}"#,
+        )
+        .unwrap();
+        assert_eq!(request.recipients.len(), 1);
+        assert!(request.selected_utxos.is_empty());
+        assert!(
+            parse_wallet_psbt_request(br#"{"recipients":[],"fee_rate_sat_vb":1,"unknown":true}"#)
+                .is_err()
+        );
+        assert!(parse_wallet_psbt_request(&vec![b' '; MAX_WALLET_PSBT_REQUEST_BYTES + 1]).is_err());
     }
 
     #[test]

@@ -87,6 +87,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "wallet_psbt"
+path = "fuzz_targets/wallet_psbt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "persisted_metadata"
 path = "fuzz_targets/persisted_metadata.rs"
 test = false

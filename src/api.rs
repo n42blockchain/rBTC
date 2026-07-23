@@ -32,8 +32,9 @@ use tokio_stream::{
 };
 
 use crate::wallet::{
-    EmbeddedWallet, WalletAddress, WalletBalance, WalletPublicDescriptors, WalletStatus,
-    WalletTransaction, WalletUtxo,
+    EmbeddedWallet, MAX_WALLET_PSBT_REQUEST_BYTES, WalletAddress, WalletBalance, WalletError,
+    WalletPsbt, WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
+    parse_wallet_psbt_request,
 };
 
 /// Explorer block summary returned by the embedded API.
@@ -173,6 +174,7 @@ struct LocalRouteSecurity {
 struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
     address_limiter: Mutex<AddressRateLimiter>,
+    psbt_limiter: Mutex<AddressRateLimiter>,
 }
 
 struct AddressRateLimiter {
@@ -981,6 +983,7 @@ pub fn wallet_router(
     let state = Arc::new(WalletApiState {
         wallet,
         address_limiter: Mutex::new(AddressRateLimiter::new()),
+        psbt_limiter: Mutex::new(AddressRateLimiter::new()),
     });
     Router::new()
         .route("/api/v1/wallet/status", get(wallet_status))
@@ -989,7 +992,9 @@ pub fn wallet_router(
         .route("/api/v1/wallet/transactions", get(wallet_transactions))
         .route("/api/v1/wallet/utxos", get(wallet_utxos))
         .route("/api/v1/wallet/address", post(next_address))
+        .route("/api/v1/wallet/psbt", post(create_wallet_psbt))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_WALLET_PSBT_REQUEST_BYTES))
         .route_layer(middleware::from_fn_with_state(
             LocalRouteSecurity { token, audit },
             require_local_auth,
@@ -1112,6 +1117,28 @@ async fn wallet_descriptors(
     State(state): State<Arc<WalletApiState>>,
 ) -> Json<WalletPublicDescriptors> {
     Json(state.wallet.public_descriptors())
+}
+async fn create_wallet_psbt(
+    State(state): State<Arc<WalletApiState>>,
+    body: Bytes,
+) -> ApiResult<WalletPsbt> {
+    let request = parse_wallet_psbt_request(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let allowed = state
+        .psbt_limiter
+        .lock()
+        .map_err(internal)?
+        .take(Instant::now());
+    if !allowed {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state
+        .wallet
+        .create_psbt(&request)
+        .map_err(|error| match error {
+            WalletError::Psbt(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })
+        .map(Json)
 }
 async fn wallet_transactions(
     State(state): State<Arc<WalletApiState>>,
@@ -1564,6 +1591,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn wallet_routes_require_bearer_authentication() {
         let directory = tempfile::tempdir().unwrap();
         let wallet = Arc::new(
@@ -1624,6 +1652,46 @@ mod tests {
         let utxos: WalletUtxoPage = serde_json::from_slice(&body).unwrap();
         assert!(utxos.utxos.is_empty());
         assert!(!utxos.has_more);
+
+        let unfunded = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"recipients":[],"fee_rate_sat_vb":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unfunded.status(), StatusCode::BAD_REQUEST);
+        let unknown_field = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"recipients":[],"fee_rate_sat_vb":1,"unknown":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_field.status(), StatusCode::BAD_REQUEST);
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/wallet/psbt")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b' '; MAX_WALLET_PSBT_REQUEST_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
         let address = app
             .clone()
             .oneshot(

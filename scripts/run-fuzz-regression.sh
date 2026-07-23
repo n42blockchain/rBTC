@@ -29,5 +29,7 @@ cargo +nightly fuzz run wallet_auth fuzz/corpus/wallet_auth -- \
     -runs="$runs" -max_len=4096
 cargo +nightly fuzz run wallet_descriptor fuzz/corpus/wallet_descriptor -- \
     -runs="$runs" -max_len=131072
+cargo +nightly fuzz run wallet_psbt fuzz/corpus/wallet_psbt -- \
+    -runs="$runs" -max_len=32769
 cargo +nightly fuzz run persisted_metadata fuzz/corpus/persisted_metadata -- \
     -runs="$runs" -max_len=8193
