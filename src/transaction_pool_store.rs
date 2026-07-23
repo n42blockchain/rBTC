@@ -5,6 +5,7 @@ use std::{
     fs,
     path::Path,
     sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bitcoin::{
@@ -23,6 +24,7 @@ const GENESIS_KEY: &str = "genesis";
 const SNAPSHOT_KEY: &str = "active";
 const DISCONNECTED_KEY: &str = "disconnected";
 const RELAY_ATTEMPTS_KEY: &str = "relay_attempts";
+const ADMISSION_TIMES_KEY: &str = "admission_times";
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
 const MAX_SNAPSHOT_BYTES: usize =
@@ -32,6 +34,14 @@ const RELAY_ATTEMPTS_HEADER_BYTES: usize = 5;
 const RELAY_ATTEMPT_BYTES: usize = 36;
 const MAX_RELAY_ATTEMPTS_BYTES: usize =
     RELAY_ATTEMPTS_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * RELAY_ATTEMPT_BYTES;
+const ADMISSION_TIMES_VERSION: u8 = 1;
+const ADMISSION_TIMES_HEADER_BYTES: usize = 5;
+const ADMISSION_TIME_BYTES: usize = 36;
+const MAX_ADMISSION_TIMES_BYTES: usize =
+    ADMISSION_TIMES_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * ADMISSION_TIME_BYTES;
+
+/// Bitcoin Core's default 336-hour mempool expiry.
+pub const DEFAULT_MEMPOOL_EXPIRY_SECS: u32 = 14 * 24 * 60 * 60;
 
 /// Durable transaction-pool failures.
 #[derive(Debug, Error)]
@@ -54,6 +64,9 @@ pub enum TransactionPoolStoreError {
     /// Filesystem safety validation failed.
     #[error("transaction-pool file: {0}")]
     File(String),
+    /// The system wall clock cannot be represented by the persisted format.
+    #[error("transaction-pool clock: {0}")]
+    Time(String),
     /// The database belongs to another network.
     #[error("transaction-pool database belongs to another Bitcoin network")]
     NetworkMismatch,
@@ -84,11 +97,27 @@ pub fn validate_persisted_transaction_relay_attempts(
     decode_relay_attempts(bytes).map(|_| ())
 }
 
+/// Validates raw persisted transaction admission times without opening a database.
+pub fn validate_persisted_transaction_admission_times(
+    bytes: &[u8],
+) -> Result<(), TransactionPoolStoreError> {
+    decode_admission_times(bytes).map(|_| ())
+}
+
 impl RedbTransactionPoolStore {
     /// Opens or creates an owner-only store and validates the persisted snapshot.
     pub fn open(
         path: impl AsRef<Path>,
         network: Network,
+    ) -> Result<Self, TransactionPoolStoreError> {
+        Self::open_at(path, network, current_unix_time()?)
+    }
+
+    /// Opens a store using an explicit wall-clock time for deterministic migration.
+    pub fn open_at(
+        path: impl AsRef<Path>,
+        network: Network,
+        now: u32,
     ) -> Result<Self, TransactionPoolStoreError> {
         let path = path.as_ref();
         validate_file_before_open(path)?;
@@ -136,6 +165,22 @@ impl RedbTransactionPoolStore {
                 let empty = encode_relay_attempts(&BTreeMap::new())?;
                 snapshots.insert(RELAY_ATTEMPTS_KEY, empty.as_slice())?;
             }
+            if let Some(times) = snapshots.get(ADMISSION_TIMES_KEY)? {
+                let times = decode_admission_times(times.value())?;
+                if times.keys().copied().collect::<HashSet<_>>() != active {
+                    return Err(TransactionPoolStoreError::Malformed(
+                        "admission times do not match active transactions",
+                    ));
+                }
+            } else {
+                let migrated = active
+                    .iter()
+                    .copied()
+                    .map(|txid| (txid, now))
+                    .collect::<BTreeMap<_, _>>();
+                let migrated = encode_admission_times(&migrated)?;
+                snapshots.insert(ADMISSION_TIMES_KEY, migrated.as_slice())?;
+            }
         }
         write.commit()?;
         Ok(Self {
@@ -170,8 +215,17 @@ impl RedbTransactionPoolStore {
 
     /// Atomically replaces the durable snapshot after validating every invariant.
     pub fn replace(&self, transactions: &[Transaction]) -> Result<(), TransactionPoolStoreError> {
+        self.replace_at(transactions, current_unix_time()?)
+    }
+
+    /// Atomically replaces the durable snapshot while preserving first-admission times.
+    pub fn replace_at(
+        &self,
+        transactions: &[Transaction],
+        now: u32,
+    ) -> Result<(), TransactionPoolStoreError> {
         let encoded = encode_snapshot(transactions)?;
-        self.replace_active_encoded(&encoded, transactions)
+        self.replace_active_encoded(&encoded, transactions, now, &BTreeSet::new())
     }
 
     /// Atomically replaces the bounded disconnected-block candidate snapshot.
@@ -205,6 +259,8 @@ impl RedbTransactionPoolStore {
         &self,
         encoded: &[u8],
         transactions: &[Transaction],
+        now: u32,
+        reset_admission_times: &BTreeSet<Txid>,
     ) -> Result<(), TransactionPoolStoreError> {
         let _guard = self
             .write_guard
@@ -225,8 +281,24 @@ impl RedbTransactionPoolStore {
                 .collect::<HashSet<_>>();
             attempts.retain(|txid, _| active.contains(txid));
             let attempts = encode_relay_attempts(&attempts)?;
+            let mut admission_times = {
+                let stored = snapshots.get(ADMISSION_TIMES_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction admission times"),
+                )?;
+                decode_admission_times(stored.value())?
+            };
+            admission_times.retain(|txid, _| active.contains(txid));
+            for txid in &active {
+                if reset_admission_times.contains(txid) {
+                    admission_times.insert(*txid, now);
+                } else {
+                    admission_times.entry(*txid).or_insert(now);
+                }
+            }
+            let admission_times = encode_admission_times(&admission_times)?;
             snapshots.insert(SNAPSHOT_KEY, encoded)?;
             snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
+            snapshots.insert(ADMISSION_TIMES_KEY, admission_times.as_slice())?;
         }
         write.commit()?;
         Ok(())
@@ -237,9 +309,25 @@ impl RedbTransactionPoolStore {
         &self,
         transactions: &[Transaction],
     ) -> Result<(), TransactionPoolStoreError> {
+        self.replace_and_clear_disconnected_at(transactions, current_unix_time()?, &BTreeSet::new())
+    }
+
+    /// Atomically publishes the pool, clears recovery rows, and resets selected admission times.
+    pub fn replace_and_clear_disconnected_at(
+        &self,
+        transactions: &[Transaction],
+        now: u32,
+        reset_admission_times: &BTreeSet<Txid>,
+    ) -> Result<(), TransactionPoolStoreError> {
         let encoded = encode_snapshot(transactions)?;
         let empty = encode_snapshot(&[])?;
-        self.replace_active_and_disconnected_encoded(&encoded, &empty, transactions)
+        self.replace_active_and_disconnected_encoded(
+            &encoded,
+            &empty,
+            transactions,
+            now,
+            reset_admission_times,
+        )
     }
 
     fn replace_active_and_disconnected_encoded(
@@ -247,6 +335,8 @@ impl RedbTransactionPoolStore {
         active_encoded: &[u8],
         disconnected_encoded: &[u8],
         transactions: &[Transaction],
+        now: u32,
+        reset_admission_times: &BTreeSet<Txid>,
     ) -> Result<(), TransactionPoolStoreError> {
         let _guard = self
             .write_guard
@@ -267,9 +357,25 @@ impl RedbTransactionPoolStore {
                 .collect::<HashSet<_>>();
             attempts.retain(|txid, _| active.contains(txid));
             let attempts = encode_relay_attempts(&attempts)?;
+            let mut admission_times = {
+                let stored = snapshots.get(ADMISSION_TIMES_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction admission times"),
+                )?;
+                decode_admission_times(stored.value())?
+            };
+            admission_times.retain(|txid, _| active.contains(txid));
+            for txid in &active {
+                if reset_admission_times.contains(txid) {
+                    admission_times.insert(*txid, now);
+                } else {
+                    admission_times.entry(*txid).or_insert(now);
+                }
+            }
+            let admission_times = encode_admission_times(&admission_times)?;
             snapshots.insert(SNAPSHOT_KEY, active_encoded)?;
             snapshots.insert(DISCONNECTED_KEY, disconnected_encoded)?;
             snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
+            snapshots.insert(ADMISSION_TIMES_KEY, admission_times.as_slice())?;
         }
         write.commit()?;
         Ok(())
@@ -308,6 +414,46 @@ impl RedbTransactionPoolStore {
                     .is_none_or(|attempt| now.saturating_sub(*attempt) >= interval_secs)
             })
             .take(limit.min(MAX_ADMITTED_TRANSACTIONS))
+            .collect())
+    }
+
+    /// Returns active transaction IDs older than the configured persisted lifetime.
+    pub fn expired_txids(
+        &self,
+        now: u32,
+        expiry_secs: u32,
+    ) -> Result<BTreeSet<Txid>, TransactionPoolStoreError> {
+        let read = self.db.begin_read()?;
+        let snapshots = read.open_table(SNAPSHOTS)?;
+        let active = decode_snapshot(
+            snapshots
+                .get(SNAPSHOT_KEY)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction-pool snapshot",
+                ))?
+                .value(),
+        )?
+        .into_iter()
+        .map(|transaction| transaction.compute_txid())
+        .collect::<BTreeSet<_>>();
+        let admission_times = decode_admission_times(
+            snapshots
+                .get(ADMISSION_TIMES_KEY)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction admission times",
+                ))?
+                .value(),
+        )?;
+        if admission_times.keys().copied().collect::<BTreeSet<_>>() != active {
+            return Err(TransactionPoolStoreError::Malformed(
+                "admission times do not match active transactions",
+            ));
+        }
+        Ok(admission_times
+            .into_iter()
+            .filter_map(|(txid, admitted_at)| {
+                (now.saturating_sub(admitted_at) > expiry_secs).then_some(txid)
+            })
             .collect())
     }
 
@@ -597,6 +743,85 @@ fn decode_relay_attempts(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, Transactio
     Ok(attempts)
 }
 
+fn encode_admission_times(
+    admission_times: &BTreeMap<Txid, u32>,
+) -> Result<Vec<u8>, TransactionPoolStoreError> {
+    if admission_times.len() > MAX_ADMITTED_TRANSACTIONS {
+        return Err(TransactionPoolStoreError::Malformed(
+            "too many transaction admission times",
+        ));
+    }
+    let count = u32::try_from(admission_times.len())
+        .map_err(|_| TransactionPoolStoreError::Malformed("admission time count overflow"))?;
+    let mut encoded = Vec::with_capacity(
+        ADMISSION_TIMES_HEADER_BYTES + admission_times.len() * ADMISSION_TIME_BYTES,
+    );
+    encoded.push(ADMISSION_TIMES_VERSION);
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for (txid, admitted_at) in admission_times {
+        encoded.extend_from_slice(&txid.to_byte_array());
+        encoded.extend_from_slice(&admitted_at.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+fn decode_admission_times(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
+    if bytes.len() < ADMISSION_TIMES_HEADER_BYTES || bytes.len() > MAX_ADMISSION_TIMES_BYTES {
+        return Err(TransactionPoolStoreError::Malformed(
+            "invalid transaction admission times length",
+        ));
+    }
+    if bytes[0] != ADMISSION_TIMES_VERSION {
+        return Err(TransactionPoolStoreError::Malformed(
+            "unsupported transaction admission times version",
+        ));
+    }
+    let count = usize::try_from(u32::from_le_bytes(
+        bytes[1..ADMISSION_TIMES_HEADER_BYTES]
+            .try_into()
+            .expect("admission times header has exact length"),
+    ))
+    .map_err(|_| TransactionPoolStoreError::Malformed("admission time count overflow"))?;
+    if count > MAX_ADMITTED_TRANSACTIONS
+        || bytes.len() != ADMISSION_TIMES_HEADER_BYTES + count * ADMISSION_TIME_BYTES
+    {
+        return Err(TransactionPoolStoreError::Malformed(
+            "invalid transaction admission time count",
+        ));
+    }
+    let mut admission_times = BTreeMap::new();
+    let mut cursor = ADMISSION_TIMES_HEADER_BYTES;
+    for _ in 0..count {
+        let txid = Txid::from_byte_array(
+            bytes[cursor..cursor + 32]
+                .try_into()
+                .expect("admission txid has exact length"),
+        );
+        cursor += 32;
+        let admitted_at = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .expect("admission timestamp has exact length"),
+        );
+        cursor += 4;
+        if admission_times.insert(txid, admitted_at).is_some() {
+            return Err(TransactionPoolStoreError::Malformed(
+                "duplicate transaction admission time",
+            ));
+        }
+    }
+    Ok(admission_times)
+}
+
+fn current_unix_time() -> Result<u32, TransactionPoolStoreError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| TransactionPoolStoreError::Time(error.to_string()))?
+        .as_secs();
+    u32::try_from(seconds)
+        .map_err(|_| TransactionPoolStoreError::Time("Unix time exceeds u32".to_owned()))
+}
+
 fn genesis_hash(network: Network) -> [u8; 32] {
     bitcoin::blockdata::constants::genesis_block(network)
         .block_hash()
@@ -778,6 +1003,203 @@ mod tests {
             ))
         ));
         assert!(reopened.due_relay(102, interval, 64).unwrap().is_empty());
+    }
+
+    #[test]
+    fn admission_times_persist_expire_reset_and_prune_with_the_pool() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        let first = transaction(41);
+        let second = transaction(42);
+        let third = transaction(43);
+        let first_txid = first.compute_txid();
+        let second_txid = second.compute_txid();
+        let third_txid = third.compute_txid();
+        {
+            let store = RedbTransactionPoolStore::open_at(&path, Network::Regtest, 100).unwrap();
+            store.replace_at(&[first, second.clone()], 100).unwrap();
+            assert!(
+                store
+                    .expired_txids(
+                        100 + DEFAULT_MEMPOOL_EXPIRY_SECS - 1,
+                        DEFAULT_MEMPOOL_EXPIRY_SECS
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .expired_txids(
+                        100 + DEFAULT_MEMPOOL_EXPIRY_SECS,
+                        DEFAULT_MEMPOOL_EXPIRY_SECS
+                    )
+                    .unwrap(),
+                BTreeSet::new()
+            );
+            assert_eq!(
+                store
+                    .expired_txids(
+                        100 + DEFAULT_MEMPOOL_EXPIRY_SECS + 1,
+                        DEFAULT_MEMPOOL_EXPIRY_SECS
+                    )
+                    .unwrap(),
+                BTreeSet::from([first_txid, second_txid])
+            );
+            store
+                .replace_at(&[second.clone(), third.clone()], 200)
+                .unwrap();
+            assert_eq!(
+                store
+                    .expired_txids(
+                        100 + DEFAULT_MEMPOOL_EXPIRY_SECS,
+                        DEFAULT_MEMPOOL_EXPIRY_SECS
+                    )
+                    .unwrap(),
+                BTreeSet::new()
+            );
+            assert_eq!(
+                store
+                    .expired_txids(
+                        100 + DEFAULT_MEMPOOL_EXPIRY_SECS + 1,
+                        DEFAULT_MEMPOOL_EXPIRY_SECS
+                    )
+                    .unwrap(),
+                BTreeSet::from([second_txid])
+            );
+        }
+
+        let now = 100 + DEFAULT_MEMPOOL_EXPIRY_SECS;
+        let reopened = RedbTransactionPoolStore::open_at(&path, Network::Regtest, now).unwrap();
+        reopened
+            .replace_and_clear_disconnected_at(
+                &[second, third],
+                now,
+                &BTreeSet::from([second_txid]),
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .expired_txids(now, DEFAULT_MEMPOOL_EXPIRY_SECS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .expired_txids(
+                    200 + DEFAULT_MEMPOOL_EXPIRY_SECS,
+                    DEFAULT_MEMPOOL_EXPIRY_SECS
+                )
+                .unwrap(),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            reopened
+                .expired_txids(
+                    200 + DEFAULT_MEMPOOL_EXPIRY_SECS + 1,
+                    DEFAULT_MEMPOOL_EXPIRY_SECS
+                )
+                .unwrap(),
+            BTreeSet::from([third_txid])
+        );
+    }
+
+    #[test]
+    fn legacy_store_without_admission_times_migrates_active_entries_as_new() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        let transaction = transaction(44);
+        let txid = transaction.compute_txid();
+        {
+            let store = RedbTransactionPoolStore::open_at(&path, Network::Regtest, 100).unwrap();
+            store.replace_at(&[transaction], 100).unwrap();
+        }
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
+                snapshots.remove(ADMISSION_TIMES_KEY).unwrap();
+            }
+            write.commit().unwrap();
+        }
+
+        let migrated = RedbTransactionPoolStore::open_at(&path, Network::Regtest, 500).unwrap();
+        assert!(
+            migrated
+                .expired_txids(
+                    500 + DEFAULT_MEMPOOL_EXPIRY_SECS - 1,
+                    DEFAULT_MEMPOOL_EXPIRY_SECS
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            migrated
+                .expired_txids(
+                    500 + DEFAULT_MEMPOOL_EXPIRY_SECS,
+                    DEFAULT_MEMPOOL_EXPIRY_SECS
+                )
+                .unwrap(),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            migrated
+                .expired_txids(
+                    500 + DEFAULT_MEMPOOL_EXPIRY_SECS + 1,
+                    DEFAULT_MEMPOOL_EXPIRY_SECS
+                )
+                .unwrap(),
+            BTreeSet::from([txid])
+        );
+    }
+
+    #[test]
+    fn admission_times_parser_rejects_duplicates_and_bad_lengths() {
+        let txid = transaction(45).compute_txid();
+        let valid = encode_admission_times(&BTreeMap::from([(txid, 1)])).unwrap();
+        assert_eq!(decode_admission_times(&valid).unwrap()[&txid], 1);
+        assert!(decode_admission_times(&valid[..valid.len() - 1]).is_err());
+        let mut duplicate = valid.clone();
+        duplicate[1..5].copy_from_slice(&2_u32.to_le_bytes());
+        duplicate.extend_from_slice(&txid.to_byte_array());
+        duplicate.extend_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            decode_admission_times(&duplicate),
+            Err(TransactionPoolStoreError::Malformed(
+                "duplicate transaction admission time"
+            ))
+        ));
+    }
+
+    #[test]
+    fn admission_times_must_exactly_match_active_pool_without_rewrite() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        {
+            let store = RedbTransactionPoolStore::open_at(&path, Network::Regtest, 100).unwrap();
+            store.replace_at(&[transaction(46)], 100).unwrap();
+        }
+        {
+            let db = Database::create(&path).unwrap();
+            let write = db.begin_write().unwrap();
+            {
+                let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
+                let unknown = BTreeMap::from([(transaction(47).compute_txid(), 100)]);
+                let encoded = encode_admission_times(&unknown).unwrap();
+                snapshots
+                    .insert(ADMISSION_TIMES_KEY, encoded.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            RedbTransactionPoolStore::open_at(&path, Network::Regtest, 200),
+            Err(TransactionPoolStoreError::Malformed(
+                "admission times do not match active transactions"
+            ))
+        ));
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]

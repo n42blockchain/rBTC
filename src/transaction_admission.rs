@@ -506,6 +506,22 @@ impl TransactionAdmissionPool {
         before.saturating_sub(self.entries.len())
     }
 
+    /// Removes selected transactions and every retained descendant atomically.
+    pub fn remove_with_descendants(&mut self, roots: &BTreeSet<Txid>) -> usize {
+        let removed = roots
+            .iter()
+            .flat_map(|txid| self.descendant_closure(*txid))
+            .collect::<BTreeSet<_>>();
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !removed.contains(&entry.transaction.compute_txid()));
+        let removed = before.saturating_sub(self.entries.len());
+        if removed > 0 {
+            self.rebuild_indexes();
+        }
+        removed
+    }
+
     fn evict_to_capacity(
         &mut self,
         protected: &BTreeSet<Txid>,
@@ -923,6 +939,30 @@ impl<S: UtxoStore> UtxoStore for AdmissionUtxoOverlay<'_, S> {
                 .map_err(|_| UtxoError::Malformed("admission overlay entry count"))?,
             cold: 0,
         })
+    }
+}
+
+/// Returns selected transaction IDs and every descendant in an unordered snapshot.
+#[must_use]
+pub fn transaction_descendant_closure(
+    transactions: &[Transaction],
+    roots: &BTreeSet<Txid>,
+) -> BTreeSet<Txid> {
+    let mut closure = roots.clone();
+    loop {
+        let before = closure.len();
+        for transaction in transactions {
+            if transaction
+                .input
+                .iter()
+                .any(|input| closure.contains(&input.previous_output.txid))
+            {
+                closure.insert(transaction.compute_txid());
+            }
+        }
+        if closure.len() == before {
+            return closure;
+        }
     }
 }
 
@@ -1510,6 +1550,60 @@ mod tests {
         assert_eq!(pool.len(), MAX_ADMITTED_TRANSACTIONS - 1);
         assert!(!txids.contains(&parent_txid));
         assert!(!txids.contains(&child_txid));
+    }
+
+    #[test]
+    fn explicit_removal_drops_descendants_and_preserves_unrelated_entries() {
+        let (_directory, store) = store();
+        let (parent_outpoint, parent_utxo, parent) = spend(78);
+        let (unrelated_outpoint, unrelated_utxo, unrelated) = spend(79);
+        store
+            .apply(
+                &[],
+                &[
+                    (parent_outpoint.into(), parent_utxo),
+                    (unrelated_outpoint.into(), unrelated_utxo),
+                ],
+            )
+            .unwrap();
+        let child = child(&parent, 80_000);
+        let parent_txid = parent.compute_txid();
+        let unrelated_txid = unrelated.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit_package(&store, vec![child, parent], context())
+            .unwrap();
+        pool.admit(&store, unrelated, context()).unwrap();
+
+        assert_eq!(
+            pool.remove_with_descendants(&BTreeSet::from([parent_txid])),
+            2
+        );
+        assert_eq!(txids(&pool), vec![unrelated_txid]);
+    }
+
+    #[test]
+    fn snapshot_descendant_closure_handles_unordered_multigeneration_entries() {
+        let (_, _, parent) = spend(80);
+        let child_transaction = child(&parent, 80_000);
+        let grandchild = child(&child_transaction, 70_000);
+        let (_, _, unrelated) = spend(81);
+        let parent_txid = parent.compute_txid();
+        assert_eq!(
+            transaction_descendant_closure(
+                &[
+                    grandchild.clone(),
+                    unrelated,
+                    child_transaction.clone(),
+                    parent,
+                ],
+                &BTreeSet::from([parent_txid]),
+            ),
+            BTreeSet::from([
+                parent_txid,
+                child_transaction.compute_txid(),
+                grandchild.compute_txid()
+            ])
+        );
     }
 
     #[test]

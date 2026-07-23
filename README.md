@@ -97,6 +97,8 @@ The active mempool snapshot also stores a versioned last-relay-attempt timestamp
 
 In addition to the 25-transaction/101,000-vB incoming package bound, every newly admitted transaction is limited to 25 ancestors and 101,000 aggregate ancestor vB, including itself. Every affected ancestor is independently limited to 25 descendants and 101,000 aggregate descendant vB. These graph checks run on the private candidate pool after conflict removal and package insertion but before publication, fee completion, or capacity eviction, so an over-limit package leaves the live pool and durable snapshot unchanged.
 
+The same active snapshot stores a complete versioned map from txid to its first admission time. Transactions expire once older than Core's default 336-hour lifetime; an expired parent is removed with every retained descendant before caught-up revalidation. Ordinary snapshot replacement preserves surviving times and prunes removed rows. If an expired transaction is independently received or recovered from a reorganization and passes admission again, its time is reset in the same commit that republishes the pool. Legacy snapshots without this map migrate every active entry as newly admitted, while malformed, duplicate, missing, or non-pool rows fail closed and join the persisted-metadata fuzz surface.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

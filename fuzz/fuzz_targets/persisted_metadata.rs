@@ -7,6 +7,7 @@ use rbtc::{
     },
     rebroadcast_store::validate_persisted_rebroadcast_entry,
     transaction_pool_store::{
+        validate_persisted_transaction_admission_times,
         validate_persisted_transaction_pool_snapshot,
         validate_persisted_transaction_relay_attempts,
     },
@@ -20,7 +21,7 @@ fuzz_target!(|input: &[u8]| {
     if value.len() > 257 * 1024 {
         return;
     }
-    match kind % 7 {
+    match kind % 8 {
         0 => {
             if value.len() <= 8 * 1024 {
                 let _ = parse_validation_directory_owner(value);
@@ -49,8 +50,11 @@ fuzz_target!(|input: &[u8]| {
         5 => {
             let _ = validate_persisted_transaction_pool_snapshot(value);
         }
-        _ => {
+        6 => {
             let _ = validate_persisted_transaction_relay_attempts(value);
+        }
+        _ => {
+            let _ = validate_persisted_transaction_admission_times(value);
         }
     }
 });

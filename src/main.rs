@@ -46,9 +46,9 @@ use rbtc::{
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     transaction_admission::{
         MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS, TransactionAdmissionContext,
-        TransactionAdmissionPool, dependency_packages,
+        TransactionAdmissionPool, dependency_packages, transaction_descendant_closure,
     },
-    transaction_pool_store::RedbTransactionPoolStore,
+    transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
     validation_owner::{
         MAX_VALIDATION_OWNER_BYTES, ValidationDirectoryOwner, parse_validation_directory_owner,
@@ -3060,11 +3060,22 @@ fn admit_pending_peer_transactions(
     full_rbf: bool,
 ) -> Result<(), String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
+    let now = unix_time()?;
+    let expired = transaction_store
+        .map(|store| store.expired_txids(now, DEFAULT_MEMPOOL_EXPIRY_SECS))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
     let persisted = transaction_store
         .map(RedbTransactionPoolStore::transactions)
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    let expired_with_descendants = transaction_descendant_closure(&persisted, &expired);
+    let persisted = persisted
+        .into_iter()
+        .filter(|transaction| !expired_with_descendants.contains(&transaction.compute_txid()))
+        .collect::<Vec<_>>();
     let persisted_txids = persisted
         .iter()
         .map(Transaction::compute_txid)
@@ -3086,7 +3097,8 @@ fn admit_pending_peer_transactions(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut candidate = pool.clone();
-    let removed = candidate.reconcile(chainstate, context);
+    let expired_removed = candidate.remove_with_descendants(&expired);
+    let reconciled_removed = candidate.reconcile(chainstate, context);
     let mut accepted_messages = Vec::new();
     let mut rejected_messages = Vec::new();
     let mut accepted_for_relay = HashSet::new();
@@ -3150,7 +3162,11 @@ fn admit_pending_peer_transactions(
     }
     if let Some(store) = transaction_store {
         store
-            .replace_and_clear_disconnected(&candidate.snapshot())
+            .replace_and_clear_disconnected_at(
+                &candidate.snapshot(),
+                now,
+                &expired_with_descendants,
+            )
             .map_err(|error| error.to_string())?;
     }
     let relay_snapshot = candidate.snapshot();
@@ -3161,12 +3177,23 @@ fn admit_pending_peer_transactions(
     if !relayed.is_empty() {
         if let Some(store) = transaction_store {
             store
-                .record_relay_attempts(&relayed, unix_time()?)
+                .record_relay_attempts(&relayed, now)
                 .map_err(|error| error.to_string())?;
         }
     }
-    if removed > 0 {
-        println!("removed {removed} local transactions after active-chain reconciliation");
+    let expired_removed = expired_removed.max(expired_with_descendants.len());
+    if expired_removed > 0 {
+        println!(
+            "expired {expired_removed} local mempool transaction{} or descendant{} after {} hours",
+            if expired_removed == 1 { "" } else { "s" },
+            if expired_removed == 1 { "" } else { "s" },
+            DEFAULT_MEMPOOL_EXPIRY_SECS / 60 / 60
+        );
+    }
+    if reconciled_removed > 0 {
+        println!(
+            "removed {reconciled_removed} local transactions after active-chain reconciliation"
+        );
     }
     for message in accepted_messages {
         println!("{message}");
