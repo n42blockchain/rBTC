@@ -72,5 +72,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "wallet_descriptor"
+path = "fuzz_targets/wallet_descriptor.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

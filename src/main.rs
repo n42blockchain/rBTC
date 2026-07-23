@@ -39,7 +39,10 @@ use rbtc::{
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
-    wallet::{DEFAULT_WALLET_GAP_LIMIT, EmbeddedWallet, MAX_WALLET_GAP_LIMIT, WalletTip},
+    wallet::{
+        EmbeddedWallet, MAX_WALLET_DESCRIPTOR_CONFIG_BYTES, WalletTip,
+        parse_wallet_descriptor_config,
+    },
 };
 use tokio::time::timeout;
 
@@ -50,7 +53,6 @@ const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
-const MAX_WALLET_DESCRIPTOR_FILE_LEN: u64 = 64 * 1024;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
@@ -194,17 +196,6 @@ impl std::fmt::Display for PeerRunError {
 struct WalletApiFiles {
     descriptors: PathBuf,
     auth_token: PathBuf,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WalletDescriptorFile {
-    receive_descriptor: String,
-    change_descriptor: String,
-    #[serde(default = "default_wallet_gap_limit")]
-    gap_limit: u32,
-    #[serde(default)]
-    birthday_height: u32,
 }
 
 struct WalletApiRuntime {
@@ -766,17 +757,11 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             let descriptors = read_owner_only_text_file(
                 &files.descriptors,
                 "wallet descriptor",
-                MAX_WALLET_DESCRIPTOR_FILE_LEN,
+                u64::try_from(MAX_WALLET_DESCRIPTOR_CONFIG_BYTES)
+                    .expect("wallet descriptor limit fits u64"),
             )?;
-            let descriptors: WalletDescriptorFile =
-                serde_json::from_str(&descriptors).map_err(|_| {
-                    "wallet descriptor file must contain the documented JSON object".to_owned()
-                })?;
-            if !(1..=MAX_WALLET_GAP_LIMIT).contains(&descriptors.gap_limit) {
-                return Err(format!(
-                    "wallet gap_limit must be between 1 and {MAX_WALLET_GAP_LIMIT}"
-                ));
-            }
+            let descriptors = parse_wallet_descriptor_config(descriptors.as_bytes())
+                .map_err(|error| error.to_string())?;
             let token = read_owner_only_text_file(
                 &files.auth_token,
                 "wallet authentication token",
@@ -813,10 +798,6 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
         })
         .transpose()?;
     Ok(Some(ApiRuntime { listen, wallet }))
-}
-
-const fn default_wallet_gap_limit() -> u32 {
-    DEFAULT_WALLET_GAP_LIMIT
 }
 
 fn read_owner_only_text_file(
@@ -1407,7 +1388,12 @@ fn ensure_validation_directory_owner(
                 "persist validation owner marker {}: {error}",
                 marker.display()
             )
-        })
+        })?;
+    #[cfg(unix)]
+    fs::File::open(validation_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync validation owner marker directory: {error}"))?;
+    Ok(())
 }
 
 fn cleanup_completed_validation_dir(
@@ -1519,6 +1505,10 @@ fn quarantine_and_remove_validation_dir(validation_dir: &std::path::Path) -> Res
             tombstone.display()
         )
     })?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync removed validation directory parent: {error}"))?;
     println!(
         "removed completed validation directory {} after owner and target revalidation; recovery is no longer possible",
         validation_dir.display()
@@ -3911,6 +3901,7 @@ mod tests {
         pow::Target,
         transaction::Version as TransactionVersion,
     };
+    use proptest::prelude::*;
     use rbtc::{
         api::ExplorerIndex,
         blockchain::block_subsidy,
@@ -3920,6 +3911,7 @@ mod tests {
         p2p::{PeerAddress, V1Transport},
         snapshot::export_snapshot,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
+        wallet::DEFAULT_WALLET_GAP_LIMIT,
     };
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4192,6 +4184,75 @@ mod tests {
             block.header.nonce = block.header.nonce.checked_add(1).unwrap();
         }
         block
+    }
+
+    fn daemon_argument() -> impl Strategy<Value = String> {
+        let known = prop::sample::select(
+            [
+                "--help",
+                "--connect",
+                "--dns-seed",
+                "--no-dns-seeds",
+                "--network",
+                "--fetch-block",
+                "--headers-db",
+                "--data-dir",
+                "--once",
+                "--explorer-listen",
+                "--wallet-descriptors",
+                "--wallet-auth-token-file",
+                "--vbparams",
+                "--testactivationheight",
+                "--signetchallenge",
+                "--signetseednode",
+                "--minimum-chainwork",
+                "--assumevalid",
+                "--assume-valid",
+                "--assumeutxo-snapshot",
+                "--finalize-assumeutxo",
+                "--validate-until-height",
+                "--validate-until-blockhash",
+                "--complete-assumeutxo",
+                "--background-assumeutxo",
+                "--cleanup-validation-dir",
+                "--validation-batch-size",
+                "--validation-pause-ms",
+                "--snapshot-height",
+                "--snapshot-blockhash",
+                "--snapshot-utxo-count",
+                "--snapshot-records-bytes",
+                "--snapshot-records-sha256",
+                "regtest",
+                "signet",
+                "bitcoin",
+                "127.0.0.1:18444",
+                "taproot:0:1:0",
+                "segwit@0",
+                "0",
+                "1",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        );
+        let arbitrary = prop::collection::vec(any::<u8>(), 0..96)
+            .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        prop_oneof![4 => known, 1 => arbitrary]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn arbitrary_bounded_daemon_option_combinations_are_deterministic(
+            arguments in prop::collection::vec(daemon_argument(), 0..80),
+        ) {
+            let first = parse_options(arguments.clone().into_iter())
+                .map(|options| options.is_some());
+            let second = parse_options(arguments.into_iter())
+                .map(|options| options.is_some());
+            prop_assert_eq!(first, second);
+        }
     }
 
     #[test]

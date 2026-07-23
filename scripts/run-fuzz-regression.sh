@@ -25,3 +25,5 @@ cargo +nightly fuzz run config_parsers fuzz/corpus/config_parsers -- \
     -runs="$runs" -max_len=4096
 cargo +nightly fuzz run wallet_auth fuzz/corpus/wallet_auth -- \
     -runs="$runs" -max_len=4096
+cargo +nightly fuzz run wallet_descriptor fuzz/corpus/wallet_descriptor -- \
+    -runs="$runs" -max_len=131072

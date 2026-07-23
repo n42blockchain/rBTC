@@ -24,6 +24,8 @@ use thiserror::Error;
 pub const DEFAULT_WALLET_GAP_LIMIT: u32 = 20;
 /// Defensive upper bound for descriptor scan lookahead.
 pub const MAX_WALLET_GAP_LIMIT: u32 = 1_000;
+/// Maximum accepted JSON descriptor configuration size.
+pub const MAX_WALLET_DESCRIPTOR_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
 const NEXT_RECEIVE_INDEX_KEY: &str = "next_receive_index";
 const SCAN_START_HEIGHT_KEY: &str = "scan_start_height";
@@ -107,6 +109,22 @@ pub struct WalletStatus {
     pub issued_receive_addresses: u32,
 }
 
+/// Validated watch-only descriptor configuration loaded by the daemon.
+#[derive(Clone, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WalletDescriptorConfig {
+    /// External/receive public descriptor.
+    pub receive_descriptor: String,
+    /// Internal/change public descriptor.
+    pub change_descriptor: String,
+    /// Bounded descriptor discovery gap.
+    #[serde(default = "default_wallet_gap_limit")]
+    pub gap_limit: u32,
+    /// Earliest block height that may contain wallet activity.
+    #[serde(default)]
+    pub birthday_height: u32,
+}
+
 /// A durable checkpoint in the wallet's view of the validated active chain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WalletTip {
@@ -146,11 +164,38 @@ pub enum WalletError {
     /// A wallet query exceeded its bounded read window.
     #[error("wallet query exceeds bounded page limits")]
     QueryLimit,
+    /// The descriptor configuration container is malformed or unbounded.
+    #[error("wallet descriptor configuration: {0}")]
+    Configuration(&'static str),
 }
 
 struct WalletState {
     wallet: PersistedWallet<Connection>,
     database: Connection,
+}
+
+/// Parses and validates one bounded watch-only descriptor JSON object.
+///
+/// Parser errors deliberately never include the supplied JSON or descriptor
+/// text, because rejected input may contain private key material.
+pub fn parse_wallet_descriptor_config(input: &[u8]) -> Result<WalletDescriptorConfig, WalletError> {
+    if input.len() > MAX_WALLET_DESCRIPTOR_CONFIG_BYTES {
+        return Err(WalletError::Configuration("file exceeds 65536 bytes"));
+    }
+    let config: WalletDescriptorConfig = serde_json::from_slice(input)
+        .map_err(|_| WalletError::Configuration("expected the documented JSON object"))?;
+    if !(1..=MAX_WALLET_GAP_LIMIT).contains(&config.gap_limit) {
+        return Err(WalletError::Configuration(
+            "gap_limit must be between 1 and 1000",
+        ));
+    }
+    public_descriptor(&config.receive_descriptor, "receive")?;
+    public_descriptor(&config.change_descriptor, "change")?;
+    Ok(config)
+}
+
+const fn default_wallet_gap_limit() -> u32 {
+    DEFAULT_WALLET_GAP_LIMIT
 }
 
 /// Mutex-protected, transactionally persisted BDK watch-only wallet.
@@ -991,6 +1036,48 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("public descriptor"));
         assert!(!message.contains("cVpPV"));
+    }
+
+    #[test]
+    fn descriptor_configuration_is_bounded_strict_and_watch_only() {
+        let valid = serde_json::json!({
+            "receive_descriptor": RECEIVE_DESCRIPTOR,
+            "change_descriptor": CHANGE_DESCRIPTOR
+        });
+        let config = parse_wallet_descriptor_config(valid.to_string().as_bytes()).unwrap();
+        assert_eq!(config.gap_limit, DEFAULT_WALLET_GAP_LIMIT);
+        assert_eq!(config.birthday_height, 0);
+
+        for invalid in [
+            serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR,
+                "gap_limit": 0
+            }),
+            serde_json::json!({
+                "receive_descriptor": RECEIVE_DESCRIPTOR,
+                "change_descriptor": CHANGE_DESCRIPTOR,
+                "unknown": true
+            }),
+        ] {
+            assert!(parse_wallet_descriptor_config(invalid.to_string().as_bytes()).is_err());
+        }
+
+        let secret = serde_json::json!({
+            "receive_descriptor": PRIVATE_DESCRIPTOR,
+            "change_descriptor": CHANGE_DESCRIPTOR
+        });
+        let error = parse_wallet_descriptor_config(secret.to_string().as_bytes())
+            .err()
+            .expect("private descriptor configuration must fail");
+        assert!(error.to_string().contains("public descriptor"));
+        assert!(!error.to_string().contains("cVpPV"));
+
+        let oversized = vec![b' '; MAX_WALLET_DESCRIPTOR_CONFIG_BYTES + 1];
+        assert!(matches!(
+            parse_wallet_descriptor_config(&oversized),
+            Err(WalletError::Configuration("file exceeds 65536 bytes"))
+        ));
     }
 
     #[test]
