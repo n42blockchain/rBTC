@@ -13,6 +13,7 @@ use bitcoin::{
         address::AddrV2Message,
         message::{MAX_INV_SIZE, NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
+        message_compact_blocks::SendCmpct,
         message_network::VersionMessage,
     },
 };
@@ -36,6 +37,8 @@ const MAX_PENDING_MESSAGE_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
+const SENDCMPCT_VERSION: u32 = 70_014;
+const COMPACT_BLOCK_VERSION: u64 = 2;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
 const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
 /// Maximum inventory entries accepted in `inv`, `getdata`, or `notfound`.
@@ -44,6 +47,8 @@ pub const MAX_INVENTORY_ENTRIES: usize = MAX_INV_SIZE;
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 /// Maximum block bodies requested concurrently from one peer.
 pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
+/// Consensus-derived upper bound for transaction references in a compact block message.
+pub const MAX_COMPACT_BLOCK_TRANSACTIONS: usize = 16_666;
 const PROTOCOL_VERSION: u32 = 70_016;
 const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
 
@@ -185,6 +190,16 @@ pub enum P2pError {
         /// Number of locator hashes received.
         count: usize,
     },
+    /// A compact-block message referenced more transactions than any valid block can contain.
+    #[error(
+        "peer sent {count} transaction references in {command}; limit is {MAX_COMPACT_BLOCK_TRANSACTIONS}"
+    )]
+    TooManyCompactBlockTransactions {
+        /// Wire command containing the oversized transaction vector.
+        command: &'static str,
+        /// Number of transaction references received.
+        count: usize,
+    },
     /// A matching pong did not arrive within the shared response-frame budget.
     #[error("peer did not provide the requested pong within {MAX_RESPONSE_MESSAGES} messages")]
     PongResponseIncomplete,
@@ -246,7 +261,8 @@ impl P2pError {
             | Self::UnsolicitedBlock(_)
             | Self::TooManyAddresses { .. }
             | Self::TooManyInventoryEntries { .. }
-            | Self::TooManyRemoteLocatorHashes { .. } => true,
+            | Self::TooManyRemoteLocatorHashes { .. }
+            | Self::TooManyCompactBlockTransactions { .. } => true,
         }
     }
 }
@@ -553,6 +569,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .await
     }
 
+    /// Announces support for witness-aware BIP152 decoding without requesting
+    /// unsolicited high-bandwidth compact-block announcements.
+    pub async fn negotiate_compact_block_relay(&mut self) -> Result<(), P2pError> {
+        if self.remote_version.version < SENDCMPCT_VERSION {
+            return Ok(());
+        }
+        self.transport
+            .write_message(NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: COMPACT_BLOCK_VERSION,
+            }))
+            .await
+    }
+
     /// Sends one standard-weight non-coinbase transaction to the connected peer.
     ///
     /// A successful write only proves delivery to this peer's socket. It does
@@ -844,8 +874,31 @@ pub fn validate_post_handshake_message(message: &NetworkMessage) -> Result<(), P
                 count: addresses.len(),
             })
         }
+        NetworkMessage::CmpctBlock(block) => validate_compact_block_len(
+            "cmpctblock",
+            block.compact_block.short_ids.len(),
+            block.compact_block.prefilled_txs.len(),
+        ),
+        NetworkMessage::GetBlockTxn(request) => {
+            validate_compact_block_len("getblocktxn", request.txs_request.indexes.len(), 0)
+        }
+        NetworkMessage::BlockTxn(response) => {
+            validate_compact_block_len("blocktxn", response.transactions.transactions.len(), 0)
+        }
         _ => Ok(()),
     }
+}
+
+fn validate_compact_block_len(
+    command: &'static str,
+    primary: usize,
+    secondary: usize,
+) -> Result<(), P2pError> {
+    let count = primary.checked_add(secondary).unwrap_or(usize::MAX);
+    if count > MAX_COMPACT_BLOCK_TRANSACTIONS {
+        return Err(P2pError::TooManyCompactBlockTransactions { command, count });
+    }
+    Ok(())
 }
 
 fn validate_inventory_len(command: &'static str, count: usize) -> Result<(), P2pError> {
@@ -921,11 +974,13 @@ mod tests {
     use super::*;
     use bitcoin::{
         Network,
+        bip152::BlockTransactionsRequest,
         hashes::Hash,
         p2p::{
             Address, Magic, ServiceFlags,
             address::{AddrV2, AddrV2Message},
             message::NetworkMessage,
+            message_compact_blocks::GetBlockTxn,
             message_network::VersionMessage,
         },
     };
@@ -959,6 +1014,23 @@ mod tests {
     }
 
     #[test]
+    fn compact_block_transaction_references_are_consensus_bounded() {
+        let message = NetworkMessage::GetBlockTxn(GetBlockTxn {
+            txs_request: BlockTransactionsRequest {
+                block_hash: BlockHash::all_zeros(),
+                indexes: vec![0; MAX_COMPACT_BLOCK_TRANSACTIONS + 1],
+            },
+        });
+        assert!(matches!(
+            validate_post_handshake_message(&message),
+            Err(P2pError::TooManyCompactBlockTransactions {
+                command: "getblocktxn",
+                count,
+            }) if count == MAX_COMPACT_BLOCK_TRANSACTIONS + 1
+        ));
+    }
+
+    #[test]
     fn only_objective_remote_wire_failures_are_protocol_violations() {
         let hash = BlockHash::all_zeros();
         for error in [
@@ -984,6 +1056,10 @@ mod tests {
             P2pError::TooManyRemoteLocatorHashes {
                 command: "getheaders",
                 count: MAX_LOCATOR_HASHES + 1,
+            },
+            P2pError::TooManyCompactBlockTransactions {
+                command: "getblocktxn",
+                count: MAX_COMPACT_BLOCK_TRANSACTIONS + 1,
             },
         ] {
             assert!(error.is_protocol_violation(), "{error}");
@@ -1721,6 +1797,50 @@ mod tests {
             remote,
         );
         session.prefer_headers_announcements().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                server_stream.read_u8()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_block_negotiation_uses_witness_version_without_high_bandwidth() {
+        let (client_stream, server_stream) = duplex(1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = SENDCMPCT_VERSION;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.negotiate_compact_block_relay().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            let NetworkMessage::SendCmpct(preference) =
+                transport.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected sendcmpct");
+            };
+            assert!(!preference.send_compact);
+            assert_eq!(preference.version, COMPACT_BLOCK_VERSION);
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let (client_stream, mut server_stream) = duplex(1024);
+        let mut remote = version(1);
+        remote.version = SENDCMPCT_VERSION - 1;
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            remote,
+        );
+        session.negotiate_compact_block_relay().await.unwrap();
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),

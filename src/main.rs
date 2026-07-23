@@ -1754,6 +1754,10 @@ async fn negotiate_peer_preferences(
     timeout(PEER_TIMEOUT, session.prefer_headers_announcements())
         .await
         .map_err(|_| PeerRunError::transient("sendheaders negotiation timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    timeout(PEER_TIMEOUT, session.negotiate_compact_block_relay())
+        .await
+        .map_err(|_| PeerRunError::transient("sendcmpct negotiation timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))
 }
 
@@ -4583,10 +4587,7 @@ mod tests {
         peer: &mut V1Transport<tokio::net::TcpStream>,
         addresses: Vec<bitcoin::p2p::address::AddrV2Message>,
     ) {
-        assert!(matches!(
-            peer.read_message().await.unwrap().into_payload(),
-            NetworkMessage::SendHeaders
-        ));
+        receive_client_preferences(peer).await;
         assert!(matches!(
             peer.read_message().await.unwrap().into_payload(),
             NetworkMessage::GetAddr
@@ -4594,6 +4595,20 @@ mod tests {
         peer.write_message(NetworkMessage::AddrV2(addresses))
             .await
             .unwrap();
+    }
+
+    async fn receive_client_preferences(peer: &mut V1Transport<tokio::net::TcpStream>) {
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::SendHeaders
+        ));
+        let NetworkMessage::SendCmpct(preference) =
+            peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected sendcmpct");
+        };
+        assert!(!preference.send_compact);
+        assert_eq!(preference.version, 2);
     }
 
     async fn accept_peer(
@@ -4635,10 +4650,7 @@ mod tests {
         let (ready, ready_received) = tokio::sync::oneshot::channel();
         let ready_server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(ready_listener, peer_version(101)).await;
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::SendHeaders
-            ));
+            receive_client_preferences(&mut peer).await;
             ready.send(()).unwrap();
         });
 
@@ -4685,10 +4697,7 @@ mod tests {
         let (release_server, server_release) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(listener, peer_version(202)).await;
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::SendHeaders
-            ));
+            receive_client_preferences(&mut peer).await;
             let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
             else {
                 panic!("expected standby ping");
@@ -6839,10 +6848,7 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::SendHeaders
-            ));
+            receive_client_preferences(&mut peer).await;
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(request) => {
                     assert_eq!(request.locator_hashes, vec![genesis.block_hash()]);
