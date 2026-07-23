@@ -336,16 +336,26 @@ fn pushed_redeem_script(
     script_sig: &Script,
     input: usize,
 ) -> Result<ScriptBuf, TransactionPolicyError> {
-    script_sig
-        .instructions()
-        .last()
-        .and_then(Result::ok)
-        .and_then(|instruction| match instruction {
-            bitcoin::script::Instruction::PushBytes(bytes) => {
-                Some(ScriptBuf::from_bytes(bytes.as_bytes().to_vec()))
+    let mut last = None;
+    for instruction in script_sig.instructions() {
+        let value = match instruction {
+            Ok(bitcoin::script::Instruction::PushBytes(bytes)) => bytes.as_bytes().to_vec(),
+            Ok(bitcoin::script::Instruction::Op(opcode))
+                if opcode == bitcoin::opcodes::all::OP_PUSHNUM_NEG1 =>
+            {
+                vec![0x81]
             }
-            bitcoin::script::Instruction::Op(_) => None,
-        })
+            Ok(bitcoin::script::Instruction::Op(opcode)) => {
+                let Some(value) = decode_positive_pushnum(opcode) else {
+                    return Err(TransactionPolicyError::P2shRedeemScript(input));
+                };
+                vec![u8::try_from(value).expect("positive pushnum is at most sixteen")]
+            }
+            Err(_) => return Err(TransactionPolicyError::P2shRedeemScript(input)),
+        };
+        last = Some(value);
+    }
+    last.map(ScriptBuf::from_bytes)
         .ok_or(TransactionPolicyError::P2shRedeemScript(input))
 }
 
@@ -551,6 +561,30 @@ mod tests {
             let prevout = ScriptBuf::new_p2sh(&redeem_script.script_hash());
             assert_eq!(validate_standard_inputs(&transaction, &[prevout]), expected);
         }
+
+        let redeem_script = Builder::new().push_int(1).into_script();
+        let redeem_push = PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap();
+        transaction.input[0].script_sig = Builder::new()
+            .push_opcode(opcodes::all::OP_RESERVED)
+            .push_slice(redeem_push)
+            .into_script();
+        let prevout = ScriptBuf::new_p2sh(&redeem_script.script_hash());
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::P2shRedeemScript(0))
+        );
+
+        transaction.input[0].script_sig = Builder::new().push_int(1).into_script();
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Ok(())
+        );
+
+        transaction.input[0].script_sig = ScriptBuf::new();
+        assert_eq!(
+            validate_standard_inputs(&transaction, &[prevout]),
+            Err(TransactionPolicyError::P2shRedeemScript(0))
+        );
     }
 
     #[test]
