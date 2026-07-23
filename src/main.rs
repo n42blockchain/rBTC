@@ -68,6 +68,7 @@ const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
+const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
@@ -222,6 +223,36 @@ struct WalletApiRuntime {
     broadcast_receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<WalletBroadcastRequest>>>,
     pending_broadcast: Arc<tokio::sync::Mutex<Option<WalletBroadcastRequest>>>,
     standby_relay: broadcast::Sender<Transaction>,
+    compact_candidates: CompactTransactionCandidates,
+}
+
+#[derive(Default)]
+struct CompactTransactionCandidates {
+    transactions: Mutex<VecDeque<Transaction>>,
+}
+
+impl CompactTransactionCandidates {
+    fn insert(&self, transaction: Transaction) {
+        let wtxid = transaction.compute_wtxid();
+        let mut transactions = self
+            .transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        transactions.retain(|candidate| candidate.compute_wtxid() != wtxid);
+        transactions.push_back(transaction);
+        while transactions.len() > MAX_COMPACT_TRANSACTION_CANDIDATES {
+            transactions.pop_front();
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Transaction> {
+        self.transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
 }
 
 struct RpcApiRuntime {
@@ -876,6 +907,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
                 pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
                 standby_relay,
+                compact_candidates: CompactTransactionCandidates::default(),
             })
         })
         .transpose()?;
@@ -2462,6 +2494,9 @@ async fn wait_for_peer_poll(
         .await
         {
             Ok(Ok(())) => {
+                wallet
+                    .compact_candidates
+                    .insert(request.transaction.clone());
                 let _ = wallet.standby_relay.send(request.transaction.clone());
                 let _ = request.result.send(Ok(()));
             }
@@ -2571,6 +2606,9 @@ async fn sync_validating_node(
         })
         .transpose()?;
     'resync: loop {
+        let compact_candidates = wallet_runtime
+            .map(|runtime| runtime.compact_candidates.snapshot())
+            .unwrap_or_default();
         let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
         if let Some(status) = background_validation {
             status.update_active(current_tip.height, headers.active_tip().height);
@@ -2656,6 +2694,7 @@ async fn sync_validating_node(
             &headers,
             execution_store,
             &ledger,
+            &compact_candidates,
         )
         .await?;
         reconcile_explorer(
@@ -2666,6 +2705,7 @@ async fn sync_validating_node(
             &ledger,
             &explorer,
             explorer_events.as_ref(),
+            &compact_candidates,
         )
         .await?;
         if let Some(wallet) = wallet_runtime {
@@ -2677,6 +2717,7 @@ async fn sync_validating_node(
                 &ledger,
                 &wallet.wallet,
                 wallet.scan,
+                &compact_candidates,
             )
             .await?;
         }
@@ -2812,6 +2853,7 @@ async fn sync_validating_node(
                 &explorer,
                 explorer_events.as_ref(),
                 wallet,
+                &compact_candidates,
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
             )
@@ -2825,6 +2867,7 @@ async fn sync_validating_node(
                     &ledger,
                     &wallet.wallet,
                     wallet.scan,
+                    &compact_candidates,
                 )
                 .await?;
             }
@@ -2853,6 +2896,7 @@ async fn sync_validating_node(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_wallet(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
@@ -2861,6 +2905,7 @@ async fn reconcile_wallet(
     ledger: &PrunedBlockLedger,
     wallet: &EmbeddedWallet,
     scan: WalletScanConfig,
+    compact_candidates: &[Transaction],
 ) -> Result<(), String> {
     let execution_tip = execution_store.tip().map_err(|error| error.to_string())?;
     let initial_lookahead_changed = wallet
@@ -2923,6 +2968,7 @@ async fn reconcile_wallet(
         wallet,
         normal_start,
         execution_tip.height,
+        compact_candidates,
     )
     .await?;
 
@@ -2951,6 +2997,7 @@ async fn reconcile_wallet(
             wallet,
             scan_start,
             execution_tip.height,
+            compact_candidates,
         )
         .await?;
         scan_needed = wallet
@@ -2981,6 +3028,7 @@ async fn replay_wallet_blocks(
     wallet: &EmbeddedWallet,
     mut next_height: u32,
     end_height: u32,
+    compact_candidates: &[Transaction],
 ) -> Result<(), String> {
     while next_height <= end_height {
         let remaining = end_height - next_height + 1;
@@ -3020,10 +3068,13 @@ async fn replay_wallet_blocks(
                 .await
                 .map_err(|_| format!("wallet backfill getdata timed out for {batch_len} blocks"))?
                 .map_err(|error| error.to_string())?;
-            blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
-                .await
-                .map_err(|_| format!("wallet backfill response timed out for {batch_len} blocks"))?
-                .map_err(|error| error.to_string())?;
+            blocks = timeout(
+                PEER_TIMEOUT,
+                session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
+            )
+            .await
+            .map_err(|_| format!("wallet backfill response timed out for {batch_len} blocks"))?
+            .map_err(|error| error.to_string())?;
         }
         for (expected, block) in expected.iter().zip(&blocks) {
             validate_archive_block(
@@ -3057,6 +3108,7 @@ async fn reconcile_ledger(
     headers: &HeaderDag,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
+    compact_candidates: &[Transaction],
 ) -> Result<(), String> {
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     if let Some(first_unexecuted) = tip.height.checked_add(1) {
@@ -3106,6 +3158,7 @@ async fn reconcile_ledger(
                     headers,
                     ledger,
                     preceding_height.min(tip.height),
+                    compact_candidates,
                 )
                 .await?;
                 ledger
@@ -3120,7 +3173,15 @@ async fn reconcile_ledger(
         }
     }
 
-    backfill_ledger(session, deployment_config, headers, ledger, tip.height).await
+    backfill_ledger(
+        session,
+        deployment_config,
+        headers,
+        ledger,
+        tip.height,
+        compact_candidates,
+    )
+    .await
 }
 
 async fn backfill_ledger(
@@ -3129,6 +3190,7 @@ async fn backfill_ledger(
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
     target_height: u32,
+    compact_candidates: &[Transaction],
 ) -> Result<(), String> {
     if target_height == 0 {
         return Ok(());
@@ -3165,10 +3227,13 @@ async fn backfill_ledger(
             .await
             .map_err(|_| format!("ledger backfill getdata timed out for {batch_len} blocks"))?
             .map_err(|error| error.to_string())?;
-        let blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
-            .await
-            .map_err(|_| format!("ledger backfill response timed out for {batch_len} blocks"))?
-            .map_err(|error| error.to_string())?;
+        let blocks = timeout(
+            PEER_TIMEOUT,
+            session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
+        )
+        .await
+        .map_err(|_| format!("ledger backfill response timed out for {batch_len} blocks"))?
+        .map_err(|error| error.to_string())?;
         let mut serialized = Vec::with_capacity(blocks.len());
         for (expected, block) in expected.iter().zip(&blocks) {
             validate_archive_block(
@@ -3234,6 +3299,7 @@ async fn reconcile_explorer(
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
     events: Option<&ExplorerEventHub>,
+    compact_candidates: &[Transaction],
 ) -> Result<(), String> {
     let execution_store = chainstate.execution();
     let undo_store = chainstate.undos();
@@ -3332,12 +3398,13 @@ async fn reconcile_explorer(
                 .await
                 .map_err(|_| format!("explorer backfill getdata timed out for {batch_len} blocks"))?
                 .map_err(|error| error.to_string())?;
-            blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
-                .await
-                .map_err(|_| {
-                    format!("explorer backfill response timed out for {batch_len} blocks")
-                })?
-                .map_err(|error| error.to_string())?;
+            blocks = timeout(
+                PEER_TIMEOUT,
+                session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
+            )
+            .await
+            .map_err(|_| format!("explorer backfill response timed out for {batch_len} blocks"))?
+            .map_err(|error| error.to_string())?;
         }
         for (expected, block) in expected.iter().zip(&blocks) {
             validate_archive_block(
@@ -3385,6 +3452,7 @@ async fn download_execute_batch(
     explorer: &RedbExplorerIndex,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
+    compact_candidates: &[Transaction],
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
 ) -> Result<(), PeerRunError> {
@@ -3425,14 +3493,17 @@ async fn download_execute_batch(
         .await
         .map_err(|_| PeerRunError::transient(format!("getdata timed out for {batch_len} blocks")))?
         .map_err(|error| PeerRunError::p2p(&error))?;
-    let blocks = timeout(PEER_TIMEOUT, session.receive_requested_blocks(&hashes))
-        .await
-        .map_err(|_| {
-            PeerRunError::transient(format!(
-                "block batch response timed out for {batch_len} blocks"
-            ))
-        })?
-        .map_err(|error| PeerRunError::p2p(&error))?;
+    let blocks = timeout(
+        PEER_TIMEOUT,
+        session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
+    )
+    .await
+    .map_err(|_| {
+        PeerRunError::transient(format!(
+            "block batch response timed out for {batch_len} blocks"
+        ))
+    })?
+    .map_err(|error| PeerRunError::p2p(&error))?;
     for (expected, block) in expected.iter().zip(&blocks) {
         validate_downloaded_block(
             deployment_config,
@@ -4958,6 +5029,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_transaction_candidates_are_deduplicated_and_bounded() {
+        let candidates = CompactTransactionCandidates::default();
+        let mut inserted = Vec::new();
+        for marker in 1..=MAX_COMPACT_TRANSACTION_CANDIDATES + 1 {
+            let mut transaction = wallet_broadcast_transaction();
+            transaction.input[0].previous_output.txid =
+                Txid::from_byte_array([u8::try_from(marker).unwrap(); 32]);
+            inserted.push(transaction.compute_wtxid());
+            candidates.insert(transaction);
+        }
+        let snapshot = candidates.snapshot();
+        assert_eq!(snapshot.len(), MAX_COMPACT_TRANSACTION_CANDIDATES);
+        assert!(!snapshot.iter().any(|tx| tx.compute_wtxid() == inserted[0]));
+        assert_eq!(
+            snapshot.last().unwrap().compute_wtxid(),
+            *inserted.last().unwrap()
+        );
+
+        candidates.insert(snapshot[0].clone());
+        let deduplicated = candidates.snapshot();
+        assert_eq!(deduplicated.len(), MAX_COMPACT_TRANSACTION_CANDIDATES);
+        assert_eq!(
+            deduplicated.last().unwrap().compute_wtxid(),
+            snapshot[0].compute_wtxid()
+        );
+    }
+
     #[tokio::test]
     async fn wallet_broadcast_queue_retries_before_writing_to_the_peer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5006,6 +5105,7 @@ mod tests {
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
             standby_relay,
+            compact_candidates: CompactTransactionCandidates::default(),
         };
         let (result, mut completion) = tokio::sync::oneshot::channel();
         let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
@@ -5052,6 +5152,7 @@ mod tests {
             .unwrap();
         assert_eq!(completion.await.unwrap(), Ok(()));
         assert_eq!(standby_receiver.recv().await.unwrap(), transaction);
+        assert_eq!(wallet.compact_candidates.snapshot(), vec![transaction]);
         server.await.unwrap();
     }
 
@@ -6830,6 +6931,7 @@ mod tests {
             broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
             standby_relay,
+            compact_candidates: CompactTransactionCandidates::default(),
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),
