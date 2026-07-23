@@ -3,8 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use rbtc::{
     peer_store::{
-        validate_stored_peer_penalty, validate_stored_peer_record,
-        validate_stored_tried_collisions,
+        validate_stored_peer_penalty, validate_stored_peer_record, validate_stored_tried_collisions,
     },
     rebroadcast_store::validate_persisted_rebroadcast_entry,
     validation_owner::parse_validation_directory_owner,

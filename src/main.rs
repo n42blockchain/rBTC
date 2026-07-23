@@ -2503,6 +2503,7 @@ async fn wait_for_peer_poll(
 ) -> Result<(), PeerRunError> {
     struct BroadcastWork {
         transaction: Transaction,
+        fee_sats: Option<u64>,
         result: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
     }
 
@@ -2516,6 +2517,7 @@ async fn wait_for_peer_poll(
         let work = if let Some(request) = wallet.pending_broadcast.lock().await.take() {
             Some(BroadcastWork {
                 transaction: request.transaction,
+                fee_sats: Some(request.fee_sats),
                 result: Some(request.result),
             })
         } else {
@@ -2523,6 +2525,7 @@ async fn wait_for_peer_poll(
             match receiver.try_recv() {
                 Ok(request) => Some(BroadcastWork {
                     transaction: request.transaction,
+                    fee_sats: Some(request.fee_sats),
                     result: Some(request.result),
                 }),
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -2540,6 +2543,7 @@ async fn wait_for_peer_poll(
                     if let Some(transaction) = due {
                         Some(BroadcastWork {
                             transaction,
+                            fee_sats: None,
                             result: None,
                         })
                     } else {
@@ -2548,6 +2552,7 @@ async fn wait_for_peer_poll(
                             () = &mut sleep => return Ok(()),
                             request = receiver.recv() => request.map(|request| BroadcastWork {
                                 transaction: request.transaction,
+                                fee_sats: Some(request.fee_sats),
                                 result: Some(request.result),
                             }),
                         }
@@ -2590,6 +2595,7 @@ async fn wait_for_peer_poll(
                         wallet,
                         WalletBroadcastRequest {
                             transaction: work.transaction,
+                            fee_sats: work.fee_sats.expect("live request retains validated fee"),
                             result,
                         },
                     )
@@ -2603,6 +2609,7 @@ async fn wait_for_peer_poll(
                         wallet,
                         WalletBroadcastRequest {
                             transaction: work.transaction,
+                            fee_sats: work.fee_sats.expect("live request retains validated fee"),
                             result,
                         },
                     )
@@ -3002,15 +3009,15 @@ async fn sync_validating_node(
 fn reconcile_rebroadcast_state(wallet: &WalletApiRuntime) -> Result<(), String> {
     let tracked = wallet
         .rebroadcast
-        .tracked_txids()
+        .tracked_transactions()
         .map_err(|error| error.to_string())?;
-    let confirmed = wallet
+    let (canonical, confirmed) = wallet
         .wallet
-        .confirmed_txids(&tracked)
+        .transaction_chain_state(&tracked)
         .map_err(|error| error.to_string())?;
     wallet
         .rebroadcast
-        .reconcile_confirmed(&confirmed, u64::from(unix_time()?))
+        .reconcile_chain_state(&canonical, &confirmed, u64::from(unix_time()?))
         .map_err(|error| error.to_string())?;
     wallet.compact_candidates.replace(
         wallet
@@ -5251,6 +5258,7 @@ mod tests {
             broadcast_sender
                 .try_send(WalletBroadcastRequest {
                     transaction: abandoned,
+                    fee_sats: 1_000,
                     result: abandoned_result,
                 })
                 .is_ok()
@@ -5259,6 +5267,7 @@ mod tests {
             broadcast_sender
                 .try_send(WalletBroadcastRequest {
                     transaction: retry,
+                    fee_sats: 1_000,
                     result,
                 })
                 .is_ok()

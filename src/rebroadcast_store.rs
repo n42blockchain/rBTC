@@ -3,7 +3,7 @@
 use std::{collections::HashSet, fs, path::Path, sync::Mutex};
 
 use bitcoin::{
-    Network, Transaction, Txid, Wtxid,
+    Network, OutPoint, Transaction, Txid, Wtxid,
     consensus::{deserialize, serialize},
     hashes::Hash,
     hex::{DisplayHex, FromHex},
@@ -52,6 +52,9 @@ pub enum RebroadcastStoreError {
     /// Stored or submitted data violates queue invariants.
     #[error("malformed rebroadcast store: {0}")]
     Malformed(&'static str),
+    /// A submitted input is already consumed by a retained transaction.
+    #[error("input {0} conflicts with a locally retained transaction")]
+    Conflict(OutPoint),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,6 +64,8 @@ struct StoredTransaction {
     last_broadcast: u64,
     attempts: u32,
     confirmed: bool,
+    #[serde(default = "default_true")]
+    canonical: bool,
     transaction: String,
 }
 
@@ -132,13 +137,16 @@ impl RedbRebroadcastStore {
         let write = self.db.begin_write()?;
         {
             let mut entries = write.open_table(TRANSACTIONS)?;
+            prune_expired_and_capacity(&mut entries, now)?;
             let key = transaction.compute_wtxid().to_byte_array();
             if entries.get(key.as_slice())?.is_none() {
+                reject_input_conflicts(&entries, transaction)?;
                 let encoded = encode_stored(&StoredTransaction {
                     first_seen: now,
                     last_broadcast: 0,
                     attempts: 0,
                     confirmed: false,
+                    canonical: true,
                     transaction: serialize(transaction).to_lower_hex_string(),
                 })?;
                 entries.insert(key.as_slice(), encoded.as_slice())?;
@@ -160,7 +168,8 @@ impl RedbRebroadcastStore {
         for row in entries.iter()? {
             let (key, value) = row?;
             let stored = validate_stored(key.value(), value.value())?;
-            if !stored.confirmed
+            if stored.canonical
+                && !stored.confirmed
                 && now.saturating_sub(stored.first_seen) <= REBROADCAST_EXPIRY_SECS
                 && (stored.last_broadcast == 0
                     || now.saturating_sub(stored.last_broadcast) >= REBROADCAST_INTERVAL_SECS)
@@ -208,9 +217,10 @@ impl RedbRebroadcastStore {
         Ok(())
     }
 
-    /// Reconciles confirmation flags against the wallet's active-chain view.
-    pub fn reconcile_confirmed(
+    /// Reconciles canonical and confirmation flags against the active-chain view.
+    pub fn reconcile_chain_state(
         &self,
+        canonical_txids: &HashSet<Txid>,
         confirmed_txids: &HashSet<Txid>,
         now: u64,
     ) -> Result<(), RebroadcastStoreError> {
@@ -233,8 +243,10 @@ impl RedbRebroadcastStore {
                 .collect::<Result<Vec<_>, _>>()?;
             for (key, mut stored) in rows {
                 let transaction = decode_transaction(&stored.transaction)?;
+                let canonical = canonical_txids.contains(&transaction.compute_txid());
                 let confirmed = confirmed_txids.contains(&transaction.compute_txid());
-                if stored.confirmed != confirmed {
+                if stored.canonical != canonical || stored.confirmed != confirmed {
+                    stored.canonical = canonical;
                     stored.confirmed = confirmed;
                     let encoded = encode_stored(&stored)?;
                     entries.insert(key.as_slice(), encoded.as_slice())?;
@@ -246,7 +258,7 @@ impl RedbRebroadcastStore {
         Ok(())
     }
 
-    /// Returns all unconfirmed transactions for compact-block reconstruction.
+    /// Returns canonical unconfirmed transactions for compact-block reconstruction.
     pub fn unconfirmed_transactions(&self) -> Result<Vec<Transaction>, RebroadcastStoreError> {
         let read = self.db.begin_read()?;
         let entries = read.open_table(TRANSACTIONS)?;
@@ -254,7 +266,7 @@ impl RedbRebroadcastStore {
         for row in entries.iter()? {
             let (key, value) = row?;
             let stored = validate_stored(key.value(), value.value())?;
-            if !stored.confirmed {
+            if stored.canonical && !stored.confirmed {
                 transactions.push((stored.first_seen, decode_transaction(&stored.transaction)?));
             }
         }
@@ -273,6 +285,20 @@ impl RedbRebroadcastStore {
             txids.insert(decode_transaction(&stored.transaction)?.compute_txid());
         }
         Ok(txids)
+    }
+
+    /// Returns all retained transactions for bounded wallet chain-state reconciliation.
+    pub fn tracked_transactions(&self) -> Result<Vec<Transaction>, RebroadcastStoreError> {
+        let read = self.db.begin_read()?;
+        let entries = read.open_table(TRANSACTIONS)?;
+        entries
+            .iter()?
+            .map(|row| {
+                let (key, value) = row?;
+                let stored = validate_stored(key.value(), value.value())?;
+                decode_transaction(&stored.transaction)
+            })
+            .collect()
     }
 
     /// Returns the number of durable rows, including confirmed retention rows.
@@ -307,6 +333,35 @@ fn validate_transaction(transaction: &Transaction, now: u64) -> Result<(), Rebro
         ));
     }
     Ok(())
+}
+
+fn reject_input_conflicts(
+    entries: &redb::Table<&[u8], &[u8]>,
+    transaction: &Transaction,
+) -> Result<(), RebroadcastStoreError> {
+    let submitted = transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<HashSet<_>>();
+    for row in entries.iter()? {
+        let (key, value) = row?;
+        let stored = validate_stored(key.value(), value.value())?;
+        let retained = decode_transaction(&stored.transaction)?;
+        if let Some(conflict) = retained
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .find(|outpoint| submitted.contains(outpoint))
+        {
+            return Err(RebroadcastStoreError::Conflict(conflict));
+        }
+    }
+    Ok(())
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 fn validate_stored(key: &[u8], bytes: &[u8]) -> Result<StoredTransaction, RebroadcastStoreError> {
@@ -366,19 +421,31 @@ fn prune_expired_and_capacity(
             Ok::<_, RebroadcastStoreError>((
                 key.value().to_vec(),
                 stored.confirmed,
+                stored.canonical,
                 stored.first_seen,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (key, _, first_seen) in &rows {
+    for (key, _, _, first_seen) in &rows {
         if now.saturating_sub(*first_seen) > REBROADCAST_EXPIRY_SECS {
             entries.remove(key.as_slice())?;
         }
     }
-    rows.retain(|(_, _, first_seen)| now.saturating_sub(*first_seen) <= REBROADCAST_EXPIRY_SECS);
-    rows.sort_by_key(|(_, confirmed, first_seen)| (!*confirmed, *first_seen));
+    rows.retain(|(_, _, _, first_seen)| now.saturating_sub(*first_seen) <= REBROADCAST_EXPIRY_SECS);
+    rows.sort_by_key(|(_, confirmed, canonical, first_seen)| {
+        (
+            if *confirmed {
+                0
+            } else if !*canonical {
+                1
+            } else {
+                2
+            },
+            *first_seen,
+        )
+    });
     let excess = rows.len().saturating_sub(MAX_STORED_TRANSACTIONS);
-    for (key, _, _) in rows.into_iter().take(excess) {
+    for (key, _, _, _) in rows.into_iter().take(excess) {
         entries.remove(key.as_slice())?;
     }
     Ok(())
@@ -481,10 +548,20 @@ mod tests {
         let transaction = transaction(2);
         store.enqueue(&transaction, 200).unwrap();
         store
-            .reconcile_confirmed(&HashSet::from([transaction.compute_txid()]), 201)
+            .reconcile_chain_state(
+                &HashSet::from([transaction.compute_txid()]),
+                &HashSet::from([transaction.compute_txid()]),
+                201,
+            )
             .unwrap();
         assert!(store.due(201, 8).unwrap().is_empty());
-        store.reconcile_confirmed(&HashSet::new(), 202).unwrap();
+        store
+            .reconcile_chain_state(
+                &HashSet::from([transaction.compute_txid()]),
+                &HashSet::new(),
+                202,
+            )
+            .unwrap();
         assert_eq!(store.due(202, 8).unwrap(), vec![transaction]);
     }
 
@@ -497,7 +574,11 @@ mod tests {
         let confirmed = transaction(1);
         store.enqueue(&confirmed, 1).unwrap();
         store
-            .reconcile_confirmed(&HashSet::from([confirmed.compute_txid()]), 2)
+            .reconcile_chain_state(
+                &HashSet::from([confirmed.compute_txid()]),
+                &HashSet::from([confirmed.compute_txid()]),
+                2,
+            )
             .unwrap();
         for marker in 2..=u8::try_from(MAX_STORED_TRANSACTIONS + 1).unwrap() {
             store
@@ -531,9 +612,62 @@ mod tests {
                 .is_empty()
         );
         store
-            .reconcile_confirmed(&HashSet::new(), 10 + REBROADCAST_EXPIRY_SECS + 1)
+            .reconcile_chain_state(
+                &HashSet::new(),
+                &HashSet::new(),
+                10 + REBROADCAST_EXPIRY_SECS + 1,
+            )
             .unwrap();
         assert_eq!(store.len().unwrap(), 0);
+        store
+            .enqueue(&transaction, 10 + REBROADCAST_EXPIRY_SECS + 2)
+            .unwrap();
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn conflicting_input_is_rejected_across_reopen() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("rebroadcast.redb");
+        let first = transaction(7);
+        let mut conflict = first.clone();
+        conflict.output[0].value = Amount::from_sat(999);
+        {
+            let store = RedbRebroadcastStore::open(&path, Network::Regtest).unwrap();
+            store.enqueue(&first, 10).unwrap();
+            assert!(matches!(
+                store.enqueue(&conflict, 11),
+                Err(RebroadcastStoreError::Conflict(outpoint))
+                    if outpoint == first.input[0].previous_output
+            ));
+            store.enqueue(&transaction(8), 12).unwrap();
+        }
+        let reopened = RedbRebroadcastStore::open(&path, Network::Regtest).unwrap();
+        assert!(matches!(
+            reopened.enqueue(&conflict, 13),
+            Err(RebroadcastStoreError::Conflict(_))
+        ));
+        assert_eq!(reopened.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn noncanonical_transaction_is_suppressed_and_reorg_restores_it() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbRebroadcastStore::open(directory.path().join("rebroadcast.redb"), Network::Regtest)
+                .unwrap();
+        let transaction = transaction(9);
+        let txid = transaction.compute_txid();
+        store.enqueue(&transaction, 20).unwrap();
+        store
+            .reconcile_chain_state(&HashSet::new(), &HashSet::new(), 21)
+            .unwrap();
+        assert!(store.due(21, 8).unwrap().is_empty());
+        assert!(store.unconfirmed_transactions().unwrap().is_empty());
+        store
+            .reconcile_chain_state(&HashSet::from([txid]), &HashSet::new(), 22)
+            .unwrap();
+        assert_eq!(store.due(22, 8).unwrap(), vec![transaction]);
     }
 
     #[test]
@@ -558,6 +692,24 @@ mod tests {
             Err(RebroadcastStoreError::Encoding(_) | RebroadcastStoreError::Malformed(_))
         ));
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_row_without_canonical_flag_defaults_to_eligible() {
+        let transaction = transaction(10);
+        let key = transaction.compute_wtxid().to_byte_array();
+        let mut value = serde_json::to_value(StoredTransaction {
+            first_seen: 100,
+            last_broadcast: 0,
+            attempts: 0,
+            confirmed: false,
+            canonical: true,
+            transaction: serialize(&transaction).to_lower_hex_string(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("canonical");
+        let parsed = validate_stored(key.as_slice(), &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(parsed.canonical);
     }
 
     #[cfg(unix)]

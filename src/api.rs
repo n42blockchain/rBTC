@@ -32,7 +32,8 @@ use tokio_stream::{
 };
 
 use crate::{
-    rebroadcast_store::RedbRebroadcastStore,
+    rebroadcast_store::{RebroadcastStoreError, RedbRebroadcastStore},
+    transaction_policy::validate_standard_transaction,
     wallet::{
         EmbeddedWallet, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES, MAX_WALLET_PSBT_REQUEST_BYTES,
         WalletAddress, WalletBalance, WalletError, WalletFinalizedTransaction, WalletPsbt,
@@ -211,29 +212,45 @@ impl WalletBroadcastSink {
         }
     }
 
-    fn try_send(&self, request: WalletBroadcastRequest) -> Result<(), ()> {
-        let permit = self.sender.try_reserve().map_err(|_| ())?;
+    fn try_send(&self, request: WalletBroadcastRequest) -> Result<(), WalletBroadcastSinkError> {
+        validate_standard_transaction(&request.transaction, request.fee_sats)
+            .map_err(|_| WalletBroadcastSinkError::Admission)?;
+        let permit = self
+            .sender
+            .try_reserve()
+            .map_err(|_| WalletBroadcastSinkError::Unavailable)?;
         if let Some(persistence) = &self.persistence {
             persistence
                 .enqueue(&request.transaction, current_unix_time()?)
-                .map_err(|_| ())?;
+                .map_err(|error| match error {
+                    RebroadcastStoreError::Conflict(_) => WalletBroadcastSinkError::Admission,
+                    _ => WalletBroadcastSinkError::Unavailable,
+                })?;
         }
         permit.send(request);
         Ok(())
     }
 }
 
-fn current_unix_time() -> Result<u64, ()> {
+#[derive(Debug)]
+enum WalletBroadcastSinkError {
+    Admission,
+    Unavailable,
+}
+
+fn current_unix_time() -> Result<u64, WalletBroadcastSinkError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| ())
+        .map_err(|_| WalletBroadcastSinkError::Unavailable)
 }
 
 /// One consensus-verified wallet transaction awaiting a peer socket write.
 pub struct WalletBroadcastRequest {
     /// Exact transaction returned by wallet finalization.
     pub transaction: bitcoin::Transaction,
+    /// Exact fee derived from the validated wallet prevouts.
+    pub fee_sats: u64,
     /// Completion signal sent only after the active peer write finishes.
     pub result: oneshot::Sender<Result<(), ()>>,
 }
@@ -1283,9 +1300,13 @@ async fn broadcast_wallet_psbt(
     broadcast
         .try_send(WalletBroadcastRequest {
             transaction,
+            fee_sats: response.fee_sats,
             result,
         })
-        .map_err(|()| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|error| match error {
+            WalletBroadcastSinkError::Admission => StatusCode::BAD_REQUEST,
+            WalletBroadcastSinkError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        })?;
     match tokio::time::timeout(WALLET_BROADCAST_TIMEOUT, completion).await {
         Ok(Ok(Ok(()))) => Ok(Json(response)),
         Ok(Ok(Err(())) | Err(_)) | Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
@@ -1387,7 +1408,9 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::new(),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [marker; 20],
+                )),
             }],
         }
     }
@@ -1405,6 +1428,7 @@ mod tests {
         let (result, _completion) = oneshot::channel();
         sink.try_send(WalletBroadcastRequest {
             transaction: transaction.clone(),
+            fee_sats: 1_000,
             result,
         })
         .unwrap();
@@ -1424,6 +1448,7 @@ mod tests {
         sender
             .try_send(WalletBroadcastRequest {
                 transaction: broadcast_test_transaction(1),
+                fee_sats: 1_000,
                 result: occupied_result,
             })
             .unwrap();
@@ -1432,11 +1457,59 @@ mod tests {
         assert!(
             sink.try_send(WalletBroadcastRequest {
                 transaction: broadcast_test_transaction(2),
+                fee_sats: 1_000,
                 result,
             })
             .is_err()
         );
         assert_eq!(store.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn broadcast_sink_rejects_policy_and_persistent_input_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            RedbRebroadcastStore::open(directory.path().join("rebroadcast.redb"), Network::Regtest)
+                .unwrap(),
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = WalletBroadcastSink::durable(sender, Arc::clone(&store));
+
+        let mut nonstandard = broadcast_test_transaction(3);
+        nonstandard.output[0].script_pubkey = bitcoin::ScriptBuf::new();
+        let (result, _completion) = oneshot::channel();
+        assert!(matches!(
+            sink.try_send(WalletBroadcastRequest {
+                transaction: nonstandard,
+                fee_sats: 1_000,
+                result,
+            }),
+            Err(WalletBroadcastSinkError::Admission)
+        ));
+        assert_eq!(store.len().unwrap(), 0);
+
+        let first = broadcast_test_transaction(4);
+        let (result, _completion) = oneshot::channel();
+        sink.try_send(WalletBroadcastRequest {
+            transaction: first.clone(),
+            fee_sats: 1_000,
+            result,
+        })
+        .unwrap();
+        drop(receiver.try_recv().unwrap());
+        let mut conflict = first;
+        conflict.output[0].value = bitcoin::Amount::from_sat(999);
+        let (result, _completion) = oneshot::channel();
+        assert!(matches!(
+            sink.try_send(WalletBroadcastRequest {
+                transaction: conflict,
+                fee_sats: 1_000,
+                result,
+            }),
+            Err(WalletBroadcastSinkError::Admission)
+        ));
+        assert_eq!(store.len().unwrap(), 1);
+        assert!(receiver.try_recv().is_err());
     }
 
     struct TestIndex;

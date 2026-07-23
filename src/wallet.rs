@@ -571,24 +571,52 @@ impl EmbeddedWallet {
             .collect())
     }
 
-    /// Returns which bounded candidate txids are confirmed in the active wallet chain.
-    pub fn confirmed_txids(
+    /// Classifies bounded candidate transactions against the active wallet chain.
+    ///
+    /// A transaction remains canonical while it is present in BDK's canonical
+    /// graph or all of its wallet inputs remain unspent. This also detects a
+    /// confirmed conflicting spend before periodically rebroadcasting stale
+    /// local bytes, while allowing a reorganization to restore the candidate.
+    pub fn transaction_chain_state(
         &self,
-        candidates: &HashSet<Txid>,
-    ) -> Result<HashSet<Txid>, WalletError> {
+        candidates: &[bitcoin::Transaction],
+    ) -> Result<(HashSet<Txid>, HashSet<Txid>), WalletError> {
         if candidates.is_empty() {
-            return Ok(HashSet::new());
+            return Ok((HashSet::new(), HashSet::new()));
         }
         let state = self.state()?;
-        Ok(state
+        let candidate_txids = candidates
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<HashSet<_>>();
+        let mut canonical = HashSet::new();
+        let mut confirmed = HashSet::new();
+        for transaction in state.wallet.transactions() {
+            let txid = transaction.tx_node.txid;
+            if candidate_txids.contains(&txid) {
+                canonical.insert(txid);
+                if matches!(transaction.chain_position, ChainPosition::Confirmed { .. }) {
+                    confirmed.insert(txid);
+                }
+            }
+        }
+        let unspent = state
             .wallet
-            .transactions()
-            .filter(|transaction| {
-                candidates.contains(&transaction.tx_node.txid)
-                    && matches!(transaction.chain_position, ChainPosition::Confirmed { .. })
-            })
-            .map(|transaction| transaction.tx_node.txid)
-            .collect())
+            .list_unspent()
+            .map(|output| output.outpoint)
+            .collect::<HashSet<_>>();
+        for transaction in candidates {
+            let txid = transaction.compute_txid();
+            if !canonical.contains(&txid)
+                && transaction
+                    .input
+                    .iter()
+                    .all(|input| unspent.contains(&input.previous_output))
+            {
+                canonical.insert(txid);
+            }
+        }
+        Ok((canonical, confirmed))
     }
 
     /// Returns durable chain, scan, and address-issuance state.

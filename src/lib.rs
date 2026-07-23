@@ -26,6 +26,7 @@ pub mod peer_store;
 pub mod rebroadcast_store;
 pub mod signet;
 pub mod snapshot;
+pub mod transaction_policy;
 pub mod undo_store;
 pub mod utxo;
 pub mod validation_owner;
