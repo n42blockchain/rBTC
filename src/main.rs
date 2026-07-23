@@ -39,14 +39,16 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
-        MAX_PENDING_TRANSACTION_INVENTORY, P2pError, PeerSession, connect_outbound,
+        MAX_PENDING_TRANSACTION_INVENTORY, P2pError, PeerSession, TransactionRelay,
+        connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     transaction_admission::{
-        MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS, TransactionAdmissionContext,
-        TransactionAdmissionPool, dependency_packages, transaction_descendant_closure,
+        AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
+        TransactionAdmissionContext, TransactionAdmissionPool, dependency_packages,
+        transaction_descendant_closure,
     },
     transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
@@ -1950,13 +1952,13 @@ async fn maintain_standby(
     mut activate: tokio::sync::oneshot::Receiver<()>,
     keepalive_interval: Duration,
     mut ping_nonce: u64,
-    mut transaction_relay: Option<broadcast::Receiver<Transaction>>,
+    mut transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     mut header_dag: Option<HeaderDag>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     enum StandbyAction {
         Activate,
         Keepalive,
-        Relay(Result<Transaction, broadcast::error::RecvError>),
+        Relay(Result<TransactionRelay, broadcast::error::RecvError>),
     }
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.tick().await;
@@ -2005,12 +2007,10 @@ async fn maintain_standby(
                     connected.validated_header_height = Some(dag.active_tip().height);
                 }
             }
-            StandbyAction::Relay(Ok(transaction)) => {
+            StandbyAction::Relay(Ok(relay)) => {
                 timeout(
                     PEER_TIMEOUT,
-                    connected
-                        .session
-                        .relay_transaction(&transaction, ping_nonce),
+                    connected.session.relay_transaction(&relay, ping_nonce),
                 )
                 .await
                 .map_err(|_| {
@@ -2043,7 +2043,7 @@ async fn connect_and_maintain_standby(
     peer_store: Option<Arc<RedbPeerStore>>,
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
-    transaction_relay: Option<broadcast::Receiver<Transaction>>,
+    transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     header_dag: Option<HeaderDag>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let connected = connect_peer(
@@ -2094,7 +2094,7 @@ fn spawn_peer_connections(
     remotes: &[SocketAddr],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
-    standby_relay: Option<&broadcast::Sender<Transaction>>,
+    standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
 ) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
@@ -2258,7 +2258,7 @@ async fn try_peer_candidates(
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
 ) -> bool {
@@ -2344,7 +2344,7 @@ async fn run_connected_peer(
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
     let ConnectedPeer {
         remote,
@@ -2470,7 +2470,7 @@ async fn complete_assumeutxo_validation(
     options: &Options,
     validation_dir: PathBuf,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
     let active_dir = options
         .data_dir
@@ -2743,7 +2743,7 @@ async fn wait_for_peer_poll(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     duration: Duration,
     wallet: Option<&WalletApiRuntime>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
     struct BroadcastWork {
         transaction: Transaction,
@@ -2822,12 +2822,17 @@ async fn wait_for_peer_poll(
         .await
         {
             Ok(Ok(())) => {
+                let relay = TransactionRelay {
+                    policy_vsize: work.transaction.vsize(),
+                    transaction: work.transaction.clone(),
+                    fee_sats: work.fee_sats,
+                };
                 wallet
                     .rebroadcast
                     .record_broadcast(work.transaction.compute_wtxid(), u64::from(unix_time()?))
                     .map_err(|error| PeerRunError::transient(error.to_string()))?;
                 wallet.compact_candidates.insert(work.transaction.clone());
-                let _ = transaction_relay.send(work.transaction);
+                let _ = transaction_relay.send(relay);
                 if let Some(result) = work.result {
                     let _ = result.send(Ok(()));
                 }
@@ -2923,14 +2928,19 @@ fn retain_disconnected_block_transactions(pending: &mut VecDeque<Transaction>, b
 }
 
 fn relay_selected_transactions(
-    relay: &broadcast::Sender<Transaction>,
-    transactions: &[Transaction],
+    relay: &broadcast::Sender<TransactionRelay>,
+    transactions: &[AdmittedTransactionRelay],
     selected: &HashSet<bitcoin::Txid>,
 ) -> Vec<bitcoin::Txid> {
     let mut relayed = Vec::new();
-    for transaction in transactions {
-        let txid = transaction.compute_txid();
-        if selected.contains(&txid) && relay.send(transaction.clone()).is_ok() {
+    for entry in transactions {
+        let txid = entry.transaction.compute_txid();
+        let event = TransactionRelay {
+            transaction: entry.transaction.clone(),
+            fee_sats: Some(entry.fee_sats),
+            policy_vsize: entry.policy_vsize,
+        };
+        if selected.contains(&txid) && relay.send(event).is_ok() {
             relayed.push(txid);
         }
     }
@@ -2939,7 +2949,8 @@ fn relay_selected_transactions(
 
 fn relay_due_peer_transactions(
     store: &RedbTransactionPoolStore,
-    relay: &broadcast::Sender<Transaction>,
+    active: &[AdmittedTransactionRelay],
+    relay: &broadcast::Sender<TransactionRelay>,
     now: u32,
 ) -> Result<usize, String> {
     let due = store
@@ -2953,7 +2964,7 @@ fn relay_due_peer_transactions(
         .iter()
         .map(Transaction::compute_txid)
         .collect::<HashSet<_>>();
-    let relayed = relay_selected_transactions(relay, &due, &selected);
+    let relayed = relay_selected_transactions(relay, active, &selected);
     if !relayed.is_empty() {
         store
             .record_relay_attempts(&relayed, now)
@@ -3064,7 +3075,7 @@ fn admit_pending_peer_transactions(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_store: Option<&RedbTransactionPoolStore>,
     disconnected_transactions: &VecDeque<Transaction>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
@@ -3225,7 +3236,7 @@ fn admit_pending_peer_transactions(
             )
             .map_err(|error| error.to_string())?;
     }
-    let relay_snapshot = candidate.snapshot();
+    let relay_snapshot = candidate.relay_snapshot();
     *pool = candidate;
     drop(pool);
     let relayed =
@@ -3284,7 +3295,7 @@ async fn sync_validating_node(
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
-    transaction_relay: &broadcast::Sender<Transaction>,
+    transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
         return Err(PeerRunError::transient(
@@ -3611,8 +3622,16 @@ async fn sync_validating_node(
                         mempool_full_rbf,
                     )?;
                     if let Some(store) = transaction_store.as_ref() {
-                        let relayed =
-                            relay_due_peer_transactions(store, transaction_relay, unix_time()?)?;
+                        let active = transaction_pool
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .relay_snapshot();
+                        let relayed = relay_due_peer_transactions(
+                            store,
+                            &active,
+                            transaction_relay,
+                            unix_time()?,
+                        )?;
                         if relayed > 0 {
                             println!(
                                 "republished {relayed} due peer transaction{} to hot standbys",
@@ -6117,7 +6136,7 @@ mod tests {
             None,
         ));
 
-        assert_eq!(relay.send(transaction).unwrap(), 2);
+        assert_eq!(relay.send(transaction_relay(transaction)).unwrap(), 2);
         timeout(Duration::from_secs(2), first_server)
             .await
             .expect("first standby transaction relay timed out")
@@ -6153,8 +6172,18 @@ mod tests {
         .await
         .unwrap();
         let (relay, receiver) = broadcast::channel(1);
-        assert_eq!(relay.send(wallet_broadcast_transaction()).unwrap(), 1);
-        assert_eq!(relay.send(wallet_broadcast_transaction()).unwrap(), 1);
+        assert_eq!(
+            relay
+                .send(transaction_relay(wallet_broadcast_transaction()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            relay
+                .send(transaction_relay(wallet_broadcast_transaction()))
+                .unwrap(),
+            1
+        );
         let (_activate, activation) = tokio::sync::oneshot::channel();
         let error = match maintain_standby(
             connected,
@@ -6192,6 +6221,14 @@ mod tests {
                 value: Amount::from_sat(1_000),
                 script_pubkey: ScriptBuf::new(),
             }],
+        }
+    }
+
+    fn transaction_relay(transaction: Transaction) -> TransactionRelay {
+        TransactionRelay {
+            policy_vsize: transaction.vsize(),
+            transaction,
+            fee_sats: Some(1_000),
         }
     }
 
@@ -6263,15 +6300,32 @@ mod tests {
         let mut second = wallet_broadcast_transaction();
         second.input[0].previous_output.txid = Txid::from_byte_array([42; 32]);
         let (relay, mut receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let first = AdmittedTransactionRelay {
+            policy_vsize: first.vsize(),
+            transaction: first,
+            fee_sats: 500,
+        };
+        let second = AdmittedTransactionRelay {
+            policy_vsize: second.vsize(),
+            transaction: second,
+            fee_sats: 1_000,
+        };
 
         let relayed = relay_selected_transactions(
             &relay,
             &[first, second.clone()],
-            &HashSet::from([second.compute_txid()]),
+            &HashSet::from([second.transaction.compute_txid()]),
         );
 
-        assert_eq!(relayed, vec![second.compute_txid()]);
-        assert_eq!(receiver.try_recv().unwrap(), second);
+        assert_eq!(relayed, vec![second.transaction.compute_txid()]);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            TransactionRelay {
+                transaction: second.transaction,
+                fee_sats: Some(second.fee_sats),
+                policy_vsize: second.policy_vsize,
+            }
+        );
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -6286,16 +6340,28 @@ mod tests {
                 .unwrap();
         let transaction = wallet_broadcast_transaction();
         store.replace(std::slice::from_ref(&transaction)).unwrap();
+        let active = vec![AdmittedTransactionRelay {
+            policy_vsize: transaction.vsize(),
+            transaction: transaction.clone(),
+            fee_sats: 1_000,
+        }];
         let (relay, receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         drop(receiver);
 
-        assert_eq!(relay_due_peer_transactions(&store, &relay, 100).unwrap(), 0);
+        assert_eq!(
+            relay_due_peer_transactions(&store, &active, &relay, 100).unwrap(),
+            0
+        );
         let mut receiver = relay.subscribe();
-        assert_eq!(relay_due_peer_transactions(&store, &relay, 101).unwrap(), 1);
-        assert_eq!(receiver.try_recv().unwrap(), transaction);
+        assert_eq!(
+            relay_due_peer_transactions(&store, &active, &relay, 101).unwrap(),
+            1
+        );
+        assert_eq!(receiver.try_recv().unwrap().transaction, transaction);
         assert_eq!(
             relay_due_peer_transactions(
                 &store,
+                &active,
                 &relay,
                 101 + PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS - 1
             )
@@ -6305,6 +6371,7 @@ mod tests {
         assert_eq!(
             relay_due_peer_transactions(
                 &store,
+                &active,
                 &relay,
                 101 + PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS
             )
@@ -6496,7 +6563,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(completion.await.unwrap(), Ok(()));
-        assert_eq!(standby_receiver.recv().await.unwrap(), transaction);
+        let relayed = standby_receiver.recv().await.unwrap();
+        assert_eq!(relayed.transaction, transaction);
+        assert_eq!(relayed.fee_sats, Some(1_000));
         assert_eq!(wallet.compact_candidates.snapshot(), vec![transaction]);
         server.await.unwrap();
     }

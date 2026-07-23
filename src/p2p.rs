@@ -45,6 +45,7 @@ pub const MAX_PENDING_TRANSACTION_INVENTORY: usize = 64;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
+const FEEFILTER_VERSION: u32 = 70_013;
 const SENDCMPCT_VERSION: u32 = 70_014;
 const COMPACT_BLOCK_VERSION: u64 = 2;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
@@ -59,6 +60,7 @@ pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
 pub const MAX_COMPACT_BLOCK_TRANSACTIONS: usize = 16_666;
 const PROTOCOL_VERSION: u32 = 70_016;
 const MIN_PEER_PROTOCOL_VERSION: u32 = 31_800;
+const MAX_MONEY_SATS: i64 = 21_000_000 * 100_000_000;
 
 fn validate_user_agent(user_agent: &str) -> Result<(), P2pError> {
     if user_agent.len() > MAX_USER_AGENT_LEN {
@@ -346,6 +348,17 @@ pub struct BlockTransferStats {
     pub response_time: Duration,
 }
 
+/// One locally validated transaction offered to hot-standby relay sessions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionRelay {
+    /// Full witness transaction.
+    pub transaction: Transaction,
+    /// Known transaction fee, or `None` for legacy durable wallet rebroadcast rows.
+    pub fee_sats: Option<u64>,
+    /// Sigop-adjusted policy vsize when known, otherwise ordinary transaction vsize.
+    pub policy_vsize: usize,
+}
+
 struct CompactBlockReconstruction {
     header: bitcoin::block::Header,
     transactions: Vec<Option<Transaction>>,
@@ -530,6 +543,7 @@ pub struct PeerSession<S> {
     transport: V1Transport<S>,
     remote_version: VersionMessage,
     wtxid_relay: bool,
+    fee_filter_sat_kvb: u64,
     compact_block_version: Option<u64>,
     requested_compact_blocks: bool,
     pending_messages: VecDeque<(NetworkMessage, usize)>,
@@ -549,6 +563,7 @@ impl<S> PeerSession<S> {
             transport,
             remote_version,
             wtxid_relay,
+            fee_filter_sat_kvb: 0,
             compact_block_version: None,
             requested_compact_blocks: false,
             pending_messages: VecDeque::new(),
@@ -578,6 +593,12 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn compact_block_version(&self) -> Option<u64> {
         self.compact_block_version
+    }
+
+    /// Returns the most recent valid BIP133 filter received from this peer.
+    #[must_use]
+    pub const fn fee_filter_sat_kvb(&self) -> u64 {
+        self.fee_filter_sat_kvb
     }
 
     /// Drains unsolicited transactions captured while another bounded response was in flight.
@@ -925,6 +946,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             self.compact_block_version = Some(COMPACT_BLOCK_VERSION);
         }
         match message {
+            NetworkMessage::FeeFilter(rate)
+                if self.remote_version.version >= FEEFILTER_VERSION
+                    && (0..=MAX_MONEY_SATS).contains(&rate) =>
+            {
+                self.fee_filter_sat_kvb =
+                    u64::try_from(rate).expect("non-negative fee filter fits u64");
+                Ok(None)
+            }
+            NetworkMessage::FeeFilter(_) => Ok(None),
             NetworkMessage::Ping(nonce) => {
                 self.transport
                     .write_message(NetworkMessage::Pong(nonce))
@@ -1036,15 +1066,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// of the same retained transaction are suppressed.
     pub async fn relay_transaction(
         &mut self,
-        transaction: &Transaction,
+        relay: &TransactionRelay,
         ping_nonce: u64,
     ) -> Result<(), P2pError> {
+        let transaction = &relay.transaction;
         Self::validate_outbound_transaction(transaction)?;
         let inventory = self.transaction_inventory(transaction);
-        if !self
-            .announced_transactions
-            .iter()
-            .any(|(announced, _, _)| *announced == inventory)
+        let vbytes = relay.policy_vsize.max(transaction.vsize());
+        let below_fee_filter = relay
+            .fee_sats
+            .is_some_and(|fee_sats| fee_sats < fee_for_filter(self.fee_filter_sat_kvb, vbytes));
+        if !below_fee_filter
+            && !self
+                .announced_transactions
+                .iter()
+                .any(|(announced, _, _)| *announced == inventory)
         {
             let payload_len = serialize(transaction).len();
             while self.announced_transactions.len() >= MAX_ANNOUNCED_TRANSACTIONS
@@ -1562,6 +1598,15 @@ fn validate_compact_block_len(
     Ok(())
 }
 
+fn fee_for_filter(rate_sat_kvb: u64, vbytes: usize) -> u64 {
+    let fee = u64::try_from(
+        u128::from(rate_sat_kvb).saturating_mul(u128::try_from(vbytes).unwrap_or(u128::MAX))
+            / 1_000,
+    )
+    .unwrap_or(u64::MAX);
+    if fee == 0 && rate_sat_kvb > 0 { 1 } else { fee }
+}
+
 fn validate_inventory_len(command: &'static str, count: usize) -> Result<(), P2pError> {
     if count > MAX_INVENTORY_ENTRIES {
         return Err(P2pError::TooManyInventoryEntries { command, count });
@@ -1696,6 +1741,14 @@ mod tests {
             bitcoin::blockdata::constants::genesis_block(Network::Regtest).txdata[0].clone();
         transaction.input[0].previous_output.vout = 0;
         transaction
+    }
+
+    fn relay_entry(transaction: Transaction) -> TransactionRelay {
+        TransactionRelay {
+            policy_vsize: transaction.vsize(),
+            transaction,
+            fee_sats: Some(10_000),
+        }
     }
 
     #[test]
@@ -2953,6 +3006,7 @@ mod tests {
     async fn legacy_transaction_relay_announces_txid_and_serves_witness_request() {
         let transaction = relay_test_transaction();
         let txid = transaction.compute_txid();
+        let relay = relay_entry(transaction.clone());
         let (client_stream, server_stream) = duplex(1024 * 1024);
         let expected = transaction.clone();
         let client = tokio::spawn(async move {
@@ -2960,7 +3014,7 @@ mod tests {
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
-            session.relay_transaction(&transaction, 41).await
+            session.relay_transaction(&relay, 41).await
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -2995,6 +3049,7 @@ mod tests {
     #[tokio::test]
     async fn wtxid_relay_services_getdata_and_preserves_crossed_messages() {
         let transaction = relay_test_transaction();
+        let relay = relay_entry(transaction.clone());
         let inventory = Inventory::WTx(transaction.compute_wtxid());
         let unknown = Inventory::Transaction(bitcoin::Txid::from_byte_array([9; 32]));
         let expected = transaction.clone();
@@ -3003,7 +3058,7 @@ mod tests {
             let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
             transport.peer_wtxid_relay = true;
             let mut session = PeerSession::new(transport, version(1));
-            session.relay_transaction(&transaction, 42).await.unwrap();
+            session.relay_transaction(&relay, 42).await.unwrap();
             session.read_message().await.unwrap()
         });
         let server = tokio::spawn(async move {
@@ -3045,6 +3100,7 @@ mod tests {
     #[tokio::test]
     async fn uninterested_peer_completes_relay_and_duplicate_inv_is_suppressed() {
         let transaction = relay_test_transaction();
+        let relay = relay_entry(transaction.clone());
         let inventory = Inventory::Transaction(transaction.compute_txid());
         let (client_stream, server_stream) = duplex(1024 * 1024);
         let client = tokio::spawn(async move {
@@ -3052,8 +3108,8 @@ mod tests {
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
-            session.relay_transaction(&transaction, 43).await.unwrap();
-            session.relay_transaction(&transaction, 44).await
+            session.relay_transaction(&relay, 43).await.unwrap();
+            session.relay_transaction(&relay, 44).await
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -3084,8 +3140,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bip133_filter_tracks_valid_updates_and_skips_low_fee_inventory() {
+        let transaction = relay_test_transaction();
+        let inventory = Inventory::Transaction(transaction.compute_txid());
+        let relay = TransactionRelay {
+            fee_sats: Some(u64::try_from(transaction.vsize()).unwrap()),
+            policy_vsize: transaction.vsize(),
+            transaction,
+        };
+        let mut unknown_fee_transaction = relay_test_transaction();
+        unknown_fee_transaction.output[0].value = Amount::from_sat(
+            unknown_fee_transaction.output[0]
+                .value
+                .to_sat()
+                .saturating_sub(1),
+        );
+        let unknown_fee_inventory = Inventory::Transaction(unknown_fee_transaction.compute_txid());
+        let unknown_fee_relay = TransactionRelay {
+            policy_vsize: unknown_fee_transaction.vsize(),
+            transaction: unknown_fee_transaction,
+            fee_sats: None,
+        };
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = FEEFILTER_VERSION;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.ping(60).await.unwrap();
+            assert_eq!(session.fee_filter_sat_kvb(), 2_000);
+
+            session.relay_transaction(&relay, 61).await.unwrap();
+            assert_eq!(session.fee_filter_sat_kvb(), 1_000);
+            session.relay_transaction(&relay, 62).await.unwrap();
+            session
+                .relay_transaction(&unknown_fee_relay, 63)
+                .await
+                .unwrap();
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(60)
+            );
+            transport
+                .write_message(NetworkMessage::FeeFilter(2_000))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Pong(60))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(61)
+            );
+            transport
+                .write_message(NetworkMessage::FeeFilter(-1))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::FeeFilter(MAX_MONEY_SATS + 1))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::FeeFilter(1_000))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Pong(61))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![inventory])
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(62)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(62))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Inv(vec![unknown_fee_inventory])
+            );
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(63)
+            );
+            transport
+                .write_message(NetworkMessage::Pong(63))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn transaction_relay_rejects_oversized_getdata_before_serving() {
         let transaction = relay_test_transaction();
+        let relay = relay_entry(transaction.clone());
         let inventory = Inventory::Transaction(transaction.compute_txid());
         let (client_stream, server_stream) = duplex(4 * 1024 * 1024);
         let client = tokio::spawn(async move {
@@ -3093,7 +3257,7 @@ mod tests {
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
-            session.relay_transaction(&transaction, 45).await
+            session.relay_transaction(&relay, 45).await
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());

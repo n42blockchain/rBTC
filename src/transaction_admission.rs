@@ -252,6 +252,17 @@ pub struct PackageAdmissionOutcome {
     pub replaced: usize,
 }
 
+/// Fee metadata required to apply per-peer transaction announcement filters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedTransactionRelay {
+    /// Full witness transaction.
+    pub transaction: Transaction,
+    /// Exact fee derived from validated prevouts.
+    pub fee_sats: u64,
+    /// Sigop-adjusted mempool virtual size.
+    pub policy_vsize: usize,
+}
+
 #[derive(Clone)]
 struct AdmittedTransaction {
     transaction: Transaction,
@@ -490,6 +501,19 @@ impl TransactionAdmissionPool {
         self.entries
             .iter()
             .map(|entry| entry.transaction.clone())
+            .collect()
+    }
+
+    /// Clones the active pool with exact fee and policy-vsize relay metadata.
+    #[must_use]
+    pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
+        self.entries
+            .iter()
+            .map(|entry| AdmittedTransactionRelay {
+                transaction: entry.transaction.clone(),
+                fee_sats: entry.fee_sats,
+                policy_vsize: entry.policy_vsize,
+            })
             .collect()
     }
 
