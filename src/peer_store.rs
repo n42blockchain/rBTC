@@ -18,6 +18,7 @@ const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_addresses
 const PENALTIES: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_penalties");
 const GENESIS_KEY: &str = "genesis";
 const BUCKET_KEY: &str = "bucket_key";
+const TRIED_COLLISIONS_KEY: &str = "tried_collisions";
 const BUCKET_KEY_LEN: usize = 32;
 const MAX_STORED_PEERS: usize = 4_096;
 const MAX_PEERS_PER_SOURCE_GROUP: usize = 64;
@@ -41,6 +42,8 @@ const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
 const MAX_RECORDED_BLOCK_THROUGHPUT_BPS: u32 = 1_000_000_000;
+const MAX_TRIED_COLLISIONS: usize = 10;
+const MAX_STORED_TRIED_COLLISIONS_BYTES: usize = 8 * 1024;
 
 type PeerPriority = (
     u8,
@@ -105,6 +108,8 @@ struct StoredPeer {
     handshake_millis: u32,
     #[serde(default)]
     block_throughput_bps: u32,
+    #[serde(default)]
+    in_new_table: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,6 +118,25 @@ struct StoredPenalty {
     violations: u8,
     last_violation: u32,
     discouraged_until: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredTriedCollision {
+    challenger: String,
+    incumbent: String,
+    created_at: u32,
+}
+
+/// One successful new-table peer waiting for its tried-bucket incumbent to be probed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TriedCollision {
+    /// Successful challenger retained in the new table until resolution.
+    pub challenger: std::net::SocketAddr,
+    /// Existing tried peer that must be checked before replacement.
+    pub incumbent: std::net::SocketAddr,
+    /// Unix time when the collision was queued.
+    pub created_at: u32,
 }
 
 /// Result counters for one learned-address batch.
@@ -192,7 +216,7 @@ impl RedbPeerStore {
         let group = source_group(source.ip());
         let mut group_count = records
             .values()
-            .filter(|record| record.last_success == 0 && record.source_group == group)
+            .filter(|record| !record_is_tried(record) && record.source_group == group)
             .count();
         let mut incoming = addresses.to_vec();
         incoming.sort_unstable_by_key(|address| std::cmp::Reverse(address.last_seen));
@@ -232,8 +256,9 @@ impl RedbPeerStore {
                 successful_sessions,
                 handshake_millis,
                 block_throughput_bps,
+                in_new_table,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0, 0, 0),
+                || (group.clone(), 0, 0, 0, 0, 0, 0, 0, false),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -244,6 +269,7 @@ impl RedbPeerStore {
                         record.successful_sessions,
                         record.handshake_millis,
                         record.block_throughput_bps,
+                        record.in_new_table,
                     )
                 },
             );
@@ -260,6 +286,7 @@ impl RedbPeerStore {
                     successful_sessions,
                     handshake_millis,
                     block_throughput_bps,
+                    in_new_table,
                 },
             );
             stats.accepted += 1;
@@ -295,6 +322,7 @@ impl RedbPeerStore {
         });
         let key = address.to_string();
         let existing = records.remove(&key);
+        let already_tried = existing.as_ref().is_some_and(record_is_tried);
         let mut record = existing.unwrap_or_else(|| StoredPeer {
             services: services.to_u64(),
             last_seen: normalize_last_seen(now, now),
@@ -306,15 +334,62 @@ impl RedbPeerStore {
             successful_sessions: 0,
             handshake_millis: 0,
             block_throughput_bps: 0,
+            in_new_table: false,
         });
         record.services = services.to_u64();
         record.last_seen = normalize_last_seen(now, now).max(record.last_seen);
         record.last_success = now;
         record.consecutive_failures = 0;
+        let mut collisions = self.load_tried_collisions()?;
+        collisions.retain(|collision| collision.challenger != key);
+        if already_tried {
+            record.in_new_table = false;
+        } else {
+            let bucket = tried_bucket(&self.bucket_key, address);
+            let incumbent = records
+                .iter()
+                .filter_map(|(stored_address, stored)| {
+                    let socket = std::net::SocketAddr::from_str(stored_address).ok()?;
+                    (record_is_tried(stored) && tried_bucket(&self.bucket_key, socket) == bucket)
+                        .then_some((peer_priority(stored), stored_address))
+                })
+                .max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+            let tried_count = records
+                .iter()
+                .filter(|(stored_address, stored)| {
+                    record_is_tried(stored)
+                        && std::net::SocketAddr::from_str(stored_address)
+                            .is_ok_and(|socket| tried_bucket(&self.bucket_key, socket) == bucket)
+                })
+                .count();
+            if tried_count == BUCKET_CAPACITY {
+                record.in_new_table = true;
+                collisions.push(StoredTriedCollision {
+                    challenger: key.clone(),
+                    incumbent: incumbent
+                        .expect("full tried bucket has an incumbent")
+                        .1
+                        .clone(),
+                    created_at: now,
+                });
+                collisions.sort_unstable_by(|left, right| {
+                    left.created_at
+                        .cmp(&right.created_at)
+                        .then_with(|| left.challenger.cmp(&right.challenger))
+                });
+                if collisions.len() > MAX_TRIED_COLLISIONS {
+                    collisions.drain(..collisions.len() - MAX_TRIED_COLLISIONS);
+                }
+            } else {
+                record.in_new_table = false;
+            }
+        }
         records.insert(key.clone(), record);
         let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
         let retained = ordered.iter().any(|(stored, _)| stored == &key);
-        self.replace_all(&ordered)?;
+        let retained_records = ordered.iter().cloned().collect::<HashMap<_, _>>();
+        let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.bucket_key);
+        self.replace_all_and_collisions(&ordered, &collisions)?;
         Ok(retained)
     }
 
@@ -358,6 +433,82 @@ impl RedbPeerStore {
             candidates,
             limit.min(MAX_STORED_PEERS),
         ))
+    }
+
+    /// Returns the bounded tried-collision queue in oldest-first probe order.
+    pub fn tried_collisions(&self) -> Result<Vec<TriedCollision>, PeerStoreError> {
+        let records = self.load_records()?;
+        Ok(
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key)
+                .into_iter()
+                .map(|collision| TriedCollision {
+                    challenger: collision
+                        .challenger
+                        .parse()
+                        .expect("stored collision challenger was validated"),
+                    incumbent: collision
+                        .incumbent
+                        .parse()
+                        .expect("stored collision incumbent was validated"),
+                    created_at: collision.created_at,
+                })
+                .collect(),
+        )
+    }
+
+    /// Resolves every queued collision for one incumbent after an outbound probe.
+    ///
+    /// A live incumbent remains tried and all challengers remain in new. When
+    /// the incumbent cannot complete a handshake, the strongest queued
+    /// challenger is promoted and the incumbent is demoted to new.
+    pub fn resolve_tried_collision_probe(
+        &self,
+        incumbent: std::net::SocketAddr,
+        alive: bool,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_records()?;
+        let incumbent_key = incumbent.to_string();
+        let collisions =
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key);
+        let (matching, remaining): (Vec<_>, Vec<_>) = collisions
+            .into_iter()
+            .partition(|collision| collision.incumbent == incumbent_key);
+        if matching.is_empty() {
+            return Ok(false);
+        }
+
+        if alive {
+            if let Some(record) = records.get_mut(&incumbent_key) {
+                record.last_success = now;
+                record.consecutive_failures = 0;
+                record.in_new_table = false;
+            }
+        } else {
+            let winner = matching
+                .iter()
+                .filter_map(|collision| {
+                    records
+                        .get(&collision.challenger)
+                        .map(|record| (peer_priority(record), collision.challenger.as_str()))
+                })
+                .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)))
+                .map(|(_, challenger)| challenger.to_owned());
+            if let Some(record) = records.get_mut(&incumbent_key) {
+                record.in_new_table = true;
+            }
+            if let Some(winner) = winner {
+                if let Some(record) = records.get_mut(&winner) {
+                    record.in_new_table = false;
+                }
+            }
+        }
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let retained = ordered.iter().cloned().collect::<HashMap<_, _>>();
+        let remaining = sanitize_tried_collisions(remaining, &retained, &self.bucket_key);
+        self.replace_all_and_collisions(&ordered, &remaining)?;
+        Ok(true)
     }
 
     /// Durably records a connection attempt before network I/O starts.
@@ -543,6 +694,15 @@ impl RedbPeerStore {
         Ok(records)
     }
 
+    fn load_tried_collisions(&self) -> Result<Vec<StoredTriedCollision>, PeerStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(META)?;
+        let Some(encoded) = table.get(TRIED_COLLISIONS_KEY)? else {
+            return Ok(Vec::new());
+        };
+        decode_stored_tried_collisions(encoded.value())
+    }
+
     fn load_penalties(&self) -> Result<HashMap<String, StoredPenalty>, PeerStoreError> {
         let transaction = self.db.begin_read()?;
         let table = transaction.open_table(PENALTIES)?;
@@ -570,6 +730,20 @@ impl RedbPeerStore {
     }
 
     fn replace_all(&self, records: &[(String, StoredPeer)]) -> Result<(), PeerStoreError> {
+        let records_by_key = records.iter().cloned().collect::<HashMap<_, _>>();
+        let collisions = sanitize_tried_collisions(
+            self.load_tried_collisions()?,
+            &records_by_key,
+            &self.bucket_key,
+        );
+        self.replace_all_and_collisions(records, &collisions)
+    }
+
+    fn replace_all_and_collisions(
+        &self,
+        records: &[(String, StoredPeer)],
+        collisions: &[StoredTriedCollision],
+    ) -> Result<(), PeerStoreError> {
         let transaction = self.db.begin_write()?;
         {
             let mut table = transaction.open_table(PEERS)?;
@@ -584,6 +758,14 @@ impl RedbPeerStore {
                 let encoded = serde_json::to_vec(record)?;
                 table.insert(key.as_str(), encoded.as_slice())?;
             }
+            let encoded = serde_json::to_vec(collisions)?;
+            if encoded.len() > MAX_STORED_TRIED_COLLISIONS_BYTES {
+                return Err(PeerStoreError::Malformed(
+                    "tried collision metadata exceeds size limit",
+                ));
+            }
+            let mut meta = transaction.open_table(META)?;
+            meta.insert(TRIED_COLLISIONS_KEY, encoded.as_slice())?;
         }
         transaction.commit()?;
         Ok(())
@@ -632,6 +814,9 @@ fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
     if record.block_throughput_bps > MAX_RECORDED_BLOCK_THROUGHPUT_BPS {
         return Err(PeerStoreError::Malformed("peer block throughput"));
     }
+    if record.in_new_table && record.last_success == 0 {
+        return Err(PeerStoreError::Malformed("peer table membership"));
+    }
     Ok(record)
 }
 
@@ -648,6 +833,32 @@ fn decode_stored_penalty(input: &[u8]) -> Result<StoredPenalty, PeerStoreError> 
     Ok(penalty)
 }
 
+fn decode_stored_tried_collisions(
+    input: &[u8],
+) -> Result<Vec<StoredTriedCollision>, PeerStoreError> {
+    if input.len() > MAX_STORED_TRIED_COLLISIONS_BYTES {
+        return Err(PeerStoreError::Malformed(
+            "tried collision metadata exceeds size limit",
+        ));
+    }
+    let collisions: Vec<StoredTriedCollision> = serde_json::from_slice(input)?;
+    if collisions.len() > MAX_TRIED_COLLISIONS {
+        return Err(PeerStoreError::Malformed("too many tried collisions"));
+    }
+    let mut challengers = std::collections::HashSet::new();
+    for collision in &collisions {
+        if collision.created_at == 0
+            || collision.challenger == collision.incumbent
+            || std::net::SocketAddr::from_str(&collision.challenger).is_err()
+            || std::net::SocketAddr::from_str(&collision.incumbent).is_err()
+            || !challengers.insert(collision.challenger.as_str())
+        {
+            return Err(PeerStoreError::Malformed("tried collision metadata"));
+        }
+    }
+    Ok(collisions)
+}
+
 /// Validates one untrusted persisted peer-address JSON value.
 pub fn validate_stored_peer_record(input: &[u8]) -> Result<(), PeerStoreError> {
     decode_stored_peer(input).map(drop)
@@ -656,6 +867,11 @@ pub fn validate_stored_peer_record(input: &[u8]) -> Result<(), PeerStoreError> {
 /// Validates one untrusted persisted protocol-penalty JSON value.
 pub fn validate_stored_peer_penalty(input: &[u8]) -> Result<(), PeerStoreError> {
     decode_stored_penalty(input).map(drop)
+}
+
+/// Validates untrusted persisted tried-collision queue JSON.
+pub fn validate_stored_tried_collisions(input: &[u8]) -> Result<(), PeerStoreError> {
+    decode_stored_tried_collisions(input).map(drop)
 }
 
 fn valid_source_group(group: &str) -> bool {
@@ -799,11 +1015,43 @@ fn peer_bucket(
     address: std::net::SocketAddr,
     record: &StoredPeer,
 ) -> PeerBucket {
-    if record.last_success == 0 {
-        (false, new_bucket(key, address, &record.source_group))
-    } else {
+    if record_is_tried(record) {
         (true, tried_bucket(key, address))
+    } else {
+        (false, new_bucket(key, address, &record.source_group))
     }
+}
+
+fn record_is_tried(record: &StoredPeer) -> bool {
+    record.last_success != 0 && !record.in_new_table
+}
+
+fn sanitize_tried_collisions(
+    collisions: Vec<StoredTriedCollision>,
+    records: &HashMap<String, StoredPeer>,
+    key: &[u8; BUCKET_KEY_LEN],
+) -> Vec<StoredTriedCollision> {
+    collisions
+        .into_iter()
+        .filter(|collision| {
+            let Some(challenger) = records.get(&collision.challenger) else {
+                return false;
+            };
+            let Some(incumbent) = records.get(&collision.incumbent) else {
+                return false;
+            };
+            let Ok(challenger_address) = std::net::SocketAddr::from_str(&collision.challenger)
+            else {
+                return false;
+            };
+            let Ok(incumbent_address) = std::net::SocketAddr::from_str(&collision.incumbent) else {
+                return false;
+            };
+            !record_is_tried(challenger)
+                && record_is_tried(incumbent)
+                && tried_bucket(key, challenger_address) == tried_bucket(key, incumbent_address)
+        })
+        .collect()
 }
 
 fn retain_bucketed(
@@ -969,6 +1217,24 @@ mod tests {
             services,
             last_seen,
         }
+    }
+
+    fn same_tried_bucket_addresses(
+        key: &[u8; BUCKET_KEY_LEN],
+        count: usize,
+    ) -> Vec<std::net::SocketAddr> {
+        let mut by_bucket: HashMap<u16, Vec<std::net::SocketAddr>> = HashMap::new();
+        for third in 0_u8..=u8::MAX {
+            for fourth in 1_u8..=u8::MAX {
+                let address = format!("1.1.{third}.{fourth}:8333").parse().unwrap();
+                let addresses = by_bucket.entry(tried_bucket(key, address)).or_default();
+                addresses.push(address);
+                if addresses.len() == count {
+                    return addresses.clone();
+                }
+            }
+        }
+        panic!("test address space should fill one tried bucket");
     }
 
     #[test]
@@ -1228,6 +1494,7 @@ mod tests {
             successful_sessions: 0,
             handshake_millis: 0,
             block_throughput_bps: 0,
+            in_new_table: false,
         };
         assert!(!retry_ready(
             &maximally_failed,
@@ -1447,7 +1714,8 @@ mod tests {
         let legacy = serde_json::to_vec(&serde_json::json!({
             "services": services,
             "last_seen": now,
-            "source_group": "v4:127:0"
+            "source_group": "v4:127:0",
+            "last_success": now - 1
         }))
         .unwrap();
         let transaction = store.db.begin_write().unwrap();
@@ -1459,6 +1727,7 @@ mod tests {
 
         let socket = address.parse().unwrap();
         assert_eq!(store.candidates(now, 16).unwrap(), vec![socket]);
+        assert!(record_is_tried(&store.load_records().unwrap()[address]));
         assert!(store.record_attempt(socket, now).unwrap());
         assert!(store.candidates(now, 16).unwrap().is_empty());
     }
@@ -1478,6 +1747,10 @@ mod tests {
         validate_stored_peer_record(&valid_peer).unwrap();
         validate_stored_peer_penalty(
             br#"{"violations":1,"last_violation":1800000000,"discouraged_until":1800003600}"#,
+        )
+        .unwrap();
+        validate_stored_tried_collisions(
+            br#"[{"challenger":"1.1.1.1:8333","incumbent":"2.2.2.2:8333","created_at":1800000000}]"#,
         )
         .unwrap();
 
@@ -1501,6 +1774,14 @@ mod tests {
         }
         assert!(validate_stored_peer_record(&vec![b' '; MAX_STORED_PEER_BYTES + 1]).is_err());
         assert!(validate_stored_peer_penalty(&vec![b' '; MAX_STORED_PENALTY_BYTES + 1]).is_err());
+        for invalid in [
+            br#"[{"challenger":"1.1.1.1:8333","incumbent":"1.1.1.1:8333","created_at":1}]"#
+                .as_slice(),
+            br#"[{"challenger":"bad","incumbent":"2.2.2.2:8333","created_at":1}]"#,
+            br#"[{"challenger":"1.1.1.1:8333","incumbent":"2.2.2.2:8333","created_at":0}]"#,
+        ] {
+            assert!(validate_stored_tried_collisions(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1540,6 +1821,7 @@ mod tests {
             successful_sessions: 0,
             handshake_millis: 0,
             block_throughput_bps: 0,
+            in_new_table: false,
         };
         let records = HashMap::from([
             ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),
@@ -1552,6 +1834,112 @@ mod tests {
             .map(|(address, _)| address)
             .collect::<Vec<_>>();
         assert_eq!(retained, vec!["1.1.1.1:8333", "2.2.2.2:8333"]);
+    }
+
+    #[test]
+    fn tried_collision_waits_for_persisted_incumbent_probe_before_promotion() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        let addresses = same_tried_bucket_addresses(&store.bucket_key, BUCKET_CAPACITY + 1);
+        for address in &addresses[..BUCKET_CAPACITY] {
+            assert!(store.insert_verified(*address, services, now).unwrap());
+        }
+        let challenger = addresses[BUCKET_CAPACITY];
+        assert!(
+            store
+                .insert_verified(challenger, services, now + 1)
+                .unwrap()
+        );
+        let collisions = store.tried_collisions().unwrap();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].challenger, challenger);
+        let incumbent = collisions[0].incumbent;
+        let records = store.load_records().unwrap();
+        assert!(!record_is_tried(&records[&challenger.to_string()]));
+        assert!(record_is_tried(&records[&incumbent.to_string()]));
+        drop(store);
+
+        let reopened = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.tried_collisions().unwrap(), collisions);
+        assert!(
+            reopened
+                .resolve_tried_collision_probe(incumbent, true, now + 2)
+                .unwrap()
+        );
+        assert!(reopened.tried_collisions().unwrap().is_empty());
+        let records = reopened.load_records().unwrap();
+        assert!(record_is_tried(&records[&incumbent.to_string()]));
+        assert!(!record_is_tried(&records[&challenger.to_string()]));
+
+        assert!(
+            reopened
+                .insert_verified(challenger, services, now + 3)
+                .unwrap()
+        );
+        let second_incumbent = reopened.tried_collisions().unwrap()[0].incumbent;
+        assert!(
+            reopened
+                .resolve_tried_collision_probe(second_incumbent, false, now + 4)
+                .unwrap()
+        );
+        assert!(reopened.tried_collisions().unwrap().is_empty());
+        let records = reopened.load_records().unwrap();
+        assert!(!record_is_tried(&records[&second_incumbent.to_string()]));
+        assert!(record_is_tried(&records[&challenger.to_string()]));
+        let tried_in_bucket = records
+            .iter()
+            .filter(|(address, record)| {
+                record_is_tried(record)
+                    && std::net::SocketAddr::from_str(address).is_ok_and(|address| {
+                        tried_bucket(&reopened.bucket_key, address)
+                            == tried_bucket(&reopened.bucket_key, challenger)
+                    })
+            })
+            .count();
+        assert_eq!(tried_in_bucket, BUCKET_CAPACITY);
+    }
+
+    #[test]
+    fn tried_collision_queue_is_bounded_and_metadata_is_strict() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        let addresses = same_tried_bucket_addresses(
+            &store.bucket_key,
+            BUCKET_CAPACITY + MAX_TRIED_COLLISIONS + 1,
+        );
+        for address in &addresses[..BUCKET_CAPACITY] {
+            store.insert_verified(*address, services, now).unwrap();
+        }
+        for (offset, address) in addresses[BUCKET_CAPACITY..].iter().enumerate() {
+            store
+                .insert_verified(*address, services, now + 1 + u32::try_from(offset).unwrap())
+                .unwrap();
+        }
+        let collisions = store.tried_collisions().unwrap();
+        assert_eq!(collisions.len(), MAX_TRIED_COLLISIONS);
+        assert!(
+            !collisions
+                .iter()
+                .any(|collision| collision.challenger == addresses[BUCKET_CAPACITY])
+        );
+
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut meta = transaction.open_table(META).unwrap();
+            meta.insert(TRIED_COLLISIONS_KEY, b"[{}]".as_slice())
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        assert!(matches!(
+            store.tried_collisions(),
+            Err(PeerStoreError::Encoding(_))
+        ));
     }
 
     #[test]
@@ -1569,6 +1957,7 @@ mod tests {
             successful_sessions: 0,
             handshake_millis: 0,
             block_throughput_bps: 0,
+            in_new_table: false,
         };
 
         let mut tried_by_bucket: HashMap<u16, Vec<std::net::SocketAddr>> = HashMap::new();

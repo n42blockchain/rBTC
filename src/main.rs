@@ -1020,6 +1020,17 @@ async fn run_peer_pool(
     let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
     let mut remotes = options.remotes.clone();
     if let Some(store) = &peer_store {
+        for collision in store
+            .tried_collisions()
+            .map_err(|error| error.to_string())?
+        {
+            if remotes.len() == MAX_CONFIGURED_PEERS {
+                break;
+            }
+            if !remotes.contains(&collision.incumbent) {
+                remotes.push(collision.incumbent);
+            }
+        }
         for learned in store
             .candidates(unix_time()?, MAX_CONFIGURED_PEERS)
             .map_err(|error| error.to_string())?
@@ -2165,9 +2176,6 @@ fn record_peer_failure(
     kind: PeerFailureKind,
     manual: bool,
 ) {
-    if kind != PeerFailureKind::ProtocolViolation || manual {
-        return;
-    }
     let Some(store) = store else {
         return;
     };
@@ -2178,6 +2186,12 @@ fn record_peer_failure(
             return;
         }
     };
+    if let Err(error) = store.resolve_tried_collision_probe(remote, false, now) {
+        eprintln!("tried-collision failure resolution for {remote} failed: {error}");
+    }
+    if kind != PeerFailureKind::ProtocolViolation || manual {
+        return;
+    }
     match store.record_protocol_violation(remote, now) {
         Ok(until) => println!(
             "discouraged peer {remote} after an objective protocol violation until Unix time {until}"
@@ -2219,6 +2233,9 @@ fn record_verified_peer(
         Ok(true) => {
             if let Err(error) = store.record_handshake_latency(remote, handshake_millis) {
                 eprintln!("peer handshake latency persistence for {remote} failed: {error}");
+            }
+            if let Err(error) = store.resolve_tried_collision_probe(remote, true, now) {
+                eprintln!("tried-collision success resolution for {remote} failed: {error}");
             }
         }
         Ok(false) => eprintln!("verified peer {remote} was not eligible for persistence"),
