@@ -5,14 +5,35 @@ repo_root="$(git rev-parse --show-toplevel)"
 max_bytes="${RBTC_SYNC_MAX_BYTES:-1073741824}"
 timeout_seconds="${RBTC_SYNC_TIMEOUT_SECONDS:-600}"
 reserve_bytes="${RBTC_SYNC_FREE_RESERVE_BYTES:-2147483648}"
-target_hash="00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53"
+if [[ "${RBTC_SYNC_TARGET_HEIGHT+x}" != "${RBTC_SYNC_TARGET_HASH+x}" ]]; then
+    echo "RBTC_SYNC_TARGET_HEIGHT and RBTC_SYNC_TARGET_HASH must be supplied together" >&2
+    exit 1
+fi
+target_height="${RBTC_SYNC_TARGET_HEIGHT:-1000}"
+target_hash="${RBTC_SYNC_TARGET_HASH:-0000010ebfa3c6193793701c198392e21bdb8bc9fb2032f0d74a628d36e9a75e}"
 
-for value in "$max_bytes" "$timeout_seconds" "$reserve_bytes"; do
+for value in "$max_bytes" "$timeout_seconds" "$reserve_bytes" "$target_height"; do
     if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value == 0 )); then
-        echo "sync resource limits must be positive integers" >&2
+        echo "sync resource limits and target height must be positive integers" >&2
         exit 1
     fi
 done
+if (( max_bytes > 1099511627776 || reserve_bytes > 1099511627776 )); then
+    echo "sync data ceiling and free-space reserve cannot exceed 1 TiB each" >&2
+    exit 1
+fi
+if (( timeout_seconds > 86400 )); then
+    echo "sync timeout cannot exceed 86,400 seconds" >&2
+    exit 1
+fi
+if (( target_height > 10000000 )); then
+    echo "sync target height cannot exceed 10,000,000" >&2
+    exit 1
+fi
+if [[ ! "$target_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "sync target hash must be 64 lowercase hexadecimal characters" >&2
+    exit 1
+fi
 
 available_bytes="$(df -Pk "$repo_root" | awk 'NR == 2 { print $4 * 1024 }')"
 required_bytes=$((max_bytes + reserve_bytes))
@@ -50,7 +71,7 @@ cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release
 "$repo_root/target/release/rbtcd" \
     --network signet \
     --data-dir "$data_dir" \
-    --validate-until-height 1 \
+    --validate-until-height "$target_height" \
     --validate-until-blockhash "$target_hash" \
     --validation-batch-size 1 \
     --once >"$log_file" 2>&1 &
@@ -86,7 +107,7 @@ if ! wait "$child_pid"; then
 fi
 child_pid=""
 
-expected="independent genesis validation stopped exactly at 1:$target_hash"
+expected="independent genesis validation stopped exactly at $target_height:$target_hash"
 if ! grep -Fq "$expected" "$log_file"; then
     echo "sync smoke test exited without reaching the authenticated target" >&2
     tail -n 80 "$log_file" >&2
@@ -94,5 +115,6 @@ if ! grep -Fq "$expected" "$log_file"; then
 fi
 
 used_bytes=$(( $(du -sk "$run_root" | awk '{ print $1 }') * 1024 ))
+elapsed=$(( $(date +%s) - started_at ))
 echo "$expected"
-echo "sync smoke test used ${used_bytes} bytes"
+echo "sync smoke test used ${used_bytes} bytes in ${elapsed} seconds"
