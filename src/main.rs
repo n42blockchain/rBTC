@@ -17,6 +17,7 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::Hash,
     hex::FromHex,
+    p2p::message_blockdata::Inventory,
 };
 use rbtc::{
     api::{
@@ -37,8 +38,8 @@ use rbtc::{
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
-        BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, PeerSession,
-        connect_outbound,
+        BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
+        MAX_PENDING_TRANSACTION_INVENTORY, P2pError, PeerSession, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
@@ -2947,6 +2948,61 @@ fn transaction_admission_context(
     })
 }
 
+fn transaction_inventory_is_known(inventory: Inventory, known: &[Transaction]) -> bool {
+    known.iter().any(|transaction| match inventory {
+        Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
+        Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+            transaction.compute_txid() == txid
+        }
+        _ => false,
+    })
+}
+
+async fn fetch_announced_peer_transactions(
+    session: &mut PeerSession<tokio::net::TcpStream>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    wallet: Option<&WalletApiRuntime>,
+) -> Result<(), PeerRunError> {
+    let announced = session.take_pending_transaction_inventory();
+    if announced.is_empty() {
+        return Ok(());
+    }
+    let mut known = transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot();
+    if let Some(wallet) = wallet {
+        known.extend(wallet.compact_candidates.snapshot());
+    }
+    let requested = announced
+        .into_iter()
+        .filter(|inventory| !transaction_inventory_is_known(*inventory, &known))
+        .take(MAX_PENDING_TRANSACTION_INVENTORY)
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let received = timeout(
+        PEER_TIMEOUT,
+        session.request_announced_transactions(&requested),
+    )
+    .await
+    .map_err(|_| {
+        PeerRunError::transient(format!(
+            "peer transaction download timed out after {} seconds",
+            PEER_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| PeerRunError::p2p(&error))?;
+    if received > 0 {
+        println!(
+            "downloaded {received} announced peer transaction{} for bounded admission",
+            if received == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
@@ -3384,6 +3440,8 @@ async fn sync_validating_node(
                     .status(&headers)
                     .map_err(|error| error.to_string())?;
                 if ibd_status.minimum_chainwork_reached {
+                    fetch_announced_peer_transactions(session, transaction_pool, wallet_runtime)
+                        .await?;
                     admit_pending_peer_transactions(
                         session,
                         transaction_pool,
@@ -6016,6 +6074,72 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn announced_peer_transaction_is_downloaded_for_existing_admission_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let transaction = wallet_broadcast_transaction();
+        let inventory = Inventory::WTx(transaction.compute_wtxid());
+        let expected = transaction.clone();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(601)).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(602)
+            );
+            peer.write_message(NetworkMessage::Inv(vec![inventory]))
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Pong(602)).await.unwrap();
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(vec![inventory])
+            );
+            peer.write_message(NetworkMessage::Tx(expected))
+                .await
+                .unwrap();
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            600,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        session.ping(602).await.unwrap();
+        let pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+
+        fetch_announced_peer_transactions(&mut session, &pool, None)
+            .await
+            .unwrap();
+
+        assert_eq!(session.take_pending_transactions(), vec![transaction]);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn known_transaction_inventory_is_not_downloaded_again() {
+        let transaction = wallet_broadcast_transaction();
+        assert!(transaction_inventory_is_known(
+            Inventory::Transaction(transaction.compute_txid()),
+            std::slice::from_ref(&transaction)
+        ));
+        assert!(transaction_inventory_is_known(
+            Inventory::WitnessTransaction(transaction.compute_txid()),
+            std::slice::from_ref(&transaction)
+        ));
+        assert!(transaction_inventory_is_known(
+            Inventory::WTx(transaction.compute_wtxid()),
+            std::slice::from_ref(&transaction)
+        ));
+        assert!(!transaction_inventory_is_known(
+            Inventory::Transaction(Txid::from_byte_array([99; 32])),
+            &[transaction]
         ));
     }
 

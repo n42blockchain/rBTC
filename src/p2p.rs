@@ -40,6 +40,8 @@ pub const MAX_PENDING_TRANSACTIONS: usize = 64;
 const MAX_PENDING_TRANSACTION_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
 const MAX_ANNOUNCED_TRANSACTIONS: usize = 64;
 const MAX_ANNOUNCED_TRANSACTION_BYTES: usize = MAX_PROTOCOL_MESSAGE_LEN as usize;
+/// Maximum transaction inventory references retained or requested from one peer at once.
+pub const MAX_PENDING_TRANSACTION_INVENTORY: usize = 64;
 const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const SENDHEADERS_VERSION: u32 = 70_012;
@@ -162,6 +164,32 @@ pub enum P2pError {
         /// Requested inventory count.
         count: usize,
     },
+    /// A caller attempted to exceed the bounded transaction-inventory request.
+    #[error("requested {count} transactions at once; limit is {MAX_PENDING_TRANSACTION_INVENTORY}")]
+    TooManyTransactionRequests {
+        /// Requested transaction inventory count.
+        count: usize,
+    },
+    /// A local transaction request contains a non-transaction inventory type.
+    #[error("transaction request contains non-transaction inventory {0:?}")]
+    InvalidTransactionRequestInventory(Inventory),
+    /// A local transaction request repeats one inventory entry.
+    #[error("duplicate requested transaction inventory {0:?}")]
+    DuplicateTransactionRequest(Inventory),
+    /// The peer did not resolve every requested transaction within the response budget.
+    #[error("peer left {remaining} requested transactions unresolved")]
+    TransactionResponseIncomplete {
+        /// Number of requested inventory entries neither returned nor reported missing.
+        remaining: usize,
+    },
+    /// Transaction payloads returned for one request exceeded the aggregate memory budget.
+    #[error("peer transaction responses require {bytes} bytes; limit is {limit}")]
+    TransactionResponsesTooLarge {
+        /// Aggregate authenticated transaction payload bytes observed.
+        bytes: usize,
+        /// Maximum aggregate transaction payload bytes accepted for one request.
+        limit: usize,
+    },
     /// A batch contains the same requested hash more than once.
     #[error("duplicate requested block {0}")]
     DuplicateBlockRequest(BlockHash),
@@ -266,6 +294,11 @@ impl P2pError {
             | Self::SelfConnection
             | Self::MissingServices { .. }
             | Self::TooManyBlockRequests { .. }
+            | Self::TooManyTransactionRequests { .. }
+            | Self::InvalidTransactionRequestInventory(_)
+            | Self::DuplicateTransactionRequest(_)
+            | Self::TransactionResponseIncomplete { .. }
+            | Self::TransactionResponsesTooLarge { .. }
             | Self::DuplicateBlockRequest(_)
             | Self::TooManyLocatorHashes { .. }
             | Self::PongResponseIncomplete
@@ -503,6 +536,7 @@ pub struct PeerSession<S> {
     pending_message_bytes: usize,
     pending_transactions: VecDeque<(Transaction, usize)>,
     pending_transaction_bytes: usize,
+    pending_transaction_inventory: VecDeque<Inventory>,
     announced_transactions: VecDeque<(Inventory, Transaction, usize)>,
     announced_transaction_bytes: usize,
     block_transfer_stats: BlockTransferStats,
@@ -521,6 +555,7 @@ impl<S> PeerSession<S> {
             pending_message_bytes: 0,
             pending_transactions: VecDeque::new(),
             pending_transaction_bytes: 0,
+            pending_transaction_inventory: VecDeque::new(),
             announced_transactions: VecDeque::new(),
             announced_transaction_bytes: 0,
             block_transfer_stats: BlockTransferStats::default(),
@@ -557,6 +592,15 @@ impl<S> PeerSession<S> {
             .drain(..)
             .map(|(transaction, _)| transaction)
             .collect()
+    }
+
+    /// Drains transaction announcements captured while another response was in flight.
+    ///
+    /// Only standard txid inventory and negotiated BIP339 wtxid inventory are
+    /// retained. Entries are unique and ordered, with oldest-first pressure
+    /// eviction at [`MAX_PENDING_TRANSACTION_INVENTORY`].
+    pub fn take_pending_transaction_inventory(&mut self) -> Vec<Inventory> {
+        self.pending_transaction_inventory.drain(..).collect()
     }
 
     /// Returns the underlying framed transport.
@@ -760,6 +804,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
     }
 
+    fn transaction_matches_inventory(transaction: &Transaction, inventory: Inventory) -> bool {
+        match inventory {
+            Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                transaction.compute_txid() == txid
+            }
+            _ => false,
+        }
+    }
+
+    fn retain_transaction_inventory(&mut self, entries: Vec<Inventory>) {
+        for inventory in entries {
+            let supported = matches!(inventory, Inventory::Transaction(_))
+                || self.wtxid_relay && matches!(inventory, Inventory::WTx(_));
+            if !supported || self.pending_transaction_inventory.contains(&inventory) {
+                continue;
+            }
+            if self.pending_transaction_inventory.len() >= MAX_PENDING_TRANSACTION_INVENTORY {
+                let _ = self.pending_transaction_inventory.pop_front();
+            }
+            self.pending_transaction_inventory.push_back(inventory);
+        }
+    }
+
+    fn retain_pending_message(
+        &mut self,
+        message: NetworkMessage,
+        payload_len: usize,
+    ) -> Result<(), P2pError> {
+        let pending = self.pending_message_bytes.checked_add(payload_len).ok_or(
+            P2pError::PendingMessagesTooLarge {
+                bytes: usize::MAX,
+                limit: MAX_PENDING_MESSAGE_BYTES,
+            },
+        )?;
+        if pending > MAX_PENDING_MESSAGE_BYTES {
+            return Err(P2pError::PendingMessagesTooLarge {
+                bytes: pending,
+                limit: MAX_PENDING_MESSAGE_BYTES,
+            });
+        }
+        self.pending_messages.push_back((message, payload_len));
+        self.pending_message_bytes = pending;
+        Ok(())
+    }
+
     async fn serve_transaction_requests(
         &mut self,
         requests: Vec<Inventory>,
@@ -845,6 +935,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 self.serve_transaction_requests(requests).await?;
                 Ok(None)
             }
+            NetworkMessage::Inv(entries) => {
+                self.retain_transaction_inventory(entries);
+                Ok(None)
+            }
             NetworkMessage::Version(_) => Err(P2pError::PostHandshakeVersion),
             message => Ok(Some((message, payload_len))),
         }
@@ -884,20 +978,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 Some((NetworkMessage::Pong(received), _)) if received == nonce => return Ok(()),
                 Some((NetworkMessage::Pong(_), _)) | None => {}
                 Some((message, payload_len)) => {
-                    let pending = self.pending_message_bytes.checked_add(payload_len).ok_or(
-                        P2pError::PendingMessagesTooLarge {
-                            bytes: usize::MAX,
-                            limit: MAX_PENDING_MESSAGE_BYTES,
-                        },
-                    )?;
-                    if pending > MAX_PENDING_MESSAGE_BYTES {
-                        return Err(P2pError::PendingMessagesTooLarge {
-                            bytes: pending,
-                            limit: MAX_PENDING_MESSAGE_BYTES,
-                        });
-                    }
-                    self.pending_messages.push_back((message, payload_len));
-                    self.pending_message_bytes = pending;
+                    self.retain_pending_message(message, payload_len)?;
                 }
             }
         }
@@ -989,6 +1070,92 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 .await?;
         }
         self.ping(ping_nonce).await
+    }
+
+    /// Requests and retains one bounded batch of announced transactions.
+    ///
+    /// Every requested entry must be unique transaction inventory. Matching
+    /// `tx` responses enter the ordinary pending-transaction FIFO for later
+    /// consensus and policy admission. `notfound` resolves missing entries;
+    /// crossed application messages are retained in wire order. The total
+    /// response budget permits one frame per requested transaction plus the
+    /// ordinary unrelated-frame allowance.
+    pub async fn request_announced_transactions(
+        &mut self,
+        inventory: &[Inventory],
+    ) -> Result<usize, P2pError> {
+        if inventory.len() > MAX_PENDING_TRANSACTION_INVENTORY {
+            return Err(P2pError::TooManyTransactionRequests {
+                count: inventory.len(),
+            });
+        }
+        let mut outstanding = HashSet::with_capacity(inventory.len());
+        for entry in inventory {
+            if !matches!(
+                entry,
+                Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_)
+            ) {
+                return Err(P2pError::InvalidTransactionRequestInventory(*entry));
+            }
+            if !outstanding.insert(*entry) {
+                return Err(P2pError::DuplicateTransactionRequest(*entry));
+            }
+        }
+        if outstanding.is_empty() {
+            return Ok(0);
+        }
+        self.transport
+            .write_message(NetworkMessage::GetData(inventory.to_vec()))
+            .await?;
+
+        let mut received = 0_usize;
+        let mut transaction_bytes = 0_usize;
+        let response_budget = inventory.len().saturating_add(MAX_RESPONSE_MESSAGES);
+        for _ in 0..response_budget {
+            match self.read_wire_response_message().await? {
+                Some((NetworkMessage::Tx(transaction), payload_len)) => {
+                    transaction_bytes = transaction_bytes.checked_add(payload_len).ok_or(
+                        P2pError::TransactionResponsesTooLarge {
+                            bytes: usize::MAX,
+                            limit: MAX_PENDING_TRANSACTION_BYTES,
+                        },
+                    )?;
+                    if transaction_bytes > MAX_PENDING_TRANSACTION_BYTES {
+                        return Err(P2pError::TransactionResponsesTooLarge {
+                            bytes: transaction_bytes,
+                            limit: MAX_PENDING_TRANSACTION_BYTES,
+                        });
+                    }
+                    let matching = outstanding
+                        .iter()
+                        .copied()
+                        .filter(|entry| Self::transaction_matches_inventory(&transaction, *entry))
+                        .collect::<Vec<_>>();
+                    if !matching.is_empty() {
+                        received = received.saturating_add(1);
+                        for entry in matching {
+                            outstanding.remove(&entry);
+                        }
+                    }
+                    self.retain_pending_transaction(transaction, payload_len);
+                }
+                Some((NetworkMessage::NotFound(entries), _)) => {
+                    for entry in entries {
+                        outstanding.remove(&entry);
+                    }
+                }
+                Some((message, payload_len)) => {
+                    self.retain_pending_message(message, payload_len)?;
+                }
+                None => {}
+            }
+            if outstanding.is_empty() {
+                return Ok(received);
+            }
+        }
+        Err(P2pError::TransactionResponseIncomplete {
+            remaining: outstanding.len(),
+        })
     }
 
     /// Reads the next application message, answering P2P keepalive pings.
@@ -1678,6 +1845,18 @@ mod tests {
             },
             P2pError::TooManyBlockRequests {
                 count: MAX_BLOCKS_IN_FLIGHT + 1,
+            },
+            P2pError::TooManyTransactionRequests {
+                count: MAX_PENDING_TRANSACTION_INVENTORY + 1,
+            },
+            P2pError::InvalidTransactionRequestInventory(Inventory::Block(hash)),
+            P2pError::DuplicateTransactionRequest(Inventory::Transaction(
+                bitcoin::Txid::all_zeros(),
+            )),
+            P2pError::TransactionResponseIncomplete { remaining: 1 },
+            P2pError::TransactionResponsesTooLarge {
+                bytes: MAX_PENDING_TRANSACTION_BYTES + 1,
+                limit: MAX_PENDING_TRANSACTION_BYTES,
             },
             P2pError::PongResponseIncomplete,
             P2pError::PendingMessagesTooLarge {
@@ -2941,6 +3120,183 @@ mod tests {
                 command: "getdata",
                 count
             }) if count == MAX_INVENTORY_ENTRIES + 1
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn announced_transactions_are_requested_and_crossed_frames_are_preserved() {
+        let transaction = relay_test_transaction();
+        let requested = Inventory::WTx(transaction.compute_wtxid());
+        let missing = Inventory::WTx(bitcoin::Wtxid::from_byte_array([8; 32]));
+        let expected = transaction.clone();
+        let (client_stream, server_stream) = duplex(1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
+            transport.peer_wtxid_relay = true;
+            let mut session = PeerSession::new(transport, version(1));
+            session.ping(51).await.unwrap();
+            assert_eq!(
+                session.take_pending_transaction_inventory(),
+                vec![requested, missing]
+            );
+            let received = session
+                .request_announced_transactions(&[requested, missing])
+                .await
+                .unwrap();
+            (
+                received,
+                session.take_pending_transactions(),
+                session.read_message().await.unwrap(),
+            )
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(51)
+            );
+            transport
+                .write_message(NetworkMessage::Inv(vec![requested, missing]))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Pong(51))
+                .await
+                .unwrap();
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(vec![requested, missing])
+            );
+            transport
+                .write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::NotFound(vec![missing]))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Tx(expected))
+                .await
+                .unwrap();
+        });
+
+        let (received, transactions, crossed) = client.await.unwrap();
+        assert_eq!(received, 1);
+        assert_eq!(transactions, vec![transaction]);
+        assert_eq!(crossed, NetworkMessage::Headers(Vec::new()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transaction_inventory_capture_is_negotiated_unique_and_bounded() {
+        let (stream, _) = duplex(64);
+        let mut session = PeerSession::new(
+            V1Transport::new(stream, Network::Regtest.magic()),
+            version(1),
+        );
+        let legacy = Inventory::Transaction(bitcoin::Txid::from_byte_array([1; 32]));
+        let wtxid = Inventory::WTx(bitcoin::Wtxid::from_byte_array([2; 32]));
+        session.retain_transaction_inventory(vec![legacy, legacy, wtxid]);
+        assert_eq!(session.take_pending_transaction_inventory(), vec![legacy]);
+
+        session.wtxid_relay = true;
+        let entries = (0..=MAX_PENDING_TRANSACTION_INVENTORY)
+            .map(|index| {
+                let byte = u8::try_from(index).unwrap();
+                Inventory::WTx(bitcoin::Wtxid::from_byte_array([byte; 32]))
+            })
+            .collect::<Vec<_>>();
+        session.retain_transaction_inventory(entries.clone());
+        assert_eq!(
+            session.take_pending_transaction_inventory(),
+            entries[1..].to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_transaction_requests_fail_before_writing() {
+        let (client_stream, mut server_stream) = duplex(64);
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            version(1),
+        );
+        let txid = bitcoin::Txid::from_byte_array([3; 32]);
+        assert!(matches!(
+            session
+                .request_announced_transactions(&[
+                    Inventory::Transaction(txid),
+                    Inventory::Transaction(txid),
+                ])
+                .await,
+            Err(P2pError::DuplicateTransactionRequest(_))
+        ));
+        assert!(matches!(
+            session
+                .request_announced_transactions(&[Inventory::Block(BlockHash::all_zeros())])
+                .await,
+            Err(P2pError::InvalidTransactionRequestInventory(_))
+        ));
+        assert!(matches!(
+            session
+                .request_announced_transactions(&vec![
+                    Inventory::Transaction(txid);
+                    MAX_PENDING_TRANSACTION_INVENTORY + 1
+                ])
+                .await,
+            Err(P2pError::TooManyTransactionRequests { count })
+                if count == MAX_PENDING_TRANSACTION_INVENTORY + 1
+        ));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                server_stream.read_u8()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_download_caps_aggregate_payload_bytes() {
+        let mut first = relay_test_transaction();
+        first.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0; 2_100_000]);
+        let mut second = first.clone();
+        second.input[0].previous_output.vout = 1;
+        let inventory = vec![
+            Inventory::Transaction(first.compute_txid()),
+            Inventory::Transaction(second.compute_txid()),
+        ];
+        let expected_inventory = inventory.clone();
+        let (client_stream, server_stream) = duplex(10 * 1024 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.request_announced_transactions(&inventory).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert_eq!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(expected_inventory)
+            );
+            transport
+                .write_message(NetworkMessage::Tx(first))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Tx(second))
+                .await
+                .unwrap();
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::TransactionResponsesTooLarge { bytes, limit })
+                if bytes > limit && limit == MAX_PENDING_TRANSACTION_BYTES
         ));
         server.await.unwrap();
     }
