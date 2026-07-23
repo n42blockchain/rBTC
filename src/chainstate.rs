@@ -33,6 +33,25 @@ pub struct AppliedTransaction {
     pub undo: UtxoUndo,
 }
 
+/// Read-only consensus result for one transaction at a candidate-chain context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedTransaction {
+    /// Transaction ID whose inputs and outputs were checked.
+    pub txid: bitcoin::Txid,
+    /// Sum of consumed inputs, in satoshis (zero for coinbase).
+    pub input_value_sats: u64,
+    /// Sum of created outputs, in satoshis.
+    pub output_value_sats: u64,
+    /// Consensus sigop cost including the witness scale factor where applicable.
+    pub sigop_cost: u64,
+}
+
+struct PreparedTransaction {
+    validated: ValidatedTransaction,
+    spent: Vec<OutPointKey>,
+    created: Vec<(OutPointKey, Utxo)>,
+}
+
 /// Transaction application failure.
 #[derive(Debug, Error)]
 pub enum ChainstateError {
@@ -185,6 +204,70 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
     script_flags: u32,
     csv_active: bool,
 ) -> Result<AppliedTransaction, ChainstateError> {
+    let prepared = prepare_transaction_with_context(
+        store,
+        transaction,
+        height,
+        now,
+        creation_mtp,
+        lock_time_context,
+        script_flags,
+        csv_active,
+    )?;
+    let undo = store.apply_with_undo(&prepared.spent, &prepared.created)?;
+    Ok(AppliedTransaction {
+        txid: prepared.validated.txid,
+        input_value_sats: prepared.validated.input_value_sats,
+        output_value_sats: prepared.validated.output_value_sats,
+        sigop_cost: prepared.validated.sigop_cost,
+        undo,
+    })
+}
+
+/// Checks one transaction against the current UTXO set without mutating it.
+///
+/// This applies the same accounting, maturity, finality, relative-lock, and
+/// script checks as [`apply_transaction_with_context`]. Block-only rules and
+/// local relay policy remain the caller's responsibility.
+///
+/// # Errors
+///
+/// Returns the same validation failures as [`apply_transaction_with_context`],
+/// but never writes to the supplied UTXO store.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_transaction_with_context<S: UtxoStore>(
+    store: &S,
+    transaction: &Transaction,
+    height: u32,
+    creation_mtp: u32,
+    lock_time_context: u32,
+    script_flags: u32,
+    csv_active: bool,
+) -> Result<ValidatedTransaction, ChainstateError> {
+    prepare_transaction_with_context(
+        store,
+        transaction,
+        height,
+        0,
+        creation_mtp,
+        lock_time_context,
+        script_flags,
+        csv_active,
+    )
+    .map(|prepared| prepared.validated)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn prepare_transaction_with_context<S: UtxoStore>(
+    store: &S,
+    transaction: &Transaction,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    lock_time_context: u32,
+    script_flags: u32,
+    csv_active: bool,
+) -> Result<PreparedTransaction, ChainstateError> {
     if transaction.base_size().saturating_mul(4) > 4_000_000 {
         return Err(ChainstateError::Oversize);
     }
@@ -218,12 +301,15 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
             return Err(ChainstateError::CoinbaseScriptSize);
         }
         let created = created_outputs(transaction, height, now, creation_mtp, true);
-        return Ok(AppliedTransaction {
-            txid,
-            input_value_sats: 0,
-            output_value_sats: output_value,
-            sigop_cost: legacy_sigop_cost(transaction),
-            undo: store.apply_with_undo(&[], &created)?,
+        return Ok(PreparedTransaction {
+            validated: ValidatedTransaction {
+                txid,
+                input_value_sats: 0,
+                output_value_sats: output_value,
+                sigop_cost: legacy_sigop_cost(transaction),
+            },
+            spent: Vec::new(),
+            created,
         });
     }
 
@@ -277,12 +363,15 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
     }
     verify_transaction_scripts_with_flags(transaction, &prevouts, script_flags)?;
     let created = created_outputs(transaction, height, now, creation_mtp, false);
-    Ok(AppliedTransaction {
-        txid,
-        input_value_sats: input_value,
-        output_value_sats: output_value,
-        sigop_cost: transaction_sigop_cost(transaction, &prevouts, script_flags),
-        undo: store.apply_with_undo(&spent, &created)?,
+    Ok(PreparedTransaction {
+        validated: ValidatedTransaction {
+            txid,
+            input_value_sats: input_value,
+            output_value_sats: output_value,
+            sigop_cost: transaction_sigop_cost(transaction, &prevouts, script_flags),
+        },
+        spent,
+        created,
     })
 }
 

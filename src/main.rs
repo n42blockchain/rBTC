@@ -43,6 +43,9 @@ use rbtc::{
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
+    transaction_admission::{
+        TransactionAdmissionContext, TransactionAdmissionOutcome, TransactionAdmissionPool,
+    },
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
     validation_owner::{
         MAX_VALIDATION_OWNER_BYTES, ValidationDirectoryOwner, parse_validation_directory_owner,
@@ -1085,6 +1088,7 @@ async fn run_peer_pool(
     validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), String> {
     let api_runtime = prepare_api_runtime(options)?;
+    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
             RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
@@ -1129,6 +1133,7 @@ async fn run_peer_pool(
         api_runtime.as_ref(),
         background_validation,
         validation_scheduler,
+        &transaction_pool,
         &manual_remotes,
         &mut failures,
     )
@@ -1169,6 +1174,7 @@ async fn run_peer_pool(
             api_runtime.as_ref(),
             background_validation,
             validation_scheduler,
+            &transaction_pool,
             &manual_remotes,
             &mut failures,
         )
@@ -2233,6 +2239,7 @@ async fn try_peer_candidates(
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
 ) -> bool {
@@ -2258,6 +2265,7 @@ async fn try_peer_candidates(
                     api_runtime,
                     background_validation,
                     validation_scheduler,
+                    transaction_pool,
                 ));
                 let mut standby_reaper = tokio::time::interval(STANDBY_REAP_INTERVAL);
                 loop {
@@ -2312,6 +2320,7 @@ async fn run_connected_peer(
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
 ) -> Result<(), PeerRunError> {
     let ConnectedPeer {
         remote,
@@ -2332,7 +2341,13 @@ async fn run_connected_peer(
         }
         let transfer_before = session.block_transfer_stats();
         let result = if let Some(validation_dir) = &options.complete_assumeutxo {
-            complete_assumeutxo_validation(&mut session, options, validation_dir.clone()).await
+            complete_assumeutxo_validation(
+                &mut session,
+                options,
+                validation_dir.clone(),
+                transaction_pool,
+            )
+            .await
         } else {
             sync_validating_node(
                 &mut session,
@@ -2346,6 +2361,7 @@ async fn run_connected_peer(
                 api_runtime,
                 background_validation,
                 validation_scheduler,
+                transaction_pool,
             )
             .await
         };
@@ -2415,6 +2431,7 @@ async fn complete_assumeutxo_validation(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     options: &Options,
     validation_dir: PathBuf,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
 ) -> Result<(), PeerRunError> {
     let active_dir = options
         .data_dir
@@ -2445,6 +2462,7 @@ async fn complete_assumeutxo_validation(
         None,
         None,
         None,
+        transaction_pool,
     )
     .await?;
     finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
@@ -2817,6 +2835,104 @@ async fn retain_wallet_broadcast(wallet: &WalletApiRuntime, request: WalletBroad
     }
 }
 
+fn compact_transaction_candidates(
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    wallet_runtime: Option<&WalletApiRuntime>,
+) -> Vec<Transaction> {
+    let mut candidates = transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot();
+    if let Some(wallet) = wallet_runtime {
+        for transaction in wallet.compact_candidates.snapshot() {
+            let wtxid = transaction.compute_wtxid();
+            candidates.retain(|candidate| candidate.compute_wtxid() != wtxid);
+            candidates.push(transaction);
+            while candidates.len() > MAX_COMPACT_TRANSACTION_CANDIDATES {
+                candidates.remove(0);
+            }
+        }
+    }
+    candidates
+}
+
+fn transaction_admission_context(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    deployment_config: &DeploymentConfig,
+) -> Result<TransactionAdmissionContext, String> {
+    let tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let active_tip = headers.active_tip();
+    if tip.height != active_tip.height || tip.hash != active_tip.hash {
+        return Err("transaction admission requires execution at the active header tip".to_owned());
+    }
+    let height = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| "transaction admission height overflow".to_owned())?;
+    let parent_mtp = headers
+        .median_time_past(tip.hash)
+        .ok_or_else(|| "transaction admission parent MTP is unavailable".to_owned())?;
+    let taproot_active =
+        taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?;
+    let deployments = block_deployment_context_for_headers(
+        deployment_config,
+        headers,
+        height,
+        BlockHash::all_zeros(),
+        parent_mtp,
+        taproot_active,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(TransactionAdmissionContext {
+        height,
+        parent_mtp,
+        script_flags: deployments.script_flags,
+        csv_active: deployments.csv_active,
+    })
+}
+
+fn admit_pending_peer_transactions(
+    session: &mut PeerSession<tokio::net::TcpStream>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    deployment_config: &DeploymentConfig,
+) -> Result<(), String> {
+    let context = transaction_admission_context(chainstate, headers, deployment_config)?;
+    let pending = session.take_pending_transactions();
+    let mut pool = transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let removed = pool.reconcile(chainstate, context);
+    if removed > 0 {
+        println!("removed {removed} local transactions after active-chain reconciliation");
+    }
+    for transaction in pending {
+        let txid = transaction.compute_txid();
+        match pool.admit(chainstate, transaction, context) {
+            Ok(TransactionAdmissionOutcome::Accepted { evicted, .. }) => {
+                println!(
+                    "admitted peer transaction {txid} into the bounded local pool{}",
+                    if evicted == 0 {
+                        String::new()
+                    } else {
+                        format!(" after evicting {evicted} oldest entries")
+                    }
+                );
+            }
+            Ok(TransactionAdmissionOutcome::AlreadyPresent(_)) => {}
+            Err(error) => {
+                eprintln!("rejected peer transaction {txid}: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
@@ -2830,6 +2946,7 @@ async fn sync_validating_node(
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
 ) -> Result<(), PeerRunError> {
     if !supports_block_execution(network) {
         return Err(PeerRunError::transient(
@@ -2898,9 +3015,7 @@ async fn sync_validating_node(
         })
         .transpose()?;
     'resync: loop {
-        let compact_candidates = wallet_runtime
-            .map(|runtime| runtime.compact_candidates.snapshot())
-            .unwrap_or_default();
+        let compact_candidates = compact_transaction_candidates(transaction_pool, wallet_runtime);
         let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
         if let Some(status) = background_validation {
             status.update_active(current_tip.height, headers.active_tip().height);
@@ -3097,6 +3212,13 @@ async fn sync_validating_node(
                     .status(&headers)
                     .map_err(|error| error.to_string())?;
                 if ibd_status.minimum_chainwork_reached {
+                    admit_pending_peer_transactions(
+                        session,
+                        transaction_pool,
+                        &chainstate,
+                        &headers,
+                        deployment_config,
+                    )?;
                     println!(
                         "minimum chainwork reached; full script validation remains enabled{}",
                         ibd_status
