@@ -595,6 +595,17 @@ pub struct PeerSession<S> {
     block_transfer_stats: BlockTransferStats,
 }
 
+/// Exact resolution of one bounded transaction `getdata` batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionRequestOutcome {
+    /// Number of distinct `tx` payloads matching at least one requested identifier.
+    pub received_transactions: usize,
+    /// Requested identifiers resolved by matching `tx` payloads.
+    pub received: Vec<Inventory>,
+    /// Requested identifiers explicitly resolved by `notfound`.
+    pub not_found: Vec<Inventory>,
+}
+
 impl<S> PeerSession<S> {
     fn new(transport: V1Transport<S>, remote_version: VersionMessage) -> Self {
         let wtxid_relay = transport.peer_wtxid_relay;
@@ -1254,6 +1265,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         &mut self,
         inventory: &[Inventory],
     ) -> Result<usize, P2pError> {
+        self.request_announced_transactions_detailed(inventory)
+            .await
+            .map(|outcome| outcome.received_transactions)
+    }
+
+    /// Requests transactions and reports the exact `tx`/`notfound` resolution.
+    pub async fn request_announced_transactions_detailed(
+        &mut self,
+        inventory: &[Inventory],
+    ) -> Result<TransactionRequestOutcome, P2pError> {
         if inventory.len() > MAX_PENDING_TRANSACTION_INVENTORY {
             return Err(P2pError::TooManyTransactionRequests {
                 count: inventory.len(),
@@ -1272,13 +1293,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             }
         }
         if outstanding.is_empty() {
-            return Ok(0);
+            return Ok(TransactionRequestOutcome {
+                received_transactions: 0,
+                received: Vec::new(),
+                not_found: Vec::new(),
+            });
         }
         self.transport
             .write_message(NetworkMessage::GetData(inventory.to_vec()))
             .await?;
 
         let mut received = 0_usize;
+        let mut received_inventory = Vec::new();
+        let mut not_found = Vec::new();
         let mut transaction_bytes = 0_usize;
         let response_budget = inventory.len().saturating_add(MAX_RESPONSE_MESSAGES);
         for _ in 0..response_budget {
@@ -1296,22 +1323,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                             limit: MAX_PENDING_TRANSACTION_BYTES,
                         });
                     }
-                    let matching = outstanding
+                    let matching = inventory
                         .iter()
                         .copied()
-                        .filter(|entry| Self::transaction_matches_inventory(&transaction, *entry))
+                        .filter(|entry| {
+                            outstanding.contains(entry)
+                                && Self::transaction_matches_inventory(&transaction, *entry)
+                        })
                         .collect::<Vec<_>>();
                     if !matching.is_empty() {
                         received = received.saturating_add(1);
                         for entry in matching {
                             outstanding.remove(&entry);
+                            received_inventory.push(entry);
                         }
                     }
                     self.retain_pending_transaction(transaction, payload_len);
                 }
                 Some((NetworkMessage::NotFound(entries), _)) => {
                     for entry in entries {
-                        outstanding.remove(&entry);
+                        if outstanding.remove(&entry) {
+                            not_found.push(entry);
+                        }
                     }
                 }
                 Some((message, payload_len)) => {
@@ -1320,7 +1353,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 None => {}
             }
             if outstanding.is_empty() {
-                return Ok(received);
+                return Ok(TransactionRequestOutcome {
+                    received_transactions: received,
+                    received: received_inventory,
+                    not_found,
+                });
             }
         }
         Err(P2pError::TransactionResponseIncomplete {
@@ -3743,12 +3780,12 @@ mod tests {
                 session.take_pending_transaction_inventory(),
                 vec![requested, missing]
             );
-            let received = session
-                .request_announced_transactions(&[requested, missing])
+            let outcome = session
+                .request_announced_transactions_detailed(&[requested, missing])
                 .await
                 .unwrap();
             (
-                received,
+                outcome,
                 session.take_pending_transactions(),
                 session.read_message().await.unwrap(),
             )
@@ -3785,8 +3822,15 @@ mod tests {
                 .unwrap();
         });
 
-        let (received, transactions, crossed) = client.await.unwrap();
-        assert_eq!(received, 1);
+        let (outcome, transactions, crossed) = client.await.unwrap();
+        assert_eq!(
+            outcome,
+            TransactionRequestOutcome {
+                received_transactions: 1,
+                received: vec![requested],
+                not_found: vec![missing],
+            }
+        );
         assert_eq!(transactions, vec![transaction]);
         assert_eq!(crossed, NetworkMessage::Headers(Vec::new()));
         server.await.unwrap();

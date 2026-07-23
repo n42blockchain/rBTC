@@ -38,6 +38,12 @@ pub const MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
 pub const MAX_RECENT_REJECTED_TXIDS: usize = 1_024;
 /// Core 26's rolling-filter capacity for recently confirmed txid/wtxid identifiers.
 pub const MAX_RECENT_CONFIRMED_TRANSACTION_IDS: usize = 48_000;
+/// Maximum announcements tracked across sixteen bounded peer sessions.
+pub const MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS: usize = 1_024;
+/// Maximum announcements tracked from one peer session.
+pub const MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS_PER_SOURCE: usize = 64;
+/// Core 26's interval before retrying one transaction through another peer.
+pub const TRANSACTION_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// Core-compatible orphan lifetime of twenty minutes.
 pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Core's twelve-hour rolling mempool minimum-fee half-life.
@@ -286,6 +292,39 @@ struct OrphanTransaction {
     source: u64,
 }
 
+/// Transaction identifier retained by the shared multi-peer request scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionRequestId {
+    /// Legacy txid announcement or parent request.
+    Txid(Txid),
+    /// BIP339 witness-transaction identifier.
+    Wtxid(Wtxid),
+}
+
+impl TransactionRequestId {
+    fn raw_hash(self) -> sha256d::Hash {
+        match self {
+            Self::Txid(txid) => txid.to_raw_hash(),
+            Self::Wtxid(wtxid) => wtxid.to_raw_hash(),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum TransactionRequestState {
+    Candidate { not_before: u64 },
+    InFlight { expires_at: u64 },
+    Completed,
+}
+
+#[derive(Clone)]
+struct TransactionRequestAnnouncement {
+    id: TransactionRequestId,
+    source: u64,
+    sequence: u64,
+    state: TransactionRequestState,
+}
+
 #[derive(Default)]
 struct ReplacementPlan {
     txids: BTreeSet<Txid>,
@@ -307,6 +346,8 @@ pub struct TransactionAdmissionPool {
     recent_rejected_txid_set: BTreeSet<Txid>,
     recent_confirmed_ids: VecDeque<sha256d::Hash>,
     recent_confirmed_id_set: BTreeSet<sha256d::Hash>,
+    transaction_request_announcements: VecDeque<TransactionRequestAnnouncement>,
+    next_transaction_request_sequence: u64,
     rolling_minimum_fee_sat_kvb: u64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
@@ -523,6 +564,19 @@ impl TransactionAdmissionPool {
             || self.is_recently_confirmed_txid(txid)
     }
 
+    /// Returns whether the active pool, orphanage, or recent chain knows a wtxid.
+    #[must_use]
+    pub fn knows_wtxid(&self, wtxid: Wtxid) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.transaction.compute_wtxid() == wtxid)
+            || self
+                .orphans
+                .iter()
+                .any(|orphan| orphan.transaction.compute_wtxid() == wtxid)
+            || self.is_recently_confirmed_wtxid(wtxid)
+    }
+
     /// Returns whether a recently connected block contained this txid.
     #[must_use]
     pub fn is_recently_confirmed_txid(&self, txid: Txid) -> bool {
@@ -543,6 +597,7 @@ impl TransactionAdmissionPool {
         let mut inserted = 0;
         let mut confirmed_txids = BTreeSet::new();
         for transaction in transactions {
+            self.forget_transaction_requests_for(transaction);
             let txid = transaction.compute_txid();
             confirmed_txids.insert(txid);
             let txid_hash = txid.to_raw_hash();
@@ -578,6 +633,171 @@ impl TransactionAdmissionPool {
     pub fn clear_recent_confirmed_transactions(&mut self) {
         self.recent_confirmed_ids.clear();
         self.recent_confirmed_id_set.clear();
+    }
+
+    /// Records source announcements under global and per-session hard limits.
+    pub fn announce_transaction_requests(
+        &mut self,
+        source: u64,
+        ids: impl IntoIterator<Item = TransactionRequestId>,
+        not_before: u64,
+    ) -> usize {
+        let mut inserted = 0;
+        for id in ids {
+            let raw_hash = id.raw_hash();
+            if self.transaction_request_announcements.len() >= MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS
+                || self
+                    .transaction_request_announcements
+                    .iter()
+                    .filter(|announcement| announcement.source == source)
+                    .count()
+                    >= MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS_PER_SOURCE
+                || self
+                    .transaction_request_announcements
+                    .iter()
+                    .any(|announcement| {
+                        announcement.source == source && announcement.id.raw_hash() == raw_hash
+                    })
+            {
+                continue;
+            }
+            let sequence = self.next_transaction_request_sequence;
+            self.next_transaction_request_sequence = self
+                .next_transaction_request_sequence
+                .checked_add(1)
+                .expect("transaction announcement sequence exhausted");
+            self.transaction_request_announcements
+                .push_back(TransactionRequestAnnouncement {
+                    id,
+                    source,
+                    sequence,
+                    state: TransactionRequestState::Candidate { not_before },
+                });
+            inserted += 1;
+        }
+        inserted
+    }
+
+    /// Returns the number of bounded peer announcements currently tracked.
+    #[must_use]
+    pub fn transaction_request_announcement_len(&self) -> usize {
+        self.transaction_request_announcements.len()
+    }
+
+    /// Selects source requests in announcement order while allowing one in flight per hash.
+    pub fn take_transaction_requests(
+        &mut self,
+        source: u64,
+        now: u64,
+        limit: usize,
+    ) -> Vec<TransactionRequestId> {
+        for announcement in &mut self.transaction_request_announcements {
+            if matches!(
+                announcement.state,
+                TransactionRequestState::InFlight { expires_at } if expires_at <= now
+            ) {
+                announcement.state = TransactionRequestState::Completed;
+            }
+        }
+        self.prune_completed_transaction_requests();
+
+        let in_flight = self
+            .transaction_request_announcements
+            .iter()
+            .filter(|announcement| {
+                matches!(announcement.state, TransactionRequestState::InFlight { .. })
+            })
+            .map(|announcement| announcement.id.raw_hash())
+            .collect::<BTreeSet<_>>();
+        let mut selected = self
+            .transaction_request_announcements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, announcement)| {
+                let TransactionRequestState::Candidate { not_before } = announcement.state else {
+                    return None;
+                };
+                let raw_hash = announcement.id.raw_hash();
+                (announcement.source == source
+                    && not_before <= now
+                    && !in_flight.contains(&raw_hash))
+                .then_some((announcement.sequence, index))
+            })
+            .collect::<Vec<_>>();
+        selected.sort_unstable();
+        selected.truncate(limit);
+        let expiry = now.saturating_add(TRANSACTION_REQUEST_TIMEOUT_SECS);
+        selected
+            .into_iter()
+            .map(|(_, index)| {
+                let announcement = self
+                    .transaction_request_announcements
+                    .get_mut(index)
+                    .expect("selected transaction announcement remains in bounds");
+                announcement.state = TransactionRequestState::InFlight { expires_at: expiry };
+                announcement.id
+            })
+            .collect()
+    }
+
+    /// Marks one source response complete so another source may become requestable.
+    pub fn complete_transaction_request(&mut self, source: u64, id: TransactionRequestId) -> bool {
+        let raw_hash = id.raw_hash();
+        let Some(announcement) =
+            self.transaction_request_announcements
+                .iter_mut()
+                .find(|announcement| {
+                    announcement.source == source && announcement.id.raw_hash() == raw_hash
+                })
+        else {
+            return false;
+        };
+        announcement.state = TransactionRequestState::Completed;
+        self.prune_completed_transaction_requests();
+        true
+    }
+
+    /// Forgets every source announcement for a no-longer-needed identifier.
+    pub fn forget_transaction_request(&mut self, id: TransactionRequestId) -> usize {
+        let raw_hash = id.raw_hash();
+        let before = self.transaction_request_announcements.len();
+        self.transaction_request_announcements
+            .retain(|announcement| announcement.id.raw_hash() != raw_hash);
+        before.saturating_sub(self.transaction_request_announcements.len())
+    }
+
+    /// Forgets both relay identifiers of a received or confirmed transaction.
+    pub fn forget_transaction_requests_for(&mut self, transaction: &Transaction) -> usize {
+        let mut removed =
+            self.forget_transaction_request(TransactionRequestId::Txid(transaction.compute_txid()));
+        removed += self
+            .forget_transaction_request(TransactionRequestId::Wtxid(transaction.compute_wtxid()));
+        removed
+    }
+
+    /// Removes all announcements owned by a disconnected session.
+    pub fn disconnect_transaction_request_source(&mut self, source: u64) -> usize {
+        let before = self.transaction_request_announcements.len();
+        self.transaction_request_announcements
+            .retain(|announcement| announcement.source != source);
+        self.prune_completed_transaction_requests();
+        before.saturating_sub(self.transaction_request_announcements.len())
+    }
+
+    fn prune_completed_transaction_requests(&mut self) {
+        let live_hashes = self
+            .transaction_request_announcements
+            .iter()
+            .filter(|announcement| {
+                !matches!(announcement.state, TransactionRequestState::Completed)
+            })
+            .map(|announcement| announcement.id.raw_hash())
+            .collect::<BTreeSet<_>>();
+        self.transaction_request_announcements
+            .retain(|announcement| {
+                !matches!(announcement.state, TransactionRequestState::Completed)
+                    || live_hashes.contains(&announcement.id.raw_hash())
+            });
     }
 
     /// Returns whether a witness-independent rejection is remembered at this tip.
@@ -668,6 +888,7 @@ impl TransactionAdmissionPool {
         let before = self.orphans.len();
         self.orphans.retain(|orphan| orphan.source != source);
         self.rebuild_orphan_indexes();
+        self.disconnect_transaction_request_source(source);
         before.saturating_sub(self.orphans.len())
     }
 
@@ -2865,6 +3086,69 @@ mod tests {
         assert!(pool.recent_confirmed_id_set.contains(&marker_hash(
             u32::try_from(MAX_RECENT_CONFIRMED_TRANSACTION_IDS).unwrap()
         )));
+    }
+
+    #[test]
+    fn transaction_requests_are_bounded_single_flight_and_fail_over_by_source() {
+        fn marker_id(marker: u32) -> TransactionRequestId {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&marker.to_le_bytes());
+            TransactionRequestId::Txid(Txid::from_byte_array(bytes))
+        }
+
+        let shared = marker_id(1);
+        let mut tracker = TransactionAdmissionPool::default();
+        assert_eq!(tracker.announce_transaction_requests(41, [shared], 100), 1);
+        assert_eq!(tracker.announce_transaction_requests(42, [shared], 100), 1);
+        assert_eq!(tracker.take_transaction_requests(42, 100, 64), vec![shared]);
+        assert!(tracker.take_transaction_requests(41, 159, 64).is_empty());
+        assert_eq!(tracker.take_transaction_requests(41, 160, 64), vec![shared]);
+        assert!(tracker.complete_transaction_request(41, shared));
+        assert!(tracker.transaction_request_announcements.is_empty());
+
+        let delayed = marker_id(2);
+        assert_eq!(tracker.announce_transaction_requests(43, [delayed], 200), 1);
+        assert!(tracker.take_transaction_requests(43, 199, 64).is_empty());
+        assert_eq!(
+            tracker.take_transaction_requests(43, 200, 64),
+            vec![delayed]
+        );
+        assert_eq!(tracker.announce_transaction_requests(44, [delayed], 200), 1);
+        assert_eq!(tracker.disconnect_transaction_request_source(43), 1);
+        assert_eq!(
+            tracker.take_transaction_requests(44, 200, 64),
+            vec![delayed]
+        );
+        assert_eq!(tracker.forget_transaction_request(delayed), 1);
+        assert!(tracker.transaction_request_announcements.is_empty());
+
+        let mut bounded = TransactionAdmissionPool::default();
+        for source in 0..16_u64 {
+            let ids = (0..MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS_PER_SOURCE)
+                .map(|index| {
+                    let marker = u32::try_from(
+                        source
+                            * u64::try_from(MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS_PER_SOURCE)
+                                .unwrap()
+                            + u64::try_from(index).unwrap(),
+                    )
+                    .unwrap();
+                    marker_id(marker)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bounded.announce_transaction_requests(source, ids, 0),
+                MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS_PER_SOURCE
+            );
+        }
+        assert_eq!(
+            bounded.transaction_request_announcements.len(),
+            MAX_TRANSACTION_REQUEST_ANNOUNCEMENTS
+        );
+        assert_eq!(
+            bounded.announce_transaction_requests(16, [marker_id(2_000)], 0),
+            0
+        );
     }
 
     #[test]

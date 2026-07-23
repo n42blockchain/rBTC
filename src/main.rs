@@ -48,8 +48,8 @@ use rbtc::{
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
-        TransactionAdmissionContext, TransactionAdmissionPool, dependency_packages,
-        transaction_descendant_closure,
+        TransactionAdmissionContext, TransactionAdmissionPool, TransactionRequestId,
+        dependency_packages, transaction_descendant_closure,
     },
     transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
@@ -1975,6 +1975,7 @@ async fn maintain_standby(
     mut ping_nonce: u64,
     mut transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     mut header_dag: Option<HeaderDag>,
+    transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     enum StandbyAction {
         Activate,
@@ -1984,6 +1985,13 @@ async fn maintain_standby(
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.tick().await;
     loop {
+        if let Some(pool) = transaction_pool {
+            register_pending_transaction_announcements(
+                &mut connected.session,
+                pool,
+                u64::from(unix_time().map_err(PeerRunError::transient)?),
+            );
+        }
         let action = tokio::select! {
             biased;
             activated = &mut activate => {
@@ -2055,6 +2063,37 @@ async fn maintain_standby(
     }
 }
 
+struct TransactionRequestSourceGuard {
+    source: u64,
+    pool: Arc<Mutex<TransactionAdmissionPool>>,
+    armed: bool,
+}
+
+impl TransactionRequestSourceGuard {
+    fn new(source: u64, pool: Arc<Mutex<TransactionAdmissionPool>>) -> Self {
+        Self {
+            source,
+            pool,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransactionRequestSourceGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .disconnect_transaction_request_source(self.source);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_maintain_standby(
     deployments: DeploymentConfig,
@@ -2067,6 +2106,7 @@ async fn connect_and_maintain_standby(
     transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     header_dag: Option<HeaderDag>,
     mempool_relay_source: Option<MempoolRelaySource>,
+    transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer(
         deployments,
@@ -2082,15 +2122,26 @@ async fn connect_and_maintain_standby(
     ready
         .send(())
         .map_err(|()| PeerRunError::transient("peer standby readiness channel closed"))?;
-    maintain_standby(
+    let orphan_source = connected.session.local_id();
+    let mut source_guard = transaction_pool
+        .as_ref()
+        .map(|pool| TransactionRequestSourceGuard::new(orphan_source, Arc::clone(pool)));
+    let result = maintain_standby(
         connected,
         activate,
         STANDBY_KEEPALIVE_INTERVAL,
         local_nonce,
         transaction_relay,
         header_dag,
+        transaction_pool.as_ref(),
     )
-    .await
+    .await;
+    if result.is_ok() {
+        if let Some(guard) = source_guard.as_mut() {
+            guard.disarm();
+        }
+    }
+    result
 }
 
 fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
@@ -2121,6 +2172,7 @@ fn spawn_peer_connections(
     peer_store: Option<&Arc<RedbPeerStore>>,
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
     mempool_relay_source: Option<&MempoolRelaySource>,
+    transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
 ) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
@@ -2138,6 +2190,9 @@ fn spawn_peer_connections(
             let mempool_relay_source = require_full_services
                 .then(|| mempool_relay_source.cloned())
                 .flatten();
+            let transaction_pool = require_full_services
+                .then(|| transaction_pool.cloned())
+                .flatten();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -2149,6 +2204,7 @@ fn spawn_peer_connections(
                 transaction_relay,
                 header_dag,
                 mempool_relay_source,
+                transaction_pool,
             ));
             (
                 remote,
@@ -2300,6 +2356,7 @@ async fn try_peer_candidates(
         peer_store,
         Some(transaction_relay),
         Some(mempool_relay_source),
+        Some(transaction_pool),
     ) {
         Ok(pending) => pending,
         Err(error) => {
@@ -3142,19 +3199,52 @@ fn transaction_inventory_is_known(
 ) -> bool {
     match inventory {
         Inventory::WTx(wtxid) => {
-            pool.is_recently_confirmed_wtxid(wtxid)
+            pool.knows_wtxid(wtxid)
                 || known
                     .iter()
                     .any(|transaction| transaction.compute_wtxid() == wtxid)
         }
         Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-            pool.is_recently_confirmed_txid(txid)
+            pool.knows_transaction(txid)
                 || known
                     .iter()
                     .any(|transaction| transaction.compute_txid() == txid)
         }
         _ => false,
     }
+}
+
+fn transaction_request_id(inventory: Inventory) -> Option<TransactionRequestId> {
+    match inventory {
+        Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+            Some(TransactionRequestId::Txid(txid))
+        }
+        Inventory::WTx(wtxid) => Some(TransactionRequestId::Wtxid(wtxid)),
+        _ => None,
+    }
+}
+
+fn transaction_request_inventory(id: TransactionRequestId) -> Inventory {
+    match id {
+        TransactionRequestId::Txid(txid) => Inventory::Transaction(txid),
+        TransactionRequestId::Wtxid(wtxid) => Inventory::WTx(wtxid),
+    }
+}
+
+fn register_pending_transaction_announcements(
+    session: &mut PeerSession<tokio::net::TcpStream>,
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    now: u64,
+) -> usize {
+    let ids = session
+        .take_pending_transaction_inventory()
+        .into_iter()
+        .filter_map(transaction_request_id)
+        .collect::<Vec<_>>();
+    transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .announce_transaction_requests(session.local_id(), ids, now)
 }
 
 fn peer_orphan_candidates(
@@ -3207,30 +3297,41 @@ async fn fetch_announced_peer_transactions(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     wallet: Option<&WalletApiRuntime>,
 ) -> Result<(), PeerRunError> {
-    let announced = session.take_pending_transaction_inventory();
-    if announced.is_empty() {
-        return Ok(());
-    }
+    let now = u64::from(unix_time().map_err(PeerRunError::transient)?);
+    register_pending_transaction_announcements(session, transaction_pool, now);
+    let source = session.local_id();
     let requested = {
-        let pool = transaction_pool
+        let mut pool = transaction_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut known = pool.snapshot();
-        if let Some(wallet) = wallet {
-            known.extend(wallet.compact_candidates.snapshot());
-        }
-        announced
+        let known = wallet
+            .map(|wallet| wallet.compact_candidates.snapshot())
+            .unwrap_or_default();
+        let selected =
+            pool.take_transaction_requests(source, now, MAX_PENDING_TRANSACTION_INVENTORY);
+        selected
             .into_iter()
-            .filter(|inventory| !transaction_inventory_is_known(*inventory, &known, &pool))
-            .take(MAX_PENDING_TRANSACTION_INVENTORY)
+            .filter_map(|id| {
+                let inventory = transaction_request_inventory(id);
+                let rejected = matches!(
+                    id,
+                    TransactionRequestId::Txid(txid) if pool.is_recently_rejected(txid)
+                );
+                if rejected || transaction_inventory_is_known(inventory, &known, &pool) {
+                    pool.forget_transaction_request(id);
+                    None
+                } else {
+                    Some(inventory)
+                }
+            })
             .collect::<Vec<_>>()
     };
     if requested.is_empty() {
         return Ok(());
     }
-    let received = timeout(
+    let outcome = timeout(
         PEER_TIMEOUT,
-        session.request_announced_transactions(&requested),
+        session.request_announced_transactions_detailed(&requested),
     )
     .await
     .map_err(|_| {
@@ -3240,6 +3341,22 @@ async fn fetch_announced_peer_transactions(
         ))
     })?
     .map_err(|error| PeerRunError::p2p(&error))?;
+    {
+        let mut pool = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for inventory in outcome.received {
+            if let Some(id) = transaction_request_id(inventory) {
+                pool.forget_transaction_request(id);
+            }
+        }
+        for inventory in outcome.not_found {
+            if let Some(id) = transaction_request_id(inventory) {
+                pool.complete_transaction_request(source, id);
+            }
+        }
+    }
+    let received = outcome.received_transactions;
     if received > 0 {
         println!(
             "downloaded {received} announced peer transaction{} for bounded admission",
@@ -3361,6 +3478,9 @@ fn admit_pending_peer_transactions(
             } else {
                 peer_orphan_candidates(retained_package.clone(), &peer_txids)
             };
+            for transaction in &retained_package {
+                candidate.forget_transaction_requests_for(transaction);
+            }
             let txid_set = package
                 .iter()
                 .map(Transaction::compute_txid)
@@ -6041,7 +6161,8 @@ mod tests {
             validation_limits: ValidationLimits::default(),
         };
         let mut pending =
-            spawn_peer_connections(&options, &options.remotes, 100, None, None, None).unwrap();
+            spawn_peer_connections(&options, &options.remotes, 100, None, None, None, None)
+                .unwrap();
         timeout(Duration::from_secs(2), ready_received)
             .await
             .expect("later candidate should handshake while first candidate is stalled")
@@ -6244,6 +6365,7 @@ mod tests {
             201,
             None,
             None,
+            None,
         ));
         timeout(Duration::from_secs(2), ping_received)
             .await
@@ -6302,6 +6424,7 @@ mod tests {
             None,
             None,
             Some(source),
+            None,
         ));
         timeout(Duration::from_secs(2), ready)
             .await
@@ -6311,6 +6434,182 @@ mod tests {
         let mut connected = connection.await.unwrap().unwrap();
         connected.session.ping(211).await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn standby_announcements_fail_over_after_notfound_without_duplicate_inflight() {
+        async fn wait_for_announcements(
+            pool: &Arc<Mutex<TransactionAdmissionPool>>,
+            expected: usize,
+        ) {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    if pool
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .transaction_request_announcement_len()
+                        == expected
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("standby announcement should enter the shared request tracker");
+        }
+
+        let transaction = wallet_broadcast_transaction();
+        let inventory = Inventory::WTx(transaction.compute_wtxid());
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_remote = first_listener.local_addr().unwrap();
+        let first_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(first_listener, peer_version(232)).await;
+            receive_client_preferences(&mut peer).await;
+            let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected first standby ping");
+            };
+            peer.write_message(NetworkMessage::Inv(vec![inventory]))
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Pong(nonce))
+                .await
+                .unwrap();
+            loop {
+                match peer.read_message().await.unwrap().into_payload() {
+                    NetworkMessage::Ping(nonce) => {
+                        peer.write_message(NetworkMessage::Pong(nonce))
+                            .await
+                            .unwrap();
+                    }
+                    NetworkMessage::GetData(entries) => {
+                        assert_eq!(entries, vec![inventory]);
+                        break;
+                    }
+                    message => panic!("unexpected first standby message: {message:?}"),
+                }
+            }
+            peer.write_message(NetworkMessage::NotFound(vec![inventory]))
+                .await
+                .unwrap();
+        });
+        let pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+        let (activate_first, first_activation) = tokio::sync::oneshot::channel();
+        let first_connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            first_remote,
+            230,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let first_pool = Arc::clone(&pool);
+        let first = tokio::spawn(async move {
+            maintain_standby(
+                first_connected,
+                first_activation,
+                Duration::from_millis(100),
+                231,
+                None,
+                None,
+                Some(&first_pool),
+            )
+            .await
+        });
+        wait_for_announcements(&pool, 1).await;
+
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_remote = second_listener.local_addr().unwrap();
+        let expected = transaction.clone();
+        let second_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(second_listener, peer_version(235)).await;
+            receive_client_preferences(&mut peer).await;
+            let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected second standby ping");
+            };
+            peer.write_message(NetworkMessage::Inv(vec![inventory]))
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Pong(nonce))
+                .await
+                .unwrap();
+            loop {
+                match peer.read_message().await.unwrap().into_payload() {
+                    NetworkMessage::Ping(nonce) => {
+                        peer.write_message(NetworkMessage::Pong(nonce))
+                            .await
+                            .unwrap();
+                    }
+                    NetworkMessage::GetData(entries) => {
+                        assert_eq!(entries, vec![inventory]);
+                        break;
+                    }
+                    message => panic!("unexpected second standby message: {message:?}"),
+                }
+            }
+            peer.write_message(NetworkMessage::Tx(expected))
+                .await
+                .unwrap();
+        });
+        let (activate_second, second_activation) = tokio::sync::oneshot::channel();
+        let second_connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            second_remote,
+            233,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let second_pool = Arc::clone(&pool);
+        let second = tokio::spawn(async move {
+            maintain_standby(
+                second_connected,
+                second_activation,
+                Duration::from_millis(100),
+                234,
+                None,
+                None,
+                Some(&second_pool),
+            )
+            .await
+        });
+        wait_for_announcements(&pool, 2).await;
+
+        activate_first.send(()).unwrap();
+        let mut first = first.await.unwrap().unwrap();
+        fetch_announced_peer_transactions(&mut first.session, &pool, None)
+            .await
+            .unwrap();
+        assert!(first.session.take_pending_transactions().is_empty());
+        assert_eq!(
+            pool.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transaction_request_announcement_len(),
+            2
+        );
+
+        activate_second.send(()).unwrap();
+        let mut second = second.await.unwrap().unwrap();
+        fetch_announced_peer_transactions(&mut second.session, &pool, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.session.take_pending_transactions(),
+            vec![transaction]
+        );
+        assert_eq!(
+            pool.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transaction_request_announcement_len(),
+            0
+        );
+        first_server.await.unwrap();
+        second_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -6359,6 +6658,7 @@ mod tests {
             211,
             None,
             Some(HeaderDag::new(Network::Regtest)),
+            None,
         ));
         timeout(Duration::from_secs(2), second_poll)
             .await
@@ -6416,6 +6716,7 @@ mod tests {
                 221,
                 None,
                 Some(HeaderDag::new(Network::Regtest)),
+                None,
             ),
         )
         .await
@@ -6495,6 +6796,7 @@ mod tests {
             303,
             Some(relay.subscribe()),
             None,
+            None,
         ));
         let second_standby = tokio::spawn(maintain_standby(
             second,
@@ -6502,6 +6804,7 @@ mod tests {
             Duration::from_secs(60),
             304,
             Some(relay.subscribe()),
+            None,
             None,
         ));
 
@@ -6560,6 +6863,7 @@ mod tests {
             Duration::from_secs(60),
             402,
             Some(receiver),
+            None,
             None,
         )
         .await
@@ -6868,6 +7172,35 @@ mod tests {
             &[transaction],
             &pool,
         ));
+    }
+
+    #[test]
+    fn transaction_request_source_guard_cleans_only_canceled_standby() {
+        let pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+        let id = TransactionRequestId::Txid(Txid::from_byte_array([89; 32]));
+        {
+            let mut tracker = pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(tracker.announce_transaction_requests(51, [id], 0), 1);
+            assert_eq!(tracker.announce_transaction_requests(52, [id], 0), 1);
+        }
+        drop(TransactionRequestSourceGuard::new(51, Arc::clone(&pool)));
+        assert_eq!(
+            pool.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transaction_request_announcement_len(),
+            1
+        );
+        let mut activated = TransactionRequestSourceGuard::new(52, Arc::clone(&pool));
+        activated.disarm();
+        drop(activated);
+        assert_eq!(
+            pool.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transaction_request_announcement_len(),
+            1
+        );
     }
 
     #[test]
