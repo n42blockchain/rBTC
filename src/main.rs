@@ -44,7 +44,7 @@ use rbtc::{
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     transaction_admission::{
-        TransactionAdmissionContext, TransactionAdmissionOutcome, TransactionAdmissionPool,
+        TransactionAdmissionContext, TransactionAdmissionPool, dependency_packages,
     },
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
     validation_owner::{
@@ -2911,22 +2911,41 @@ fn admit_pending_peer_transactions(
     if removed > 0 {
         println!("removed {removed} local transactions after active-chain reconciliation");
     }
-    for transaction in pending {
-        let txid = transaction.compute_txid();
-        match pool.admit(chainstate, transaction, context) {
-            Ok(TransactionAdmissionOutcome::Accepted { evicted, .. }) => {
+    for package in dependency_packages(pending) {
+        let txids = package
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        match pool.admit_package(chainstate, package, context) {
+            Ok(outcome) if !outcome.accepted.is_empty() => {
                 println!(
-                    "admitted peer transaction {txid} into the bounded local pool{}",
-                    if evicted == 0 {
+                    "admitted peer transaction package [{}] into the bounded local pool{}",
+                    outcome
+                        .accepted
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if outcome.evicted == 0 {
                         String::new()
                     } else {
-                        format!(" after evicting {evicted} oldest entries")
+                        format!(
+                            " after evicting {} oldest entries or descendants",
+                            outcome.evicted
+                        )
                     }
                 );
             }
-            Ok(TransactionAdmissionOutcome::AlreadyPresent(_)) => {}
+            Ok(_) => {}
             Err(error) => {
-                eprintln!("rejected peer transaction {txid}: {error}");
+                eprintln!(
+                    "rejected peer transaction package [{}]: {error}",
+                    txids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
     }
