@@ -2,6 +2,7 @@
 *.rbtc
 *.rblk
 ledger-index.json
+wallet-api-audit.jsonl
 /rbtc.cdx.json
 /fuzz/artifacts/
 /fuzz/target/

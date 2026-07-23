@@ -7,8 +7,11 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path as FsPath,
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -117,12 +120,42 @@ const MAX_WALLET_AUTH_TOKEN_LEN: usize = 256;
 const WALLET_ADDRESS_BURST: u8 = 20;
 const WALLET_ADDRESS_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXPLORER_EVENT_CLIENTS: usize = 64;
+/// Maximum on-disk wallet authorization audit log size.
+pub const MAX_WALLET_AUDIT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Rotatable in-memory bearer credential protecting every wallet route.
 ///
 /// The value is intentionally not printable through `Debug` or `Display`.
 #[derive(Clone)]
 pub struct WalletAuthToken(Arc<RwLock<Option<Arc<[u8]>>>>);
+
+/// Append-only, owner-only authorization audit log shared by wallet routes.
+///
+/// Records contain only a timestamp, method, path without a query string, and
+/// authorization result. Credentials, query values, bodies, and responses are
+/// deliberately excluded.
+#[derive(Clone)]
+pub struct WalletAuditLog(Arc<Mutex<WalletAuditWriter>>);
+
+struct WalletAuditWriter {
+    file: File,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct WalletAuditRecord<'a> {
+    version: u8,
+    unix_time: u64,
+    method: &'a str,
+    path: &'a str,
+    authorization: &'static str,
+}
+
+#[derive(Clone)]
+struct WalletRouteSecurity {
+    token: WalletAuthToken,
+    audit: WalletAuditLog,
+}
 
 struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
@@ -219,6 +252,213 @@ impl WalletAuthToken {
             && supplied.len() <= MAX_WALLET_AUTH_TOKEN_LEN
             && constant_time_eq(supplied.as_bytes(), configured)
     }
+}
+
+impl WalletAuditLog {
+    /// Opens or creates a bounded append-only audit file.
+    ///
+    /// Existing files must be regular, owner-only, single-link files on Unix.
+    /// New Unix files are created with mode `0600`.
+    pub fn open(path: impl AsRef<FsPath>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let (file, created) = match wallet_audit_open_options().create_new(true).open(path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let before = std::fs::symlink_metadata(path).map_err(|error| {
+                    format!("inspect wallet API audit log {}: {error}", path.display())
+                })?;
+                validate_wallet_audit_metadata(path, &before)?;
+                let file = wallet_audit_open_options().open(path).map_err(|error| {
+                    format!("open wallet API audit log {}: {error}", path.display())
+                })?;
+                let after = file.metadata().map_err(|error| {
+                    format!("inspect wallet API audit log {}: {error}", path.display())
+                })?;
+                validate_wallet_audit_metadata(path, &after)?;
+                validate_wallet_audit_identity(path, &before, &after)?;
+                (file, false)
+            }
+            Err(error) => {
+                return Err(format!(
+                    "create wallet API audit log {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect wallet API audit log {}: {error}", path.display()))?;
+        validate_wallet_audit_metadata(path, &metadata)?;
+        validate_wallet_audit_tail(path, &file, metadata.len())?;
+        if created {
+            sync_wallet_audit_parent(path)?;
+        }
+        Ok(Self(Arc::new(Mutex::new(WalletAuditWriter {
+            file,
+            bytes: metadata.len(),
+        }))))
+    }
+
+    fn record(&self, method: &str, path: &str, authorized: bool) -> Result<(), String> {
+        let unix_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system time precedes the Unix epoch".to_owned())?
+            .as_secs();
+        let mut line = serde_json::to_vec(&WalletAuditRecord {
+            version: 1,
+            unix_time,
+            method,
+            path,
+            authorization: if authorized { "accepted" } else { "rejected" },
+        })
+        .map_err(|error| format!("serialize wallet API audit record: {error}"))?;
+        line.push(b'\n');
+        let line_len = u64::try_from(line.len())
+            .map_err(|_| "wallet API audit record too large".to_owned())?;
+        let mut writer = self
+            .0
+            .lock()
+            .map_err(|_| "wallet API audit log lock poisoned".to_owned())?;
+        if writer.bytes.saturating_add(line_len) > MAX_WALLET_AUDIT_BYTES {
+            return Err("wallet API audit log reached its size limit".to_owned());
+        }
+        let previous_bytes = writer.bytes;
+        if let Err(error) = writer
+            .file
+            .write_all(&line)
+            .and_then(|()| writer.file.sync_data())
+        {
+            let rollback = writer
+                .file
+                .set_len(previous_bytes)
+                .and_then(|()| writer.file.sync_data());
+            writer.bytes = MAX_WALLET_AUDIT_BYTES;
+            return match rollback {
+                Ok(()) => Err(format!("write wallet API audit record: {error}")),
+                Err(rollback) => Err(format!(
+                    "write wallet API audit record: {error}; rollback failed: {rollback}"
+                )),
+            };
+        }
+        writer.bytes += line_len;
+        Ok(())
+    }
+}
+
+fn wallet_audit_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn validate_wallet_audit_tail(path: &FsPath, file: &File, bytes: u64) -> Result<(), String> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let mut reader = file
+        .try_clone()
+        .map_err(|error| format!("inspect wallet API audit log {}: {error}", path.display()))?;
+    reader
+        .seek(SeekFrom::Start(bytes - 1))
+        .and_then(|_| {
+            let mut tail = [0_u8; 1];
+            reader.read_exact(&mut tail)?;
+            if tail == [b'\n'] {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "audit log ends with a partial record",
+                ))
+            }
+        })
+        .map_err(|error| format!("validate wallet API audit log {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+fn sync_wallet_audit_parent(path: &FsPath) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "sync wallet API audit log directory {}: {error}",
+                parent.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_wallet_audit_parent(_: &FsPath) -> Result<(), String> {
+    Ok(())
+}
+
+fn validate_wallet_audit_metadata(
+    path: &FsPath,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "wallet API audit log {} must be a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_WALLET_AUDIT_BYTES {
+        return Err(format!(
+            "wallet API audit log {} exceeds {MAX_WALLET_AUDIT_BYTES} bytes",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "wallet API audit log {} permissions must not grant group or other access",
+                path.display()
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "wallet API audit log {} must have exactly one hard link",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_wallet_audit_identity(
+    path: &FsPath,
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if before.dev() != after.dev() || before.ino() != after.ino() {
+        return Err(format!(
+            "wallet API audit log {} changed while it was opened",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_wallet_audit_identity(
+    _: &FsPath,
+    _: &std::fs::Metadata,
+    _: &std::fs::Metadata,
+) -> Result<(), String> {
+    Ok(())
 }
 
 /// Read-only index required by explorer routes. Implement this against the node's block/tx indexes.
@@ -495,8 +735,12 @@ async fn explorer_page() -> (HeaderMap, Html<&'static str>) {
     (headers, Html(EXPLORER_HTML))
 }
 
-/// Creates bearer-authenticated REST routes for the in-process descriptor wallet.
-pub fn wallet_router(wallet: Arc<EmbeddedWallet>, token: WalletAuthToken) -> Router {
+/// Creates wallet routes whose every authorization attempt is durably audited.
+pub fn wallet_router(
+    wallet: Arc<EmbeddedWallet>,
+    token: WalletAuthToken,
+    audit: WalletAuditLog,
+) -> Router {
     let state = Arc::new(WalletApiState {
         wallet,
         address_limiter: Mutex::new(AddressRateLimiter::new()),
@@ -508,19 +752,33 @@ pub fn wallet_router(wallet: Arc<EmbeddedWallet>, token: WalletAuthToken) -> Rou
         .route("/api/v1/wallet/utxos", get(wallet_utxos))
         .route("/api/v1/wallet/address", post(next_address))
         .with_state(state)
-        .route_layer(middleware::from_fn_with_state(token, require_wallet_auth))
+        .route_layer(middleware::from_fn_with_state(
+            WalletRouteSecurity { token, audit },
+            require_wallet_auth,
+        ))
 }
 
 async fn require_wallet_auth(
-    State(token): State<WalletAuthToken>,
+    State(security): State<WalletRouteSecurity>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request
+    let authorized = request
         .headers()
         .get(header::AUTHORIZATION)
-        .is_some_and(|value| token.authorizes(value.as_bytes()))
+        .is_some_and(|value| security.token.authorizes(value.as_bytes()));
+    if security
+        .audit
+        .record(request.method().as_str(), request.uri().path(), authorized)
+        .is_err()
     {
+        let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    if authorized {
         let mut response = next.run(request).await;
         response
             .headers_mut()
@@ -922,7 +1180,11 @@ mod tests {
             .unwrap(),
         );
         let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
-        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
+        let app = wallet_router(
+            wallet,
+            WalletAuthToken::new(&token).unwrap(),
+            WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+        );
 
         for authorization in [None, Some("Bearer wrong-token")] {
             let mut request = Request::get("/api/v1/wallet/balance");
@@ -1010,6 +1272,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_audit_records_only_bounded_non_secret_authorization_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(
+            EmbeddedWallet::open_or_create(
+                directory.path().join("wallet.sqlite"),
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let audit_path = directory.path().join("wallet-api-audit.jsonl");
+        let audit = WalletAuditLog::open(&audit_path).unwrap();
+        let token = "audit-token-that-must-never-be-written".to_owned();
+        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap(), audit);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/wallet/balance?private-query-value")
+                    .header(
+                        header::AUTHORIZATION,
+                        "Bearer rejected-secret-that-must-not-be-written",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let accepted = app
+            .oneshot(
+                Request::get("/api/v1/wallet/balance?another-private-value")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let contents = std::fs::read_to_string(&audit_path).unwrap();
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["method"], "GET");
+        assert_eq!(records[0]["path"], "/api/v1/wallet/balance");
+        assert_eq!(records[0]["authorization"], "rejected");
+        assert_eq!(records[1]["authorization"], "accepted");
+        for secret in [
+            &token,
+            "rejected-secret-that-must-not-be-written",
+            "private-query-value",
+            "another-private-value",
+            "Authorization",
+        ] {
+            assert!(!contents.contains(secret), "{secret}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(audit_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_wallet_audit_log_fails_closed_before_address_revelation() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = Arc::new(
+            EmbeddedWallet::open_or_create(
+                directory.path().join("wallet.sqlite"),
+                RECEIVE_DESCRIPTOR,
+                CHANGE_DESCRIPTOR,
+                Network::Testnet,
+            )
+            .unwrap(),
+        );
+        let audit_path = directory.path().join("wallet-api-audit.jsonl");
+        let mut file = File::create(&audit_path).unwrap();
+        file.set_len(MAX_WALLET_AUDIT_BYTES).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let audit = WalletAuditLog::open(audit_path).unwrap();
+        let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
+        let app = wallet_router(
+            Arc::clone(&wallet),
+            WalletAuthToken::new(&token).unwrap(),
+            audit,
+        );
+        let response = app
+            .oneshot(
+                Request::post("/api/v1/wallet/address")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(wallet.status().unwrap().issued_receive_addresses, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wallet_audit_rejects_over_permissive_symlink_and_hardlink_files() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.jsonl");
+        File::create(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let over_permissive = directory.path().join("permissive.jsonl");
+        File::create(&over_permissive).unwrap();
+        std::fs::set_permissions(&over_permissive, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            WalletAuditLog::open(over_permissive)
+                .err()
+                .unwrap()
+                .contains("permissions")
+        );
+
+        let symlink_path = directory.path().join("symlink.jsonl");
+        symlink(&target, &symlink_path).unwrap();
+        assert!(
+            WalletAuditLog::open(symlink_path)
+                .err()
+                .unwrap()
+                .contains("regular file")
+        );
+
+        let hardlink_path = directory.path().join("hardlink.jsonl");
+        std::fs::hard_link(&target, &hardlink_path).unwrap();
+        assert!(
+            WalletAuditLog::open(hardlink_path)
+                .err()
+                .unwrap()
+                .contains("hard link")
+        );
+    }
+
+    #[test]
+    fn wallet_audit_rejects_a_partial_existing_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet-api-audit.jsonl");
+        std::fs::write(&path, br#"{"version":1"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let error = WalletAuditLog::open(path).err().unwrap();
+        assert!(error.contains("partial record"));
+    }
+
+    #[tokio::test]
     async fn wallet_utxo_pages_reject_unbounded_queries() {
         let directory = tempfile::tempdir().unwrap();
         let wallet = Arc::new(
@@ -1022,7 +1451,11 @@ mod tests {
             .unwrap(),
         );
         let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
-        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
+        let app = wallet_router(
+            wallet,
+            WalletAuthToken::new(&token).unwrap(),
+            WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+        );
         for route in ["utxos", "transactions"] {
             for query in ["limit=0", "limit=101", "offset=10001"] {
                 let response = app
@@ -1053,7 +1486,11 @@ mod tests {
             .unwrap(),
         );
         let token = "a".repeat(MIN_WALLET_AUTH_TOKEN_LEN);
-        let app = wallet_router(wallet, WalletAuthToken::new(&token).unwrap());
+        let app = wallet_router(
+            wallet,
+            WalletAuthToken::new(&token).unwrap(),
+            WalletAuditLog::open(directory.path().join("wallet-api-audit.jsonl")).unwrap(),
+        );
         let request = |path: &'static str| {
             Request::get(path)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -1149,6 +1586,33 @@ mod tests {
         token.rotate(&second).unwrap();
         assert!(!token.authorizes(format!("Bearer {first}").as_bytes()));
         assert!(token.authorizes(format!("Bearer {second}").as_bytes()));
+    }
+
+    #[test]
+    fn concurrent_wallet_audit_writers_preserve_complete_json_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wallet-api-audit.jsonl");
+        let audit = WalletAuditLog::open(&path).unwrap();
+        let writers = (0..8)
+            .map(|_| {
+                let audit = audit.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        audit.record("GET", "/api/v1/wallet/status", true).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(contents.lines().count(), 160);
+        for line in contents.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["authorization"], "accepted");
+            assert_eq!(record["path"], "/api/v1/wallet/status");
+        }
     }
 
     #[test]

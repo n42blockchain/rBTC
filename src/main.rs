@@ -20,8 +20,8 @@ use bitcoin::{
 };
 use rbtc::{
     api::{
-        ExplorerEventHub, ExplorerEventKind, WalletAuthToken, explorer_events_router,
-        explorer_router, wallet_router,
+        ExplorerEventHub, ExplorerEventKind, WalletAuditLog, WalletAuthToken,
+        explorer_events_router, explorer_router, wallet_router,
     },
     block_execution::{
         BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
@@ -62,6 +62,7 @@ const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
+const WALLET_AUDIT_FILE: &str = "wallet-api-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
@@ -208,6 +209,7 @@ struct WalletApiRuntime {
     wallet: Arc<EmbeddedWallet>,
     token: WalletAuthToken,
     token_path: PathBuf,
+    audit: WalletAuditLog,
     scan: WalletScanConfig,
 }
 
@@ -622,6 +624,7 @@ impl ApiServer {
             router = router.merge(wallet_router(
                 Arc::clone(&wallet.wallet),
                 wallet.token.clone(),
+                wallet.audit.clone(),
             ));
         }
         if let Some(status) = background_validation {
@@ -781,6 +784,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 .data_dir
                 .as_ref()
                 .expect("wallet API parser requires data directory");
+            let audit = WalletAuditLog::open(data_dir.join(WALLET_AUDIT_FILE))?;
             let wallet = EmbeddedWallet::open_or_create(
                 data_dir.join("wallet.sqlite"),
                 descriptors.receive_descriptor,
@@ -799,6 +803,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 wallet: Arc::new(wallet),
                 token,
                 token_path: files.auth_token.clone(),
+                audit,
                 scan: WalletScanConfig {
                     gap_limit: descriptors.gap_limit,
                     birthday_height: descriptors.birthday_height,
@@ -5801,6 +5806,19 @@ mod tests {
         assert_eq!(wallet.scan.gap_limit, 42);
         assert_eq!(wallet.scan.birthday_height, 100);
         assert!(directory.path().join("wallet.sqlite").exists());
+        assert!(directory.path().join(WALLET_AUDIT_FILE).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(directory.path().join(WALLET_AUDIT_FILE))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         drop(runtime);
 
         write_owner_only(
@@ -5856,6 +5874,7 @@ mod tests {
             ),
             token: WalletAuthToken::new(&token_text).unwrap(),
             token_path: token_path.clone(),
+            audit: WalletAuditLog::open(directory.path().join(WALLET_AUDIT_FILE)).unwrap(),
             scan: WalletScanConfig {
                 gap_limit: DEFAULT_WALLET_GAP_LIMIT,
                 birthday_height: 0,
@@ -5972,6 +5991,12 @@ mod tests {
         )
         .await;
         assert!(disabled.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        let audit = fs::read_to_string(directory.path().join(WALLET_AUDIT_FILE)).unwrap();
+        assert!(audit.contains(r#""authorization":"accepted""#));
+        assert!(audit.contains(r#""authorization":"rejected""#));
+        assert!(!audit.contains(&token_text));
+        assert!(!audit.contains(&rotated_text));
     }
 
     #[tokio::test]
