@@ -101,6 +101,8 @@ The same active snapshot stores a complete versioned map from txid to its first 
 
 Transactions that fail admission only because an input is unavailable enter a separate process-shared orphan pool instead of being discarded. It retains at most 64 transactions and 4 MB, rejects any orphan above the 400,000-weight-unit standard ceiling, deduplicates txid/wtxid variants, evicts oldest first under pressure, and expires entries after Core's 20-minute lifetime. Admission of any parent selects its direct orphan children; dependency grouping and the unchanged atomic admission path then validate complete multi-generation chains one generation at a time. A still-missing orphan remains eligible for a later parent, while any terminal consensus, policy, conflict, package, or topology failure removes the attempted orphan. The orphan pool is intentionally memory-only and does not survive process restart.
 
+Capacity eviction now raises a process-local rolling mempool minimum to the aggregate fee rate of the evicted oldest transaction and its descendants plus the 1 sat/vB incremental relay rate. Every subsequently submitted package member must independently pay that current rate before the candidate pool can publish. Like Core 26, the bump cannot decay until a later caught-up chain tip is observed; it then has a 12-hour half-life, accelerated twofold below half capacity and fourfold below quarter capacity, and clears below 0.5 sat/vB. Existing entries are not retroactively repriced during active-chain reconciliation. The rolling value is deliberately absent from the durable mempool snapshot and resets on process restart, matching Core's mempool dump boundary.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

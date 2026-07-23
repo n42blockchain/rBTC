@@ -3097,6 +3097,14 @@ fn admit_pending_peer_transactions(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut candidate = pool.clone();
+    candidate.observe_chain_tip(
+        chainstate
+            .execution()
+            .tip()
+            .map_err(|error| error.to_string())?
+            .hash,
+        now,
+    );
     let expired_removed = candidate.remove_with_descendants(&expired);
     let reconciled_removed = candidate.reconcile(chainstate, context);
     let expired_orphans = candidate.prune_orphans(now);
@@ -3118,7 +3126,7 @@ fn admit_pending_peer_transactions(
                 .iter()
                 .map(Transaction::compute_txid)
                 .collect::<Vec<_>>();
-            match candidate.admit_package(chainstate, package, context) {
+            match candidate.admit_package_at(chainstate, package, context, now) {
                 Ok(outcome) if !outcome.accepted.is_empty() => {
                     candidate.remove_orphans(&txid_set);
                     accepted_parents.extend(outcome.accepted.iter().copied());

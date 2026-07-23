@@ -9,7 +9,7 @@ use std::{
     sync::Mutex,
 };
 
-use bitcoin::{OutPoint, Transaction, Txid, Wtxid, consensus::encode::serialize};
+use bitcoin::{BlockHash, OutPoint, Transaction, Txid, Wtxid, consensus::encode::serialize};
 use thiserror::Error;
 
 use crate::{
@@ -28,6 +28,9 @@ pub const MAX_ORPHAN_TRANSACTIONS: usize = 64;
 pub const MAX_ORPHAN_TRANSACTION_BYTES: usize = 4_000_000;
 /// Core-compatible orphan lifetime of twenty minutes.
 pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
+/// Core's twelve-hour rolling mempool minimum-fee half-life.
+pub const ROLLING_FEE_HALFLIFE_SECS: u32 = 12 * 60 * 60;
+const SATOSHIS_PER_KVB: u64 = 1_000;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
@@ -189,6 +192,14 @@ pub enum TransactionAdmissionError {
         /// BIP125 eviction limit.
         limit: usize,
     },
+    /// Capacity pressure raised the rolling mempool minimum above this fee.
+    #[error("fee {fee_sats} is below rolling mempool minimum {minimum_sats}")]
+    RollingMinimumFee {
+        /// Transaction fee.
+        fee_sats: u64,
+        /// Fee required at the current rolling rate.
+        minimum_sats: u64,
+    },
 }
 
 impl TransactionAdmissionError {
@@ -243,6 +254,10 @@ pub struct TransactionAdmissionPool {
     retained_bytes: usize,
     orphans: VecDeque<OrphanTransaction>,
     orphan_bytes: usize,
+    rolling_minimum_fee_sat_kvb: u64,
+    rolling_fee_last_update: u32,
+    rolling_fee_decay_enabled: bool,
+    observed_chain_tip: Option<BlockHash>,
 }
 
 impl TransactionAdmissionPool {
@@ -274,6 +289,32 @@ impl TransactionAdmissionPool {
     #[must_use]
     pub const fn orphan_bytes(&self) -> usize {
         self.orphan_bytes
+    }
+
+    /// Observes a caught-up chain tip and enables fee decay after a later block.
+    pub fn observe_chain_tip(&mut self, tip: BlockHash, now: u32) {
+        if self
+            .observed_chain_tip
+            .is_some_and(|previous| previous != tip)
+        {
+            self.rolling_fee_decay_enabled = true;
+            self.rolling_fee_last_update = now;
+        }
+        self.observed_chain_tip = Some(tip);
+    }
+
+    /// Returns the current rolling minimum in satoshis per 1,000 virtual bytes.
+    pub fn rolling_minimum_fee_sat_kvb(&mut self, now: u32) -> u64 {
+        self.decay_rolling_minimum_fee(now);
+        self.effective_rolling_minimum_fee_sat_kvb()
+    }
+
+    fn effective_rolling_minimum_fee_sat_kvb(&self) -> u64 {
+        if self.rolling_minimum_fee_sat_kvb == 0 || !self.rolling_fee_decay_enabled {
+            self.rolling_minimum_fee_sat_kvb
+        } else {
+            self.rolling_minimum_fee_sat_kvb.max(SATOSHIS_PER_KVB)
+        }
     }
 
     /// Removes orphan transactions whose twenty-minute lifetime has elapsed.
@@ -386,6 +427,17 @@ impl TransactionAdmissionPool {
         transaction: Transaction,
         context: TransactionAdmissionContext,
     ) -> Result<TransactionAdmissionOutcome, TransactionAdmissionError> {
+        self.admit_at(store, transaction, context, 0)
+    }
+
+    /// Validates and retains one transaction at an explicit wall-clock time.
+    pub fn admit_at<S: UtxoStore>(
+        &mut self,
+        store: &S,
+        transaction: Transaction,
+        context: TransactionAdmissionContext,
+        now: u32,
+    ) -> Result<TransactionAdmissionOutcome, TransactionAdmissionError> {
         let wtxid = transaction.compute_wtxid();
         if self
             .entries
@@ -395,7 +447,7 @@ impl TransactionAdmissionPool {
             return Ok(TransactionAdmissionOutcome::AlreadyPresent(wtxid));
         }
         let txid = transaction.compute_txid();
-        let outcome = self.admit_package(store, vec![transaction], context)?;
+        let outcome = self.admit_package_at(store, vec![transaction], context, now)?;
         Ok(TransactionAdmissionOutcome::Accepted {
             txid,
             evicted: outcome.evicted,
@@ -415,7 +467,19 @@ impl TransactionAdmissionPool {
         transactions: Vec<Transaction>,
         context: TransactionAdmissionContext,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        self.admit_package_at(store, transactions, context, 0)
+    }
+
+    /// Atomically validates a package at an explicit wall-clock time.
+    pub fn admit_package_at<S: UtxoStore>(
+        &mut self,
+        store: &S,
+        transactions: Vec<Transaction>,
+        context: TransactionAdmissionContext,
+        now: u32,
+    ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
         validate_package_bounds(&transactions)?;
+        self.decay_rolling_minimum_fee(now);
         let mut candidate = self.clone();
         let outcome = candidate.admit_package_inner(store, transactions, context)?;
         *self = candidate;
@@ -592,6 +656,16 @@ impl TransactionAdmissionPool {
             }
             let txid = transaction.compute_txid();
             let fee_sats = apply_to_overlay(overlay, &transaction, context)?;
+            let minimum_sats = fee_for_rate(
+                self.effective_rolling_minimum_fee_sat_kvb(),
+                transaction.vsize(),
+            );
+            if fee_sats < minimum_sats {
+                return Err(TransactionAdmissionError::RollingMinimumFee {
+                    fee_sats,
+                    minimum_sats,
+                });
+            }
             replacement_fee_sats = replacement_fee_sats.saturating_add(fee_sats);
             let serialized_len = serialize(&transaction).len();
             for input in &transaction.input {
@@ -620,6 +694,8 @@ impl TransactionAdmissionPool {
         store: &S,
         context: TransactionAdmissionContext,
     ) -> usize {
+        let rolling_minimum_fee_sat_kvb = self.rolling_minimum_fee_sat_kvb;
+        self.rolling_minimum_fee_sat_kvb = 0;
         let previous = self
             .entries
             .drain(..)
@@ -631,6 +707,7 @@ impl TransactionAdmissionPool {
         for transaction in previous {
             let _ = self.admit(store, transaction, context);
         }
+        self.rolling_minimum_fee_sat_kvb = rolling_minimum_fee_sat_kvb;
         before.saturating_sub(self.entries.len())
     }
 
@@ -664,6 +741,26 @@ impl TransactionAdmissionPool {
                 .map(|entry| self.descendant_closure(entry.transaction.compute_txid()))
                 .find(|closure| closure.is_disjoint(protected))
                 .ok_or(TransactionAdmissionError::PackageCapacity)?;
+            let (removed_fee_sats, removed_vbytes) = self
+                .entries
+                .iter()
+                .filter(|entry| removed.contains(&entry.transaction.compute_txid()))
+                .fold((0_u64, 0_usize), |(fees, vbytes), entry| {
+                    (
+                        fees.saturating_add(entry.fee_sats),
+                        vbytes.saturating_add(entry.transaction.vsize()),
+                    )
+                });
+            let removed_rate = u64::try_from(
+                u128::from(removed_fee_sats).saturating_mul(u128::from(SATOSHIS_PER_KVB))
+                    / u128::try_from(removed_vbytes).unwrap_or(u128::MAX),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(SATOSHIS_PER_KVB);
+            if removed_rate > self.rolling_minimum_fee_sat_kvb {
+                self.rolling_minimum_fee_sat_kvb = removed_rate;
+                self.rolling_fee_decay_enabled = false;
+            }
             let before = self.entries.len();
             self.entries
                 .retain(|entry| !removed.contains(&entry.transaction.compute_txid()));
@@ -671,6 +768,36 @@ impl TransactionAdmissionPool {
             self.rebuild_indexes();
         }
         Ok(evicted)
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn decay_rolling_minimum_fee(&mut self, now: u32) {
+        if !self.rolling_fee_decay_enabled
+            || self.rolling_minimum_fee_sat_kvb == 0
+            || now <= self.rolling_fee_last_update.saturating_add(10)
+        {
+            return;
+        }
+        let mut half_life = f64::from(ROLLING_FEE_HALFLIFE_SECS);
+        if self.retained_bytes < MAX_ADMITTED_TRANSACTION_BYTES / 4 {
+            half_life /= 4.0;
+        } else if self.retained_bytes < MAX_ADMITTED_TRANSACTION_BYTES / 2 {
+            half_life /= 2.0;
+        }
+        let elapsed = f64::from(now.saturating_sub(self.rolling_fee_last_update));
+        // Core performs this exponential decay in double precision. Both operands
+        // are non-negative and the quotient cannot exceed the original u64 rate.
+        self.rolling_minimum_fee_sat_kvb = ((self.rolling_minimum_fee_sat_kvb as f64)
+            / 2_f64.powf(elapsed / half_life))
+        .round() as u64;
+        self.rolling_fee_last_update = now;
+        if self.rolling_minimum_fee_sat_kvb < SATOSHIS_PER_KVB / 2 {
+            self.rolling_minimum_fee_sat_kvb = 0;
+        }
     }
 
     fn descendant_closure(&self, txid: Txid) -> BTreeSet<Txid> {
@@ -853,6 +980,16 @@ fn validate_replacement_fees(
         });
     }
     Ok(())
+}
+
+fn fee_for_rate(rate_sat_kvb: u64, vbytes: usize) -> u64 {
+    let product =
+        u128::from(rate_sat_kvb).saturating_mul(u128::try_from(vbytes).unwrap_or(u128::MAX));
+    let fee = u64::try_from(
+        product.saturating_add(u128::from(SATOSHIS_PER_KVB - 1)) / u128::from(SATOSHIS_PER_KVB),
+    )
+    .unwrap_or(u64::MAX);
+    if fee == 0 && rate_sat_kvb > 0 { 1 } else { fee }
 }
 
 fn validate_package_bounds(transactions: &[Transaction]) -> Result<(), TransactionAdmissionError> {
@@ -1744,6 +1881,73 @@ mod tests {
         assert_eq!(pool.len(), MAX_ADMITTED_TRANSACTIONS - 1);
         assert!(!txids.contains(&parent_txid));
         assert!(!txids.contains(&child_txid));
+    }
+
+    #[test]
+    fn capacity_bump_rejects_low_fees_until_block_enabled_decay_clears_it() {
+        let (_directory, store) = store();
+        let mut pool = TransactionAdmissionPool::default();
+        for index in 1..=u8::try_from(MAX_ADMITTED_TRANSACTIONS + 1).unwrap() {
+            let (outpoint, utxo, transaction) = spend(index);
+            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            pool.admit_at(&store, transaction, context(), 100).unwrap();
+        }
+        let bumped = pool.rolling_minimum_fee_sat_kvb(1_000_000);
+        assert!(bumped > SATOSHIS_PER_KVB);
+
+        let (outpoint, utxo, mut low_fee) = spend(200);
+        low_fee.output[0].value = Amount::from_sat(99_800);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let before = txids(&pool);
+        assert!(matches!(
+            pool.admit_at(&store, low_fee.clone(), context(), 200),
+            Err(TransactionAdmissionError::RollingMinimumFee { .. })
+        ));
+        assert_eq!(txids(&pool), before);
+
+        let first_tip = BlockHash::from_byte_array([1; 32]);
+        let second_tip = BlockHash::from_byte_array([2; 32]);
+        pool.observe_chain_tip(first_tip, 200);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(200 + 48 * 60 * 60), bumped);
+        pool.observe_chain_tip(second_tip, 300);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(300 + 48 * 60 * 60), 0);
+        pool.admit_at(&store, low_fee, context(), 300 + 48 * 60 * 60)
+            .unwrap();
+    }
+
+    #[test]
+    fn rolling_fee_uses_accelerated_half_life_below_quarter_capacity() {
+        assert_eq!(fee_for_rate(1_001, 100), 101);
+        assert_eq!(fee_for_rate(1, 1), 1);
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 8_000,
+            ..TransactionAdmissionPool::default()
+        };
+        let first_tip = BlockHash::from_byte_array([3; 32]);
+        let second_tip = BlockHash::from_byte_array([4; 32]);
+        pool.observe_chain_tip(first_tip, 100);
+        pool.observe_chain_tip(second_tip, 200);
+        assert_eq!(
+            pool.rolling_minimum_fee_sat_kvb(200 + ROLLING_FEE_HALFLIFE_SECS / 4),
+            4_000
+        );
+        pool.rolling_minimum_fee_sat_kvb = 600;
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(11_001), SATOSHIS_PER_KVB);
+    }
+
+    #[test]
+    fn active_chain_reconciliation_does_not_reprice_retained_transactions() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, transaction) = spend(201);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let txid = transaction.compute_txid();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, transaction, context()).unwrap();
+        pool.rolling_minimum_fee_sat_kvb = 1_000_000;
+
+        assert_eq!(pool.reconcile(&store, context()), 0);
+        assert_eq!(txids(&pool), vec![txid]);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(0), 1_000_000);
     }
 
     #[test]
