@@ -1101,6 +1101,13 @@ async fn run_peer_pool(
     let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
     let mut remotes = options.remotes.clone();
     if let Some(store) = &peer_store {
+        let now = unix_time()?;
+        let pruned = store
+            .prune_terrible(now)
+            .map_err(|error| error.to_string())?;
+        if pruned > 0 {
+            println!("pruned {pruned} terrible persisted peer entries before selection");
+        }
         for collision in store
             .tried_collisions()
             .map_err(|error| error.to_string())?
@@ -1113,7 +1120,7 @@ async fn run_peer_pool(
             }
         }
         for learned in store
-            .candidates(unix_time()?, MAX_CONFIGURED_PEERS)
+            .candidates(now, MAX_CONFIGURED_PEERS)
             .map_err(|error| error.to_string())?
         {
             if remotes.len() == MAX_CONFIGURED_PEERS {

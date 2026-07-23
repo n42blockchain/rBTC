@@ -51,6 +51,10 @@ const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
 const MAX_RECORDED_BLOCK_THROUGHPUT_BPS: u32 = 1_000_000_000;
 const MAX_TRIED_COLLISIONS: usize = 10;
 const MAX_STORED_TRIED_COLLISIONS_BYTES: usize = 8 * 1024;
+const TERRIBLE_RECENT_ATTEMPT_SECS: u32 = 60;
+const TERRIBLE_UNPROVEN_FAILURES: u8 = 3;
+const TERRIBLE_PROVEN_FAILURES: u8 = 10;
+const TERRIBLE_PROVEN_SUCCESS_HORIZON_SECS: u32 = 7 * 24 * 60 * 60;
 
 type PeerPriority = (
     u8,
@@ -220,7 +224,7 @@ impl RedbPeerStore {
             std::net::SocketAddr::from_str(address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
                     && is_acceptable_peer_address(socket, self.network)
-                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
+                    && !is_terrible(record, now)
             })
         });
         let group = source_group(source.ip());
@@ -349,7 +353,7 @@ impl RedbPeerStore {
             std::net::SocketAddr::from_str(stored_address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
                     && is_acceptable_peer_address(socket, self.network)
-                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
+                    && !is_terrible(record, now)
             })
         });
         let key = address.to_string();
@@ -434,7 +438,7 @@ impl RedbPeerStore {
                 let services = ServiceFlags::from(record.services);
                 (services.has(required)
                     && is_acceptable_peer_address(socket, self.network)
-                    && now.saturating_sub(record.last_seen) <= ADDRESS_HORIZON_SECS
+                    && !is_terrible(&record, now)
                     && retry_ready(&record, now))
                 .then_some((record, socket))
                 .filter(|_| {
@@ -458,6 +462,24 @@ impl RedbPeerStore {
             candidates,
             limit.min(MAX_STORED_PEERS),
         ))
+    }
+
+    /// Atomically removes Core-style terrible entries and stale collision references.
+    ///
+    /// A just-attempted peer is protected for one minute. Otherwise, impossible
+    /// future timestamps, zero/over-30-day-old address times, three failures without
+    /// any success, or ten failures after seven days without success are removed.
+    pub fn prune_terrible(&self, now: u32) -> Result<usize, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_records()?;
+        let before = records.len();
+        records.retain(|_, record| !is_terrible(record, now));
+        let removed = before.saturating_sub(records.len());
+        if removed > 0 {
+            let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+            self.replace_all(&ordered)?;
+        }
+        Ok(removed)
     }
 
     /// Returns the bounded tried-collision queue in oldest-first probe order.
@@ -951,6 +973,25 @@ fn normalize_last_seen(last_seen: u32, now: u32) -> u32 {
         now.saturating_sub(BAD_TIMESTAMP_REPLACEMENT_AGE_SECS)
     };
     normalized.saturating_sub(ADDRESS_TIME_PENALTY_SECS)
+}
+
+fn is_terrible(record: &StoredPeer, now: u32) -> bool {
+    if record.last_attempt != 0
+        && record.last_attempt >= now.saturating_sub(TERRIBLE_RECENT_ATTEMPT_SECS)
+    {
+        return false;
+    }
+    if record.last_seen > now.saturating_add(MAX_FUTURE_SECS)
+        || record.last_seen == 0
+        || now.saturating_sub(record.last_seen) > ADDRESS_HORIZON_SECS
+    {
+        return true;
+    }
+    if record.last_success == 0 {
+        return record.consecutive_failures >= TERRIBLE_UNPROVEN_FAILURES;
+    }
+    now.saturating_sub(record.last_success) > TERRIBLE_PROVEN_SUCCESS_HORIZON_SECS
+        && record.consecutive_failures >= TERRIBLE_PROVEN_FAILURES
 }
 
 fn retry_ready(record: &StoredPeer, now: u32) -> bool {
@@ -1534,6 +1575,106 @@ mod tests {
             IpAddr::V6("::ffff:1.1.1.1".parse().unwrap()),
             Network::Bitcoin
         ));
+    }
+
+    #[test]
+    fn terrible_entry_boundaries_match_core_style_rules() {
+        let now = 1_800_000_000;
+        let mut record = StoredPeer {
+            services: (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64(),
+            last_seen: now,
+            source_group: "v4:127:0".to_owned(),
+            last_attempt: 0,
+            last_success: 0,
+            consecutive_failures: 0,
+            last_session_success: 0,
+            successful_sessions: 0,
+            handshake_millis: 0,
+            block_throughput_bps: 0,
+            in_new_table: false,
+            new_source_groups: Vec::new(),
+        };
+        assert!(!is_terrible(&record, now));
+        record.last_seen = now.saturating_add(MAX_FUTURE_SECS);
+        assert!(!is_terrible(&record, now));
+        record.last_seen = now.saturating_add(MAX_FUTURE_SECS + 1);
+        assert!(is_terrible(&record, now));
+        record.last_seen = now.saturating_sub(ADDRESS_HORIZON_SECS);
+        assert!(!is_terrible(&record, now));
+        record.last_seen = now.saturating_sub(ADDRESS_HORIZON_SECS + 1);
+        assert!(is_terrible(&record, now));
+        record.last_seen = 0;
+        assert!(is_terrible(&record, now));
+
+        record.last_seen = now;
+        record.consecutive_failures = TERRIBLE_UNPROVEN_FAILURES - 1;
+        assert!(!is_terrible(&record, now));
+        record.consecutive_failures = TERRIBLE_UNPROVEN_FAILURES;
+        assert!(is_terrible(&record, now));
+        record.last_attempt = now.saturating_sub(TERRIBLE_RECENT_ATTEMPT_SECS);
+        assert!(!is_terrible(&record, now));
+        record.last_attempt = record.last_attempt.saturating_sub(1);
+        assert!(is_terrible(&record, now));
+
+        record.consecutive_failures = TERRIBLE_PROVEN_FAILURES;
+        record.last_success = now.saturating_sub(TERRIBLE_PROVEN_SUCCESS_HORIZON_SECS);
+        assert!(!is_terrible(&record, now));
+        record.last_success = record.last_success.saturating_sub(1);
+        assert!(is_terrible(&record, now));
+        record.consecutive_failures = TERRIBLE_PROVEN_FAILURES - 1;
+        assert!(!is_terrible(&record, now));
+    }
+
+    #[test]
+    fn terrible_entries_are_physically_pruned_and_recent_attempts_are_protected() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let unproven = "127.0.0.1:18441".parse().unwrap();
+        let proven = "127.0.0.1:18442".parse().unwrap();
+        let recent = "127.0.0.1:18443".parse().unwrap();
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        store
+            .insert_discovered(
+                "127.0.0.2:18444".parse().unwrap(),
+                &[
+                    learned("127.0.0.1:18441", services, now),
+                    learned("127.0.0.1:18443", services, now),
+                ],
+                now,
+            )
+            .unwrap();
+        assert!(store.insert_verified(proven, services, now).unwrap());
+        for attempt in [now, now + 60, now + 180] {
+            assert!(store.record_attempt(unproven, attempt).unwrap());
+        }
+        let proven_attempt_base = now + TERRIBLE_PROVEN_SUCCESS_HORIZON_SECS + 1;
+        for offset in 0..TERRIBLE_PROVEN_FAILURES {
+            assert!(
+                store
+                    .record_attempt(proven, proven_attempt_base + u32::from(offset))
+                    .unwrap()
+            );
+        }
+        let prune_now = proven_attempt_base + u32::from(TERRIBLE_PROVEN_FAILURES) + 2 * 60 * 60;
+        for attempt in [prune_now - 120, prune_now - 60, prune_now] {
+            assert!(store.record_attempt(recent, attempt).unwrap());
+        }
+
+        assert_eq!(store.prune_terrible(prune_now).unwrap(), 2);
+        assert_eq!(store.len().unwrap(), 1);
+        drop(store);
+
+        let reopened = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.len().unwrap(), 1);
+        assert_eq!(
+            reopened
+                .prune_terrible(prune_now + TERRIBLE_RECENT_ATTEMPT_SECS + 1)
+                .unwrap(),
+            1
+        );
+        assert!(reopened.is_empty().unwrap());
     }
 
     #[test]
