@@ -6164,6 +6164,23 @@ mod tests {
         let address: rbtc::wallet::WalletAddress = serde_json::from_str(body).unwrap();
         assert_eq!(address.index, 0);
 
+        let descriptors = http_request(
+            server.address(),
+            format!(
+                "GET /api/v1/wallet/descriptors HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token_text}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(descriptors.starts_with("HTTP/1.1 200 OK"));
+        let descriptors: rbtc::wallet::WalletPublicDescriptors =
+            serde_json::from_str(descriptors.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let imported =
+            parse_wallet_descriptor_config(&serde_json::to_vec(&descriptors).unwrap()).unwrap();
+        assert_eq!(imported.receive_descriptor, descriptors.receive_descriptor);
+        assert_eq!(imported.change_descriptor, descriptors.change_descriptor);
+        assert!(descriptors.receive_descriptor.contains("tpub"));
+
         let rotated_text = "b".repeat(32);
         let replacement = directory.path().join("wallet.token.next");
         write_owner_only(&replacement, &rotated_text);
@@ -6208,6 +6225,7 @@ mod tests {
         assert!(!audit.contains(&rpc_token_text));
         assert!(!audit.contains(&rotated_rpc_text));
         assert!(!audit.contains(r#""method":"help""#));
+        assert!(!audit.contains("tpub"));
     }
 
     #[tokio::test]

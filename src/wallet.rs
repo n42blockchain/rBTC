@@ -109,6 +109,15 @@ pub struct WalletStatus {
     pub issued_receive_addresses: u32,
 }
 
+/// Canonical public descriptors safe for authenticated watch-only export.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WalletPublicDescriptors {
+    /// External/receive public descriptor, including its checksum.
+    pub receive_descriptor: String,
+    /// Internal/change public descriptor, including its checksum.
+    pub change_descriptor: String,
+}
+
 /// Validated watch-only descriptor configuration loaded by the daemon.
 #[derive(Clone, Eq, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -453,6 +462,20 @@ impl EmbeddedWallet {
             scan_start_height: read_metadata_u32(&state.database, SCAN_START_HEIGHT_KEY)?,
             issued_receive_addresses,
         })
+    }
+
+    /// Returns canonical public descriptors without scan-policy metadata.
+    ///
+    /// Both stored descriptor types are statically public-key-only, so this
+    /// export cannot contain private key material. The returned two-field JSON
+    /// object is accepted by [`parse_wallet_descriptor_config`] with default
+    /// gap and birthday policy.
+    #[must_use]
+    pub fn public_descriptors(&self) -> WalletPublicDescriptors {
+        WalletPublicDescriptors {
+            receive_descriptor: self.receive_descriptor.to_string(),
+            change_descriptor: self.change_descriptor.to_string(),
+        }
     }
 
     /// Returns the latest persisted validated-chain checkpoint.
@@ -1036,6 +1059,34 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("public descriptor"));
         assert!(!message.contains("cVpPV"));
+    }
+
+    #[test]
+    fn public_descriptor_export_roundtrips_through_strict_import() {
+        let directory = tempfile::tempdir().unwrap();
+        let wallet = EmbeddedWallet::open_or_create(
+            directory.path().join("wallet.sqlite"),
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Testnet,
+        )
+        .unwrap();
+        let exported = wallet.public_descriptors();
+        assert_eq!(
+            public_descriptor(&exported.receive_descriptor, "receive").unwrap(),
+            public_descriptor(RECEIVE_DESCRIPTOR, "receive").unwrap()
+        );
+        assert_eq!(
+            public_descriptor(&exported.change_descriptor, "change").unwrap(),
+            public_descriptor(CHANGE_DESCRIPTOR, "change").unwrap()
+        );
+        let encoded = serde_json::to_vec(&exported).unwrap();
+        let imported = parse_wallet_descriptor_config(&encoded).unwrap();
+        assert_eq!(imported.receive_descriptor, exported.receive_descriptor);
+        assert_eq!(imported.change_descriptor, exported.change_descriptor);
+        assert_eq!(imported.gap_limit, DEFAULT_WALLET_GAP_LIMIT);
+        assert_eq!(imported.birthday_height, 0);
+        assert!(!String::from_utf8(encoded).unwrap().contains("prv"));
     }
 
     #[test]

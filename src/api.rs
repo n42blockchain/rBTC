@@ -32,7 +32,8 @@ use tokio_stream::{
 };
 
 use crate::wallet::{
-    EmbeddedWallet, WalletAddress, WalletBalance, WalletStatus, WalletTransaction, WalletUtxo,
+    EmbeddedWallet, WalletAddress, WalletBalance, WalletPublicDescriptors, WalletStatus,
+    WalletTransaction, WalletUtxo,
 };
 
 /// Explorer block summary returned by the embedded API.
@@ -983,6 +984,7 @@ pub fn wallet_router(
     });
     Router::new()
         .route("/api/v1/wallet/status", get(wallet_status))
+        .route("/api/v1/wallet/descriptors", get(wallet_descriptors))
         .route("/api/v1/wallet/balance", get(wallet_balance))
         .route("/api/v1/wallet/transactions", get(wallet_transactions))
         .route("/api/v1/wallet/utxos", get(wallet_utxos))
@@ -1105,6 +1107,11 @@ async fn wallet_balance(State(state): State<Arc<WalletApiState>>) -> ApiResult<W
 }
 async fn wallet_status(State(state): State<Arc<WalletApiState>>) -> ApiResult<WalletStatus> {
     state.wallet.status().map_err(internal).map(Json)
+}
+async fn wallet_descriptors(
+    State(state): State<Arc<WalletApiState>>,
+) -> Json<WalletPublicDescriptors> {
+    Json(state.wallet.public_descriptors())
 }
 async fn wallet_transactions(
     State(state): State<Arc<WalletApiState>>,
@@ -1898,6 +1905,25 @@ mod tests {
         let status: WalletStatus = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.tip_height, 0);
         assert_eq!(status.issued_receive_addresses, 0);
+
+        let descriptors = app
+            .clone()
+            .oneshot(request("/api/v1/wallet/descriptors"))
+            .await
+            .unwrap();
+        assert_eq!(descriptors.status(), StatusCode::OK);
+        assert_eq!(descriptors.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(descriptors.into_body(), 4096)
+            .await
+            .unwrap();
+        let descriptors: WalletPublicDescriptors = serde_json::from_slice(&body).unwrap();
+        let imported = crate::wallet::parse_wallet_descriptor_config(
+            &serde_json::to_vec(&descriptors).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(imported.receive_descriptor, descriptors.receive_descriptor);
+        assert_eq!(imported.change_descriptor, descriptors.change_descriptor);
+        assert!(descriptors.receive_descriptor.contains("tpub"));
 
         let history = app
             .oneshot(request("/api/v1/wallet/transactions?limit=1"))
