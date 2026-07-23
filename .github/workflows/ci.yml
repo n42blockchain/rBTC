@@ -23,6 +23,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: bash -n scripts/*.sh
+      - run: scripts/enrich-historical-utxos.py --self-test
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1

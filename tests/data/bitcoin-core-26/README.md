@@ -61,6 +61,7 @@ pinned BIP68 height. The ignored
 `target/historical-utxo-metadata` cache makes rebuilds resumable:
 
 ```sh
+scripts/enrich-historical-utxos.py --self-test
 scripts/enrich-historical-utxos.py --api https://mempool.space/api --jobs 16
 scripts/enrich-historical-utxos.py --api https://mempool.space/api --verify-only
 ```

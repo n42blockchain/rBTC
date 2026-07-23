@@ -4107,6 +4107,26 @@ mod tests {
         (peer, local_version)
     }
 
+    async fn serve_duplicate_version_peer(
+        listener: TcpListener,
+        first_nonce: u64,
+        duplicate_nonce: u64,
+    ) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Version(_)
+        ));
+        peer.write_message(NetworkMessage::Version(peer_version(first_nonce)))
+            .await
+            .unwrap();
+        receive_client_negotiation(&mut peer).await;
+        peer.write_message(NetworkMessage::Version(peer_version(duplicate_nonce)))
+            .await
+            .unwrap();
+    }
+
     async fn serve_concurrent_assumeutxo_peer(
         stream: tokio::net::TcpStream,
         version_nonce: u64,
@@ -6565,18 +6585,7 @@ mod tests {
         let learned_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let learned_remote = learned_listener.local_addr().unwrap();
         let learned_server = tokio::spawn(async move {
-            let (stream, _) = learned_listener.accept().await.unwrap();
-            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Version(_)
-            ));
-            peer.write_message(NetworkMessage::Version(peer_version(41)))
-                .await
-                .unwrap();
-            peer.write_message(NetworkMessage::Version(peer_version(42)))
-                .await
-                .unwrap();
+            serve_duplicate_version_peer(learned_listener, 41, 42).await;
         });
 
         let directory = TempDir::new().unwrap();
@@ -6639,18 +6648,7 @@ mod tests {
         let manual_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let manual_remote = manual_listener.local_addr().unwrap();
         let manual_server = tokio::spawn(async move {
-            let (stream, _) = manual_listener.accept().await.unwrap();
-            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::Version(_)
-            ));
-            peer.write_message(NetworkMessage::Version(peer_version(43)))
-                .await
-                .unwrap();
-            peer.write_message(NetworkMessage::Version(peer_version(44)))
-                .await
-                .unwrap();
+            serve_duplicate_version_peer(manual_listener, 43, 44).await;
         });
         let error = run(Options {
             remotes: vec![manual_remote],

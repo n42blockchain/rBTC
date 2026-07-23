@@ -22,6 +22,15 @@ SUFFIX = ".utxos.json.zst"
 DEFAULT_CACHE = ROOT / "target" / "historical-utxo-metadata"
 DEFAULT_API = "https://blockstream.info/api"
 USER_AGENT = "rBTC-historical-fixture-builder/1"
+FIXTURE_FIELDS = {
+    "txid",
+    "vout",
+    "value_sats",
+    "script_pubkey",
+    "height",
+    "creation_mtp",
+    "is_coinbase",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,10 +44,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cache", type=pathlib.Path, default=DEFAULT_CACHE)
     parser.add_argument("--jobs", type=int, default=8)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--verify-only",
         action="store_true",
         help="validate exact fixture metadata without rewriting files",
+    )
+    mode.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run offline generator and committed-fixture checks",
     )
     return parser.parse_args()
 
@@ -347,10 +362,81 @@ def encode_fixture(path: pathlib.Path, records: list[dict[str, object]]) -> None
                 leftover.unlink()
 
 
+def run_self_test() -> None:
+    genesis = {
+        "id": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+        "height": 0,
+        "version": 1,
+        "previousblockhash": "00" * 32,
+        "merkle_root": (
+            "4a5e1e4baab89f3a32518a88c31bc87f"
+            "618f76673e2cc77ab2127b7afdeda33b"
+        ),
+        "timestamp": 1_231_006_505,
+        "mediantime": 1_231_006_505,
+        "bits": 0x1D00FFFF,
+        "nonce": 2_083_236_893,
+    }
+    validate_block_header(genesis)
+    tampered = dict(genesis)
+    tampered["nonce"] = int(tampered["nonce"]) + 1
+    try:
+        validate_block_header(tampered)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tampered genesis header unexpectedly passed")
+
+    paths = fixture_paths()
+    if len(paths) != 5:
+        raise AssertionError(f"expected 5 historical UTXO fixtures, found {len(paths)}")
+    record_count = 0
+    coinbase_count = 0
+    for path in paths:
+        for record in decode_fixture(path):
+            if set(record) != FIXTURE_FIELDS:
+                raise AssertionError(f"{path.name} has a non-canonical record schema")
+            if type(record["height"]) is not int or int(record["height"]) <= 0:
+                raise AssertionError(f"{path.name} has a normalized origin height")
+            if (
+                type(record["creation_mtp"]) is not int
+                or int(record["creation_mtp"]) <= 0
+            ):
+                raise AssertionError(f"{path.name} has a normalized origin MTP")
+            if type(record["is_coinbase"]) is not bool:
+                raise AssertionError(f"{path.name} has a non-boolean coinbase flag")
+            if type(record["vout"]) is not int or int(record["vout"]) < 0:
+                raise AssertionError(f"{path.name} has an invalid output index")
+            if type(record["value_sats"]) is not int or int(record["value_sats"]) < 0:
+                raise AssertionError(f"{path.name} has an invalid output value")
+            try:
+                txid = bytes.fromhex(str(record["txid"]))
+                bytes.fromhex(str(record["script_pubkey"]))
+            except ValueError as error:
+                raise AssertionError(f"{path.name} has invalid hex data") from error
+            if len(txid) != 32:
+                raise AssertionError(f"{path.name} has an invalid transaction ID")
+            record_count += 1
+            coinbase_count += int(bool(record["is_coinbase"]))
+    if (record_count, coinbase_count) != (23_331, 8):
+        raise AssertionError(
+            "historical UTXO fixture totals changed: "
+            f"{record_count} records, {coinbase_count} coinbase origins"
+        )
+    print(
+        f"Self-test passed: {record_count} records, "
+        f"{coinbase_count} coinbase origins",
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.jobs < 1 or args.jobs > 32:
         raise ValueError("--jobs must be between 1 and 32")
+    if args.self_test:
+        run_self_test()
+        return
     apis = list(dict.fromkeys(api.rstrip("/") for api in [args.api, *args.fallback_api]))
     if not all(api.startswith(("http://", "https://")) for api in apis):
         raise ValueError("every Esplora API must be an HTTP(S) base URL")
