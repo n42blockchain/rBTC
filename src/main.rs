@@ -57,6 +57,10 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const STANDBY_REAP_INTERVAL: Duration = Duration::from_millis(20);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
@@ -2115,6 +2119,37 @@ async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer
     }
 }
 
+async fn reap_finished_standbys(
+    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    peer_store: Option<&RedbPeerStore>,
+    manual_remotes: &HashSet<SocketAddr>,
+    failures: &mut Vec<String>,
+) {
+    let finished = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, connection))| connection.task.is_finished().then_some(index))
+        .collect::<Vec<_>>();
+    for (removed, index) in finished.into_iter().enumerate() {
+        let (remote, connection) = pending
+            .remove(index - removed)
+            .expect("finished standby index remains in the queue");
+        let error = match connection.task.await {
+            Ok(Err(error)) => error,
+            Err(error) => PeerRunError::transient(format!("peer connection task failed: {error}")),
+            Ok(Ok(_)) => PeerRunError::transient("peer standby exited before activation"),
+        };
+        eprintln!("standby peer {remote} failed: {error}");
+        record_peer_failure(
+            peer_store,
+            remote,
+            error.kind,
+            manual_remotes.contains(&remote),
+        );
+        failures.push(format!("{remote}: {error}"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_peer_candidates(
     options: &Options,
@@ -2142,15 +2177,28 @@ async fn try_peer_candidates(
         let connected = activate_pending_peer(connection).await;
         let result = match connected {
             Ok(connected) => {
-                run_connected_peer(
+                let mut active = Box::pin(run_connected_peer(
                     options,
                     connected,
                     peer_store.map(Arc::as_ref),
                     api_runtime,
                     background_validation,
                     validation_scheduler,
-                )
-                .await
+                ));
+                let mut standby_reaper = tokio::time::interval(STANDBY_REAP_INTERVAL);
+                loop {
+                    tokio::select! {
+                        result = &mut active => break result,
+                        _ = standby_reaper.tick() => {
+                            reap_finished_standbys(
+                                &mut pending,
+                                peer_store.map(Arc::as_ref),
+                                manual_remotes,
+                                failures,
+                            ).await;
+                        }
+                    }
+                }
             }
             Err(error) => Err(error),
         };
@@ -5028,6 +5076,69 @@ mod tests {
         release_stalled.send(()).unwrap();
         stalled_server.await.unwrap();
         ready_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finished_standbys_are_reaped_and_classified_in_queue_order() {
+        fn finished_pending(error: PeerRunError) -> PendingPeer {
+            let (_ready_sender, ready) = tokio::sync::oneshot::channel();
+            let (activate, _activation) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move { Err::<ConnectedPeer, _>(error) });
+            PendingPeer {
+                ready,
+                activate: Some(activate),
+                task,
+            }
+        }
+
+        let protocol_remote = "127.0.0.1:18441".parse().unwrap();
+        let manual_remote = "127.0.0.1:18442".parse().unwrap();
+        let transient_remote = "127.0.0.1:18443".parse().unwrap();
+        let mut pending = VecDeque::from([
+            (
+                protocol_remote,
+                finished_pending(PeerRunError::protocol("invalid standby header")),
+            ),
+            (
+                manual_remote,
+                finished_pending(PeerRunError::protocol("invalid manual standby header")),
+            ),
+            (
+                transient_remote,
+                finished_pending(PeerRunError::transient("standby timed out")),
+            ),
+        ]);
+        timeout(Duration::from_secs(1), async {
+            while pending
+                .iter()
+                .any(|(_, connection)| !connection.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let manual_remotes = HashSet::from([manual_remote]);
+        let mut failures = Vec::new();
+        reap_finished_standbys(&mut pending, Some(&store), &manual_remotes, &mut failures).await;
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            failures,
+            vec![
+                format!("{protocol_remote}: invalid standby header"),
+                format!("{manual_remote}: invalid manual standby header"),
+                format!("{transient_remote}: standby timed out"),
+            ]
+        );
+        let now = unix_time().unwrap();
+        assert!(store.is_discouraged(protocol_remote, now).unwrap());
+        assert!(!store.is_discouraged(manual_remote, now).unwrap());
+        assert!(!store.is_discouraged(transient_remote, now).unwrap());
     }
 
     #[tokio::test]
