@@ -31,11 +31,14 @@ use tokio_stream::{
     wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
 };
 
-use crate::wallet::{
-    EmbeddedWallet, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES, MAX_WALLET_PSBT_REQUEST_BYTES,
-    WalletAddress, WalletBalance, WalletError, WalletFinalizedTransaction, WalletPsbt,
-    WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
-    parse_wallet_psbt_finalize_request, parse_wallet_psbt_request,
+use crate::{
+    rebroadcast_store::RedbRebroadcastStore,
+    wallet::{
+        EmbeddedWallet, MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES, MAX_WALLET_PSBT_REQUEST_BYTES,
+        WalletAddress, WalletBalance, WalletError, WalletFinalizedTransaction, WalletPsbt,
+        WalletPublicDescriptors, WalletStatus, WalletTransaction, WalletUtxo,
+        parse_wallet_psbt_finalize_request, parse_wallet_psbt_request,
+    },
 };
 
 /// Explorer block summary returned by the embedded API.
@@ -179,7 +182,52 @@ struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
     address_limiter: Mutex<AddressRateLimiter>,
     psbt_limiter: Mutex<AddressRateLimiter>,
-    broadcast: Option<mpsc::Sender<WalletBroadcastRequest>>,
+    broadcast: Option<WalletBroadcastSink>,
+}
+
+/// Bounded handoff that persists a verified transaction before publishing it.
+#[derive(Clone)]
+pub struct WalletBroadcastSink {
+    sender: mpsc::Sender<WalletBroadcastRequest>,
+    persistence: Option<Arc<RedbRebroadcastStore>>,
+}
+
+impl WalletBroadcastSink {
+    /// Creates a durable sink backed by the network-bound rebroadcast store.
+    pub fn durable(
+        sender: mpsc::Sender<WalletBroadcastRequest>,
+        persistence: Arc<RedbRebroadcastStore>,
+    ) -> Self {
+        Self {
+            sender,
+            persistence: Some(persistence),
+        }
+    }
+
+    fn ephemeral(sender: mpsc::Sender<WalletBroadcastRequest>) -> Self {
+        Self {
+            sender,
+            persistence: None,
+        }
+    }
+
+    fn try_send(&self, request: WalletBroadcastRequest) -> Result<(), ()> {
+        let permit = self.sender.try_reserve().map_err(|_| ())?;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .enqueue(&request.transaction, current_unix_time()?)
+                .map_err(|_| ())?;
+        }
+        permit.send(request);
+        Ok(())
+    }
+}
+
+fn current_unix_time() -> Result<u64, ()> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ())
 }
 
 /// One consensus-verified wallet transaction awaiting a peer socket write.
@@ -994,6 +1042,21 @@ pub fn wallet_router(
     audit: AuthorizationAuditLog,
     broadcast: Option<mpsc::Sender<WalletBroadcastRequest>>,
 ) -> Router {
+    wallet_router_with_sink(
+        wallet,
+        token,
+        audit,
+        broadcast.map(WalletBroadcastSink::ephemeral),
+    )
+}
+
+/// Creates wallet routes with durable pre-handoff transaction persistence.
+pub fn wallet_router_with_sink(
+    wallet: Arc<EmbeddedWallet>,
+    token: LocalAuthToken,
+    audit: AuthorizationAuditLog,
+    broadcast: Option<WalletBroadcastSink>,
+) -> Router {
     let state = Arc::new(WalletApiState {
         wallet,
         address_limiter: Mutex::new(AddressRateLimiter::new()),
@@ -1222,7 +1285,7 @@ async fn broadcast_wallet_psbt(
             transaction,
             result,
         })
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|()| StatusCode::SERVICE_UNAVAILABLE)?;
     match tokio::time::timeout(WALLET_BROADCAST_TIMEOUT, completion).await {
         Ok(Ok(Ok(()))) => Ok(Json(response)),
         Ok(Ok(Err(())) | Err(_)) | Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
@@ -1307,6 +1370,74 @@ mod tests {
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
+
+    fn broadcast_test_transaction(marker: u8) -> bitcoin::Transaction {
+        use bitcoin::{
+            Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Txid, Witness, absolute::LockTime,
+            hashes::Hash, transaction::Version,
+        };
+        bitcoin::Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([marker; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn durable_broadcast_sink_persists_before_channel_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            RedbRebroadcastStore::open(directory.path().join("rebroadcast.redb"), Network::Regtest)
+                .unwrap(),
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        let sink = WalletBroadcastSink::durable(sender, Arc::clone(&store));
+        let transaction = broadcast_test_transaction(1);
+        let (result, _completion) = oneshot::channel();
+        sink.try_send(WalletBroadcastRequest {
+            transaction: transaction.clone(),
+            result,
+        })
+        .unwrap();
+        assert_eq!(store.unconfirmed_transactions().unwrap(), vec![transaction]);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn full_broadcast_channel_does_not_persist_rejected_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            RedbRebroadcastStore::open(directory.path().join("rebroadcast.redb"), Network::Regtest)
+                .unwrap(),
+        );
+        let (sender, _receiver) = mpsc::channel(1);
+        let (occupied_result, _occupied_completion) = oneshot::channel();
+        sender
+            .try_send(WalletBroadcastRequest {
+                transaction: broadcast_test_transaction(1),
+                result: occupied_result,
+            })
+            .unwrap();
+        let sink = WalletBroadcastSink::durable(sender, Arc::clone(&store));
+        let (result, _completion) = oneshot::channel();
+        assert!(
+            sink.try_send(WalletBroadcastRequest {
+                transaction: broadcast_test_transaction(2),
+                result,
+            })
+            .is_err()
+        );
+        assert_eq!(store.len().unwrap(), 0);
+    }
 
     struct TestIndex;
     impl ExplorerIndex for TestIndex {

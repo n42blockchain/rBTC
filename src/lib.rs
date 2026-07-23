@@ -23,6 +23,7 @@ pub mod mdbx_utxo;
 pub mod merkle_proof;
 pub mod p2p;
 pub mod peer_store;
+pub mod rebroadcast_store;
 pub mod signet;
 pub mod snapshot;
 pub mod undo_store;

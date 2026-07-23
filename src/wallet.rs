@@ -571,6 +571,26 @@ impl EmbeddedWallet {
             .collect())
     }
 
+    /// Returns which bounded candidate txids are confirmed in the active wallet chain.
+    pub fn confirmed_txids(
+        &self,
+        candidates: &HashSet<Txid>,
+    ) -> Result<HashSet<Txid>, WalletError> {
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let state = self.state()?;
+        Ok(state
+            .wallet
+            .transactions()
+            .filter(|transaction| {
+                candidates.contains(&transaction.tx_node.txid)
+                    && matches!(transaction.chain_position, ChainPosition::Confirmed { .. })
+            })
+            .map(|transaction| transaction.tx_node.txid)
+            .collect())
+    }
+
     /// Returns durable chain, scan, and address-issuance state.
     pub fn status(&self) -> Result<WalletStatus, WalletError> {
         let state = self.state()?;
