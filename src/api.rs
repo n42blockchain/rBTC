@@ -2,8 +2,7 @@
 //!
 //! Bind this router only to loopback. Watch-only wallet routes enforce bearer
 //! authentication, no-store responses, and address-revelation rate limits;
-//! TLS termination, token rotation, and broader authorization remain daemon
-//! deployment concerns.
+//! TLS termination and broader authorization remain daemon deployment concerns.
 
 use std::{
     collections::HashMap,
@@ -119,11 +118,11 @@ const WALLET_ADDRESS_BURST: u8 = 20;
 const WALLET_ADDRESS_REFILL_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXPLORER_EVENT_CLIENTS: usize = 64;
 
-/// In-memory bearer credential protecting every wallet route.
+/// Rotatable in-memory bearer credential protecting every wallet route.
 ///
 /// The value is intentionally not printable through `Debug` or `Display`.
 #[derive(Clone)]
-pub struct WalletAuthToken(Arc<[u8]>);
+pub struct WalletAuthToken(Arc<RwLock<Option<Arc<[u8]>>>>);
 
 struct WalletApiState {
     wallet: Arc<EmbeddedWallet>,
@@ -168,13 +167,34 @@ impl AddressRateLimiter {
 impl WalletAuthToken {
     /// Validates an ASCII token read from an owner-only file.
     pub fn new(token: impl AsRef<str>) -> Result<Self, &'static str> {
+        Ok(Self(Arc::new(RwLock::new(Some(Self::validate(token)?)))))
+    }
+
+    fn validate(token: impl AsRef<str>) -> Result<Arc<[u8]>, &'static str> {
         let token = token.as_ref().as_bytes();
         if !(MIN_WALLET_AUTH_TOKEN_LEN..=MAX_WALLET_AUTH_TOKEN_LEN).contains(&token.len())
             || !token.iter().all(u8::is_ascii_graphic)
         {
             return Err("wallet API token must be 32-256 printable ASCII bytes");
         }
-        Ok(Self(Arc::from(token)))
+        Ok(Arc::from(token))
+    }
+
+    /// Atomically replaces the credential shared by every cloned router state.
+    pub fn rotate(&self, token: impl AsRef<str>) -> Result<(), &'static str> {
+        let token = Self::validate(token)?;
+        *self
+            .0
+            .write()
+            .map_err(|_| "wallet API token lock poisoned")? = Some(token);
+        Ok(())
+    }
+
+    /// Disables all authorization until a valid credential is rotated in.
+    pub fn invalidate(&self) {
+        if let Ok(mut token) = self.0.write() {
+            *token = None;
+        }
     }
 
     /// Checks one raw HTTP `Authorization` header using constant-time token comparison.
@@ -189,9 +209,15 @@ impl WalletAuthToken {
         let Some((scheme, supplied)) = header.split_once(' ') else {
             return false;
         };
+        let Ok(configured) = self.0.read() else {
+            return false;
+        };
+        let Some(configured) = configured.as_ref() else {
+            return false;
+        };
         scheme.eq_ignore_ascii_case("Bearer")
             && supplied.len() <= MAX_WALLET_AUTH_TOKEN_LEN
-            && constant_time_eq(supplied.as_bytes(), &self.0)
+            && constant_time_eq(supplied.as_bytes(), configured)
     }
 }
 
@@ -1072,6 +1098,57 @@ mod tests {
         assert!(token.authorizes(format!("bEaReR {}", "a".repeat(32)).as_bytes()));
         assert!(!token.authorizes(format!("Bearer  {}", "a".repeat(32)).as_bytes()));
         assert!(!token.authorizes(b"Bearer \xff"));
+    }
+
+    #[test]
+    fn wallet_auth_token_rotation_is_atomic_shared_and_fail_closed() {
+        let old = "a".repeat(32);
+        let new = "b".repeat(32);
+        let token = WalletAuthToken::new(&old).unwrap();
+        let router_state = token.clone();
+        assert!(router_state.authorizes(format!("Bearer {old}").as_bytes()));
+
+        token.rotate(&new).unwrap();
+        assert!(!router_state.authorizes(format!("Bearer {old}").as_bytes()));
+        assert!(router_state.authorizes(format!("Bearer {new}").as_bytes()));
+        assert!(token.rotate("invalid").is_err());
+        assert!(router_state.authorizes(format!("Bearer {new}").as_bytes()));
+
+        token.invalidate();
+        assert!(!router_state.authorizes(format!("Bearer {new}").as_bytes()));
+        router_state.rotate(&old).unwrap();
+        assert!(token.authorizes(format!("Bearer {old}").as_bytes()));
+    }
+
+    #[test]
+    fn concurrent_wallet_auth_checks_survive_repeated_rotation() {
+        let first = "a".repeat(32);
+        let second = "b".repeat(32);
+        let token = WalletAuthToken::new(&first).unwrap();
+        let readers = (0..8)
+            .map(|_| {
+                let token = token.clone();
+                let first = first.clone();
+                let second = second.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        let _ = token.authorizes(format!("Bearer {first}").as_bytes());
+                        let _ = token.authorizes(format!("Bearer {second}").as_bytes());
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for index in 0..1_000 {
+            token
+                .rotate(if index % 2 == 0 { &second } else { &first })
+                .unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        token.rotate(&second).unwrap();
+        assert!(!token.authorizes(format!("Bearer {first}").as_bytes()));
+        assert!(token.authorizes(format!("Bearer {second}").as_bytes()));
     }
 
     #[test]

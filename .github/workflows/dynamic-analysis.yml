@@ -55,6 +55,7 @@ jobs:
           components: rust-src
       - run: cargo test --locked --all-features --lib -Zbuild-std --target x86_64-unknown-linux-gnu wallet::tests::concurrent_address_revelation_is_serialized_and_persisted -- --exact
       - run: cargo test --locked --all-features --lib -Zbuild-std --target x86_64-unknown-linux-gnu api::tests::concurrent_explorer_publishers_serialize_sequence_and_latest_state -- --exact
+      - run: cargo test --locked --all-features --lib -Zbuild-std --target x86_64-unknown-linux-gnu api::tests::concurrent_wallet_auth_checks_survive_repeated_rotation -- --exact
 
   memory-sanitizer:
     runs-on: ubuntu-latest

@@ -57,6 +57,10 @@ const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const MAX_WALLET_TOKEN_FILE_LEN: u64 = 1024;
+#[cfg(not(test))]
+const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const WALLET_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
@@ -203,6 +207,7 @@ struct WalletApiFiles {
 struct WalletApiRuntime {
     wallet: Arc<EmbeddedWallet>,
     token: WalletAuthToken,
+    token_path: PathBuf,
     scan: WalletScanConfig,
 }
 
@@ -587,6 +592,7 @@ struct ApiServer {
     #[cfg(test)]
     address: SocketAddr,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    token_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ApiServer {
@@ -607,6 +613,11 @@ impl ApiServer {
         let mut router = explorer_router(index)
             .merge(explorer_events_router(explorer_events))
             .merge(node_status_router(node_status));
+        let token_task = wallet.map(|wallet| {
+            let token = wallet.token.clone();
+            let token_path = wallet.token_path.clone();
+            tokio::spawn(watch_wallet_auth_token(token_path, token))
+        });
         if let Some(wallet) = wallet {
             router = router.merge(wallet_router(
                 Arc::clone(&wallet.wallet),
@@ -626,6 +637,7 @@ impl ApiServer {
             #[cfg(test)]
             address: bound,
             task: Some(task),
+            token_task,
         })
     }
 
@@ -652,6 +664,9 @@ impl ApiServer {
 impl Drop for ApiServer {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(task) = &self.token_task {
             task.abort();
         }
     }
@@ -783,6 +798,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
             Ok::<_, String>(WalletApiRuntime {
                 wallet: Arc::new(wallet),
                 token,
+                token_path: files.auth_token.clone(),
                 scan: WalletScanConfig {
                     gap_limit: descriptors.gap_limit,
                     birthday_height: descriptors.birthday_height,
@@ -791,6 +807,42 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
         })
         .transpose()?;
     Ok(Some(ApiRuntime { listen, wallet }))
+}
+
+async fn watch_wallet_auth_token(path: PathBuf, token: WalletAuthToken) {
+    let mut interval = tokio::time::interval(WALLET_TOKEN_RELOAD_INTERVAL);
+    let mut enabled = true;
+    loop {
+        interval.tick().await;
+        let result = read_owner_only_text_file(
+            &path,
+            "wallet authentication token",
+            MAX_WALLET_TOKEN_FILE_LEN,
+        )
+        .and_then(|contents| {
+            token
+                .rotate(contents.trim_end_matches(['\r', '\n']))
+                .map_err(str::to_owned)
+        });
+        match result {
+            Ok(()) if !enabled => {
+                eprintln!(
+                    "wallet authentication token restored from owner-only file {}",
+                    path.display()
+                );
+                enabled = true;
+            }
+            Ok(()) => {}
+            Err(error) if enabled => {
+                token.invalidate();
+                eprintln!("wallet authentication disabled until token file is valid: {error}");
+                enabled = false;
+            }
+            Err(_) => {
+                token.invalidate();
+            }
+        }
+    }
 }
 
 fn read_owner_only_text_file(
@@ -5782,6 +5834,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn embedded_api_serves_explorer_and_authenticated_watch_only_wallet() {
         let directory = TempDir::new().unwrap();
         let index = Arc::new(
@@ -5789,6 +5842,8 @@ mod tests {
                 .unwrap(),
         );
         let token_text = "a".repeat(32);
+        let token_path = directory.path().join("wallet.token");
+        write_owner_only(&token_path, &token_text);
         let wallet = WalletApiRuntime {
             wallet: Arc::new(
                 EmbeddedWallet::open_or_create(
@@ -5800,6 +5855,7 @@ mod tests {
                 .unwrap(),
             ),
             token: WalletAuthToken::new(&token_text).unwrap(),
+            token_path: token_path.clone(),
             scan: WalletScanConfig {
                 gap_limit: DEFAULT_WALLET_GAP_LIMIT,
                 birthday_height: 0,
@@ -5880,6 +5936,42 @@ mod tests {
         let body = authorized.split("\r\n\r\n").nth(1).unwrap();
         let address: rbtc::wallet::WalletAddress = serde_json::from_str(body).unwrap();
         assert_eq!(address.index, 0);
+
+        let rotated_text = "b".repeat(32);
+        let replacement = directory.path().join("wallet.token.next");
+        write_owner_only(&replacement, &rotated_text);
+        fs::rename(replacement, &token_path).unwrap();
+        tokio::time::sleep(WALLET_TOKEN_RELOAD_INTERVAL * 2).await;
+        let old = http_request(
+            server.address(),
+            format!(
+                "GET /api/v1/wallet/balance HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token_text}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(old.starts_with("HTTP/1.1 401 Unauthorized"));
+        let rotated = http_request(
+            server.address(),
+            format!(
+                "GET /api/v1/wallet/balance HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {rotated_text}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(rotated.starts_with("HTTP/1.1 200 OK"));
+
+        write_owner_only(&token_path, "invalid");
+        tokio::time::sleep(WALLET_TOKEN_RELOAD_INTERVAL * 2).await;
+        let disabled = http_request(
+            server.address(),
+            format!(
+                "GET /api/v1/wallet/balance HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {rotated_text}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(disabled.starts_with("HTTP/1.1 401 Unauthorized"));
     }
 
     #[tokio::test]
