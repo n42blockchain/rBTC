@@ -23,6 +23,8 @@ pub const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
 pub const MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE: usize = 80;
 /// Maximum public keys in a standard bare multisig output.
 pub const MAX_STANDARD_BARE_MULTISIG_KEYS: usize = 3;
+/// Maximum public keys recognized by Core's bare-multisig script solver.
+pub const MAX_SOLVER_BARE_MULTISIG_KEYS: usize = 16;
 
 /// A transaction failed local relay policy after consensus verification.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -157,6 +159,9 @@ pub fn validate_standard_transaction(
     for (index, output) in transaction.output.iter().enumerate() {
         let script = &output.script_pubkey;
         if script.is_op_return() {
+            if !Script::from_bytes(&script.as_bytes()[1..]).is_push_only() {
+                return Err(TransactionPolicyError::OutputScript(index));
+            }
             if op_return {
                 return Err(TransactionPolicyError::MultipleOpReturn);
             }
@@ -172,7 +177,7 @@ pub fn validate_standard_transaction(
             || script.is_p2wpkh()
             || script.is_p2wsh()
             || script.is_p2tr()
-            || is_standard_bare_multisig(script))
+            || is_bare_multisig(script, MAX_STANDARD_BARE_MULTISIG_KEYS))
         {
             return Err(TransactionPolicyError::OutputScript(index));
         }
@@ -212,7 +217,7 @@ pub fn validate_standard_inputs(
             || prevout.is_p2wpkh()
             || prevout.is_p2wsh()
             || prevout.is_p2tr()
-            || is_standard_bare_multisig(prevout))
+            || is_bare_multisig(prevout, MAX_SOLVER_BARE_MULTISIG_KEYS))
         {
             return Err(TransactionPolicyError::InputScript(index));
         }
@@ -288,7 +293,7 @@ pub fn validate_standard_inputs(
     Ok(())
 }
 
-fn is_standard_bare_multisig(script: &Script) -> bool {
+fn is_bare_multisig(script: &Script, maximum_public_keys: usize) -> bool {
     let Ok(instructions) = script.instructions().collect::<Result<Vec<_>, _>>() else {
         return false;
     };
@@ -309,7 +314,7 @@ fn is_standard_bare_multisig(script: &Script) -> bool {
     };
     *checkmultisig == bitcoin::opcodes::all::OP_CHECKMULTISIG
         && total == public_keys.len()
-        && (1..=MAX_STANDARD_BARE_MULTISIG_KEYS).contains(&total)
+        && (1..=maximum_public_keys).contains(&total)
         && required <= total
         && public_keys.iter().all(|instruction| {
             matches!(
@@ -467,6 +472,20 @@ mod tests {
         assert_eq!(
             validate_standard_transaction(&transaction, 1_000),
             Err(TransactionPolicyError::MultipleOpReturn)
+        );
+
+        let mut transaction = standard_transaction();
+        transaction.output[0] = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: Builder::new()
+                .push_opcode(opcodes::all::OP_RETURN)
+                .push_slice([0; 20])
+                .push_opcode(opcodes::all::OP_DUP)
+                .into_script(),
+        };
+        assert_eq!(
+            validate_standard_transaction(&transaction, 1_000),
+            Err(TransactionPolicyError::OutputScript(0))
         );
     }
 
@@ -629,10 +648,19 @@ mod tests {
             Err(TransactionPolicyError::UnexpectedWitness(0))
         );
 
+        let mut no_witness = transaction;
+        no_witness.input[0].witness = Witness::new();
         assert_eq!(
             validate_standard_inputs(
-                &transaction,
+                &no_witness,
                 &[bare_multisig(MAX_STANDARD_BARE_MULTISIG_KEYS + 1)],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_standard_inputs(
+                &no_witness,
+                &[bare_multisig(MAX_SOLVER_BARE_MULTISIG_KEYS + 1)],
             ),
             Err(TransactionPolicyError::InputScript(0))
         );
