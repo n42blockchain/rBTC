@@ -51,6 +51,8 @@ pub const MAX_ANCESTOR_VBYTES: usize = 101_000;
 pub const MAX_DESCENDANT_TRANSACTIONS: usize = 25;
 /// Core default maximum aggregate descendant virtual size.
 pub const MAX_DESCENDANT_VBYTES: usize = 101_000;
+/// Core's single-transaction CPFP descendant-size carve-out.
+pub const EXTRA_DESCENDANT_TRANSACTION_VBYTES: usize = 10_000;
 /// Maximum original transactions and descendants replaced in one admission.
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
 /// Additional relay fee charged for every replacement virtual byte.
@@ -559,6 +561,7 @@ impl TransactionAdmissionPool {
         transactions: Vec<Transaction>,
         context: TransactionAdmissionContext,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        let allow_cpfp_carveout = transactions.len() == 1;
         let (already_present, package) = self.collect_new_package(transactions)?;
         if package.is_empty() {
             return Ok(PackageAdmissionOutcome {
@@ -584,7 +587,7 @@ impl TransactionAdmissionPool {
                 limit: MAX_PACKAGE_VBYTES,
             });
         }
-        self.validate_topology_limits(&accepted)?;
+        self.validate_topology_limits(&accepted, allow_cpfp_carveout)?;
         validate_replacement_fees(
             replacement_fee_sats,
             replacement.conflicts_fee_sats,
@@ -938,8 +941,13 @@ impl TransactionAdmissionPool {
             })
     }
 
-    fn validate_topology_limits(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
+    fn validate_topology_limits(
+        &self,
+        accepted: &[Txid],
+        allow_cpfp_carveout: bool,
+    ) -> Result<(), TransactionAdmissionError> {
         let mut affected_ancestors = BTreeSet::new();
+        let mut cpfp_carveout_parent = None;
         for txid in accepted {
             let ancestors = self.ancestor_closure(*txid);
             if ancestors.len() > MAX_ANCESTOR_TRANSACTIONS {
@@ -957,23 +965,38 @@ impl TransactionAdmissionPool {
                     limit: MAX_ANCESTOR_VBYTES,
                 });
             }
+            if allow_cpfp_carveout && accepted.len() == 1 && ancestors.len() == 2 {
+                let policy_vsize = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.transaction.compute_txid() == *txid)
+                    .map_or(usize::MAX, |entry| entry.policy_vsize);
+                if policy_vsize <= EXTRA_DESCENDANT_TRANSACTION_VBYTES {
+                    cpfp_carveout_parent =
+                        ancestors.iter().copied().find(|ancestor| ancestor != txid);
+                }
+            }
             affected_ancestors.extend(ancestors);
         }
         for txid in affected_ancestors {
             let descendants = self.descendant_closure(txid);
-            if descendants.len() > MAX_DESCENDANT_TRANSACTIONS {
+            let uses_carveout = cpfp_carveout_parent == Some(txid);
+            let count_limit = MAX_DESCENDANT_TRANSACTIONS + usize::from(uses_carveout);
+            if descendants.len() > count_limit {
                 return Err(TransactionAdmissionError::TooManyDescendants {
                     txid,
                     count: descendants.len(),
-                    limit: MAX_DESCENDANT_TRANSACTIONS,
+                    limit: count_limit,
                 });
             }
             let vbytes = self.closure_vbytes(&descendants);
-            if vbytes > MAX_DESCENDANT_VBYTES {
+            let vbytes_limit = MAX_DESCENDANT_VBYTES
+                + usize::from(uses_carveout) * EXTRA_DESCENDANT_TRANSACTION_VBYTES;
+            if vbytes > vbytes_limit {
                 return Err(TransactionAdmissionError::DescendantsTooLarge {
                     txid,
                     vbytes,
-                    limit: MAX_DESCENDANT_VBYTES,
+                    limit: vbytes_limit,
                 });
             }
         }
@@ -1747,7 +1770,7 @@ mod tests {
             .apply(&[], &[(fanout_outpoint.into(), fanout_utxo)])
             .unwrap();
         let output = fanout_parent.output[0].clone();
-        fanout_parent.output = (0..MAX_DESCENDANT_TRANSACTIONS)
+        fanout_parent.output = (0..=MAX_DESCENDANT_TRANSACTIONS)
             .map(|_| TxOut {
                 value: Amount::from_sat(3_000),
                 script_pubkey: output.script_pubkey.clone(),
@@ -1768,12 +1791,35 @@ mod tests {
             u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap(),
             2_000,
         );
+        let mut multi_package_pool = fanout_pool.clone();
         assert!(matches!(
-            fanout_pool.admit(&store, last, context()),
+            multi_package_pool.admit_package(
+                &store,
+                vec![last.clone(), fanout_parent.clone()],
+                context(),
+            ),
             Err(TransactionAdmissionError::TooManyDescendants {
                 txid,
                 count: 26,
                 limit: MAX_DESCENDANT_TRANSACTIONS,
+            }) if txid == parent_txid
+        ));
+        assert_eq!(multi_package_pool.snapshot(), before);
+
+        fanout_pool.admit(&store, last, context()).unwrap();
+        assert_eq!(fanout_pool.len(), MAX_DESCENDANT_TRANSACTIONS + 1);
+        let before = fanout_pool.snapshot();
+        let twenty_seventh = child_at(
+            &fanout_parent,
+            u32::try_from(MAX_DESCENDANT_TRANSACTIONS).unwrap(),
+            2_000,
+        );
+        assert!(matches!(
+            fanout_pool.admit(&store, twenty_seventh, context()),
+            Err(TransactionAdmissionError::TooManyDescendants {
+                txid,
+                count: 27,
+                limit: 26,
             }) if txid == parent_txid
         ));
         assert_eq!(fanout_pool.snapshot(), before);
@@ -1791,7 +1837,7 @@ mod tests {
         let child_txid = large_child.compute_txid();
         let ancestor_pool = unchecked_pool(vec![large_parent.clone(), large_child.clone()]);
         assert!(matches!(
-            ancestor_pool.validate_topology_limits(&[child_txid]),
+            ancestor_pool.validate_topology_limits(&[child_txid], false),
             Err(TransactionAdmissionError::AncestorsTooLarge {
                 txid,
                 vbytes,
@@ -1808,12 +1854,74 @@ mod tests {
         let second_txid = second.compute_txid();
         let descendant_pool = unchecked_pool(vec![parent, first, second]);
         assert!(matches!(
-            descendant_pool.validate_topology_limits(&[second_txid]),
+            descendant_pool.validate_topology_limits(&[second_txid], false),
             Err(TransactionAdmissionError::DescendantsTooLarge {
                 txid,
                 vbytes,
                 limit: MAX_DESCENDANT_VBYTES,
             }) if txid == parent_txid && vbytes > MAX_DESCENDANT_VBYTES
+        ));
+    }
+
+    #[test]
+    fn cpfp_carveout_extends_descendant_size_by_ten_thousand_vbytes() {
+        let (_, _, mut parent) = spend(96);
+        let output = parent.output[0].clone();
+        parent.output = vec![output.clone(), output];
+        let mut existing_child = child_at(&parent, 0, 80_000);
+        existing_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 100_600]);
+        let mut carveout_child = child_at(&parent, 1, 70_000);
+        carveout_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 5_000]);
+        let parent_txid = parent.compute_txid();
+        let child_txid = carveout_child.compute_txid();
+        let pool = unchecked_pool(vec![parent, existing_child, carveout_child]);
+        let descendants = pool.descendant_closure(parent_txid);
+        let descendant_vbytes = pool.closure_vbytes(&descendants);
+        assert!(descendant_vbytes > MAX_DESCENDANT_VBYTES);
+        assert!(descendant_vbytes <= MAX_DESCENDANT_VBYTES + EXTRA_DESCENDANT_TRANSACTION_VBYTES);
+
+        assert!(matches!(
+            pool.validate_topology_limits(&[child_txid], false),
+            Err(TransactionAdmissionError::DescendantsTooLarge {
+                txid,
+                limit: MAX_DESCENDANT_VBYTES,
+                ..
+            }) if txid == parent_txid
+        ));
+        assert!(pool.validate_topology_limits(&[child_txid], true).is_ok());
+    }
+
+    #[test]
+    fn cpfp_carveout_rejects_a_child_above_ten_thousand_vbytes() {
+        let (_, _, mut parent) = spend(97);
+        let output = parent.output[0].clone();
+        parent.output = (0..MAX_DESCENDANT_TRANSACTIONS)
+            .map(|_| output.clone())
+            .collect();
+        let mut entries = vec![parent.clone()];
+        for vout in 0..u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap() {
+            entries.push(child_at(&parent, vout, 80_000));
+        }
+        let mut oversized = child_at(
+            &parent,
+            u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap(),
+            79_000,
+        );
+        oversized.output[0].script_pubkey =
+            ScriptBuf::from_bytes(vec![0; EXTRA_DESCENDANT_TRANSACTION_VBYTES + 1_000]);
+        let parent_txid = parent.compute_txid();
+        let oversized_txid = oversized.compute_txid();
+        assert!(oversized.vsize() > EXTRA_DESCENDANT_TRANSACTION_VBYTES);
+        entries.push(oversized);
+        let pool = unchecked_pool(entries);
+
+        assert!(matches!(
+            pool.validate_topology_limits(&[oversized_txid], true),
+            Err(TransactionAdmissionError::TooManyDescendants {
+                txid,
+                count: 26,
+                limit: MAX_DESCENDANT_TRANSACTIONS,
+            }) if txid == parent_txid
         ));
     }
 
