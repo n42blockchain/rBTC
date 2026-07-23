@@ -7,13 +7,14 @@
 
 use bitcoin::{
     BlockHash, Transaction,
+    bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId},
     consensus::{deserialize, encode::Error as EncodeError, serialize},
     p2p::{
         Address, Magic, ServiceFlags,
         address::AddrV2Message,
         message::{MAX_INV_SIZE, NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
-        message_compact_blocks::SendCmpct,
+        message_compact_blocks::{GetBlockTxn, SendCmpct},
         message_network::VersionMessage,
     },
 };
@@ -200,6 +201,23 @@ pub enum P2pError {
         /// Number of transaction references received.
         count: usize,
     },
+    /// A peer supplied structurally impossible compact-block metadata.
+    #[error("malformed compact block: {reason}")]
+    MalformedCompactBlock {
+        /// Objective BIP152 structural failure.
+        reason: &'static str,
+    },
+    /// A peer supplied missing transactions for a block with no pending reconstruction.
+    #[error("peer sent unexpected blocktxn for {0}")]
+    UnexpectedBlockTransactions(BlockHash),
+    /// A peer returned a different number of transactions than requested.
+    #[error("peer sent {actual} blocktxn transactions; expected {expected}")]
+    WrongBlockTransactionCount {
+        /// Number of missing transactions requested.
+        expected: usize,
+        /// Number returned by the peer.
+        actual: usize,
+    },
     /// A matching pong did not arrive within the shared response-frame budget.
     #[error("peer did not provide the requested pong within {MAX_RESPONSE_MESSAGES} messages")]
     PongResponseIncomplete,
@@ -262,7 +280,10 @@ impl P2pError {
             | Self::TooManyAddresses { .. }
             | Self::TooManyInventoryEntries { .. }
             | Self::TooManyRemoteLocatorHashes { .. }
-            | Self::TooManyCompactBlockTransactions { .. } => true,
+            | Self::TooManyCompactBlockTransactions { .. }
+            | Self::MalformedCompactBlock { .. }
+            | Self::UnexpectedBlockTransactions(_)
+            | Self::WrongBlockTransactionCount { .. } => true,
         }
     }
 }
@@ -287,6 +308,182 @@ pub struct BlockTransferStats {
     pub response_time: Duration,
 }
 
+struct CompactBlockReconstruction {
+    header: bitcoin::block::Header,
+    transactions: Vec<Option<Transaction>>,
+    missing: Vec<usize>,
+}
+
+enum CompactBlockCompletion {
+    Complete(bitcoin::Block),
+    MerkleMismatch,
+}
+
+impl CompactBlockReconstruction {
+    fn new(compact: HeaderAndShortIds, candidates: &[Transaction]) -> Result<Self, P2pError> {
+        let transaction_count = compact
+            .short_ids
+            .len()
+            .checked_add(compact.prefilled_txs.len())
+            .ok_or(P2pError::MalformedCompactBlock {
+                reason: "transaction count overflow",
+            })?;
+        if transaction_count == 0 || transaction_count > MAX_COMPACT_BLOCK_TRANSACTIONS {
+            return Err(P2pError::MalformedCompactBlock {
+                reason: "transaction count is outside consensus bounds",
+            });
+        }
+
+        let mut transactions = vec![None; transaction_count];
+        let mut last_prefilled: Option<usize> = None;
+        for prefilled in compact.prefilled_txs {
+            let differential = usize::from(prefilled.idx);
+            let position = match last_prefilled {
+                None => differential,
+                Some(last) => last
+                    .checked_add(1)
+                    .and_then(|next| next.checked_add(differential))
+                    .ok_or(P2pError::MalformedCompactBlock {
+                        reason: "prefilled transaction index overflow",
+                    })?,
+            };
+            if position >= transaction_count {
+                return Err(P2pError::MalformedCompactBlock {
+                    reason: "prefilled transaction index is out of range",
+                });
+            }
+            transactions[position] = Some(prefilled.tx);
+            last_prefilled = Some(position);
+        }
+        if !transactions
+            .first()
+            .and_then(Option::as_ref)
+            .is_some_and(Transaction::is_coinbase)
+        {
+            return Err(P2pError::MalformedCompactBlock {
+                reason: "coinbase transaction is not prefilled at index zero",
+            });
+        }
+
+        let mut short_positions = HashMap::<ShortId, Vec<usize>>::new();
+        let mut short_ids = compact.short_ids.into_iter();
+        for (position, transaction) in transactions.iter().enumerate() {
+            if transaction.is_none() {
+                let short_id = short_ids.next().ok_or(P2pError::MalformedCompactBlock {
+                    reason: "short transaction ID count is inconsistent",
+                })?;
+                short_positions.entry(short_id).or_default().push(position);
+            }
+        }
+        if short_ids.next().is_some() {
+            return Err(P2pError::MalformedCompactBlock {
+                reason: "short transaction ID count is inconsistent",
+            });
+        }
+
+        let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
+        let mut candidate_matches = HashMap::<ShortId, Option<Transaction>>::new();
+        for candidate in candidates {
+            let wtxid = candidate.compute_wtxid();
+            let short_id = ShortId::with_siphash_keys(&wtxid.to_raw_hash(), keys);
+            match candidate_matches.entry(short_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(candidate.clone()));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry
+                        .get()
+                        .as_ref()
+                        .is_some_and(|existing| existing.compute_wtxid() != wtxid)
+                    {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+        for (short_id, positions) in short_positions {
+            if positions.len() == 1 {
+                if let Some(Some(candidate)) = candidate_matches.remove(&short_id) {
+                    transactions[positions[0]] = Some(candidate);
+                }
+            }
+        }
+        let missing = transactions
+            .iter()
+            .enumerate()
+            .filter_map(|(position, transaction)| transaction.is_none().then_some(position))
+            .collect();
+        Ok(Self {
+            header: compact.header,
+            transactions,
+            missing,
+        })
+    }
+
+    fn block_hash(&self) -> BlockHash {
+        self.header.block_hash()
+    }
+
+    fn missing_request(&self) -> Option<GetBlockTxn> {
+        (!self.missing.is_empty()).then(|| GetBlockTxn {
+            txs_request: BlockTransactionsRequest {
+                block_hash: self.block_hash(),
+                indexes: self
+                    .missing
+                    .iter()
+                    .map(|position| {
+                        u64::try_from(*position).expect("compact block position fits u64")
+                    })
+                    .collect(),
+            },
+        })
+    }
+
+    fn complete(
+        mut self,
+        response: Option<BlockTransactions>,
+    ) -> Result<CompactBlockCompletion, P2pError> {
+        match (self.missing.is_empty(), response) {
+            (true, None) => {}
+            (false, Some(response)) => {
+                if response.block_hash != self.block_hash() {
+                    return Err(P2pError::UnexpectedBlockTransactions(response.block_hash));
+                }
+                if response.transactions.len() != self.missing.len() {
+                    return Err(P2pError::WrongBlockTransactionCount {
+                        expected: self.missing.len(),
+                        actual: response.transactions.len(),
+                    });
+                }
+                for (position, transaction) in self.missing.into_iter().zip(response.transactions) {
+                    self.transactions[position] = Some(transaction);
+                }
+            }
+            (true, Some(response)) => {
+                return Err(P2pError::UnexpectedBlockTransactions(response.block_hash));
+            }
+            (false, None) => {
+                return Err(P2pError::MalformedCompactBlock {
+                    reason: "missing transactions were not supplied",
+                });
+            }
+        }
+        let block = bitcoin::Block {
+            header: self.header,
+            txdata: self
+                .transactions
+                .into_iter()
+                .map(|transaction| transaction.expect("all compact block positions are complete"))
+                .collect(),
+        };
+        if block.check_merkle_root() && block.check_witness_commitment() {
+            Ok(CompactBlockCompletion::Complete(block))
+        } else {
+            Ok(CompactBlockCompletion::MerkleMismatch)
+        }
+    }
+}
+
 /// An established Bitcoin peer session.
 ///
 /// The session owns its transport, so messages left after handshake remain in
@@ -294,6 +491,8 @@ pub struct BlockTransferStats {
 pub struct PeerSession<S> {
     transport: V1Transport<S>,
     remote_version: VersionMessage,
+    compact_block_version: Option<u64>,
+    requested_compact_blocks: bool,
     pending_messages: VecDeque<(NetworkMessage, usize)>,
     pending_message_bytes: usize,
     block_transfer_stats: BlockTransferStats,
@@ -304,6 +503,8 @@ impl<S> PeerSession<S> {
         Self {
             transport,
             remote_version,
+            compact_block_version: None,
+            requested_compact_blocks: false,
             pending_messages: VecDeque::new(),
             pending_message_bytes: 0,
             block_transfer_stats: BlockTransferStats::default(),
@@ -320,6 +521,12 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn block_transfer_stats(&self) -> BlockTransferStats {
         self.block_transfer_stats
+    }
+
+    /// Returns the negotiated inbound compact-block encoding, when supported.
+    #[must_use]
+    pub const fn compact_block_version(&self) -> Option<u64> {
+        self.compact_block_version
     }
 
     /// Returns the underlying framed transport.
@@ -489,6 +696,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         let (message, payload_len) = self.transport.read_message_with_payload_len().await?;
         let message = message.into_payload();
         validate_post_handshake_message(&message)?;
+        if matches!(
+            &message,
+            NetworkMessage::SendCmpct(SendCmpct {
+                version: COMPACT_BLOCK_VERSION,
+                ..
+            })
+        ) {
+            self.compact_block_version = Some(COMPACT_BLOCK_VERSION);
+        }
         match message {
             NetworkMessage::Ping(nonce) => {
                 self.transport
@@ -719,21 +935,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
 
     /// Requests witness-serialized blocks through standard `getdata` entries.
     pub async fn request_witness_blocks(&mut self, hashes: &[BlockHash]) -> Result<(), P2pError> {
-        if hashes.len() > MAX_BLOCKS_IN_FLIGHT {
-            return Err(P2pError::TooManyBlockRequests {
-                count: hashes.len(),
-            });
-        }
-        let mut unique = HashSet::with_capacity(hashes.len());
-        for hash in hashes {
-            if !unique.insert(*hash) {
-                return Err(P2pError::DuplicateBlockRequest(*hash));
-            }
-        }
+        validate_block_request(hashes)?;
+        self.requested_compact_blocks = false;
         let inventory = hashes
             .iter()
             .copied()
             .map(Inventory::WitnessBlock)
+            .collect();
+        self.transport
+            .write_message(NetworkMessage::GetData(inventory))
+            .await
+    }
+
+    /// Requests compact blocks after two-way BIP152 version-2 negotiation,
+    /// falling back to full witness-block inventory for other peers.
+    pub async fn request_blocks(&mut self, hashes: &[BlockHash]) -> Result<(), P2pError> {
+        validate_block_request(hashes)?;
+        let compact = self.compact_block_version == Some(COMPACT_BLOCK_VERSION);
+        self.requested_compact_blocks = compact;
+        let inventory = hashes
+            .iter()
+            .copied()
+            .map(|hash| {
+                if compact {
+                    Inventory::CompactBlock(hash)
+                } else {
+                    Inventory::WitnessBlock(hash)
+                }
+            })
             .collect();
         self.transport
             .write_message(NetworkMessage::GetData(inventory))
@@ -765,11 +994,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         &mut self,
         expected: &[BlockHash],
     ) -> Result<Vec<bitcoin::Block>, P2pError> {
-        if expected.len() > MAX_BLOCKS_IN_FLIGHT {
-            return Err(P2pError::TooManyBlockRequests {
-                count: expected.len(),
-            });
-        }
+        self.receive_requested_blocks_with_candidates(expected, &[])
+            .await
+    }
+
+    /// Receives full or compact blocks, using witness transactions already
+    /// known to the caller before requesting only the missing BIP152 indexes.
+    #[allow(clippy::too_many_lines)]
+    pub async fn receive_requested_blocks_with_candidates(
+        &mut self,
+        expected: &[BlockHash],
+        candidates: &[Transaction],
+    ) -> Result<Vec<bitcoin::Block>, P2pError> {
+        validate_block_request(expected)?;
         if expected.is_empty() {
             return Ok(Vec::new());
         }
@@ -780,6 +1017,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             }
         }
         let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
+        let mut compact_blocks = HashMap::<BlockHash, CompactBlockReconstruction>::new();
+        let mut full_block_fallbacks = HashSet::<BlockHash>::new();
         let response_started = Instant::now();
         let mut payload_bytes = 0_u64;
         for _ in 0..MAX_RESPONSE_MESSAGES {
@@ -795,25 +1034,70 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     payload_bytes = payload_bytes.saturating_add(
                         u64::try_from(payload_len).expect("payload length fits u64"),
                     );
+                    compact_blocks.remove(&actual);
+                    full_block_fallbacks.remove(&actual);
                     blocks[position] = Some(block);
-                    if positions.is_empty() {
-                        self.block_transfer_stats.payload_bytes = self
-                            .block_transfer_stats
-                            .payload_bytes
-                            .saturating_add(payload_bytes);
-                        self.block_transfer_stats.response_time = self
-                            .block_transfer_stats
-                            .response_time
-                            .saturating_add(response_started.elapsed());
-                        return Ok(blocks
-                            .into_iter()
-                            .map(|block| block.expect("every requested position was filled"))
-                            .collect());
+                }
+                Some((NetworkMessage::CmpctBlock(message), payload_len)) => {
+                    let actual = message.compact_block.header.block_hash();
+                    if !self.requested_compact_blocks
+                        || !positions.contains_key(&actual)
+                        || compact_blocks.contains_key(&actual)
+                        || full_block_fallbacks.contains(&actual)
+                    {
+                        return Err(P2pError::UnsolicitedBlock(actual));
+                    }
+                    payload_bytes = payload_bytes.saturating_add(
+                        u64::try_from(payload_len).expect("payload length fits u64"),
+                    );
+                    let reconstruction =
+                        CompactBlockReconstruction::new(message.compact_block, candidates)?;
+                    if let Some(request) = reconstruction.missing_request() {
+                        self.transport
+                            .write_message(NetworkMessage::GetBlockTxn(request))
+                            .await?;
+                        compact_blocks.insert(actual, reconstruction);
+                    } else {
+                        match reconstruction.complete(None)? {
+                            CompactBlockCompletion::Complete(block) => {
+                                let position = positions
+                                    .remove(&actual)
+                                    .expect("requested compact block position exists");
+                                blocks[position] = Some(block);
+                            }
+                            CompactBlockCompletion::MerkleMismatch => {
+                                self.request_full_block_fallback(actual, &mut full_block_fallbacks)
+                                    .await?;
+                            }
+                        }
+                    }
+                }
+                Some((NetworkMessage::BlockTxn(message), payload_len)) => {
+                    let actual = message.transactions.block_hash;
+                    let reconstruction = compact_blocks
+                        .remove(&actual)
+                        .ok_or(P2pError::UnexpectedBlockTransactions(actual))?;
+                    payload_bytes = payload_bytes.saturating_add(
+                        u64::try_from(payload_len).expect("payload length fits u64"),
+                    );
+                    match reconstruction.complete(Some(message.transactions))? {
+                        CompactBlockCompletion::Complete(block) => {
+                            let position = positions
+                                .remove(&actual)
+                                .expect("compact reconstruction remains requested");
+                            blocks[position] = Some(block);
+                        }
+                        CompactBlockCompletion::MerkleMismatch => {
+                            self.request_full_block_fallback(actual, &mut full_block_fallbacks)
+                                .await?;
+                        }
                     }
                 }
                 Some((NetworkMessage::NotFound(inventory), _)) => {
                     if let Some(hash) = inventory.iter().find_map(|entry| match entry {
-                        Inventory::Block(hash) | Inventory::WitnessBlock(hash)
+                        Inventory::Block(hash)
+                        | Inventory::CompactBlock(hash)
+                        | Inventory::WitnessBlock(hash)
                             if positions.contains_key(hash) =>
                         {
                             Some(*hash)
@@ -825,6 +1109,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 }
                 _ => {}
             }
+            if positions.is_empty() {
+                self.block_transfer_stats.payload_bytes = self
+                    .block_transfer_stats
+                    .payload_bytes
+                    .saturating_add(payload_bytes);
+                self.block_transfer_stats.response_time = self
+                    .block_transfer_stats
+                    .response_time
+                    .saturating_add(response_started.elapsed());
+                return Ok(blocks
+                    .into_iter()
+                    .map(|block| block.expect("every requested position was filled"))
+                    .collect());
+            }
         }
         Err(P2pError::BlockResponseIncomplete {
             requested: *positions
@@ -832,6 +1130,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 .next()
                 .expect("non-empty batch remains incomplete"),
         })
+    }
+
+    async fn request_full_block_fallback(
+        &mut self,
+        hash: BlockHash,
+        fallbacks: &mut HashSet<BlockHash>,
+    ) -> Result<(), P2pError> {
+        if !fallbacks.insert(hash) {
+            return Err(P2pError::UnsolicitedBlock(hash));
+        }
+        self.transport
+            .write_message(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
+            .await
     }
 }
 
@@ -908,6 +1219,21 @@ fn validate_inventory_len(command: &'static str, count: usize) -> Result<(), P2p
     Ok(())
 }
 
+fn validate_block_request(hashes: &[BlockHash]) -> Result<(), P2pError> {
+    if hashes.len() > MAX_BLOCKS_IN_FLIGHT {
+        return Err(P2pError::TooManyBlockRequests {
+            count: hashes.len(),
+        });
+    }
+    let mut unique = HashSet::with_capacity(hashes.len());
+    for hash in hashes {
+        if !unique.insert(*hash) {
+            return Err(P2pError::DuplicateBlockRequest(*hash));
+        }
+    }
+    Ok(())
+}
+
 fn deduplicate_addresses(addresses: impl Iterator<Item = PeerAddress>) -> Vec<PeerAddress> {
     let mut sockets = HashSet::new();
     addresses
@@ -973,14 +1299,14 @@ pub fn decode_v1(bytes: &[u8]) -> Result<RawNetworkMessage, EncodeError> {
 mod tests {
     use super::*;
     use bitcoin::{
-        Network,
+        Amount, Network,
         bip152::BlockTransactionsRequest,
         hashes::Hash,
         p2p::{
             Address, Magic, ServiceFlags,
             address::{AddrV2, AddrV2Message},
             message::NetworkMessage,
-            message_compact_blocks::GetBlockTxn,
+            message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn},
             message_network::VersionMessage,
         },
     };
@@ -1005,6 +1331,16 @@ mod tests {
         )
     }
 
+    fn compact_test_block() -> bitcoin::Block {
+        let mut block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut second = block.txdata[0].clone();
+        second.output[0].value =
+            Amount::from_sat(second.output[0].value.to_sat().checked_sub(1).unwrap());
+        block.txdata.push(second);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
     #[test]
     fn v1_verack_roundtrip() {
         let message = encode_v1(Magic::BITCOIN, NetworkMessage::Verack);
@@ -1027,6 +1363,70 @@ mod tests {
                 command: "getblocktxn",
                 count,
             }) if count == MAX_COMPACT_BLOCK_TRANSACTIONS + 1
+        ));
+    }
+
+    #[test]
+    fn compact_block_reconstruction_matches_candidates_and_missing_transactions() {
+        let block = compact_test_block();
+        let compact = HeaderAndShortIds::from_block(&block, 42, 2, &[]).unwrap();
+        let reconstruction = CompactBlockReconstruction::new(compact.clone(), &[]).unwrap();
+        let request = reconstruction.missing_request().unwrap();
+        assert_eq!(request.txs_request.indexes, vec![1]);
+        let wrong_count = CompactBlockReconstruction::new(compact.clone(), &[]).unwrap();
+        assert!(matches!(
+            wrong_count.complete(Some(BlockTransactions {
+                block_hash: block.block_hash(),
+                transactions: Vec::new(),
+            })),
+            Err(P2pError::WrongBlockTransactionCount {
+                expected: 1,
+                actual: 0,
+            })
+        ));
+        let completion = reconstruction
+            .complete(Some(BlockTransactions {
+                block_hash: block.block_hash(),
+                transactions: vec![block.txdata[1].clone()],
+            }))
+            .unwrap();
+        let CompactBlockCompletion::Complete(reconstructed) = completion else {
+            panic!("expected complete block");
+        };
+        assert_eq!(reconstructed, block);
+
+        let reconstruction = CompactBlockReconstruction::new(compact, &block.txdata[1..]).unwrap();
+        assert!(reconstruction.missing_request().is_none());
+        let CompactBlockCompletion::Complete(reconstructed) =
+            reconstruction.complete(None).unwrap()
+        else {
+            panic!("expected candidate-complete block");
+        };
+        assert_eq!(reconstructed, block);
+    }
+
+    #[test]
+    fn compact_block_reconstruction_rejects_bad_prefill_and_detects_short_id_collision() {
+        let block = compact_test_block();
+        let mut malformed = HeaderAndShortIds::from_block(&block, 43, 2, &[]).unwrap();
+        malformed.prefilled_txs[0].idx = 1;
+        assert!(matches!(
+            CompactBlockReconstruction::new(malformed, &[]),
+            Err(P2pError::MalformedCompactBlock { .. })
+        ));
+
+        let mut wrong = block.txdata[1].clone();
+        wrong.output[0].value =
+            Amount::from_sat(wrong.output[0].value.to_sat().checked_sub(1).unwrap());
+        let mut compact = HeaderAndShortIds::from_block(&block, 44, 2, &[]).unwrap();
+        let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
+        compact.short_ids[0] =
+            ShortId::with_siphash_keys(&wrong.compute_wtxid().to_raw_hash(), keys);
+        let reconstruction = CompactBlockReconstruction::new(compact, &[wrong]).unwrap();
+        assert!(reconstruction.missing_request().is_none());
+        assert!(matches!(
+            reconstruction.complete(None).unwrap(),
+            CompactBlockCompletion::MerkleMismatch
         ));
     }
 
@@ -1060,6 +1460,14 @@ mod tests {
             P2pError::TooManyCompactBlockTransactions {
                 command: "getblocktxn",
                 count: MAX_COMPACT_BLOCK_TRANSACTIONS + 1,
+            },
+            P2pError::MalformedCompactBlock {
+                reason: "test failure",
+            },
+            P2pError::UnexpectedBlockTransactions(hash),
+            P2pError::WrongBlockTransactionCount {
+                expected: 1,
+                actual: 2,
             },
         ] {
             assert!(error.is_protocol_violation(), "{error}");
@@ -1448,6 +1856,170 @@ mod tests {
         assert_eq!(blocks[0].block_hash(), expected[0]);
         assert_eq!(blocks[1].block_hash(), expected[1]);
         assert_eq!(stats.payload_bytes, expected_payload_bytes);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiated_compact_block_requests_only_missing_transactions() {
+        let (client_stream, server_stream) = duplex(32 * 1024);
+        let block = compact_test_block();
+        let block_hash = block.block_hash();
+        let compact = CmpctBlock {
+            compact_block: HeaderAndShortIds::from_block(&block, 50, 2, &[]).unwrap(),
+        };
+        let response = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash,
+                transactions: vec![block.txdata[1].clone()],
+            },
+        };
+        let expected_payload_bytes =
+            u64::try_from(serialize(&compact).len() + serialize(&response).len()).unwrap();
+        let expected_block = block.clone();
+        let client = tokio::spawn(async move {
+            let mut remote = version(1);
+            remote.version = SENDCMPCT_VERSION;
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote,
+            );
+            session.negotiate_compact_block_relay().await.unwrap();
+            assert!(matches!(
+                session.read_message().await.unwrap(),
+                NetworkMessage::SendCmpct(SendCmpct {
+                    version: COMPACT_BLOCK_VERSION,
+                    ..
+                })
+            ));
+            assert_eq!(session.compact_block_version(), Some(COMPACT_BLOCK_VERSION));
+            session.request_blocks(&[block_hash]).await.unwrap();
+            let received = session.receive_requested_block(block_hash).await.unwrap();
+            (received, session.block_transfer_stats())
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::SendCmpct(_)
+            ));
+            transport
+                .write_message(NetworkMessage::SendCmpct(SendCmpct {
+                    send_compact: false,
+                    version: COMPACT_BLOCK_VERSION,
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![Inventory::CompactBlock(block_hash)]
+            ));
+            transport
+                .write_message(NetworkMessage::CmpctBlock(compact))
+                .await
+                .unwrap();
+            let NetworkMessage::GetBlockTxn(request) =
+                transport.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected getblocktxn");
+            };
+            assert_eq!(request.txs_request.block_hash, block_hash);
+            assert_eq!(request.txs_request.indexes, vec![1]);
+            transport
+                .write_message(NetworkMessage::BlockTxn(response))
+                .await
+                .unwrap();
+        });
+        let (received, stats) = client.await.unwrap();
+        assert_eq!(received, expected_block);
+        assert_eq!(stats.payload_bytes, expected_payload_bytes);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_block_candidate_mismatch_falls_back_to_full_witness_block() {
+        let (client_stream, server_stream) = duplex(32 * 1024);
+        let block = compact_test_block();
+        let block_hash = block.block_hash();
+        let mut wrong = block.txdata[1].clone();
+        wrong.output[0].value = Amount::from_sat(wrong.output[0].value.to_sat() - 1);
+        let mut compact = HeaderAndShortIds::from_block(&block, 51, 2, &[]).unwrap();
+        let keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
+        compact.short_ids[0] =
+            ShortId::with_siphash_keys(&wrong.compute_wtxid().to_raw_hash(), keys);
+        let compact = CmpctBlock {
+            compact_block: compact,
+        };
+        let expected_block = block.clone();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.compact_block_version = Some(COMPACT_BLOCK_VERSION);
+            session.request_blocks(&[block_hash]).await.unwrap();
+            session
+                .receive_requested_blocks_with_candidates(&[block_hash], &[wrong])
+                .await
+                .unwrap()
+                .remove(0)
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![Inventory::CompactBlock(block_hash)]
+            ));
+            transport
+                .write_message(NetworkMessage::CmpctBlock(compact))
+                .await
+                .unwrap();
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![Inventory::WitnessBlock(block_hash)]
+            ));
+            transport
+                .write_message(NetworkMessage::Block(block))
+                .await
+                .unwrap();
+        });
+        assert_eq!(client.await.unwrap(), expected_block);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_response_is_rejected_for_a_full_witness_request() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let block = compact_test_block();
+        let block_hash = block.block_hash();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.request_witness_blocks(&[block_hash]).await.unwrap();
+            session.receive_requested_blocks(&[block_hash]).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(inventory)
+                    if inventory == vec![Inventory::WitnessBlock(block_hash)]
+            ));
+            transport
+                .write_message(NetworkMessage::CmpctBlock(CmpctBlock {
+                    compact_block: HeaderAndShortIds::from_block(&block, 52, 2, &[]).unwrap(),
+                }))
+                .await
+                .unwrap();
+        });
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::UnsolicitedBlock(actual)) if actual == block_hash
+        ));
         server.await.unwrap();
     }
 

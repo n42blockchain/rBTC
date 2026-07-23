@@ -2070,7 +2070,7 @@ async fn fetch_requested_block(
     session
         .ensure_full_witness_block_relay()
         .map_err(|error| PeerRunError::p2p(&error))?;
-    timeout(PEER_TIMEOUT, session.request_witness_blocks(&[hash]))
+    timeout(PEER_TIMEOUT, session.request_blocks(&[hash]))
         .await
         .map_err(|_| PeerRunError::transient("getdata request timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))?;
@@ -2941,7 +2941,7 @@ async fn replay_wallet_blocks(
                 .iter()
                 .map(|header| header.hash)
                 .collect::<Vec<_>>();
-            timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+            timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
                 .await
                 .map_err(|_| format!("wallet backfill getdata timed out for {batch_len} blocks"))?
                 .map_err(|error| error.to_string())?;
@@ -3086,7 +3086,7 @@ async fn backfill_ledger(
             .iter()
             .map(|header| header.hash)
             .collect::<Vec<_>>();
-        timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+        timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
             .await
             .map_err(|_| format!("ledger backfill getdata timed out for {batch_len} blocks"))?
             .map_err(|error| error.to_string())?;
@@ -3253,7 +3253,7 @@ async fn reconcile_explorer(
                 .iter()
                 .map(|header| header.hash)
                 .collect::<Vec<_>>();
-            timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+            timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
                 .await
                 .map_err(|_| format!("explorer backfill getdata timed out for {batch_len} blocks"))?
                 .map_err(|error| error.to_string())?;
@@ -3346,7 +3346,7 @@ async fn download_execute_batch(
         .iter()
         .map(|header| header.hash)
         .collect::<Vec<_>>();
-    timeout(PEER_TIMEOUT, session.request_witness_blocks(&hashes))
+    timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
         .await
         .map_err(|_| PeerRunError::transient(format!("getdata timed out for {batch_len} blocks")))?
         .map_err(|error| PeerRunError::p2p(&error))?;
@@ -4401,9 +4401,15 @@ mod tests {
         Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid,
         Witness,
         absolute::LockTime,
+        bip152::HeaderAndShortIds,
         block::{Header, Version},
         hex::FromHex,
-        p2p::{Address, ServiceFlags, message::NetworkMessage, message_network::VersionMessage},
+        p2p::{
+            Address, ServiceFlags,
+            message::NetworkMessage,
+            message_compact_blocks::{CmpctBlock, SendCmpct},
+            message_network::VersionMessage,
+        },
         pow::Target,
         transaction::Version as TransactionVersion,
     };
@@ -7806,16 +7812,27 @@ mod tests {
                 .unwrap();
             receive_client_negotiation(&mut peer).await;
             peer.write_message(NetworkMessage::Verack).await.unwrap();
-            respond_to_getaddr_with(
-                &mut peer,
-                vec![bitcoin::p2p::address::AddrV2Message {
+            receive_client_preferences(&mut peer).await;
+            peer.write_message(NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }))
+            .await
+            .unwrap();
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            peer.write_message(NetworkMessage::AddrV2(vec![
+                bitcoin::p2p::address::AddrV2Message {
                     time: 0,
                     services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
                     addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.2".parse().unwrap()),
                     port: 18_445,
-                }],
-            )
-            .await;
+                },
+            ]))
+            .await
+            .unwrap();
             match peer.read_message().await.unwrap().into_payload() {
                 NetworkMessage::GetHeaders(_) => peer
                     .write_message(NetworkMessage::Headers(vec![block.header]))
@@ -7827,13 +7844,15 @@ mod tests {
                 NetworkMessage::GetData(inventory) => {
                     assert_eq!(
                         inventory,
-                        vec![bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(
+                        vec![bitcoin::p2p::message_blockdata::Inventory::CompactBlock(
                             block_hash
                         )]
                     );
-                    peer.write_message(NetworkMessage::Block(block))
-                        .await
-                        .unwrap();
+                    peer.write_message(NetworkMessage::CmpctBlock(CmpctBlock {
+                        compact_block: HeaderAndShortIds::from_block(&block, 6, 2, &[]).unwrap(),
+                    }))
+                    .await
+                    .unwrap();
                 }
                 message => panic!("expected getdata, got {message:?}"),
             }
