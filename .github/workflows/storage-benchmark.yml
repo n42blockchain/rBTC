@@ -1,0 +1,58 @@
+name: Storage benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      blocks:
+        description: Deterministic block batches
+        required: true
+        default: "100"
+      updates_per_block:
+        description: UTXO spends and creates per block
+        required: true
+        default: "100"
+      utxos:
+        description: Generated steady-state UTXO population
+        required: true
+        default: "10000"
+      lookups:
+        description: Deterministic hit/miss lookups
+        required: true
+        default: "20000"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RBTC_BENCH_BLOCKS: ${{ inputs.blocks }}
+      RBTC_BENCH_UPDATES_PER_BLOCK: ${{ inputs.updates_per_block }}
+      RBTC_BENCH_UTXOS: ${{ inputs.utxos }}
+      RBTC_BENCH_LOOKUPS: ${{ inputs.lookups }}
+      RBTC_BENCH_REPORT: target/storage-benchmark.json
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # stable
+      - name: Capture runner and storage environment
+        run: |
+          mkdir -p target
+          {
+            uname -a
+            rustc -Vv
+            cargo -V
+            lscpu
+            lsblk -o NAME,ROTA,TYPE,SIZE,FSTYPE,MOUNTPOINTS
+            df -T .
+          } > target/storage-benchmark-environment.txt
+      - name: Run deterministic generated workload
+        run: cargo test --locked --release --all-features --test storage_bench reproducible_storage_workload -- --ignored --exact --nocapture
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: storage-benchmark-${{ github.run_id }}
+          path: |
+            target/storage-benchmark.json
+            target/storage-benchmark-environment.txt
+          if-no-files-found: error

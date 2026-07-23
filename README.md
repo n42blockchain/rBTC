@@ -43,6 +43,15 @@ RBTC_BITCOIND=/path/to/bitcoin-core-26/bin/bitcoind cargo test --test core_block
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
 ```
 
+The storage benchmark generates its block-shaped UTXO population at runtime and
+reports machine-readable JSON; no generated database, snapshot, or result is
+versioned. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
+`RBTC_BENCH_UTXOS`, and `RBTC_BENCH_LOOKUPS` to scale the bounded workload, and
+set `RBTC_BENCH_REPORT` to retain the JSON report. The manual Storage benchmark
+workflow uploads that report together with runner CPU, filesystem, and block
+device metadata so NVMe and HDD runs can be compared without confusing runner
+differences with backend results.
+
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character
 hash names remain local and are ignored rather than accumulated in commits.
