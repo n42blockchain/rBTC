@@ -95,6 +95,8 @@ Each newly admitted, durably committed transaction is announced to every hot sta
 
 The active mempool snapshot also stores a versioned last-relay-attempt timestamp for each retained transaction. Newly admitted transactions and legacy snapshots without this metadata are immediately due; after that, a caught-up loop selects at most eight due transactions every 12 hours in parent-before-child order. An attempt is recorded only when the transaction was published into a standby ring with at least one receiver, so the absence of a hot standby cannot suppress a later attempt. Snapshot replacement atomically removes attempt rows for evicted, replaced, confirmed, or otherwise stale transactions. This schedule bounds repeated diffusion attempts but still does not prove peer receipt, acknowledgement, or mempool acceptance.
 
+In addition to the 25-transaction/101,000-vB incoming package bound, every newly admitted transaction is limited to 25 ancestors and 101,000 aggregate ancestor vB, including itself. Every affected ancestor is independently limited to 25 descendants and 101,000 aggregate descendant vB. These graph checks run on the private candidate pool after conflict removal and package insertion but before publication, fee completion, or capacity eviction, so an over-limit package leaves the live pool and durable snapshot unchanged.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
