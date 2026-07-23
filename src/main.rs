@@ -36,7 +36,9 @@ use rbtc::{
     headers::{HeaderDag, HeaderError},
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
-    p2p::{MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, connect_outbound},
+    p2p::{
+        MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, PeerSession, connect_outbound,
+    },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
@@ -1786,6 +1788,7 @@ async fn run_with_peer(
     validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), PeerRunError> {
     record_peer_attempt(peer_store, remote);
+    let handshake_started = Instant::now();
     let mut session = timeout(
         PEER_TIMEOUT,
         connect_outbound(
@@ -1807,6 +1810,7 @@ async fn run_with_peer(
 
     let remote_version = session.remote_version();
     let remote_services = remote_version.services;
+    let handshake_millis = elapsed_ms(handshake_started);
     println!(
         "connected to {}: version={}, height={}, agent={}",
         remote, remote_version.version, remote_version.start_height, remote_version.user_agent
@@ -1814,27 +1818,7 @@ async fn run_with_peer(
     negotiate_peer_preferences(&mut session).await?;
 
     if let Some(hash) = options.fetch_block {
-        session
-            .ensure_full_witness_block_relay()
-            .map_err(|error| PeerRunError::p2p(&error))?;
-        timeout(PEER_TIMEOUT, session.request_witness_blocks(&[hash]))
-            .await
-            .map_err(|_| PeerRunError::transient("getdata request timed out"))?
-            .map_err(|error| PeerRunError::p2p(&error))?;
-        let block = timeout(PEER_TIMEOUT, session.receive_requested_block(hash))
-            .await
-            .map_err(|_| {
-                PeerRunError::transient(format!(
-                    "block response timed out after {} seconds",
-                    PEER_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|error| PeerRunError::p2p(&error))?;
-        println!(
-            "received block {} ({} transactions); not applied: IBD chainstate integration is pending",
-            block.block_hash(),
-            block.txdata.len()
-        );
+        fetch_requested_block(&mut session, hash).await?;
         return Ok(());
     }
 
@@ -1843,7 +1827,7 @@ async fn run_with_peer(
             .ensure_full_witness_block_relay()
             .map_err(|error| PeerRunError::p2p(&error))?;
         if let Some(store) = peer_store {
-            record_verified_peer(store, remote, remote_services);
+            record_verified_peer(store, remote, remote_services, handshake_millis);
             discover_peer_addresses(&mut session, store, remote).await;
         }
         if let Some(validation_dir) = &options.complete_assumeutxo {
@@ -1885,6 +1869,34 @@ async fn run_with_peer(
     println!(
         "received {} headers; pass --headers-db PATH to validate, persist, and continue IBD",
         headers.len()
+    );
+    Ok(())
+}
+
+async fn fetch_requested_block(
+    session: &mut PeerSession<tokio::net::TcpStream>,
+    hash: BlockHash,
+) -> Result<(), PeerRunError> {
+    session
+        .ensure_full_witness_block_relay()
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    timeout(PEER_TIMEOUT, session.request_witness_blocks(&[hash]))
+        .await
+        .map_err(|_| PeerRunError::transient("getdata request timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    let block = timeout(PEER_TIMEOUT, session.receive_requested_block(hash))
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "block response timed out after {} seconds",
+                PEER_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    println!(
+        "received block {} ({} transactions); not applied: IBD chainstate integration is pending",
+        block.block_hash(),
+        block.txdata.len()
     );
     Ok(())
 }
@@ -2004,6 +2016,7 @@ fn record_verified_peer(
     store: &RedbPeerStore,
     remote: SocketAddr,
     services: bitcoin::p2p::ServiceFlags,
+    handshake_millis: u32,
 ) {
     let now = match unix_time() {
         Ok(now) => now,
@@ -2013,7 +2026,11 @@ fn record_verified_peer(
         }
     };
     match store.insert_verified(remote, services, now) {
-        Ok(true) => {}
+        Ok(true) => {
+            if let Err(error) = store.record_handshake_latency(remote, handshake_millis) {
+                eprintln!("peer handshake latency persistence for {remote} failed: {error}");
+            }
+        }
         Ok(false) => eprintln!("verified peer {remote} was not eligible for persistence"),
         Err(error) => eprintln!("verified peer persistence for {remote} failed: {error}"),
     }
@@ -3290,6 +3307,10 @@ fn unix_time() -> Result<u32, String> {
         .as_secs();
     u32::try_from(seconds)
         .map_err(|_| "system clock does not fit Bitcoin timestamp range".to_owned())
+}
+
+fn elapsed_ms(started: Instant) -> u32 {
+    u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {

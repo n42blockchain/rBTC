@@ -28,12 +28,15 @@ const PROTOCOL_VIOLATION_DECAY_SECS: u32 = 7 * 24 * 60 * 60;
 const MAX_STORED_PENALTIES: usize = 1_024;
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
+const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
 
 type PeerPriority = (
     u8,
     u8,
     std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
+    u8,
+    u32,
     std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
 );
@@ -84,6 +87,8 @@ struct StoredPeer {
     last_session_success: u32,
     #[serde(default)]
     successful_sessions: u32,
+    #[serde(default)]
+    handshake_millis: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -196,8 +201,9 @@ impl RedbPeerStore {
                 consecutive_failures,
                 last_session_success,
                 successful_sessions,
+                handshake_millis,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0),
+                || (group.clone(), 0, 0, 0, 0, 0, 0),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -206,6 +212,7 @@ impl RedbPeerStore {
                         record.consecutive_failures,
                         record.last_session_success,
                         record.successful_sessions,
+                        record.handshake_millis,
                     )
                 },
             );
@@ -220,6 +227,7 @@ impl RedbPeerStore {
                     consecutive_failures,
                     last_session_success,
                     successful_sessions,
+                    handshake_millis,
                 },
             );
             stats.accepted += 1;
@@ -311,6 +319,21 @@ impl RedbPeerStore {
         self.update_existing(address, |record| {
             record.last_success = now;
             record.consecutive_failures = 0;
+        })
+    }
+
+    /// Records the most recent successful outbound handshake latency.
+    ///
+    /// Zero remains reserved for legacy/unknown records, and extreme values
+    /// are capped so a clock anomaly cannot dominate candidate scoring.
+    pub fn record_handshake_latency(
+        &self,
+        address: std::net::SocketAddr,
+        millis: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let millis = millis.clamp(1, MAX_RECORDED_HANDSHAKE_MILLIS);
+        self.update_existing(address, |record| {
+            record.handshake_millis = millis;
         })
     }
 
@@ -525,6 +548,9 @@ fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
     {
         return Err(PeerStoreError::Malformed("peer session success history"));
     }
+    if record.handshake_millis > MAX_RECORDED_HANDSHAKE_MILLIS {
+        return Err(PeerStoreError::Malformed("peer handshake latency"));
+    }
     Ok(record)
 }
 
@@ -610,6 +636,8 @@ fn peer_priority(record: &StoredPeer) -> PeerPriority {
         u8::from(record.last_session_success == 0),
         std::cmp::Reverse(record.last_session_success),
         std::cmp::Reverse(record.successful_sessions),
+        u8::from(record.handshake_millis == 0),
+        record.handshake_millis,
         std::cmp::Reverse(record.last_success),
         std::cmp::Reverse(record.last_seen),
     )
@@ -916,6 +944,7 @@ mod tests {
             consecutive_failures: u8::MAX,
             last_session_success: 0,
             successful_sessions: 0,
+            handshake_millis: 0,
         };
         assert!(!retry_ready(
             &maximally_failed,
@@ -1060,6 +1089,38 @@ mod tests {
     }
 
     #[test]
+    fn measured_handshake_latency_is_bounded_persisted_and_ranks_unknown_last() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let fast = "1.1.1.1:38333".parse().unwrap();
+        let slow = "2.2.2.2:38333".parse().unwrap();
+        let unknown = "3.3.3.3:38333".parse().unwrap();
+        for address in [fast, slow, unknown] {
+            store.insert_verified(address, services, now).unwrap();
+        }
+        store.record_handshake_latency(fast, 0).unwrap();
+        store.record_handshake_latency(slow, u32::MAX).unwrap();
+        assert_eq!(store.candidates(now, 3).unwrap(), vec![fast, slow, unknown]);
+        drop(store);
+
+        let reopened = RedbPeerStore::open(path, Network::Signet).unwrap();
+        let records = reopened.load_records().unwrap();
+        assert_eq!(records[&fast.to_string()].handshake_millis, 1);
+        assert_eq!(
+            records[&slow.to_string()].handshake_millis,
+            MAX_RECORDED_HANDSHAKE_MILLIS
+        );
+        assert_eq!(records[&unknown.to_string()].handshake_millis, 0);
+        assert_eq!(
+            reopened.candidates(now, 3).unwrap(),
+            vec![fast, slow, unknown]
+        );
+    }
+
+    #[test]
     fn loads_records_written_before_attempt_history_fields_existed() {
         let directory = TempDir::new().unwrap();
         let store =
@@ -1110,6 +1171,7 @@ mod tests {
             br#"{"services":9,"last_seen":1,"source_group":"other:1:2"}"#,
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":1,"successful_sessions":0}"#,
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":2,"successful_sessions":1}"#,
+            br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","handshake_millis":60001}"#,
         ] {
             assert!(validate_stored_peer_record(invalid).is_err());
         }
@@ -1159,6 +1221,7 @@ mod tests {
             consecutive_failures,
             last_session_success: 0,
             successful_sessions: 0,
+            handshake_millis: 0,
         };
         let records = HashMap::from([
             ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),
