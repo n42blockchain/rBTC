@@ -777,6 +777,48 @@ mod tests {
         assert_eq!(events.latest().height, 140);
     }
 
+    #[test]
+    fn concurrent_explorer_publishers_serialize_sequence_and_latest_state() {
+        const PUBLISHERS: usize = 8;
+        const EVENTS_PER_PUBLISHER: usize = 8;
+
+        let events = ExplorerEventHub::new(0, "initial-hash");
+        let mut receiver = events.sender.subscribe();
+        let publishers = (0..PUBLISHERS)
+            .map(|publisher| {
+                let events = events.clone();
+                std::thread::spawn(move || {
+                    for event in 0..EVENTS_PER_PUBLISHER {
+                        let height =
+                            u32::try_from(publisher * EVENTS_PER_PUBLISHER + event + 1).unwrap();
+                        events.publish(
+                            ExplorerEventKind::Connected,
+                            height,
+                            format!("hash-{publisher}-{event}"),
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for publisher in publishers {
+            publisher.join().unwrap();
+        }
+
+        let expected = u64::try_from(PUBLISHERS * EVENTS_PER_PUBLISHER).unwrap();
+        let mut last = None;
+        for sequence in 1..=expected {
+            let event = receiver.try_recv().unwrap();
+            assert_eq!(event.sequence, sequence);
+            last = Some(event);
+        }
+        assert_eq!(events.latest(), last.unwrap());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test]
     async fn explorer_events_cap_concurrent_streams() {
         let app = explorer_events_router(ExplorerEventHub::new(0, "genesis"));

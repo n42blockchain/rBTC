@@ -39,3 +39,19 @@ jobs:
           toolchain: nightly-2026-07-13
           components: rust-src
       - run: cargo test --locked --all-features --lib --tests -Zbuild-std --target x86_64-unknown-linux-gnu
+
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+      RUSTFLAGS: -Zsanitizer=thread
+      RUSTDOCFLAGS: -Zsanitizer=thread
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly-2026-07-13
+        with:
+          toolchain: nightly-2026-07-13
+          components: rust-src
+      - run: cargo test --locked --all-features --lib -Zbuild-std --target x86_64-unknown-linux-gnu wallet::tests::concurrent_address_revelation_is_serialized_and_persisted -- --exact
+      - run: cargo test --locked --all-features --lib -Zbuild-std --target x86_64-unknown-linux-gnu api::tests::concurrent_explorer_publishers_serialize_sequence_and_latest_state -- --exact
