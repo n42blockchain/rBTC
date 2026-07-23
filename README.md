@@ -75,6 +75,8 @@ The first validation target is durably bound to the validation database and cann
 
 The lower-level two-step interface remains available: build with `rbtcd --data-dir VALIDATION --network NETWORK [PEER OPTIONS] --validate-until-height HEIGHT --validate-until-blockhash HASH`, then run `rbtcd --data-dir ACTIVE --network NETWORK --finalize-assumeutxo VALIDATION`. Both explicit target values must be taken from the authenticated snapshot identity. Headers may synchronize beyond the target, but block requests, atomic execution batches, the retained ledger, and explorer projection stop exactly at it; restart resumes safely and a different active hash or an already-overrun chainstate fails closed. The same resource-limit options apply. Finalization requires the same consensus configuration and never replaces active UTXOs. The logical digest deliberately excludes local `last_touched` tier-aging time while retaining every consensus field; the separate snapshot-record digest still authenticates the complete transported bytes. The lower-level manual finalization path deliberately never performs automatic cleanup.
 
+Post-handshake routing centrally caps `inv`/`getdata`/`notfound` at 50,000 entries, locators at 101 hashes, headers at 2,000, and address messages at 1,000. These limits also apply to unrelated frames injected while another response is pending. The session's active ping/pong primitive requires the matching nonce within the same 32-frame total response budget and answers crossed peer pings without extending it.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

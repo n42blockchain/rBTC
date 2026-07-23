@@ -11,7 +11,7 @@ use bitcoin::{
     p2p::{
         Address, Magic, ServiceFlags,
         address::AddrV2Message,
-        message::{NetworkMessage, RawNetworkMessage},
+        message::{MAX_INV_SIZE, NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
         message_network::VersionMessage,
     },
@@ -36,6 +36,8 @@ const MAX_USER_AGENT_LEN: usize = 256;
 const MAX_LOCATOR_HASHES: usize = 101;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
 const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
+/// Maximum inventory entries accepted in `inv`, `getdata`, or `notfound`.
+pub const MAX_INVENTORY_ENTRIES: usize = MAX_INV_SIZE;
 /// Maximum headers permitted in one protocol `headers` response.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 /// Maximum block bodies requested concurrently from one peer.
@@ -165,6 +167,25 @@ pub enum P2pError {
         /// Number of addresses received from the peer.
         count: usize,
     },
+    /// A peer exceeded Bitcoin Core's inventory-vector entry limit.
+    #[error("peer sent {count} entries in {command}; limit is {MAX_INVENTORY_ENTRIES}")]
+    TooManyInventoryEntries {
+        /// Wire command containing the oversized vector.
+        command: &'static str,
+        /// Number of inventory entries received.
+        count: usize,
+    },
+    /// A peer sent an oversized locator in an unsolicited request.
+    #[error("peer sent {count} locator hashes in {command}; limit is {MAX_LOCATOR_HASHES}")]
+    TooManyRemoteLocatorHashes {
+        /// Wire command containing the oversized locator.
+        command: &'static str,
+        /// Number of locator hashes received.
+        count: usize,
+    },
+    /// A matching pong did not arrive within the shared response-frame budget.
+    #[error("peer did not provide the requested pong within {MAX_RESPONSE_MESSAGES} messages")]
+    PongResponseIncomplete,
 }
 
 impl P2pError {
@@ -187,7 +208,8 @@ impl P2pError {
             | Self::MissingServices { .. }
             | Self::TooManyBlockRequests { .. }
             | Self::DuplicateBlockRequest(_)
-            | Self::TooManyLocatorHashes { .. } => false,
+            | Self::TooManyLocatorHashes { .. }
+            | Self::PongResponseIncomplete => false,
             Self::Message(_)
             | Self::WrongMagic
             | Self::Oversize { .. }
@@ -198,7 +220,9 @@ impl P2pError {
             | Self::UnexpectedBlock { .. }
             | Self::OversizeUserAgent { .. }
             | Self::UnsolicitedBlock(_)
-            | Self::TooManyAddresses { .. } => true,
+            | Self::TooManyAddresses { .. }
+            | Self::TooManyInventoryEntries { .. }
+            | Self::TooManyRemoteLocatorHashes { .. } => true,
         }
     }
 }
@@ -384,7 +408,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
-        match self.transport.read_message().await?.into_payload() {
+        let message = self.transport.read_message().await?.into_payload();
+        validate_post_handshake_message(&message)?;
+        match message {
             NetworkMessage::Ping(nonce) => {
                 self.transport
                     .write_message(NetworkMessage::Pong(nonce))
@@ -394,6 +420,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             NetworkMessage::Version(_) => Err(P2pError::PostHandshakeVersion),
             message => Ok(Some(message)),
         }
+    }
+
+    /// Sends an application-level keepalive and waits for its matching pong.
+    ///
+    /// Stale pongs and unrelated messages consume the same fixed response
+    /// budget used by header and block requests. Concurrent inbound pings are
+    /// answered without resetting that budget.
+    pub async fn ping(&mut self, nonce: u64) -> Result<(), P2pError> {
+        self.transport
+            .write_message(NetworkMessage::Ping(nonce))
+            .await?;
+        for _ in 0..MAX_RESPONSE_MESSAGES {
+            if matches!(
+                self.read_bounded_response_message().await?,
+                Some(NetworkMessage::Pong(received)) if received == nonce
+            ) {
+                return Ok(());
+            }
+        }
+        Err(P2pError::PongResponseIncomplete)
     }
 
     /// Reads the next application message, answering P2P keepalive pings.
@@ -611,6 +657,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     }
 }
 
+/// Enforces per-command vector bounds after a v1 handshake.
+///
+/// This check applies before routing any application message, including
+/// unrelated frames received while waiting for a header, block, address, or
+/// pong response.
+pub fn validate_post_handshake_message(message: &NetworkMessage) -> Result<(), P2pError> {
+    match message {
+        NetworkMessage::Inv(entries) => validate_inventory_len("inv", entries.len()),
+        NetworkMessage::GetData(entries) => validate_inventory_len("getdata", entries.len()),
+        NetworkMessage::NotFound(entries) => validate_inventory_len("notfound", entries.len()),
+        NetworkMessage::GetBlocks(request) if request.locator_hashes.len() > MAX_LOCATOR_HASHES => {
+            Err(P2pError::TooManyRemoteLocatorHashes {
+                command: "getblocks",
+                count: request.locator_hashes.len(),
+            })
+        }
+        NetworkMessage::GetHeaders(request)
+            if request.locator_hashes.len() > MAX_LOCATOR_HASHES =>
+        {
+            Err(P2pError::TooManyRemoteLocatorHashes {
+                command: "getheaders",
+                count: request.locator_hashes.len(),
+            })
+        }
+        NetworkMessage::Headers(headers) if headers.len() > MAX_HEADERS_PER_RESPONSE => {
+            Err(P2pError::TooManyHeaders {
+                count: headers.len(),
+            })
+        }
+        NetworkMessage::Addr(addresses) if addresses.len() > MAX_ADDRESSES_PER_MESSAGE => {
+            Err(P2pError::TooManyAddresses {
+                count: addresses.len(),
+            })
+        }
+        NetworkMessage::AddrV2(addresses) if addresses.len() > MAX_ADDRESSES_PER_MESSAGE => {
+            Err(P2pError::TooManyAddresses {
+                count: addresses.len(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_inventory_len(command: &'static str, count: usize) -> Result<(), P2pError> {
+    if count > MAX_INVENTORY_ENTRIES {
+        return Err(P2pError::TooManyInventoryEntries { command, count });
+    }
+    Ok(())
+}
+
 fn deduplicate_addresses(addresses: impl Iterator<Item = PeerAddress>) -> Vec<PeerAddress> {
     let mut sockets = HashSet::new();
     addresses
@@ -736,6 +832,14 @@ mod tests {
             P2pError::TooManyAddresses {
                 count: MAX_ADDRESSES_PER_MESSAGE + 1,
             },
+            P2pError::TooManyInventoryEntries {
+                command: "inv",
+                count: MAX_INVENTORY_ENTRIES + 1,
+            },
+            P2pError::TooManyRemoteLocatorHashes {
+                command: "getheaders",
+                count: MAX_LOCATOR_HASHES + 1,
+            },
         ] {
             assert!(error.is_protocol_violation(), "{error}");
         }
@@ -756,6 +860,7 @@ mod tests {
             P2pError::TooManyBlockRequests {
                 count: MAX_BLOCKS_IN_FLIGHT + 1,
             },
+            P2pError::PongResponseIncomplete,
         ] {
             assert!(!error.is_protocol_violation(), "{error}");
         }
@@ -1241,6 +1346,120 @@ mod tests {
         assert!(matches!(
             client.await.unwrap(),
             Err(P2pError::HeadersResponseIncomplete)
+        ));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn all_post_handshake_vector_commands_enforce_protocol_limits() {
+        let hash = BlockHash::all_zeros();
+        for (message, command) in [
+            (
+                NetworkMessage::Inv(vec![Inventory::Block(hash); MAX_INVENTORY_ENTRIES + 1]),
+                "inv",
+            ),
+            (
+                NetworkMessage::GetData(vec![Inventory::Block(hash); MAX_INVENTORY_ENTRIES + 1]),
+                "getdata",
+            ),
+            (
+                NetworkMessage::NotFound(vec![Inventory::Block(hash); MAX_INVENTORY_ENTRIES + 1]),
+                "notfound",
+            ),
+        ] {
+            assert!(matches!(
+                validate_post_handshake_message(&message),
+                Err(P2pError::TooManyInventoryEntries {
+                    command: actual,
+                    count
+                }) if actual == command && count == MAX_INVENTORY_ENTRIES + 1
+            ));
+        }
+
+        for message in [
+            NetworkMessage::GetHeaders(GetHeadersMessage {
+                version: PROTOCOL_VERSION,
+                locator_hashes: vec![hash; MAX_LOCATOR_HASHES + 1],
+                stop_hash: hash,
+            }),
+            NetworkMessage::GetBlocks(bitcoin::p2p::message_blockdata::GetBlocksMessage::new(
+                vec![hash; MAX_LOCATOR_HASHES + 1],
+                hash,
+            )),
+        ] {
+            assert!(matches!(
+                validate_post_handshake_message(&message),
+                Err(P2pError::TooManyRemoteLocatorHashes { count, .. })
+                    if count == MAX_LOCATOR_HASHES + 1
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn active_ping_matches_nonce_and_answers_crossed_keepalive() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.ping(42).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(42)
+            ));
+            transport
+                .write_message(NetworkMessage::Pong(41))
+                .await
+                .unwrap();
+            transport
+                .write_message(NetworkMessage::Ping(7))
+                .await
+                .unwrap();
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Pong(7)
+            ));
+            transport
+                .write_message(NetworkMessage::Pong(42))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_ping_has_a_total_frame_budget() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession {
+                transport: V1Transport::new(client_stream, Network::Regtest.magic()),
+                remote_version: version(1),
+            };
+            session.ping(42).await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Ping(42)
+            ));
+            for nonce in 0..u64::try_from(MAX_RESPONSE_MESSAGES).unwrap() {
+                transport
+                    .write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        assert!(matches!(
+            client.await.unwrap(),
+            Err(P2pError::PongResponseIncomplete)
         ));
         server.await.unwrap();
     }
