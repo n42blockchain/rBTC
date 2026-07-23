@@ -177,8 +177,13 @@ impl WalletAuthToken {
         Ok(Self(Arc::from(token)))
     }
 
-    fn authorizes(&self, header: Option<&HeaderValue>) -> bool {
-        let Some(header) = header.and_then(|value| value.to_str().ok()) else {
+    /// Checks one raw HTTP `Authorization` header using constant-time token comparison.
+    ///
+    /// The complete header grammar remains deliberately narrow: exactly one
+    /// case-insensitive `Bearer` scheme, one space, and the configured token.
+    #[must_use]
+    pub fn authorizes(&self, header: &[u8]) -> bool {
+        let Ok(header) = std::str::from_utf8(header) else {
             return false;
         };
         let Some((scheme, supplied)) = header.split_once(' ') else {
@@ -485,7 +490,11 @@ async fn require_wallet_auth(
     request: Request,
     next: Next,
 ) -> Response {
-    if token.authorizes(request.headers().get(header::AUTHORIZATION)) {
+    if request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .is_some_and(|value| token.authorizes(value.as_bytes()))
+    {
         let mut response = next.run(request).await;
         response
             .headers_mut()
@@ -1017,7 +1026,10 @@ mod tests {
         assert!(WalletAuthToken::new("a".repeat(257)).is_err());
         let token = WalletAuthToken::new("a".repeat(32)).unwrap();
         let oversized = HeaderValue::from_str(&format!("Bearer {}", "a".repeat(257))).unwrap();
-        assert!(!token.authorizes(Some(&oversized)));
+        assert!(!token.authorizes(oversized.as_bytes()));
+        assert!(token.authorizes(format!("bEaReR {}", "a".repeat(32)).as_bytes()));
+        assert!(!token.authorizes(format!("Bearer  {}", "a".repeat(32)).as_bytes()));
+        assert!(!token.authorizes(b"Bearer \xff"));
     }
 
     #[test]

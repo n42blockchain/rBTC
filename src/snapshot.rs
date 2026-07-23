@@ -29,6 +29,11 @@ const VERSION: u16 = 3;
 const CONTAINER_HEADER_LEN: usize = 14;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_PUBKEY_BYTES: usize = 10_000;
+// Zstandard recommends supporting at least an 8 MiB window for interoperable
+// streaming frames. Keep that fixed memory floor separate from the authenticated
+// decompressed-output ceiling below.
+const MIN_ZSTD_WINDOW_LOG: u32 = 23;
+const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 
 /// Snapshot import and export failures.
 #[derive(Debug, Error)]
@@ -233,8 +238,8 @@ impl VerifiedSnapshot {
         Ok(self.manifest)
     }
 
-    fn entries(&self) -> Result<SnapshotEntryReader, SnapshotError> {
-        SnapshotEntryReader::open(&self.path, self.payload_offset)
+    fn entries(&self) -> Result<SnapshotEntryReader<File>, SnapshotError> {
+        SnapshotEntryReader::open(&self.path, self.payload_offset, self.manifest.records_bytes)
     }
 }
 
@@ -340,25 +345,76 @@ pub fn verify_snapshot_with_trust(
     verify_snapshot_inner(path.as_ref(), Some(trusted))
 }
 
+/// Verifies an in-memory snapshot while enforcing a caller-selected decompression budget.
+///
+/// Network and fuzz callers should set `max_records_bytes` from an authenticated
+/// transport contract or a deliberately small test budget. Operational snapshot
+/// activation continues to require [`verify_snapshot_with_trust`].
+pub fn verify_snapshot_bytes_bounded(
+    bytes: &[u8],
+    max_records_bytes: u64,
+) -> Result<SnapshotManifest, SnapshotError> {
+    let (manifest, payload_offset) = read_manifest_bytes(bytes)?;
+    validate_snapshot_manifest(&manifest)?;
+    if manifest.records_bytes > max_records_bytes {
+        return Err(SnapshotError::Invalid("snapshot exceeds byte budget"));
+    }
+    let entries = SnapshotEntryReader::from_reader(
+        Cursor::new(&bytes[payload_offset..]),
+        manifest.records_bytes,
+    )?;
+    verify_entries(&manifest, entries)?;
+    Ok(manifest)
+}
+
 fn verify_snapshot_inner(
     path: &Path,
     trusted: Option<&SnapshotTrustAnchor>,
 ) -> Result<VerifiedSnapshot, SnapshotError> {
     let path = fs::canonicalize(path)?;
     let (manifest, payload_offset) = read_manifest(&path)?;
+    validate_snapshot_manifest(&manifest)?;
+    if let Some(trusted) = trusted {
+        validate_manifest_trust(&manifest, trusted)?;
+    }
+    verify_entries(
+        &manifest,
+        SnapshotEntryReader::open(&path, payload_offset, manifest.records_bytes)?,
+    )?;
+    Ok(VerifiedSnapshot {
+        manifest,
+        path,
+        payload_offset,
+    })
+}
+
+fn validate_snapshot_manifest(manifest: &SnapshotManifest) -> Result<(), SnapshotError> {
     if manifest.format_version != VERSION || manifest.compression != "zstd" {
         return Err(SnapshotError::Invalid("manifest format"));
     }
     if decode_sha256(&manifest.records_sha256).is_none() {
         return Err(SnapshotError::Invalid("records checksum encoding"));
     }
-    if let Some(trusted) = trusted {
-        validate_manifest_trust(&manifest, trusted)?;
+    let minimum_bytes = manifest.utxo_count.checked_mul(65);
+    let maximum_bytes = manifest.utxo_count.checked_mul(
+        u64::try_from(65 + MAX_SCRIPT_PUBKEY_BYTES).expect("snapshot record bound fits u64"),
+    );
+    if minimum_bytes.is_none_or(|minimum| manifest.records_bytes < minimum)
+        || maximum_bytes.is_none_or(|maximum| manifest.records_bytes > maximum)
+    {
+        return Err(SnapshotError::Invalid("manifest record bounds"));
     }
+    Ok(())
+}
+
+fn verify_entries<R: Read>(
+    manifest: &SnapshotManifest,
+    entries: SnapshotEntryReader<R>,
+) -> Result<(), SnapshotError> {
     let mut records = Sha256::new();
     let mut count = 0_u64;
     let mut records_bytes = 0_u64;
-    for entry in SnapshotEntryReader::open(&path, payload_offset)? {
+    for entry in entries {
         let (key, utxo) = entry?;
         records.update(key.as_bytes());
         let encoded = utxo.encode()?;
@@ -382,11 +438,7 @@ fn verify_snapshot_inner(
     if records_bytes != manifest.records_bytes {
         return Err(SnapshotError::Invalid("records length"));
     }
-    Ok(VerifiedSnapshot {
-        manifest,
-        path,
-        payload_offset,
-    })
+    Ok(())
 }
 
 fn validate_manifest_trust(
@@ -430,6 +482,37 @@ fn read_manifest(path: &Path) -> Result<(SnapshotManifest, u64), SnapshotError> 
     Ok((serde_json::from_slice(&manifest)?, payload_offset))
 }
 
+fn read_manifest_bytes(bytes: &[u8]) -> Result<(SnapshotManifest, usize), SnapshotError> {
+    if bytes.len() < CONTAINER_HEADER_LEN {
+        return Err(SnapshotError::Invalid("container header"));
+    }
+    let header = &bytes[..CONTAINER_HEADER_LEN];
+    if &header[..8] != MAGIC {
+        return Err(SnapshotError::Invalid("magic"));
+    }
+    let version = u16::from_le_bytes(header[8..10].try_into().expect("fixed header"));
+    if version != VERSION {
+        return Err(SnapshotError::Invalid("unsupported version"));
+    }
+    let manifest_len = usize::try_from(u32::from_le_bytes(
+        header[10..14].try_into().expect("fixed header"),
+    ))
+    .expect("u32 fits usize");
+    if manifest_len == 0 || manifest_len > MAX_MANIFEST_BYTES {
+        return Err(SnapshotError::Invalid("manifest length"));
+    }
+    let payload_offset = CONTAINER_HEADER_LEN
+        .checked_add(manifest_len)
+        .ok_or(SnapshotError::Invalid("manifest length"))?;
+    if payload_offset > bytes.len() {
+        return Err(SnapshotError::Invalid("manifest length"));
+    }
+    Ok((
+        serde_json::from_slice(&bytes[CONTAINER_HEADER_LEN..payload_offset])?,
+        payload_offset,
+    ))
+}
+
 fn read_exact_or_invalid(
     reader: &mut impl Read,
     buffer: &mut [u8],
@@ -444,18 +527,30 @@ fn read_exact_or_invalid(
     }
 }
 
-struct SnapshotEntryReader {
-    decoder: zstd::stream::read::Decoder<'static, BufReader<File>>,
+struct SnapshotEntryReader<R: Read> {
+    decoder: zstd::stream::read::Decoder<'static, BufReader<R>>,
     previous: Option<OutPointKey>,
     finished: bool,
 }
 
-impl SnapshotEntryReader {
-    fn open(path: &Path, payload_offset: u64) -> Result<Self, SnapshotError> {
+impl SnapshotEntryReader<File> {
+    fn open(
+        path: &Path,
+        payload_offset: u64,
+        max_records_bytes: u64,
+    ) -> Result<Self, SnapshotError> {
         let mut file = File::open(path)?;
         file.seek(SeekFrom::Start(payload_offset))?;
+        Self::from_reader(file, max_records_bytes)
+    }
+}
+
+impl<R: Read> SnapshotEntryReader<R> {
+    fn from_reader(reader: R, max_records_bytes: u64) -> Result<Self, SnapshotError> {
+        let mut decoder = zstd::stream::Decoder::new(reader)?;
+        decoder.window_log_max(zstd_window_log(max_records_bytes))?;
         Ok(Self {
-            decoder: zstd::stream::Decoder::new(file)?,
+            decoder,
             previous: None,
             finished: false,
         })
@@ -508,7 +603,7 @@ impl SnapshotEntryReader {
     }
 }
 
-impl Iterator for SnapshotEntryReader {
+impl<R: Read> Iterator for SnapshotEntryReader<R> {
     type Item = Result<(OutPointKey, Utxo), UtxoError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -560,6 +655,11 @@ fn decode_sha256(value: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
     }
     Some(digest)
+}
+
+fn zstd_window_log(records_bytes: u64) -> u32 {
+    let required = u64::BITS - records_bytes.saturating_sub(1).leading_zeros();
+    required.clamp(MIN_ZSTD_WINDOW_LOG, MAX_ZSTD_WINDOW_LOG)
 }
 
 #[cfg(test)]
@@ -627,6 +727,70 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         fs::write(&snapshot_file, bytes).unwrap();
         assert!(verify_snapshot(&snapshot_file).is_err());
+    }
+
+    #[test]
+    fn bounded_in_memory_verification_enforces_budget_before_decompression() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("bounded.rbtc");
+        let key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([4; 32]), 1));
+        let utxo = Utxo {
+            value_sats: 42,
+            height: 2,
+            is_coinbase: false,
+            last_touched: 3,
+            creation_mtp: 1,
+            script_pubkey: vec![0x51],
+        };
+        let mut records = Vec::new();
+        records.extend_from_slice(key.as_bytes());
+        records.extend_from_slice(&utxo.encode().unwrap());
+        write_test_container(&path, &records, 1);
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(
+            verify_snapshot_bytes_bounded(&bytes, u64::try_from(records.len()).unwrap())
+                .unwrap()
+                .utxo_count,
+            1
+        );
+        assert!(matches!(
+            verify_snapshot_bytes_bounded(&bytes, u64::try_from(records.len() - 1).unwrap()),
+            Err(SnapshotError::Invalid("snapshot exceeds byte budget"))
+        ));
+    }
+
+    #[test]
+    fn bounded_in_memory_verification_rejects_oversized_zstd_window() {
+        let records = [0_u8; 65];
+        let manifest = SnapshotManifest {
+            format_version: VERSION,
+            network: "regtest".to_owned(),
+            height: 1,
+            block_hash: BlockHash::all_zeros().to_string(),
+            utxo_count: 1,
+            records_bytes: u64::try_from(records.len()).unwrap(),
+            records_sha256: hex_hash(&records),
+            compression: "zstd".to_owned(),
+        };
+        let metadata = serde_json::to_vec(&manifest).unwrap();
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(27).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&records).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut snapshot = Vec::new();
+        snapshot.extend_from_slice(MAGIC);
+        snapshot.extend_from_slice(&VERSION.to_le_bytes());
+        snapshot.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+        snapshot.extend_from_slice(&metadata);
+        snapshot.extend_from_slice(&compressed);
+
+        let result =
+            verify_snapshot_bytes_bounded(&snapshot, u64::try_from(records.len()).unwrap());
+        assert!(
+            matches!(result, Err(SnapshotError::Utxo(UtxoError::Io(_)))),
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -762,9 +762,12 @@ dependencies = [
 name = "rbtc-fuzz"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bitcoin",
  "libfuzzer-sys",
  "rbtc",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

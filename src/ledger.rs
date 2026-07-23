@@ -745,6 +745,33 @@ mod tests {
     }
 
     #[test]
+    fn recovers_a_wrapped_slot_rename_before_the_index_commit() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 2,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        ledger.append(11, &[vec![11]]).unwrap();
+
+        // Simulate interruption after append_locked renamed the new archive
+        // over the wrapped slot but before it published the replacement index.
+        write_archive(ledger.slot_path(0), 12, &[vec![12]]).unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(
+            recovered.retained_ranges().unwrap(),
+            vec![(11, 11), (12, 12)]
+        );
+        assert_eq!(recovered.read_block(10).unwrap(), None);
+        assert_eq!(recovered.read_block(11).unwrap(), Some(vec![11]));
+        assert_eq!(recovered.read_block(12).unwrap(), Some(vec![12]));
+    }
+
+    #[test]
     fn truncates_a_segment_prefix_and_removes_newer_segments() {
         let dir = TempDir::new().unwrap();
         let retention = LedgerRetention {
@@ -796,6 +823,70 @@ mod tests {
     }
 
     #[test]
+    fn truncation_recovery_finishes_after_newer_segment_deletion() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        ledger.append(13, &[vec![13], vec![14]]).unwrap();
+        ledger.write_truncate_intent(12).unwrap();
+        fs::remove_file(ledger.slot_path(1)).unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert_eq!(recovered.read_block(11).unwrap(), Some(vec![11]));
+        assert_eq!(recovered.read_block(12).unwrap(), None);
+        assert!(!recovered.truncate_path().exists());
+    }
+
+    #[test]
+    fn truncation_recovery_finishes_after_prefix_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        ledger.append(13, &[vec![13], vec![14]]).unwrap();
+        ledger.write_truncate_intent(12).unwrap();
+        write_archive(ledger.slot_path(0), 10, &[vec![10], vec![11]]).unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert!(!recovered.slot_path(1).exists());
+        assert!(!recovered.truncate_path().exists());
+    }
+
+    #[test]
+    fn malformed_truncation_intent_fails_closed_without_pruning() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11]]).unwrap();
+        fs::write(ledger.truncate_path(), [1, 2, 3]).unwrap();
+        drop(ledger);
+
+        assert!(matches!(
+            PrunedBlockLedger::open(dir.path(), retention),
+            Err(LedgerError::Invalid("truncate intent"))
+        ));
+        let (_, blocks) = read_archive(dir.path().join("blk-0000.rblk")).unwrap();
+        assert_eq!(blocks, vec![vec![10], vec![11]]);
+    }
+
+    #[test]
     fn reads_retained_blocks_by_height_and_reports_the_tip() {
         let dir = TempDir::new().unwrap();
         let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
@@ -841,6 +932,35 @@ mod tests {
 
         assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 11)]);
         assert!(ledger.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_commit_recovers_after_archive_rename_before_index_commit() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11]]).unwrap();
+        ledger.stage(12, &[vec![12], vec![13]]).unwrap();
+
+        // Simulate commit_staged/append_locked publishing its archive rename
+        // and then losing power before write_index.
+        write_archive(ledger.slot_path(1), 12, &[vec![12]]).unwrap();
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(
+            recovered.retained_ranges().unwrap(),
+            vec![(10, 11), (12, 12)]
+        );
+        assert_eq!(recovered.staged().unwrap().unwrap().blocks.len(), 2);
+        recovered.commit_staged(1).unwrap();
+        assert!(recovered.staged().unwrap().is_none());
+        assert_eq!(recovered.read_block(12).unwrap(), Some(vec![12]));
+        assert_eq!(recovered.read_block(13).unwrap(), None);
     }
 
     #[test]

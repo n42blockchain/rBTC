@@ -9,9 +9,12 @@ license = "GPL-3.0-only"
 cargo-fuzz = true
 
 [dependencies]
+axum = "=0.8.9"
 bitcoin = "=0.32.8"
 libfuzzer-sys = "=0.4.13"
 rbtc = { path = "..", version = "=0.1.0" }
+tokio = { version = "=1.53.1", features = ["rt"] }
+tower = { version = "=0.5.3", features = ["util"] }
 
 [[bin]]
 name = "p2p_decode_v1"
@@ -30,6 +33,41 @@ bench = false
 [[bin]]
 name = "signet_block"
 path = "fuzz_targets/signet_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_decode"
+path = "fuzz_targets/archive_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "explorer_request"
+path = "fuzz_targets/explorer_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parsers"
+path = "fuzz_targets/config_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wallet_auth"
+path = "fuzz_targets/wallet_auth.rs"
 test = false
 doc = false
 bench = false

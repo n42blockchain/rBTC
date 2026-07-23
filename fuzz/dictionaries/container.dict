@@ -1,0 +1,5 @@
+archive_magic="RBTCBLK1"
+snapshot_magic="RBTCUTXO"
+zstd_magic="\x28\xb5\x2f\xfd"
+archive_v2="\x02\x00"
+snapshot_v3="\x03\x00"
