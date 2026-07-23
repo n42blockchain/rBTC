@@ -29,6 +29,7 @@ const MAX_STORED_PENALTIES: usize = 1_024;
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
+const MAX_RECORDED_BLOCK_THROUGHPUT_BPS: u32 = 1_000_000_000;
 
 type PeerPriority = (
     u8,
@@ -37,6 +38,7 @@ type PeerPriority = (
     std::cmp::Reverse<u32>,
     u8,
     u32,
+    std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
 );
@@ -89,6 +91,8 @@ struct StoredPeer {
     successful_sessions: u32,
     #[serde(default)]
     handshake_millis: u32,
+    #[serde(default)]
+    block_throughput_bps: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,8 +206,9 @@ impl RedbPeerStore {
                 last_session_success,
                 successful_sessions,
                 handshake_millis,
+                block_throughput_bps,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0, 0),
+                || (group.clone(), 0, 0, 0, 0, 0, 0, 0),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -213,6 +218,7 @@ impl RedbPeerStore {
                         record.last_session_success,
                         record.successful_sessions,
                         record.handshake_millis,
+                        record.block_throughput_bps,
                     )
                 },
             );
@@ -228,6 +234,7 @@ impl RedbPeerStore {
                     last_session_success,
                     successful_sessions,
                     handshake_millis,
+                    block_throughput_bps,
                 },
             );
             stats.accepted += 1;
@@ -334,6 +341,18 @@ impl RedbPeerStore {
         let millis = millis.clamp(1, MAX_RECORDED_HANDSHAKE_MILLIS);
         self.update_existing(address, |record| {
             record.handshake_millis = millis;
+        })
+    }
+
+    /// Records completed requested-block payload throughput for candidate scoring.
+    pub fn record_block_throughput(
+        &self,
+        address: std::net::SocketAddr,
+        bytes_per_second: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let bytes_per_second = bytes_per_second.clamp(1, MAX_RECORDED_BLOCK_THROUGHPUT_BPS);
+        self.update_existing(address, |record| {
+            record.block_throughput_bps = bytes_per_second;
         })
     }
 
@@ -551,6 +570,9 @@ fn decode_stored_peer(input: &[u8]) -> Result<StoredPeer, PeerStoreError> {
     if record.handshake_millis > MAX_RECORDED_HANDSHAKE_MILLIS {
         return Err(PeerStoreError::Malformed("peer handshake latency"));
     }
+    if record.block_throughput_bps > MAX_RECORDED_BLOCK_THROUGHPUT_BPS {
+        return Err(PeerStoreError::Malformed("peer block throughput"));
+    }
     Ok(record)
 }
 
@@ -638,6 +660,7 @@ fn peer_priority(record: &StoredPeer) -> PeerPriority {
         std::cmp::Reverse(record.successful_sessions),
         u8::from(record.handshake_millis == 0),
         record.handshake_millis,
+        std::cmp::Reverse(record.block_throughput_bps),
         std::cmp::Reverse(record.last_success),
         std::cmp::Reverse(record.last_seen),
     )
@@ -945,6 +968,7 @@ mod tests {
             last_session_success: 0,
             successful_sessions: 0,
             handshake_millis: 0,
+            block_throughput_bps: 0,
         };
         assert!(!retry_ready(
             &maximally_failed,
@@ -1121,6 +1145,39 @@ mod tests {
     }
 
     #[test]
+    fn measured_block_throughput_is_bounded_persisted_and_ranks_higher_first() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let fast = "4.4.4.4:38333".parse().unwrap();
+        let slow = "5.5.5.5:38333".parse().unwrap();
+        let unknown = "6.6.6.6:38333".parse().unwrap();
+        for address in [fast, slow, unknown] {
+            store.insert_verified(address, services, now).unwrap();
+            store.record_handshake_latency(address, 10).unwrap();
+        }
+        store.record_block_throughput(fast, u32::MAX).unwrap();
+        store.record_block_throughput(slow, 0).unwrap();
+        assert_eq!(store.candidates(now, 3).unwrap(), vec![fast, slow, unknown]);
+        drop(store);
+
+        let reopened = RedbPeerStore::open(path, Network::Signet).unwrap();
+        let records = reopened.load_records().unwrap();
+        assert_eq!(
+            records[&fast.to_string()].block_throughput_bps,
+            MAX_RECORDED_BLOCK_THROUGHPUT_BPS
+        );
+        assert_eq!(records[&slow.to_string()].block_throughput_bps, 1);
+        assert_eq!(records[&unknown.to_string()].block_throughput_bps, 0);
+        assert_eq!(
+            reopened.candidates(now, 3).unwrap(),
+            vec![fast, slow, unknown]
+        );
+    }
+
+    #[test]
     fn loads_records_written_before_attempt_history_fields_existed() {
         let directory = TempDir::new().unwrap();
         let store =
@@ -1172,6 +1229,7 @@ mod tests {
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":1,"successful_sessions":0}"#,
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","last_success":1,"last_session_success":2,"successful_sessions":1}"#,
             br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","handshake_millis":60001}"#,
+            br#"{"services":9,"last_seen":1,"source_group":"v4:1:2","block_throughput_bps":1000000001}"#,
         ] {
             assert!(validate_stored_peer_record(invalid).is_err());
         }
@@ -1222,6 +1280,7 @@ mod tests {
             last_session_success: 0,
             successful_sessions: 0,
             handshake_millis: 0,
+            block_throughput_bps: 0,
         };
         let records = HashMap::from([
             ("1.1.1.1:8333".to_owned(), record(100, 90, 0)),

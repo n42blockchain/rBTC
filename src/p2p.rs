@@ -19,7 +19,7 @@ use bitcoin::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
@@ -262,6 +262,15 @@ pub struct PeerAddress {
     pub last_seen: u32,
 }
 
+/// Cumulative payload and response-wait measurements for completed block batches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BlockTransferStats {
+    /// Checksum-verified block payload bytes returned in completed requested batches.
+    pub payload_bytes: u64,
+    /// Time spent awaiting those completed requested batches.
+    pub response_time: Duration,
+}
+
 /// An established Bitcoin peer session.
 ///
 /// The session owns its transport, so messages left after handshake remain in
@@ -271,6 +280,7 @@ pub struct PeerSession<S> {
     remote_version: VersionMessage,
     pending_messages: VecDeque<(NetworkMessage, usize)>,
     pending_message_bytes: usize,
+    block_transfer_stats: BlockTransferStats,
 }
 
 impl<S> PeerSession<S> {
@@ -280,6 +290,7 @@ impl<S> PeerSession<S> {
             remote_version,
             pending_messages: VecDeque::new(),
             pending_message_bytes: 0,
+            block_transfer_stats: BlockTransferStats::default(),
         }
     }
 
@@ -287,6 +298,12 @@ impl<S> PeerSession<S> {
     #[must_use]
     pub const fn remote_version(&self) -> &VersionMessage {
         &self.remote_version
+    }
+
+    /// Returns cumulative measurements for fully received requested block batches.
+    #[must_use]
+    pub const fn block_transfer_stats(&self) -> BlockTransferStats {
+        self.block_transfer_stats
     }
 
     /// Returns the underlying framed transport.
@@ -468,15 +485,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
     }
 
-    async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
+    async fn read_bounded_response_message_with_payload_len(
+        &mut self,
+    ) -> Result<Option<(NetworkMessage, usize)>, P2pError> {
         if let Some((message, payload_len)) = self.pending_messages.pop_front() {
             self.pending_message_bytes = self
                 .pending_message_bytes
                 .checked_sub(payload_len)
                 .expect("queued payload charge matches pending byte total");
-            return Ok(Some(message));
+            return Ok(Some((message, payload_len)));
         }
-        self.read_wire_response_message()
+        self.read_wire_response_message().await
+    }
+
+    async fn read_bounded_response_message(&mut self) -> Result<Option<NetworkMessage>, P2pError> {
+        self.read_bounded_response_message_with_payload_len()
             .await
             .map(|message| message.map(|(message, _)| message))
     }
@@ -727,22 +750,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             }
         }
         let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
+        let response_started = Instant::now();
+        let mut payload_bytes = 0_u64;
         for _ in 0..MAX_RESPONSE_MESSAGES {
-            match self.read_bounded_response_message().await? {
-                Some(NetworkMessage::Block(block)) => {
+            match self
+                .read_bounded_response_message_with_payload_len()
+                .await?
+            {
+                Some((NetworkMessage::Block(block), payload_len)) => {
                     let actual = block.block_hash();
                     let Some(position) = positions.remove(&actual) else {
                         return Err(P2pError::UnsolicitedBlock(actual));
                     };
+                    payload_bytes = payload_bytes.saturating_add(
+                        u64::try_from(payload_len).expect("payload length fits u64"),
+                    );
                     blocks[position] = Some(block);
                     if positions.is_empty() {
+                        self.block_transfer_stats.payload_bytes = self
+                            .block_transfer_stats
+                            .payload_bytes
+                            .saturating_add(payload_bytes);
+                        self.block_transfer_stats.response_time = self
+                            .block_transfer_stats
+                            .response_time
+                            .saturating_add(response_started.elapsed());
                         return Ok(blocks
                             .into_iter()
                             .map(|block| block.expect("every requested position was filled"))
                             .collect());
                     }
                 }
-                Some(NetworkMessage::NotFound(inventory)) => {
+                Some((NetworkMessage::NotFound(inventory), _)) => {
                     if let Some(hash) = inventory.iter().find_map(|entry| match entry {
                         Inventory::Block(hash) | Inventory::WitnessBlock(hash)
                             if positions.contains_key(hash) =>
@@ -1303,13 +1342,16 @@ mod tests {
         let first = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let second = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
         let expected = [first.block_hash(), second.block_hash()];
+        let expected_payload_bytes =
+            u64::try_from(serialize(&first).len() + serialize(&second).len()).unwrap();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
             session.request_witness_blocks(&expected).await.unwrap();
-            session.receive_requested_blocks(&expected).await.unwrap()
+            let blocks = session.receive_requested_blocks(&expected).await.unwrap();
+            (blocks, session.block_transfer_stats())
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -1326,9 +1368,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let blocks = client.await.unwrap();
+        let (blocks, stats) = client.await.unwrap();
         assert_eq!(blocks[0].block_hash(), expected[0]);
         assert_eq!(blocks[1].block_hash(), expected[1]);
+        assert_eq!(stats.payload_bytes, expected_payload_bytes);
         server.await.unwrap();
     }
 
@@ -1364,7 +1407,8 @@ mod tests {
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
-            session.receive_requested_blocks(&[expected_hash]).await
+            let result = session.receive_requested_blocks(&[expected_hash]).await;
+            (result, session.block_transfer_stats())
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -1373,10 +1417,12 @@ mod tests {
                 .await
                 .unwrap();
         });
+        let (result, stats) = client.await.unwrap();
         assert!(matches!(
-            client.await.unwrap(),
+            result,
             Err(P2pError::UnsolicitedBlock(actual)) if actual == unsolicited_hash
         ));
+        assert_eq!(stats, BlockTransferStats::default());
         server.await.unwrap();
 
         let (client_stream, server_stream) = duplex(4096);
@@ -1385,7 +1431,8 @@ mod tests {
                 V1Transport::new(client_stream, Network::Regtest.magic()),
                 version(1),
             );
-            session.receive_requested_blocks(&[expected_hash]).await
+            let result = session.receive_requested_blocks(&[expected_hash]).await;
+            (result, session.block_transfer_stats())
         });
         let server = tokio::spawn(async move {
             let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
@@ -1396,10 +1443,12 @@ mod tests {
                 .await
                 .unwrap();
         });
+        let (result, stats) = client.await.unwrap();
         assert!(matches!(
-            client.await.unwrap(),
+            result,
             Err(P2pError::BlockNotFound(actual)) if actual == expected_hash
         ));
+        assert_eq!(stats, BlockTransferStats::default());
         server.await.unwrap();
     }
 

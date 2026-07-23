@@ -37,7 +37,8 @@ use rbtc::{
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
-        MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, PeerSession, connect_outbound,
+        BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE, P2pError, PeerSession,
+        connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
@@ -1830,24 +1831,34 @@ async fn run_with_peer(
             record_verified_peer(store, remote, remote_services, handshake_millis);
             discover_peer_addresses(&mut session, store, remote).await;
         }
-        if let Some(validation_dir) = &options.complete_assumeutxo {
-            return complete_assumeutxo_validation(&mut session, options, validation_dir.clone())
-                .await;
+        let transfer_before = session.block_transfer_stats();
+        let result = if let Some(validation_dir) = &options.complete_assumeutxo {
+            complete_assumeutxo_validation(&mut session, options, validation_dir.clone()).await
+        } else {
+            sync_validating_node(
+                &mut session,
+                options.network,
+                &options.deployments,
+                options.ibd_policy,
+                path.clone(),
+                options.once,
+                options.validation_target,
+                options.validation_limits,
+                api_runtime,
+                background_validation,
+                validation_scheduler,
+            )
+            .await
+        };
+        if result.is_ok() {
+            record_peer_block_throughput(
+                peer_store,
+                remote,
+                transfer_before,
+                session.block_transfer_stats(),
+            );
         }
-        return sync_validating_node(
-            &mut session,
-            options.network,
-            &options.deployments,
-            options.ibd_policy,
-            path.clone(),
-            options.once,
-            options.validation_target,
-            options.validation_limits,
-            api_runtime,
-            background_validation,
-            validation_scheduler,
-        )
-        .await;
+        return result;
     }
 
     if let Some(path) = &options.headers_db {
@@ -2034,6 +2045,37 @@ fn record_verified_peer(
         Ok(false) => eprintln!("verified peer {remote} was not eligible for persistence"),
         Err(error) => eprintln!("verified peer persistence for {remote} failed: {error}"),
     }
+}
+
+fn record_peer_block_throughput(
+    store: Option<&RedbPeerStore>,
+    remote: SocketAddr,
+    before: BlockTransferStats,
+    after: BlockTransferStats,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let Some(bytes_per_second) = block_throughput_bps(before, after) else {
+        return;
+    };
+    if let Err(error) = store.record_block_throughput(remote, bytes_per_second) {
+        eprintln!("peer block throughput persistence for {remote} failed: {error}");
+    }
+}
+
+fn block_throughput_bps(before: BlockTransferStats, after: BlockTransferStats) -> Option<u32> {
+    let payload_bytes = after.payload_bytes.saturating_sub(before.payload_bytes);
+    if payload_bytes == 0 {
+        return None;
+    }
+    let response_nanos = after
+        .response_time
+        .saturating_sub(before.response_time)
+        .as_nanos()
+        .max(1);
+    let bytes_per_second = u128::from(payload_bytes).saturating_mul(1_000_000_000) / response_nanos;
+    Some(u32::try_from(bytes_per_second).unwrap_or(u32::MAX))
 }
 
 async fn discover_peer_addresses(
@@ -4193,6 +4235,35 @@ mod tests {
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
+
+    #[test]
+    fn block_throughput_uses_completed_transfer_deltas_and_saturates() {
+        let before = BlockTransferStats {
+            payload_bytes: 1_000,
+            response_time: Duration::from_secs(2),
+        };
+        assert_eq!(block_throughput_bps(before, before), None);
+        assert_eq!(
+            block_throughput_bps(
+                before,
+                BlockTransferStats {
+                    payload_bytes: 3_000,
+                    response_time: Duration::from_secs(3),
+                }
+            ),
+            Some(2_000)
+        );
+        assert_eq!(
+            block_throughput_bps(
+                before,
+                BlockTransferStats {
+                    payload_bytes: u64::MAX,
+                    response_time: before.response_time,
+                }
+            ),
+            Some(u32::MAX)
+        );
+    }
 
     async fn http_request(address: SocketAddr, request: &[u8]) -> String {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
