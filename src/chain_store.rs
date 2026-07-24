@@ -197,10 +197,16 @@ pub struct RedbChainStore {
 
 const VALIDATION_DELTA_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_deltas");
+const VALIDATION_DELTA_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
+    TableDefinition::new("validation_utxo_delta_blooms");
+const VALIDATION_GROUP_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
+    TableDefinition::new("validation_utxo_group_blooms");
 const MAX_VALIDATION_DELTA_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const VALIDATION_DELTA_MAGIC: [u8; 4] = *b"RVD3";
 const VALIDATION_DELTA_HEADER_BYTES: usize = 16;
 const VALIDATION_DELTA_INDEX_BYTES: usize = 45;
+const VALIDATION_BLOOM_MAGIC: [u8; 4] = *b"RVB1";
+const VALIDATION_BLOOM_HEADER_BYTES: usize = 48;
 const VALIDATION_BLOOM_BITS_PER_UPDATE: usize = 10;
 const VALIDATION_ROWS_PER_BLOOM_GROUP: usize = 16;
 const VALIDATION_GROUP_BLOOM_UPDATES: usize = 16_000_000;
@@ -216,6 +222,7 @@ struct ValidationJournalRow {
     bloom: ValidationBloom,
 }
 
+#[derive(Clone)]
 struct ValidationBloom {
     bits: Vec<u8>,
 }
@@ -230,10 +237,7 @@ type ValidationDeltaUpdates = Vec<(OutPointKey, ValidationUpdate)>;
 
 impl ValidationBloom {
     fn with_update_count(update_count: usize) -> Result<Self, UtxoError> {
-        let bit_count = update_count
-            .checked_mul(VALIDATION_BLOOM_BITS_PER_UPDATE)
-            .ok_or(UtxoError::Malformed("validation bloom size overflow"))?;
-        let byte_count = bit_count.div_ceil(8).max(1);
+        let byte_count = validation_bloom_byte_count(update_count)?;
         Ok(Self {
             bits: vec![0; byte_count],
         })
@@ -258,6 +262,62 @@ impl ValidationBloom {
             self.bits[byte] & (1 << (bit % 8)) != 0
         })
     }
+}
+
+fn validation_bloom_byte_count(update_count: usize) -> Result<usize, UtxoError> {
+    update_count
+        .checked_mul(VALIDATION_BLOOM_BITS_PER_UPDATE)
+        .map(|bits| bits.div_ceil(8).max(1))
+        .ok_or(UtxoError::Malformed("validation bloom size overflow"))
+}
+
+fn encode_validation_bloom(bloom: &ValidationBloom, utxo_count: u64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(VALIDATION_BLOOM_HEADER_BYTES + bloom.bits.len());
+    encoded.extend_from_slice(&VALIDATION_BLOOM_MAGIC);
+    encoded.extend_from_slice(&utxo_count.to_le_bytes());
+    encoded.extend_from_slice(
+        &u32::try_from(bloom.bits.len())
+            .expect("bounded validation bloom byte length fits u32")
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(Sha256::digest(&bloom.bits).as_slice());
+    encoded.extend_from_slice(&bloom.bits);
+    encoded
+}
+
+fn decode_validation_bloom(
+    encoded: &[u8],
+    expected_bytes: usize,
+) -> Result<(u64, ValidationBloom), UtxoError> {
+    if encoded.len() != VALIDATION_BLOOM_HEADER_BYTES.saturating_add(expected_bytes) {
+        return Err(UtxoError::Malformed("validation bloom record length"));
+    }
+    if encoded[..4] != VALIDATION_BLOOM_MAGIC {
+        return Err(UtxoError::Malformed("validation bloom format"));
+    }
+    let utxo_count = u64::from_le_bytes(
+        encoded[4..12]
+            .try_into()
+            .expect("eight-byte validation bloom UTXO count"),
+    );
+    let byte_count = u32::from_le_bytes(
+        encoded[12..16]
+            .try_into()
+            .expect("four-byte validation bloom length"),
+    );
+    if usize::try_from(byte_count).expect("u32 fits usize") != expected_bytes {
+        return Err(UtxoError::Malformed("validation bloom bit length"));
+    }
+    let bits = &encoded[VALIDATION_BLOOM_HEADER_BYTES..];
+    if encoded[16..VALIDATION_BLOOM_HEADER_BYTES] != Sha256::digest(bits).as_slice()[..] {
+        return Err(UtxoError::Malformed("validation bloom checksum"));
+    }
+    Ok((
+        utxo_count,
+        ValidationBloom {
+            bits: bits.to_vec(),
+        },
+    ))
 }
 
 fn validation_bloom_hashes(outpoint: OutPointKey) -> (u64, u64) {
@@ -585,6 +645,7 @@ impl RedbChainStore {
         .map_err(|_| ChainStoreError::Damaged)?
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_database(
         db: Arc<Database>,
         network: Network,
@@ -606,10 +667,14 @@ impl RedbChainStore {
             let transaction = db.begin_write()?;
             {
                 let _deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+                let _row_blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
+                let _group_blooms = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
             }
             transaction.commit()?;
             let transaction = db.begin_read()?;
             let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let row_blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
+            let group_blooms = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
             if !options.validation_delta_journal && !deltas.is_empty()? {
                 return Err(ChainStoreError::ValidationDeltaModeRequired);
             }
@@ -623,6 +688,8 @@ impl RedbChainStore {
                         .checked_add(base_stats.cold)
                         .ok_or(UtxoError::Malformed("validation UTXO count overflow"))?,
                 };
+                let mut migrated_rows = Vec::new();
+                let mut migrated_groups = Vec::new();
                 let mut previous_height = None;
                 for row in deltas.iter()? {
                     let (height, encoded) = row?;
@@ -635,18 +702,79 @@ impl RedbChainStore {
                     }
                     previous_height = Some(height);
                     if journal.rows.len() % VALIDATION_ROWS_PER_BLOOM_GROUP == 0 {
-                        journal.groups.push(ValidationBloom::with_update_count(
-                            VALIDATION_GROUP_BLOOM_UPDATES,
-                        )?);
+                        let group_index = u32::try_from(journal.groups.len()).map_err(|_| {
+                            UtxoError::Malformed("validation bloom group index overflow")
+                        })?;
+                        if let Some(encoded) = group_blooms.get(group_index)? {
+                            let expected =
+                                validation_bloom_byte_count(VALIDATION_GROUP_BLOOM_UPDATES)?;
+                            let (utxo_count, bloom) =
+                                decode_validation_bloom(encoded.value(), expected)?;
+                            if utxo_count != 0 {
+                                return Err(UtxoError::Malformed(
+                                    "validation group bloom carries a UTXO count",
+                                )
+                                .into());
+                            }
+                            journal.groups.push(bloom);
+                        } else {
+                            journal.groups.push(ValidationBloom::with_update_count(
+                                VALIDATION_GROUP_BLOOM_UPDATES,
+                            )?);
+                        }
                     }
+                    let group_index = journal.groups.len() - 1;
+                    let group_is_persisted = group_blooms
+                        .get(u32::try_from(group_index).map_err(|_| {
+                            UtxoError::Malformed("validation bloom group index overflow")
+                        })?)?
+                        .is_some();
                     let aggregate = journal
                         .groups
                         .last_mut()
                         .expect("validation row has a bloom group");
-                    let (utxo_count, _, bloom) =
-                        inspect_validation_delta(encoded.value(), Some(aggregate))?;
+                    let (utxo_count, update_count, _) = validation_delta_header(encoded.value())?;
+                    let expected_bloom_bytes = validation_bloom_byte_count(update_count)?;
+                    let bloom = if let Some(encoded_bloom) = row_blooms.get(height)? {
+                        let (bloom_utxo_count, bloom) =
+                            decode_validation_bloom(encoded_bloom.value(), expected_bloom_bytes)?;
+                        if bloom_utxo_count != utxo_count {
+                            return Err(UtxoError::Malformed(
+                                "validation delta bloom UTXO count mismatch",
+                            )
+                            .into());
+                        }
+                        if !group_is_persisted {
+                            let (_, _, inspected) =
+                                inspect_validation_delta(encoded.value(), Some(aggregate))?;
+                            if inspected.bits != bloom.bits {
+                                return Err(UtxoError::Malformed(
+                                    "validation delta bloom content mismatch",
+                                )
+                                .into());
+                            }
+                        }
+                        bloom
+                    } else {
+                        let (_, _, bloom) = inspect_validation_delta(
+                            encoded.value(),
+                            (!group_is_persisted).then_some(aggregate),
+                        )?;
+                        migrated_rows.push((height, encode_validation_bloom(&bloom, utxo_count)));
+                        bloom
+                    };
+                    let completed_group =
+                        ((journal.rows.len() + 1) % VALIDATION_ROWS_PER_BLOOM_GROUP == 0
+                            && !group_is_persisted)
+                            .then(|| encode_validation_bloom(aggregate, 0));
                     journal.utxo_count = utxo_count;
                     journal.rows.push(ValidationJournalRow { height, bloom });
+                    if let Some(encoded) = completed_group {
+                        let group_index = u32::try_from(group_index).map_err(|_| {
+                            UtxoError::Malformed("validation bloom group index overflow")
+                        })?;
+                        migrated_groups.push((group_index, encoded));
+                    }
                 }
                 if let Some(last_delta_height) = previous_height {
                     let execution_height = execution.tip()?.height;
@@ -656,6 +784,26 @@ impl RedbChainStore {
                         )
                         .into());
                     }
+                }
+                drop(group_blooms);
+                drop(row_blooms);
+                drop(deltas);
+                drop(transaction);
+                if !migrated_rows.is_empty() || !migrated_groups.is_empty() {
+                    let mut migration = db.begin_write()?;
+                    migration.set_durability(Durability::Immediate);
+                    migration.set_quick_repair(options.quick_repair);
+                    {
+                        let mut blooms = migration.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
+                        for (height, encoded) in &migrated_rows {
+                            blooms.insert(*height, encoded.as_slice())?;
+                        }
+                        let mut groups = migration.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
+                        for (index, encoded) in &migrated_groups {
+                            groups.insert(*index, encoded.as_slice())?;
+                        }
+                    }
+                    migration.commit()?;
                 }
                 Some(Mutex::new(journal))
             } else {
@@ -741,6 +889,10 @@ impl RedbChainStore {
         {
             let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
             deltas.retain(|_, _| false)?;
+            let mut blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
+            blooms.retain(|_, _| false)?;
+            let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
+            groups.retain(|_, _| false)?;
         }
         transaction.commit()?;
         let count = u64::try_from(updates.len()).expect("usize fits u64");
@@ -1018,12 +1170,24 @@ impl RedbChainStore {
         let mut new_group = starts_group
             .then(|| ValidationBloom::with_update_count(VALIDATION_GROUP_BLOOM_UPDATES))
             .transpose()?;
+        let group_finishes = (journal.rows.len() + 1) % VALIDATION_ROWS_PER_BLOOM_GROUP == 0;
+        let mut completed_group_bloom = group_finishes.then(|| {
+            journal
+                .groups
+                .last()
+                .expect("completing validation row has an existing bloom group")
+                .clone()
+        });
         for outpoint in updates.iter().map(|(outpoint, _)| *outpoint) {
             bloom.insert(outpoint);
             if let Some(new_group) = &mut new_group {
                 new_group.insert(outpoint);
             }
+            if let Some(group_bloom) = &mut completed_group_bloom {
+                group_bloom.insert(outpoint);
+            }
         }
+        let encoded_bloom = encode_validation_bloom(&bloom, next_utxo_count);
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
         {
@@ -1032,6 +1196,17 @@ impl RedbChainStore {
                 return Err(UtxoError::Malformed("duplicate validation delta checkpoint").into());
             }
             deltas.insert(final_height, encoded.as_slice())?;
+            let mut blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
+            blooms.insert(final_height, encoded_bloom.as_slice())?;
+            if let Some(group_bloom) = &completed_group_bloom {
+                let group_index = u32::try_from(
+                    journal.rows.len() / VALIDATION_ROWS_PER_BLOOM_GROUP,
+                )
+                .map_err(|_| UtxoError::Malformed("validation bloom group index overflow"))?;
+                let encoded_group = encode_validation_bloom(group_bloom, 0);
+                let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
+                groups.insert(group_index, encoded_group.as_slice())?;
+            }
         }
         for transition in transitions {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
@@ -2116,6 +2291,24 @@ mod tests {
                 "validation delta outpoints are not strictly ordered"
             ))
         ));
+
+        let mut bloom = ValidationBloom::with_update_count(4).unwrap();
+        for value in 1..=4 {
+            bloom.insert(key(value));
+        }
+        let encoded_bloom = encode_validation_bloom(&bloom, 77);
+        assert_eq!(
+            decode_validation_bloom(&encoded_bloom, bloom.bits.len())
+                .unwrap()
+                .0,
+            77
+        );
+        let mut damaged_bloom = encoded_bloom.clone();
+        *damaged_bloom.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            decode_validation_bloom(&damaged_bloom, bloom.bits.len()),
+            Err(UtxoError::Malformed("validation bloom checksum"))
+        ));
     }
 
     #[test]
@@ -2334,8 +2527,34 @@ mod tests {
         }
         drop(store);
 
+        let database = Database::open(&path).unwrap();
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut rows = transaction
+                .open_table(VALIDATION_DELTA_BLOOM_TABLE)
+                .unwrap();
+            rows.retain(|_, _| false).unwrap();
+            let mut groups = transaction
+                .open_table(VALIDATION_GROUP_BLOOM_TABLE)
+                .unwrap();
+            groups.retain(|_, _| false).unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(database);
+
         let store =
             RedbChainStore::open_with_options(&path, Network::Regtest, journal_options).unwrap();
+        {
+            let transaction = store.db.begin_read().unwrap();
+            let rows = transaction
+                .open_table(VALIDATION_DELTA_BLOOM_TABLE)
+                .unwrap();
+            let groups = transaction
+                .open_table(VALIDATION_GROUP_BLOOM_TABLE)
+                .unwrap();
+            assert_eq!(rows.len().unwrap(), 18);
+            assert_eq!(groups.len().unwrap(), 1);
+        }
         assert_eq!(store.get(key(1)).unwrap(), Some(coin(118)));
         assert_eq!(store.get(key(2)).unwrap(), Some(coin(777)));
         assert!(store.get(key(3)).unwrap().is_none());

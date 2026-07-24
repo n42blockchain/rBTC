@@ -184,13 +184,17 @@ and exited at the same BIP65 height/hash.
 The next storage pass replaced validation-only random base-tree rewrites with
 immediate-durability, append-only checkpoint deltas. Each `RVD3` record has a
 strict fixed-width sorted outpoint index followed by canonical UTXO bytes, so a
-lookup decodes only its matching coin. Per-record Bloom filters and 16-record
-aggregate filters reject old runs before redb value access; restart validates
-every index, and ordinary reorganizing stores reject this format. The
-execution tip and one complete delta enter the same redb transaction, while an
-explicit materialization folds all runs and clears the journal atomically.
-There is no relaxed durability, automatic periodic materialization, or block
-undo in this fixed-target mode.
+lookup decodes only its matching coin. Checksummed `RVB1` per-record Bloom
+filters and completed 16-record aggregate filters reject old runs before redb
+value access. New filters enter the same redb transaction as the complete
+delta and execution tip. Existing RVD3 directories perform one strict
+full-record scan and atomically install the missing filters; later restarts
+validate their sizes, checksums, UTXO counts, delta headers, and exact
+execution-tip alignment without rebuilding the complete historical index.
+Ordinary reorganizing stores reject this format. Explicit materialization
+folds all runs and clears the delta and filter tables atomically. There is no
+relaxed durability, automatic periodic materialization, or block undo in this
+fixed-target mode.
 
 At heights 405,518–408,673, adjacent 252-block checkpoints normally completed
 in 20.97–30.22 seconds with execution/persistence mostly 6.78–9.90 seconds;
@@ -205,12 +209,32 @@ instead of the preceding 11–17 seconds. The retained configuration is
 therefore the measured 252-block checkpoint with one bounded 128-block
 lookahead window.
 
+For experimental mainnet checkpoints wider than 128 blocks, up to three ready
+standby candidates now survive the chainstate-open phase; the first one that
+still passes bounded activation becomes an auxiliary block source. A
+252-block batch requests 128 blocks from the active peer and 124 from the
+auxiliary peer concurrently, preserves active-chain order, and retries the
+auxiliary window on the primary after any request or response failure. An
+adjacent live sample reduced median download time only from about 19.4 to
+18.8 seconds, so this is a modest network improvement rather than the main
+speedup. Actively receiving the auxiliary lookahead during execution was
+rejected after a 124-block response exceeded the 30-second bound; the retained
+design keeps the simpler bounded request lookahead and failover semantics.
+
 The same production directory then stopped exactly at CSV activation height
 419,328/hash
 `000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5`.
 The 71-block tail committed in 12.22 seconds. A cold restart with the optimized
 release advanced only the header store from 959,431 to 959,434, requested no
 blocks, and exited again at the exact CSV height/hash.
+
+After extending the authenticated ceiling to SegWit height 481,824, the
+persisted-filter migration opened the 18 GB chainstate at height 432,684 in
+11.454 seconds. The immediately following reopen loaded the same journal in
+6.035 seconds, versus the approximately one-to-two-minute rebuild observed
+before this change. Its first post-migration 252-block checkpoint completed in
+25.624 seconds, including 9.231 seconds of execution/persistence, so the
+restart acceleration did not move the scan cost into ordinary checkpoints.
 
 For the current safety-gated validating daemon, `rbtcd --network signet --data-dir PATH` can bootstrap from Core 26's default Signet seeds, while regtest normally supplies `--connect HOST:PORT` or reuses a previously verified peer in `peers.redb`. Repeat `--connect HOST:PORT` to provide up to 16 ordered, deduplicated peers. Repeat `--dns-seed HOST[:PORT]` to replace the pinned defaults, or use `--no-dns-seeds`; explicit peers and fresh persisted candidates are tried before DNS is queried. Each stage starts its bounded candidate handshakes concurrently but still selects the active session in the configured/persisted order; later completed handshakes stay in memory as hot failover sessions while the earlier session runs. Each full-service standby clones the current validated header DAG, then independently requires a nonce-matched ping/pong and performs one bounded `getheaders` validation step every 30 seconds. Its PoW, difficulty, timestamp, checkpoint, and deployment validation is isolated from shared persistence; invalid announcements evict that standby, while activation carries its validated height and the active synchronizer resumes from durable state. Other application messages remain bounded and ordered for activation. After the active socket completely writes a wallet transaction, the same transaction is fanned out through a bounded in-memory ring to every hot standby; a stalled or lagging standby is removed without blocking active synchronization. A failed handshake, missing full-history/witness service, interrupted headers or block transfer, or rejected response advances to the next candidate; durable headers and atomic chainstate let that peer resume the same IBD. Learned connection attempts are committed before each task starts network I/O and receive a persistent one-minute-to-six-hour exponential retry delay. Malformed framing/ordering, bounded-response violations, objectively invalid headers, and invalid downloaded blocks additionally discourage non-manual peers for one hour, doubling to at most one day; the count decays after seven quiet days. Transient I/O, timeouts, future-time headers, missing blocks, obsolete versions, and missing services never receive that penalty. Every successful full-history/Witness handshake is persisted as verified, migrates into the keyed tried bucket set, and clears the ordinary connection delay, so a later launch can omit `--connect` and DNS; promotion frees the learned source's new-bucket quota. The stronger protocol record is cleared only after the requested synchronization session completes successfully, preventing an invalid-block peer from resetting escalation with a clean handshake. Completion time and a saturating completion count are persisted separately from handshake success, survive database reopen, and rank fully proven peers ahead of handshake-only candidates. Within otherwise equal reputation, the latest successful outbound handshake measurement is capped to 1–60,000 ms and lower known latency ranks first. A successful requested synchronization session with downloaded blocks additionally persists exact completed block-payload bytes divided by response-wait time, capped at 1 GB/s; higher known throughput then ranks ahead of lower or legacy-unknown throughput before the existing freshness and target-network-group diversity rules. Successful full-service handshakes request addresses with a three-second bound; newly learned candidates become eligible on the next restart. Sync completion remains based on validated cumulative work, never the peer's untrusted advertised height. The keyed new table now retains up to eight source-group references with Core-style exponentially decreasing admission probability, while tried collisions use exact hashed slots. This remains a bounded outbound peer manager rather than Core's complete addrman or adaptive connected-peer eviction design. Core-compatible `--signetchallenge HEX` selects a custom BIP325 challenge, derives its P2P magic, disables default-Signet trust anchors/seeds, and accepts repeatable `--signetseednode HOST[:PORT]`; use an isolated data directory, whose challenge identity is checked before wallet opening or network I/O. Add `--once` for a bounded sync-and-exit run. Add `--explorer-listen 127.0.0.1:3000` to serve the embedded read-only explorer and REST API; non-loopback binds are rejected until authentication is implemented. Regtest Taproot activation can be overridden with Core-compatible `--vbparams taproot:START:END[:MIN_HEIGHT]`. Buried deployments accept repeatable Core-compatible `--testactivationheight NAME@HEIGHT`, where `NAME` is `segwit`, `bip34`, `dersig`, `cltv`, or `csv`; the last value for a name wins. The complete selected consensus configuration is bound to a fresh execution database and cannot later change in place. An offline regtest/Signet base can be installed only into a fresh data directory with `--assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX`; every identity value must come from an authenticated channel, the header must already be active in `headers.redb`, and the durable assumed marker remains until the still-pending background genesis validator exists. Core 26 minimum-chainwork and assume-valid defaults are loaded per supported legacy network and can be overridden with `--minimum-chainwork HEX` and `--assumevalid HASH|0`. A chain below the work floor remains in IBD. Assume-valid currently identifies a reviewed active-chain anchor only: all scripts are still verified. Mainnet, legacy testnet, and testnet4 may probe or persist headers; ordinary `--data-dir` block execution remains rejected before connecting until the remaining acceptance gates close. For bounded validation and soak only, Bitcoin or legacy testnet can explicitly opt into the same production execution path with `--experimental-network-execution --once` plus a mandatory authenticated `--validate-until-height`/`--validate-until-blockhash` pair; the execution routine repeats that hard-ceiling requirement. This mode prints a funds-safety warning, cannot start an indefinite node or expose explorer/RPC/wallet services, and does not support testnet4 or automatic AssumeUTXO cleanup. Because Core 26 predates testnet4, rBTC does not silently mix a newer testnet4 seed list into this pinned compatibility baseline; supply an explicit peer or custom seed for testnet4 header operations.
 

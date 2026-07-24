@@ -190,18 +190,40 @@ transaction inserts the complete delta and advances every block transition;
 no prefix is visible after failure.
 
 Reads search newest deltas first by binary search and decode only a matched
-UTXO. A 10-bit-per-update Bloom filter accompanies every in-memory row, and
-each 16-row group shares a fixed aggregate Bloom filter, so historical base
-inputs normally skip 16 records with three probes. Bulk prefetch resolves all
-journal hits newest-first and issues one ordered parallel redb base lookup only
-for unresolved outpoints. Restart strictly validates record size, ordering,
-state bits, contiguous offsets, canonical UTXO bytes, and exact execution-tip
-alignment before rebuilding those acceleration filters. Ordinary mode rejects
-a non-empty delta table, and journal mode rejects block-undo retention and
-disconnects. Explicit materialization is one immediate transaction that folds
-the logical newest values into the base trees and clears the journal; periodic
-automatic materialization was rejected because it merely deferred the
-superlinear random-write cost.
+UTXO. A 10-bit-per-update Bloom filter accompanies every row, and each
+completed 16-row group shares a fixed aggregate Bloom filter, so historical
+base inputs normally skip 16 records with three probes. The row filter is
+checksummed and committed atomically with its RVD3 delta; the completed group
+filter joins the same transaction on every sixteenth row. Bulk prefetch
+resolves all journal hits newest-first and issues one ordered parallel redb
+base lookup only for unresolved outpoints.
+
+An older RVD3 database without persisted filters undergoes one strict scan of
+record size, ordering, state bits, contiguous offsets, and canonical UTXO
+bytes, then installs all row and completed-group filters in one
+immediate-durability migration. Subsequent opens validate the redb-protected
+filter format, byte length, SHA-256 checksum, per-row UTXO count, delta header,
+and exact execution-tip alignment; only the at-most-15-row unfinished group is
+strictly rescanned to rebuild its aggregate. At height 432,684, the migration
+opened the 18 GB production chainstate in 11.454 seconds and the next reopen
+took 6.035 seconds, replacing the earlier approximately one-to-two-minute
+filter rebuild. Ordinary mode rejects a non-empty delta table, and journal
+mode rejects block-undo retention and disconnects. Explicit materialization is
+one immediate transaction that folds the logical newest values into the base
+trees and clears the journal plus both filter tables; periodic automatic
+materialization was rejected because it merely deferred the superlinear
+random-write cost.
+
+Experimental fixed-target mainnet validation can reserve up to three ready
+standby candidates while the chainstate opens asynchronously and the active
+session receives bounded keepalives. It activates the first surviving
+candidate as an auxiliary block source. Checkpoints wider than the 128-block
+single-peer pipeline split into ordered primary and auxiliary windows, request
+and receive both concurrently, then concatenate them in active-chain order.
+Any auxiliary request or response failure drops that source and redownloads
+only its window from the primary. The measured download median moved from
+about 19.4 to 18.8 seconds; a more aggressive background-response experiment
+was rejected after it exceeded the existing 30-second peer bound.
 
 Transaction IDs computed for Merkle authentication are carried into execution
 instead of hashing every transaction serialization again. Large sorted
@@ -270,6 +292,11 @@ height 419,328/hash
 Its 71-block tail committed in 12.22 seconds. A cold restart advanced only the
 active header store from 959,431 to 959,434, requested no blocks, and exited at
 the same CSV height/hash.
+The target was then atomically extended to SegWit height 481,824/hash
+`0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893`.
+After persisted Bloom migration, the first 252-block checkpoint at
+432,685–432,936 completed in 25.624 seconds, with 9.231 seconds in
+execution/persistence.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
