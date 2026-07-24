@@ -53,6 +53,8 @@ BIP152 now negotiates witness-aware version 2 with high-bandwidth announcements 
 
 Wallet transaction diffusion now keeps the active-socket completion boundary while fanning the exact verified transaction through a separate eight-entry in-memory ring to every hot standby. Before channel handoff, distinct wallet-origin standardness and a 1 sat/vB relay floor run after consensus verification; a reserved slot and atomic `rebroadcast.redb` commit then close the crash window. The network-bound, owner-only queue retains at most 64 unique wtxids for 14 days, persistently rejects retained-input conflicts, retries after restart and every 12 hours, suppresses active-chain confirmations and noncanonical conflicts, and restores eligibility after reorg reconciliation. Standbys independently complete the bounded inventory/request exchange under the peer timeout and terminate on socket failure or ring lag. Peer mempool acknowledgement, a general inbound listener, a complete Core transaction-relay lifecycle, and complete dynamic fee policy remain open.
 
+Core 26's public standard-script subset is now independent of custom consensus activation heights during transaction admission. Active-next-block flags run first; an incomplete set is followed by P2SH/DERSIG/NULLDUMMY/CLTV/CSV/Witness/Taproot verification against the same exact prevouts, while fully activated contexts skip duplicate execution. A pinned Core vector accepted under `VERIFY_NONE` and rejected under DERSIG/NULLDUMMY proves that the failure remains policy-only and leaves both UTXO state and the candidate pool unchanged. Policy-only interpreter flags outside the public ABI remain explicit open work.
+
 ## Phase 2 — data services
 
 - [x] In-memory explorer index implementation for embedded/regtest use.

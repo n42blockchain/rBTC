@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use crate::{
     chainstate::{ChainstateError, apply_transaction_with_context},
+    consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
         TransactionPolicyError, validate_standard_inputs, validate_standard_transaction,
     },
@@ -52,6 +53,9 @@ const SATOSHIS_PER_KVB: u64 = 1_000;
 const DEFAULT_BYTES_PER_SIGOP: usize = 20;
 /// Core 26's per-transaction standard sigop cost ceiling.
 pub const MAX_STANDARD_TRANSACTION_SIGOP_COST: u64 = 16_000;
+/// Core 26 standard-script flags expressible through the public consensus ABI.
+pub const PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS: u32 =
+    bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 /// Core-like maximum aggregate virtual size accepted for one package.
@@ -113,6 +117,9 @@ pub enum TransactionAdmissionError {
     /// Local standard relay policy rejected the transaction.
     #[error("relay policy: {0}")]
     Policy(#[from] TransactionPolicyError),
+    /// A public standard-script flag rejected an otherwise active-consensus-valid input.
+    #[error("standard script policy: {0}")]
+    StandardScript(#[source] ConsensusError),
     /// An empty package has no admission meaning.
     #[error("transaction package is empty")]
     EmptyPackage,
@@ -1664,7 +1671,7 @@ fn apply_to_overlay<S: UtxoStore>(
     transaction: &Transaction,
     context: TransactionAdmissionContext,
 ) -> Result<AppliedAdmission, TransactionAdmissionError> {
-    let prevout_scripts = transaction
+    let prevouts = transaction
         .input
         .iter()
         .map(|input| {
@@ -1673,9 +1680,12 @@ fn apply_to_overlay<S: UtxoStore>(
                 .get(outpoint)
                 .map_err(ChainstateError::from)?
                 .ok_or(ChainstateError::Utxo(UtxoError::Missing(outpoint)))
-                .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey))
         })
-        .collect::<Result<Vec<_>, ChainstateError>>()?;
+        .collect::<Result<Vec<Utxo>, ChainstateError>>()?;
+    let prevout_scripts = prevouts
+        .iter()
+        .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey.clone()))
+        .collect::<Vec<_>>();
     let applied = apply_transaction_with_context(
         overlay,
         transaction,
@@ -1692,6 +1702,16 @@ fn apply_to_overlay<S: UtxoStore>(
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction(transaction, fee_sats)?;
     validate_standard_inputs(transaction, &prevout_scripts)?;
+    if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+        != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+    {
+        verify_transaction_scripts_with_flags(
+            transaction,
+            &prevouts,
+            PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS,
+        )
+        .map_err(TransactionAdmissionError::StandardScript)?;
+    }
     if applied.sigop_cost > MAX_STANDARD_TRANSACTION_SIGOP_COST {
         return Err(TransactionAdmissionError::TooManySigops {
             cost: applied.sigop_cost,
@@ -1922,7 +1942,9 @@ mod tests {
         Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
         absolute::LockTime,
         blockdata::script::Builder,
+        consensus::deserialize,
         hashes::Hash,
+        hex::FromHex,
         opcodes,
         script::PushBytesBuf,
         secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey},
@@ -1943,6 +1965,10 @@ mod tests {
             csv_active: true,
             full_rbf: false,
         }
+    }
+
+    fn transaction_from_hex(encoded: &str) -> Transaction {
+        deserialize(&Vec::<u8>::from_hex(encoded).unwrap()).unwrap()
     }
 
     fn store() -> (TempDir, RedbUtxoStore) {
@@ -2218,6 +2244,58 @@ mod tests {
             assert!(pool.is_empty());
             assert_eq!(pool.retained_bytes(), 0);
         }
+    }
+
+    #[test]
+    fn public_standard_script_flags_apply_before_custom_activation_and_are_atomic() {
+        // Bitcoin Core 26 tx_valid.json: valid without the standard DERSIG and
+        // NULLDUMMY flags, rejected when their public standard subset is used.
+        let transaction = transaction_from_hex(concat!(
+            "0100000001b14bdcbc3e01bdaad36cc08e81e69c82e1060bc14e518db2b49aa43a",
+            "d90ba260000000004a01ff47304402203f16c6f40162ab686621ef3000b04e75418",
+            "a0c0cb2d8aebeac894ae360ac1e780220ddc15ecdfc3507ac48e1681a33eb6099",
+            "6631bf6bf5bc0a0682c4db743ce7ca2b01ffffffff0140420f00000000001976a9",
+            "14660d4ef3a743e3e696ad990364e555c271ad504b88ac00000000",
+        ));
+        let prevout_script = Vec::<u8>::from_hex(concat!(
+            "514104cc71eb30d653c0c3163990c47b976f3fb3f37cccdcbedb169a1dfef58bb",
+            "fbfaff7d8a473e7e2e6d317b87bafe8bde97e3cf8f065dec022b51d11fcdd0d3",
+            "48ac4410461cbdcc5409fb4b4d42b51d33381354d80e550078cb532a34bfa2fcf",
+            "deb7d76519aecc62770f5b0e4ef8551946d8a540911abe3e7854a26f39f58b25",
+            "c15342af52ae",
+        ))
+        .unwrap();
+        let outpoint = transaction.input[0].previous_output;
+        let (_directory, store) = store();
+        store
+            .apply(
+                &[],
+                &[(
+                    outpoint.into(),
+                    Utxo {
+                        value_sats: 2_000_000,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 1,
+                        script_pubkey: prevout_script,
+                    },
+                )],
+            )
+            .unwrap();
+        let mut pre_activation = context();
+        pre_activation.script_flags = bitcoinconsensus::VERIFY_NONE;
+        pre_activation.csv_active = false;
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit(&store, transaction.clone(), pre_activation),
+            Err(TransactionAdmissionError::StandardScript(
+                ConsensusError::Script { input: 0, .. }
+            ))
+        ));
+        assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+        assert!(pool.is_empty());
     }
 
     #[test]
