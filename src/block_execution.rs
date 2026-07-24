@@ -516,7 +516,9 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         }
         let mut seen_created = BTreeSet::new();
         for (outpoint, _) in created {
-            if !seen_created.insert(*outpoint) || self.load(&mut state, *outpoint)?.is_some() {
+            if !seen_created.insert(*outpoint)
+                || (!seen_spent.contains(outpoint) && self.load(&mut state, *outpoint)?.is_some())
+            {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
         }
@@ -1100,6 +1102,25 @@ mod tests {
                 bip30_enforced: false,
                 ..deployments(1)
             },
+        )
+        .unwrap();
+        assert_eq!(
+            chainstate.get(collision).unwrap().unwrap().value_sats,
+            block_subsidy(1)
+        );
+        disconnect_execution_tip(&chainstate, &headers, 2, 60).unwrap();
+        assert_eq!(chainstate.get(collision).unwrap().unwrap().value_sats, 42);
+
+        connect_active_blocks(
+            &chainstate,
+            &headers,
+            &[block],
+            1,
+            60,
+            &[BlockDeploymentContext {
+                bip30_enforced: false,
+                ..deployments(1)
+            }],
         )
         .unwrap();
         assert_eq!(
