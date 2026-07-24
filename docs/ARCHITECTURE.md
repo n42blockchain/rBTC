@@ -304,6 +304,11 @@ The target was then atomically extended to SegWit height 481,824/hash
 After persisted Bloom migration, the first 252-block checkpoint at
 432,685–432,936 completed in 25.624 seconds, with 9.231 seconds in
 execution/persistence.
+The same journal then reached SegWit activation height 481,824/hash
+`0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893`.
+The final 252-block checkpoint took 43.780 seconds. A completed-target restart
+opened chainstate in 13.078 seconds, advanced headers from 959,450 to 959,452,
+requested no blocks, and stopped at the identical target.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
