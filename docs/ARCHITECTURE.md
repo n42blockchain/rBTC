@@ -105,6 +105,10 @@ validation may explicitly defer the allocator-state repair write while keeping
 immediate transaction durability; this reduces write amplification at the cost
 of potentially slower post-crash reopen. The repeated SIGKILL/reopen matrix
 covers both settings and still requires an old or new complete checkpoint.
+The default checkpoint remains 64 blocks. Explicit bounded validation may use
+up to 256 blocks (a consensus worst-case payload bound of 1 GiB) to amortize
+the staged-ledger and chainstate durability barriers on adequately provisioned
+machines; later full-block eras should retain a lower memory-aware setting.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

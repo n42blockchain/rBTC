@@ -68,7 +68,7 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
-const MAX_VALIDATION_BATCH_SIZE: usize = 64;
+const MAX_VALIDATION_BATCH_SIZE: usize = 256;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -9414,6 +9414,8 @@ mod tests {
                 "--experimental-network-execution",
                 "--extend-validation-target",
                 "--validation-deferred-repair",
+                "--validation-batch-size",
+                "256",
                 "--once",
                 "--validate-until-height",
                 "2",
@@ -9430,6 +9432,7 @@ mod tests {
             NetworkExecutionMode::ExperimentalOnceExtend
         );
         assert!(!extension.validation_limits.quick_repair);
+        assert_eq!(extension.validation_limits.max_blocks_per_batch, 256);
     }
 
     #[test]
