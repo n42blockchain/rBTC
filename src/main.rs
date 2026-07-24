@@ -26,7 +26,8 @@ use rbtc::{
         explorer_events_router, explorer_router, rpc_router, wallet_router_with_sink,
     },
     block_execution::{
-        BlockExecutionError, connect_active_block, connect_active_blocks, disconnect_execution_tip,
+        BlockDeploymentContext, BlockExecutionError, connect_prevalidated_active_blocks,
+        disconnect_execution_tip,
     },
     blockchain::{AppliedBlock, validate_block_structure_with_deployments},
     chain_store::RedbChainStore,
@@ -35,7 +36,7 @@ use rbtc::{
     explorer_store::RedbExplorerIndex,
     fee_estimator::{FeeEstimatorError, FeeTrack, RedbFeeEstimator},
     header_store::RedbHeaderStore,
-    headers::{HeaderDag, HeaderError},
+    headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
@@ -65,6 +66,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
+const MAX_VALIDATION_BATCH_SIZE: usize = 64;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -155,7 +158,7 @@ struct ValidationLimits {
 impl Default for ValidationLimits {
     fn default() -> Self {
         Self {
-            max_blocks_per_batch: MAX_BLOCKS_IN_FLIGHT,
+            max_blocks_per_batch: DEFAULT_VALIDATION_BATCH_SIZE,
             pause_between_batches: Duration::ZERO,
         }
     }
@@ -4818,74 +4821,58 @@ async fn download_execute_batch(
         .iter()
         .map(|header| header.hash)
         .collect::<Vec<_>>();
-    timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
+    let mut blocks = Vec::with_capacity(batch_len);
+    for request_hashes in hashes.chunks(MAX_BLOCKS_IN_FLIGHT) {
+        timeout(PEER_TIMEOUT, session.request_blocks(request_hashes))
+            .await
+            .map_err(|_| {
+                PeerRunError::transient(format!(
+                    "getdata timed out for {} blocks",
+                    request_hashes.len()
+                ))
+            })?
+            .map_err(|error| PeerRunError::p2p(&error))?;
+        let mut received = timeout(
+            PEER_TIMEOUT,
+            session.receive_requested_blocks_with_candidates(request_hashes, compact_candidates),
+        )
         .await
-        .map_err(|_| PeerRunError::transient(format!("getdata timed out for {batch_len} blocks")))?
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "block response timed out for {} blocks",
+                request_hashes.len()
+            ))
+        })?
         .map_err(|error| PeerRunError::p2p(&error))?;
-    let blocks = timeout(
-        PEER_TIMEOUT,
-        session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
-    )
-    .await
-    .map_err(|_| {
-        PeerRunError::transient(format!(
-            "block batch response timed out for {batch_len} blocks"
-        ))
-    })?
-    .map_err(|error| PeerRunError::p2p(&error))?;
-    for (expected, block) in expected.iter().zip(&blocks) {
-        validate_downloaded_block(
-            deployment_config,
-            headers,
-            expected.height,
-            expected.hash,
-            block,
-        )?;
+        blocks.append(&mut received);
     }
-    let serialized = blocks.iter().map(serialize).collect::<Vec<_>>();
-    ledger
-        .stage(next_height, &serialized)
-        .map_err(|error| error.to_string())?;
     let deployment_contexts = expected
         .iter()
         .zip(&blocks)
         .map(|(expected, block)| {
-            block_deployment_context_for_headers(
+            validate_downloaded_block(
                 deployment_config,
                 headers,
                 expected.height,
                 expected.hash,
-                block.header.time,
-                taproot_active(headers, expected.height, deployment_config)
-                    .map_err(|error| error.to_string())?,
+                block,
             )
-            .map_err(|error| error.to_string())
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, PeerRunError>>()?;
+    let serialized = blocks.iter().map(serialize).collect::<Vec<_>>();
+    ledger
+        .stage(next_height, &serialized)
+        .map_err(|error| error.to_string())?;
     let now = u64::from(unix_time()?);
-    let applied_blocks = if blocks.len() == 1 {
-        vec![
-            connect_active_block(
-                chainstate,
-                headers,
-                &blocks[0],
-                now,
-                DEFAULT_HOT_WINDOW_SECS,
-                &deployment_contexts[0],
-            )
-            .map_err(|error| PeerRunError::block(&error))?,
-        ]
-    } else {
-        connect_active_blocks(
-            chainstate,
-            headers,
-            &blocks,
-            now,
-            DEFAULT_HOT_WINDOW_SECS,
-            &deployment_contexts,
-        )
-        .map_err(|error| PeerRunError::block(&error))?
-    };
+    let applied_blocks = connect_prevalidated_active_blocks(
+        chainstate,
+        headers,
+        &blocks,
+        now,
+        DEFAULT_HOT_WINDOW_SECS,
+        &deployment_contexts,
+    )
+    .map_err(|error| PeerRunError::block(&error))?;
     let removed_orphans = {
         let mut pool = transaction_pool
             .lock()
@@ -4901,20 +4888,28 @@ async fn download_execute_batch(
             if removed_orphans == 1 { "" } else { "s" }
         );
     }
-    for ((expected, block), applied) in expected.into_iter().zip(&blocks).zip(&applied_blocks) {
-        index_validated_block(
-            explorer,
-            explorer_events,
-            wallet,
-            expected.height,
-            block,
-            applied,
-        )?;
-        println!(
-            "validated and executed block {}:{}",
-            expected.height, expected.hash
-        );
-    }
+    index_validated_blocks(
+        explorer,
+        explorer_events,
+        wallet,
+        &expected,
+        &blocks,
+        &applied_blocks,
+    )?;
+    let first = expected
+        .first()
+        .expect("non-empty block batch has a first header");
+    let last = expected
+        .last()
+        .expect("non-empty block batch has a last header");
+    println!(
+        "validated and executed {} blocks {}-{}; active tip {}:{}",
+        blocks.len(),
+        first.height,
+        last.height,
+        last.height,
+        last.hash
+    );
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
@@ -4927,7 +4922,7 @@ fn validate_downloaded_block(
     height: u32,
     expected_hash: BlockHash,
     block: &Block,
-) -> Result<(), PeerRunError> {
+) -> Result<BlockDeploymentContext, PeerRunError> {
     let actual = block.block_hash();
     if actual != expected_hash {
         return Err(PeerRunError::protocol(format!(
@@ -4956,33 +4951,45 @@ fn validate_downloaded_block(
         PeerRunError::protocol(format!(
             "downloaded block structure at height {height}: {error}"
         ))
-    })
+    })?;
+    Ok(deployments)
 }
 
-fn index_validated_block(
+fn index_validated_blocks(
     explorer: &RedbExplorerIndex,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
-    height: u32,
-    block: &Block,
-    applied: &AppliedBlock,
+    expected: &[HeaderInfo],
+    blocks: &[Block],
+    applied_blocks: &[AppliedBlock],
 ) -> Result<(), String> {
-    explorer
-        .connect(height, block, applied)
-        .map_err(|error| error.to_string())?;
-    if let Some(wallet) = wallet {
-        wallet
-            .apply_validated_block(block, height)
-            .map_err(|error| error.to_string())?;
+    if expected.len() != blocks.len() || blocks.len() != applied_blocks.len() {
+        return Err("validated projection batch lengths differ".to_owned());
     }
-    publish_explorer_event(
-        explorer_events,
-        ExplorerEventKind::Connected,
-        rbtc::execution_store::ExecutionTip {
-            height,
-            hash: applied.hash,
-        },
-    );
+    let explorer_batch = expected
+        .iter()
+        .zip(blocks)
+        .zip(applied_blocks)
+        .map(|((expected, block), applied)| (expected.height, block, applied))
+        .collect::<Vec<_>>();
+    explorer
+        .connect_batch(&explorer_batch)
+        .map_err(|error| error.to_string())?;
+    for ((expected, block), applied) in expected.iter().zip(blocks).zip(applied_blocks) {
+        if let Some(wallet) = wallet {
+            wallet
+                .apply_validated_block(block, expected.height)
+                .map_err(|error| error.to_string())?;
+        }
+        publish_explorer_event(
+            explorer_events,
+            ExplorerEventKind::Connected,
+            rbtc::execution_store::ExecutionTip {
+                height: expected.height,
+                hash: applied.hash,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -5458,9 +5465,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 let size = value
                     .parse::<usize>()
                     .map_err(|_| format!("invalid validation batch size: {value}"))?;
-                if !(1..=MAX_BLOCKS_IN_FLIGHT).contains(&size) {
+                if !(1..=MAX_VALIDATION_BATCH_SIZE).contains(&size) {
                     return Err(format!(
-                        "validation batch size must be between 1 and {MAX_BLOCKS_IN_FLIGHT}"
+                        "validation batch size must be between 1 and {MAX_VALIDATION_BATCH_SIZE}"
                     ));
                 }
                 validation_batch_size = Some(size);
@@ -5749,7 +5756,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
     let validation_limits = ValidationLimits {
-        max_blocks_per_batch: validation_batch_size.unwrap_or(MAX_BLOCKS_IN_FLIGHT),
+        max_blocks_per_batch: validation_batch_size.unwrap_or(DEFAULT_VALIDATION_BATCH_SIZE),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
     };
     if experimental_network_execution {
@@ -5971,7 +5978,7 @@ mod tests {
     use proptest::prelude::*;
     use rbtc::{
         api::ExplorerIndex,
-        blockchain::block_subsidy,
+        blockchain::{block_subsidy, block_subsidy_with_interval},
         chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
@@ -7671,7 +7678,7 @@ mod tests {
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy(height)),
+                value: Amount::from_sat(block_subsidy_with_interval(height, 150)),
                 script_pubkey: ScriptBuf::new(),
             }],
         };
@@ -11049,7 +11056,16 @@ mod tests {
         let ledger =
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
-        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, block_count)]);
+        let expected_ranges = (1..=block_count)
+            .step_by(DEFAULT_VALIDATION_BATCH_SIZE)
+            .map(|first| {
+                let last = first
+                    .saturating_add(u32::try_from(DEFAULT_VALIDATION_BATCH_SIZE - 1).unwrap())
+                    .min(block_count);
+                (first, last)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ledger.retained_ranges().unwrap(), expected_ranges);
 
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let report = serde_json::json!({

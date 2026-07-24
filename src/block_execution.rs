@@ -9,7 +9,10 @@ use bitcoin::{Block, BlockHash, OutPoint};
 use thiserror::Error;
 
 use crate::{
-    blockchain::{AppliedBlock, BlockError, apply_block_with_deployments, disconnect_block},
+    blockchain::{
+        AppliedBlock, BlockError, apply_block_with_deployments,
+        apply_prevalidated_block_with_deployments, disconnect_block,
+    },
     chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
     chainstate::is_unspendable,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
@@ -265,6 +268,7 @@ pub fn connect_active_block(
         now,
         hot_window_secs,
         deployments,
+        false,
     )?;
     let next_tip = ExecutionTip {
         height: current.height + 1,
@@ -295,6 +299,51 @@ pub fn connect_active_blocks(
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
 ) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    connect_active_blocks_inner(
+        chainstate,
+        headers,
+        blocks,
+        now,
+        hot_window_secs,
+        deployments,
+        false,
+    )
+}
+
+/// Connects a downloaded batch whose block structures were already checked
+/// against the supplied deployment contexts.
+///
+/// Script, UTXO, lock-time, subsidy, fee, and sigop validation remain enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_prevalidated_active_blocks(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    connect_active_blocks_inner(
+        chainstate,
+        headers,
+        blocks,
+        now,
+        hot_window_secs,
+        deployments,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_active_blocks_inner(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+    structure_prevalidated: bool,
+) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
             blocks: blocks.len(),
@@ -319,6 +368,7 @@ pub fn connect_active_blocks(
             now,
             hot_window_secs,
             deployment,
+            structure_prevalidated,
         )?;
         let next = ExecutionTip {
             height: current
@@ -352,6 +402,7 @@ fn validate_active_block<S: UtxoStore>(
     now: u64,
     hot_window_secs: u64,
     deployments: &BlockDeploymentContext,
+    structure_prevalidated: bool,
 ) -> Result<(AppliedBlock, UtxoChanges), BlockExecutionError> {
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
@@ -386,20 +437,35 @@ fn validate_active_block<S: UtxoStore>(
     } else {
         return Err(BlockExecutionError::Bip30Collision(collisions[0]));
     };
-    let mut applied = match apply_block_with_deployments(
-        &overlay,
-        block,
-        next_height,
-        now,
-        parent_mtp,
-        hot_window_secs,
-        deployments.script_flags,
-        deployments.bip34_active,
-        deployments.csv_active,
-        deployments.segwit_active,
-        deployments.signet_challenge.as_deref(),
-        deployments.subsidy_sats,
-    ) {
+    let result = if structure_prevalidated {
+        apply_prevalidated_block_with_deployments(
+            &overlay,
+            block,
+            next_height,
+            now,
+            parent_mtp,
+            hot_window_secs,
+            deployments.script_flags,
+            deployments.csv_active,
+            deployments.subsidy_sats,
+        )
+    } else {
+        apply_block_with_deployments(
+            &overlay,
+            block,
+            next_height,
+            now,
+            parent_mtp,
+            hot_window_secs,
+            deployments.script_flags,
+            deployments.bip34_active,
+            deployments.csv_active,
+            deployments.segwit_active,
+            deployments.signet_challenge.as_deref(),
+            deployments.subsidy_sats,
+        )
+    };
+    let mut applied = match result {
         Ok(applied) => applied,
         Err(error) => return Err(BlockExecutionError::Block(error)),
     };

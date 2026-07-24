@@ -6,7 +6,7 @@ use bitcoin::{
     Address, Block, BlockHash, Network, Txid,
     hashes::{Hash, sha256},
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -213,9 +213,39 @@ impl RedbExplorerIndex {
     }
 
     /// Atomically indexes one fully validated child block.
-    #[allow(clippy::too_many_lines)]
     pub fn connect(
         &self,
+        height: u32,
+        block: &Block,
+        applied: &AppliedBlock,
+    ) -> Result<(), ExplorerStoreError> {
+        self.connect_batch(&[(height, block, applied)])
+    }
+
+    /// Atomically indexes a contiguous batch of fully validated child blocks.
+    ///
+    /// The whole projection batch becomes visible in one redb commit, matching
+    /// the execution store's IBD checkpoint boundary and avoiding one durable
+    /// transaction per block.
+    pub fn connect_batch(
+        &self,
+        batch: &[(u32, &Block, &AppliedBlock)],
+    ) -> Result<(), ExplorerStoreError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.write_guard.lock().expect("explorer lock not poisoned");
+        let transaction = self.db.begin_write()?;
+        for (height, block, applied) in batch {
+            Self::connect_transaction(&transaction, *height, block, applied)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn connect_transaction(
+        transaction: &WriteTransaction,
         height: u32,
         block: &Block,
         applied: &AppliedBlock,
@@ -232,8 +262,6 @@ impl RedbExplorerIndex {
                 "block undo does not match block",
             ));
         }
-        let _guard = self.write_guard.lock().expect("explorer lock not poisoned");
-        let transaction = self.db.begin_write()?;
         {
             let mut meta = transaction.open_table(META)?;
             let current_value = meta
@@ -365,7 +393,6 @@ impl RedbExplorerIndex {
                 .as_slice(),
             )?;
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -717,6 +744,63 @@ mod tests {
         drop(utxos);
         drop(read);
         assert_eq!(index.disconnect_tip().unwrap(), genesis);
+    }
+
+    #[test]
+    fn explorer_batch_is_atomic_and_reversible() {
+        let directory = TempDir::new().unwrap();
+        let index =
+            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = index.tip().unwrap();
+        let first_transaction = transaction(
+            None,
+            ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([1; 20])),
+        );
+        let first = block(genesis.hash, 1, vec![first_transaction.clone()]);
+        let first_applied = AppliedBlock {
+            hash: first.block_hash(),
+            transaction_undos: vec![created_undo(&first_transaction)],
+        };
+        let second_transaction = transaction(
+            None,
+            ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([2; 20])),
+        );
+        let second = block(first.block_hash(), 2, vec![second_transaction.clone()]);
+        let second_applied = AppliedBlock {
+            hash: second.block_hash(),
+            transaction_undos: vec![created_undo(&second_transaction)],
+        };
+
+        index
+            .connect_batch(&[(1, &first, &first_applied), (2, &second, &second_applied)])
+            .unwrap();
+        assert_eq!(index.tip().unwrap().height, 2);
+        assert_eq!(index.disconnect_tip().unwrap().height, 1);
+        assert_eq!(index.disconnect_tip().unwrap(), genesis);
+
+        let invalid_directory = TempDir::new().unwrap();
+        let invalid = RedbExplorerIndex::open(
+            invalid_directory.path().join("explorer.redb"),
+            Network::Regtest,
+        )
+        .unwrap();
+        let disconnected = block(genesis.hash, 2, vec![second_transaction]);
+        let disconnected_applied = AppliedBlock {
+            hash: disconnected.block_hash(),
+            transaction_undos: second_applied.transaction_undos,
+        };
+        assert!(matches!(
+            invalid.connect_batch(&[
+                (1, &first, &first_applied),
+                (2, &disconnected, &disconnected_applied),
+            ]),
+            Err(ExplorerStoreError::Invalid(
+                "block does not extend explorer tip"
+            ))
+        ));
+        assert_eq!(invalid.tip().unwrap(), genesis);
+        assert!(invalid.block(1).unwrap().is_none());
     }
 
     #[test]

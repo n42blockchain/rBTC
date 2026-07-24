@@ -17,7 +17,7 @@ case "$network" in
         default_timeout_seconds=3600
         default_target_height=105000
         default_target_hash=00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97
-        default_batch_size=16
+        default_batch_size=64
         default_restart_height=1000
         ;;
     *)
@@ -56,8 +56,8 @@ if (( target_height > 10000000 )); then
     echo "sync target height cannot exceed 10,000,000" >&2
     exit 1
 fi
-if (( batch_size > 16 )); then
-    echo "sync batch size cannot exceed 16 blocks" >&2
+if (( batch_size > 64 )); then
+    echo "sync batch size cannot exceed 64 blocks" >&2
     exit 1
 fi
 if [[ ! "$restart_height" =~ ^[0-9]+$ ]] || (( restart_height >= target_height )); then
@@ -142,8 +142,14 @@ while kill -0 "$child_pid" 2>/dev/null; do
         tail -n 40 "$log_file" >&2
         exit 1
     fi
+    observed_height="$(
+        sed -n \
+            's/^validated and executed [0-9][0-9]* blocks [0-9][0-9]*-[0-9][0-9]*; active tip \([0-9][0-9]*\):.*/\1/p' \
+            "$log_file" | tail -n 1
+    )"
     if (( restart_height > 0 && restarted == 0 )) \
-        && grep -Fq "validated and executed block ${restart_height}:" "$log_file"; then
+        && [[ -n "$observed_height" ]] \
+        && (( observed_height >= restart_height )); then
         echo "interrupting sync after observing block $restart_height to verify durable restart"
         kill -TERM "$child_pid" 2>/dev/null || true
         wait "$child_pid" 2>/dev/null || true

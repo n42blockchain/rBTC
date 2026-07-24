@@ -256,7 +256,36 @@ pub fn apply_block_with_deployments<S: UtxoStore>(
         segwit_active,
         signet_challenge,
     )?;
+    apply_prevalidated_block_with_deployments(
+        store,
+        block,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        csv_active,
+        subsidy_sats,
+    )
+}
 
+/// Applies a block whose context-free and deployment-aware structure was
+/// already checked against the same candidate context.
+///
+/// This avoids recomputing transaction/witness Merkle commitments on the IBD
+/// path after the downloaded payload has already passed structural validation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
+    store: &S,
+    block: &Block,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    csv_active: bool,
+    subsidy_sats: u64,
+) -> Result<AppliedBlock, BlockError> {
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut sigop_cost = 0_u64;
     let mut fees = 0_u64;
