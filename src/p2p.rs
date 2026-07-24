@@ -61,6 +61,8 @@ pub const MAX_INVENTORY_ENTRIES: usize = MAX_INV_SIZE;
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 /// Maximum block bodies requested concurrently from one peer.
 pub const MAX_BLOCKS_IN_FLIGHT: usize = 16;
+/// Maximum aggregate responses accepted from pipelined bounded block requests.
+pub const MAX_PIPELINED_BLOCKS_IN_FLIGHT: usize = 128;
 /// Consensus-derived upper bound for transaction references in a compact block message.
 pub const MAX_COMPACT_BLOCK_TRANSACTIONS: usize = 16_666;
 const PROTOCOL_VERSION: u32 = 70_016;
@@ -129,7 +131,7 @@ pub enum P2pError {
         count: usize,
     },
     /// A peer did not provide a requested block within the bounded message budget.
-    #[error("peer did not provide block {requested} within {MAX_RESPONSE_MESSAGES} messages")]
+    #[error("peer did not provide block {requested} within the bounded response budget")]
     BlockResponseIncomplete {
         /// Block requested by the caller.
         requested: BlockHash,
@@ -176,6 +178,12 @@ pub enum P2pError {
     #[error("requested {count} blocks at once; limit is {MAX_BLOCKS_IN_FLIGHT}")]
     TooManyBlockRequests {
         /// Requested inventory count.
+        count: usize,
+    },
+    /// A caller attempted to pipeline too many bounded block requests.
+    #[error("pipelined {count} block responses; limit is {MAX_PIPELINED_BLOCKS_IN_FLIGHT}")]
+    TooManyPipelinedBlockRequests {
+        /// Aggregate response count.
         count: usize,
     },
     /// A caller attempted to exceed the bounded transaction-inventory request.
@@ -308,6 +316,7 @@ impl P2pError {
             | Self::SelfConnection
             | Self::MissingServices { .. }
             | Self::TooManyBlockRequests { .. }
+            | Self::TooManyPipelinedBlockRequests { .. }
             | Self::TooManyTransactionRequests { .. }
             | Self::InvalidTransactionRequestInventory(_)
             | Self::DuplicateTransactionRequest(_)
@@ -1561,6 +1570,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         candidates: &[Transaction],
     ) -> Result<Vec<bitcoin::Block>, P2pError> {
         validate_block_request(expected)?;
+        self.receive_block_responses_with_candidates(expected, candidates, MAX_RESPONSE_MESSAGES)
+            .await
+    }
+
+    /// Receives the aggregate response to several already-sent, individually
+    /// bounded block requests.
+    pub async fn receive_pipelined_blocks_with_candidates(
+        &mut self,
+        expected: &[BlockHash],
+        candidates: &[Transaction],
+    ) -> Result<Vec<bitcoin::Block>, P2pError> {
+        if expected.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT {
+            return Err(P2pError::TooManyPipelinedBlockRequests {
+                count: expected.len(),
+            });
+        }
+        validate_unique_block_request(expected)?;
+        let response_budget = expected
+            .len()
+            .saturating_mul(2)
+            .saturating_add(MAX_RESPONSE_MESSAGES);
+        self.receive_block_responses_with_candidates(expected, candidates, response_budget)
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn receive_block_responses_with_candidates(
+        &mut self,
+        expected: &[BlockHash],
+        candidates: &[Transaction],
+        response_budget: usize,
+    ) -> Result<Vec<bitcoin::Block>, P2pError> {
         if expected.is_empty() {
             return Ok(Vec::new());
         }
@@ -1575,7 +1616,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         let mut full_block_fallbacks = HashSet::<BlockHash>::new();
         let response_started = Instant::now();
         let mut payload_bytes = 0_u64;
-        for _ in 0..MAX_RESPONSE_MESSAGES {
+        for _ in 0..response_budget {
             match self
                 .read_bounded_response_message_with_payload_len()
                 .await?
@@ -1791,6 +1832,10 @@ fn validate_block_request(hashes: &[BlockHash]) -> Result<(), P2pError> {
             count: hashes.len(),
         });
     }
+    validate_unique_block_request(hashes)
+}
+
+fn validate_unique_block_request(hashes: &[BlockHash]) -> Result<(), P2pError> {
     let mut unique = HashSet::with_capacity(hashes.len());
     for hash in hashes {
         if !unique.insert(*hash) {
@@ -2466,6 +2511,60 @@ mod tests {
         assert_eq!(blocks[0].block_hash(), expected[0]);
         assert_eq!(blocks[1].block_hash(), expected[1]);
         assert_eq!(stats.payload_bytes, expected_payload_bytes);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipelined_block_batches_share_one_ordered_response_window() {
+        let (client_stream, server_stream) = duplex(256 * 1024);
+        let blocks = (0..17_u32)
+            .map(|nonce| {
+                let mut block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+                block.header.nonce = nonce;
+                block
+            })
+            .collect::<Vec<_>>();
+        let expected = blocks
+            .iter()
+            .map(bitcoin::Block::block_hash)
+            .collect::<Vec<_>>();
+        let client_expected = expected.clone();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            for request in client_expected.chunks(MAX_BLOCKS_IN_FLIGHT) {
+                session.request_witness_blocks(request).await.unwrap();
+            }
+            session
+                .receive_pipelined_blocks_with_candidates(&client_expected, &[])
+                .await
+                .unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            for expected_len in [MAX_BLOCKS_IN_FLIGHT, 1] {
+                assert!(matches!(
+                    transport.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetData(inventory) if inventory.len() == expected_len
+                ));
+            }
+            for block in blocks.into_iter().rev() {
+                transport
+                    .write_message(NetworkMessage::Block(block))
+                    .await
+                    .unwrap();
+            }
+        });
+        let received = client.await.unwrap();
+        assert_eq!(
+            received
+                .iter()
+                .map(bitcoin::Block::block_hash)
+                .collect::<Vec<_>>(),
+            expected
+        );
         server.await.unwrap();
     }
 

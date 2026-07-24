@@ -42,8 +42,8 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
-        MAX_PENDING_TRANSACTION_INVENTORY, MempoolRelaySource, P2pError, PeerSession,
-        TransactionRelay, connect_outbound,
+        MAX_PENDING_TRANSACTION_INVENTORY, MAX_PIPELINED_BLOCKS_IN_FLIGHT, MempoolRelaySource,
+        P2pError, PeerSession, TransactionRelay, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
@@ -68,7 +68,8 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
-const MAX_VALIDATION_BATCH_SIZE: usize = 256;
+const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
+const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 6 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -3784,6 +3785,12 @@ async fn sync_validating_node(
         network,
         ChainStoreOptions {
             quick_repair: validation_limits.quick_repair,
+            retain_block_undo: !network_execution.is_experimental(),
+            cache_size_bytes: if network_execution.is_experimental() {
+                BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
+            } else {
+                ChainStoreOptions::default().cache_size_bytes
+            },
         },
     )
     .map_err(|error| error.to_string())?;
@@ -4914,25 +4921,27 @@ async fn download_execute_batch(
         .map(|header| header.hash)
         .collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(batch_len);
-    for request_hashes in hashes.chunks(MAX_BLOCKS_IN_FLIGHT) {
-        timeout(PEER_TIMEOUT, session.request_blocks(request_hashes))
-            .await
-            .map_err(|_| {
-                PeerRunError::transient(format!(
-                    "getdata timed out for {} blocks",
-                    request_hashes.len()
-                ))
-            })?
-            .map_err(|error| PeerRunError::p2p(&error))?;
+    for pipelined_hashes in hashes.chunks(MAX_PIPELINED_BLOCKS_IN_FLIGHT) {
+        for request_hashes in pipelined_hashes.chunks(MAX_BLOCKS_IN_FLIGHT) {
+            timeout(PEER_TIMEOUT, session.request_blocks(request_hashes))
+                .await
+                .map_err(|_| {
+                    PeerRunError::transient(format!(
+                        "getdata timed out for {} blocks",
+                        request_hashes.len()
+                    ))
+                })?
+                .map_err(|error| PeerRunError::p2p(&error))?;
+        }
         let mut received = timeout(
             PEER_TIMEOUT,
-            session.receive_requested_blocks_with_candidates(request_hashes, compact_candidates),
+            session.receive_pipelined_blocks_with_candidates(pipelined_hashes, compact_candidates),
         )
         .await
         .map_err(|_| {
             PeerRunError::transient(format!(
                 "block response timed out for {} blocks",
-                request_hashes.len()
+                pipelined_hashes.len()
             ))
         })?
         .map_err(|error| PeerRunError::p2p(&error))?;
@@ -4965,20 +4974,23 @@ async fn download_execute_batch(
         &deployment_contexts,
     )
     .map_err(|error| PeerRunError::block(&error))?;
-    let removed_orphans = {
-        let mut pool = transaction_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let removed = pool
-            .remove_orphans_for_block_transactions(blocks.iter().flat_map(|block| &block.txdata));
-        pool.remember_confirmed_transactions(blocks.iter().flat_map(|block| &block.txdata));
-        removed
-    };
-    if removed_orphans > 0 {
-        println!(
-            "removed {removed_orphans} orphan transaction{} included or conflicted by connected blocks",
-            if removed_orphans == 1 { "" } else { "s" }
-        );
+    if maximum_height.is_none() {
+        let removed_orphans = {
+            let mut pool = transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let removed = pool.remove_orphans_for_block_transactions(
+                blocks.iter().flat_map(|block| &block.txdata),
+            );
+            pool.remember_confirmed_transactions(blocks.iter().flat_map(|block| &block.txdata));
+            removed
+        };
+        if removed_orphans > 0 {
+            println!(
+                "removed {removed_orphans} orphan transaction{} included or conflicted by connected blocks",
+                if removed_orphans == 1 { "" } else { "s" }
+            );
+        }
     }
     index_validated_blocks(
         explorer,
@@ -9415,7 +9427,7 @@ mod tests {
                 "--extend-validation-target",
                 "--validation-deferred-repair",
                 "--validation-batch-size",
-                "256",
+                "1008",
                 "--once",
                 "--validate-until-height",
                 "2",
@@ -9432,7 +9444,23 @@ mod tests {
             NetworkExecutionMode::ExperimentalOnceExtend
         );
         assert!(!extension.validation_limits.quick_repair);
-        assert_eq!(extension.validation_limits.max_blocks_per_batch, 256);
+        assert_eq!(extension.validation_limits.max_blocks_per_batch, 1_008);
+
+        let too_large = [
+            "--network",
+            "bitcoin",
+            "--data-dir",
+            "/tmp/rbtc-experimental-execution-gate",
+            "--experimental-network-execution",
+            "--once",
+            "--validation-batch-size",
+            "1009",
+            "--validate-until-height",
+            "2",
+            "--validate-until-blockhash",
+            "000000006a625f06636b8bb6ac7b960a8d03705dc0a87fe1b90a9e5da8d913cd",
+        ];
+        assert!(parse_options(too_large.into_iter().map(str::to_owned)).is_err());
     }
 
     #[test]

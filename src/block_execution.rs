@@ -1,7 +1,7 @@
 //! Sequential active-chain block execution and durable progress coordination.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -39,6 +39,8 @@ pub struct BlockDeploymentContext {
     pub signet_challenge: Option<Arc<[u8]>>,
     /// Whether Core requires collision checks for this block's transaction outputs.
     pub bip30_enforced: bool,
+    /// Whether a historical BIP30 exception must preserve overwritten coins for undo.
+    pub bip30_overwrite: bool,
     /// Maximum proof-of-work subsidy for this candidate height.
     pub subsidy_sats: u64,
 }
@@ -358,6 +360,15 @@ fn connect_active_blocks_inner(
 
     let mut current = chainstate.execution().tip()?;
     let cumulative = UtxoOverlay::new(chainstate);
+    let mut input_outpoints = blocks
+        .iter()
+        .flat_map(|block| block.txdata.iter().skip(1))
+        .flat_map(|transaction| transaction.input.iter())
+        .map(|input| OutPointKey::from(input.previous_output))
+        .collect::<Vec<_>>();
+    input_outpoints.sort_unstable();
+    input_outpoints.dedup();
+    cumulative.prefetch(&input_outpoints)?;
     let mut applied_blocks = Vec::with_capacity(blocks.len());
     let mut transitions = Vec::with_capacity(blocks.len());
     let mut deferred_scripts = Vec::new();
@@ -402,13 +413,17 @@ fn connect_active_blocks_inner(
                 .ok_or(BlockExecutionError::NoNextHeader(current.height))?,
             hash: applied.hash,
         };
-        cumulative.apply(&changes.spent, &changes.created)?;
+        cumulative.apply_validated_changes(&changes);
         transitions.push(ConnectTransition {
             expected_parent: current.hash,
             next,
             spent: changes.spent,
             created: changes.created,
-            transaction_undos: applied.transaction_undos.clone(),
+            transaction_undos: if chainstate.retains_block_undo() {
+                applied.transaction_undos.clone()
+            } else {
+                Vec::new()
+            },
         });
         applied_blocks.push(applied);
         if let Some(batch) = &mut script_batch {
@@ -429,8 +444,7 @@ fn connect_active_blocks_inner(
             source: source.into(),
         }));
     }
-    let committed = chainstate.commit_connect_batch(&transitions)?;
-    debug_assert_eq!(committed.len(), transitions.len());
+    chainstate.commit_connect_batch(&transitions)?;
     Ok(applied_blocks)
 }
 
@@ -496,14 +510,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         .median_time_past(current.hash)
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let overlay = UtxoOverlay::new(chainstate);
-    let collisions = block_output_collisions(&overlay, block)?;
-    let exception_undo = if collisions.is_empty() {
-        None
-    } else if !deployments.bip30_enforced {
-        Some(overlay.apply_with_undo(&collisions, &[])?)
-    } else {
-        return Err(BlockExecutionError::Bip30Collision(collisions[0]));
-    };
+    let exception_undo = apply_bip30_rules(&overlay, block, deployments)?;
     let (mut applied, scripts) = if defer_scripts {
         if !structure_prevalidated {
             validate_block_structure_with_deployments(
@@ -572,8 +579,8 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
 
 #[derive(Default)]
 struct OverlayState {
-    original: BTreeMap<OutPointKey, Option<Utxo>>,
-    current: BTreeMap<OutPointKey, Option<Utxo>>,
+    original: HashMap<OutPointKey, Option<Utxo>>,
+    current: HashMap<OutPointKey, Option<Utxo>>,
 }
 
 struct UtxoChanges {
@@ -634,12 +641,35 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
                 created.push((*outpoint, utxo.clone()));
             }
         }
+        spent.sort_unstable();
+        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+        undo_spent.sort_unstable_by_key(|(outpoint, _)| *outpoint);
         let undo_created = created.iter().map(|(outpoint, _)| *outpoint).collect();
         Ok(UtxoChanges {
             spent,
             created,
             undo: UtxoUndo::new(undo_spent, undo_created),
         })
+    }
+
+    fn apply_validated_changes(&self, changes: &UtxoChanges) {
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        for outpoint in &changes.spent {
+            state.current.insert(*outpoint, None);
+        }
+        for (outpoint, utxo) in &changes.created {
+            state.current.insert(*outpoint, Some(utxo.clone()));
+        }
+    }
+
+    fn prefetch(&self, outpoints: &[OutPointKey]) -> Result<(), UtxoError> {
+        let prefetched = self.base.get_many(outpoints)?;
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        for (outpoint, value) in prefetched {
+            state.original.insert(outpoint, value.clone());
+            state.current.insert(outpoint, value);
+        }
+        Ok(())
     }
 }
 
@@ -686,6 +716,45 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             state.current.insert(*outpoint, None);
         }
         for (outpoint, utxo) in created {
+            state.current.insert(*outpoint, Some(utxo.clone()));
+        }
+        Ok(UtxoUndo::new(
+            undo_spent,
+            created.iter().map(|(outpoint, _)| *outpoint).collect(),
+        ))
+    }
+
+    fn apply_with_undo_fresh_outputs(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        let mut seen_spent = BTreeSet::new();
+        let mut undo_spent = Vec::with_capacity(spent.len());
+        for outpoint in spent {
+            if !seen_spent.insert(*outpoint) {
+                return Err(UtxoError::DuplicateSpend(*outpoint));
+            }
+            let previous = self
+                .load(&mut state, *outpoint)?
+                .ok_or(UtxoError::Missing(*outpoint))?;
+            undo_spent.push((*outpoint, previous));
+        }
+        let mut seen_created = BTreeSet::new();
+        for (outpoint, _) in created {
+            if !seen_created.insert(*outpoint)
+                || (!seen_spent.contains(outpoint)
+                    && state.current.get(outpoint).is_some_and(Option::is_some))
+            {
+                return Err(UtxoError::Duplicate(*outpoint));
+            }
+        }
+        for outpoint in spent {
+            state.current.insert(*outpoint, None);
+        }
+        for (outpoint, utxo) in created {
+            state.original.entry(*outpoint).or_insert(None);
             state.current.insert(*outpoint, Some(utxo.clone()));
         }
         Ok(UtxoUndo::new(
@@ -777,6 +846,27 @@ fn block_output_collisions<S: UtxoStore>(
         }
     }
     Ok(collisions.into_iter().collect())
+}
+
+fn apply_bip30_rules<S: UtxoStore>(
+    chainstate: &S,
+    block: &Block,
+    deployments: &BlockDeploymentContext,
+) -> Result<Option<UtxoUndo>, BlockExecutionError> {
+    if !deployments.bip30_enforced && !deployments.bip30_overwrite {
+        return Ok(None);
+    }
+    let collisions = block_output_collisions(chainstate, block)?;
+    if collisions.is_empty() {
+        return Ok(None);
+    }
+    if deployments.bip30_overwrite {
+        return chainstate
+            .apply_with_undo(&collisions, &[])
+            .map(Some)
+            .map_err(Into::into);
+    }
+    Err(BlockExecutionError::Bip30Collision(collisions[0]))
 }
 
 /// Disconnects the current execution tip using its durable undo record.
@@ -1344,6 +1434,7 @@ mod tests {
             60,
             &BlockDeploymentContext {
                 bip30_enforced: false,
+                bip30_overwrite: true,
                 ..deployments(1)
             },
         )
@@ -1363,6 +1454,7 @@ mod tests {
             60,
             &[BlockDeploymentContext {
                 bip30_enforced: false,
+                bip30_overwrite: true,
                 ..deployments(1)
             }],
         )

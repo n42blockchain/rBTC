@@ -42,8 +42,15 @@ fn coin(height: u32) -> Utxo {
 }
 
 fn open_chainstate(path: impl AsRef<std::path::Path>, quick_repair: bool) -> RedbChainStore {
-    RedbChainStore::open_with_options(path, Network::Regtest, ChainStoreOptions { quick_repair })
-        .unwrap()
+    RedbChainStore::open_with_options(
+        path,
+        Network::Regtest,
+        ChainStoreOptions {
+            quick_repair,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .unwrap()
 }
 
 fn assert_consistent(store: &RedbChainStore) {

@@ -1,7 +1,7 @@
 //! Unified durable storage for active-chain state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
@@ -25,7 +25,8 @@ use crate::{
     },
     utxo::{
         OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo,
-        apply_with_undo_transaction, insert_snapshot_entries_transaction, tables_empty_transaction,
+        apply_validated_changes_transaction, apply_with_undo_transaction,
+        insert_snapshot_entries_transaction, tables_empty_transaction,
     },
 };
 
@@ -34,6 +35,10 @@ use crate::{
 pub struct ChainStoreOptions {
     /// Persist allocator state and use redb's two-phase commit protocol.
     pub quick_repair: bool,
+    /// Retain per-block records needed to disconnect the active tip.
+    pub retain_block_undo: bool,
+    /// Total redb read/write cache budget in bytes.
+    pub cache_size_bytes: usize,
 }
 
 /// Authenticated identity of one canonical snapshot entry stream.
@@ -49,7 +54,11 @@ pub struct SnapshotContentIdentity {
 
 impl Default for ChainStoreOptions {
     fn default() -> Self {
-        Self { quick_repair: true }
+        Self {
+            quick_repair: true,
+            retain_block_undo: true,
+            cache_size_bytes: 1024 * 1024 * 1024,
+        }
     }
 }
 
@@ -189,8 +198,12 @@ impl RedbChainStore {
         // redb 2.6 contains an internal assertion for certain truncated files.
         // Convert that boundary panic into an explicit startup rejection so a
         // damaged chainstate cannot take the daemon down without diagnosis.
-        let database = catch_unwind(AssertUnwindSafe(|| Database::create(path)))
-            .map_err(|_| ChainStoreError::Damaged)??;
+        let database = catch_unwind(AssertUnwindSafe(|| {
+            Database::builder()
+                .set_cache_size(options.cache_size_bytes)
+                .create(path)
+        }))
+        .map_err(|_| ChainStoreError::Damaged)??;
         let db = Arc::new(database);
         Self::from_database(db, network, options)
     }
@@ -221,6 +234,9 @@ impl RedbChainStore {
             }
         }
         let undos = RedbUndoStore::from_database(Arc::clone(&db))?;
+        if !options.retain_block_undo {
+            undos.clear_block_undos()?;
+        }
         let execution = RedbExecutionStore::from_database(Arc::clone(&db), network)?;
         Ok(Self {
             db,
@@ -230,6 +246,12 @@ impl RedbChainStore {
             options,
             write_guard: Mutex::new(()),
         })
+    }
+
+    /// Whether this chainstate retains the records required for reorganization.
+    #[must_use]
+    pub(crate) const fn retains_block_undo(&self) -> bool {
+        self.options.retain_block_undo
     }
 
     /// Read-only access to retained block undo records.
@@ -432,7 +454,9 @@ impl RedbChainStore {
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
         let undo = apply_with_undo_transaction(&transaction, spent, created)?;
-        insert_undo_transaction(&transaction, next.hash, transaction_undos)?;
+        if self.options.retain_block_undo {
+            insert_undo_transaction(&transaction, next.hash, transaction_undos)?;
+        }
         advance_transaction(&transaction, expected_parent, next)?;
         transaction.commit()?;
         Ok(undo)
@@ -446,29 +470,44 @@ impl RedbChainStore {
     pub(crate) fn commit_connect_batch(
         &self,
         transitions: &[ConnectTransition],
-    ) -> Result<Vec<UtxoUndo>, ChainStoreError> {
+    ) -> Result<(), ChainStoreError> {
         if transitions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
+        let mut spent = BTreeSet::new();
+        let mut created = BTreeMap::new();
+        for transition in transitions {
+            for key in &transition.spent {
+                if created.remove(key).is_none() && !spent.insert(*key) {
+                    return Err(UtxoError::DuplicateSpend(*key).into());
+                }
+            }
+            for (key, utxo) in &transition.created {
+                if created.insert(*key, utxo.clone()).is_some() {
+                    return Err(UtxoError::Duplicate(*key).into());
+                }
+            }
+        }
+        let spent = spent.into_iter().collect::<Vec<_>>();
+        let created = created.into_iter().collect::<Vec<_>>();
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
-        let mut undos = Vec::with_capacity(transitions.len());
+        apply_validated_changes_transaction(&transaction, &spent, &created)?;
+        if self.options.retain_block_undo {
+            for transition in transitions {
+                insert_undo_transaction(
+                    &transaction,
+                    transition.next.hash,
+                    &transition.transaction_undos,
+                )?;
+            }
+        }
         for transition in transitions {
-            undos.push(apply_with_undo_transaction(
-                &transaction,
-                &transition.spent,
-                &transition.created,
-            )?);
-            insert_undo_transaction(
-                &transaction,
-                transition.next.hash,
-                &transition.transaction_undos,
-            )?;
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
         transaction.commit()?;
-        Ok(undos)
+        Ok(())
     }
 
     /// Atomically applies a reverse UTXO transition, removes undo, and rewinds the tip.
@@ -504,6 +543,13 @@ impl RedbChainStore {
 impl UtxoStore for RedbChainStore {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
         self.utxos.get(outpoint)
+    }
+
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        self.utxos.get_many(outpoints)
     }
 
     fn apply(
@@ -718,7 +764,10 @@ mod tests {
         let store = RedbChainStore::open_with_options(
             &path,
             Network::Regtest,
-            ChainStoreOptions { quick_repair: true },
+            ChainStoreOptions {
+                quick_repair: true,
+                ..ChainStoreOptions::default()
+            },
         )
         .unwrap();
         let genesis = store.execution().tip().unwrap();
@@ -1174,6 +1223,92 @@ mod tests {
         ));
         let reopened = RedbUtxoStore::open(path).unwrap();
         assert_eq!(reopened.get(key(1)).unwrap(), Some(coin(10)));
+    }
+
+    #[test]
+    fn batch_folds_intermediate_outputs_into_one_atomic_net_change() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let first_hash = BlockHash::from_byte_array([31; 32]);
+        let second_hash = BlockHash::from_byte_array([32; 32]);
+        let transitions = [
+            ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: first_hash,
+                },
+                spent: vec![key(1)],
+                created: vec![(key(2), coin(9))],
+                transaction_undos: vec![],
+            },
+            ConnectTransition {
+                expected_parent: first_hash,
+                next: ExecutionTip {
+                    height: 2,
+                    hash: second_hash,
+                },
+                spent: vec![key(2)],
+                created: vec![(key(3), coin(8))],
+                transaction_undos: vec![],
+            },
+        ];
+
+        store.commit_connect_batch(&transitions).unwrap();
+        assert_eq!(
+            store.execution().tip().unwrap(),
+            ExecutionTip {
+                height: 2,
+                hash: second_hash,
+            }
+        );
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert!(store.get(key(2)).unwrap().is_none());
+        assert_eq!(store.get(key(3)).unwrap(), Some(coin(8)));
+        assert!(store.undos().get(first_hash).unwrap().is_some());
+        assert!(store.undos().get(second_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn validation_only_store_discards_historical_and_new_block_undo() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let first = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([41; 32]),
+        };
+        store
+            .commit_connect(genesis.hash, first, &[key(1)], &[(key(2), coin(9))], &[])
+            .unwrap();
+        assert!(store.undos().get(first.hash).unwrap().is_some());
+        drop(store);
+
+        let store = RedbChainStore::open_with_options(
+            &path,
+            Network::Regtest,
+            ChainStoreOptions {
+                retain_block_undo: false,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(!store.retains_block_undo());
+        assert!(store.undos().get(first.hash).unwrap().is_none());
+        let second = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([42; 32]),
+        };
+        store
+            .commit_connect(first.hash, second, &[key(2)], &[(key(3), coin(8))], &[])
+            .unwrap();
+        assert!(store.undos().get(second.hash).unwrap().is_none());
     }
 
     #[test]

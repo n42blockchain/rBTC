@@ -56,8 +56,9 @@ inherits the raised ceiling exactly as it inherited the original one.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
-default executes through Core 26 checkpoint height 250,000 in 64-block
-atomic persistence batches filled through bounded 16-block peer requests.
+default executes through Core 26 checkpoint height 295,000 in 1,008-block
+high-memory atomic persistence batches filled through bounded 16-block peer
+requests.
 After observing block 1,000, it sends a termination signal; the
 in-flight atomic batch may finish, then a second process must reopen the same
 headers, execution state, UTXOs, undo, and retained ledger before reaching the
@@ -91,6 +92,22 @@ plus recovery in 435.36 seconds (15.99 blocks/second), 12.9% above the adjacent
 checkpoint-barrier leg and about 51% above the original per-block-barrier leg.
 The exact target and a cold completed-target restart both succeeded without an
 additional block request.
+The next run reached Core checkpoint height 279,000/hash
+`0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40`.
+After checkpoint-wide UTXO folding, fresh-output proofs, single-pass durable
+mutation, staged-archive reuse, and 1,008-block high-memory checkpoints, its
+final 4,168-block leg took 246.75 seconds including cold startup (16.89
+blocks/second). One steady 1,008-block checkpoint took 40 seconds (25.2
+blocks/second), about 47% above the adjacent 256-block single-pass run's
+roughly 17.1 blocks/second. A cold completed-target restart took 15.52 seconds
+and requested no block.
+The same state next reached Core checkpoint height 295,000/hash
+`00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983`.
+Batch input prefetch reused one redb read snapshot and open hot/cold tables
+instead of starting a durable read transaction per historical input. The final
+3,904-block leg completed in 282.22 seconds including cold startup; its measured
+steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
+17.46-second completed-target restart both passed without a block request.
 
 ## UTXO layout
 
@@ -98,7 +115,17 @@ Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endi
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
-Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit bounded validation may raise that checkpoint to 256 while retaining an undo record for every block. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block. The durable writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+
+Mainnet output-collision handling follows Core's BIP30 optimization: after the
+authenticated BIP34 anchor, ordinary blocks skip the redundant durable output
+pre-scan, while both historical duplicate-coinbase exceptions still remove and
+preserve overwritten coins for exact undo. The resulting fresh-output proof
+lets the tentative overlay avoid a second durable lookup for each created
+outpoint. A validated block's changes merge directly into the cumulative
+checkpoint overlay instead of replaying every input and output through generic
+store validation, and the final redb mutation obtains spent coins from its
+single remove operation rather than issuing a get followed by a remove.
 
 Within each block, prevout resolution, maturity/lock-time checks, value
 accounting, and UTXO mutation remain sequential so an input can consume an
@@ -110,7 +137,7 @@ single-block input sets stay serial. After IBD constructs one block's
 sequential transition, it immediately submits that block's immutable jobs
 while the calling thread builds later blocks against the cumulative UTXO
 overlay. One checkpoint-wide barrier remains before commit. This removes up
-to 256 per-block joins and overlaps script work with transition construction
+to 1,008 per-block joins and overlaps script work with transition construction
 without moving tentative state into redb. Every script must pass before the
 checkpoint can commit; out-of-order
 completion still selects the earliest failing block and transaction and rolls
@@ -136,10 +163,23 @@ validation may explicitly defer the allocator-state repair write while keeping
 immediate transaction durability; this reduces write amplification at the cost
 of potentially slower post-crash reopen. The repeated SIGKILL/reopen matrix
 covers both settings and still requires an old or new complete checkpoint.
+Authenticated Bitcoin/testnet validation-only stores additionally discard
+historical block undo and omit future undo writes: they have a fixed reviewed
+target and are never exposed as reorganizing service nodes. Ordinary serving
+and AssumeUTXO stores retain per-block undo. A checkpoint's validated
+transitions are folded into one sorted net UTXO change before the redb
+transaction, so outputs created and spent inside the same checkpoint never
+touch disk and the durable layer does not decode a second, unused aggregate
+undo. Empty cold-tier validation stores skip that B-tree entirely. Dropping
+309,112 obsolete undo rows followed by native offline compaction reduced the
+live soak database from 23 GiB to 4.0 GiB; the experimental high-memory path
+uses a 6 GiB redb cache so that compact working set and a larger write cache fit
+without changing ordinary-node defaults.
 The default checkpoint remains 64 blocks. Explicit bounded validation may use
-up to 256 blocks (a consensus worst-case payload bound of 1 GiB) to amortize
-the staged-ledger and chainstate durability barriers on adequately provisioned
-machines; later full-block eras should retain a lower memory-aware setting.
+up to 1,008 blocks (approximately 4 GiB at the consensus block-size maximum,
+with an independent 1 GiB ledger-record ceiling) to amortize staged-ledger and
+chainstate durability barriers on adequately provisioned machines; later
+full-block eras should retain a lower memory-aware setting.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
@@ -153,7 +193,7 @@ The marker deliberately survives successful execution and restart, so assumed st
 
 `--background-assumeutxo` orchestrates active assumed-state service and independent genesis validation concurrently. The two futures share only the process self-connection nonce and a small synchronized progress record; each owns a separate outbound connection/failover cycle, peer database, headers, chainstate, and ledger. Only the API-serving side maintains an explorer projection; the isolated validator does not build an unused historical transaction index. The active loop publishes its execution/header tips. Until they match, the validator yields after every block for at least 100 ms; once active serving catches up, its configured batch and pause limits are restored. The loopback explorer exposes this state at `/api/v1/validation`, including the immutable target, both tips, remaining work, lifecycle phase, throttle state, and terminal error. The active loop consumes successful completion, compares the independently streamed UTXO identity, and commits marker removal while its API remains live. An active-side failure cancels validation; a validation or finalization failure terminates the combined service and leaves resumable state. `--once` waits for both futures and performs the same finalization after their stores close. `--complete-assumeutxo` remains the sequential operational fallback.
 
-Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–256 blocks and defaults to 64; the downloader fills it through 16-block protocol windows so a larger durability batch does not enlarge one peer request. The 256-block ceiling implies a consensus worst-case 1 GiB payload and is an explicit high-memory validation-host setting. `--validation-pause-ms` yields between checkpoints. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
+Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 64; the downloader fills it through 16-block protocol windows so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` yields between checkpoints. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
 
 Validation storage is retained by default. The destructive `--cleanup-validation-dir` option is accepted only by the automatic completion modes and is gated by a versioned, owner-only marker created only when rBTC first observed an absent or empty directory. The marker uses strict size-bounded JSON and binds a canonical network and target height/hash; its contents and containing directory are synced on Unix before the claim is considered durable. After successful finalization, cleanup canonicalizes the active and validation paths again, reopens the validation chainstate, requires its non-assumed tip and bound target to equal the snapshot base, allowlists top-level rBTC artifacts, and recursively rejects symlinks and special files. It then atomically renames the directory to a randomized sibling quarantine, syncs the parent, removes the quarantine, and syncs the parent again so both namespace transitions are durable. Failure of the first parent sync rolls the rename back before deletion; failure of the final sync reports that removal completed but its namespace durability is uncertain. An unowned legacy directory or any unexpected artifact is preserved with an error; manual two-step finalization never deletes it.
 
@@ -161,7 +201,7 @@ Explorer recovery treats a snapshot as a projection boundary rather than inventi
 
 ## Pruned historical ledger
 
-`PrunedBlockLedger` stores zstd-compressed block segments in numbered ring slots. Its policy has both a block-count and byte ceiling; the default `1008` blocks / `1 GiB` means approximately one week of ten-minute blocks. Archive format v2 authenticates the exact uncompressed record length in addition to the record and 4 MiB piece hashes; imports enforce a 1 GiB decompression ceiling and Bitcoin's 4,000,000-byte serialized-block ceiling before retaining decoded blocks. Existing v1 archives remain readable under a block-count-derived decompression ceiling. A new segment is first completed and synced in a temporary file, renamed into a slot, and followed by a directory sync before the live index is published; the index therefore cannot durably reference an archive namespace transition that was never synced. The live index retains the newest contiguous segments satisfying both bounds. Old block bytes are no longer locally queryable after rotation; headers and UTXO state remain. On startup the ledger validates indexed slot manifests, adopts a complete contiguous segment whose rename beat its index commit, and reconstructs a missing/corrupt index from the newest contiguous slot chain. Reorg truncation durably records its boundary before deleting newer segments or atomically rewriting a crossing segment, so restart repeats the operation safely. Tests cover recovery when interruption occurs before mutation, after newer-segment deletion, after the crossing-segment prefix rename, after a wrapped slot is renamed but before its index commit, and after a staged validated prefix is renamed but before its index commit; malformed intents fail closed without pruning. A per-ledger durability boundary injects one-shot failures at all twelve file and directory sync points across staging, wrapped-slot replacement, index publication, truncation, and intent removal; reopen must expose either the intact old ring or the complete published state.
+`PrunedBlockLedger` stores zstd-compressed block segments in numbered ring slots. Its policy has both a block-count and byte ceiling; the default `1008` blocks / `1 GiB` means approximately one week of ten-minute blocks. Archive format v2 authenticates the exact uncompressed record length in addition to the record and 4 MiB piece hashes; imports enforce a 1 GiB decompression ceiling and Bitcoin's 4,000,000-byte serialized-block ceiling before retaining decoded blocks. Existing v1 archives remain readable under a block-count-derived decompression ceiling. Online ledger archives use zstd level 1 because retention is byte-bounded and encoding lies on the IBD hot path. A downloaded segment is completed and synced before chainstate mutation; when its entire validated prefix commits, the ledger verifies its compressed piece hashes and atomically renames that exact file into the ring instead of decompressing and encoding it a second time. Partial-prefix recovery retains the full decode/re-encode path. A directory sync precedes live-index publication, so the index cannot durably reference an archive namespace transition that was never synced. The live index retains the newest contiguous segments satisfying both bounds. Old block bytes are no longer locally queryable after rotation; headers and UTXO state remain. On startup the ledger validates indexed slot manifests, adopts a complete contiguous segment whose rename beat its index commit, and reconstructs a missing/corrupt index from the newest contiguous slot chain. Reorg truncation durably records its boundary before deleting newer segments or atomically rewriting a crossing segment, so restart repeats the operation safely. Tests cover recovery when interruption occurs before mutation, after newer-segment deletion, after the crossing-segment prefix rename, after a wrapped slot is renamed but before its index commit, and after a staged validated prefix is renamed but before its index commit; malformed intents fail closed without pruning. A per-ledger durability boundary injects one-shot failures at all twelve file and directory sync points across staging, wrapped-slot replacement, index publication, truncation, and intent removal; reopen must expose either the intact old ring or the complete published state.
 
 IBD first writes each downloaded batch to a checksum-protected staging archive. Blocks become visible in the retained ledger only after their UTXO transitions have reached the durable execution tip. On restart the daemon truncates archive data above the recovered active execution tip, publishes only the active validated prefix of a staged batch, and backfills a missing retained suffix from a full-history witness peer. This coordinates the separate redb chainstate and file ring without claiming an atomic transaction across storage engines.
 

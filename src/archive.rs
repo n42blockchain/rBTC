@@ -20,6 +20,10 @@ const MAX_BLOCKS_PER_ARCHIVE: u32 = 100_000;
 const MAX_RECORDS_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTAINER_BYTES: u64 = MAX_RECORDS_BYTES + MAX_MANIFEST_SIZE as u64 + 12;
 const MAX_PIECES: usize = 261;
+// Ledger segments are produced on the IBD hot path and retained only inside a
+// fixed byte budget. Level 1 keeps decompression compatibility and integrity
+// unchanged while avoiding level-9 CPU cost for data that will soon rotate.
+const ARCHIVE_COMPRESSION_LEVEL: i32 = 1;
 // Zstandard recommends supporting at least an 8 MiB window for interoperable
 // streaming frames. Keep that fixed memory floor separate from the authenticated
 // decompressed-output ceiling below.
@@ -95,7 +99,7 @@ pub fn encode_archive(
             return Err(ArchiveError::Invalid("records too large"));
         }
     }
-    let compressed = zstd::stream::encode_all(Cursor::new(&records), 9)?;
+    let compressed = zstd::stream::encode_all(Cursor::new(&records), ARCHIVE_COMPRESSION_LEVEL)?;
     let manifest = ArchiveManifest {
         format_version: FORMAT_VERSION,
         first_height,
@@ -137,33 +141,7 @@ pub fn read_archive(
 ///
 /// This is the parser used by file imports and deterministic fuzz regression.
 pub fn decode_archive(file: &[u8]) -> Result<(ArchiveManifest, Vec<Vec<u8>>), ArchiveError> {
-    if u64::try_from(file.len()).expect("slice length fits u64") > MAX_CONTAINER_BYTES {
-        return Err(ArchiveError::Invalid("archive too large"));
-    }
-    if file.len() < 12 || &file[..8] != MAGIC {
-        return Err(ArchiveError::Invalid("magic"));
-    }
-    let metadata_len = u32::from_le_bytes(file[8..12].try_into().expect("checked header"));
-    let metadata_len = usize::try_from(metadata_len).expect("u32 fits usize");
-    if metadata_len == 0 || metadata_len > MAX_MANIFEST_SIZE {
-        return Err(ArchiveError::Invalid("manifest length"));
-    }
-    let start = 12_usize
-        .checked_add(metadata_len)
-        .ok_or(ArchiveError::Invalid("manifest length"))?;
-    if start > file.len() {
-        return Err(ArchiveError::Invalid("manifest length"));
-    }
-    let manifest: ArchiveManifest = serde_json::from_slice(&file[12..start])?;
-    let records_limit = validate_manifest(&manifest)?;
-    let compressed = &file[start..];
-    let actual_pieces = compressed
-        .chunks(PIECE_SIZE)
-        .map(hash_hex)
-        .collect::<Vec<_>>();
-    if actual_pieces != manifest.piece_sha256 {
-        return Err(ArchiveError::Invalid("piece checksum"));
-    }
+    let (manifest, records_limit, compressed) = verify_archive_container(file)?;
     let mut records = Vec::new();
     let mut decoder = zstd::stream::Decoder::new(Cursor::new(compressed))?;
     decoder.window_log_max(zstd_window_log(records_limit))?;
@@ -203,6 +181,54 @@ pub fn decode_archive(file: &[u8]) -> Result<(ArchiveManifest, Vec<Vec<u8>>), Ar
         return Err(ArchiveError::Invalid("block count"));
     }
     Ok((manifest, blocks))
+}
+
+/// Verifies an archive container and its compressed transfer pieces without
+/// decompressing the authenticated record stream.
+///
+/// This is sufficient when a freshly staged archive is moved unchanged into a
+/// ledger slot. Full reads still validate the decompressed length, digest, and
+/// individual block framing.
+pub(crate) fn verify_archive(path: impl AsRef<Path>) -> Result<ArchiveManifest, ArchiveError> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let (manifest, _, _) = verify_archive_container(&bytes)?;
+    Ok(manifest)
+}
+
+fn verify_archive_container(file: &[u8]) -> Result<(ArchiveManifest, u64, &[u8]), ArchiveError> {
+    if u64::try_from(file.len()).expect("slice length fits u64") > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+    if file.len() < 12 || &file[..8] != MAGIC {
+        return Err(ArchiveError::Invalid("magic"));
+    }
+    let metadata_len = u32::from_le_bytes(file[8..12].try_into().expect("checked header"));
+    let metadata_len = usize::try_from(metadata_len).expect("u32 fits usize");
+    if metadata_len == 0 || metadata_len > MAX_MANIFEST_SIZE {
+        return Err(ArchiveError::Invalid("manifest length"));
+    }
+    let start = 12_usize
+        .checked_add(metadata_len)
+        .ok_or(ArchiveError::Invalid("manifest length"))?;
+    if start > file.len() {
+        return Err(ArchiveError::Invalid("manifest length"));
+    }
+    let manifest: ArchiveManifest = serde_json::from_slice(&file[12..start])?;
+    let records_limit = validate_manifest(&manifest)?;
+    let compressed = &file[start..];
+    let actual_pieces = compressed
+        .chunks(PIECE_SIZE)
+        .map(hash_hex)
+        .collect::<Vec<_>>();
+    if actual_pieces != manifest.piece_sha256 {
+        return Err(ArchiveError::Invalid("piece checksum"));
+    }
+    Ok((manifest, records_limit, compressed))
 }
 
 /// Reads only the bounded archive manifest without decompressing block data.

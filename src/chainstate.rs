@@ -254,7 +254,7 @@ pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
         csv_active,
         false,
     )?;
-    let undo = store.apply_with_undo(&prepared.spent, &prepared.created)?;
+    let undo = store.apply_with_undo_fresh_outputs(&prepared.spent, &prepared.created)?;
     Ok((
         AppliedTransaction {
             txid: prepared.validated.txid,

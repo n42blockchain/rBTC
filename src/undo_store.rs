@@ -136,6 +136,27 @@ impl RedbUndoStore {
         Ok(removed)
     }
 
+    /// Drops every retained block undo while preserving transition metadata.
+    ///
+    /// Authenticated, validation-only chainstates do not serve reorganizations.
+    /// Deleting the whole B-tree releases its pages in one metadata operation
+    /// instead of issuing one random-key deletion per historical block.
+    pub(crate) fn clear_block_undos(&self) -> Result<bool, UndoStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        let table = transaction.open_table(BLOCK_UNDOS)?;
+        if table.is_empty()? {
+            return Ok(false);
+        }
+        drop(table);
+        transaction.delete_table(BLOCK_UNDOS)?;
+        {
+            let _table = transaction.open_table(BLOCK_UNDOS)?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
     /// Durably records intent before the corresponding UTXO transaction starts.
     pub fn prepare_transition(&self, pending: &PendingTransition) -> Result<(), UndoStoreError> {
         let _guard = self.lock();

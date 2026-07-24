@@ -412,6 +412,7 @@ fn block_deployment_context_with_bip34_anchor(
 ) -> BlockDeploymentContext {
     let network = config.network;
     let bip30_enforced = bip30_enforced(network, height, block_hash, bip34_anchor_matches);
+    let bip30_overwrite = is_bip30_exception(network, height, block_hash);
     let subsidy_sats = block_subsidy_with_interval(height, halving_interval(network));
     let heights = config.activation_heights;
     // Core 26 enables these mutually dependent interpreter flags for ordinary
@@ -441,6 +442,7 @@ fn block_deployment_context_with_bip34_anchor(
         segwit_active: height >= heights.segwit,
         signet_challenge: config.signet_challenge.clone(),
         bip30_enforced,
+        bip30_overwrite,
         subsidy_sats,
     }
 }
@@ -928,6 +930,28 @@ mod tests {
             parse_hash("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"),
             false
         ));
+
+        let config = DeploymentConfig::for_network(Network::Bitcoin);
+        let optimized = block_deployment_context_with_bip34_anchor(
+            &config,
+            227_932,
+            ordinary,
+            u32::MAX,
+            false,
+            true,
+        );
+        assert!(!optimized.bip30_enforced);
+        assert!(!optimized.bip30_overwrite);
+        let exception = block_deployment_context_with_bip34_anchor(
+            &config,
+            91_842,
+            parse_hash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"),
+            u32::MAX,
+            false,
+            false,
+        );
+        assert!(!exception.bip30_enforced);
+        assert!(exception.bip30_overwrite);
     }
 
     #[test]

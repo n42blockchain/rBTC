@@ -301,6 +301,19 @@ fn take_u32_at(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<
 pub trait UtxoStore: Send + Sync {
     /// Fetches a coin from either physical tier.
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError>;
+    /// Fetches a caller-ordered group of coins.
+    ///
+    /// Durable implementations may override this to reuse one read snapshot
+    /// and its open tables instead of starting a transaction per outpoint.
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        outpoints
+            .iter()
+            .map(|outpoint| self.get(*outpoint).map(|utxo| (*outpoint, utxo)))
+            .collect()
+    }
     /// Atomically deletes inputs and inserts fresh outputs.
     fn apply(
         &self,
@@ -313,6 +326,19 @@ pub trait UtxoStore: Send + Sync {
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError>;
+    /// Applies a mutation after the caller has proved every created outpoint
+    /// absent under its enclosing consensus rules.
+    ///
+    /// The default retains the ordinary duplicate lookup. In-memory overlays
+    /// may use the proof to avoid repeating durable reads while still
+    /// rejecting duplicate keys within the tentative transition.
+    fn apply_with_undo_fresh_outputs(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        self.apply_with_undo(spent, created)
+    }
     /// Reverses one prior mutation using its undo data.
     fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError>;
     /// Moves aged records from hot to cold without changing their consensus content.
@@ -501,6 +527,29 @@ impl UtxoStore for RedbUtxoStore {
         cold.get(outpoint.as_bytes().as_slice())?
             .map(|value| Utxo::decode(value.value()))
             .transpose()
+    }
+
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let transaction = self.db.begin_read()?;
+        let hot = transaction.open_table(HOT_TABLE)?;
+        let cold = transaction.open_table(COLD_TABLE)?;
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                let key = outpoint.as_bytes();
+                let utxo = match hot.get(key.as_slice())? {
+                    Some(value) => Some(Utxo::decode(value.value())?),
+                    None => cold
+                        .get(key.as_slice())?
+                        .map(|value| Utxo::decode(value.value()))
+                        .transpose()?,
+                };
+                Ok((*outpoint, utxo))
+            })
+            .collect()
     }
 
     fn apply(
@@ -758,45 +807,100 @@ pub(crate) fn apply_with_undo_transaction(
 ) -> Result<UtxoUndo, UtxoError> {
     let mut hot = transaction.open_table(HOT_TABLE)?;
     let mut cold = transaction.open_table(COLD_TABLE)?;
+    // A genesis-validation chainstate never ages coins while it catches up, so
+    // its cold tier remains empty. Avoid probing or mutating that B-tree once
+    // per input/output in the overwhelmingly common bulk-validation case.
+    let cold_is_empty = cold.is_empty()?;
     let mut seen_spent = std::collections::BTreeSet::new();
     let mut undo_spent = Vec::with_capacity(spent.len());
     for key in spent {
         if !seen_spent.insert(*key) {
             return Err(UtxoError::DuplicateSpend(*key));
         }
-        let previous = match hot.get(key.as_bytes().as_slice())? {
-            Some(value) => Utxo::decode(value.value())?,
-            None => match cold.get(key.as_bytes().as_slice())? {
-                Some(value) => Utxo::decode(value.value())?,
-                None => return Err(UtxoError::Missing(*key)),
-            },
+        let hot_previous = hot
+            .remove(key.as_bytes().as_slice())?
+            .map(|value| value.value().to_vec());
+        let previous = match hot_previous {
+            Some(value) => {
+                if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
+                    return Err(UtxoError::Malformed("outpoint in both tiers"));
+                }
+                Utxo::decode(&value)?
+            }
+            None if cold_is_empty => return Err(UtxoError::Missing(*key)),
+            None => {
+                let value = cold
+                    .remove(key.as_bytes().as_slice())?
+                    .ok_or(UtxoError::Missing(*key))?;
+                Utxo::decode(value.value())?
+            }
         };
         undo_spent.push((*key, previous));
     }
     let mut seen_created = std::collections::BTreeSet::new();
-    for (key, _) in created {
+    for (key, utxo) in created {
         if !seen_created.insert(*key) {
             return Err(UtxoError::Duplicate(*key));
         }
-        if !seen_spent.contains(key)
-            && (hot.get(key.as_bytes().as_slice())?.is_some()
-                || cold.get(key.as_bytes().as_slice())?.is_some())
+        if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
+            return Err(UtxoError::Duplicate(*key));
+        }
+        let value = utxo.encode()?;
+        if hot
+            .insert(key.as_bytes().as_slice(), value.as_slice())?
+            .is_some()
+            && !seen_spent.contains(key)
         {
             return Err(UtxoError::Duplicate(*key));
         }
-    }
-    for key in spent {
-        hot.remove(key.as_bytes().as_slice())?;
-        cold.remove(key.as_bytes().as_slice())?;
-    }
-    for (key, utxo) in created {
-        let value = utxo.encode()?;
-        hot.insert(key.as_bytes().as_slice(), value.as_slice())?;
     }
     Ok(UtxoUndo {
         spent: undo_spent,
         created: created.iter().map(|(key, _)| *key).collect(),
     })
+}
+
+/// Applies a sorted, unique net transition already validated against this
+/// chainstate without rebuilding an aggregate undo record.
+///
+/// The durable removals still prove that every input exists and the inserts
+/// still reject an unexpected collision, so a stale/racing validation view
+/// cannot commit. The caller supplies sorted unique slices by folding a
+/// complete validated checkpoint.
+pub(crate) fn apply_validated_changes_transaction(
+    transaction: &WriteTransaction,
+    spent: &[OutPointKey],
+    created: &[(OutPointKey, Utxo)],
+) -> Result<(), UtxoError> {
+    debug_assert!(spent.windows(2).all(|keys| keys[0] < keys[1]));
+    debug_assert!(created.windows(2).all(|rows| rows[0].0 < rows[1].0));
+    let mut hot = transaction.open_table(HOT_TABLE)?;
+    let mut cold = transaction.open_table(COLD_TABLE)?;
+    let cold_is_empty = cold.is_empty()?;
+    for key in spent {
+        let removed_hot = hot.remove(key.as_bytes().as_slice())?.is_some();
+        if removed_hot {
+            if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
+                return Err(UtxoError::Malformed("outpoint in both tiers"));
+            }
+        } else if cold_is_empty || cold.remove(key.as_bytes().as_slice())?.is_none() {
+            return Err(UtxoError::Missing(*key));
+        }
+    }
+    for (key, utxo) in created {
+        if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
+            return Err(UtxoError::Duplicate(*key));
+        }
+        let value = utxo.encode()?;
+        if hot
+            .insert(key.as_bytes().as_slice(), value.as_slice())?
+            .is_some()
+            && spent.binary_search(key).is_err()
+        {
+            return Err(UtxoError::Duplicate(*key));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

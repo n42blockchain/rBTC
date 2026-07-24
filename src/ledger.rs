@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::archive::{
-    ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, write_archive,
+    ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, verify_archive,
+    write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -239,36 +240,65 @@ impl PrunedBlockLedger {
             return Err(LedgerError::Invalid("empty staged commit"));
         }
         let _guard = self.lock();
-        let (manifest, blocks) = read_archive(self.staged_path())?;
+        let manifest = verify_archive(self.staged_path())?;
         if block_count > manifest.block_count {
             return Err(LedgerError::Invalid("staged commit exceeds segment"));
         }
-        let count = usize::try_from(block_count).expect("staged block count fits usize");
-        let prefix = &blocks[..count];
         let index = self.read_index()?;
         let retained_next = index
             .segments
             .last()
             .map(segment_end_exclusive)
             .transpose()?;
-        match retained_next {
-            None => {
-                self.append_locked(manifest.first_height, prefix)?;
+        if retained_next.is_none() || retained_next == Some(manifest.first_height) {
+            if block_count == manifest.block_count {
+                return self.publish_staged_locked(&manifest, index);
             }
-            Some(next) if next == manifest.first_height => {
-                self.append_locked(manifest.first_height, prefix)?;
-            }
-            Some(next)
-                if manifest.first_height.checked_add(block_count) == Some(next)
-                    && self.retained_bytes_match(&index, manifest.first_height, prefix)? => {}
-            Some(_) => {
+            let (_, blocks) = read_archive(self.staged_path())?;
+            let count = usize::try_from(block_count).expect("staged block count fits usize");
+            self.append_locked(manifest.first_height, &blocks[..count])?;
+        } else if manifest.first_height.checked_add(block_count) == retained_next {
+            let (_, blocks) = read_archive(self.staged_path())?;
+            let count = usize::try_from(block_count).expect("staged block count fits usize");
+            if !self.retained_bytes_match(&index, manifest.first_height, &blocks[..count])? {
                 return Err(LedgerError::Invalid(
                     "staged segment does not extend ledger tip",
                 ));
             }
+        } else {
+            return Err(LedgerError::Invalid(
+                "staged segment does not extend ledger tip",
+            ));
         }
         fs::remove_file(self.staged_path())?;
         self.sync_directory(LedgerSyncPoint::StagedRemoval)
+    }
+
+    fn publish_staged_locked(
+        &self,
+        manifest: &ArchiveManifest,
+        mut index: LedgerIndex,
+    ) -> Result<(), LedgerError> {
+        let bytes = fs::metadata(self.staged_path())?.len();
+        if bytes > self.retention.max_bytes {
+            return Err(LedgerError::Invalid("single segment exceeds maximum bytes"));
+        }
+        let slot = index.next_slot % self.retention.slots;
+        index.segments.retain(|segment| segment.slot != slot);
+        let destination = self.slot_path(slot);
+        fs::rename(self.staged_path(), &destination)?;
+        self.sync_directory(LedgerSyncPoint::SlotPublish)?;
+        index.segments.push(Segment {
+            first_height: manifest.first_height,
+            block_count: manifest.block_count,
+            slot,
+            bytes,
+        });
+        index.next_slot = (slot + 1) % self.retention.slots;
+        while exceeds(&index.segments, self.retention) {
+            index.segments.remove(0);
+        }
+        self.write_index(&index)
     }
 
     /// Removes an uncommitted staged segment, if one exists.
@@ -1005,6 +1035,27 @@ mod tests {
         assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
         assert_eq!(ledger.read_block(12).unwrap(), None);
         assert!(ledger.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn full_staged_segment_is_published_without_reencoding() {
+        let dir = TempDir::new().unwrap();
+        let durability = Arc::new(FailOnceDurability::new(LedgerSyncPoint::SlotArchive));
+        let ledger = PrunedBlockLedger::open_with_durability(
+            dir.path(),
+            LedgerRetention::default(),
+            durability.clone(),
+        )
+        .unwrap();
+        ledger.stage(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        durability.arm();
+
+        ledger.commit_staged(3).unwrap();
+
+        assert!(!durability.did_fail());
+        assert!(ledger.staged().unwrap().is_none());
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(10, 12)]);
+        assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
     }
 
     #[test]

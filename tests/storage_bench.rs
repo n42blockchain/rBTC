@@ -248,7 +248,10 @@ fn run_redb(workload: Workload, quick_repair: bool) -> BackendResult {
     let store = RedbChainStore::open_with_options(
         &database_path,
         bitcoin::Network::Regtest,
-        ChainStoreOptions { quick_repair },
+        ChainStoreOptions {
+            quick_repair,
+            ..ChainStoreOptions::default()
+        },
     )
     .expect("open benchmark store");
     let initial = initial_entries(workload);
