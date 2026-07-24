@@ -125,6 +125,7 @@ pub struct HeaderDag {
     deployments: DeploymentConfig,
     headers: HashMap<BlockHash, HeaderInfo>,
     active_tip: BlockHash,
+    active_chain: Vec<BlockHash>,
 }
 
 impl HeaderDag {
@@ -153,6 +154,7 @@ impl HeaderDag {
             deployments,
             headers,
             active_tip: hash,
+            active_chain: vec![hash],
         }
     }
 
@@ -171,10 +173,11 @@ impl HeaderDag {
     /// Returns the active-chain header at `height`.
     #[must_use]
     pub fn active_header_at(&self, height: u32) -> Option<HeaderInfo> {
-        let tip = self.active_tip();
-        (height <= tip.height)
-            .then(|| self.ancestor_at_height(tip, height))
-            .flatten()
+        let index = usize::try_from(height).ok()?;
+        self.active_chain
+            .get(index)
+            .and_then(|hash| self.headers.get(hash))
+            .copied()
     }
 
     /// Builds a standard newest-to-oldest block locator for `getheaders`.
@@ -401,11 +404,42 @@ impl HeaderDag {
             height,
             chainwork: parent.chainwork + target.to_work(),
         };
-        if info.chainwork > self.active_tip().chainwork {
-            self.active_tip = hash;
-        }
         self.headers.insert(hash, info);
+        if info.chainwork > self.active_tip().chainwork {
+            self.promote_active_tip(info);
+        }
         Ok(info)
+    }
+
+    fn promote_active_tip(&mut self, info: HeaderInfo) {
+        if info.header.prev_blockhash == self.active_tip
+            && usize::try_from(info.height).ok() == Some(self.active_chain.len())
+        {
+            self.active_chain.push(info.hash);
+            self.active_tip = info.hash;
+            return;
+        }
+
+        let chain_len = usize::try_from(info.height)
+            .expect("header height fits usize")
+            .checked_add(1)
+            .expect("active-chain length fits usize");
+        let mut active_chain = vec![info.hash; chain_len];
+        let mut current = info;
+        loop {
+            active_chain[usize::try_from(current.height).expect("header height fits usize")] =
+                current.hash;
+            if current.height == 0 {
+                break;
+            }
+            current = self
+                .headers
+                .get(&current.header.prev_blockhash)
+                .copied()
+                .expect("known header has every ancestor");
+        }
+        self.active_tip = info.hash;
+        self.active_chain = active_chain;
     }
 
     fn ancestor_at_height(&self, mut current: HeaderInfo, height: u32) -> Option<HeaderInfo> {
@@ -524,6 +558,38 @@ mod tests {
         assert_eq!(info.height, 1);
         assert_eq!(dag.active_tip().hash, info.hash);
         assert!(dag.active_tip().chainwork > genesis.chainwork);
+    }
+
+    #[test]
+    fn active_height_index_tracks_extensions_and_stronger_side_chains() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let first = dag
+            .insert(mine_child(genesis.hash, genesis.header.time + 1))
+            .unwrap();
+        let second = dag
+            .insert(mine_child(first.hash, genesis.header.time + 2))
+            .unwrap();
+        assert_eq!(dag.active_header_at(0), Some(genesis));
+        assert_eq!(dag.active_header_at(1), Some(first));
+        assert_eq!(dag.active_header_at(2), Some(second));
+        assert_eq!(dag.active_header_at(3), None);
+
+        let side_one = dag
+            .insert(mine_child(genesis.hash, genesis.header.time + 10))
+            .unwrap();
+        let side_two = dag
+            .insert(mine_child(side_one.hash, genesis.header.time + 11))
+            .unwrap();
+        assert_eq!(dag.active_tip(), second);
+        let side_three = dag
+            .insert(mine_child(side_two.hash, genesis.header.time + 12))
+            .unwrap();
+        assert_eq!(dag.active_tip(), side_three);
+        assert_eq!(dag.active_header_at(0), Some(genesis));
+        assert_eq!(dag.active_header_at(1), Some(side_one));
+        assert_eq!(dag.active_header_at(2), Some(side_two));
+        assert_eq!(dag.active_header_at(3), Some(side_three));
     }
 
     #[test]

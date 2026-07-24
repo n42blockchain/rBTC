@@ -4,7 +4,12 @@
 //! `bitcoinconsensus` dependency, including regtest's `-vbparams` override
 //! semantics for Taproot.
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    str::FromStr,
+    sync::{Arc, PoisonError, RwLock},
+};
 
 use bitcoin::{BlockHash, Network, consensus::serialize, hashes::Hash, p2p::Magic};
 use thiserror::Error;
@@ -56,14 +61,40 @@ struct VersionBitsParams {
 }
 
 /// Complete deployment parameters used while validating one network.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct DeploymentConfig {
     network: Network,
     taproot: VersionBitsParams,
     activation_heights: ActivationHeights,
     signet_challenge: Option<Arc<[u8]>>,
     custom_signet: bool,
+    taproot_state_cache: Arc<RwLock<HashMap<BlockHash, ThresholdState>>>,
 }
+
+impl fmt::Debug for DeploymentConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeploymentConfig")
+            .field("network", &self.network)
+            .field("taproot", &self.taproot)
+            .field("activation_heights", &self.activation_heights)
+            .field("signet_challenge", &self.signet_challenge)
+            .field("custom_signet", &self.custom_signet)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for DeploymentConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.network == other.network
+            && self.taproot == other.taproot
+            && self.activation_heights == other.activation_heights
+            && self.signet_challenge == other.signet_challenge
+            && self.custom_signet == other.custom_signet
+    }
+}
+
+impl Eq for DeploymentConfig {}
 
 /// Invalid deployment configuration.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -147,6 +178,7 @@ impl DeploymentConfig {
             signet_challenge: (network == Network::Signet)
                 .then(|| Arc::<[u8]>::from(DEFAULT_SIGNET_CHALLENGE)),
             custom_signet: false,
+            taproot_state_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -218,6 +250,11 @@ impl DeploymentConfig {
             timeout,
             min_activation_height,
         };
+        // A cloned default configuration may share a cache with a live header
+        // DAG. Detach instead of clearing it so the original configuration
+        // keeps its valid entries while this override starts from an empty,
+        // parameter-specific cache.
+        self.taproot_state_cache = Arc::new(RwLock::new(HashMap::new()));
         Ok(())
     }
 
@@ -441,9 +478,15 @@ pub fn taproot_active(
     if config.taproot.start_time == NEVER_ACTIVE {
         return Ok(false);
     }
-    Ok(threshold_state(headers, candidate_height, config.taproot) == ThresholdState::Active)
+    Ok(threshold_state_cached(
+        headers,
+        candidate_height,
+        config.taproot,
+        &config.taproot_state_cache,
+    ) == ThresholdState::Active)
 }
 
+#[cfg(test)]
 fn threshold_state(
     headers: &HeaderDag,
     candidate_height: u32,
@@ -465,40 +508,104 @@ fn threshold_state(
         if period_end > parent_height {
             break;
         }
+        if headers.active_header_at(period_end).is_none() {
+            return ThresholdState::Defined;
+        }
+        state = next_threshold_state(headers, period_end, params, state);
+    }
+    state
+}
+
+fn threshold_state_cached(
+    headers: &HeaderDag,
+    candidate_height: u32,
+    params: VersionBitsParams,
+    cache: &RwLock<HashMap<BlockHash, ThresholdState>>,
+) -> ThresholdState {
+    let Some(parent_height) = candidate_height.checked_sub(1) else {
+        return ThresholdState::Defined;
+    };
+    let completed_periods = candidate_height / params.period;
+    if completed_periods == 0 {
+        return ThresholdState::Defined;
+    }
+
+    // Walk back only to the newest cached period on this exact branch. The
+    // period-end hash makes side-chain states independent even when heights
+    // and signalling counts coincide.
+    let mut pending = Vec::new();
+    let mut state = ThresholdState::Defined;
+    for period_index in (1..=completed_periods).rev() {
+        let period_end = period_index
+            .checked_mul(params.period)
+            .and_then(|height| height.checked_sub(1))
+            .expect("active header height is bounded by u32");
+        if period_end > parent_height {
+            continue;
+        }
         let Some(period_end_header) = headers.active_header_at(period_end) else {
             return ThresholdState::Defined;
         };
-        let period_mtp = i64::from(
-            headers
-                .median_time_past(period_end_header.hash)
-                .expect("active header has median time past"),
-        );
-        state = match state {
-            ThresholdState::Defined if period_mtp >= params.start_time => ThresholdState::Started,
-            ThresholdState::Started => {
-                let period_start = period_end + 1 - params.period;
-                let signals = (period_start..=period_end)
-                    .filter_map(|height| headers.active_header_at(height))
-                    .filter(|header| signals_taproot(header.header.version.to_consensus()))
-                    .count();
-                if signals >= usize::try_from(params.threshold).expect("threshold fits usize") {
-                    ThresholdState::LockedIn
-                } else if period_mtp >= params.timeout {
-                    ThresholdState::Failed
-                } else {
-                    ThresholdState::Started
-                }
-            }
-            ThresholdState::LockedIn
-                if i64::from(period_end.saturating_add(1))
-                    >= i64::from(params.min_activation_height) =>
-            {
-                ThresholdState::Active
-            }
-            other => other,
-        };
+        if let Some(cached) = cache
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&period_end_header.hash)
+            .copied()
+        {
+            state = cached;
+            break;
+        }
+        pending.push((period_end, period_end_header.hash));
+    }
+
+    for (period_end, period_end_hash) in pending.into_iter().rev() {
+        state = next_threshold_state(headers, period_end, params, state);
+        cache
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(period_end_hash, state);
     }
     state
+}
+
+fn next_threshold_state(
+    headers: &HeaderDag,
+    period_end: u32,
+    params: VersionBitsParams,
+    state: ThresholdState,
+) -> ThresholdState {
+    let period_end_header = headers
+        .active_header_at(period_end)
+        .expect("completed active-chain period has an end header");
+    let period_mtp = i64::from(
+        headers
+            .median_time_past(period_end_header.hash)
+            .expect("active header has median time past"),
+    );
+    match state {
+        ThresholdState::Defined if period_mtp >= params.start_time => ThresholdState::Started,
+        ThresholdState::Started => {
+            let period_start = period_end + 1 - params.period;
+            let signals = (period_start..=period_end)
+                .filter_map(|height| headers.active_header_at(height))
+                .filter(|header| signals_taproot(header.header.version.to_consensus()))
+                .count();
+            if signals >= usize::try_from(params.threshold).expect("threshold fits usize") {
+                ThresholdState::LockedIn
+            } else if period_mtp >= params.timeout {
+                ThresholdState::Failed
+            } else {
+                ThresholdState::Started
+            }
+        }
+        ThresholdState::LockedIn
+            if i64::from(period_end.saturating_add(1))
+                >= i64::from(params.min_activation_height) =>
+        {
+            ThresholdState::Active
+        }
+        other => other,
+    }
 }
 
 fn signals_taproot(version: i32) -> bool {
@@ -642,6 +749,23 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    fn mine_regtest_header(headers: &mut HeaderDag, time: u32, version: i32) -> Header {
+        let parent = headers.active_tip();
+        let mut header = Header {
+            version: Version::from_consensus(version),
+            prev_blockhash: parent.hash,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
+            nonce: 0,
+        };
+        while header.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_err() {
+            header.nonce = header.nonce.checked_add(1).expect("regtest nonce space");
+        }
+        headers.insert_contextual(header, u32::MAX).unwrap();
+        header
+    }
 
     #[test]
     fn regtest_activates_default_core_rules_at_block_one() {
@@ -810,27 +934,20 @@ mod tests {
     fn bip9_taproot_state_obeys_period_threshold_and_minimum_height() {
         let mut headers = HeaderDag::new(Network::Regtest);
         for height in 1..12_u32 {
-            let parent = headers.active_tip();
             let signals = (4..=6).contains(&height);
-            let mut header = Header {
-                version: if signals {
+            mine_regtest_header(
+                &mut headers,
+                TAPROOT_START_TIME + height,
+                if signals {
                     Version::from_consensus(
                         i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT))
                             .expect("version-bits value fits i32"),
                     )
+                    .to_consensus()
                 } else {
-                    Version::from_consensus(4)
+                    4
                 },
-                prev_blockhash: parent.hash,
-                merkle_root: TxMerkleNode::all_zeros(),
-                time: TAPROOT_START_TIME + height,
-                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
-                nonce: 0,
-            };
-            while header.validate_pow(Target::MAX_ATTAINABLE_REGTEST).is_err() {
-                header.nonce += 1;
-            }
-            headers.insert_contextual(header, u32::MAX).unwrap();
+            );
         }
         let params = VersionBitsParams {
             period: 4,
@@ -859,6 +976,166 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn bip9_matches_core_timeout_lockin_and_delayed_activation_boundaries() {
+        let genesis_time = HeaderDag::new(Network::Regtest).active_tip().header.time;
+        let start_and_timeout = i64::from(genesis_time + 2);
+        let signal_version = i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT)).unwrap();
+        let params = VersionBitsParams {
+            period: 4,
+            threshold: 3,
+            start_time: start_and_timeout,
+            timeout: start_and_timeout,
+            min_activation_height: 10,
+        };
+
+        // Core transitions DEFINED -> STARTED first when start and timeout
+        // are reached together, then fails only at the following boundary.
+        let mut failed = HeaderDag::new(Network::Regtest);
+        for height in 1..8 {
+            mine_regtest_header(&mut failed, genesis_time + height, 4);
+        }
+        assert_eq!(threshold_state(&failed, 4, params), ThresholdState::Started);
+        assert_eq!(threshold_state(&failed, 7, params), ThresholdState::Started);
+        assert_eq!(threshold_state(&failed, 8, params), ThresholdState::Failed);
+
+        // Core checks the completed period's threshold before its timeout,
+        // so a threshold reached at the timeout boundary still locks in.
+        let mut locked = HeaderDag::new(Network::Regtest);
+        for height in 1..12 {
+            let version = if (4..=6).contains(&height) {
+                signal_version
+            } else {
+                4
+            };
+            mine_regtest_header(&mut locked, genesis_time + height, version);
+        }
+        assert_eq!(threshold_state(&locked, 4, params), ThresholdState::Started);
+        assert_eq!(
+            threshold_state(&locked, 8, params),
+            ThresholdState::LockedIn
+        );
+        assert_eq!(
+            threshold_state(&locked, 10, params),
+            ThresholdState::LockedIn
+        );
+        assert_eq!(threshold_state(&locked, 12, params), ThresholdState::Active);
+    }
+
+    #[test]
+    fn bip9_counts_only_top_bits_signals_and_requires_the_exact_threshold() {
+        let genesis_time = HeaderDag::new(Network::Regtest).active_tip().header.time;
+        let signal_version = i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT)).unwrap();
+        let params = VersionBitsParams {
+            period: 4,
+            threshold: 3,
+            start_time: i64::from(genesis_time + 2),
+            timeout: i64::MAX,
+            min_activation_height: 0,
+        };
+
+        let mut below = HeaderDag::new(Network::Regtest);
+        for height in 1..8 {
+            let version = match height {
+                4 | 5 => signal_version,
+                // The deployment bit without the version-bits top pattern is
+                // not a signal in Core's Condition().
+                6 => 1 << TAPROOT_BIT,
+                _ => 4,
+            };
+            mine_regtest_header(&mut below, genesis_time + height, version);
+        }
+        assert_eq!(threshold_state(&below, 8, params), ThresholdState::Started);
+
+        let mut exact = HeaderDag::new(Network::Regtest);
+        for height in 1..8 {
+            let version = if (4..=6).contains(&height) {
+                signal_version
+            } else {
+                4
+            };
+            mine_regtest_header(&mut exact, genesis_time + height, version);
+        }
+        assert_eq!(threshold_state(&exact, 8, params), ThresholdState::LockedIn);
+    }
+
+    #[test]
+    fn bip9_period_cache_matches_uncached_state_and_reuses_completed_work() {
+        let genesis_time = HeaderDag::new(Network::Regtest).active_tip().header.time;
+        let signal_version = i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT)).unwrap();
+        let params = VersionBitsParams {
+            period: 4,
+            threshold: 3,
+            start_time: i64::from(genesis_time + 2),
+            timeout: i64::MAX,
+            min_activation_height: 12,
+        };
+        let mut headers = HeaderDag::new(Network::Regtest);
+        for height in 1..32 {
+            let version = if (4..=6).contains(&height) {
+                signal_version
+            } else {
+                4
+            };
+            mine_regtest_header(&mut headers, genesis_time + height, version);
+        }
+        let cache = RwLock::new(HashMap::new());
+        for height in 0..=32 {
+            assert_eq!(
+                threshold_state_cached(&headers, height, params, &cache),
+                threshold_state(&headers, height, params),
+                "candidate height {height}"
+            );
+        }
+        assert_eq!(cache.read().unwrap().len(), 8);
+
+        for height in (0..=32).rev() {
+            assert_eq!(
+                threshold_state_cached(&headers, height, params, &cache),
+                threshold_state(&headers, height, params)
+            );
+        }
+        assert_eq!(cache.read().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn bip9_period_cache_isolated_by_period_end_block_hash() {
+        let genesis_time = HeaderDag::new(Network::Regtest).active_tip().header.time;
+        let signal_version = i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT)).unwrap();
+        let params = VersionBitsParams {
+            period: 4,
+            threshold: 3,
+            start_time: i64::from(genesis_time + 2),
+            timeout: i64::MAX,
+            min_activation_height: 0,
+        };
+        let cache = RwLock::new(HashMap::new());
+        let mut signalling = HeaderDag::new(Network::Regtest);
+        let mut silent = HeaderDag::new(Network::Regtest);
+        for height in 1..8 {
+            mine_regtest_header(
+                &mut signalling,
+                genesis_time + height,
+                if (4..=6).contains(&height) {
+                    signal_version
+                } else {
+                    4
+                },
+            );
+            mine_regtest_header(&mut silent, genesis_time + height, 4);
+        }
+
+        assert_eq!(
+            threshold_state_cached(&signalling, 8, params, &cache),
+            ThresholdState::LockedIn
+        );
+        assert_eq!(
+            threshold_state_cached(&silent, 8, params, &cache),
+            ThresholdState::Started
+        );
+        assert_eq!(cache.read().unwrap().len(), 3);
     }
 
     #[test]

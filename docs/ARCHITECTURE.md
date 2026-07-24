@@ -19,6 +19,16 @@ embedded explorer index                 └── wallet sync source
         └──────────── REST / embedded browser ────┘
 ```
 
+The header DAG keeps a height-indexed view of the selected best-work branch, so
+active-height lookups stay constant-time while an ordinary extension appends
+one entry. A stronger side branch rebuilds that index from its committed
+ancestors before becoming active. Taproot's BIP9 state is cached at completed
+period-end block hashes inside the deployment configuration; this makes the
+cache branch-specific, lets cloned validating/standby DAGs share immutable
+results, and reduces sequential deployment evaluation to one new period of
+work instead of rescanning from genesis for every candidate. A `--vbparams`
+override detaches to an empty parameter-specific cache.
+
 ## UTXO layout
 
 Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier; `utxo_cold` contains coins not touched within `hot_window_secs` (default 60 days). Moving tiers is a single redb transaction and never changes consensus data.
