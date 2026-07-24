@@ -17,7 +17,7 @@ use rand::Rng;
 use thiserror::Error;
 
 use crate::{
-    chainstate::{ChainstateError, apply_transaction_with_context},
+    chainstate::{ChainstateError, apply_transaction_with_context, check_sequence_lock},
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
         TransactionPolicyError, validate_standard_inputs, validate_standard_transaction,
@@ -120,6 +120,9 @@ pub enum TransactionAdmissionError {
     /// A public standard-script flag rejected an otherwise active-consensus-valid input.
     #[error("standard script policy: {0}")]
     StandardScript(#[source] ConsensusError),
+    /// Core's standard next-block sequence-lock policy rejected an input.
+    #[error("standard sequence-lock policy: {0}")]
+    StandardSequenceLock(#[source] ChainstateError),
     /// An empty package has no admission meaning.
     #[error("transaction package is empty")]
     EmptyPackage,
@@ -839,12 +842,13 @@ impl TransactionAdmissionPool {
         let witness_independent = txid.to_raw_hash() == transaction.compute_wtxid().to_raw_hash()
             || matches!(
                 error,
-                TransactionAdmissionError::Policy(
-                    TransactionPolicyError::InputScript(_)
-                        | TransactionPolicyError::P2shRedeemScript(_)
-                        | TransactionPolicyError::P2shSigops { .. }
-                        | TransactionPolicyError::UpgradableWitnessProgram(_)
-                )
+                TransactionAdmissionError::StandardSequenceLock(_)
+                    | TransactionAdmissionError::Policy(
+                        TransactionPolicyError::InputScript(_)
+                            | TransactionPolicyError::P2shRedeemScript(_)
+                            | TransactionPolicyError::P2shSigops { .. }
+                            | TransactionPolicyError::UpgradableWitnessProgram(_)
+                    )
             );
         witness_independent && self.remember_rejected_txid(txid)
     }
@@ -1696,6 +1700,18 @@ fn apply_to_overlay<S: UtxoStore>(
         context.script_flags,
         context.csv_active,
     )?;
+    if !context.csv_active && transaction.version.0 >= 2 {
+        for (input, utxo) in transaction.input.iter().zip(&prevouts) {
+            check_sequence_lock(
+                input.sequence,
+                OutPointKey::from(input.previous_output),
+                utxo,
+                context.height,
+                context.parent_mtp,
+            )
+            .map_err(TransactionAdmissionError::StandardSequenceLock)?;
+        }
+    }
     let fee_sats = applied
         .input_value_sats
         .checked_sub(applied.output_value_sats)
@@ -2296,6 +2312,79 @@ mod tests {
         ));
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn standard_sequence_locks_apply_before_csv_activation_at_strict_boundaries() {
+        let (_directory, store) = store();
+        let mut pre_activation = context();
+        pre_activation.csv_active = false;
+
+        let (height_fail_outpoint, mut height_fail_utxo, mut height_fail) = spend(94);
+        height_fail_utxo.height = pre_activation.height - 1;
+        height_fail.input[0].sequence = Sequence::from_height(2);
+        let (height_pass_outpoint, mut height_pass_utxo, mut height_pass) = spend(95);
+        height_pass_utxo.height = pre_activation.height - 1;
+        height_pass.input[0].sequence = Sequence::from_height(1);
+
+        let (time_fail_outpoint, mut time_fail_utxo, mut time_fail) = spend(96);
+        time_fail_utxo.creation_mtp = pre_activation.parent_mtp - 511;
+        time_fail.input[0].sequence = Sequence::from_512_second_intervals(1);
+        let (time_pass_outpoint, mut time_pass_utxo, mut time_pass) = spend(97);
+        time_pass_utxo.creation_mtp = pre_activation.parent_mtp - 512;
+        time_pass.input[0].sequence = Sequence::from_512_second_intervals(1);
+
+        store
+            .apply(
+                &[],
+                &[
+                    (height_fail_outpoint.into(), height_fail_utxo),
+                    (height_pass_outpoint.into(), height_pass_utxo),
+                    (time_fail_outpoint.into(), time_fail_utxo),
+                    (time_pass_outpoint.into(), time_pass_utxo),
+                ],
+            )
+            .unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit(&store, height_fail, pre_activation),
+            Err(TransactionAdmissionError::StandardSequenceLock(
+                ChainstateError::RelativeHeightLock {
+                    minimum_height,
+                    ..
+                }
+            )) if minimum_height == pre_activation.height
+        ));
+        assert!(matches!(
+            pool.admit(&store, time_fail, pre_activation),
+            Err(TransactionAdmissionError::StandardSequenceLock(
+                ChainstateError::RelativeTimeLock { minimum_mtp, .. }
+            )) if minimum_mtp == pre_activation.parent_mtp
+        ));
+        assert!(pool.is_empty());
+        assert!(
+            store
+                .get(OutPointKey::from(height_fail_outpoint))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get(OutPointKey::from(time_fail_outpoint))
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(matches!(
+            pool.admit(&store, height_pass, pre_activation),
+            Ok(TransactionAdmissionOutcome::Accepted { .. })
+        ));
+        assert!(matches!(
+            pool.admit(&store, time_pass, pre_activation),
+            Ok(TransactionAdmissionOutcome::Accepted { .. })
+        ));
+        assert_eq!(pool.len(), 2);
     }
 
     #[test]
@@ -3237,6 +3326,15 @@ mod tests {
             TransactionAdmissionError::Policy(TransactionPolicyError::UpgradableWitnessProgram(0));
         assert!(pool.remember_terminal_rejection(&upgradable_program, &upgradable_standardness));
         assert!(pool.is_recently_rejected(upgradable_program.compute_txid()));
+
+        let sequence_locked = spend(94).2;
+        let sequence_standardness =
+            TransactionAdmissionError::StandardSequenceLock(ChainstateError::RelativeHeightLock {
+                outpoint: OutPointKey::from(sequence_locked.input[0].previous_output),
+                minimum_height: 200,
+            });
+        assert!(pool.remember_terminal_rejection(&sequence_locked, &sequence_standardness));
+        assert!(pool.is_recently_rejected(sequence_locked.compute_txid()));
 
         let mut legacy_transaction = spend(92).2;
         legacy_transaction.input[0].witness = Witness::new();

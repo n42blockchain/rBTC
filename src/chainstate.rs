@@ -467,7 +467,7 @@ fn transaction_is_final(transaction: &Transaction, height: u32, lock_time_contex
             .all(|input| input.sequence == Sequence::MAX)
 }
 
-fn check_sequence_lock(
+pub(crate) fn check_sequence_lock(
     sequence: Sequence,
     outpoint: OutPointKey,
     utxo: &Utxo,
