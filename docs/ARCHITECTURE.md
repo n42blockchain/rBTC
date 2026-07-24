@@ -31,6 +31,11 @@ override detaches to an empty parameter-specific cache. Hardened mainnet and
 legacy-testnet checkpoints are exact-height commitments; after any such hash is
 known, the contextual validator also rejects a newly announced fork below the
 highest known checkpoint immediately, matching Core's old-fork resource gate.
+Header responses may begin with an already known prefix because a retained
+announcement can race the following `getheaders` response. Active and standby
+sync trim only that exact prefix; a known header after unseen work remains a
+malformed duplicate. This keeps benign repeated tip announcements from
+evicting every hot standby without weakening contextual validation.
 The public-network execution safety gate remains closed by default. A separate
 `--experimental-network-execution --once` validation path admits only Bitcoin
 or legacy testnet, requires an authenticated height/hash execution hard ceiling,
@@ -47,13 +52,14 @@ inherits the raised ceiling exactly as it inherited the original one.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
-default executes through Core 26's pinned height-193,000 checkpoint in 64-block
+default executes through Core 26's pinned height-210,000 checkpoint in 64-block
 atomic persistence batches filled through bounded 16-block peer requests.
 After observing block 1,000, it sends a termination signal; the
 in-flight atomic batch may finish, then a second process must reopen the same
 headers, execution state, UTXOs, undo, and retained ledger before reaching the
 target. The range includes both historical BIP30 duplicate-transaction
-exceptions, the BIP16 exception, and the P2SH activation boundary. The first deep run exposed that the batch overlay rejected their
+exceptions, the BIP16 exception, P2SH activation, and the first subsidy
+halving boundary. The first deep run exposed that the batch overlay rejected their
 spent-and-recreated outpoint even though the durable layer supported it; after
 aligning those semantics, the fresh 2026-07-23 restart acceptance run executed
 both exceptions and completed height 105,000 in 2,350 seconds using
@@ -61,6 +67,11 @@ both exceptions and completed height 105,000 in 2,350 seconds using
 exactly at height 193,000, exercised the BIP16 exception/activation era, and
 proved that a completed-target restart requests no additional block. Its final
 optimized 59,496-block leg completed in 2,191 seconds.
+The same durable state was then extended to height 210,000 and completed at
+hash `000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e`.
+Under a concurrent development workload, quick repair processed a 6,592-block
+leg at 11.38 blocks/second and deferred repair processed the following
+7,016-block leg at 12.74 blocks/second.
 
 ## UTXO layout
 
@@ -78,6 +89,12 @@ Every script must pass before the block checkpoint can commit; a failure reports
 the earliest failing transaction and rolls back all tentative mutations.
 Three isolated release runs of the historical full-block regression improved
 from a 3.59-second median at `534c28c` to 2.36 seconds, a 1.52× speedup.
+
+Ordinary serving-chain commits retain redb quick repair. Bounded bulk
+validation may explicitly defer the allocator-state repair write while keeping
+immediate transaction durability; this reduces write amplification at the cost
+of potentially slower post-crash reopen. The repeated SIGKILL/reopen matrix
+covers both settings and still requires an old or new complete checkpoint.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

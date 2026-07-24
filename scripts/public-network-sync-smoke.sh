@@ -11,14 +11,16 @@ case "$network" in
         default_target_hash=0000010ebfa3c6193793701c198392e21bdb8bc9fb2032f0d74a628d36e9a75e
         default_batch_size=1
         default_restart_height=0
+        default_deferred_repair=0
         ;;
     bitcoin)
-        default_max_bytes=7516192768
+        default_max_bytes=10737418240
         default_timeout_seconds=7200
-        default_target_height=193000
-        default_target_hash=000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317
+        default_target_height=210000
+        default_target_hash=000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e
         default_batch_size=64
         default_restart_height=1000
+        default_deferred_repair=1
         ;;
     *)
         echo "RBTC_SYNC_NETWORK must be signet or bitcoin" >&2
@@ -31,6 +33,7 @@ timeout_seconds="${RBTC_SYNC_TIMEOUT_SECONDS:-$default_timeout_seconds}"
 reserve_bytes="${RBTC_SYNC_FREE_RESERVE_BYTES:-2147483648}"
 batch_size="${RBTC_SYNC_BATCH_SIZE:-$default_batch_size}"
 restart_height="${RBTC_SYNC_RESTART_HEIGHT:-$default_restart_height}"
+deferred_repair="${RBTC_SYNC_DEFERRED_REPAIR:-$default_deferred_repair}"
 if [[ "${RBTC_SYNC_TARGET_HEIGHT+x}" != "${RBTC_SYNC_TARGET_HASH+x}" ]]; then
     echo "RBTC_SYNC_TARGET_HEIGHT and RBTC_SYNC_TARGET_HASH must be supplied together" >&2
     exit 1
@@ -66,6 +69,10 @@ if [[ ! "$restart_height" =~ ^[0-9]+$ ]] || (( restart_height >= target_height )
 fi
 if [[ ! "$target_hash" =~ ^[0-9a-f]{64}$ ]]; then
     echo "sync target hash must be 64 lowercase hexadecimal characters" >&2
+    exit 1
+fi
+if [[ "$deferred_repair" != "0" && "$deferred_repair" != "1" ]]; then
+    echo "RBTC_SYNC_DEFERRED_REPAIR must be 0 or 1" >&2
     exit 1
 fi
 
@@ -105,6 +112,9 @@ cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release
 execution_options=()
 if [[ "$network" == "bitcoin" ]]; then
     execution_options+=(--experimental-network-execution)
+fi
+if [[ "$deferred_repair" == "1" ]]; then
+    execution_options+=(--validation-deferred-repair)
 fi
 
 launch_node() {

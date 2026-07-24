@@ -9,7 +9,7 @@ use std::{
 
 use bitcoin::{BlockHash, Network, OutPoint, Txid, hashes::Hash};
 use rbtc::{
-    chain_store::RedbChainStore,
+    chain_store::{ChainStoreOptions, RedbChainStore},
     execution_store::ExecutionTip,
     utxo::{OutPointKey, Utxo, UtxoStore},
 };
@@ -41,6 +41,11 @@ fn coin(height: u32) -> Utxo {
     }
 }
 
+fn open_chainstate(path: impl AsRef<std::path::Path>, quick_repair: bool) -> RedbChainStore {
+    RedbChainStore::open_with_options(path, Network::Regtest, ChainStoreOptions { quick_repair })
+        .unwrap()
+}
+
 fn assert_consistent(store: &RedbChainStore) {
     let tip = store.execution().tip().unwrap();
     if tip.height == 0 {
@@ -64,7 +69,8 @@ fn crash_writer_child() {
         return;
     };
     let marker = std::env::var("RBTC_CRASH_MARKER").unwrap();
-    let store = RedbChainStore::open(database, Network::Regtest).unwrap();
+    let quick_repair = std::env::var("RBTC_CRASH_QUICK_REPAIR").as_deref() != Ok("0");
+    let store = open_chainstate(database, quick_repair);
     let mut tip = store.execution().tip().unwrap();
     if tip.height == 0 && store.get(key(0, 0)).unwrap().is_none() {
         let initial = (0..WIDTH)
@@ -96,41 +102,47 @@ fn crash_writer_child() {
 #[cfg(unix)]
 #[test]
 fn repeated_sigkill_recovers_an_atomic_state() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("chainstate.redb");
-    let marker = directory.path().join("progress");
     let executable = std::env::current_exe().unwrap();
-    let mut prior_height = 0;
 
-    for _ in 0..3 {
-        let mut child = Command::new(&executable)
-            .args(["--exact", "crash_writer_child", "--ignored", "--nocapture"])
-            .env("RBTC_CRASH_DB", &database)
-            .env("RBTC_CRASH_MARKER", &marker)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Ok(progress) = fs::read_to_string(&marker) {
-                if progress
-                    .trim()
-                    .parse::<u32>()
-                    .is_ok_and(|height| height > prior_height)
-                {
-                    break;
+    for quick_repair in [true, false] {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("chainstate.redb");
+        let marker = directory.path().join("progress");
+        let mut prior_height = 0;
+        for _ in 0..3 {
+            let mut child = Command::new(&executable)
+                .args(["--exact", "crash_writer_child", "--ignored", "--nocapture"])
+                .env("RBTC_CRASH_DB", &database)
+                .env("RBTC_CRASH_MARKER", &marker)
+                .env(
+                    "RBTC_CRASH_QUICK_REPAIR",
+                    if quick_repair { "1" } else { "0" },
+                )
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(progress) = fs::read_to_string(&marker) {
+                    if progress
+                        .trim()
+                        .parse::<u32>()
+                        .is_ok_and(|height| height > prior_height)
+                    {
+                        break;
+                    }
                 }
+                assert!(Instant::now() < deadline, "crash writer made no progress");
+                thread::sleep(Duration::from_millis(5));
             }
-            assert!(Instant::now() < deadline, "crash writer made no progress");
-            thread::sleep(Duration::from_millis(5));
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
 
-        let store = RedbChainStore::open(&database, Network::Regtest).unwrap();
-        assert_consistent(&store);
-        prior_height = store.execution().tip().unwrap().height;
+            let store = open_chainstate(&database, quick_repair);
+            assert_consistent(&store);
+            prior_height = store.execution().tip().unwrap().height;
+        }
     }
 }
 

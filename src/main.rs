@@ -14,6 +14,7 @@ use std::{
 
 use bitcoin::{
     Block, BlockHash, Network, Transaction,
+    block::Header,
     consensus::{deserialize, serialize},
     hashes::Hash,
     hex::FromHex,
@@ -30,7 +31,7 @@ use rbtc::{
         disconnect_execution_tip,
     },
     blockchain::{AppliedBlock, validate_block_structure_with_deployments},
-    chain_store::RedbChainStore,
+    chain_store::{ChainStoreOptions, RedbChainStore},
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
@@ -164,6 +165,7 @@ struct ValidationTarget {
 struct ValidationLimits {
     max_blocks_per_batch: usize,
     pause_between_batches: Duration,
+    quick_repair: bool,
 }
 
 impl Default for ValidationLimits {
@@ -171,6 +173,7 @@ impl Default for ValidationLimits {
         Self {
             max_blocks_per_batch: DEFAULT_VALIDATION_BATCH_SIZE,
             pause_between_batches: Duration::ZERO,
+            quick_repair: true,
         }
     }
 }
@@ -503,6 +506,7 @@ impl BackgroundValidationStatus {
                 pause_between_batches: configured
                     .pause_between_batches
                     .max(ADAPTIVE_VALIDATION_BUSY_PAUSE),
+                quick_repair: configured.quick_repair,
             }
         } else {
             configured
@@ -2056,10 +2060,12 @@ async fn maintain_standby(
                 if let Some(dag) = header_dag.as_mut() {
                     request_headers(&mut connected.session, dag.block_locator()).await?;
                     let headers = receive_headers(&mut connected.session).await?;
-                    if !headers.is_empty() {
+                    let unseen = unseen_header_suffix(dag, &headers)
+                        .map_err(|error| PeerRunError::header(&error))?;
+                    if !unseen.is_empty() {
                         let (candidate, _) = dag
                             .validate_batch_contextual(
-                                &headers,
+                                unseen,
                                 unix_time().map_err(PeerRunError::transient)?,
                             )
                             .map_err(|error| PeerRunError::header(&error))?;
@@ -2822,22 +2828,28 @@ async fn sync_headers(
     loop {
         request_headers(session, dag.block_locator()).await?;
         let headers = receive_headers(session).await?;
-        let count = headers.len();
-        if count == 0 {
+        let response_count = headers.len();
+        if response_count == 0 {
+            break;
+        }
+        let unseen =
+            unseen_header_suffix(&dag, &headers).map_err(|error| PeerRunError::header(&error))?;
+        if unseen.is_empty() {
             break;
         }
         let (candidate, _) = dag
-            .validate_batch_contextual(&headers, unix_time().map_err(PeerRunError::transient)?)
+            .validate_batch_contextual(unseen, unix_time().map_err(PeerRunError::transient)?)
             .map_err(|error| PeerRunError::header(&error))?;
         store
-            .append_batch(&headers)
+            .append_batch(unseen)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         dag = candidate;
         println!(
-            "validated and persisted {count} headers; active height {}",
+            "validated and persisted {} headers; active height {}",
+            unseen.len(),
             dag.active_tip().height
         );
-        if count < MAX_HEADERS_PER_RESPONSE {
+        if response_count < MAX_HEADERS_PER_RESPONSE {
             break;
         }
     }
@@ -2846,6 +2858,23 @@ async fn sync_headers(
         dag.active_tip().height
     );
     Ok(dag)
+}
+
+fn unseen_header_suffix<'a>(
+    dag: &HeaderDag,
+    headers: &'a [Header],
+) -> Result<&'a [Header], HeaderError> {
+    let first_unseen = headers
+        .iter()
+        .position(|header| dag.get(&header.block_hash()).is_none())
+        .unwrap_or(headers.len());
+    if let Some(duplicate) = headers[first_unseen..]
+        .iter()
+        .find(|header| dag.get(&header.block_hash()).is_some())
+    {
+        return Err(HeaderError::Duplicate(duplicate.block_hash()));
+    }
+    Ok(&headers[first_unseen..])
 }
 
 fn reject_legacy_split_chainstate(data_dir: &std::path::Path) -> Result<(), String> {
@@ -3750,8 +3779,14 @@ async fn sync_validating_node(
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     let headers_path = data_dir.join("headers.redb");
     reject_legacy_split_chainstate(&data_dir)?;
-    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), network)
-        .map_err(|error| error.to_string())?;
+    let chainstate = RedbChainStore::open_with_options(
+        data_dir.join("chainstate.redb"),
+        network,
+        ChainStoreOptions {
+            quick_repair: validation_limits.quick_repair,
+        },
+    )
+    .map_err(|error| error.to_string())?;
     let execution_store = chainstate.execution();
     execution_store
         .bind_consensus_config(
@@ -5329,6 +5364,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut cleanup_validation_dir = false;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
+    let mut validation_deferred_repair = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -5550,6 +5586,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 }
                 validation_pause_ms = Some(pause);
             }
+            "--validation-deferred-repair" => validation_deferred_repair = true,
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
                     return Err("--snapshot-height cannot be supplied more than once".to_owned());
@@ -5797,7 +5834,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
-    if (validation_batch_size.is_some() || validation_pause_ms.is_some())
+    if (validation_batch_size.is_some()
+        || validation_pause_ms.is_some()
+        || validation_deferred_repair)
         && validation_target.is_none()
         && complete_assumeutxo.is_none()
         && background_assumeutxo.is_none()
@@ -5819,6 +5858,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let validation_limits = ValidationLimits {
         max_blocks_per_batch: validation_batch_size.unwrap_or(DEFAULT_VALIDATION_BATCH_SIZE),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
+        quick_repair: !validation_deferred_repair,
     };
     if experimental_network_execution {
         if data_dir.is_none() {
@@ -6018,7 +6058,7 @@ fn print_usage() {
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
@@ -6786,7 +6826,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(listener, peer_version(212)).await;
             receive_client_preferences(&mut peer).await;
-            for response in [vec![child], Vec::new()] {
+            for response in [vec![child], vec![child]] {
                 let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
                 else {
                     panic!("expected standby ping");
@@ -6832,6 +6872,26 @@ mod tests {
         let activated = standby.await.unwrap().unwrap();
         assert_eq!(activated.validated_header_height, Some(1));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn repeated_known_header_prefix_is_a_noop_but_not_an_infix() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let child = mine_regtest_child(genesis.block_hash(), genesis.time + 1);
+        let (dag, _) = HeaderDag::new(Network::Regtest)
+            .validate_batch_contextual(&[child], child.time)
+            .unwrap();
+        let grandchild = mine_regtest_child(child.block_hash(), child.time + 1);
+
+        assert!(unseen_header_suffix(&dag, &[child]).unwrap().is_empty());
+        assert_eq!(
+            unseen_header_suffix(&dag, &[child, grandchild]).unwrap(),
+            &[grandchild]
+        );
+        assert!(matches!(
+            unseen_header_suffix(&dag, &[grandchild, child]),
+            Err(HeaderError::Duplicate(hash)) if hash == child.block_hash()
+        ));
     }
 
     #[tokio::test]
@@ -8426,6 +8486,7 @@ mod tests {
             ValidationLimits {
                 max_blocks_per_batch: 3,
                 pause_between_batches: Duration::from_millis(7),
+                quick_repair: true,
             }
         );
         for arguments in [
@@ -8513,6 +8574,7 @@ mod tests {
             ValidationLimits {
                 max_blocks_per_batch: 2,
                 pause_between_batches: Duration::from_millis(5),
+                quick_repair: true,
             }
         );
         for arguments in [
@@ -8580,12 +8642,14 @@ mod tests {
         let configured = ValidationLimits {
             max_blocks_per_batch: 8,
             pause_between_batches: Duration::from_millis(5),
+            quick_repair: false,
         };
         assert_eq!(
             status.adaptive_limits(configured),
             ValidationLimits {
                 max_blocks_per_batch: 1,
                 pause_between_batches: ADAPTIVE_VALIDATION_BUSY_PAUSE,
+                quick_repair: false,
             }
         );
         status.update_active(40, 50);
@@ -9349,6 +9413,7 @@ mod tests {
                 "/tmp/rbtc-experimental-execution-gate",
                 "--experimental-network-execution",
                 "--extend-validation-target",
+                "--validation-deferred-repair",
                 "--once",
                 "--validate-until-height",
                 "2",
@@ -9364,6 +9429,7 @@ mod tests {
             extension.network_execution,
             NetworkExecutionMode::ExperimentalOnceExtend
         );
+        assert!(!extension.validation_limits.quick_repair);
     }
 
     #[test]
@@ -10330,6 +10396,7 @@ mod tests {
                 validation_limits: ValidationLimits {
                     max_blocks_per_batch: 1,
                     pause_between_batches: Duration::ZERO,
+                    quick_repair: true,
                 },
             }),
         )
