@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     path::Path,
 };
 
@@ -24,6 +24,8 @@ const MAX_PIECES: usize = 261;
 // fixed byte budget. Level 1 keeps decompression compatibility and integrity
 // unchanged while avoiding level-9 CPU cost for data that will soon rotate.
 const ARCHIVE_COMPRESSION_LEVEL: i32 = 1;
+const MAX_ARCHIVE_COMPRESSION_WORKERS: usize = 4;
+const MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER: u64 = 32 * 1024 * 1024;
 // Zstandard recommends supporting at least an 8 MiB window for interoperable
 // streaming frames. Keep that fixed memory floor separate from the authenticated
 // decompressed-output ceiling below.
@@ -86,27 +88,58 @@ pub fn encode_archive(
     if blocks.len() > usize::try_from(MAX_BLOCKS_PER_ARCHIVE).expect("u32 fits usize") {
         return Err(ArchiveError::Invalid("too many blocks"));
     }
-    let mut records = Vec::new();
+    let mut records_bytes = 0_u64;
     for block in blocks {
         if block.len() > MAX_BLOCK_BYTES {
             return Err(ArchiveError::Invalid("block too large"));
         }
-        let len =
-            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
-        records.extend_from_slice(&len.to_le_bytes());
-        records.extend_from_slice(block);
-        if u64::try_from(records.len()).expect("record length fits u64") > MAX_RECORDS_BYTES {
+        records_bytes = records_bytes
+            .checked_add(4)
+            .and_then(|bytes| {
+                bytes.checked_add(u64::try_from(block.len()).expect("block length fits u64"))
+            })
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if records_bytes > MAX_RECORDS_BYTES {
             return Err(ArchiveError::Invalid("records too large"));
         }
     }
-    let compressed = zstd::stream::encode_all(Cursor::new(&records), ARCHIVE_COMPRESSION_LEVEL)?;
+    let compressed_capacity =
+        usize::try_from(records_bytes).expect("bounded record length fits usize");
+    let mut encoder = zstd::stream::Encoder::new(
+        Vec::with_capacity(compressed_capacity),
+        ARCHIVE_COMPRESSION_LEVEL,
+    )?;
+    let useful_workers = usize::try_from(
+        records_bytes
+            .div_ceil(MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER)
+            .max(1),
+    )
+    .unwrap_or(usize::MAX);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(MAX_ARCHIVE_COMPRESSION_WORKERS)
+        .min(useful_workers);
+    if workers > 1 {
+        encoder.multithread(u32::try_from(workers).expect("compression worker bound fits u32"))?;
+    }
+    let mut records_hash = Sha256::new();
+    for block in blocks {
+        let len =
+            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
+        let len = len.to_le_bytes();
+        records_hash.update(len);
+        records_hash.update(block);
+        encoder.write_all(&len)?;
+        encoder.write_all(block)?;
+    }
+    let compressed = encoder.finish()?;
     let manifest = ArchiveManifest {
         format_version: FORMAT_VERSION,
         first_height,
         block_count: u32::try_from(blocks.len())
             .map_err(|_| ArchiveError::Invalid("too many blocks"))?,
-        records_bytes: u64::try_from(records.len()).expect("bounded records length fits u64"),
-        records_sha256: hash_hex(&records),
+        records_bytes,
+        records_sha256: format!("{:x}", records_hash.finalize()),
         piece_size: PIECE_SIZE,
         piece_sha256: compressed.chunks(PIECE_SIZE).map(hash_hex).collect(),
     };
@@ -315,7 +348,6 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::TempDir;
 
     #[test]

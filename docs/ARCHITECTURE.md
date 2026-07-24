@@ -190,21 +190,22 @@ transaction inserts the complete delta and advances every block transition;
 no prefix is visible after failure.
 
 Reads search newest deltas first by binary search and decode only a matched
-UTXO. A 10-bit-per-update Bloom filter accompanies every row, and each
-completed 16-row group shares a fixed aggregate Bloom filter, so historical
-base inputs normally skip 16 records with three probes. The row filter is
-checksummed and committed atomically with its RVD3 delta; the completed group
-filter joins the same transaction on every sixteenth row. Bulk prefetch
-resolves all journal hits newest-first and issues one ordered parallel redb
-base lookup only for unresolved outpoints.
+UTXO. A 10-bit-per-update Bloom filter accompanies every row, and each 16-row
+group shares a fixed aggregate Bloom filter, so historical base inputs
+normally skip 16 records with three probes. The row filter and current group
+aggregate are checksummed and committed atomically with every RVD3 delta,
+including while the newest group is incomplete. Bulk prefetch resolves all
+journal hits newest-first and issues one ordered parallel redb base lookup only
+for unresolved outpoints.
 
 An older RVD3 database without persisted filters undergoes one strict scan of
 record size, ordering, state bits, contiguous offsets, and canonical UTXO
-bytes, then installs all row and completed-group filters in one
-immediate-durability migration. Subsequent opens validate the redb-protected
-filter format, byte length, SHA-256 checksum, per-row UTXO count, delta header,
-and exact execution-tip alignment; only the at-most-15-row unfinished group is
-strictly rescanned to rebuild its aggregate. At height 432,684, the migration
+bytes, then installs all row and group filters in one immediate-durability
+migration. A directory that already has row and completed-group filters scans
+only a missing at-most-15-row partial group once and persists its aggregate.
+Subsequent opens validate the redb-protected filter format, byte length,
+SHA-256 checksum, per-row UTXO count, delta header, and exact execution-tip
+alignment without scanning delta payloads. At height 432,684, the migration
 opened the 18 GB production chainstate in 11.454 seconds and the next reopen
 took 6.035 seconds, replacing the earlier approximately one-to-two-minute
 filter rebuild. Ordinary mode rejects a non-empty delta table, and journal
@@ -316,15 +317,18 @@ Four adjacent 504-block checkpoints took 60.608–82.237 seconds, or
 checkpoints took 163.505, 185.132, and 169.897 seconds. Their median was 6.0%
 below twice the preceding nine-checkpoint 504-block median; the directly
 adjacent comparison improved by 16.3%. Because RVD3 avoided the old base-tree
-superlinear commit, the Taproot run therefore uses 1,008 despite its larger
-atomic tail. A follow-up that assigned one 128-block window to each of three
-auxiliaries was rejected: public-peer failures and independent response tails
-widened complete-batch time to 73.243–127.829 seconds. Production validation
-retains one auxiliary window and at most three ready candidates for hot
-replacement. Expanding that pool to eight
-ready-or-in-flight peers was rejected as well: five auxiliary-bearing batches
-took 80.105–105.571 seconds, followed by primary-only batches at 80.482 and
-88.089 seconds.
+superlinear commit, 1,008 remained attractive until the next batch at height
+504,505 exceeded the ledger's separate 1 GiB canonical-record ceiling. It
+failed before staging or chainstate mutation. The Taproot run therefore uses
+756 blocks; its first four checkpoints completed in 124.259–148.291 seconds.
+A follow-up that assigned one 128-block window to each of three auxiliaries
+was rejected: public-peer failures and independent response tails widened
+complete-batch time to 73.243–127.829 seconds. Production validation instead
+reuses one auxiliary across successive paired windows, never leaves more than
+128 responses outstanding on either session, and abandons an auxiliary half
+that trails the primary by more than two seconds. Each pair is appended in
+active-chain order. Additional ready candidates remain hot replacements
+rather than independent batch tails.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work
@@ -333,6 +337,23 @@ failing block even if a later worker completes first. Adjacent 1,008-block
 mainnet checkpoints reduced this phase from 11.489 seconds to 1.652 and 1.705
 seconds, approximately 85%, without changing transaction identifiers,
 deployment contexts, or the later atomic execution.
+
+The same workers now serialize their validated blocks, and archive encoding
+streams those length-prefixed bytes through a bounded four-worker zstd encoder
+while incrementally computing the authenticated record digest. This removes a
+second batch-sized uncompressed buffer. On the first 756-block production
+sample, archive staging fell from the preceding 6.723–7.175 seconds to 4.949
+seconds. Large validation-journal prefetches likewise partition each
+independent group-Bloom probe over bounded CPU workers and merge both match and
+reject partitions in original input order; row lookup and newest-first
+resolution remain unchanged.
+
+SIGINT and SIGTERM are awaited alongside the daemon future. Cancellation drops
+network tasks and closes the durable stores cleanly; synchronous atomic
+execution reaches its next async boundary first. A stalled-handshake process
+test exits successfully after logging that durable stores are closing, avoiding
+the allocator-repair cost caused by the operating system's default abrupt
+termination.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

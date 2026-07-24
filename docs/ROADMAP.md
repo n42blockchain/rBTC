@@ -26,13 +26,16 @@ equivalent to 30.3–41.1 seconds per 252 blocks. At heights
 495,433–498,456, three adjacent 1,008-block checkpoints had a
 169.897-second median, 6.0% below twice the preceding nine-checkpoint
 504-block median; the directly adjacent gain was 16.3%. RVD3 avoided the old
-base-tree superlinear commit, so the Taproot leg now uses 1,008 despite its
-larger atomic tail. A four-peer 504-block experiment was rejected after
-independent public-peer failures
-widened complete batches to 73.243–127.829 seconds. The retained downloader
-keeps one auxiliary 128-block window and at most three ready hot replacements.
-Expanding that pool to eight ready-or-in-flight peers was rejected
-after it repeatedly selected peers without proven block-response throughput;
+base-tree superlinear commit, but the next 1,008-block batch exceeded the
+ledger's separate 1 GiB canonical-record ceiling and failed without mutation.
+The Taproot leg now uses 756 blocks; its first four checkpoints took
+124.259–148.291 seconds. A four-peer experiment was rejected after independent
+public-peer failures widened complete batches to 73.243–127.829 seconds. The
+retained downloader reuses one auxiliary across ordered paired 128-block
+windows with a two-second tail guard and hot replacements. Streamed
+four-worker archive compression reduced the first 756-block staging sample
+from 6.723–7.175 seconds to 4.949 seconds, large RVD3 group-Bloom probes now
+partition over bounded CPU workers, and SIGINT/SIGTERM close stores cleanly;
 Taproot exact-stop and completed-target restart remain the active soak gate.
 Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
 with ordered joins and earliest-height failure semantics. Adjacent 1,008-block

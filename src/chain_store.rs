@@ -210,6 +210,7 @@ const VALIDATION_BLOOM_HEADER_BYTES: usize = 48;
 const VALIDATION_BLOOM_BITS_PER_UPDATE: usize = 10;
 const VALIDATION_ROWS_PER_BLOOM_GROUP: usize = 16;
 const VALIDATION_GROUP_BLOOM_UPDATES: usize = 16_000_000;
+const MIN_PARALLEL_VALIDATION_BLOOM_KEYS: usize = 16_384;
 
 struct ValidationJournal {
     rows: Vec<ValidationJournalRow>,
@@ -318,6 +319,43 @@ fn decode_validation_bloom(
             bits: bits.to_vec(),
         },
     ))
+}
+
+fn partition_validation_bloom_matches(
+    bloom: &ValidationBloom,
+    outpoints: &[OutPointKey],
+    indices: Vec<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let available_workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let workers = available_workers.min(indices.len().div_ceil(MIN_PARALLEL_VALIDATION_BLOOM_KEYS));
+    if workers <= 1 {
+        return indices
+            .into_iter()
+            .partition(|index| bloom.might_contain(outpoints[*index]));
+    }
+    let chunk_size = indices.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let jobs = indices
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(|| {
+                    chunk
+                        .iter()
+                        .copied()
+                        .partition::<Vec<_>, _>(|index| bloom.might_contain(outpoints[*index]))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut matching = Vec::new();
+        let mut rejected = Vec::new();
+        for job in jobs {
+            let (mut job_matching, mut job_rejected) =
+                job.join().expect("validation bloom worker must not panic");
+            matching.append(&mut job_matching);
+            rejected.append(&mut job_rejected);
+        }
+        (matching, rejected)
+    })
 }
 
 fn validation_bloom_hashes(outpoint: OutPointKey) -> (u64, u64) {
@@ -776,6 +814,20 @@ impl RedbChainStore {
                         migrated_groups.push((group_index, encoded));
                     }
                 }
+                if !journal.rows.is_empty()
+                    && journal.rows.len() % VALIDATION_ROWS_PER_BLOOM_GROUP != 0
+                {
+                    let group_index = u32::try_from(journal.groups.len() - 1).map_err(|_| {
+                        UtxoError::Malformed("validation bloom group index overflow")
+                    })?;
+                    if group_blooms.get(group_index)?.is_none() {
+                        let aggregate = journal
+                            .groups
+                            .last()
+                            .expect("partial validation group has an aggregate bloom");
+                        migrated_groups.push((group_index, encode_validation_bloom(aggregate, 0)));
+                    }
+                }
                 if let Some(last_delta_height) = previous_height {
                     let execution_height = execution.tip()?.height;
                     if last_delta_height != execution_height {
@@ -1167,27 +1219,23 @@ impl RedbChainStore {
         )?;
         let mut bloom = ValidationBloom::with_update_count(updates.len())?;
         let starts_group = journal.rows.len() % VALIDATION_ROWS_PER_BLOOM_GROUP == 0;
-        let mut new_group = starts_group
-            .then(|| ValidationBloom::with_update_count(VALIDATION_GROUP_BLOOM_UPDATES))
-            .transpose()?;
-        let group_finishes = (journal.rows.len() + 1) % VALIDATION_ROWS_PER_BLOOM_GROUP == 0;
-        let mut completed_group_bloom = group_finishes.then(|| {
+        let mut updated_group = if starts_group {
+            ValidationBloom::with_update_count(VALIDATION_GROUP_BLOOM_UPDATES)?
+        } else {
             journal
                 .groups
                 .last()
-                .expect("completing validation row has an existing bloom group")
+                .expect("continuing validation row has an existing bloom group")
                 .clone()
-        });
+        };
         for outpoint in updates.iter().map(|(outpoint, _)| *outpoint) {
             bloom.insert(outpoint);
-            if let Some(new_group) = &mut new_group {
-                new_group.insert(outpoint);
-            }
-            if let Some(group_bloom) = &mut completed_group_bloom {
-                group_bloom.insert(outpoint);
-            }
+            updated_group.insert(outpoint);
         }
         let encoded_bloom = encode_validation_bloom(&bloom, next_utxo_count);
+        let encoded_group = encode_validation_bloom(&updated_group, 0);
+        let group_index = u32::try_from(journal.rows.len() / VALIDATION_ROWS_PER_BLOOM_GROUP)
+            .map_err(|_| UtxoError::Malformed("validation bloom group index overflow"))?;
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
         {
@@ -1198,30 +1246,20 @@ impl RedbChainStore {
             deltas.insert(final_height, encoded.as_slice())?;
             let mut blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
             blooms.insert(final_height, encoded_bloom.as_slice())?;
-            if let Some(group_bloom) = &completed_group_bloom {
-                let group_index = u32::try_from(
-                    journal.rows.len() / VALIDATION_ROWS_PER_BLOOM_GROUP,
-                )
-                .map_err(|_| UtxoError::Malformed("validation bloom group index overflow"))?;
-                let encoded_group = encode_validation_bloom(group_bloom, 0);
-                let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
-                groups.insert(group_index, encoded_group.as_slice())?;
-            }
+            let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
+            groups.insert(group_index, encoded_group.as_slice())?;
         }
         for transition in transitions {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
         transaction.commit()?;
-        if let Some(new_group) = new_group {
-            journal.groups.push(new_group);
+        if starts_group {
+            journal.groups.push(updated_group);
         } else {
-            let group = journal
+            *journal
                 .groups
                 .last_mut()
-                .expect("validation row has a bloom group");
-            for outpoint in updates.iter().map(|(outpoint, _)| *outpoint) {
-                group.insert(outpoint);
-            }
+                .expect("validation row has a bloom group") = updated_group;
         }
         journal.rows.push(ValidationJournalRow {
             height: final_height,
@@ -1365,16 +1403,8 @@ impl UtxoStore for RedbChainStore {
             if unresolved.is_empty() {
                 break;
             }
-            let mut group_unresolved = Vec::new();
-            let mut next_unresolved = Vec::with_capacity(unresolved.len());
-            for index in unresolved {
-                let outpoint = outpoints[index];
-                if group.might_contain(outpoint) {
-                    group_unresolved.push(index);
-                } else {
-                    next_unresolved.push(index);
-                }
-            }
+            let (mut group_unresolved, mut next_unresolved) =
+                partition_validation_bloom_matches(group, outpoints, unresolved);
             let start = group_index * VALIDATION_ROWS_PER_BLOOM_GROUP;
             let end = (start + VALIDATION_ROWS_PER_BLOOM_GROUP).min(journal.rows.len());
             for row in journal.rows[start..end].iter().rev() {
@@ -2312,6 +2342,33 @@ mod tests {
     }
 
     #[test]
+    fn parallel_validation_bloom_partition_preserves_serial_order() {
+        let outpoints = (0..(MIN_PARALLEL_VALIDATION_BLOOM_KEYS * 3))
+            .map(|index| {
+                OutPoint::new(
+                    Txid::from_byte_array([u8::try_from(index % 251).unwrap(); 32]),
+                    u32::try_from(index).unwrap(),
+                )
+                .into()
+            })
+            .collect::<Vec<_>>();
+        let mut bloom = ValidationBloom::with_update_count(outpoints.len()).unwrap();
+        for outpoint in outpoints.iter().step_by(3).copied() {
+            bloom.insert(outpoint);
+        }
+        let indices = (0..outpoints.len()).rev().collect::<Vec<_>>();
+        let expected: (Vec<_>, Vec<_>) = indices
+            .iter()
+            .copied()
+            .partition(|index| bloom.might_contain(outpoints[*index]));
+
+        assert_eq!(
+            partition_validation_bloom_matches(&bloom, &outpoints, indices),
+            expected
+        );
+    }
+
+    #[test]
     fn validation_delta_journal_survives_restart_and_materializes_atomically() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("chainstate.redb");
@@ -2553,7 +2610,7 @@ mod tests {
                 .open_table(VALIDATION_GROUP_BLOOM_TABLE)
                 .unwrap();
             assert_eq!(rows.len().unwrap(), 18);
-            assert_eq!(groups.len().unwrap(), 1);
+            assert_eq!(groups.len().unwrap(), 2);
         }
         assert_eq!(store.get(key(1)).unwrap(), Some(coin(118)));
         assert_eq!(store.get(key(2)).unwrap(), Some(coin(777)));
