@@ -231,8 +231,8 @@ pub enum TransactionAdmissionError {
         /// Incremental relay fee required by replacement virtual size.
         required_fee_sats: u64,
     },
-    /// A replacement would remove more transactions than BIP125 permits.
-    #[error("replacement would evict {count} transactions; limit is {limit}")]
+    /// A replacement has more potential removals than BIP125 permits.
+    #[error("replacement has {count} potential evictions; limit is {limit}")]
     TooManyReplacementEvictions {
         /// Original conflicts plus their descendants.
         count: usize,
@@ -1166,17 +1166,22 @@ impl TransactionAdmissionPool {
             return Ok(ReplacementPlan::default());
         }
         let mut txids = BTreeSet::new();
+        let mut potential_evictions = 0_usize;
         for txid in &direct_conflicts {
             if !full_rbf && !self.transaction_is_replaceable(*txid) {
                 return Err(TransactionAdmissionError::NonReplaceable(*txid));
             }
-            txids.extend(self.descendant_closure(*txid));
-        }
-        if txids.len() > MAX_REPLACEMENT_EVICTIONS {
-            return Err(TransactionAdmissionError::TooManyReplacementEvictions {
-                count: txids.len(),
-                limit: MAX_REPLACEMENT_EVICTIONS,
-            });
+            let descendants = self.descendant_closure(*txid);
+            // Core deliberately sums each direct conflict's descendant count
+            // before deduplication to bound worst-case replacement work.
+            potential_evictions = potential_evictions.saturating_add(descendants.len());
+            if potential_evictions > MAX_REPLACEMENT_EVICTIONS {
+                return Err(TransactionAdmissionError::TooManyReplacementEvictions {
+                    count: potential_evictions,
+                    limit: MAX_REPLACEMENT_EVICTIONS,
+                });
+            }
+            txids.extend(descendants);
         }
         self.validate_replacement_inputs(ordered, &direct_conflicts)?;
         let direct_conflict_fees_and_sizes = self
@@ -3053,6 +3058,49 @@ mod tests {
             } if txid == replacement_txid
         ));
         assert_eq!(txids(&pool), vec![replacement_txid]);
+    }
+
+    #[test]
+    fn replacement_limit_conservatively_counts_shared_descendants_per_conflict() {
+        let roots = (109..114).map(|index| spend(index).2).collect::<Vec<_>>();
+        let mut shared_child = child(&roots[0], 400_000);
+        for root in roots.iter().skip(1) {
+            shared_child.input.push(child(root, 0).input[0].clone());
+        }
+        let mut entries = roots.clone();
+        entries.push(shared_child.clone());
+        let mut previous = shared_child;
+        for _ in 0..19 {
+            let descendant = child(&previous, 300_000);
+            entries.push(descendant.clone());
+            previous = descendant;
+        }
+        let last_txid = previous.compute_txid();
+        let mut pool = unchecked_pool(entries);
+        assert_eq!(pool.len(), 25);
+        assert!(pool.validate_topology_limits(&[last_txid], false).is_ok());
+        let unique_evictions = roots
+            .iter()
+            .flat_map(|root| pool.descendant_closure(root.compute_txid()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique_evictions.len(), 25);
+
+        let mut replacement = roots[0].clone();
+        for root in roots.iter().skip(1) {
+            replacement.input.push(root.input[0].clone());
+        }
+        let before = pool.snapshot();
+        let Err(error) = pool.prepare_replacement(&[replacement], true) else {
+            panic!("shared descendants must count once per direct conflict");
+        };
+        assert!(matches!(
+            error,
+            TransactionAdmissionError::TooManyReplacementEvictions {
+                count: 105,
+                limit: MAX_REPLACEMENT_EVICTIONS,
+            }
+        ));
+        assert_eq!(pool.snapshot(), before);
     }
 
     #[test]
