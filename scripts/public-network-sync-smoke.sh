@@ -14,10 +14,10 @@ case "$network" in
         default_deferred_repair=0
         ;;
     bitcoin)
-        default_max_bytes=17179869184
+        default_max_bytes=25769803776
         default_timeout_seconds=7200
-        default_target_height=227931
-        default_target_hash=000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
+        default_target_height=250000
+        default_target_hash=000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214
         default_batch_size=64
         default_restart_height=1000
         default_deferred_repair=1
@@ -59,8 +59,8 @@ if (( target_height > 10000000 )); then
     echo "sync target height cannot exceed 10,000,000" >&2
     exit 1
 fi
-if (( batch_size > 64 )); then
-    echo "sync batch size cannot exceed 64 blocks" >&2
+if (( batch_size > 256 )); then
+    echo "sync batch size cannot exceed 256 blocks" >&2
     exit 1
 fi
 if [[ ! "$restart_height" =~ ^[0-9]+$ ]] || (( restart_height >= target_height )); then

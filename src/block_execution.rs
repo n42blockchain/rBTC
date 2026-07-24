@@ -10,9 +10,10 @@ use thiserror::Error;
 
 use crate::{
     blockchain::{
-        AppliedBlock, BlockError, DeferredScriptCheck, apply_block_with_deployments,
-        apply_prevalidated_block_with_deferred_scripts, apply_prevalidated_block_with_deployments,
-        disconnect_block, validate_block_structure_with_deployments, verify_deferred_scripts,
+        AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck,
+        apply_block_with_deployments, apply_prevalidated_block_with_deferred_scripts,
+        apply_prevalidated_block_with_deployments, disconnect_block,
+        validate_block_structure_with_deployments, verify_deferred_scripts,
     },
     chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
     chainstate::is_unspendable,
@@ -360,6 +361,7 @@ fn connect_active_blocks_inner(
     let mut applied_blocks = Vec::with_capacity(blocks.len());
     let mut transitions = Vec::with_capacity(blocks.len());
     let mut deferred_scripts = Vec::new();
+    let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
     for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
         let block_overlay = UtxoOverlay::new(&cumulative);
         let validated = validate_active_block_inner(
@@ -376,9 +378,12 @@ fn connect_active_blocks_inner(
         let (applied, changes, mut block_scripts) = match validated {
             Ok(validated) => validated,
             Err(error) => {
-                if let Some((index, source)) =
+                let script_failure = if let Some(batch) = script_batch.take() {
+                    batch.finish()
+                } else {
                     verify_deferred_scripts(std::mem::take(&mut deferred_scripts))
-                {
+                };
+                if let Some((index, source)) = script_failure {
                     return Err(BlockExecutionError::Block(BlockError::Transaction {
                         index,
                         source: source.into(),
@@ -390,7 +395,6 @@ fn connect_active_blocks_inner(
         for script in &mut block_scripts {
             script.set_block_order(block_order);
         }
-        deferred_scripts.extend(block_scripts);
         let next = ExecutionTip {
             height: current
                 .height
@@ -407,9 +411,19 @@ fn connect_active_blocks_inner(
             transaction_undos: applied.transaction_undos.clone(),
         });
         applied_blocks.push(applied);
+        if let Some(batch) = &mut script_batch {
+            batch.submit(block_scripts);
+        } else {
+            deferred_scripts.extend(block_scripts);
+        }
         current = next;
     }
-    if let Some((index, source)) = verify_deferred_scripts(deferred_scripts) {
+    let script_failure = if let Some(batch) = script_batch {
+        batch.finish()
+    } else {
+        verify_deferred_scripts(deferred_scripts)
+    };
+    if let Some((index, source)) = script_failure {
         return Err(BlockExecutionError::Block(BlockError::Transaction {
             index,
             source: source.into(),

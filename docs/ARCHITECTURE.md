@@ -56,7 +56,7 @@ inherits the raised ceiling exactly as it inherited the original one.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
-default executes through BIP34 activation height 227,931 in 64-block
+default executes through Core 26 checkpoint height 250,000 in 64-block
 atomic persistence batches filled through bounded 16-block peer requests.
 After observing block 1,000, it sends a termination signal; the
 in-flight atomic batch may finish, then a second process must reopen the same
@@ -82,6 +82,15 @@ BIP34 activation height 227,931/hash
 `000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8`.
 Its final 6,923 newly executed blocks plus startup/recovery took 848 seconds
 (8.16 blocks/second end to end); a completed-target restart requested no block.
+The authenticated target was then extended to Core 26 checkpoint 250,000/hash
+`000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214`.
+Checkpoint-wide script pooling first raised an adjacent 5,888-block live leg
+from 10.57 to 12.95 blocks/second. Starting script jobs as soon as each block's
+sequential transition was constructed then completed the final 6,965 blocks
+plus recovery in 435.36 seconds (15.99 blocks/second), 12.9% above the adjacent
+checkpoint-barrier leg and about 51% above the original per-block-barrier leg.
+The exact target and a cold completed-target restart both succeeded without an
+additional block request.
 
 ## UTXO layout
 
@@ -97,11 +106,13 @@ output created earlier in that block. The resolved prevouts are then immutable
 script-validation jobs distributed across a persistent, bounded host-CPU
 worker pool. Serialized jobs are scheduled dynamically by transaction instead
 of creating and joining a fresh set of threads for every block; small
-single-block input sets stay serial. IBD keeps building the sequential
-cumulative UTXO overlay for every block in a checkpoint, then submits all of
-that checkpoint's immutable script jobs through one pool barrier. This removes
-up to 256 per-block join barriers without moving any tentative state into
-redb. Every script must pass before the checkpoint can commit; out-of-order
+single-block input sets stay serial. After IBD constructs one block's
+sequential transition, it immediately submits that block's immutable jobs
+while the calling thread builds later blocks against the cumulative UTXO
+overlay. One checkpoint-wide barrier remains before commit. This removes up
+to 256 per-block joins and overlaps script work with transition construction
+without moving tentative state into redb. Every script must pass before the
+checkpoint can commit; out-of-order
 completion still selects the earliest failing block and transaction and rolls
 back all tentative mutations.
 Three isolated release runs of the historical full-block regression improved
@@ -115,6 +126,10 @@ The first 3,328 blocks after switching the same durable directory to the
 checkpoint-wide barrier took 257 seconds including recovery (12.95
 blocks/second), a 22.5% throughput increase while preserving 256-block atomic
 tips.
+The follow-up producer/consumer overlap completed the final 6,965 blocks to
+height 250,000 in 435.36 seconds including recovery (15.99 blocks/second),
+12.9% above the adjacent checkpoint-barrier leg's 14.16 blocks/second and
+about 51% above the original per-block-barrier leg.
 
 Ordinary serving-chain commits retain redb quick repair. Bounded bulk
 validation may explicitly defer the allocator-state repair write while keeping

@@ -52,6 +52,8 @@ impl DeferredScriptCheck<'_> {
     }
 }
 
+type ScriptValidationResult = (usize, usize, Result<(), ConsensusError>);
+
 struct ScriptValidationJob {
     index: usize,
     block_order: usize,
@@ -59,7 +61,7 @@ struct ScriptValidationJob {
     input_count: usize,
     prevouts: Vec<Utxo>,
     script_flags: u32,
-    result: mpsc::Sender<(usize, usize, Result<(), ConsensusError>)>,
+    result: mpsc::Sender<ScriptValidationResult>,
 }
 
 #[derive(Default)]
@@ -127,6 +129,54 @@ fn script_validation_worker(queue: &ScriptValidationQueue) {
 fn script_validation_pool() -> &'static ScriptValidationPool {
     static POOL: OnceLock<ScriptValidationPool> = OnceLock::new();
     POOL.get_or_init(ScriptValidationPool::new)
+}
+
+/// A checkpoint-wide producer/consumer session that overlaps sequential UTXO
+/// construction with immutable script validation.
+pub(crate) struct DeferredScriptBatch {
+    result: mpsc::Sender<ScriptValidationResult>,
+    results: mpsc::Receiver<ScriptValidationResult>,
+    jobs: usize,
+}
+
+impl DeferredScriptBatch {
+    pub(crate) fn new() -> Self {
+        let (result, results) = mpsc::channel();
+        Self {
+            result,
+            results,
+            jobs: 0,
+        }
+    }
+
+    pub(crate) fn submit(&mut self, checks: Vec<DeferredScriptCheck<'_>>) {
+        let pool = script_validation_pool();
+        for check in checks {
+            pool.enqueue(ScriptValidationJob {
+                index: check.index,
+                block_order: check.block_order,
+                raw_transaction: serialize(check.transaction),
+                input_count: check.transaction.input.len(),
+                prevouts: check.prevouts,
+                script_flags: check.script_flags,
+                result: self.result.clone(),
+            });
+            self.jobs = self.jobs.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn finish(self) -> Option<(usize, ConsensusError)> {
+        (0..self.jobs)
+            .filter_map(|_| {
+                let (block_order, index, validation) = self
+                    .results
+                    .recv()
+                    .expect("script-validation worker terminated without a result");
+                validation.err().map(|error| (block_order, index, error))
+            })
+            .min_by_key(|(block_order, index, _)| (*block_order, *index))
+            .map(|(_, index, error)| (index, error))
+    }
 }
 
 /// Block-level validation or atomic-application error.
@@ -583,29 +633,9 @@ pub(crate) fn verify_deferred_scripts(
             .map(|error| (check.index, error))
         });
     }
-    let jobs = checks.len();
-    let (result, results) = mpsc::channel();
-    for check in checks {
-        pool.enqueue(ScriptValidationJob {
-            index: check.index,
-            block_order: check.block_order,
-            raw_transaction: serialize(check.transaction),
-            input_count: check.transaction.input.len(),
-            prevouts: check.prevouts,
-            script_flags: check.script_flags,
-            result: result.clone(),
-        });
-    }
-    drop(result);
-    (0..jobs)
-        .filter_map(|_| {
-            let (block_order, index, validation) = results
-                .recv()
-                .expect("script-validation worker terminated without a result");
-            validation.err().map(|error| (block_order, index, error))
-        })
-        .min_by_key(|(block_order, index, _)| (*block_order, *index))
-        .map(|(_, index, error)| (index, error))
+    let mut batch = DeferredScriptBatch::new();
+    batch.submit(checks);
+    batch.finish()
 }
 
 /// Validates block commitments and context-free structure without mutating UTXO state.
