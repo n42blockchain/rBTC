@@ -213,10 +213,12 @@ For experimental mainnet checkpoints wider than 128 blocks, up to three ready
 standby candidates now survive the chainstate-open phase; the first one that
 still passes bounded activation becomes an auxiliary block source. A
 252-block batch requests 128 blocks from the active peer and 124 from the
-auxiliary peer concurrently, preserves active-chain order, and retries the
-auxiliary window on the primary after any request or response failure. The
-next retained candidate is then activated without restarting the primary
-session. Once the primary window completes, an unfinished auxiliary response
+auxiliary peer concurrently. Larger configured batches still cap both parallel
+windows at 128 and download the remainder through bounded primary windows.
+The receiver preserves active-chain order and retries the auxiliary window on
+the primary after any request or response failure. The next retained candidate
+is then activated without restarting the primary session. Once the primary
+window completes, an unfinished auxiliary response
 gets two seconds of grace before it is abandoned and retried on the primary;
 this reduced one observed slow-auxiliary download from 40.485 to 27.684
 seconds instead of paying the complete 30-second auxiliary timeout first. An

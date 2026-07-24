@@ -220,9 +220,11 @@ session receives bounded keepalives. It activates the first surviving
 candidate as an auxiliary block source. Checkpoints wider than the 128-block
 single-peer pipeline split into ordered primary and auxiliary windows, request
 and receive both concurrently, then concatenate them in active-chain order.
-Any auxiliary request or response failure drops that source and redownloads
-only its window from the primary, then activates the next reserved candidate
-without restarting the active session. An unfinished auxiliary window is
+Both parallel windows remain capped at 128 blocks; a larger configured
+checkpoint downloads its remainder through additional bounded primary
+windows. Any auxiliary request or response failure drops that source and
+redownloads only its window from the primary, then activates the next reserved
+candidate without restarting the active session. An unfinished auxiliary window is
 given only two seconds after the primary window completes before the same
 fallback runs, avoiding a full auxiliary timeout followed by another
 download. This bounded one observed slow-auxiliary download at 27.684 seconds

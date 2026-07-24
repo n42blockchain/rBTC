@@ -5017,6 +5017,16 @@ async fn request_block_window(
     Ok(())
 }
 
+fn split_parallel_block_windows(
+    hashes: &[BlockHash],
+) -> (&[BlockHash], &[BlockHash], &[BlockHash]) {
+    let primary_len = hashes.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+    let (primary, remaining) = hashes.split_at(primary_len);
+    let auxiliary_len = remaining.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+    let (auxiliary, primary_remainder) = remaining.split_at(auxiliary_len);
+    (primary, auxiliary, primary_remainder)
+}
+
 async fn receive_block_window(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     hashes: &[BlockHash],
@@ -5133,7 +5143,8 @@ async fn download_execute_batch(
     let mut blocks = Vec::with_capacity(batch_len);
     let prefetched = std::mem::take(prefetched_block_windows);
     if auxiliary_session.is_some() && hashes.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT {
-        let (primary_hashes, auxiliary_hashes) = hashes.split_at(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+        let (primary_hashes, auxiliary_hashes, primary_remainder) =
+            split_parallel_block_windows(&hashes);
         if (!prefetched.primary.is_empty() && prefetched.primary != primary_hashes)
             || (!prefetched.auxiliary.is_empty() && prefetched.auxiliary != auxiliary_hashes)
         {
@@ -5234,6 +5245,17 @@ async fn download_execute_batch(
                 .await?,
             );
         }
+        for pipelined_hashes in primary_remainder.chunks(MAX_PIPELINED_BLOCKS_IN_FLIGHT) {
+            blocks.extend(
+                download_block_window(
+                    session,
+                    pipelined_hashes,
+                    compact_candidates,
+                    "primary remainder",
+                )
+                .await?,
+            );
+        }
     } else {
         if !prefetched.auxiliary.is_empty()
             || (!prefetched.primary.is_empty()
@@ -5307,8 +5329,8 @@ async fn download_execute_batch(
                 .collect::<Result<Vec<_>, String>>();
             match next_hashes {
                 Ok(next_hashes) => {
-                    let primary_len = next_hashes.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
-                    let (primary_hashes, auxiliary_hashes) = next_hashes.split_at(primary_len);
+                    let (primary_hashes, auxiliary_hashes, _) =
+                        split_parallel_block_windows(&next_hashes);
                     if let Some(auxiliary) = auxiliary_session.as_mut() {
                         let (primary_result, auxiliary_result) = tokio::join!(
                             request_block_window(session, primary_hashes, "primary prefetch"),
@@ -7836,6 +7858,24 @@ mod tests {
         );
         primary_server.await.unwrap();
         auxiliary_server.await.unwrap();
+    }
+
+    #[test]
+    fn parallel_block_windows_keep_every_configured_batch_bounded() {
+        for (batch_len, expected) in [
+            (64, (64, 0, 0)),
+            (129, (128, 1, 0)),
+            (252, (128, 124, 0)),
+            (504, (128, 128, 248)),
+            (MAX_VALIDATION_BATCH_SIZE, (128, 128, 752)),
+        ] {
+            let hashes = vec![BlockHash::all_zeros(); batch_len];
+            let (primary, auxiliary, remainder) = split_parallel_block_windows(&hashes);
+            assert_eq!((primary.len(), auxiliary.len(), remainder.len()), expected);
+            assert!(primary.len() <= MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+            assert!(auxiliary.len() <= MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+            assert_eq!(primary.len() + auxiliary.len() + remainder.len(), batch_len);
+        }
     }
 
     #[tokio::test]
