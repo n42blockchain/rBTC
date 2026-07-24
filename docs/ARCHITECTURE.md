@@ -43,8 +43,12 @@ The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
 default executes through Core 26's pinned height-11,111 checkpoint in 16-block
-batches; the 2026-07-23 local acceptance run completed in 719 seconds using
-323,735,552 bytes and cleaned its isolated temporary directory.
+batches. After observing block 1,000, it sends a termination signal; the
+in-flight atomic batch may finish, then a second process must reopen the same
+headers, execution state, UTXOs, undo, and retained ledger before reaching the
+target. The 2026-07-23 restart acceptance run resumed from committed height
+1,024 and completed in 400 seconds using 320,573,440 bytes before cleaning its
+isolated temporary directory.
 
 ## UTXO layout
 

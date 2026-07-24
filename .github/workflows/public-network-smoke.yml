@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  height-one-thousand:
+  signet-height-one-thousand:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
