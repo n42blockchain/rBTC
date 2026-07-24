@@ -42,13 +42,16 @@ can be gathered without representing the ordinary daemon as production-ready.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
-default executes through Core 26's pinned height-11,111 checkpoint in 16-block
+default executes through Core 26's pinned height-105,000 checkpoint in 16-block
 batches. After observing block 1,000, it sends a termination signal; the
 in-flight atomic batch may finish, then a second process must reopen the same
 headers, execution state, UTXOs, undo, and retained ledger before reaching the
-target. The 2026-07-23 restart acceptance run resumed from committed height
-1,024 and completed in 400 seconds using 320,573,440 bytes before cleaning its
-isolated temporary directory.
+target. The range includes both historical BIP30 duplicate-transaction
+exceptions. The first deep run exposed that the batch overlay rejected their
+spent-and-recreated outpoint even though the durable layer supported it; after
+aligning those semantics, the fresh 2026-07-23 restart acceptance run executed
+both exceptions and completed in 2,350 seconds using 833,470,464 bytes before
+cleaning its isolated temporary directory.
 
 ## UTXO layout
 

@@ -14,9 +14,9 @@ case "$network" in
         ;;
     bitcoin)
         default_max_bytes=2147483648
-        default_timeout_seconds=1800
-        default_target_height=11111
-        default_target_hash=0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d
+        default_timeout_seconds=3600
+        default_target_height=105000
+        default_target_hash=00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97
         default_batch_size=16
         default_restart_height=1000
         ;;
