@@ -836,6 +836,7 @@ impl TransactionAdmissionPool {
                     TransactionPolicyError::InputScript(_)
                         | TransactionPolicyError::P2shRedeemScript(_)
                         | TransactionPolicyError::P2shSigops { .. }
+                        | TransactionPolicyError::UpgradableWitnessProgram(_)
                 )
             );
         witness_independent && self.remember_rejected_txid(txid)
@@ -1918,8 +1919,15 @@ pub fn dependency_packages(mut transactions: Vec<Transaction>) -> Vec<Vec<Transa
 #[cfg(test)]
 mod tests {
     use bitcoin::{
-        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute::LockTime,
-        blockdata::script::Builder, hashes::Hash, opcodes, transaction::Version,
+        Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        absolute::LockTime,
+        blockdata::script::Builder,
+        hashes::Hash,
+        opcodes,
+        script::PushBytesBuf,
+        secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey},
+        taproot::{LeafVersion, TaprootBuilder},
+        transaction::Version,
     };
     use tempfile::TempDir;
 
@@ -1993,6 +2001,53 @@ mod tests {
         let mut transaction = child(parent, value_sats);
         transaction.input[0].previous_output.vout = vout;
         transaction
+    }
+
+    fn taproot_script_path_spend(
+        index: u8,
+        script: &ScriptBuf,
+        leaf_version: LeafVersion,
+    ) -> (OutPoint, Utxo, Transaction) {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[index; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        let (internal_key, _) = XOnlyPublicKey::from_keypair(&keypair);
+        let spend_info = TaprootBuilder::new()
+            .add_leaf_with_ver(0, script.clone(), leaf_version)
+            .unwrap()
+            .finalize(&secp, internal_key)
+            .unwrap();
+        let control = spend_info
+            .control_block(&(script.clone(), leaf_version))
+            .unwrap()
+            .serialize();
+        let outpoint = OutPoint::new(Txid::from_byte_array([index; 32]), 0);
+        let output_script = Builder::new().push_opcode(opcodes::OP_TRUE).into_script();
+        (
+            outpoint,
+            Utxo {
+                value_sats: 100_000,
+                height: 1,
+                is_coinbase: false,
+                last_touched: 0,
+                creation_mtp: 1,
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(spend_info.output_key()).into_bytes(),
+            },
+            Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::from_slice(&[script.as_bytes(), &control]),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(90_000),
+                    script_pubkey: ScriptBuf::new_p2wsh(&output_script.wscript_hash()),
+                }],
+            },
+        )
     }
 
     fn unchecked_pool(transactions: Vec<Transaction>) -> TransactionAdmissionPool {
@@ -2080,6 +2135,89 @@ mod tests {
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
         assert!(pool.is_empty());
         assert_eq!(pool.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn upgradable_script_policy_rejections_are_consensus_valid_and_atomic() {
+        let (_directory, store) = store();
+        let future_leaf = LeafVersion::from_consensus(0xc2).unwrap();
+        let (future_outpoint, future_utxo, future_transaction) =
+            taproot_script_path_spend(91, &ScriptBuf::new(), future_leaf);
+        let (success_outpoint, success_utxo, success_transaction) = taproot_script_path_spend(
+            92,
+            &ScriptBuf::from_bytes(vec![opcodes::all::OP_RESERVED.to_u8()]),
+            LeafVersion::TapScript,
+        );
+
+        let mut future_program = vec![opcodes::all::OP_PUSHNUM_2.to_u8(), 32];
+        future_program.extend([3; 32]);
+        let future_program = ScriptBuf::from_bytes(future_program);
+        let redeem_push = PushBytesBuf::try_from(future_program.as_bytes().to_vec()).unwrap();
+        let wrapped_outpoint = OutPoint::new(Txid::from_byte_array([93; 32]), 0);
+        let wrapped_utxo = Utxo {
+            value_sats: 100_000,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 1,
+            script_pubkey: ScriptBuf::new_p2sh(&future_program.script_hash()).into_bytes(),
+        };
+        let output_script = Builder::new().push_opcode(opcodes::OP_TRUE).into_script();
+        let wrapped_transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: wrapped_outpoint,
+                script_sig: Builder::new().push_slice(redeem_push).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new_p2wsh(&output_script.wscript_hash()),
+            }],
+        };
+        store
+            .apply(
+                &[],
+                &[
+                    (future_outpoint.into(), future_utxo),
+                    (success_outpoint.into(), success_utxo),
+                    (wrapped_outpoint.into(), wrapped_utxo),
+                ],
+            )
+            .unwrap();
+
+        let mut active_context = context();
+        active_context.script_flags |= bitcoinconsensus::VERIFY_TAPROOT;
+        let cases = [
+            (
+                future_outpoint,
+                future_transaction,
+                TransactionPolicyError::UpgradableTaprootLeafVersion(0),
+            ),
+            (
+                success_outpoint,
+                success_transaction,
+                TransactionPolicyError::TapscriptOpSuccess(0),
+            ),
+            (
+                wrapped_outpoint,
+                wrapped_transaction,
+                TransactionPolicyError::UpgradableWitnessProgram(0),
+            ),
+        ];
+        let mut pool = TransactionAdmissionPool::default();
+        for (outpoint, transaction, expected) in cases {
+            let error = pool.admit(&store, transaction, active_context).unwrap_err();
+            let TransactionAdmissionError::Policy(actual) = error else {
+                panic!("expected policy rejection, got {error}");
+            };
+            assert_eq!(actual, expected);
+            assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+            assert!(pool.is_empty());
+            assert_eq!(pool.retained_bytes(), 0);
+        }
     }
 
     #[test]
@@ -3015,6 +3153,12 @@ mod tests {
             TransactionAdmissionError::Policy(TransactionPolicyError::InputScript(0));
         assert!(pool.remember_terminal_rejection(&witness_transaction, &input_standardness));
         assert!(pool.is_recently_rejected(witness_transaction.compute_txid()));
+
+        let upgradable_program = spend(93).2;
+        let upgradable_standardness =
+            TransactionAdmissionError::Policy(TransactionPolicyError::UpgradableWitnessProgram(0));
+        assert!(pool.remember_terminal_rejection(&upgradable_program, &upgradable_standardness));
+        assert!(pool.is_recently_rejected(upgradable_program.compute_txid()));
 
         let mut legacy_transaction = spend(92).2;
         legacy_transaction.input[0].witness = Witness::new();

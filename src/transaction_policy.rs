@@ -1,6 +1,9 @@
 //! Local transaction relay policy kept separate from consensus validation.
 
-use bitcoin::{OutPoint, Script, ScriptBuf, Transaction};
+use bitcoin::{
+    OutPoint, Script, ScriptBuf, Transaction, WitnessVersion,
+    opcodes::{Class, ClassifyContext},
+};
 use thiserror::Error;
 
 /// Core 26's minimum non-witness transaction size used by standardness policy.
@@ -96,6 +99,9 @@ pub enum TransactionPolicyError {
     /// Witness data is attached to a non-witness input.
     #[error("input {0} has witness data for a non-witness program")]
     UnexpectedWitness(usize),
+    /// A witness program is reserved for a future soft fork under standard policy.
+    #[error("input {0} spends an upgradable witness program")]
+    UpgradableWitnessProgram(usize),
     /// A P2WSH witness script exceeds the standard byte ceiling.
     #[error("input {0} P2WSH script exceeds the standard size limit")]
     WitnessScriptSize(usize),
@@ -116,6 +122,12 @@ pub enum TransactionPolicyError {
     /// A Taproot script-path spend has an empty control block.
     #[error("input {0} has an empty Taproot control block")]
     TaprootControlBlock(usize),
+    /// A Taproot leaf version is reserved for a future soft fork.
+    #[error("input {0} spends an upgradable Taproot leaf version")]
+    UpgradableTaprootLeafVersion(usize),
+    /// A tapscript contains an OP_SUCCESS opcode reserved for a future soft fork.
+    #[error("input {0} tapscript contains a discouraged OP_SUCCESS opcode")]
+    TapscriptOpSuccess(usize),
     /// A tapscript argument item exceeds the standard byte ceiling.
     #[error("input {input} tapscript stack item {item} exceeds the standard size limit")]
     TapscriptStackItemSize {
@@ -234,6 +246,11 @@ pub fn validate_standard_inputs(
                     limit: MAX_STANDARD_P2SH_SIGOPS,
                 });
             }
+            if redeem_script.is_witness_program()
+                && !is_standard_witness_program(redeem_script, true)
+            {
+                return Err(TransactionPolicyError::UpgradableWitnessProgram(index));
+            }
         }
         if input.witness.is_empty() {
             continue;
@@ -264,33 +281,63 @@ pub fn validate_standard_inputs(
             }
         }
         if witness_program.is_p2tr() && !prevout.is_p2sh() {
-            let stack = input.witness.iter().collect::<Vec<_>>();
-            if stack.len() >= 2
-                && stack.last().is_some_and(|item| {
-                    item.first() == Some(&bitcoin::taproot::TAPROOT_ANNEX_PREFIX)
-                })
-            {
-                return Err(TransactionPolicyError::TaprootAnnex(index));
-            }
-            if stack.len() >= 2 {
-                let control = stack.last().expect("script path has a control block");
-                if control.is_empty() {
-                    return Err(TransactionPolicyError::TaprootControlBlock(index));
-                }
-                if control[0] & 0xfe == bitcoin::taproot::TAPROOT_LEAF_TAPSCRIPT {
-                    for (item, value) in stack[..stack.len() - 2].iter().enumerate() {
-                        if value.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE {
-                            return Err(TransactionPolicyError::TapscriptStackItemSize {
-                                input: index,
-                                item,
-                            });
-                        }
-                    }
-                }
-            }
+            validate_standard_taproot_witness(index, &input.witness)?;
         }
     }
     Ok(())
+}
+
+fn validate_standard_taproot_witness(
+    input: usize,
+    witness: &bitcoin::Witness,
+) -> Result<(), TransactionPolicyError> {
+    let stack = witness.iter().collect::<Vec<_>>();
+    if stack.len() >= 2
+        && stack
+            .last()
+            .is_some_and(|item| item.first() == Some(&bitcoin::taproot::TAPROOT_ANNEX_PREFIX))
+    {
+        return Err(TransactionPolicyError::TaprootAnnex(input));
+    }
+    if stack.len() < 2 {
+        return Ok(());
+    }
+    let control = stack.last().expect("script path has a control block");
+    if control.is_empty() {
+        return Err(TransactionPolicyError::TaprootControlBlock(input));
+    }
+    if control[0] & 0xfe != bitcoin::taproot::TAPROOT_LEAF_TAPSCRIPT {
+        return Err(TransactionPolicyError::UpgradableTaprootLeafVersion(input));
+    }
+    let tapscript = Script::from_bytes(stack[stack.len() - 2]);
+    for instruction in tapscript.instructions() {
+        match instruction {
+            Ok(bitcoin::script::Instruction::Op(opcode))
+                if opcode.classify(ClassifyContext::TapScript) == Class::SuccessOp =>
+            {
+                return Err(TransactionPolicyError::TapscriptOpSuccess(input));
+            }
+            Ok(_) => {}
+            // Consensus validation runs first. A parse error before
+            // OP_SUCCESS is therefore already terminal, while an earlier
+            // OP_SUCCESS has been returned above.
+            Err(_) => break,
+        }
+    }
+    for (item, value) in stack[..stack.len() - 2].iter().enumerate() {
+        if value.len() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE {
+            return Err(TransactionPolicyError::TapscriptStackItemSize { input, item });
+        }
+    }
+    Ok(())
+}
+
+fn is_standard_witness_program(script: &Script, p2sh_wrapped: bool) -> bool {
+    match script.witness_version() {
+        Some(WitnessVersion::V0) => script.is_p2wpkh() || script.is_p2wsh(),
+        Some(WitnessVersion::V1) => !p2sh_wrapped && script.is_p2tr(),
+        _ => false,
+    }
 }
 
 fn is_bare_multisig(script: &Script, maximum_public_keys: usize) -> bool {
@@ -659,6 +706,84 @@ mod tests {
             validate_standard_inputs(&transaction, &[prevout]),
             Err(TransactionPolicyError::TapscriptStackItemSize { input: 0, item: 0 })
         );
+    }
+
+    #[test]
+    fn rejects_p2sh_wrapped_upgradable_witness_programs_even_without_witness() {
+        let mut transaction = standard_transaction();
+        transaction.input[0].witness = Witness::new();
+
+        for redeem_script in [
+            ScriptBuf::from_bytes({
+                let mut script = vec![opcodes::all::OP_PUSHNUM_2.to_u8(), 32];
+                script.extend([2; 32]);
+                script
+            }),
+            ScriptBuf::from_bytes({
+                let mut script = vec![opcodes::all::OP_PUSHNUM_1.to_u8(), 32];
+                script.extend([3; 32]);
+                script
+            }),
+            ScriptBuf::from_bytes({
+                let mut script = vec![opcodes::OP_0.to_u8(), 21];
+                script.extend([4; 21]);
+                script
+            }),
+        ] {
+            assert!(redeem_script.is_witness_program());
+            let redeem_push = PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap();
+            transaction.input[0].script_sig = Builder::new().push_slice(redeem_push).into_script();
+            let prevout = ScriptBuf::new_p2sh(&redeem_script.script_hash());
+            assert_eq!(
+                validate_standard_inputs(&transaction, &[prevout]),
+                Err(TransactionPolicyError::UpgradableWitnessProgram(0))
+            );
+        }
+
+        let standard_redeem = ScriptBuf::new_p2wsh(
+            &Builder::new()
+                .push_opcode(opcodes::OP_TRUE)
+                .into_script()
+                .wscript_hash(),
+        );
+        let redeem_push = PushBytesBuf::try_from(standard_redeem.as_bytes().to_vec()).unwrap();
+        transaction.input[0].script_sig = Builder::new().push_slice(redeem_push).into_script();
+        let prevout = ScriptBuf::new_p2sh(&standard_redeem.script_hash());
+        assert_eq!(validate_standard_inputs(&transaction, &[prevout]), Ok(()));
+    }
+
+    #[test]
+    fn rejects_upgradable_taproot_leaf_versions_and_tapscript_op_success() {
+        let mut transaction = standard_transaction();
+        transaction.input[0].script_sig = ScriptBuf::new();
+        let mut program = vec![opcodes::all::OP_PUSHNUM_1.to_u8(), 32];
+        program.extend([2; 32]);
+        let prevout = ScriptBuf::from_bytes(program);
+        assert!(prevout.is_p2tr());
+
+        transaction.input[0].witness =
+            Witness::from_slice(&[vec![opcodes::OP_TRUE.to_u8()], vec![0xc2]]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::UpgradableTaprootLeafVersion(0))
+        );
+
+        transaction.input[0].witness =
+            Witness::from_slice(&[vec![opcodes::all::OP_RESERVED.to_u8()], vec![0xc0]]);
+        assert_eq!(
+            validate_standard_inputs(&transaction, std::slice::from_ref(&prevout)),
+            Err(TransactionPolicyError::TapscriptOpSuccess(0))
+        );
+
+        transaction.input[0].witness = Witness::from_slice(&[
+            vec![
+                1,
+                opcodes::all::OP_RESERVED.to_u8(),
+                opcodes::OP_TRUE.to_u8(),
+            ],
+            vec![0xc0],
+        ]);
+        assert_eq!(validate_standard_inputs(&transaction, &[prevout]), Ok(()));
     }
 
     #[test]
