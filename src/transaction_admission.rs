@@ -199,6 +199,18 @@ pub enum TransactionAdmissionError {
     /// A replacement package added an input from an unrelated unconfirmed transaction.
     #[error("replacement adds unconfirmed input {0}")]
     ReplacementAddsUnconfirmedInput(OutPoint),
+    /// A replacement's feerate did not strictly exceed one direct conflict.
+    #[error(
+        "replacement feerate {replacement_fee_rate_sat_kvb} sat/kvB does not exceed direct conflict {conflict_txid} at {conflict_fee_rate_sat_kvb} sat/kvB"
+    )]
+    InsufficientReplacementFeerate {
+        /// Replacement transaction or package feerate.
+        replacement_fee_rate_sat_kvb: u64,
+        /// Directly conflicting transaction.
+        conflict_txid: Txid,
+        /// Direct conflict's individual feerate.
+        conflict_fee_rate_sat_kvb: u64,
+    },
     /// A replacement did not pay more than all transactions it would remove.
     #[error(
         "replacement fee {replacement_fee_sats} sat does not exceed conflicting fee {conflicts_fee_sats} sat"
@@ -341,6 +353,7 @@ struct TransactionRequestAnnouncement {
 struct ReplacementPlan {
     txids: BTreeSet<Txid>,
     conflicts_fee_sats: u64,
+    direct_conflicts: BTreeMap<Txid, (u64, usize)>,
 }
 
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
@@ -1090,7 +1103,7 @@ impl TransactionAdmissionPool {
             replacement_fee_sats,
             replacement.conflicts_fee_sats,
             replacement_vbytes,
-            !replacement.txids.is_empty(),
+            &replacement.direct_conflicts,
         )?;
         let protected = accepted.iter().copied().collect::<BTreeSet<_>>();
         let evicted = self.evict_to_capacity(&protected)?;
@@ -1166,6 +1179,17 @@ impl TransactionAdmissionPool {
             });
         }
         self.validate_replacement_inputs(ordered, &direct_conflicts)?;
+        let direct_conflict_fees_and_sizes = self
+            .entries
+            .iter()
+            .filter(|entry| direct_conflicts.contains(&entry.transaction.compute_txid()))
+            .map(|entry| {
+                (
+                    entry.transaction.compute_txid(),
+                    (entry.fee_sats, entry.policy_vsize),
+                )
+            })
+            .collect();
         let conflicts_fee_sats = self
             .entries
             .iter()
@@ -1177,6 +1201,7 @@ impl TransactionAdmissionPool {
         Ok(ReplacementPlan {
             txids,
             conflicts_fee_sats,
+            direct_conflicts: direct_conflict_fees_and_sizes,
         })
     }
 
@@ -1590,10 +1615,26 @@ fn validate_replacement_fees(
     replacement_fee_sats: u64,
     conflicts_fee_sats: u64,
     replacement_vbytes: usize,
-    is_replacement: bool,
+    direct_conflicts: &BTreeMap<Txid, (u64, usize)>,
 ) -> Result<(), TransactionAdmissionError> {
-    if !is_replacement {
+    if direct_conflicts.is_empty() {
         return Ok(());
+    }
+    let replacement_fee_rate_sat_kvb = fee_rate_sat_kvb(replacement_fee_sats, replacement_vbytes);
+    if let Some((conflict_txid, conflict_fee_rate_sat_kvb)) =
+        direct_conflicts
+            .iter()
+            .find_map(|(txid, (fee_sats, vbytes))| {
+                let conflict_fee_rate_sat_kvb = fee_rate_sat_kvb(*fee_sats, *vbytes);
+                (replacement_fee_rate_sat_kvb <= conflict_fee_rate_sat_kvb)
+                    .then_some((*txid, conflict_fee_rate_sat_kvb))
+            })
+    {
+        return Err(TransactionAdmissionError::InsufficientReplacementFeerate {
+            replacement_fee_rate_sat_kvb,
+            conflict_txid,
+            conflict_fee_rate_sat_kvb,
+        });
     }
     if replacement_fee_sats <= conflicts_fee_sats {
         return Err(TransactionAdmissionError::InsufficientReplacementFee {
@@ -1612,6 +1653,14 @@ fn validate_replacement_fees(
         });
     }
     Ok(())
+}
+
+fn fee_rate_sat_kvb(fee_sats: u64, vbytes: usize) -> u64 {
+    u64::try_from(
+        u128::from(fee_sats).saturating_mul(u128::from(SATOSHIS_PER_KVB))
+            / u128::try_from(vbytes).unwrap_or(u128::MAX),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn fee_for_rate(rate_sat_kvb: u64, vbytes: usize) -> u64 {
@@ -2578,6 +2627,10 @@ mod tests {
         let original_txid = original.compute_txid();
         let mut insufficient_fee = original.clone();
         insufficient_fee.output[0].value = Amount::from_sat(90_001);
+        insufficient_fee.output[0].script_pubkey = Builder::new()
+            .push_opcode(opcodes::all::OP_RETURN)
+            .push_slice([0_u8; 4])
+            .into_script();
         let mut replacement = original.clone();
         replacement.output[0].value = Amount::from_sat(89_000);
         let replacement_txid = replacement.compute_txid();
@@ -2905,18 +2958,26 @@ mod tests {
         let original_txid = original.compute_txid();
         let mut lower_fee = original.clone();
         lower_fee.output[0].value = Amount::from_sat(90_001);
+        lower_fee.output[0].script_pubkey = Builder::new()
+            .push_opcode(opcodes::all::OP_RETURN)
+            .push_slice([0_u8; 4])
+            .into_script();
         let mut insufficient_increment = original.clone();
         insufficient_increment.output[0].value = Amount::from_sat(89_999);
         let mut pool = TransactionAdmissionPool::default();
         pool.admit(&store, original, context()).unwrap();
 
-        assert!(matches!(
-            pool.admit(&store, lower_fee, context()),
-            Err(TransactionAdmissionError::InsufficientReplacementFee {
-                replacement_fee_sats: 9_999,
-                conflicts_fee_sats: 10_000,
-            })
-        ));
+        let lower_fee_error = pool.admit(&store, lower_fee, context()).unwrap_err();
+        assert!(
+            matches!(
+                &lower_fee_error,
+                TransactionAdmissionError::InsufficientReplacementFee {
+                    replacement_fee_sats: 9_999,
+                    conflicts_fee_sats: 10_000,
+                }
+            ),
+            "{lower_fee_error:?}"
+        );
         assert_eq!(txids(&pool), vec![original_txid]);
         assert!(matches!(
             pool.admit(&store, insufficient_increment, context()),
@@ -2926,6 +2987,72 @@ mod tests {
             }) if required_fee_sats > 1
         ));
         assert_eq!(txids(&pool), vec![original_txid]);
+    }
+
+    #[test]
+    fn replacement_must_strictly_raise_each_direct_conflict_feerate() {
+        let (_directory, store) = store();
+        let (first_outpoint, first_utxo, mut original) = spend(107);
+        let (second_outpoint, second_utxo, second_spend) = spend(108);
+        store
+            .apply(
+                &[],
+                &[
+                    (first_outpoint.into(), first_utxo),
+                    (second_outpoint.into(), second_utxo),
+                ],
+            )
+            .unwrap();
+        signal_rbf(&mut original);
+        let original_txid = original.compute_txid();
+        let original_fee = 10_000;
+        let original_rate = fee_rate_sat_kvb(original_fee, original.vsize());
+        let mut replacement = original.clone();
+        replacement.input.push(second_spend.input[0].clone());
+        let replacement_vbytes = replacement.vsize();
+        let lower_rate_fee = original_fee + u64::try_from(replacement_vbytes).unwrap();
+        replacement.output[0].value = Amount::from_sat(200_000 - lower_rate_fee);
+        let lower_rate = fee_rate_sat_kvb(lower_rate_fee, replacement_vbytes);
+        assert!(lower_rate <= original_rate);
+        assert_eq!(
+            lower_rate_fee - original_fee,
+            u64::try_from(replacement_vbytes).unwrap()
+        );
+
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, original, context()).unwrap();
+        let before = pool.snapshot();
+        assert!(matches!(
+            pool.admit(&store, replacement.clone(), context()),
+            Err(TransactionAdmissionError::InsufficientReplacementFeerate {
+                replacement_fee_rate_sat_kvb,
+                conflict_txid,
+                conflict_fee_rate_sat_kvb,
+            }) if replacement_fee_rate_sat_kvb == lower_rate
+                && conflict_txid == original_txid
+                && conflict_fee_rate_sat_kvb == original_rate
+        ));
+        assert_eq!(pool.snapshot(), before);
+        assert!(store.get(second_outpoint.into()).unwrap().is_some());
+
+        let higher_rate_fee = u64::try_from(
+            (u128::from(original_rate + 1) * u128::try_from(replacement_vbytes).unwrap())
+                .div_ceil(u128::from(SATOSHIS_PER_KVB)),
+        )
+        .unwrap();
+        replacement.output[0].value = Amount::from_sat(200_000 - higher_rate_fee);
+        assert!(fee_rate_sat_kvb(higher_rate_fee, replacement_vbytes) > original_rate);
+        let replacement_txid = replacement.compute_txid();
+        let outcome = pool.admit(&store, replacement, context()).unwrap();
+        assert!(matches!(
+            outcome,
+            TransactionAdmissionOutcome::Accepted {
+                txid,
+                replaced: 1,
+                ..
+            } if txid == replacement_txid
+        ));
+        assert_eq!(txids(&pool), vec![replacement_txid]);
     }
 
     #[test]

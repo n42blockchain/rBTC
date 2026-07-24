@@ -59,6 +59,8 @@ Core 26 package-fee subset semantics now prevent parents from paying for childre
 
 Core 26 package identity and raw-weight semantics are covered as well. Submitted txids are deduplicated before active-pool lookup, while one submitted alternate-witness transaction whose txid is already admitted is replaced by the validated pool entry for child dependency resolution and cannot overwrite it. Multi-transaction packages use one 404,000-weight-unit aggregate ceiling instead of summing individually rounded virtual sizes; singleton submissions proceed to the ordinary 400,000-weight-unit transaction standardness rule. Boundary and rollback tests cover all three cases.
 
+Core 26's remaining BIP125 direct-conflict rate gate is now explicit. A replacement's integer sat/kvB feerate must strictly exceed every directly conflicting transaction before aggregate removed fees and the incremental relay charge are considered; rBTC applies the same rule to the aggregate fee and policy vsize of its atomic replacement-package extension. A larger candidate that pays both absolute fee rules while lowering the original feerate is rejected without mutation, and a one-sat/kvB-higher boundary succeeds. Full-RBF still bypasses only signaling.
+
 ## Phase 2 — data services
 
 - [x] In-memory explorer index implementation for embedded/regtest use.
