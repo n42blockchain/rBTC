@@ -1,15 +1,23 @@
 //! Atomic block-to-chainstate transition checks.
 
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
+};
+
 use bitcoin::{
     Block, TxMerkleNode,
-    consensus::Encodable,
+    consensus::{Encodable, serialize},
     hashes::{Hash, sha256d},
 };
 use thiserror::Error;
 
 use crate::{
     chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_deferred_scripts},
-    consensus::{ConsensusError, verify_transaction_scripts_with_flags},
+    consensus::{
+        ConsensusError, verify_serialized_transaction_scripts_with_flags,
+        verify_transaction_scripts_with_flags,
+    },
     signet::{SignetError, validate_signet_block_solution},
     utxo::{Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -34,6 +42,82 @@ struct DeferredScriptCheck<'a> {
     index: usize,
     transaction: &'a bitcoin::Transaction,
     prevouts: Vec<Utxo>,
+}
+
+struct ScriptValidationJob {
+    index: usize,
+    raw_transaction: Vec<u8>,
+    input_count: usize,
+    prevouts: Vec<Utxo>,
+    script_flags: u32,
+    result: mpsc::Sender<(usize, Result<(), ConsensusError>)>,
+}
+
+#[derive(Default)]
+struct ScriptValidationQueue {
+    jobs: Mutex<VecDeque<ScriptValidationJob>>,
+    available: Condvar,
+}
+
+struct ScriptValidationPool {
+    queue: Arc<ScriptValidationQueue>,
+    workers: usize,
+}
+
+impl ScriptValidationPool {
+    fn new() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .max(1);
+        let queue = Arc::new(ScriptValidationQueue::default());
+        for worker in 0..workers {
+            let queue = Arc::clone(&queue);
+            std::thread::Builder::new()
+                .name(format!("rbtc-script-{worker}"))
+                .spawn(move || script_validation_worker(&queue))
+                .expect("script-validation worker must start");
+        }
+        Self { queue, workers }
+    }
+
+    fn enqueue(&self, job: ScriptValidationJob) {
+        self.queue
+            .jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(job);
+        self.queue.available.notify_one();
+    }
+}
+
+fn script_validation_worker(queue: &ScriptValidationQueue) {
+    loop {
+        let job = {
+            let mut jobs = queue
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while jobs.is_empty() {
+                jobs = queue
+                    .available
+                    .wait(jobs)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            jobs.pop_front().expect("non-empty script queue")
+        };
+        let validation = verify_serialized_transaction_scripts_with_flags(
+            &job.raw_transaction,
+            job.input_count,
+            &job.prevouts,
+            job.script_flags,
+        );
+        let _ = job.result.send((job.index, validation));
+    }
+}
+
+fn script_validation_pool() -> &'static ScriptValidationPool {
+    static POOL: OnceLock<ScriptValidationPool> = OnceLock::new();
+    POOL.get_or_init(ScriptValidationPool::new)
 }
 
 /// Block-level validation or atomic-application error.
@@ -349,7 +433,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
                 }
             }
             Err(source) => {
-                let script_failure = verify_deferred_scripts(&script_checks, script_flags);
+                let script_failure = verify_deferred_scripts(script_checks, script_flags);
                 rollback(store, &applied, now, hot_window_secs)?;
                 if let Some((index, source)) = script_failure {
                     return Err(BlockError::Transaction {
@@ -361,7 +445,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
             }
         }
     }
-    if let Some((index, source)) = verify_deferred_scripts(&script_checks, script_flags) {
+    if let Some((index, source)) = verify_deferred_scripts(script_checks, script_flags) {
         rollback(store, &applied, now, hot_window_secs)?;
         return Err(BlockError::Transaction {
             index,
@@ -389,45 +473,45 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
 }
 
 fn verify_deferred_scripts(
-    checks: &[DeferredScriptCheck<'_>],
+    checks: Vec<DeferredScriptCheck<'_>>,
     script_flags: u32,
 ) -> Option<(usize, ConsensusError)> {
     if checks.is_empty() {
         return None;
     }
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(checks.len());
-    if workers == 1 {
-        return checks.iter().find_map(|check| {
+    let input_count = checks
+        .iter()
+        .map(|check| check.transaction.input.len())
+        .sum::<usize>();
+    let pool = script_validation_pool();
+    if pool.workers == 1 || checks.len() == 1 || input_count < 8 {
+        return checks.into_iter().find_map(|check| {
             verify_transaction_scripts_with_flags(check.transaction, &check.prevouts, script_flags)
                 .err()
                 .map(|error| (check.index, error))
         });
     }
-    let chunk_size = checks.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        let handles = checks
-            .chunks(chunk_size)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk.iter().find_map(|check| {
-                        verify_transaction_scripts_with_flags(
-                            check.transaction,
-                            &check.prevouts,
-                            script_flags,
-                        )
-                        .err()
-                        .map(|error| (check.index, error))
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().expect("script-validation worker panicked"))
-            .min_by_key(|(index, _)| *index)
-    })
+    let jobs = checks.len();
+    let (result, results) = mpsc::channel();
+    for check in checks {
+        pool.enqueue(ScriptValidationJob {
+            index: check.index,
+            raw_transaction: serialize(check.transaction),
+            input_count: check.transaction.input.len(),
+            prevouts: check.prevouts,
+            script_flags,
+            result: result.clone(),
+        });
+    }
+    drop(result);
+    (0..jobs)
+        .filter_map(|_| {
+            let (index, validation) = results
+                .recv()
+                .expect("script-validation worker terminated without a result");
+            validation.err().map(|error| (index, error))
+        })
+        .min_by_key(|(index, _)| *index)
 }
 
 /// Validates block commitments and context-free structure without mutating UTXO state.
@@ -730,6 +814,64 @@ mod tests {
         ));
         let output = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 0));
         assert!(store.get(output).unwrap().is_none());
+    }
+
+    #[test]
+    fn parallel_script_pool_reports_the_earliest_failure_and_rolls_back() {
+        let (_dir, store) = store();
+        let outpoints = (0_u8..8)
+            .map(|byte| OutPoint::new(bitcoin::Txid::from_byte_array([byte; 32]), 0))
+            .collect::<Vec<_>>();
+        let spendable = outpoints
+            .iter()
+            .enumerate()
+            .map(|(index, outpoint)| {
+                (
+                    OutPointKey::from(*outpoint),
+                    Utxo {
+                        value_sats: 1,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: vec![if matches!(index, 2 | 6) { 0x00 } else { 0x51 }],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        store.apply(&[], &spendable).unwrap();
+        let spends = outpoints
+            .chunks_exact(2)
+            .map(|pair| Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: pair
+                    .iter()
+                    .map(|outpoint| TxIn {
+                        previous_output: *outpoint,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::default(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let coinbase = coinbase();
+        let coinbase_output = OutPointKey::from(OutPoint::new(coinbase.compute_txid(), 0));
+        let candidate = block(std::iter::once(coinbase).chain(spends).collect());
+
+        assert!(matches!(
+            apply_block(&store, &candidate, 2, 100, 0, 60, 0),
+            Err(BlockError::Transaction { index: 2, .. })
+        ));
+        assert!(store.get(coinbase_output).unwrap().is_none());
+        for outpoint in outpoints {
+            assert!(store.get(outpoint.into()).unwrap().is_some());
+        }
     }
 
     #[test]

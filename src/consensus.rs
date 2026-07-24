@@ -59,10 +59,28 @@ pub fn verify_transaction_scripts_with_flags(
     prevouts: &[Utxo],
     flags: u32,
 ) -> Result<(), ConsensusError> {
-    if transaction.input.len() != prevouts.len() {
+    verify_serialized_transaction_scripts_with_flags(
+        &serialize(transaction),
+        transaction.input.len(),
+        prevouts,
+        flags,
+    )
+}
+
+/// Validates every input from an already consensus-serialized transaction.
+///
+/// Batch validation can serialize work before handing it to persistent worker
+/// threads, avoiding both transaction cloning and per-block thread creation.
+pub(crate) fn verify_serialized_transaction_scripts_with_flags(
+    raw_transaction: &[u8],
+    input_count: usize,
+    prevouts: &[Utxo],
+    flags: u32,
+) -> Result<(), ConsensusError> {
+    if input_count != prevouts.len() {
         return Err(ConsensusError::PrevoutCount {
             prevouts: prevouts.len(),
-            inputs: transaction.input.len(),
+            inputs: input_count,
         });
     }
     let spent_outputs = prevouts
@@ -77,12 +95,11 @@ pub fn verify_transaction_scripts_with_flags(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let raw_transaction = serialize(transaction);
     for (input, utxo) in prevouts.iter().enumerate() {
         bitcoinconsensus::verify_with_flags(
             &utxo.script_pubkey,
             utxo.value_sats,
-            &raw_transaction,
+            raw_transaction,
             Some(&spent_outputs),
             input,
             flags,

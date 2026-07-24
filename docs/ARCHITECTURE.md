@@ -88,11 +88,17 @@ Block validation runs against a lazy in-memory UTXO overlay and commits the net 
 Within each block, prevout resolution, maturity/lock-time checks, value
 accounting, and UTXO mutation remain sequential so an input can consume an
 output created earlier in that block. The resolved prevouts are then immutable
-script-validation jobs distributed across the host's available CPU threads.
-Every script must pass before the block checkpoint can commit; a failure reports
-the earliest failing transaction and rolls back all tentative mutations.
+script-validation jobs distributed across a persistent, bounded host-CPU
+worker pool. Serialized jobs are scheduled dynamically by transaction instead
+of creating and joining a fresh set of threads for every block; small input
+sets stay serial. Every script must pass before the block checkpoint can
+commit; out-of-order completion still reports the earliest failing transaction
+and rolls back all tentative mutations.
 Three isolated release runs of the historical full-block regression improved
 from a 3.59-second median at `534c28c` to 2.36 seconds, a 1.52× speedup.
+Against the immediately preceding scoped-thread implementation, a second
+three-run hot release A/B improved the same workload from 4.00 seconds to a
+3.30-second median (17.5% lower elapsed time).
 
 Ordinary serving-chain commits retain redb quick repair. Bounded bulk
 validation may explicitly defer the allocator-state repair write while keeping
