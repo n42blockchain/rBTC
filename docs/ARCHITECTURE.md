@@ -27,7 +27,10 @@ period-end block hashes inside the deployment configuration; this makes the
 cache branch-specific, lets cloned validating/standby DAGs share immutable
 results, and reduces sequential deployment evaluation to one new period of
 work instead of rescanning from genesis for every candidate. A `--vbparams`
-override detaches to an empty parameter-specific cache.
+override detaches to an empty parameter-specific cache. Hardened mainnet and
+legacy-testnet checkpoints are exact-height commitments; after any such hash is
+known, the contextual validator also rejects a newly announced fork below the
+highest known checkpoint immediately, matching Core's old-fork resource gate.
 
 ## UTXO layout
 

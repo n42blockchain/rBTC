@@ -87,6 +87,14 @@ pub enum HeaderError {
         /// Candidate header hash.
         actual: BlockHash,
     },
+    /// A new fork branches below a checkpoint already present in the header index.
+    #[error("header at height {height} forks below known checkpoint height {checkpoint_height}")]
+    ForkBeforeCheckpoint {
+        /// Candidate header height.
+        height: u32,
+        /// Highest hardened checkpoint already known by this DAG.
+        checkpoint_height: u32,
+    },
     /// A buried deployment requires a newer block-header version.
     #[error("obsolete block version {actual} at height {height}; minimum version is {required}")]
     ObsoleteVersion {
@@ -113,6 +121,7 @@ impl HeaderError {
                 | Self::TimeTooOld { .. }
                 | Self::UnexpectedDifficulty { .. }
                 | Self::CheckpointMismatch { .. }
+                | Self::ForkBeforeCheckpoint { .. }
                 | Self::ObsoleteVersion { .. }
         )
     }
@@ -327,6 +336,14 @@ impl HeaderDag {
             .height
             .checked_add(1)
             .ok_or(HeaderError::HeightOverflow)?;
+        if let Some(checkpoint_height) = self.last_known_checkpoint_height() {
+            if height < checkpoint_height {
+                return Err(HeaderError::ForkBeforeCheckpoint {
+                    height,
+                    checkpoint_height,
+                });
+            }
+        }
         let required_version = self.deployments.minimum_block_version(height);
         let actual_version = header.version.to_consensus();
         if actual_version < required_version {
@@ -448,6 +465,28 @@ impl HeaderDag {
         }
         (current.height == height).then_some(current)
     }
+
+    fn last_known_checkpoint_height(&self) -> Option<u32> {
+        checkpoint_heights(self.params.network)
+            .iter()
+            .rev()
+            .copied()
+            .find(|height| {
+                checkpoint_hash(self.params.network, *height)
+                    .is_some_and(|hash| self.headers.contains_key(&hash))
+            })
+    }
+}
+
+const fn checkpoint_heights(network: Network) -> &'static [u32] {
+    match network {
+        Network::Bitcoin => &[
+            11_111, 33_333, 74_000, 105_000, 134_444, 168_000, 193_000, 210_000, 216_116, 225_430,
+            250_000, 279_000, 295_000,
+        ],
+        Network::Testnet => &[546],
+        Network::Testnet4 | Network::Signet | Network::Regtest => &[],
+    }
 }
 
 fn checkpoint_hash(network: Network, height: u32) -> Option<BlockHash> {
@@ -517,6 +556,13 @@ mod tests {
             HeaderError::UnexpectedDifficulty {
                 expected: 1,
                 actual: 2,
+            }
+            .is_peer_invalid()
+        );
+        assert!(
+            HeaderError::ForkBeforeCheckpoint {
+                height: 1,
+                checkpoint_height: 2,
             }
             .is_peer_invalid()
         );
@@ -824,5 +870,39 @@ mod tests {
             checkpoint_hash(Network::Testnet, 546).unwrap().to_string(),
             "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"
         );
+    }
+
+    #[test]
+    fn known_checkpoint_rejects_an_older_fork_immediately() {
+        let mut dag = HeaderDag::new(Network::Bitcoin);
+        let genesis = dag.active_tip();
+        let checkpoint_height = 11_111;
+        let checkpoint_hash = checkpoint_hash(Network::Bitcoin, checkpoint_height).unwrap();
+        dag.headers.insert(
+            checkpoint_hash,
+            HeaderInfo {
+                header: genesis.header,
+                hash: checkpoint_hash,
+                height: checkpoint_height,
+                chainwork: genesis.chainwork,
+            },
+        );
+        let candidate = Header {
+            version: Version::ONE,
+            prev_blockhash: genesis.hash,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: genesis.header.time + 1,
+            bits: genesis.header.bits,
+            nonce: 0,
+        };
+
+        assert!(matches!(
+            dag.insert_contextual(candidate, candidate.time),
+            Err(HeaderError::ForkBeforeCheckpoint {
+                height: 1,
+                checkpoint_height: 11_111,
+            })
+        ));
+        assert_eq!(dag.headers.len(), 2);
     }
 }
