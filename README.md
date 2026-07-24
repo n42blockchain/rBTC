@@ -107,6 +107,8 @@ Capacity eviction now raises a process-local rolling mempool minimum to the aggr
 
 For custom activation schedules, transaction admission keeps block consensus and relay policy separate. It first validates with the active next-block flags, then—only when that set is incomplete—rechecks scripts with every Core 26 standard flag exposed by `libbitcoinconsensus`: P2SH, strict DER signatures, NULLDUMMY, CLTV, CSV, Witness, and Taproot. A Core fixture that is valid with no flags but violates DERSIG/NULLDUMMY is rejected through the distinct standard-script policy path without changing the UTXO set or pool. Fully activated production contexts avoid the redundant second interpreter pass. Core's standard lock-time policy is independent as well: version-2 transactions must satisfy BIP68 for the next block even when a custom chain has not activated CSV. Exact height and 512-second boundaries are tested, while the active block path retains its configured activation semantics.
 
+Core 26 package fee aggregation now uses the same fee-bumping subpackage boundary rather than the entire submitted set. Only parents below the rolling mempool floor remain in the fee calculation with the child; parents that already pay their own way are excluded, so a rich parent cannot subsidize a low-fee child. Aggregation is limited to a tree of mutually independent direct parents plus one child. Every transaction still independently pays min-relay, and all package failures retain rBTC's atomic publication boundary.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

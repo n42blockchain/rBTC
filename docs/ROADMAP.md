@@ -55,6 +55,8 @@ Wallet transaction diffusion now keeps the active-socket completion boundary whi
 
 Core 26's public standard-script subset is now independent of custom consensus activation heights during transaction admission. Active-next-block flags run first; an incomplete set is followed by P2SH/DERSIG/NULLDUMMY/CLTV/CSV/Witness/Taproot verification against the same exact prevouts, while fully activated contexts skip duplicate execution. A pinned Core vector accepted under `VERIFY_NONE` and rejected under DERSIG/NULLDUMMY proves that the failure remains policy-only and leaves both UTXO state and the candidate pool unchanged. Core's `STANDARD_LOCKTIME_VERIFY_FLAGS` is also independent of custom CSV activation: version-2 mempool candidates always undergo read-only BIP68 checks for the next height and parent MTP, with exact height and 512-second equality boundaries, atomic failure, and witness-safe recent-reject caching covered. Policy-only interpreter flags outside the public ABI remain explicit open work.
 
+Core 26 package-fee subset semantics now prevent parents from paying for children. Aggregate rolling-fee evaluation is available only to a tree of mutually independent direct parents plus one child. Parents already satisfying the rolling floor are excluded before fee and policy-vsize summation; only below-floor parents and the child form the fee-bumping subpackage. A rich-parent/low-child case proves that whole-package fees can exceed the floor while the correct child-only subset is atomically rejected. Individual min-relay, existing-parent, replacement, deeper-chain, and non-tree paths receive no inappropriate aggregation.
+
 ## Phase 2 — data services
 
 - [x] In-memory explorer index implementation for embedded/regtest use.

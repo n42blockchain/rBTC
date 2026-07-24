@@ -1067,7 +1067,7 @@ impl TransactionAdmissionPool {
         }
 
         let ordered = topological_package_order(package)?;
-        let child_with_parents = is_child_with_parents(&ordered);
+        let child_with_parents = is_child_with_parents_tree(&ordered);
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
         let use_package_feerate = child_with_parents && replacement.txids.is_empty();
 
@@ -1216,6 +1216,14 @@ impl TransactionAdmissionPool {
         let mut accepted = Vec::with_capacity(ordered.len());
         let mut replacement_fee_sats = 0_u64;
         let mut replacement_vbytes = 0_usize;
+        let mut package_fee_sats = 0_u64;
+        let mut package_fee_vbytes = 0_usize;
+        let fee_bumping_child = use_package_feerate.then(|| {
+            ordered
+                .last()
+                .expect("a child-with-parents package is non-empty")
+                .compute_txid()
+        });
         let rolling_rate = self
             .effective_rolling_minimum_fee_sat_kvb()
             .max(SATOSHIS_PER_KVB);
@@ -1244,6 +1252,13 @@ impl TransactionAdmissionPool {
             }
             replacement_fee_sats = replacement_fee_sats.saturating_add(applied.fee_sats);
             replacement_vbytes = replacement_vbytes.saturating_add(applied.policy_vsize);
+            if use_package_feerate
+                && (fee_bumping_child == Some(txid)
+                    || applied.fee_sats < fee_for_rate(rolling_rate, applied.policy_vsize))
+            {
+                package_fee_sats = package_fee_sats.saturating_add(applied.fee_sats);
+                package_fee_vbytes = package_fee_vbytes.saturating_add(applied.policy_vsize);
+            }
             let serialized_len = serialize(&transaction).len();
             for input in &transaction.input {
                 self.spent.insert(input.previous_output, txid);
@@ -1261,10 +1276,10 @@ impl TransactionAdmissionPool {
             accepted.push(txid);
         }
         if use_package_feerate {
-            let minimum_sats = fee_for_rate(rolling_rate, replacement_vbytes);
-            if replacement_fee_sats < minimum_sats {
+            let minimum_sats = fee_for_rate(rolling_rate, package_fee_vbytes);
+            if package_fee_sats < minimum_sats {
                 return Err(TransactionAdmissionError::PackageRollingMinimumFee {
-                    fee_sats: replacement_fee_sats,
+                    fee_sats: package_fee_sats,
                     minimum_sats,
                 });
             }
@@ -1663,6 +1678,25 @@ fn is_child_with_parents(transactions: &[Transaction]) -> bool {
     parents
         .iter()
         .all(|parent| child_inputs.contains(&parent.compute_txid()))
+}
+
+fn is_child_with_parents_tree(transactions: &[Transaction]) -> bool {
+    if !is_child_with_parents(transactions) {
+        return false;
+    }
+    let (_, parents) = transactions
+        .split_last()
+        .expect("child-with-parents package is non-empty");
+    let parent_txids = parents
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<BTreeSet<_>>();
+    parents.iter().all(|parent| {
+        parent
+            .input
+            .iter()
+            .all(|input| !parent_txids.contains(&input.previous_output.txid))
+    })
 }
 
 struct AppliedAdmission {
@@ -2966,6 +3000,36 @@ mod tests {
     }
 
     #[test]
+    fn package_feerate_excludes_rich_parents_that_would_subsidize_the_child() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, parent) = spend(103);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut child = child(&parent, 80_000);
+        let child_min_relay = u64::try_from(child.vsize()).unwrap();
+        child.output[0].value = Amount::from_sat(parent.output[0].value.to_sat() - child_min_relay);
+        let rolling_rate = 5_000;
+        let whole_package_minimum = fee_for_rate(rolling_rate, parent.vsize() + child.vsize());
+        let whole_package_fee = 100_000 - parent.output[0].value.to_sat() + child_min_relay;
+        assert!(whole_package_fee >= whole_package_minimum);
+
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: rolling_rate,
+            ..TransactionAdmissionPool::default()
+        };
+        assert!(matches!(
+            pool.admit_package(&store, vec![child.clone(), parent], context()),
+            Err(TransactionAdmissionError::PackageRollingMinimumFee {
+                fee_sats,
+                minimum_sats,
+            }) if fee_sats == child_min_relay
+                && minimum_sats == fee_for_rate(rolling_rate, child.vsize())
+                && fee_sats < minimum_sats
+        ));
+        assert!(pool.is_empty());
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
     fn package_feerate_never_bypasses_individual_minimum_relay() {
         let (_directory, store) = store();
         let (outpoint, utxo, mut parent) = spend(99);
@@ -3018,6 +3082,23 @@ mod tests {
             parent.clone(),
             middle.clone(),
             last.clone(),
+        ]));
+        let mut non_tree_child = last.clone();
+        non_tree_child.input.push(TxIn {
+            previous_output: OutPoint::new(parent.compute_txid(), 1),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        });
+        assert!(is_child_with_parents(&[
+            parent.clone(),
+            middle.clone(),
+            non_tree_child.clone(),
+        ]));
+        assert!(!is_child_with_parents_tree(&[
+            parent.clone(),
+            middle.clone(),
+            non_tree_child,
         ]));
         assert!(matches!(
             pool.admit_package(&store, vec![last, parent, middle], context()),
