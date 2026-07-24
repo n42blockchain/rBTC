@@ -214,10 +214,11 @@ standby candidates now survive the chainstate-open phase; the first one that
 still passes bounded activation becomes an auxiliary block source. A
 252-block batch requests 128 blocks from the active peer and 124 from the
 auxiliary peer concurrently, preserves active-chain order, and retries the
-auxiliary window on the primary after any request or response failure. An
-adjacent live sample reduced median download time only from about 19.4 to
-18.8 seconds, so this is a modest network improvement rather than the main
-speedup. Actively receiving the auxiliary lookahead during execution was
+auxiliary window on the primary after any request or response failure. The
+next retained candidate is then activated without restarting the primary
+session. An adjacent live sample reduced median download time only from about
+19.4 to 18.8 seconds, so this is a modest network improvement rather than the
+main speedup. Actively receiving the auxiliary lookahead during execution was
 rejected after a 124-block response exceeded the 30-second bound; the retained
 design keeps the simpler bounded request lookahead and failover semantics.
 

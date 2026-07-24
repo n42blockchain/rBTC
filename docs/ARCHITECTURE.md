@@ -221,9 +221,10 @@ candidate as an auxiliary block source. Checkpoints wider than the 128-block
 single-peer pipeline split into ordered primary and auxiliary windows, request
 and receive both concurrently, then concatenate them in active-chain order.
 Any auxiliary request or response failure drops that source and redownloads
-only its window from the primary. The measured download median moved from
-about 19.4 to 18.8 seconds; a more aggressive background-response experiment
-was rejected after it exceeded the existing 30-second peer bound.
+only its window from the primary, then activates the next reserved candidate
+without restarting the active session. The measured download median moved
+from about 19.4 to 18.8 seconds; a more aggressive background-response
+experiment was rejected after it exceeded the existing 30-second peer bound.
 
 Transaction IDs computed for Merkle authentication are carried into execution
 instead of hashing every transaction serialization again. Large sorted

@@ -2316,6 +2316,24 @@ async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer
     }
 }
 
+async fn activate_next_auxiliary_peer(
+    candidates: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
+) {
+    while let Some((remote, pending)) = candidates.pop_front() {
+        match activate_pending_peer(pending).await {
+            Ok(connected) => {
+                println!("activated auxiliary block-download peer {remote}");
+                *session = Some(connected.session);
+                return;
+            }
+            Err(error) => {
+                eprintln!("auxiliary block-download peer {remote} failed activation: {error}");
+            }
+        }
+    }
+}
+
 fn take_ready_auxiliary_peers(
     pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
 ) -> VecDeque<(SocketAddr, PendingPeer)> {
@@ -3893,18 +3911,7 @@ async fn sync_validating_node(
         chainstate_open_started.elapsed().as_millis()
     );
     let mut auxiliary_session = None;
-    while let Some((remote, pending)) = auxiliary.pop_front() {
-        match activate_pending_peer(pending).await {
-            Ok(connected) => {
-                println!("activated auxiliary block-download peer {remote}");
-                auxiliary_session = Some(connected.session);
-                break;
-            }
-            Err(error) => {
-                eprintln!("auxiliary block-download peer {remote} failed activation: {error}");
-            }
-        }
-    }
+    activate_next_auxiliary_peer(&mut auxiliary, &mut auxiliary_session).await;
     let execution_store = chainstate.execution();
     execution_store
         .bind_consensus_config(
@@ -4380,6 +4387,9 @@ async fn sync_validating_node(
                 validation_target.is_some() && validation_scheduler.is_none(),
             )
             .await?;
+            if auxiliary_session.is_none() {
+                activate_next_auxiliary_peer(&mut auxiliary, &mut auxiliary_session).await;
+            }
             if let Some(wallet) = wallet_runtime {
                 reconcile_wallet(
                     session,
