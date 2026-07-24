@@ -31,6 +31,13 @@ override detaches to an empty parameter-specific cache. Hardened mainnet and
 legacy-testnet checkpoints are exact-height commitments; after any such hash is
 known, the contextual validator also rejects a newly announced fork below the
 highest known checkpoint immediately, matching Core's old-fork resource gate.
+The public-network execution safety gate remains closed by default. A separate
+`--experimental-network-execution --once` validation path admits only Bitcoin
+or legacy testnet, repeats those constraints inside the execution routine,
+prints a funds-safety warning before storage or network startup, and forbids an
+indefinite node plus explorer/RPC/wallet and automatic AssumeUTXO-cleanup modes.
+It exists so historical production-path and sustained-IBD acceptance evidence
+can be gathered without representing the ordinary daemon as production-ready.
 
 ## UTXO layout
 
