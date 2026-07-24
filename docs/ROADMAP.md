@@ -36,6 +36,9 @@ windows with a two-second tail guard and hot replacements. Streamed
 four-worker archive compression reduced the first 756-block staging sample
 from 6.723–7.175 seconds to 4.949 seconds, large RVD3 group-Bloom probes now
 partition over bounded CPU workers, and SIGINT/SIGTERM close stores cleanly;
+the first five complete optimized checkpoints reduced the 756-block total
+median from 135.252 to 124.198 seconds, execution/persistence median from
+59.870 to 50.367 seconds, and staging median from 7.098 to 4.453 seconds;
 Taproot exact-stop and completed-target restart remain the active soak gate.
 Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
 with ordered joins and earliest-height failure semantics. Adjacent 1,008-block

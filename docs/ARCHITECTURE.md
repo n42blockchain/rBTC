@@ -347,6 +347,11 @@ seconds. Large validation-journal prefetches likewise partition each
 independent group-Bloom probe over bounded CPU workers and merge both match and
 reject partitions in original input order; row lookup and newest-first
 resolution remain unchanged.
+The first five complete all-optimization checkpoints had a 124.198-second
+median versus 135.252 seconds for the preceding four 756-block checkpoints.
+Execution/persistence median improved from 59.870 to 50.367 seconds (15.9%),
+and staging median improved from 7.098 to 4.453 seconds (37.3%), with identical
+atomic checkpoint semantics.
 
 SIGINT and SIGTERM are awaited alongside the daemon future. Cancellation drops
 network tasks and closes the durable stores cleanly; synchronous atomic
