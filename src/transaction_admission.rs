@@ -1215,7 +1215,7 @@ impl TransactionAdmissionPool {
         ordered: &[Transaction],
         direct_conflicts: &BTreeSet<Txid>,
     ) -> Result<(), TransactionAdmissionError> {
-        let allowed = self
+        let allowed_parent_txids = self
             .entries
             .iter()
             .filter(|entry| direct_conflicts.contains(&entry.transaction.compute_txid()))
@@ -1224,7 +1224,7 @@ impl TransactionAdmissionPool {
                     .transaction
                     .input
                     .iter()
-                    .map(|input| input.previous_output)
+                    .map(|input| input.previous_output.txid)
             })
             .collect::<BTreeSet<_>>();
         let pool_txids = self
@@ -1236,7 +1236,10 @@ impl TransactionAdmissionPool {
             .iter()
             .flat_map(|transaction| transaction.input.iter())
             .map(|input| input.previous_output)
-            .find(|outpoint| pool_txids.contains(&outpoint.txid) && !allowed.contains(outpoint))
+            .find(|outpoint| {
+                pool_txids.contains(&outpoint.txid)
+                    && !allowed_parent_txids.contains(&outpoint.txid)
+            })
         {
             return Err(TransactionAdmissionError::ReplacementAddsUnconfirmedInput(
                 outpoint,
@@ -2952,6 +2955,59 @@ mod tests {
         ));
         assert_eq!(txids(&pool), before);
         assert_eq!(before, vec![original_txid, unrelated_txid]);
+    }
+
+    #[test]
+    fn replacement_may_switch_outputs_of_an_existing_unconfirmed_parent() {
+        let (_directory, store) = store();
+        let (parent_outpoint, parent_utxo, mut parent) = spend(114);
+        let (confirmed_outpoint, confirmed_utxo, confirmed_spend) = spend(115);
+        let parent_script = parent.output[0].script_pubkey.clone();
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: parent_script.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: parent_script,
+            },
+        ];
+        store
+            .apply(
+                &[],
+                &[
+                    (parent_outpoint.into(), parent_utxo),
+                    (confirmed_outpoint.into(), confirmed_utxo),
+                ],
+            )
+            .unwrap();
+
+        let mut original = child_at(&parent, 0, 120_000);
+        original.input.insert(0, confirmed_spend.input[0].clone());
+        signal_rbf(&mut original);
+        let original_txid = original.compute_txid();
+        let mut replacement = original.clone();
+        replacement.input[1].previous_output.vout = 1;
+        replacement.output[0].value = Amount::from_sat(100_000);
+        let replacement_txid = replacement.compute_txid();
+        let parent_txid = parent.compute_txid();
+
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent, context()).unwrap();
+        pool.admit(&store, original, context()).unwrap();
+        let outcome = pool.admit(&store, replacement, context()).unwrap();
+        assert!(matches!(
+            outcome,
+            TransactionAdmissionOutcome::Accepted {
+                txid,
+                replaced: 1,
+                evicted: 0,
+            } if txid == replacement_txid
+        ));
+        assert_eq!(txids(&pool), vec![parent_txid, replacement_txid]);
+        assert!(!txids(&pool).contains(&original_txid));
+        assert!(store.get(confirmed_outpoint.into()).unwrap().is_some());
     }
 
     #[test]

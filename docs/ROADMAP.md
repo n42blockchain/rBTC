@@ -61,6 +61,8 @@ Core 26 package identity and raw-weight semantics are covered as well. Submitted
 
 Core 26's remaining BIP125 direct-conflict rate gate is now explicit. A replacement's integer sat/kvB feerate must strictly exceed every directly conflicting transaction before aggregate removed fees and the incremental relay charge are considered; rBTC applies the same rule to the aggregate fee and policy vsize of its atomic replacement-package extension. A larger candidate that pays both absolute fee rules while lowering the original feerate is rejected without mutation, and a one-sat/kvB-higher boundary succeeds. Rule #5 now also sums every direct conflict's descendant count before deduplicating shared descendants, matching Core's conservative 100-potential-replacement work bound; a topology-valid 25-entry graph whose five roots share twenty descendants produces 105 and fails atomically. Full-RBF still bypasses only signaling.
 
+Core 26's Rule #2 input identity is aligned as well. Allowed prior unconfirmed dependencies are tracked by parent txid, not exact outpoint, so a replacement can move between sibling outputs of the same already-used mempool parent. An input from an unrelated mempool parent remains rejected. Both the successful sibling-output replacement and unrelated-parent rollback boundary are covered.
+
 ## Phase 2 — data services
 
 - [x] In-memory explorer index implementation for embedded/regtest use.

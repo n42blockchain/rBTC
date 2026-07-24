@@ -113,6 +113,8 @@ Package identity and size checks also follow Core 26's context-free boundary. Du
 
 BIP125 replacement additionally enforces Core 26's strict direct-conflict feerate rule. The candidate transaction—or rBTC's atomic replacement package as a whole—must have a higher integer sat/kvB rate than every transaction it directly conflicts with, before the existing aggregate-fee and incremental-relay-fee checks can succeed. Paying enough total bandwidth fee while lowering one direct conflict's feerate is rejected without changing the live or durable pool. The 100-entry work ceiling conservatively sums each direct conflict's complete descendant count before deduplication, so shared descendants cannot hide an expensive replacement traversal. Full-RBF bypasses only opt-in signaling and does not weaken either gate.
 
+BIP125's no-new-unconfirmed-input rule follows Core's parent-transaction identity rather than an over-strict exact-outpoint identity. A replacement may switch from one output to another output of an unconfirmed parent already used by a direct conflict, while adding an input from any unrelated mempool parent remains an atomic rejection. This distinction preserves Core-compatible replacement flexibility without allowing low-fee dependency injection.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
