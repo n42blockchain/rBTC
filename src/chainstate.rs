@@ -50,6 +50,7 @@ struct PreparedTransaction {
     validated: ValidatedTransaction,
     spent: Vec<OutPointKey>,
     created: Vec<(OutPointKey, Utxo)>,
+    prevouts: Vec<Utxo>,
 }
 
 /// Transaction application failure.
@@ -213,6 +214,7 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
         lock_time_context,
         script_flags,
         csv_active,
+        true,
     )?;
     let undo = store.apply_with_undo(&prepared.spent, &prepared.created)?;
     Ok(AppliedTransaction {
@@ -222,6 +224,47 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
         sigop_cost: prepared.validated.sigop_cost,
         undo,
     })
+}
+
+/// Applies accounting and UTXO changes while returning the resolved prevouts
+/// for a block-level parallel script-validation pass.
+///
+/// All non-script consensus checks remain ordered, so transactions may spend
+/// outputs created earlier in the same candidate block. The caller must roll
+/// back every returned application if any deferred script check fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
+    store: &S,
+    transaction: &Transaction,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    lock_time_context: u32,
+    script_flags: u32,
+    csv_active: bool,
+) -> Result<(AppliedTransaction, Vec<Utxo>), ChainstateError> {
+    let prepared = prepare_transaction_with_context(
+        store,
+        transaction,
+        height,
+        now,
+        creation_mtp,
+        lock_time_context,
+        script_flags,
+        csv_active,
+        false,
+    )?;
+    let undo = store.apply_with_undo(&prepared.spent, &prepared.created)?;
+    Ok((
+        AppliedTransaction {
+            txid: prepared.validated.txid,
+            input_value_sats: prepared.validated.input_value_sats,
+            output_value_sats: prepared.validated.output_value_sats,
+            sigop_cost: prepared.validated.sigop_cost,
+            undo,
+        },
+        prepared.prevouts,
+    ))
 }
 
 /// Checks one transaction against the current UTXO set without mutating it.
@@ -253,6 +296,7 @@ pub fn validate_transaction_with_context<S: UtxoStore>(
         lock_time_context,
         script_flags,
         csv_active,
+        true,
     )
     .map(|prepared| prepared.validated)
 }
@@ -267,6 +311,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
     lock_time_context: u32,
     script_flags: u32,
     csv_active: bool,
+    verify_scripts: bool,
 ) -> Result<PreparedTransaction, ChainstateError> {
     if transaction.base_size().saturating_mul(4) > 4_000_000 {
         return Err(ChainstateError::Oversize);
@@ -310,6 +355,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
             },
             spent: Vec::new(),
             created,
+            prevouts: Vec::new(),
         });
     }
 
@@ -361,7 +407,9 @@ fn prepare_transaction_with_context<S: UtxoStore>(
     if output_value > input_value {
         return Err(ChainstateError::Inflation);
     }
-    verify_transaction_scripts_with_flags(transaction, &prevouts, script_flags)?;
+    if verify_scripts {
+        verify_transaction_scripts_with_flags(transaction, &prevouts, script_flags)?;
+    }
     let created = created_outputs(transaction, height, now, creation_mtp, false);
     Ok(PreparedTransaction {
         validated: ValidatedTransaction {
@@ -372,6 +420,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
         },
         spent,
         created,
+        prevouts,
     })
 }
 

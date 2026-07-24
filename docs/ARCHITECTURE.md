@@ -65,6 +65,13 @@ redb is selected for the default node because its pure-Rust, ordered copy-on-wri
 
 Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, up to 16 already validated contiguous blocks form one durable checkpoint while retaining an undo record for every block; once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
 
+Within each block, prevout resolution, maturity/lock-time checks, value
+accounting, and UTXO mutation remain sequential so an input can consume an
+output created earlier in that block. The resolved prevouts are then immutable
+script-validation jobs distributed across the host's available CPU threads.
+Every script must pass before the block checkpoint can commit; a failure reports
+the earliest failing transaction and rolls back all tentative mutations.
+
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
 Recovery gates cover transaction-stage failure, simulated disk-full writes, repeated process SIGKILL followed by reopen, and truncated database copies. A damaged file must either reopen to a complete committed state or be rejected explicitly; it must never be served as partially current chainstate.

@@ -8,9 +8,10 @@ use bitcoin::{
 use thiserror::Error;
 
 use crate::{
-    chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_context},
+    chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_deferred_scripts},
+    consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     signet::{SignetError, validate_signet_block_solution},
-    utxo::{UtxoError, UtxoStore, UtxoUndo},
+    utxo::{Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
 /// Bitcoin's maximum serialized block weight in weight units.
@@ -27,6 +28,12 @@ pub struct AppliedBlock {
     pub hash: bitcoin::BlockHash,
     /// Transaction undo data in block order; disconnect in reverse order.
     pub transaction_undos: Vec<UtxoUndo>,
+}
+
+struct DeferredScriptCheck<'a> {
+    index: usize,
+    transaction: &'a bitcoin::Transaction,
+    prevouts: Vec<Utxo>,
 }
 
 /// Block-level validation or atomic-application error.
@@ -287,6 +294,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
     subsidy_sats: u64,
 ) -> Result<AppliedBlock, BlockError> {
     let mut applied = Vec::with_capacity(block.txdata.len());
+    let mut script_checks = Vec::with_capacity(block.txdata.len().saturating_sub(1));
     let mut sigop_cost = 0_u64;
     let mut fees = 0_u64;
     let lock_time_context = if csv_active {
@@ -295,7 +303,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
         block.header.time
     };
     for (index, transaction) in block.txdata.iter().enumerate() {
-        match apply_transaction_with_context(
+        match apply_transaction_with_deferred_scripts(
             store,
             transaction,
             height,
@@ -305,9 +313,14 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
             script_flags,
             csv_active,
         ) {
-            Ok(transaction) => {
+            Ok((transaction, prevouts)) => {
                 applied.push(transaction);
                 if index != 0 {
+                    script_checks.push(DeferredScriptCheck {
+                        index,
+                        transaction: &block.txdata[index],
+                        prevouts,
+                    });
                     let transaction = applied.last().expect("just pushed");
                     let transaction_fee = transaction
                         .input_value_sats
@@ -336,10 +349,24 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
                 }
             }
             Err(source) => {
+                let script_failure = verify_deferred_scripts(&script_checks, script_flags);
                 rollback(store, &applied, now, hot_window_secs)?;
+                if let Some((index, source)) = script_failure {
+                    return Err(BlockError::Transaction {
+                        index,
+                        source: source.into(),
+                    });
+                }
                 return Err(BlockError::Transaction { index, source });
             }
         }
+    }
+    if let Some((index, source)) = verify_deferred_scripts(&script_checks, script_flags) {
+        rollback(store, &applied, now, hot_window_secs)?;
+        return Err(BlockError::Transaction {
+            index,
+            source: source.into(),
+        });
     }
     let Some(allowed) = subsidy_sats.checked_add(fees) else {
         rollback(store, &applied, now, hot_window_secs)?;
@@ -358,6 +385,48 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
             .into_iter()
             .map(|transaction| transaction.undo)
             .collect(),
+    })
+}
+
+fn verify_deferred_scripts(
+    checks: &[DeferredScriptCheck<'_>],
+    script_flags: u32,
+) -> Option<(usize, ConsensusError)> {
+    if checks.is_empty() {
+        return None;
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(checks.len());
+    if workers == 1 {
+        return checks.iter().find_map(|check| {
+            verify_transaction_scripts_with_flags(check.transaction, &check.prevouts, script_flags)
+                .err()
+                .map(|error| (check.index, error))
+        });
+    }
+    let chunk_size = checks.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles = checks
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk.iter().find_map(|check| {
+                        verify_transaction_scripts_with_flags(
+                            check.transaction,
+                            &check.prevouts,
+                            script_flags,
+                        )
+                        .err()
+                        .map(|error| (check.index, error))
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().expect("script-validation worker panicked"))
+            .min_by_key(|(index, _)| *index)
     })
 }
 
