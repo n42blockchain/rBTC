@@ -216,11 +216,14 @@ still passes bounded activation becomes an auxiliary block source. A
 auxiliary peer concurrently, preserves active-chain order, and retries the
 auxiliary window on the primary after any request or response failure. The
 next retained candidate is then activated without restarting the primary
-session. An adjacent live sample reduced median download time only from about
-19.4 to 18.8 seconds, so this is a modest network improvement rather than the
-main speedup. Actively receiving the auxiliary lookahead during execution was
-rejected after a 124-block response exceeded the 30-second bound; the retained
-design keeps the simpler bounded request lookahead and failover semantics.
+session. Once the primary window completes, an unfinished auxiliary response
+gets two seconds of grace before it is abandoned and retried on the primary;
+this reduced one observed slow-auxiliary download from 40.485 to 27.684
+seconds instead of paying the complete 30-second auxiliary timeout first. An
+adjacent live sample reduced ordinary median download time only from about
+19.4 to 18.8 seconds, so this remains a tail-latency guard rather than the main
+speedup. Actively receiving the auxiliary lookahead during execution was
+rejected after a 124-block response exceeded the 30-second bound.
 
 The same production directory then stopped exactly at CSV activation height
 419,328/hash

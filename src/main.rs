@@ -70,6 +70,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
@@ -5046,6 +5047,37 @@ async fn download_block_window(
     receive_block_window(session, hashes, compact_candidates, context).await
 }
 
+async fn receive_parallel_block_windows(
+    primary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    primary_hashes: &[BlockHash],
+    auxiliary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    auxiliary_hashes: &[BlockHash],
+    compact_candidates: &[Transaction],
+    auxiliary_grace: Duration,
+) -> Result<(Vec<Block>, Option<Result<Vec<Block>, PeerRunError>>), PeerRunError> {
+    let primary_receive =
+        receive_block_window(primary, primary_hashes, compact_candidates, "primary");
+    let auxiliary_receive =
+        receive_block_window(auxiliary, auxiliary_hashes, compact_candidates, "auxiliary");
+    tokio::pin!(primary_receive);
+    tokio::pin!(auxiliary_receive);
+    let mut auxiliary_result = None;
+    let primary_result = loop {
+        tokio::select! {
+            result = &mut primary_receive => break result,
+            result = &mut auxiliary_receive, if auxiliary_result.is_none() => {
+                auxiliary_result = Some(result);
+            }
+        }
+    };
+    if auxiliary_result.is_none() {
+        if let Ok(result) = timeout(auxiliary_grace, &mut auxiliary_receive).await {
+            auxiliary_result = Some(result);
+        }
+    }
+    primary_result.map(|blocks| (blocks, auxiliary_result))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
@@ -5142,16 +5174,37 @@ async fn download_execute_batch(
             let auxiliary = auxiliary_session
                 .as_mut()
                 .expect("requested auxiliary session remains present");
-            let (primary_result, auxiliary_result) = tokio::join!(
-                receive_block_window(session, primary_hashes, compact_candidates, "primary"),
-                receive_block_window(auxiliary, auxiliary_hashes, compact_candidates, "auxiliary",),
-            );
-            blocks.extend(primary_result?);
+            let (primary_blocks, auxiliary_result) = receive_parallel_block_windows(
+                session,
+                primary_hashes,
+                auxiliary,
+                auxiliary_hashes,
+                compact_candidates,
+                AUXILIARY_BLOCK_RESPONSE_GRACE,
+            )
+            .await?;
+            blocks.extend(primary_blocks);
             match auxiliary_result {
-                Ok(auxiliary_blocks) => blocks.extend(auxiliary_blocks),
-                Err(error) => {
+                Some(Ok(auxiliary_blocks)) => blocks.extend(auxiliary_blocks),
+                Some(Err(error)) => {
                     eprintln!(
                         "auxiliary block window disabled after response failure; retrying on primary: {error}"
+                    );
+                    *auxiliary_session = None;
+                    blocks.extend(
+                        download_block_window(
+                            session,
+                            auxiliary_hashes,
+                            compact_candidates,
+                            "primary fallback",
+                        )
+                        .await?,
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "auxiliary block window lagged the primary response by more than {} ms; retrying on primary",
+                        AUXILIARY_BLOCK_RESPONSE_GRACE.as_millis()
                     );
                     *auxiliary_session = None;
                     blocks.extend(
@@ -7781,6 +7834,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             auxiliary_expected
         );
+        primary_server.await.unwrap();
+        auxiliary_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lagging_auxiliary_window_is_abandoned_after_primary_grace() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_remote = primary_listener.local_addr().unwrap();
+        let auxiliary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auxiliary_remote = auxiliary_listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let primary_block =
+            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 1, 1);
+        let auxiliary_block =
+            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 2, 2);
+        let primary_hash = primary_block.block_hash();
+        let auxiliary_hash = auxiliary_block.block_hash();
+        let primary_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(primary_listener, peer_version(653)).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(vec![Inventory::WitnessBlock(primary_hash)])
+            );
+            peer.write_message(NetworkMessage::Block(primary_block))
+                .await
+                .unwrap();
+        });
+        let (release_sender, release) = tokio::sync::oneshot::channel();
+        let auxiliary_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(auxiliary_listener, peer_version(654)).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(vec![Inventory::WitnessBlock(auxiliary_hash)])
+            );
+            let _ = release.await;
+            let _ = peer
+                .write_message(NetworkMessage::Block(auxiliary_block))
+                .await;
+        });
+        let (primary, auxiliary) = tokio::join!(
+            connect_outbound(
+                primary_remote,
+                Network::Regtest.magic(),
+                655,
+                "/rbtcd:test/".to_owned(),
+                0,
+            ),
+            connect_outbound(
+                auxiliary_remote,
+                Network::Regtest.magic(),
+                656,
+                "/rbtcd:test/".to_owned(),
+                0,
+            ),
+        );
+        let mut primary = primary.unwrap();
+        let mut auxiliary = auxiliary.unwrap();
+        let primary_hashes = [primary_hash];
+        let auxiliary_hashes = [auxiliary_hash];
+        let (primary_request, auxiliary_request) = tokio::join!(
+            request_block_window(&mut primary, &primary_hashes, "primary lag test"),
+            request_block_window(&mut auxiliary, &auxiliary_hashes, "auxiliary lag test"),
+        );
+        primary_request.unwrap();
+        auxiliary_request.unwrap();
+
+        let (blocks, auxiliary_result) = receive_parallel_block_windows(
+            &mut primary,
+            &primary_hashes,
+            &mut auxiliary,
+            &auxiliary_hashes,
+            &[],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(blocks[0].block_hash(), primary_hash);
+        assert!(auxiliary_result.is_none());
+        drop(auxiliary);
+        release_sender.send(()).unwrap();
         primary_server.await.unwrap();
         auxiliary_server.await.unwrap();
     }
