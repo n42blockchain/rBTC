@@ -39,6 +39,11 @@ warning before storage or network startup, and forbids an indefinite node plus
 explorer/RPC/wallet and automatic AssumeUTXO-cleanup modes.
 It exists so historical production-path and sustained-IBD acceptance evidence
 can be gathered without representing the ordinary daemon as production-ready.
+An already completed validation directory can raise its ceiling only through
+the explicit extension mode: the new authenticated height/hash must be on the
+validated active header chain, must move forward, and is published atomically
+only while the execution tip still equals the old target. A restart then
+inherits the raised ceiling exactly as it inherited the original one.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
@@ -71,6 +76,8 @@ output created earlier in that block. The resolved prevouts are then immutable
 script-validation jobs distributed across the host's available CPU threads.
 Every script must pass before the block checkpoint can commit; a failure reports
 the earliest failing transaction and rolls back all tentative mutations.
+Three isolated release runs of the historical full-block regression improved
+from a 3.59-second median at `534c28c` to 2.36 seconds, a 1.52× speedup.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

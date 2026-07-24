@@ -110,6 +110,33 @@ pub enum ExecutionStoreError {
         /// Requested validation hash.
         requested_hash: BlockHash,
     },
+    /// Validation-target extension requires an existing durable target.
+    #[error("validation target extension requires an existing bound target")]
+    ValidationTargetExtensionUnbound,
+    /// A target may only be extended after its existing ceiling was executed.
+    #[error(
+        "validation target extension requires completed target {target_height}:{target_hash}, execution tip is {tip_height}:{tip_hash}"
+    )]
+    ValidationTargetExtensionIncomplete {
+        /// Persisted validation height.
+        target_height: u32,
+        /// Persisted validation hash.
+        target_hash: BlockHash,
+        /// Existing execution height.
+        tip_height: u32,
+        /// Existing execution hash.
+        tip_hash: BlockHash,
+    },
+    /// A target extension must move strictly forward.
+    #[error(
+        "validation target extension height {requested_height} must be above existing target {stored_height}"
+    )]
+    ValidationTargetExtensionNotForward {
+        /// Persisted validation height.
+        stored_height: u32,
+        /// Requested validation height.
+        requested_height: u32,
+    },
     /// The requested validation target is below the already executed tip.
     #[error("validation target height {target_height} is below execution height {tip_height}")]
     ValidationTargetBehindTip {
@@ -235,7 +262,7 @@ impl RedbExecutionStore {
             .map(|value| value.value().to_vec()))
     }
 
-    /// Returns the immutable snapshot base assigned to this validation directory.
+    /// Returns the current hard ceiling assigned to this validation directory.
     pub fn validation_target(&self) -> Result<Option<ExecutionTip>, ExecutionStoreError> {
         let transaction = self.db.begin_read()?;
         let meta = transaction.open_table(META)?;
@@ -244,7 +271,7 @@ impl RedbExecutionStore {
             .transpose()
     }
 
-    /// Permanently binds a non-assumed chainstate to one validation target.
+    /// Binds a non-assumed chainstate to its initial validation target.
     pub fn bind_validation_target(
         &self,
         requested: ExecutionTip,
@@ -296,6 +323,61 @@ impl RedbExecutionStore {
                     requested_hash: requested.hash,
                 });
             }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically raises a completed validation ceiling to a new authenticated
+    /// active-chain target.
+    ///
+    /// The caller must first prove that `requested` is on its validated header
+    /// chain. Requiring the current execution tip to equal the old target
+    /// prevents a partially completed run from silently widening its scope.
+    pub fn extend_validation_target(
+        &self,
+        requested: ExecutionTip,
+    ) -> Result<(), ExecutionStoreError> {
+        if requested.height == 0 {
+            return Err(ExecutionStoreError::Malformed(
+                "validation target cannot be genesis",
+            ));
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            if decode_assumed_snapshot(&meta)?.is_some() {
+                return Err(ExecutionStoreError::ValidationTargetOnAssumedChainstate);
+            }
+            let stored = meta
+                .get(VALIDATION_TARGET_KEY)?
+                .map(|value| decode_tip(value.value()))
+                .transpose()?
+                .ok_or(ExecutionStoreError::ValidationTargetExtensionUnbound)?;
+            if requested == stored {
+                return Ok(());
+            }
+            if requested.height <= stored.height {
+                return Err(ExecutionStoreError::ValidationTargetExtensionNotForward {
+                    stored_height: stored.height,
+                    requested_height: requested.height,
+                });
+            }
+            let tip_value = meta
+                .get(TIP_KEY)?
+                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+            let tip = decode_tip(tip_value.value())?;
+            drop(tip_value);
+            if tip != stored {
+                return Err(ExecutionStoreError::ValidationTargetExtensionIncomplete {
+                    target_height: stored.height,
+                    target_hash: stored.hash,
+                    tip_height: tip.height,
+                    tip_hash: tip.hash,
+                });
+            }
+            meta.insert(VALIDATION_TARGET_KEY, encode_tip(requested).as_slice())?;
         }
         transaction.commit()?;
         Ok(())
@@ -711,6 +793,49 @@ mod tests {
         drop(store);
         let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
         assert_eq!(reopened.validation_target().unwrap(), Some(target));
+    }
+
+    #[test]
+    fn completed_validation_target_can_only_extend_forward() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        let genesis = store.tip().unwrap();
+        let first = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        let second = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([2; 32]),
+        };
+
+        assert!(matches!(
+            store.extend_validation_target(first),
+            Err(ExecutionStoreError::ValidationTargetExtensionUnbound)
+        ));
+        store.bind_validation_target(first).unwrap();
+        assert!(matches!(
+            store.extend_validation_target(second),
+            Err(ExecutionStoreError::ValidationTargetExtensionIncomplete { .. })
+        ));
+        store.advance(genesis.hash, first).unwrap();
+        assert!(matches!(
+            store.extend_validation_target(ExecutionTip {
+                height: 1,
+                hash: BlockHash::from_byte_array([9; 32]),
+            }),
+            Err(ExecutionStoreError::ValidationTargetExtensionNotForward { .. })
+        ));
+
+        store.extend_validation_target(second).unwrap();
+        store.extend_validation_target(second).unwrap();
+        assert_eq!(store.validation_target().unwrap(), Some(second));
+        store.advance(first.hash, second).unwrap();
+        drop(store);
+
+        let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(reopened.validation_target().unwrap(), Some(second));
     }
 
     #[test]

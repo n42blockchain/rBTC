@@ -131,6 +131,17 @@ struct Options {
 enum NetworkExecutionMode {
     SafetyGated,
     ExperimentalOnce,
+    ExperimentalOnceExtend,
+}
+
+impl NetworkExecutionMode {
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::ExperimentalOnce | Self::ExperimentalOnceExtend)
+    }
+
+    const fn extends_validation_target(self) -> bool {
+        matches!(self, Self::ExperimentalOnceExtend)
+    }
 }
 
 #[derive(Clone)]
@@ -1082,7 +1093,7 @@ fn read_owner_only_text_file(
 
 #[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
-    if options.network_execution == NetworkExecutionMode::ExperimentalOnce {
+    if options.network_execution.is_experimental() {
         eprintln!(
             "WARNING: experimental {} block execution is enabled for validation only; \
              this build is not a production full node and must not be trusted with funds",
@@ -3718,7 +3729,7 @@ async fn sync_validating_node(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
-    if network_execution == NetworkExecutionMode::ExperimentalOnce {
+    if network_execution.is_experimental() {
         if !supports_experimental_block_execution(network) || !once {
             return Err(PeerRunError::transient(
                 "experimental block execution requires bitcoin or legacy testnet together with bounded --once mode",
@@ -3730,8 +3741,7 @@ async fn sync_validating_node(
             ));
         }
     }
-    if !supports_block_execution(network) && network_execution == NetworkExecutionMode::SafetyGated
-    {
+    if !supports_block_execution(network) && !network_execution.is_experimental() {
         return Err(PeerRunError::transient(
             "block execution is currently safety-gated to regtest and Signet until mainnet/testnet activation coverage is complete",
         ));
@@ -3749,7 +3759,9 @@ async fn sync_validating_node(
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
-    if let Some(target) = validation_target {
+    if let Some(target) =
+        validation_target.filter(|_| !network_execution.extends_validation_target())
+    {
         execution_store
             .bind_validation_target(rbtc::execution_store::ExecutionTip {
                 height: target.height,
@@ -3757,14 +3769,18 @@ async fn sync_validating_node(
             })
             .map_err(|error| error.to_string())?;
     }
-    let validation_target = execution_store
+    let persisted_validation_target = execution_store
         .validation_target()
         .map_err(|error| error.to_string())?
         .map(|target| ValidationTarget {
             height: target.height,
             block_hash: target.hash,
-        })
-        .or(validation_target);
+        });
+    let validation_target = if network_execution.extends_validation_target() {
+        validation_target.or(persisted_validation_target)
+    } else {
+        persisted_validation_target.or(validation_target)
+    };
     let transaction_store = validation_target
         .is_none()
         .then(|| RedbTransactionPoolStore::open(data_dir.join("mempool.redb"), network))
@@ -3797,6 +3813,31 @@ async fn sync_validating_node(
     let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+    if network_execution.extends_validation_target() {
+        let target = validation_target.expect("parser requires an explicit extension target");
+        let active = headers.active_header_at(target.height).ok_or_else(|| {
+            PeerRunError::transient(format!(
+                "validation target height {} is above the available active header chain",
+                target.height
+            ))
+        })?;
+        if active.hash != target.block_hash {
+            return Err(PeerRunError::transient(format!(
+                "validation target {}:{} is not on the active header chain",
+                target.height, target.block_hash
+            )));
+        }
+        execution_store
+            .extend_validation_target(rbtc::execution_store::ExecutionTip {
+                height: target.height,
+                hash: target.block_hash,
+            })
+            .map_err(|error| error.to_string())?;
+        println!(
+            "extended completed validation target to {}:{}",
+            target.height, target.block_hash
+        );
+    }
     let mut disconnected_transactions = VecDeque::new();
     let node_status = api_runtime
         .map(|_| {
@@ -5262,6 +5303,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut data_dir = None;
     let mut once = false;
     let mut experimental_network_execution = false;
+    let mut extend_validation_target = false;
     let mut explorer_listen = None;
     let mut wallet_descriptors = None;
     let mut wallet_auth_token_file = None;
@@ -5342,6 +5384,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             }
             "--once" => once = true,
             "--experimental-network-execution" => experimental_network_execution = true,
+            "--extend-validation-target" => extend_validation_target = true,
             "--explorer-listen" => {
                 let value = required_option_value(&mut args, "--explorer-listen")?;
                 let address: SocketAddr = value
@@ -5815,6 +5858,19 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
+    if extend_validation_target {
+        if !experimental_network_execution {
+            return Err(
+                "--extend-validation-target requires --experimental-network-execution".to_owned(),
+            );
+        }
+        if validation_target.is_none() {
+            return Err(
+                "--extend-validation-target requires --validate-until-height and --validate-until-blockhash"
+                    .to_owned(),
+            );
+        }
+    }
     if data_dir.is_some() && !supports_block_execution(network) && !experimental_network_execution {
         return Err(
             "--data-dir block execution currently supports only regtest and Signet".to_owned(),
@@ -5873,7 +5929,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         headers_db,
         data_dir,
         once,
-        network_execution: if experimental_network_execution {
+        network_execution: if extend_validation_target {
+            NetworkExecutionMode::ExperimentalOnceExtend
+        } else if experimental_network_execution {
             NetworkExecutionMode::ExperimentalOnce
         } else {
             NetworkExecutionMode::SafetyGated
@@ -5960,7 +6018,7 @@ fn print_usage() {
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once --validate-until-height HEIGHT --validate-until-blockhash HASH\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
@@ -9259,12 +9317,53 @@ mod tests {
                 "--experimental-network-execution",
                 "--once",
             ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-experimental-execution-gate",
+                "--extend-validation-target",
+                "--once",
+                "--validate-until-height",
+                "2",
+                "--validate-until-blockhash",
+                "000000006a625f06636b8bb6ac7b960a8d03705dc0a87fe1b90a9e5da8d913cd",
+            ],
         ] {
             assert!(
                 parse_options(arguments.clone().into_iter().map(str::to_owned)).is_err(),
                 "{arguments:?}"
             );
         }
+    }
+
+    #[test]
+    fn experimental_target_extension_is_explicit_and_complete() {
+        let extension = parse_options(
+            [
+                "--connect",
+                "127.0.0.1:1",
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-experimental-execution-gate",
+                "--experimental-network-execution",
+                "--extend-validation-target",
+                "--once",
+                "--validate-until-height",
+                "2",
+                "--validate-until-blockhash",
+                "000000006a625f06636b8bb6ac7b960a8d03705dc0a87fe1b90a9e5da8d913cd",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            extension.network_execution,
+            NetworkExecutionMode::ExperimentalOnceExtend
+        );
     }
 
     #[test]
