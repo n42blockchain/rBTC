@@ -58,6 +58,8 @@ pub const PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS: u32 =
     bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
 /// Maximum transactions accepted as one dependency-connected package.
 pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
+/// Core 26's context-free package weight ceiling for multi-transaction packages.
+pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 /// Core-like maximum aggregate virtual size accepted for one package.
 pub const MAX_PACKAGE_VBYTES: usize = 101_000;
 /// Core default maximum ancestors, including the transaction itself.
@@ -1105,8 +1107,13 @@ impl TransactionAdmissionPool {
         transactions: Vec<Transaction>,
     ) -> Result<(usize, BTreeMap<Txid, Transaction>), TransactionAdmissionError> {
         let mut already_present = 0;
+        let mut submitted_txids = BTreeSet::new();
         let mut package = BTreeMap::new();
         for transaction in transactions {
+            let txid = transaction.compute_txid();
+            if !submitted_txids.insert(txid) {
+                return Err(TransactionAdmissionError::DuplicatePackageTransaction(txid));
+            }
             let wtxid = transaction.compute_wtxid();
             if self
                 .entries
@@ -1116,15 +1123,18 @@ impl TransactionAdmissionPool {
                 already_present += 1;
                 continue;
             }
-            let txid = transaction.compute_txid();
             if self
                 .entries
                 .iter()
                 .any(|entry| entry.transaction.compute_txid() == txid)
-                || package.insert(txid, transaction).is_some()
             {
-                return Err(TransactionAdmissionError::DuplicatePackageTransaction(txid));
+                // Core package submission substitutes the already-admitted
+                // witness variant and deliberately ignores this one's validity.
+                already_present += 1;
+                continue;
             }
+            let replaced = package.insert(txid, transaction);
+            debug_assert!(replaced.is_none(), "submitted txids are unique");
         }
         Ok((already_present, package))
     }
@@ -1624,13 +1634,14 @@ fn validate_package_bounds(transactions: &[Transaction]) -> Result<(), Transacti
             limit: MAX_PACKAGE_TRANSACTIONS,
         });
     }
-    let vbytes = transactions
+    let weight = transactions
         .iter()
         .try_fold(0_usize, |total, transaction| {
-            total.checked_add(transaction.vsize())
+            total.checked_add(usize::try_from(transaction.weight().to_wu()).unwrap_or(usize::MAX))
         })
         .unwrap_or(usize::MAX);
-    if vbytes > MAX_PACKAGE_VBYTES {
+    if transactions.len() > 1 && u64::try_from(weight).unwrap_or(u64::MAX) > MAX_PACKAGE_WEIGHT {
+        let vbytes = weight.saturating_add(3) / 4;
         return Err(TransactionAdmissionError::PackageTooLarge {
             vbytes,
             limit: MAX_PACKAGE_VBYTES,
@@ -3205,6 +3216,42 @@ mod tests {
     }
 
     #[test]
+    fn package_uses_admitted_parent_when_submitted_witness_differs() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, parent) = spend(104);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let child = child(&parent, 80_000);
+        let parent_txid = parent.compute_txid();
+        let admitted_parent_witness_id = parent.compute_wtxid();
+        let mut alternate = parent.clone();
+        alternate.input[0].witness = Witness::new();
+        assert_eq!(alternate.compute_txid(), parent_txid);
+        assert_ne!(alternate.compute_wtxid(), admitted_parent_witness_id);
+
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent, context()).unwrap();
+        let outcome = pool
+            .admit_package(&store, vec![child.clone(), alternate.clone()], context())
+            .unwrap();
+        assert_eq!(outcome.already_present, 1);
+        assert_eq!(outcome.accepted, vec![child.compute_txid()]);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(
+            pool.snapshot()[0].compute_wtxid(),
+            admitted_parent_witness_id
+        );
+
+        let before = txids(&pool);
+        assert!(matches!(
+            pool.admit_package(&store, vec![alternate.clone(), alternate], context()),
+            Err(TransactionAdmissionError::DuplicatePackageTransaction(txid))
+                if txid == parent_txid
+        ));
+        assert_eq!(txids(&pool), before);
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
     fn orphan_pool_is_deduplicated_bounded_and_expires_at_twenty_minutes() {
         let mut pool = TransactionAdmissionPool::default();
         let transactions = (1_u8..=65).map(|index| spend(index).2).collect::<Vec<_>>();
@@ -3606,6 +3653,65 @@ mod tests {
             Err(TransactionAdmissionError::DuplicatePackageTransaction(_))
         ));
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn raw_package_weight_uses_one_aggregate_rounding_and_skips_singletons() {
+        fn padded(mut transaction: Transaction, bytes: usize) -> Transaction {
+            transaction.input[0].witness = Witness::from_slice(&[vec![0; bytes]]);
+            transaction
+        }
+
+        let first_base = spend(105).2;
+        let second_base = spend(106).2;
+        let mut boundary = None;
+        for first_padding in 100_000..100_008 {
+            let first = padded(first_base.clone(), first_padding);
+            let second_at_one = padded(second_base.clone(), 1);
+            let fixed_weight = first.weight().to_wu() + second_at_one.weight().to_wu();
+            let approximate_second = usize::try_from(
+                MAX_PACKAGE_WEIGHT
+                    .saturating_sub(fixed_weight)
+                    .saturating_add(1),
+            )
+            .unwrap();
+            for second_padding in
+                approximate_second.saturating_sub(8)..=approximate_second.saturating_add(8)
+            {
+                let second = padded(second_base.clone(), second_padding);
+                let total_weight = first.weight().to_wu() + second.weight().to_wu();
+                if total_weight <= MAX_PACKAGE_WEIGHT
+                    && first.vsize() + second.vsize() > MAX_PACKAGE_VBYTES
+                {
+                    boundary = Some((first.clone(), second, second_padding, total_weight));
+                    break;
+                }
+            }
+            if boundary.is_some() {
+                break;
+            }
+        }
+        let (first, second, second_padding, total_weight) =
+            boundary.expect("aggregate weight has an independently rounded vsize boundary");
+        assert_eq!(
+            (total_weight.saturating_add(3)) / 4,
+            u64::try_from(MAX_PACKAGE_VBYTES).unwrap()
+        );
+        assert!(validate_package_bounds(&[first.clone(), second]).is_ok());
+
+        let overage = usize::try_from(MAX_PACKAGE_WEIGHT - total_weight + 1).unwrap();
+        let overweight_second = padded(second_base.clone(), second_padding + overage);
+        assert!(matches!(
+            validate_package_bounds(&[first, overweight_second]),
+            Err(TransactionAdmissionError::PackageTooLarge {
+                vbytes,
+                limit: MAX_PACKAGE_VBYTES,
+            }) if vbytes == MAX_PACKAGE_VBYTES + 1
+        ));
+
+        let giant_singleton = padded(second_base, usize::try_from(MAX_PACKAGE_WEIGHT).unwrap());
+        assert!(giant_singleton.weight().to_wu() > MAX_PACKAGE_WEIGHT);
+        assert!(validate_package_bounds(&[giant_singleton]).is_ok());
     }
 
     #[test]

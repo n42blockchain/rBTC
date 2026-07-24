@@ -109,6 +109,8 @@ For custom activation schedules, transaction admission keeps block consensus and
 
 Core 26 package fee aggregation now uses the same fee-bumping subpackage boundary rather than the entire submitted set. Only parents below the rolling mempool floor remain in the fee calculation with the child; parents that already pay their own way are excluded, so a rich parent cannot subsidize a low-fee child. Aggregation is limited to a tree of mutually independent direct parents plus one child. Every transaction still independently pays min-relay, and all package failures retain rBTC's atomic publication boundary.
 
+Package identity and size checks also follow Core 26's context-free boundary. Duplicate txids within the submitted package are rejected before mempool lookup, but a single submitted transaction whose txid is already admitted is replaced by the pool's witness variant for dependency resolution; an alternate or invalid submitted witness therefore cannot hide the admitted parent's outputs or overwrite it. Multi-transaction packages are capped by one aggregate 404,000-weight-unit total, avoiding false rejection from summing individually rounded virtual sizes. Singleton submissions skip that package-only ceiling and continue through the ordinary per-transaction 400,000-weight-unit standardness check.
+
 ## API boundary
 
 The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:

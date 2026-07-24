@@ -57,6 +57,8 @@ Core 26's public standard-script subset is now independent of custom consensus a
 
 Core 26 package-fee subset semantics now prevent parents from paying for children. Aggregate rolling-fee evaluation is available only to a tree of mutually independent direct parents plus one child. Parents already satisfying the rolling floor are excluded before fee and policy-vsize summation; only below-floor parents and the child form the fee-bumping subpackage. A rich-parent/low-child case proves that whole-package fees can exceed the floor while the correct child-only subset is atomically rejected. Individual min-relay, existing-parent, replacement, deeper-chain, and non-tree paths receive no inappropriate aggregation.
 
+Core 26 package identity and raw-weight semantics are covered as well. Submitted txids are deduplicated before active-pool lookup, while one submitted alternate-witness transaction whose txid is already admitted is replaced by the validated pool entry for child dependency resolution and cannot overwrite it. Multi-transaction packages use one 404,000-weight-unit aggregate ceiling instead of summing individually rounded virtual sizes; singleton submissions proceed to the ordinary 400,000-weight-unit transaction standardness rule. Boundary and rollback tests cover all three cases.
+
 ## Phase 2 — data services
 
 - [x] In-memory explorer index implementation for embedded/regtest use.
