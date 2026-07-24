@@ -10,8 +10,9 @@ use thiserror::Error;
 
 use crate::{
     blockchain::{
-        AppliedBlock, BlockError, apply_block_with_deployments,
-        apply_prevalidated_block_with_deployments, disconnect_block,
+        AppliedBlock, BlockError, DeferredScriptCheck, apply_block_with_deployments,
+        apply_prevalidated_block_with_deferred_scripts, apply_prevalidated_block_with_deployments,
+        disconnect_block, validate_block_structure_with_deployments, verify_deferred_scripts,
     },
     chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
     chainstate::is_unspendable,
@@ -358,9 +359,10 @@ fn connect_active_blocks_inner(
     let cumulative = UtxoOverlay::new(chainstate);
     let mut applied_blocks = Vec::with_capacity(blocks.len());
     let mut transitions = Vec::with_capacity(blocks.len());
-    for (block, deployment) in blocks.iter().zip(deployments) {
+    let mut deferred_scripts = Vec::new();
+    for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
         let block_overlay = UtxoOverlay::new(&cumulative);
-        let (applied, changes) = validate_active_block(
+        let validated = validate_active_block_inner(
             &block_overlay,
             headers,
             block,
@@ -369,7 +371,26 @@ fn connect_active_blocks_inner(
             hot_window_secs,
             deployment,
             structure_prevalidated,
-        )?;
+            true,
+        );
+        let (applied, changes, mut block_scripts) = match validated {
+            Ok(validated) => validated,
+            Err(error) => {
+                if let Some((index, source)) =
+                    verify_deferred_scripts(std::mem::take(&mut deferred_scripts))
+                {
+                    return Err(BlockExecutionError::Block(BlockError::Transaction {
+                        index,
+                        source: source.into(),
+                    }));
+                }
+                return Err(error);
+            }
+        };
+        for script in &mut block_scripts {
+            script.set_block_order(block_order);
+        }
+        deferred_scripts.extend(block_scripts);
         let next = ExecutionTip {
             height: current
                 .height
@@ -388,6 +409,12 @@ fn connect_active_blocks_inner(
         applied_blocks.push(applied);
         current = next;
     }
+    if let Some((index, source)) = verify_deferred_scripts(deferred_scripts) {
+        return Err(BlockExecutionError::Block(BlockError::Transaction {
+            index,
+            source: source.into(),
+        }));
+    }
     let committed = chainstate.commit_connect_batch(&transitions)?;
     debug_assert_eq!(committed.len(), transitions.len());
     Ok(applied_blocks)
@@ -404,6 +431,32 @@ fn validate_active_block<S: UtxoStore>(
     deployments: &BlockDeploymentContext,
     structure_prevalidated: bool,
 ) -> Result<(AppliedBlock, UtxoChanges), BlockExecutionError> {
+    validate_active_block_inner(
+        chainstate,
+        headers,
+        block,
+        current,
+        now,
+        hot_window_secs,
+        deployments,
+        structure_prevalidated,
+        false,
+    )
+    .map(|(applied, changes, _)| (applied, changes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_active_block_inner<'a, S: UtxoStore>(
+    chainstate: &S,
+    headers: &HeaderDag,
+    block: &'a Block,
+    current: ExecutionTip,
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &BlockDeploymentContext,
+    structure_prevalidated: bool,
+    defer_scripts: bool,
+) -> Result<(AppliedBlock, UtxoChanges, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
@@ -437,8 +490,18 @@ fn validate_active_block<S: UtxoStore>(
     } else {
         return Err(BlockExecutionError::Bip30Collision(collisions[0]));
     };
-    let result = if structure_prevalidated {
-        apply_prevalidated_block_with_deployments(
+    let (mut applied, scripts) = if defer_scripts {
+        if !structure_prevalidated {
+            validate_block_structure_with_deployments(
+                block,
+                next_height,
+                deployments.bip34_active,
+                deployments.segwit_active,
+                deployments.signet_challenge.as_deref(),
+            )
+            .map_err(BlockExecutionError::Block)?;
+        }
+        apply_prevalidated_block_with_deferred_scripts(
             &overlay,
             block,
             next_height,
@@ -448,32 +511,49 @@ fn validate_active_block<S: UtxoStore>(
             deployments.script_flags,
             deployments.csv_active,
             deployments.subsidy_sats,
+        )
+        .map_err(BlockExecutionError::Block)?
+    } else if structure_prevalidated {
+        (
+            apply_prevalidated_block_with_deployments(
+                &overlay,
+                block,
+                next_height,
+                now,
+                parent_mtp,
+                hot_window_secs,
+                deployments.script_flags,
+                deployments.csv_active,
+                deployments.subsidy_sats,
+            )
+            .map_err(BlockExecutionError::Block)?,
+            Vec::new(),
         )
     } else {
-        apply_block_with_deployments(
-            &overlay,
-            block,
-            next_height,
-            now,
-            parent_mtp,
-            hot_window_secs,
-            deployments.script_flags,
-            deployments.bip34_active,
-            deployments.csv_active,
-            deployments.segwit_active,
-            deployments.signet_challenge.as_deref(),
-            deployments.subsidy_sats,
+        (
+            apply_block_with_deployments(
+                &overlay,
+                block,
+                next_height,
+                now,
+                parent_mtp,
+                hot_window_secs,
+                deployments.script_flags,
+                deployments.bip34_active,
+                deployments.csv_active,
+                deployments.segwit_active,
+                deployments.signet_challenge.as_deref(),
+                deployments.subsidy_sats,
+            )
+            .map_err(BlockExecutionError::Block)?,
+            Vec::new(),
         )
-    };
-    let mut applied = match result {
-        Ok(applied) => applied,
-        Err(error) => return Err(BlockExecutionError::Block(error)),
     };
     if let Some(undo) = exception_undo {
         applied.transaction_undos.insert(0, undo);
     }
     let transition = overlay.net_changes()?;
-    Ok((applied, transition))
+    Ok((applied, transition, scripts))
 }
 
 #[derive(Default)]
@@ -1030,6 +1110,90 @@ mod tests {
         let first_outpoint = OutPoint::new(first.txdata[0].compute_txid(), 0).into();
         assert!(failed.get(first_outpoint).unwrap().is_none());
         assert!(failed.undos().get(first.block_hash()).unwrap().is_none());
+    }
+
+    #[test]
+    fn ibd_checkpoint_defers_all_scripts_but_reports_the_earliest_block() {
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let outpoints = (0_u8..8)
+            .map(|byte| OutPoint::new(bitcoin::Txid::from_byte_array([byte; 32]), 0))
+            .collect::<Vec<_>>();
+        let coins = outpoints
+            .iter()
+            .enumerate()
+            .map(|(index, outpoint)| {
+                (
+                    OutPointKey::from(*outpoint),
+                    Utxo {
+                        value_sats: 2,
+                        height: 0,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: vec![if matches!(index, 3 | 4) { 0x00 } else { 0x51 }],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        chainstate.apply(&[], &coins).unwrap();
+        let spend = |outpoint: OutPoint| Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = block_with_transactions(
+            genesis.hash,
+            genesis.header.time + 1,
+            std::iter::once(coinbase(1))
+                .chain(outpoints[..4].iter().copied().map(spend))
+                .collect(),
+        );
+        headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let second = block_with_transactions(
+            first.block_hash(),
+            first.header.time + 1,
+            std::iter::once(coinbase(2))
+                .chain(outpoints[4..].iter().copied().map(spend))
+                .collect(),
+        );
+        headers
+            .insert_contextual(second.header, second.header.time)
+            .unwrap();
+
+        assert!(matches!(
+            connect_prevalidated_active_blocks(
+                &chainstate,
+                &headers,
+                &[first, second],
+                1,
+                60,
+                &[deployments(1), deployments(2)],
+            ),
+            Err(BlockExecutionError::Block(BlockError::Transaction {
+                index: 4,
+                ..
+            }))
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+        for outpoint in outpoints {
+            assert!(chainstate.get(outpoint.into()).unwrap().is_some());
+        }
     }
 
     #[test]

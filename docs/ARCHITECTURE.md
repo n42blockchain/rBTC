@@ -89,22 +89,32 @@ Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endi
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
-Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, up to 16 already validated contiguous blocks form one durable checkpoint while retaining an undo record for every block; once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit bounded validation may raise that checkpoint to 256 while retaining an undo record for every block. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
 
 Within each block, prevout resolution, maturity/lock-time checks, value
 accounting, and UTXO mutation remain sequential so an input can consume an
 output created earlier in that block. The resolved prevouts are then immutable
 script-validation jobs distributed across a persistent, bounded host-CPU
 worker pool. Serialized jobs are scheduled dynamically by transaction instead
-of creating and joining a fresh set of threads for every block; small input
-sets stay serial. Every script must pass before the block checkpoint can
-commit; out-of-order completion still reports the earliest failing transaction
-and rolls back all tentative mutations.
+of creating and joining a fresh set of threads for every block; small
+single-block input sets stay serial. IBD keeps building the sequential
+cumulative UTXO overlay for every block in a checkpoint, then submits all of
+that checkpoint's immutable script jobs through one pool barrier. This removes
+up to 256 per-block join barriers without moving any tentative state into
+redb. Every script must pass before the checkpoint can commit; out-of-order
+completion still selects the earliest failing block and transaction and rolls
+back all tentative mutations.
 Three isolated release runs of the historical full-block regression improved
 from a 3.59-second median at `534c28c` to 2.36 seconds, a 1.52× speedup.
 Against the immediately preceding scoped-thread implementation, a second
 three-run hot release A/B improved the same workload from 4.00 seconds to a
 3.30-second median (17.5% lower elapsed time).
+On the adjacent live mainnet height-227,932+ run, the former per-block barrier
+executed 5,888 blocks in 557 seconds including startup (10.57 blocks/second).
+The first 3,328 blocks after switching the same durable directory to the
+checkpoint-wide barrier took 257 seconds including recovery (12.95
+blocks/second), a 22.5% throughput increase while preserving 256-block atomic
+tips.
 
 Ordinary serving-chain commits retain redb quick repair. Bounded bulk
 validation may explicitly defer the allocator-state repair write while keeping
@@ -128,7 +138,7 @@ The marker deliberately survives successful execution and restart, so assumed st
 
 `--background-assumeutxo` orchestrates active assumed-state service and independent genesis validation concurrently. The two futures share only the process self-connection nonce and a small synchronized progress record; each owns a separate outbound connection/failover cycle, peer database, headers, chainstate, and ledger. Only the API-serving side maintains an explorer projection; the isolated validator does not build an unused historical transaction index. The active loop publishes its execution/header tips. Until they match, the validator yields after every block for at least 100 ms; once active serving catches up, its configured batch and pause limits are restored. The loopback explorer exposes this state at `/api/v1/validation`, including the immutable target, both tips, remaining work, lifecycle phase, throttle state, and terminal error. The active loop consumes successful completion, compares the independently streamed UTXO identity, and commits marker removal while its API remains live. An active-side failure cancels validation; a validation or finalization failure terminates the combined service and leaves resumable state. `--once` waits for both futures and performs the same finalization after their stores close. `--complete-assumeutxo` remains the sequential operational fallback.
 
-Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–64 blocks; the downloader fills it through 16-block protocol windows so a larger durability batch does not enlarge one peer request. `--validation-pause-ms` yields between checkpoints. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
+Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–256 blocks and defaults to 64; the downloader fills it through 16-block protocol windows so a larger durability batch does not enlarge one peer request. The 256-block ceiling implies a consensus worst-case 1 GiB payload and is an explicit high-memory validation-host setting. `--validation-pause-ms` yields between checkpoints. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
 
 Validation storage is retained by default. The destructive `--cleanup-validation-dir` option is accepted only by the automatic completion modes and is gated by a versioned, owner-only marker created only when rBTC first observed an absent or empty directory. The marker uses strict size-bounded JSON and binds a canonical network and target height/hash; its contents and containing directory are synced on Unix before the claim is considered durable. After successful finalization, cleanup canonicalizes the active and validation paths again, reopens the validation chainstate, requires its non-assumed tip and bound target to equal the snapshot base, allowlists top-level rBTC artifacts, and recursively rejects symlinks and special files. It then atomically renames the directory to a randomized sibling quarantine, syncs the parent, removes the quarantine, and syncs the parent again so both namespace transitions are durable. Failure of the first parent sync rolls the rename back before deletion; failure of the final sync reports that removal completed but its namespace durability is uncertain. An unowned legacy directory or any unexpected artifact is preserved with an error; manual two-step finalization never deletes it.
 

@@ -38,19 +38,28 @@ pub struct AppliedBlock {
     pub transaction_undos: Vec<UtxoUndo>,
 }
 
-struct DeferredScriptCheck<'a> {
+pub(crate) struct DeferredScriptCheck<'a> {
     index: usize,
+    block_order: usize,
     transaction: &'a bitcoin::Transaction,
     prevouts: Vec<Utxo>,
+    script_flags: u32,
+}
+
+impl DeferredScriptCheck<'_> {
+    pub(crate) fn set_block_order(&mut self, block_order: usize) {
+        self.block_order = block_order;
+    }
 }
 
 struct ScriptValidationJob {
     index: usize,
+    block_order: usize,
     raw_transaction: Vec<u8>,
     input_count: usize,
     prevouts: Vec<Utxo>,
     script_flags: u32,
-    result: mpsc::Sender<(usize, Result<(), ConsensusError>)>,
+    result: mpsc::Sender<(usize, usize, Result<(), ConsensusError>)>,
 }
 
 #[derive(Default)]
@@ -111,7 +120,7 @@ fn script_validation_worker(queue: &ScriptValidationQueue) {
             &job.prevouts,
             job.script_flags,
         );
-        let _ = job.result.send((job.index, validation));
+        let _ = job.result.send((job.block_order, job.index, validation));
     }
 }
 
@@ -377,6 +386,61 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
     csv_active: bool,
     subsidy_sats: u64,
 ) -> Result<AppliedBlock, BlockError> {
+    apply_prevalidated_block_with_deployments_inner(
+        store,
+        block,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        csv_active,
+        subsidy_sats,
+        false,
+    )
+    .map(|(applied, _)| applied)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>(
+    store: &S,
+    block: &'a Block,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    csv_active: bool,
+    subsidy_sats: u64,
+) -> Result<(AppliedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
+    apply_prevalidated_block_with_deployments_inner(
+        store,
+        block,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        csv_active,
+        subsidy_sats,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn apply_prevalidated_block_with_deployments_inner<'a, S: UtxoStore>(
+    store: &S,
+    block: &'a Block,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    csv_active: bool,
+    subsidy_sats: u64,
+    defer_scripts: bool,
+) -> Result<(AppliedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
     let mut applied = Vec::with_capacity(block.txdata.len());
     let mut script_checks = Vec::with_capacity(block.txdata.len().saturating_sub(1));
     let mut sigop_cost = 0_u64;
@@ -402,8 +466,10 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
                 if index != 0 {
                     script_checks.push(DeferredScriptCheck {
                         index,
+                        block_order: 0,
                         transaction: &block.txdata[index],
                         prevouts,
+                        script_flags,
                     });
                     let transaction = applied.last().expect("just pushed");
                     let transaction_fee = transaction
@@ -433,7 +499,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
                 }
             }
             Err(source) => {
-                let script_failure = verify_deferred_scripts(script_checks, script_flags);
+                let script_failure = verify_deferred_scripts(script_checks);
                 rollback(store, &applied, now, hot_window_secs)?;
                 if let Some((index, source)) = script_failure {
                     return Err(BlockError::Transaction {
@@ -445,36 +511,58 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
             }
         }
     }
-    if let Some((index, source)) = verify_deferred_scripts(script_checks, script_flags) {
-        rollback(store, &applied, now, hot_window_secs)?;
-        return Err(BlockError::Transaction {
-            index,
-            source: source.into(),
-        });
+    if !defer_scripts {
+        if let Some((index, source)) = verify_deferred_scripts(std::mem::take(&mut script_checks)) {
+            rollback(store, &applied, now, hot_window_secs)?;
+            return Err(BlockError::Transaction {
+                index,
+                source: source.into(),
+            });
+        }
     }
     let Some(allowed) = subsidy_sats.checked_add(fees) else {
+        let script_failure = defer_scripts
+            .then(|| verify_deferred_scripts(std::mem::take(&mut script_checks)))
+            .flatten();
         rollback(store, &applied, now, hot_window_secs)?;
+        if let Some((index, source)) = script_failure {
+            return Err(BlockError::Transaction {
+                index,
+                source: source.into(),
+            });
+        }
         return Err(BlockError::FeeOverflow);
     };
     if applied[0].output_value_sats > allowed {
+        let script_failure = defer_scripts
+            .then(|| verify_deferred_scripts(std::mem::take(&mut script_checks)))
+            .flatten();
         rollback(store, &applied, now, hot_window_secs)?;
+        if let Some((index, source)) = script_failure {
+            return Err(BlockError::Transaction {
+                index,
+                source: source.into(),
+            });
+        }
         return Err(BlockError::ExcessCoinbase {
             claimed: applied[0].output_value_sats,
             allowed,
         });
     }
-    Ok(AppliedBlock {
-        hash: block.block_hash(),
-        transaction_undos: applied
-            .into_iter()
-            .map(|transaction| transaction.undo)
-            .collect(),
-    })
+    Ok((
+        AppliedBlock {
+            hash: block.block_hash(),
+            transaction_undos: applied
+                .into_iter()
+                .map(|transaction| transaction.undo)
+                .collect(),
+        },
+        script_checks,
+    ))
 }
 
-fn verify_deferred_scripts(
+pub(crate) fn verify_deferred_scripts(
     checks: Vec<DeferredScriptCheck<'_>>,
-    script_flags: u32,
 ) -> Option<(usize, ConsensusError)> {
     if checks.is_empty() {
         return None;
@@ -486,9 +574,13 @@ fn verify_deferred_scripts(
     let pool = script_validation_pool();
     if pool.workers == 1 || checks.len() == 1 || input_count < 8 {
         return checks.into_iter().find_map(|check| {
-            verify_transaction_scripts_with_flags(check.transaction, &check.prevouts, script_flags)
-                .err()
-                .map(|error| (check.index, error))
+            verify_transaction_scripts_with_flags(
+                check.transaction,
+                &check.prevouts,
+                check.script_flags,
+            )
+            .err()
+            .map(|error| (check.index, error))
         });
     }
     let jobs = checks.len();
@@ -496,22 +588,24 @@ fn verify_deferred_scripts(
     for check in checks {
         pool.enqueue(ScriptValidationJob {
             index: check.index,
+            block_order: check.block_order,
             raw_transaction: serialize(check.transaction),
             input_count: check.transaction.input.len(),
             prevouts: check.prevouts,
-            script_flags,
+            script_flags: check.script_flags,
             result: result.clone(),
         });
     }
     drop(result);
     (0..jobs)
         .filter_map(|_| {
-            let (index, validation) = results
+            let (block_order, index, validation) = results
                 .recv()
                 .expect("script-validation worker terminated without a result");
-            validation.err().map(|error| (index, error))
+            validation.err().map(|error| (block_order, index, error))
         })
-        .min_by_key(|(index, _)| *index)
+        .min_by_key(|(block_order, index, _)| (*block_order, *index))
+        .map(|(_, index, error)| (index, error))
 }
 
 /// Validates block commitments and context-free structure without mutating UTXO state.
