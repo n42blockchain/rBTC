@@ -56,7 +56,7 @@ inherits the raised ceiling exactly as it inherited the original one.
 The weekly/manual public-network smoke workflow wraps that path with an
 authenticated height/hash target, a wall-clock deadline, a measured data
 ceiling, a free-space reserve, and exact-target log verification. Its mainnet
-default executes through Core 26's pinned height-210,000 checkpoint in 64-block
+default executes through BIP34 activation height 227,931 in 64-block
 atomic persistence batches filled through bounded 16-block peer requests.
 After observing block 1,000, it sends a termination signal; the
 in-flight atomic batch may finish, then a second process must reopen the same
@@ -76,6 +76,12 @@ hash `000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e`.
 Under a concurrent development workload, quick repair processed a 6,592-block
 leg at 11.38 blocks/second and deferred repair processed the following
 7,016-block leg at 12.74 blocks/second.
+After the locator and persistent-script-pool optimizations, an explicit
+256-block run crossed checkpoints 216,116 and 225,430 and stopped exactly at
+BIP34 activation height 227,931/hash
+`000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8`.
+Its final 6,923 newly executed blocks plus startup/recovery took 848 seconds
+(8.16 blocks/second end to end); a completed-target restart requested no block.
 
 ## UTXO layout
 
