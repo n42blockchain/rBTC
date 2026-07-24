@@ -197,19 +197,24 @@ impl HeaderDag {
     #[must_use]
     pub fn block_locator(&self) -> Vec<BlockHash> {
         let mut locator = Vec::new();
-        let mut current = self.active_tip();
+        let mut height = self.active_tip().height;
         let mut step = 1_u32;
-        while current.height > 0 {
-            locator.push(current.hash);
-            let next_height = current.height.saturating_sub(step);
-            current = self
-                .ancestor_at_height(current, next_height)
-                .expect("active chain has all ancestors");
+        while height > 0 {
+            locator.push(
+                self.active_header_at(height)
+                    .expect("active chain contains its tip height")
+                    .hash,
+            );
+            height = height.saturating_sub(step);
             if locator.len() >= 10 {
                 step = step.saturating_mul(2);
             }
         }
-        locator.push(current.hash);
+        locator.push(
+            self.active_header_at(0)
+                .expect("active chain contains genesis")
+                .hash,
+        );
         locator
     }
 
@@ -844,6 +849,28 @@ mod tests {
             Err(HeaderError::Duplicate(_))
         ));
         assert_eq!(dag.active_tip().hash, child.block_hash());
+    }
+
+    #[test]
+    fn locator_uses_exponentially_spaced_active_height_entries() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        for height in 1..=32 {
+            let parent = dag.active_tip();
+            let child = mine_child(parent.hash, parent.header.time + height);
+            dag.insert(child).unwrap();
+        }
+
+        let locator = dag.block_locator();
+        let expected_heights = [32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 20, 16, 8, 0];
+        assert_eq!(locator.len(), expected_heights.len());
+        for (hash, height) in locator.iter().zip(expected_heights) {
+            assert_eq!(
+                *hash,
+                dag.active_header_at(height)
+                    .expect("expected active-chain height")
+                    .hash
+            );
+        }
     }
 
     #[test]

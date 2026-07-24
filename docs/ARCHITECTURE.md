@@ -36,6 +36,10 @@ announcement can race the following `getheaders` response. Active and standby
 sync trim only that exact prefix; a known header after unseen work remains a
 malformed duplicate. This keeps benign repeated tip announcements from
 evicting every hot standby without weakening contextual validation.
+Block locators use the active-chain height index directly for their roughly
+logarithmic set of entries. They do not walk almost the entire parent chain for
+each standby poll; at a 959,381-header tip this removes about one million hash
+lookups per locator from the shared event-loop thread.
 The public-network execution safety gate remains closed by default. A separate
 `--experimental-network-execution --once` validation path admits only Bitcoin
 or legacy testnet, requires an authenticated height/hash execution hard ceiling,
