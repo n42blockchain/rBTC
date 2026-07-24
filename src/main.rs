@@ -97,6 +97,7 @@ const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
+const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 
 const fn supports_block_execution(network: Network) -> bool {
@@ -5286,19 +5287,8 @@ async fn download_execute_batch(
         }
     }
     let downloaded_at = Instant::now();
-    let validated_blocks = expected
-        .iter()
-        .zip(&blocks)
-        .map(|(expected, block)| {
-            validate_downloaded_block(
-                deployment_config,
-                headers,
-                expected.height,
-                expected.hash,
-                block,
-            )
-        })
-        .collect::<Result<Vec<_>, PeerRunError>>()?;
+    let validated_blocks =
+        validate_downloaded_blocks(deployment_config, headers, &expected, &blocks)?;
     let (deployment_contexts, transaction_ids): (Vec<_>, Vec<_>) =
         validated_blocks.into_iter().unzip();
     let structure_validated_at = Instant::now();
@@ -5497,6 +5487,75 @@ fn validate_downloaded_block(
         ))
     })?;
     Ok((deployments, transaction_ids))
+}
+
+fn validate_downloaded_blocks(
+    deployment_config: &DeploymentConfig,
+    headers: &HeaderDag,
+    expected: &[HeaderInfo],
+    blocks: &[Block],
+) -> Result<Vec<(BlockDeploymentContext, ValidatedBlockTransactionIds)>, PeerRunError> {
+    if expected.len() != blocks.len() {
+        return Err(PeerRunError::transient(format!(
+            "downloaded block count {} does not match expected count {}",
+            blocks.len(),
+            expected.len()
+        )));
+    }
+    let available_workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let workers = available_workers.min(
+        expected
+            .len()
+            .div_ceil(MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER),
+    );
+    if workers <= 1 {
+        return expected
+            .iter()
+            .zip(blocks)
+            .map(|(expected, block)| {
+                validate_downloaded_block(
+                    deployment_config,
+                    headers,
+                    expected.height,
+                    expected.hash,
+                    block,
+                )
+            })
+            .collect();
+    }
+
+    let chunk_size = expected.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let jobs = expected
+            .chunks(chunk_size)
+            .zip(blocks.chunks(chunk_size))
+            .map(|(expected, blocks)| {
+                scope.spawn(move || {
+                    expected
+                        .iter()
+                        .zip(blocks)
+                        .map(|(expected, block)| {
+                            validate_downloaded_block(
+                                deployment_config,
+                                headers,
+                                expected.height,
+                                expected.hash,
+                                block,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, PeerRunError>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut validated = Vec::with_capacity(expected.len());
+        for job in jobs {
+            validated.extend(
+                job.join()
+                    .expect("block-structure validation worker must not panic")?,
+            );
+        }
+        Ok(validated)
+    })
 }
 
 fn index_validated_blocks(
@@ -7876,6 +7935,28 @@ mod tests {
             assert!(auxiliary.len() <= MAX_PIPELINED_BLOCKS_IN_FLIGHT);
             assert_eq!(primary.len() + auxiliary.len() + remainder.len(), batch_len);
         }
+    }
+
+    #[test]
+    fn parallel_structure_validation_preserves_order_and_earliest_error() {
+        let headers = HeaderDag::new(Network::Regtest);
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let expected = vec![headers.active_tip(); 192];
+        let blocks = vec![block; expected.len()];
+        let deployments = DeploymentConfig::for_network(Network::Regtest);
+
+        let validated =
+            validate_downloaded_blocks(&deployments, &headers, &expected, &blocks).unwrap();
+        assert_eq!(validated.len(), expected.len());
+
+        let mut invalid = expected;
+        invalid[70].height = 70;
+        invalid[70].hash = BlockHash::all_zeros();
+        invalid[130].height = 130;
+        invalid[130].hash = BlockHash::all_zeros();
+        let error =
+            validate_downloaded_blocks(&deployments, &headers, &invalid, &blocks).unwrap_err();
+        assert!(error.to_string().contains("height 70"));
     }
 
     #[tokio::test]

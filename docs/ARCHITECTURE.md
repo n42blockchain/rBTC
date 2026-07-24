@@ -326,6 +326,14 @@ ready-or-in-flight peers was rejected as well: five auxiliary-bearing batches
 took 80.105–105.571 seconds, followed by primary-only batches at 80.482 and
 88.089 seconds.
 
+Large downloaded batches validate their independent block structure on
+bounded host-CPU workers before the sequential UTXO transition begins. Work
+chunks and joins stay in height order, so a failure remains the earliest
+failing block even if a later worker completes first. Adjacent 1,008-block
+mainnet checkpoints reduced this phase from 11.489 seconds to 1.652 and 1.705
+seconds, approximately 85%, without changing transaction identifiers,
+deployment contexts, or the later atomic execution.
+
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
 Recovery gates cover transaction-stage failure, simulated disk-full writes, repeated process SIGKILL followed by reopen, and truncated database copies. A damaged file must either reopen to a complete committed state or be rejected explicitly; it must never be served as partially current chainstate.
