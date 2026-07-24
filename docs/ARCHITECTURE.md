@@ -309,6 +309,22 @@ The same journal then reached SegWit activation height 481,824/hash
 The final 252-block checkpoint took 43.780 seconds. A completed-target restart
 opened chainstate in 13.078 seconds, advanced headers from 959,450 to 959,452,
 requested no blocks, and stopped at the identical target.
+In the post-SegWit era, four 252-block checkpoints took 44.850–69.021 seconds.
+Four adjacent 504-block checkpoints took 60.608–82.237 seconds, or
+30.3–41.1 seconds per 252 blocks. An initial 1,008-block checkpoint took
+126.796 seconds. At heights 495,433–498,456, three later 1,008-block
+checkpoints took 163.505, 185.132, and 169.897 seconds. Their median was 6.0%
+below twice the preceding nine-checkpoint 504-block median; the directly
+adjacent comparison improved by 16.3%. Because RVD3 avoided the old base-tree
+superlinear commit, the Taproot run therefore uses 1,008 despite its larger
+atomic tail. A follow-up that assigned one 128-block window to each of three
+auxiliaries was rejected: public-peer failures and independent response tails
+widened complete-batch time to 73.243–127.829 seconds. Production validation
+retains one auxiliary window and at most three ready candidates for hot
+replacement. Expanding that pool to eight
+ready-or-in-flight peers was rejected as well: five auxiliary-bearing batches
+took 80.105–105.571 seconds, followed by primary-only batches at 80.482 and
+88.089 seconds.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
