@@ -2,17 +2,40 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-max_bytes="${RBTC_SYNC_MAX_BYTES:-1073741824}"
-timeout_seconds="${RBTC_SYNC_TIMEOUT_SECONDS:-600}"
+network="${RBTC_SYNC_NETWORK:-signet}"
+case "$network" in
+    signet)
+        default_max_bytes=1073741824
+        default_timeout_seconds=600
+        default_target_height=1000
+        default_target_hash=0000010ebfa3c6193793701c198392e21bdb8bc9fb2032f0d74a628d36e9a75e
+        default_batch_size=1
+        ;;
+    bitcoin)
+        default_max_bytes=2147483648
+        default_timeout_seconds=1800
+        default_target_height=11111
+        default_target_hash=0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d
+        default_batch_size=16
+        ;;
+    *)
+        echo "RBTC_SYNC_NETWORK must be signet or bitcoin" >&2
+        exit 1
+        ;;
+esac
+
+max_bytes="${RBTC_SYNC_MAX_BYTES:-$default_max_bytes}"
+timeout_seconds="${RBTC_SYNC_TIMEOUT_SECONDS:-$default_timeout_seconds}"
 reserve_bytes="${RBTC_SYNC_FREE_RESERVE_BYTES:-2147483648}"
+batch_size="${RBTC_SYNC_BATCH_SIZE:-$default_batch_size}"
 if [[ "${RBTC_SYNC_TARGET_HEIGHT+x}" != "${RBTC_SYNC_TARGET_HASH+x}" ]]; then
     echo "RBTC_SYNC_TARGET_HEIGHT and RBTC_SYNC_TARGET_HASH must be supplied together" >&2
     exit 1
 fi
-target_height="${RBTC_SYNC_TARGET_HEIGHT:-1000}"
-target_hash="${RBTC_SYNC_TARGET_HASH:-0000010ebfa3c6193793701c198392e21bdb8bc9fb2032f0d74a628d36e9a75e}"
+target_height="${RBTC_SYNC_TARGET_HEIGHT:-$default_target_height}"
+target_hash="${RBTC_SYNC_TARGET_HASH:-$default_target_hash}"
 
-for value in "$max_bytes" "$timeout_seconds" "$reserve_bytes" "$target_height"; do
+for value in "$max_bytes" "$timeout_seconds" "$reserve_bytes" "$target_height" "$batch_size"; do
     if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value == 0 )); then
         echo "sync resource limits and target height must be positive integers" >&2
         exit 1
@@ -30,6 +53,10 @@ if (( target_height > 10000000 )); then
     echo "sync target height cannot exceed 10,000,000" >&2
     exit 1
 fi
+if (( batch_size > 16 )); then
+    echo "sync batch size cannot exceed 16 blocks" >&2
+    exit 1
+fi
 if [[ ! "$target_hash" =~ ^[0-9a-f]{64}$ ]]; then
     echo "sync target hash must be 64 lowercase hexadecimal characters" >&2
     exit 1
@@ -42,7 +69,7 @@ if (( available_bytes < required_bytes )); then
     exit 1
 fi
 
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/rbtc-signet-smoke.XXXXXX")"
+run_root="$(mktemp -d "${TMPDIR:-/tmp}/rbtc-${network}-smoke.XXXXXX")"
 data_dir="$run_root/data"
 log_file="$run_root/rbtcd.log"
 mkdir -p "$data_dir"
@@ -68,12 +95,17 @@ trap cleanup EXIT
 trap handle_signal INT TERM
 
 cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release
+execution_options=()
+if [[ "$network" == "bitcoin" ]]; then
+    execution_options+=(--experimental-network-execution)
+fi
 "$repo_root/target/release/rbtcd" \
-    --network signet \
+    --network "$network" \
     --data-dir "$data_dir" \
+    "${execution_options[@]}" \
     --validate-until-height "$target_height" \
     --validate-until-blockhash "$target_hash" \
-    --validation-batch-size 1 \
+    --validation-batch-size "$batch_size" \
     --once >"$log_file" 2>&1 &
 child_pid=$!
 started_at="$(date +%s)"

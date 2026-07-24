@@ -38,6 +38,12 @@ prints a funds-safety warning before storage or network startup, and forbids an
 indefinite node plus explorer/RPC/wallet and automatic AssumeUTXO-cleanup modes.
 It exists so historical production-path and sustained-IBD acceptance evidence
 can be gathered without representing the ordinary daemon as production-ready.
+The weekly/manual public-network smoke workflow wraps that path with an
+authenticated height/hash target, a wall-clock deadline, a measured data
+ceiling, a free-space reserve, and exact-target log verification. Its mainnet
+default executes through Core 26's pinned height-11,111 checkpoint in 16-block
+batches; the 2026-07-23 local acceptance run completed in 719 seconds using
+323,735,552 bytes and cleaned its isolated temporary directory.
 
 ## UTXO layout
 

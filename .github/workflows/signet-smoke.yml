@@ -1,4 +1,4 @@
-name: Signet sync smoke
+name: Public network sync smoke
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: signet-sync-smoke
+  group: public-network-sync-smoke
   cancel-in-progress: false
 
 jobs:
@@ -21,4 +21,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
           toolchain: 1.85.0
-      - run: scripts/signet-sync-smoke.sh
+      - run: scripts/public-network-sync-smoke.sh
+
+  mainnet-checkpoint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RBTC_SYNC_NETWORK: bitcoin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
+      - run: scripts/public-network-sync-smoke.sh
