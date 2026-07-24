@@ -327,6 +327,10 @@ impl HeaderDag {
         header: Header,
         adjusted_time: u32,
     ) -> Result<HeaderInfo, HeaderError> {
+        let hash = header.block_hash();
+        if self.headers.contains_key(&hash) {
+            return Err(HeaderError::Duplicate(hash));
+        }
         let parent = self
             .headers
             .get(&header.prev_blockhash)
@@ -887,6 +891,10 @@ mod tests {
                 chainwork: genesis.chainwork,
             },
         );
+        assert!(matches!(
+            dag.insert_contextual(genesis.header, genesis.header.time),
+            Err(HeaderError::Duplicate(hash)) if hash == genesis.hash
+        ));
         let candidate = Header {
             version: Version::ONE,
             prev_blockhash: genesis.hash,
