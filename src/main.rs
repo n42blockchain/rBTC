@@ -3777,12 +3777,16 @@ async fn sync_validating_node(
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
         .map_err(|error| error.to_string())?;
-    let explorer = Arc::new(
-        RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
-            .map_err(|error| error.to_string())?,
-    );
-    let explorer_events = api_runtime
+    let explorer = api_runtime
         .map(|_| {
+            RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    let explorer_events = explorer
+        .as_ref()
+        .map(|explorer| {
             explorer
                 .tip()
                 .map(|tip| ExplorerEventHub::new(tip.height, tip.hash.to_string()))
@@ -3801,7 +3805,9 @@ async fn sync_validating_node(
                 ibd_policy,
                 &headers,
                 &chainstate,
-                &explorer,
+                explorer
+                    .as_deref()
+                    .expect("API runtime has an explorer index"),
                 &ledger,
                 wallet,
             )
@@ -3943,17 +3949,19 @@ async fn sync_validating_node(
             &compact_candidates,
         )
         .await?;
-        reconcile_explorer(
-            session,
-            deployment_config,
-            &headers,
-            &chainstate,
-            &ledger,
-            &explorer,
-            explorer_events.as_ref(),
-            &compact_candidates,
-        )
-        .await?;
+        if let Some(explorer) = explorer.as_deref() {
+            reconcile_explorer(
+                session,
+                deployment_config,
+                &headers,
+                &chainstate,
+                &ledger,
+                explorer,
+                explorer_events.as_ref(),
+                &compact_candidates,
+            )
+            .await?;
+        }
         if let Some(wallet) = wallet_runtime {
             reconcile_wallet(
                 session,
@@ -3974,7 +3982,9 @@ async fn sync_validating_node(
                 ibd_policy,
                 &headers,
                 &chainstate,
-                &explorer,
+                explorer
+                    .as_deref()
+                    .expect("node status has an explorer index"),
                 &ledger,
                 wallet,
             )?);
@@ -3984,7 +3994,11 @@ async fn sync_validating_node(
                 api_server = Some(
                     ApiServer::bind(
                         api.listen,
-                        Arc::clone(&explorer),
+                        Arc::clone(
+                            explorer
+                                .as_ref()
+                                .expect("API runtime has an explorer index"),
+                        ),
                         explorer_events
                             .as_ref()
                             .expect("API runtime has explorer events")
@@ -4014,7 +4028,9 @@ async fn sync_validating_node(
                     ibd_policy,
                     &headers,
                     &chainstate,
-                    &explorer,
+                    explorer
+                        .as_deref()
+                        .expect("node status has an explorer index"),
                     &ledger,
                     wallet,
                 )?);
@@ -4157,7 +4173,7 @@ async fn sync_validating_node(
                 &headers,
                 &chainstate,
                 &ledger,
-                &explorer,
+                explorer.as_deref(),
                 explorer_events.as_ref(),
                 wallet,
                 &compact_candidates,
@@ -4780,7 +4796,7 @@ async fn download_execute_batch(
     headers: &HeaderDag,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
-    explorer: &RedbExplorerIndex,
+    explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
     compact_candidates: &[Transaction],
@@ -4956,7 +4972,7 @@ fn validate_downloaded_block(
 }
 
 fn index_validated_blocks(
-    explorer: &RedbExplorerIndex,
+    explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
     expected: &[HeaderInfo],
@@ -4966,15 +4982,17 @@ fn index_validated_blocks(
     if expected.len() != blocks.len() || blocks.len() != applied_blocks.len() {
         return Err("validated projection batch lengths differ".to_owned());
     }
-    let explorer_batch = expected
-        .iter()
-        .zip(blocks)
-        .zip(applied_blocks)
-        .map(|((expected, block), applied)| (expected.height, block, applied))
-        .collect::<Vec<_>>();
-    explorer
-        .connect_batch(&explorer_batch)
-        .map_err(|error| error.to_string())?;
+    if let Some(explorer) = explorer {
+        let explorer_batch = expected
+            .iter()
+            .zip(blocks)
+            .zip(applied_blocks)
+            .map(|((expected, block), applied)| (expected.height, block, applied))
+            .collect::<Vec<_>>();
+        explorer
+            .connect_batch(&explorer_batch)
+            .map_err(|error| error.to_string())?;
+    }
     for ((expected, block), applied) in expected.iter().zip(blocks).zip(applied_blocks) {
         if let Some(wallet) = wallet {
             wallet
@@ -11048,11 +11066,7 @@ mod tests {
                 .unwrap();
         assert_eq!(chainstate.execution().tip().unwrap().height, block_count);
         assert_eq!(chainstate.execution().tip().unwrap().hash, expected_tip);
-        let explorer =
-            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
-                .unwrap();
-        assert_eq!(explorer.tip().unwrap().height, block_count);
-        assert_eq!(explorer.tip().unwrap().hash, expected_tip);
+        assert!(!directory.path().join("explorer.redb").exists());
         let ledger =
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
@@ -11215,10 +11229,7 @@ mod tests {
                 .unwrap();
         assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
         assert!(ledger.staged().unwrap().is_none());
-        let explorer =
-            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest)
-                .unwrap();
-        assert_eq!(explorer.tip().unwrap().height, 1);
+        assert!(!directory.path().join("explorer.redb").exists());
     }
 
     #[tokio::test]
@@ -11314,13 +11325,6 @@ mod tests {
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
         assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
-        let explorer =
-            RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Signet)
-                .unwrap();
-        assert_eq!(explorer.tip().unwrap().height, 1);
-        assert_eq!(
-            explorer.block(1).unwrap().unwrap().hash,
-            block_hash.to_string()
-        );
+        assert!(!directory.path().join("explorer.redb").exists());
     }
 }
