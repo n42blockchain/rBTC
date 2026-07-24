@@ -3715,12 +3715,17 @@ async fn sync_validating_node(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
 ) -> Result<(), PeerRunError> {
-    if network_execution == NetworkExecutionMode::ExperimentalOnce
-        && (!supports_experimental_block_execution(network) || !once)
-    {
-        return Err(PeerRunError::transient(
-            "experimental block execution requires bitcoin or legacy testnet together with bounded --once mode",
-        ));
+    if network_execution == NetworkExecutionMode::ExperimentalOnce {
+        if !supports_experimental_block_execution(network) || !once {
+            return Err(PeerRunError::transient(
+                "experimental block execution requires bitcoin or legacy testnet together with bounded --once mode",
+            ));
+        }
+        if validation_target.is_none() {
+            return Err(PeerRunError::transient(
+                "experimental block execution requires an authenticated validation height and block hash hard ceiling",
+            ));
+        }
     }
     if !supports_block_execution(network) && network_execution == NetworkExecutionMode::SafetyGated
     {
@@ -5763,6 +5768,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     .to_owned(),
             );
         }
+        if validation_target.is_none() {
+            return Err(
+                "--experimental-network-execution requires --validate-until-height and --validate-until-blockhash"
+                    .to_owned(),
+            );
+        }
         if explorer_listen.is_some() {
             return Err(
                 "--experimental-network-execution cannot expose explorer, RPC, or wallet services"
@@ -5924,7 +5935,7 @@ fn print_usage() {
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--validate-until-height HEIGHT --validate-until-blockhash HASH]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once --validate-until-height HEIGHT --validate-until-blockhash HASH\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
@@ -9152,7 +9163,10 @@ mod tests {
             };
             assert!(error.contains("only regtest and Signet"));
         }
+    }
 
+    #[test]
+    fn experimental_network_execution_requires_a_bounded_authenticated_target() {
         for network in ["bitcoin", "testnet"] {
             let options = parse_options(
                 [
@@ -9164,6 +9178,10 @@ mod tests {
                     "/tmp/rbtc-experimental-execution-gate",
                     "--experimental-network-execution",
                     "--once",
+                    "--validate-until-height",
+                    "1",
+                    "--validate-until-blockhash",
+                    "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -9175,6 +9193,7 @@ mod tests {
                 NetworkExecutionMode::ExperimentalOnce
             );
             assert!(options.once);
+            assert!(options.validation_target.is_some());
         }
 
         for arguments in [
@@ -9196,6 +9215,14 @@ mod tests {
             vec![
                 "--network",
                 "regtest",
+                "--data-dir",
+                "/tmp/rbtc-experimental-execution-gate",
+                "--experimental-network-execution",
+                "--once",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
                 "--data-dir",
                 "/tmp/rbtc-experimental-execution-gate",
                 "--experimental-network-execution",
