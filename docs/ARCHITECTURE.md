@@ -115,7 +115,7 @@ Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endi
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
-Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block. The durable writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
 
 Mainnet output-collision handling follows Core's BIP30 optimization: after the
 authenticated BIP34 anchor, ordinary blocks skip the redundant durable output
@@ -142,6 +142,16 @@ without moving tentative state into redb. Every script must pass before the
 checkpoint can commit; out-of-order
 completion still selects the earliest failing block and transaction and rolls
 back all tentative mutations.
+The pinned Core 26 `bitcoinconsensus` source adds a narrow transaction-level
+ABI used by those jobs. It decodes the serialized transaction once, constructs
+`PrecomputedTransactionData` once, then verifies every input against the same
+immutable spent-output vector; the returned failure still identifies the exact
+input. The former public one-input ABI repeated transaction decoding and common
+signature-hash precomputation for every input. A hot release A/B on the same
+five authenticated activation blocks (8,997 transactions and 23,331 inputs)
+fell from 1.47 to 0.44 seconds, a 3.34× execution speedup. The complete pinned
+Core 26 public transaction/script corpus plus real CSV, SegWit, Taproot, and
+full activation-block fixtures exercise the added boundary.
 Three isolated release runs of the historical full-block regression improved
 from a 3.59-second median at `534c28c` to 2.36 seconds, a 1.52× speedup.
 Against the immediately preceding scoped-thread implementation, a second
@@ -170,16 +180,69 @@ and AssumeUTXO stores retain per-block undo. A checkpoint's validated
 transitions are folded into one sorted net UTXO change before the redb
 transaction, so outputs created and spent inside the same checkpoint never
 touch disk and the durable layer does not decode a second, unused aggregate
-undo. Empty cold-tier validation stores skip that B-tree entirely. Dropping
+undo. The final spend/create streams are merged into one monotonically ordered
+B-tree walk. The validation overlay uses a keyed high-throughput hash table
+with checkpoint-sized capacity reservations, while transaction IDs computed
+for Merkle authentication are carried into execution instead of hashing every
+transaction serialization again. Large sorted input-prefetch sets are divided
+across host-CPU read workers; each owns one redb read snapshot and the joined
+result preserves caller order. Empty cold-tier validation stores skip that B-tree entirely. Dropping
 309,112 obsolete undo rows followed by native offline compaction reduced the
 live soak database from 23 GiB to 4.0 GiB; the experimental high-memory path
-uses a 6 GiB redb cache so that compact working set and a larger write cache fit
+uses a 16 GiB redb cache so that compact working set and a larger write cache fit
 without changing ordinary-node defaults.
 The default checkpoint remains 64 blocks. Explicit bounded validation may use
 up to 1,008 blocks (approximately 4 GiB at the consensus block-size maximum,
 with an independent 1 GiB ledger-record ceiling) to amortize staged-ledger and
 chainstate durability barriers on adequately provisioned machines; later
 full-block eras should retain a lower memory-aware setting.
+The post-BIP66 soak located that boundary empirically. One stable 1,008-block
+checkpoint took 181.77 seconds after its working set crossed the redb dirty-page
+cache threshold. Splitting the adjacent work into two 504-block checkpoints
+took 84.71 seconds combined, and three 252-block checkpoints sustained 12.1
+blocks/second without the superlinear commit tail. The public mainnet soak
+therefore moved first to 252 blocks while the CLI retained the full explicit
+range for measured hosts and chain eras.
+Standalone bounded validation additionally sends one lookahead window only
+after the current batch's downloaded blocks pass header, Merkle, structure, and
+deployment checks. At most 128 future block hashes are requested, still as
+16-entry `getdata` messages. Their bytes can enter the authenticated ordered
+receive stream while current scripts and the atomic chainstate commit run; the
+next iteration consumes that exact hash prefix through the ordinary bounded
+receiver before issuing another request. It never stages, executes, or commits
+lookahead state and never requests above the immutable target. A mismatch,
+timeout, unsolicited response, compact-block failure, or peer replacement
+retains the existing fail-closed path. Although a 126-block checkpoint fits
+entirely in one lookahead window and its first two batches took 29.0 seconds
+combined, the 21-checkpoint long sample fell to 5.41 blocks/second as twice as
+many macOS `F_FULLFSYNC` barriers accumulated. The adjacent 252-block lookahead
+sample sustained 5.97 blocks/second, so the public mainnet soak retains 252 as
+its measured default.
+
+The pinned redb 2.6 storage backend is vendored with one local write-buffer
+change: dirty pages are sorted by file offset and adjacent pages are coalesced
+into writes capped at 8 MiB. This preserves page bytes, immediate durability,
+and commit ordering while avoiding hash-map iteration order turning one flush
+into hundreds of thousands of random small writes. On the exact same mainnet
+height-346,921–347,928 batch, total time fell
+from 117.72 to 72.46 seconds and execution/persistence from 82.95 to 30.77
+seconds. The authenticated run subsequently reached BIP66 height 363,725/hash
+`00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931`;
+a cold completed-target restart requested no blocks.
+The subsequent transaction-level consensus ABI eliminated repeated
+transaction parsing and shared signature-hash precomputation across inputs;
+the exact authenticated five-block release fixture improved from 1.47 to 0.44
+seconds while preserving input-specific failures.
+The same production directory subsequently reached BIP65 height 388,381/hash
+`000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0`.
+At height 381,113, 171.8 seconds of offline compaction reduced the chainstate
+file from 10.88 to 7.48 GB and improved the adjacent execution/persistence
+measurement from 72.31 to 13.48 seconds. The file later expanded under normal
+copy-on-write reservation, so the measured benefit is attributed to reclaimed
+fragmentation and page locality rather than treating compact file length as a
+permanent size bound. A cold completed-target restart advanced only the header
+store to height 959,424, requested no block, and stopped at the same BIP65
+height/hash.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

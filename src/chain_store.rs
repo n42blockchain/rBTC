@@ -19,7 +19,8 @@ use crate::{
     },
     headers::HeaderDag,
     undo_store::{
-        RedbUndoStore, UndoStoreError, insert_transaction as insert_undo_transaction,
+        RedbUndoStore, UndoStoreError, clear_block_undos_database,
+        insert_transaction as insert_undo_transaction,
         remove_transaction as remove_undo_transaction,
         tables_empty_transaction as undo_tables_empty_transaction,
     },
@@ -198,12 +199,15 @@ impl RedbChainStore {
         // redb 2.6 contains an internal assertion for certain truncated files.
         // Convert that boundary panic into an explicit startup rejection so a
         // damaged chainstate cannot take the daemon down without diagnosis.
-        let database = catch_unwind(AssertUnwindSafe(|| {
+        let mut database = catch_unwind(AssertUnwindSafe(|| {
             Database::builder()
                 .set_cache_size(options.cache_size_bytes)
                 .create(path)
         }))
         .map_err(|_| ChainStoreError::Damaged)??;
+        if !options.retain_block_undo && clear_block_undos_database(&database)? {
+            database.compact()?;
+        }
         let db = Arc::new(database);
         Self::from_database(db, network, options)
     }
@@ -234,9 +238,6 @@ impl RedbChainStore {
             }
         }
         let undos = RedbUndoStore::from_database(Arc::clone(&db))?;
-        if !options.retain_block_undo {
-            undos.clear_block_undos()?;
-        }
         let execution = RedbExecutionStore::from_database(Arc::clone(&db), network)?;
         Ok(Self {
             db,
@@ -1271,6 +1272,33 @@ mod tests {
         assert_eq!(store.get(key(3)).unwrap(), Some(coin(8)));
         assert!(store.undos().get(first_hash).unwrap().is_some());
         assert!(store.undos().get(second_hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn batch_atomically_replaces_a_spent_outpoint() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store.apply(&[], &[(key(1), coin(10))]).unwrap();
+        let replacement = Utxo {
+            value_sats: 99,
+            ..coin(20)
+        };
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([40; 32]),
+                },
+                spent: vec![key(1)],
+                created: vec![(key(1), replacement.clone())],
+                transaction_undos: vec![],
+            }])
+            .unwrap();
+        assert_eq!(store.get(key(1)).unwrap(), Some(replacement));
     }
 
     #[test]

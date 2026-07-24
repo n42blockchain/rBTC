@@ -9,6 +9,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "getrandom 0.3.4",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -263,8 +264,6 @@ dependencies = [
 [[package]]
 name = "bitcoinconsensus"
 version = "0.106.0+26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e12cba9cce5043cdda968e07b9df6d05ec6b0b38aa27a9a40bb575cf3e521ae9"
 dependencies = [
  "cc",
 ]
@@ -1026,6 +1025,7 @@ dependencies = [
 name = "rbtc"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "axum",
  "bdk_wallet",
  "bitcoin",
@@ -1048,8 +1048,6 @@ dependencies = [
 [[package]]
 name = "redb"
 version = "2.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
 dependencies = [
  "libc",
 ]

@@ -1,17 +1,20 @@
 //! Sequential active-chain block execution and durable progress coordination.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 
-use bitcoin::{Block, BlockHash, OutPoint};
+use ahash::AHashMap;
+use bitcoin::{Block, BlockHash, OutPoint, Txid};
 use thiserror::Error;
 
 use crate::{
     blockchain::{
         AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck,
-        apply_block_with_deployments, apply_prevalidated_block_with_deferred_scripts,
+        ValidatedBlockTransactionIds, apply_block_with_deployments,
+        apply_prevalidated_block_with_deferred_scripts,
+        apply_prevalidated_block_with_deferred_scripts_and_txids,
         apply_prevalidated_block_with_deployments, disconnect_block,
         validate_block_structure_with_deployments, verify_deferred_scripts,
     },
@@ -113,6 +116,9 @@ pub enum BlockExecutionError {
         /// Number of deployment contexts.
         deployments: usize,
     },
+    /// Precomputed transaction identifiers do not align with their blocks.
+    #[error("precomputed transaction identifiers do not match block batch")]
+    TransactionIdCount,
     /// A write-ahead transition does not match either its pre- or post-state.
     #[error("pending transition UTXO state is internally inconsistent")]
     InconsistentTransition,
@@ -311,6 +317,7 @@ pub fn connect_active_blocks(
         hot_window_secs,
         deployments,
         false,
+        None,
     )
 }
 
@@ -335,10 +342,35 @@ pub fn connect_prevalidated_active_blocks(
         hot_window_secs,
         deployments,
         true,
+        None,
     )
 }
 
+/// Connects structurally authenticated blocks while reusing the transaction
+/// identifiers already computed for their Merkle roots.
 #[allow(clippy::too_many_arguments)]
+pub fn connect_prevalidated_active_blocks_with_txids(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    transaction_ids: &[ValidatedBlockTransactionIds],
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    connect_active_blocks_inner(
+        chainstate,
+        headers,
+        blocks,
+        now,
+        hot_window_secs,
+        deployments,
+        true,
+        Some(transaction_ids),
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_active_blocks_inner(
     chainstate: &RedbChainStore,
     headers: &HeaderDag,
@@ -347,6 +379,7 @@ fn connect_active_blocks_inner(
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
     structure_prevalidated: bool,
+    transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
 ) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
@@ -357,9 +390,17 @@ fn connect_active_blocks_inner(
     if blocks.is_empty() {
         return Ok(Vec::new());
     }
+    if transaction_ids.is_some_and(|ids| {
+        ids.len() != blocks.len()
+            || ids
+                .iter()
+                .zip(blocks)
+                .any(|(ids, block)| ids.as_slice().len() != block.txdata.len())
+    }) {
+        return Err(BlockExecutionError::TransactionIdCount);
+    }
 
     let mut current = chainstate.execution().tip()?;
-    let cumulative = UtxoOverlay::new(chainstate);
     let mut input_outpoints = blocks
         .iter()
         .flat_map(|block| block.txdata.iter().skip(1))
@@ -368,13 +409,27 @@ fn connect_active_blocks_inner(
         .collect::<Vec<_>>();
     input_outpoints.sort_unstable();
     input_outpoints.dedup();
+    let output_count = blocks
+        .iter()
+        .flat_map(|block| &block.txdata)
+        .map(|transaction| transaction.output.len())
+        .sum::<usize>();
+    let cumulative = UtxoOverlay::with_capacity(
+        chainstate,
+        input_outpoints.len().saturating_add(output_count),
+    );
     cumulative.prefetch(&input_outpoints)?;
     let mut applied_blocks = Vec::with_capacity(blocks.len());
     let mut transitions = Vec::with_capacity(blocks.len());
     let mut deferred_scripts = Vec::new();
     let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
     for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
-        let block_overlay = UtxoOverlay::new(&cumulative);
+        let block_capacity = block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.input.len() + transaction.output.len())
+            .sum();
+        let block_overlay = UtxoOverlay::with_capacity(&cumulative, block_capacity);
         let validated = validate_active_block_inner(
             &block_overlay,
             headers,
@@ -385,6 +440,7 @@ fn connect_active_blocks_inner(
             deployment,
             structure_prevalidated,
             true,
+            transaction_ids.map(|ids| ids[block_order].as_slice()),
         );
         let (applied, changes, mut block_scripts) = match validated {
             Ok(validated) => validated,
@@ -469,11 +525,12 @@ fn validate_active_block<S: UtxoStore>(
         deployments,
         structure_prevalidated,
         false,
+        None,
     )
     .map(|(applied, changes, _)| (applied, changes))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_active_block_inner<'a, S: UtxoStore>(
     chainstate: &S,
     headers: &HeaderDag,
@@ -484,6 +541,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     deployments: &BlockDeploymentContext,
     structure_prevalidated: bool,
     defer_scripts: bool,
+    transaction_ids: Option<&[Txid]>,
 ) -> Result<(AppliedBlock, UtxoChanges, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
@@ -522,17 +580,31 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
             )
             .map_err(BlockExecutionError::Block)?;
         }
-        apply_prevalidated_block_with_deferred_scripts(
-            &overlay,
-            block,
-            next_height,
-            now,
-            parent_mtp,
-            hot_window_secs,
-            deployments.script_flags,
-            deployments.csv_active,
-            deployments.subsidy_sats,
-        )
+        match transaction_ids {
+            Some(transaction_ids) => apply_prevalidated_block_with_deferred_scripts_and_txids(
+                &overlay,
+                block,
+                transaction_ids,
+                next_height,
+                now,
+                parent_mtp,
+                hot_window_secs,
+                deployments.script_flags,
+                deployments.csv_active,
+                deployments.subsidy_sats,
+            ),
+            None => apply_prevalidated_block_with_deferred_scripts(
+                &overlay,
+                block,
+                next_height,
+                now,
+                parent_mtp,
+                hot_window_secs,
+                deployments.script_flags,
+                deployments.csv_active,
+                deployments.subsidy_sats,
+            ),
+        }
         .map_err(BlockExecutionError::Block)?
     } else if structure_prevalidated {
         (
@@ -579,8 +651,8 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
 
 #[derive(Default)]
 struct OverlayState {
-    original: HashMap<OutPointKey, Option<Utxo>>,
-    current: HashMap<OutPointKey, Option<Utxo>>,
+    original: AHashMap<OutPointKey, Option<Utxo>>,
+    current: AHashMap<OutPointKey, Option<Utxo>>,
 }
 
 struct UtxoChanges {
@@ -597,9 +669,16 @@ struct UtxoOverlay<'a, S> {
 
 impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     fn new(base: &'a S) -> Self {
+        Self::with_capacity(base, 0)
+    }
+
+    fn with_capacity(base: &'a S, capacity: usize) -> Self {
         Self {
             base,
-            state: Mutex::new(OverlayState::default()),
+            state: Mutex::new(OverlayState {
+                original: AHashMap::with_capacity(capacity),
+                current: AHashMap::with_capacity(capacity),
+            }),
         }
     }
 

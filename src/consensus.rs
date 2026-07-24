@@ -22,6 +22,13 @@ pub enum ConsensusError {
         /// Number of transaction inputs.
         inputs: usize,
     },
+    /// Bitcoin Core's transaction-level consensus ABI rejected the work item.
+    #[error("transaction script validation setup failed: {source}")]
+    Transaction {
+        /// Concrete library error.
+        #[source]
+        source: bitcoinconsensus::Error,
+    },
     /// Bitcoin Core's consensus script engine rejected an input.
     #[error("script validation failed for input {input}: {source}")]
     Script {
@@ -95,18 +102,13 @@ pub(crate) fn verify_serialized_transaction_scripts_with_flags(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (input, utxo) in prevouts.iter().enumerate() {
-        bitcoinconsensus::verify_with_flags(
-            &utxo.script_pubkey,
-            utxo.value_sats,
-            raw_transaction,
-            Some(&spent_outputs),
-            input,
-            flags,
-        )
-        .map_err(|source| ConsensusError::Script { input, source })?;
-    }
-    Ok(())
+    bitcoinconsensus::verify_transaction_with_flags(raw_transaction, &spent_outputs, flags).map_err(
+        |(input, source)| {
+            input.map_or(ConsensusError::Transaction { source }, |input| {
+                ConsensusError::Script { input, source }
+            })
+        },
+    )
 }
 
 #[cfg(test)]

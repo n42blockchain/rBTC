@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
+    thread,
 };
 
 use bitcoin::{OutPoint, Txid, hashes::Hash};
@@ -364,6 +365,8 @@ pub struct RedbUtxoStore {
 }
 
 impl RedbUtxoStore {
+    const MIN_PARALLEL_PREFETCH_KEYS: usize = 4_096;
+
     /// Opens or creates a chainstate file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtxoError> {
         Self::from_database(Arc::new(Database::create(path)?))
@@ -384,6 +387,29 @@ impl RedbUtxoStore {
 
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
+    }
+
+    fn get_many_serial(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let transaction = self.db.begin_read()?;
+        let hot = transaction.open_table(HOT_TABLE)?;
+        let cold = transaction.open_table(COLD_TABLE)?;
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                let key = outpoint.as_bytes();
+                let utxo = match hot.get(key.as_slice())? {
+                    Some(value) => Some(Utxo::decode(value.value())?),
+                    None => cold
+                        .get(key.as_slice())?
+                        .map(|value| Utxo::decode(value.value()))
+                        .transpose()?,
+                };
+                Ok((*outpoint, utxo))
+            })
+            .collect()
     }
 
     /// Computes count, encoded length, and logical UTXO-set identity without
@@ -533,23 +559,25 @@ impl UtxoStore for RedbUtxoStore {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
-        let transaction = self.db.begin_read()?;
-        let hot = transaction.open_table(HOT_TABLE)?;
-        let cold = transaction.open_table(COLD_TABLE)?;
-        outpoints
-            .iter()
-            .map(|outpoint| {
-                let key = outpoint.as_bytes();
-                let utxo = match hot.get(key.as_slice())? {
-                    Some(value) => Some(Utxo::decode(value.value())?),
-                    None => cold
-                        .get(key.as_slice())?
-                        .map(|value| Utxo::decode(value.value()))
-                        .transpose()?,
-                };
-                Ok((*outpoint, utxo))
-            })
-            .collect()
+        let available_workers = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let workers =
+            available_workers.min(outpoints.len().div_ceil(Self::MIN_PARALLEL_PREFETCH_KEYS));
+        if workers <= 1 {
+            return self.get_many_serial(outpoints);
+        }
+
+        let chunk_size = outpoints.len().div_ceil(workers);
+        thread::scope(|scope| {
+            let jobs = outpoints
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(|| self.get_many_serial(chunk)))
+                .collect::<Vec<_>>();
+            let mut prefetched = Vec::with_capacity(outpoints.len());
+            for job in jobs {
+                prefetched.extend(job.join().expect("UTXO prefetch worker must not panic")?);
+            }
+            Ok(prefetched)
+        })
     }
 
     fn apply(
@@ -877,7 +905,11 @@ pub(crate) fn apply_validated_changes_transaction(
     let mut hot = transaction.open_table(HOT_TABLE)?;
     let mut cold = transaction.open_table(COLD_TABLE)?;
     let cold_is_empty = cold.is_empty()?;
-    for key in spent {
+
+    let remove = |hot: &mut redb::Table<'_, &[u8], &[u8]>,
+                  cold: &mut redb::Table<'_, &[u8], &[u8]>,
+                  key: &OutPointKey|
+     -> Result<(), UtxoError> {
         let removed_hot = hot.remove(key.as_bytes().as_slice())?.is_some();
         if removed_hot {
             if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
@@ -886,8 +918,14 @@ pub(crate) fn apply_validated_changes_transaction(
         } else if cold_is_empty || cold.remove(key.as_bytes().as_slice())?.is_none() {
             return Err(UtxoError::Missing(*key));
         }
-    }
-    for (key, utxo) in created {
+        Ok(())
+    };
+    let insert = |hot: &mut redb::Table<'_, &[u8], &[u8]>,
+                  cold: &redb::Table<'_, &[u8], &[u8]>,
+                  key: &OutPointKey,
+                  utxo: &Utxo,
+                  replaces_spent: bool|
+     -> Result<(), UtxoError> {
         if !cold_is_empty && cold.get(key.as_bytes().as_slice())?.is_some() {
             return Err(UtxoError::Duplicate(*key));
         }
@@ -895,9 +933,45 @@ pub(crate) fn apply_validated_changes_transaction(
         if hot
             .insert(key.as_bytes().as_slice(), value.as_slice())?
             .is_some()
-            && spent.binary_search(key).is_err()
+            && !replaces_spent
         {
             return Err(UtxoError::Duplicate(*key));
+        }
+        Ok(())
+    };
+
+    // Both slices are sorted. Merge them into one monotonically increasing
+    // B-tree walk so pages touched by removals can be reused immediately for
+    // nearby inserts instead of traversing and dirtying the whole tree twice.
+    let mut spent_index = 0;
+    let mut created_index = 0;
+    while spent_index < spent.len() || created_index < created.len() {
+        match (spent.get(spent_index), created.get(created_index)) {
+            (Some(spent_key), Some((created_key, utxo))) => match spent_key.cmp(created_key) {
+                std::cmp::Ordering::Less => {
+                    remove(&mut hot, &mut cold, spent_key)?;
+                    spent_index += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    remove(&mut hot, &mut cold, spent_key)?;
+                    insert(&mut hot, &cold, created_key, utxo, true)?;
+                    spent_index += 1;
+                    created_index += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    insert(&mut hot, &cold, created_key, utxo, false)?;
+                    created_index += 1;
+                }
+            },
+            (Some(spent_key), None) => {
+                remove(&mut hot, &mut cold, spent_key)?;
+                spent_index += 1;
+            }
+            (None, Some((created_key, utxo))) => {
+                insert(&mut hot, &cold, created_key, utxo, false)?;
+                created_index += 1;
+            }
+            (None, None) => break,
         }
     }
     Ok(())
@@ -917,6 +991,11 @@ mod tests {
     }
     fn key(n: u8) -> OutPointKey {
         OutPoint::new(Txid::from_byte_array([n; 32]), 0).into()
+    }
+    fn indexed_key(n: u32) -> OutPointKey {
+        let mut txid = [0_u8; 32];
+        txid[..4].copy_from_slice(&n.to_le_bytes());
+        OutPoint::new(Txid::from_byte_array(txid), 0).into()
     }
     fn coin(touched: u64) -> Utxo {
         Utxo {
@@ -1024,5 +1103,33 @@ mod tests {
         assert_eq!(store.get(key(1)).unwrap(), Some(replacement));
         store.undo(&undo, 100, 60).unwrap();
         assert_eq!(store.get(key(1)).unwrap(), Some(coin(10)));
+    }
+
+    #[test]
+    fn parallel_get_many_preserves_caller_order_and_missing_rows() {
+        let (_dir, store) = store();
+        let outpoints = (0..8_193).map(indexed_key).collect::<Vec<_>>();
+        store
+            .apply(
+                &[],
+                &[
+                    (outpoints[0], coin(10)),
+                    (outpoints[4_096], coin(20)),
+                    (outpoints[8_192], coin(30)),
+                ],
+            )
+            .unwrap();
+
+        let rows = store.get_many(&outpoints).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(outpoint, _)| *outpoint)
+                .collect::<Vec<_>>(),
+            outpoints
+        );
+        assert_eq!(rows[0].1, Some(coin(10)));
+        assert_eq!(rows[4_096].1, Some(coin(20)));
+        assert_eq!(rows[8_192].1, Some(coin(30)));
+        assert!(rows[1].1.is_none());
     }
 }

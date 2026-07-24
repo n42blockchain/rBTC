@@ -208,6 +208,7 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
     let prepared = prepare_transaction_with_context(
         store,
         transaction,
+        None,
         height,
         now,
         creation_mtp,
@@ -236,6 +237,7 @@ pub fn apply_transaction_with_context<S: UtxoStore>(
 pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
     store: &S,
     transaction: &Transaction,
+    txid: bitcoin::Txid,
     height: u32,
     now: u64,
     creation_mtp: u32,
@@ -246,6 +248,7 @@ pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
     let prepared = prepare_transaction_with_context(
         store,
         transaction,
+        Some(txid),
         height,
         now,
         creation_mtp,
@@ -290,6 +293,7 @@ pub fn validate_transaction_with_context<S: UtxoStore>(
     prepare_transaction_with_context(
         store,
         transaction,
+        None,
         height,
         0,
         creation_mtp,
@@ -305,6 +309,7 @@ pub fn validate_transaction_with_context<S: UtxoStore>(
 fn prepare_transaction_with_context<S: UtxoStore>(
     store: &S,
     transaction: &Transaction,
+    precomputed_txid: Option<bitcoin::Txid>,
     height: u32,
     now: u64,
     creation_mtp: u32,
@@ -326,7 +331,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
             },
         });
     }
-    let txid = transaction.compute_txid();
+    let txid = precomputed_txid.unwrap_or_else(|| transaction.compute_txid());
     let output_value = transaction.output.iter().try_fold(0_u64, |sum, output| {
         if output.value.to_sat() > MAX_MONEY_SATS {
             return Err(ChainstateError::MoneyRange);
@@ -345,7 +350,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
         if !(2..=100).contains(&script_len) {
             return Err(ChainstateError::CoinbaseScriptSize);
         }
-        let created = created_outputs(transaction, height, now, creation_mtp, true);
+        let created = created_outputs(transaction, txid, height, now, creation_mtp, true);
         return Ok(PreparedTransaction {
             validated: ValidatedTransaction {
                 txid,
@@ -410,7 +415,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
     if verify_scripts {
         verify_transaction_scripts_with_flags(transaction, &prevouts, script_flags)?;
     }
-    let created = created_outputs(transaction, height, now, creation_mtp, false);
+    let created = created_outputs(transaction, txid, height, now, creation_mtp, false);
     Ok(PreparedTransaction {
         validated: ValidatedTransaction {
             txid,
@@ -553,12 +558,12 @@ pub(crate) fn check_sequence_lock(
 
 fn created_outputs(
     transaction: &Transaction,
+    txid: bitcoin::Txid,
     height: u32,
     now: u64,
     creation_mtp: u32,
     is_coinbase: bool,
 ) -> Vec<(OutPointKey, Utxo)> {
-    let txid = transaction.compute_txid();
     transaction
         .output
         .iter()

@@ -18,7 +18,7 @@ case "$network" in
         default_timeout_seconds=7200
         default_target_height=295000
         default_target_hash=00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983
-        default_batch_size=1008
+        default_batch_size=252
         default_restart_height=1000
         default_deferred_repair=1
         ;;

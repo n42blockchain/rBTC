@@ -27,10 +27,13 @@ use rbtc::{
         explorer_events_router, explorer_router, rpc_router, wallet_router_with_sink,
     },
     block_execution::{
-        BlockDeploymentContext, BlockExecutionError, connect_prevalidated_active_blocks,
+        BlockDeploymentContext, BlockExecutionError, connect_prevalidated_active_blocks_with_txids,
         disconnect_execution_tip,
     },
-    blockchain::{AppliedBlock, validate_block_structure_with_deployments},
+    blockchain::{
+        AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
+        validate_block_structure_with_deployments_and_txids,
+    },
     chain_store::{ChainStoreOptions, RedbChainStore},
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
@@ -69,7 +72,7 @@ use tokio::time::timeout;
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
-const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 6 * 1024 * 1024 * 1024;
+const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -3931,6 +3934,7 @@ async fn sync_validating_node(
         if let Some(server) = &mut api_server {
             server.ensure_running().await?;
         }
+        let mut prefetched_block_hashes = None;
         loop {
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
@@ -4263,6 +4267,8 @@ async fn sync_validating_node(
                 transaction_pool,
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
+                &mut prefetched_block_hashes,
+                validation_target.is_some() && validation_scheduler.is_none(),
             )
             .await?;
             if let Some(wallet) = wallet_runtime {
@@ -4886,7 +4892,10 @@ async fn download_execute_batch(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
+    prefetched_block_hashes: &mut Option<Vec<BlockHash>>,
+    prefetch_next_batch: bool,
 ) -> Result<(), PeerRunError> {
+    let batch_started = Instant::now();
     let execution_store = chainstate.execution();
     let tip = execution_store.tip().map_err(|error| error.to_string())?;
     let next_height = tip
@@ -4921,7 +4930,33 @@ async fn download_execute_batch(
         .map(|header| header.hash)
         .collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(batch_len);
-    for pipelined_hashes in hashes.chunks(MAX_PIPELINED_BLOCKS_IN_FLIGHT) {
+    let prefetched_len = if let Some(prefetched) = prefetched_block_hashes.take() {
+        if prefetched.is_empty()
+            || prefetched.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT
+            || !hashes.starts_with(&prefetched)
+        {
+            return Err(PeerRunError::transient(
+                "prefetched block window does not match the next active-chain batch",
+            ));
+        }
+        let mut received = timeout(
+            PEER_TIMEOUT,
+            session.receive_pipelined_blocks_with_candidates(&prefetched, compact_candidates),
+        )
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "prefetched block response timed out for {} blocks",
+                prefetched.len()
+            ))
+        })?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+        blocks.append(&mut received);
+        prefetched.len()
+    } else {
+        0
+    };
+    for pipelined_hashes in hashes[prefetched_len..].chunks(MAX_PIPELINED_BLOCKS_IN_FLIGHT) {
         for request_hashes in pipelined_hashes.chunks(MAX_BLOCKS_IN_FLIGHT) {
             timeout(PEER_TIMEOUT, session.request_blocks(request_hashes))
                 .await
@@ -4947,7 +4982,8 @@ async fn download_execute_batch(
         .map_err(|error| PeerRunError::p2p(&error))?;
         blocks.append(&mut received);
     }
-    let deployment_contexts = expected
+    let downloaded_at = Instant::now();
+    let validated_blocks = expected
         .iter()
         .zip(&blocks)
         .map(|(expected, block)| {
@@ -4960,20 +4996,80 @@ async fn download_execute_batch(
             )
         })
         .collect::<Result<Vec<_>, PeerRunError>>()?;
+    let (deployment_contexts, transaction_ids): (Vec<_>, Vec<_>) =
+        validated_blocks.into_iter().unzip();
+    let structure_validated_at = Instant::now();
+    let mut prefetch_error = None;
+    if prefetch_next_batch {
+        let last_height = expected
+            .last()
+            .expect("non-empty block batch has a last header")
+            .height;
+        let remaining_after_batch = execution_ceiling.saturating_sub(last_height);
+        let prefetch_len = usize::try_from(remaining_after_batch)
+            .unwrap_or(usize::MAX)
+            .min(maximum_batch_size)
+            .min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+        if prefetch_len > 0 {
+            let next_height = last_height
+                .checked_add(1)
+                .expect("non-final validation batch height can advance");
+            let next_hashes = (0..prefetch_len)
+                .map(|offset| {
+                    let height = next_height
+                        .checked_add(u32::try_from(offset).expect("prefetch window fits u32"))
+                        .ok_or_else(|| "prefetched block height overflow".to_owned())?;
+                    headers
+                        .active_header_at(height)
+                        .map(|header| header.hash)
+                        .ok_or_else(|| format!("missing active header at height {height}"))
+                })
+                .collect::<Result<Vec<_>, String>>();
+            match next_hashes {
+                Ok(next_hashes) => {
+                    for request_hashes in next_hashes.chunks(MAX_BLOCKS_IN_FLIGHT) {
+                        if let Err(error) =
+                            timeout(PEER_TIMEOUT, session.request_blocks(request_hashes))
+                                .await
+                                .map_err(|_| {
+                                    PeerRunError::transient(format!(
+                                        "prefetch getdata timed out for {} blocks",
+                                        request_hashes.len()
+                                    ))
+                                })
+                                .and_then(|result| {
+                                    result.map_err(|error| PeerRunError::p2p(&error))
+                                })
+                        {
+                            prefetch_error = Some(error);
+                            break;
+                        }
+                    }
+                    if prefetch_error.is_none() {
+                        *prefetched_block_hashes = Some(next_hashes);
+                    }
+                }
+                Err(error) => prefetch_error = Some(PeerRunError::transient(error)),
+            }
+        }
+    }
     let serialized = blocks.iter().map(serialize).collect::<Vec<_>>();
     ledger
         .stage(next_height, &serialized)
         .map_err(|error| error.to_string())?;
+    let staged_at = Instant::now();
     let now = u64::from(unix_time()?);
-    let applied_blocks = connect_prevalidated_active_blocks(
+    let applied_blocks = connect_prevalidated_active_blocks_with_txids(
         chainstate,
         headers,
         &blocks,
+        &transaction_ids,
         now,
         DEFAULT_HOT_WINDOW_SECS,
         &deployment_contexts,
     )
     .map_err(|error| PeerRunError::block(&error))?;
+    let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
             let mut pool = transaction_pool
@@ -5000,23 +5096,37 @@ async fn download_execute_batch(
         &blocks,
         &applied_blocks,
     )?;
+    let indexed_at = Instant::now();
     let first = expected
         .first()
         .expect("non-empty block batch has a first header");
     let last = expected
         .last()
         .expect("non-empty block batch has a last header");
+    ledger
+        .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
+        .map_err(|error| error.to_string())?;
+    let published_at = Instant::now();
     println!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
         last.height,
-        last.hash
+        last.hash,
+        downloaded_at.duration_since(batch_started).as_millis(),
+        structure_validated_at
+            .duration_since(downloaded_at)
+            .as_millis(),
+        staged_at.duration_since(structure_validated_at).as_millis(),
+        executed_at.duration_since(staged_at).as_millis(),
+        indexed_at.duration_since(executed_at).as_millis(),
+        published_at.duration_since(indexed_at).as_millis(),
+        published_at.duration_since(batch_started).as_millis(),
     );
-    ledger
-        .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
-        .map_err(|error| error.to_string())?;
+    if let Some(error) = prefetch_error {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -5026,7 +5136,7 @@ fn validate_downloaded_block(
     height: u32,
     expected_hash: BlockHash,
     block: &Block,
-) -> Result<BlockDeploymentContext, PeerRunError> {
+) -> Result<(BlockDeploymentContext, ValidatedBlockTransactionIds), PeerRunError> {
     let actual = block.block_hash();
     if actual != expected_hash {
         return Err(PeerRunError::protocol(format!(
@@ -5044,7 +5154,7 @@ fn validate_downloaded_block(
         taproot,
     )
     .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    validate_block_structure_with_deployments(
+    let transaction_ids = validate_block_structure_with_deployments_and_txids(
         block,
         height,
         deployments.bip34_active,
@@ -5056,7 +5166,7 @@ fn validate_downloaded_block(
             "downloaded block structure at height {height}: {error}"
         ))
     })?;
-    Ok(deployments)
+    Ok((deployments, transaction_ids))
 }
 
 fn index_validated_blocks(

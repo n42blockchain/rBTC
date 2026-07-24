@@ -6,7 +6,7 @@ use std::{
 };
 
 use bitcoin::{
-    Block, TxMerkleNode,
+    Block, TxMerkleNode, Txid,
     consensus::{Encodable, serialize},
     hashes::{Hash, sha256d},
 };
@@ -28,6 +28,16 @@ pub const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
 pub const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
 const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const INITIAL_SUBSIDY_SATS: u64 = 50 * 100_000_000;
+
+/// Transaction identifiers authenticated by a block's validated Merkle root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedBlockTransactionIds(Vec<Txid>);
+
+impl ValidatedBlockTransactionIds {
+    pub(crate) fn as_slice(&self) -> &[Txid] {
+        &self.0
+    }
+}
 
 /// Reorg data produced by a successfully applied block.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +449,7 @@ pub(crate) fn apply_prevalidated_block_with_deployments<S: UtxoStore>(
     apply_prevalidated_block_with_deployments_inner(
         store,
         block,
+        None,
         height,
         now,
         creation_mtp,
@@ -463,9 +474,45 @@ pub(crate) fn apply_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>(
     csv_active: bool,
     subsidy_sats: u64,
 ) -> Result<(AppliedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(bitcoin::Transaction::compute_txid)
+        .collect::<Vec<_>>();
+    apply_prevalidated_block_with_deferred_scripts_and_txids(
+        store,
+        block,
+        &transaction_ids,
+        height,
+        now,
+        creation_mtp,
+        hot_window_secs,
+        script_flags,
+        csv_active,
+        subsidy_sats,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_prevalidated_block_with_deferred_scripts_and_txids<'a, S: UtxoStore>(
+    store: &S,
+    block: &'a Block,
+    transaction_ids: &[Txid],
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    hot_window_secs: u64,
+    script_flags: u32,
+    csv_active: bool,
+    subsidy_sats: u64,
+) -> Result<(AppliedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
+    if transaction_ids.len() != block.txdata.len() {
+        return Err(BlockError::MerkleRoot);
+    }
     apply_prevalidated_block_with_deployments_inner(
         store,
         block,
+        Some(transaction_ids),
         height,
         now,
         creation_mtp,
@@ -482,6 +529,7 @@ pub(crate) fn apply_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>(
 fn apply_prevalidated_block_with_deployments_inner<'a, S: UtxoStore>(
     store: &S,
     block: &'a Block,
+    transaction_ids: Option<&[Txid]>,
     height: u32,
     now: u64,
     creation_mtp: u32,
@@ -501,9 +549,11 @@ fn apply_prevalidated_block_with_deployments_inner<'a, S: UtxoStore>(
         block.header.time
     };
     for (index, transaction) in block.txdata.iter().enumerate() {
+        let txid = transaction_ids.map_or_else(|| transaction.compute_txid(), |ids| ids[index]);
         match apply_transaction_with_deferred_scripts(
             store,
             transaction,
+            txid,
             height,
             now,
             creation_mtp,
@@ -666,6 +716,25 @@ pub fn validate_block_structure_with_deployments(
     segwit_active: bool,
     signet_challenge: Option<&[u8]>,
 ) -> Result<(), BlockError> {
+    validate_block_structure_with_deployments_and_txids(
+        block,
+        height,
+        bip34_active,
+        segwit_active,
+        signet_challenge,
+    )
+    .map(|_| ())
+}
+
+/// Validates block structure and returns the transaction identifiers computed
+/// while authenticating its Merkle root.
+pub fn validate_block_structure_with_deployments_and_txids(
+    block: &Block,
+    height: u32,
+    bip34_active: bool,
+    segwit_active: bool,
+    signet_challenge: Option<&[u8]>,
+) -> Result<ValidatedBlockTransactionIds, BlockError> {
     if let Some(challenge) = signet_challenge {
         if block.block_hash()
             != bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet).block_hash()
@@ -688,7 +757,12 @@ pub fn validate_block_structure_with_deployments(
     {
         return Err(BlockError::MultipleCoinbase);
     }
-    let (merkle_root, mutated) = transaction_merkle_root(block);
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(bitcoin::Transaction::compute_txid)
+        .collect::<Vec<_>>();
+    let (merkle_root, mutated) = transaction_merkle_root(&transaction_ids);
     if merkle_root != Some(block.header.merkle_root) {
         return Err(BlockError::MerkleRoot);
     }
@@ -700,14 +774,13 @@ pub fn validate_block_structure_with_deployments(
     if weight > MAX_BLOCK_WEIGHT {
         return Err(BlockError::Weight { weight });
     }
-    Ok(())
+    Ok(ValidatedBlockTransactionIds(transaction_ids))
 }
 
-fn transaction_merkle_root(block: &Block) -> (Option<TxMerkleNode>, bool) {
-    let mut hashes = block
-        .txdata
+fn transaction_merkle_root(transaction_ids: &[Txid]) -> (Option<TxMerkleNode>, bool) {
+    let mut hashes = transaction_ids
         .iter()
-        .map(|transaction| transaction.compute_txid().to_raw_hash())
+        .map(|txid| txid.to_raw_hash())
         .collect::<Vec<_>>();
     if hashes.is_empty() {
         return (None, false);

@@ -22,6 +22,7 @@ name = "rbtcd"
 path = "src/main.rs"
 
 [dependencies]
+ahash = "0.8"
 bitcoin = { version = "=0.32.8", default-features = true }
 bitcoinconsensus = "0.106"
 bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
@@ -41,6 +42,10 @@ zstd = "0.13"
 proptest = "1.7"
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
+
+[patch.crates-io]
+bitcoinconsensus = { path = "vendor/bitcoinconsensus" }
+redb = { path = "vendor/redb" }
 
 [lints.rust]
 unsafe_code = "forbid"
