@@ -264,6 +264,12 @@ fragmentation and page locality rather than treating compact file length as a
 permanent size bound. A cold completed-target restart advanced only the header
 store to height 959,424, requested no block, and stopped at the same BIP65
 height/hash.
+The append-only validation path subsequently stopped exactly at CSV activation
+height 419,328/hash
+`000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5`.
+Its 71-block tail committed in 12.22 seconds. A cold restart advanced only the
+active header store from 959,431 to 959,434, requested no blocks, and exited at
+the same CSV height/hash.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 
