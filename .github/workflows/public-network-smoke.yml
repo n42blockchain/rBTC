@@ -25,7 +25,7 @@ jobs:
 
   mainnet-checkpoint:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 135
     env:
       RBTC_SYNC_NETWORK: bitcoin
     steps:
