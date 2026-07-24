@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use bitcoin::{Block, BlockHash, OutPoint, Txid};
 use thiserror::Error;
 
@@ -370,6 +370,53 @@ pub fn connect_prevalidated_active_blocks_with_txids(
     )
 }
 
+fn external_batch_input_outpoints(
+    blocks: &[Block],
+    transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
+    output_count: usize,
+) -> Vec<OutPointKey> {
+    let mut input_outpoints = Vec::new();
+    if let Some(transaction_ids) = transaction_ids {
+        let mut created_in_batch = AHashSet::with_capacity(output_count);
+        for (block, transaction_ids) in blocks.iter().zip(transaction_ids) {
+            for (index, (transaction, txid)) in block
+                .txdata
+                .iter()
+                .zip(transaction_ids.as_slice())
+                .enumerate()
+            {
+                if index != 0 {
+                    input_outpoints.extend(
+                        transaction
+                            .input
+                            .iter()
+                            .map(|input| OutPointKey::from(input.previous_output))
+                            .filter(|outpoint| !created_in_batch.contains(outpoint)),
+                    );
+                }
+                for (vout, output) in transaction.output.iter().enumerate() {
+                    if is_unspendable(&output.script_pubkey) {
+                        continue;
+                    }
+                    let vout = u32::try_from(vout).expect("transaction output count fits u32");
+                    created_in_batch.insert(OutPointKey::from(OutPoint::new(*txid, vout)));
+                }
+            }
+        }
+    } else {
+        input_outpoints.extend(
+            blocks
+                .iter()
+                .flat_map(|block| block.txdata.iter().skip(1))
+                .flat_map(|transaction| transaction.input.iter())
+                .map(|input| OutPointKey::from(input.previous_output)),
+        );
+    }
+    input_outpoints.sort_unstable();
+    input_outpoints.dedup();
+    input_outpoints
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_active_blocks_inner(
     chainstate: &RedbChainStore,
@@ -401,19 +448,12 @@ fn connect_active_blocks_inner(
     }
 
     let mut current = chainstate.execution().tip()?;
-    let mut input_outpoints = blocks
-        .iter()
-        .flat_map(|block| block.txdata.iter().skip(1))
-        .flat_map(|transaction| transaction.input.iter())
-        .map(|input| OutPointKey::from(input.previous_output))
-        .collect::<Vec<_>>();
-    input_outpoints.sort_unstable();
-    input_outpoints.dedup();
     let output_count = blocks
         .iter()
         .flat_map(|block| &block.txdata)
         .map(|transaction| transaction.output.len())
         .sum::<usize>();
+    let input_outpoints = external_batch_input_outpoints(blocks, transaction_ids, output_count);
     let cumulative = UtxoOverlay::with_capacity(
         chainstate,
         input_outpoints.len().saturating_add(output_count),
@@ -1015,7 +1055,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        blockchain::{BlockError, block_subsidy},
+        blockchain::{
+            BlockError, block_subsidy, validate_block_structure_with_deployments_and_txids,
+        },
         chain_store::RedbChainStore,
         deployments::block_deployment_context,
         headers::HeaderDag,
@@ -1037,6 +1079,52 @@ mod tests {
                 .is_peer_invalid()
         );
         assert!(!BlockExecutionError::NoNextHeader(0).is_peer_invalid());
+    }
+
+    #[test]
+    fn prevalidated_batch_prefetch_omits_outputs_created_earlier_in_batch() {
+        let external = OutPoint::new(Txid::from_byte_array([71; 32]), 0);
+        let parent = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: external,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let child = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(800),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let block =
+            block_with_transactions(BlockHash::all_zeros(), 1, vec![coinbase(1), parent, child]);
+        let transaction_ids =
+            validate_block_structure_with_deployments_and_txids(&block, 1, false, false, None)
+                .unwrap();
+        assert_eq!(
+            external_batch_input_outpoints(
+                std::slice::from_ref(&block),
+                Some(std::slice::from_ref(&transaction_ids)),
+                3,
+            ),
+            vec![external.into()]
+        );
     }
 
     fn coinbase(height: u32) -> Transaction {

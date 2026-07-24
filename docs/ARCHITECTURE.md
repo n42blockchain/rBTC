@@ -176,17 +176,38 @@ covers both settings and still requires an old or new complete checkpoint.
 Authenticated Bitcoin/testnet validation-only stores additionally discard
 historical block undo and omit future undo writes: they have a fixed reviewed
 target and are never exposed as reorganizing service nodes. Ordinary serving
-and AssumeUTXO stores retain per-block undo. A checkpoint's validated
-transitions are folded into one sorted net UTXO change before the redb
-transaction, so outputs created and spent inside the same checkpoint never
-touch disk and the durable layer does not decode a second, unused aggregate
-undo. The final spend/create streams are merged into one monotonically ordered
-B-tree walk. The validation overlay uses a keyed high-throughput hash table
-with checkpoint-sized capacity reservations, while transaction IDs computed
-for Merkle authentication are carried into execution instead of hashing every
-transaction serialization again. Large sorted input-prefetch sets are divided
-across host-CPU read workers; each owns one redb read snapshot and the joined
-result preserves caller order. Empty cold-tier validation stores skip that B-tree entirely. Dropping
+and AssumeUTXO stores retain per-block undo.
+
+Fixed-target validation folds a checkpoint's transitions with a keyed hash
+table and one final sort, so outputs created and spent inside the same
+checkpoint never touch disk. Inputs consuming outputs created earlier in that
+same prevalidated batch are removed from the historical prefetch set. The net
+change is encoded as one immutable `RVD3` delta: a strict 16-byte header,
+fixed-width sorted outpoint/state/offset/length index, and contiguous canonical
+UTXO data. Encoding writes each UTXO directly into the aggregate buffer rather
+than allocating one temporary record per coin. One immediate-durability redb
+transaction inserts the complete delta and advances every block transition;
+no prefix is visible after failure.
+
+Reads search newest deltas first by binary search and decode only a matched
+UTXO. A 10-bit-per-update Bloom filter accompanies every in-memory row, and
+each 16-row group shares a fixed aggregate Bloom filter, so historical base
+inputs normally skip 16 records with three probes. Bulk prefetch resolves all
+journal hits newest-first and issues one ordered parallel redb base lookup only
+for unresolved outpoints. Restart strictly validates record size, ordering,
+state bits, contiguous offsets, canonical UTXO bytes, and exact execution-tip
+alignment before rebuilding those acceleration filters. Ordinary mode rejects
+a non-empty delta table, and journal mode rejects block-undo retention and
+disconnects. Explicit materialization is one immediate transaction that folds
+the logical newest values into the base trees and clears the journal; periodic
+automatic materialization was rejected because it merely deferred the
+superlinear random-write cost.
+
+Transaction IDs computed for Merkle authentication are carried into execution
+instead of hashing every transaction serialization again. Large sorted
+input-prefetch sets are divided across host-CPU read workers; each owns one
+redb read snapshot and the joined result preserves caller order. Empty
+cold-tier validation stores skip that B-tree entirely. Dropping
 309,112 obsolete undo rows followed by native offline compaction reduced the
 live soak database from 23 GiB to 4.0 GiB; the experimental high-memory path
 uses a 16 GiB redb cache so that compact working set and a larger write cache fit

@@ -1112,7 +1112,12 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         println!("peer transaction admission full-RBF policy enabled");
     }
     if let Some(data_dir) = &options.data_dir {
-        preflight_data_dir(data_dir, options.network, &options.deployments)?;
+        preflight_data_dir(
+            data_dir,
+            options.network,
+            &options.deployments,
+            options.network_execution.is_experimental(),
+        )?;
     }
     if let Some(validation_dir) = &options.complete_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
@@ -1596,7 +1601,12 @@ fn prepare_assumeutxo_validation(
     if validation_chainstate.exists() && same_file(&active_chainstate, &validation_chainstate)? {
         return Err("validation chainstate must be separate from active chainstate".to_owned());
     }
-    preflight_data_dir(&validation_dir, options.network, &options.deployments)?;
+    preflight_data_dir(
+        &validation_dir,
+        options.network,
+        &options.deployments,
+        false,
+    )?;
     if same_file(&active_chainstate, &validation_chainstate)? {
         return Err("validation chainstate must be separate from active chainstate".to_owned());
     }
@@ -1900,12 +1910,26 @@ fn preflight_data_dir(
     data_dir: &std::path::Path,
     network: Network,
     deployments: &DeploymentConfig,
+    validation_delta_journal: bool,
 ) -> Result<(), String> {
     fs::create_dir_all(data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     reject_legacy_split_chainstate(data_dir)?;
-    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), network)
-        .map_err(|error| error.to_string())?;
+    if validation_delta_journal {
+        // The validating-node open below binds and verifies the same consensus
+        // identity. Avoid decoding every immutable delta index twice at startup.
+        return Ok(());
+    }
+    let chainstate = RedbChainStore::open_with_options(
+        data_dir.join("chainstate.redb"),
+        network,
+        ChainStoreOptions {
+            retain_block_undo: !validation_delta_journal,
+            validation_delta_journal,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     chainstate
         .execution()
         .bind_consensus_config(
@@ -3794,6 +3818,7 @@ async fn sync_validating_node(
             } else {
                 ChainStoreOptions::default().cache_size_bytes
             },
+            validation_delta_journal: network_execution.is_experimental(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -9577,13 +9602,14 @@ mod tests {
     fn custom_signet_identity_is_rejected_before_network_or_wallet_startup() {
         let directory = TempDir::new().unwrap();
         let default = DeploymentConfig::for_network(Network::Signet);
-        preflight_data_dir(directory.path(), Network::Signet, &default).unwrap();
+        preflight_data_dir(directory.path(), Network::Signet, &default, false).unwrap();
         assert!(!directory.path().join("peers.redb").exists());
         assert!(!directory.path().join("wallet.sqlite").exists());
 
         let mut custom = DeploymentConfig::for_network(Network::Signet);
         custom.set_signet_challenge(vec![0x51]).unwrap();
-        let error = preflight_data_dir(directory.path(), Network::Signet, &custom).unwrap_err();
+        let error =
+            preflight_data_dir(directory.path(), Network::Signet, &custom, false).unwrap_err();
         assert!(error.contains("consensus configuration"));
         assert!(!directory.path().join("peers.redb").exists());
         assert!(!directory.path().join("wallet.sqlite").exists());

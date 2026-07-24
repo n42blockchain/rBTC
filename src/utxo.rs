@@ -120,9 +120,14 @@ pub struct Utxo {
 
 impl Utxo {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, UtxoError> {
+        let mut bytes = Vec::with_capacity(29 + self.script_pubkey.len());
+        self.encode_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<(), UtxoError> {
         let script_len = u32::try_from(self.script_pubkey.len())
             .map_err(|_| UtxoError::Malformed("script exceeds u32"))?;
-        let mut bytes = Vec::with_capacity(29 + self.script_pubkey.len());
         bytes.extend_from_slice(&self.value_sats.to_le_bytes());
         bytes.extend_from_slice(&self.height.to_le_bytes());
         bytes.push(u8::from(self.is_coinbase));
@@ -130,27 +135,16 @@ impl Utxo {
         bytes.extend_from_slice(&self.creation_mtp.to_le_bytes());
         bytes.extend_from_slice(&script_len.to_le_bytes());
         bytes.extend_from_slice(&self.script_pubkey);
-        Ok(bytes)
+        Ok(())
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
-        if bytes.len() < 29 {
-            return Err(UtxoError::Malformed("record header"));
-        }
+        Self::validate_encoded(bytes)?;
         let value_sats = u64::from_le_bytes(bytes[..8].try_into().expect("checked length"));
         let height = u32::from_le_bytes(bytes[8..12].try_into().expect("checked length"));
-        let is_coinbase = match bytes[12] {
-            0 => false,
-            1 => true,
-            _ => return Err(UtxoError::Malformed("coinbase flag")),
-        };
+        let is_coinbase = bytes[12] == 1;
         let last_touched = u64::from_le_bytes(bytes[13..21].try_into().expect("checked length"));
         let creation_mtp = u32::from_le_bytes(bytes[21..25].try_into().expect("checked length"));
-        let script_len = u32::from_le_bytes(bytes[25..29].try_into().expect("checked length"));
-        let script_len = usize::try_from(script_len).expect("u32 fits usize");
-        if bytes.len() != 29 + script_len {
-            return Err(UtxoError::Malformed("script length"));
-        }
         Ok(Self {
             value_sats,
             height,
@@ -159,6 +153,22 @@ impl Utxo {
             creation_mtp,
             script_pubkey: bytes[29..].to_vec(),
         })
+    }
+
+    pub(crate) fn validate_encoded(bytes: &[u8]) -> Result<(), UtxoError> {
+        if bytes.len() < 29 {
+            return Err(UtxoError::Malformed("record header"));
+        }
+        match bytes[12] {
+            0 | 1 => {}
+            _ => return Err(UtxoError::Malformed("coinbase flag")),
+        }
+        let script_len = u32::from_le_bytes(bytes[25..29].try_into().expect("checked length"));
+        let script_len = usize::try_from(script_len).expect("u32 fits usize");
+        if bytes.len() != 29 + script_len {
+            return Err(UtxoError::Malformed("script length"));
+        }
+        Ok(())
     }
 }
 
@@ -704,10 +714,7 @@ impl UtxoStore for RedbUtxoStore {
         let transaction = self.db.begin_read()?;
         let count = |definition| -> Result<u64, UtxoError> {
             let table = transaction.open_table(definition)?;
-            let count = table
-                .iter()?
-                .try_fold(0_u64, |count, row| row.map(|_| count + 1))?;
-            Ok(count)
+            Ok(table.len()?)
         };
         Ok(TierStats {
             hot: count(HOT_TABLE)?,
@@ -814,7 +821,7 @@ where
     ))
 }
 
-fn update_utxo_set_digest(digest: &mut Sha256, key: &[u8], utxo: &Utxo) {
+pub(crate) fn update_utxo_set_digest(digest: &mut Sha256, key: &[u8], utxo: &Utxo) {
     digest.update(key);
     digest.update(utxo.value_sats.to_le_bytes());
     digest.update(utxo.height.to_le_bytes());
