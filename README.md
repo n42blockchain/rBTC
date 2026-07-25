@@ -288,14 +288,16 @@ Expanding each batch across more simultaneous auxiliaries was also rejected afte
 five auxiliary-bearing batches took 80.105–105.571 seconds while the following
 primary-only batches took 80.482 and 88.089 seconds.
 
-Cross-execution lookahead now actively downloads and stores at most 256 blocks
-on a scoped network worker while the current checkpoint performs its
-sequential UTXO transition. The next checkpoint validates that exact block-hash
-prefix before using it and downloads only the remainder. This overlaps roughly
-one third of a 756-block transfer with otherwise network-idle execution while
-bounding additional consensus-maximum payload memory at 1 GiB. Because the
-worker continuously drains each 64-block response window, it does not recreate
-the unread 128-block response pressure seen in the earlier soak.
+Cross-execution lookahead now actively downloads at most 256 blocks on a
+scoped network worker while the current checkpoint stages its archive and
+performs its sequential UTXO transition. Each received 64-block window is
+immediately reduced to compact consensus bytes instead of retaining an
+expanded transaction object tree. The next checkpoint decodes and validates
+that exact block-hash prefix before using it and downloads only the remainder.
+This overlaps roughly one third of a 756-block transfer with otherwise
+network-idle persistence while bounding additional payload memory at 1 GiB.
+Because the worker continuously drains every response window, it does not
+recreate the unread 128-block response pressure seen in the earlier soak.
 
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,

@@ -186,7 +186,7 @@ struct ValidationLimits {
 
 #[derive(Default)]
 struct PrefetchedBlocks {
-    blocks: Vec<Block>,
+    serialized: Vec<Vec<u8>>,
 }
 
 impl Default for ValidationLimits {
@@ -5126,15 +5126,15 @@ async fn download_execution_prefetch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     hashes: &[BlockHash],
     compact_candidates: &[Transaction],
-) -> Result<Vec<Block>, PeerRunError> {
-    let mut blocks = Vec::with_capacity(hashes.len());
+) -> Result<Vec<Vec<u8>>, PeerRunError> {
+    let mut serialized = Vec::with_capacity(hashes.len());
     for window in hashes.chunks(VALIDATION_BLOCK_WINDOW_SIZE) {
-        blocks.extend(
+        let blocks =
             download_block_window(session, window, compact_candidates, "execution prefetch")
-                .await?,
-        );
+                .await?;
+        serialized.extend(blocks.into_iter().map(|block| serialize(&block)));
     }
-    Ok(blocks)
+    Ok(serialized)
 }
 
 async fn receive_parallel_block_windows(
@@ -5360,18 +5360,30 @@ async fn download_execute_batch(
         .collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(batch_len);
     let prefetched = std::mem::take(prefetched_blocks);
-    if prefetched.blocks.len() > hashes.len()
-        || prefetched
-            .blocks
-            .iter()
-            .zip(&hashes)
-            .any(|(block, expected_hash)| block.block_hash() != *expected_hash)
+    if prefetched.serialized.len() > hashes.len() {
+        return Err(PeerRunError::transient(
+            "prefetched blocks exceed the next active-chain batch",
+        ));
+    }
+    let decoded_prefetch = prefetched
+        .serialized
+        .into_iter()
+        .map(|bytes| {
+            deserialize::<Block>(&bytes).map_err(|error| {
+                PeerRunError::transient(format!("decode execution-prefetched block: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if decoded_prefetch
+        .iter()
+        .zip(&hashes)
+        .any(|(block, expected_hash)| block.block_hash() != *expected_hash)
     {
         return Err(PeerRunError::transient(
             "prefetched blocks do not match the next active-chain batch",
         ));
     }
-    blocks.extend(prefetched.blocks);
+    blocks.extend(decoded_prefetch);
     let mut offset = blocks.len();
     while offset < hashes.len() {
         let remaining = &hashes[offset..];
@@ -5462,12 +5474,13 @@ async fn download_execute_batch(
     } else {
         Vec::new()
     };
-    ledger
-        .stage(next_height, &serialized)
-        .map_err(|error| error.to_string())?;
-    let staged_at = Instant::now();
     let now = u64::from(unix_time()?);
+    let staged_at;
     let (applied_blocks, downloaded_prefetch) = if next_prefetch_hashes.is_empty() {
+        ledger
+            .stage(next_height, &serialized)
+            .map_err(|error| error.to_string())?;
+        staged_at = Instant::now();
         (
             connect_prevalidated_active_blocks_with_txids(
                 chainstate,
@@ -5485,28 +5498,42 @@ async fn download_execute_batch(
         == tokio::runtime::RuntimeFlavor::MultiThread
     {
         let runtime = tokio::runtime::Handle::current();
-        let (execution_result, prefetch_result) = std::thread::scope(|scope| {
-            let prefetch = scope.spawn(|| {
-                runtime.block_on(download_execution_prefetch(
-                    session,
-                    &next_prefetch_hashes,
-                    compact_candidates,
-                ))
+        let (stage_result, branch_staged_at, execution_result, prefetch_result) =
+            std::thread::scope(|scope| {
+                let prefetch = scope.spawn(|| {
+                    runtime.block_on(download_execution_prefetch(
+                        session,
+                        &next_prefetch_hashes,
+                        compact_candidates,
+                    ))
+                });
+                let stage_result = ledger.stage(next_height, &serialized);
+                let branch_staged_at = Instant::now();
+                let execution_result = stage_result.as_ref().ok().map(|()| {
+                    connect_prevalidated_active_blocks_with_txids(
+                        chainstate,
+                        headers,
+                        &blocks,
+                        &transaction_ids,
+                        now,
+                        DEFAULT_HOT_WINDOW_SECS,
+                        &deployment_contexts,
+                    )
+                });
+                let prefetch_result = prefetch
+                    .join()
+                    .expect("scoped execution-prefetch thread must not panic");
+                (
+                    stage_result,
+                    branch_staged_at,
+                    execution_result,
+                    prefetch_result,
+                )
             });
-            let execution_result = connect_prevalidated_active_blocks_with_txids(
-                chainstate,
-                headers,
-                &blocks,
-                &transaction_ids,
-                now,
-                DEFAULT_HOT_WINDOW_SECS,
-                &deployment_contexts,
-            );
-            let prefetch_result = prefetch
-                .join()
-                .expect("scoped execution-prefetch thread must not panic");
-            (execution_result, prefetch_result)
-        });
+        stage_result.map_err(|error| error.to_string())?;
+        staged_at = branch_staged_at;
+        let execution_result =
+            execution_result.expect("successful staging starts chainstate execution");
         let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
         let downloaded_prefetch = match prefetch_result {
             Ok(blocks) => blocks,
@@ -5517,6 +5544,10 @@ async fn download_execute_batch(
         };
         (applied_blocks, downloaded_prefetch)
     } else {
+        ledger
+            .stage(next_height, &serialized)
+            .map_err(|error| error.to_string())?;
+        staged_at = Instant::now();
         let applied_blocks = connect_prevalidated_active_blocks_with_txids(
             chainstate,
             headers,
@@ -5540,7 +5571,7 @@ async fn download_execute_batch(
         (applied_blocks, downloaded_prefetch)
     };
     let execution_prefetch_count = downloaded_prefetch.len();
-    prefetched_blocks.blocks = downloaded_prefetch;
+    prefetched_blocks.serialized = downloaded_prefetch;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
@@ -8137,7 +8168,10 @@ mod tests {
         });
 
         assert_eq!(
-            downloaded.iter().map(Block::block_hash).collect::<Vec<_>>(),
+            downloaded
+                .iter()
+                .map(|bytes| deserialize::<Block>(bytes).unwrap().block_hash())
+                .collect::<Vec<_>>(),
             hashes
         );
         server.await.unwrap();
