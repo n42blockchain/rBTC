@@ -119,10 +119,6 @@ const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 
-const fn supports_block_execution(network: Network) -> bool {
-    matches!(network, Network::Regtest | Network::Signet)
-}
-
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
 }
@@ -130,7 +126,7 @@ const fn supports_experimental_block_execution(network: Network) -> bool {
 #[derive(Clone)]
 struct Options {
     remotes: Vec<SocketAddr>,
-    /// `None` selects the pinned Core 26 defaults; `Some` is an explicit override.
+    /// `None` selects the pinned Core 31 defaults; `Some` is an explicit override.
     dns_seeds: Option<Vec<DnsSeed>>,
     network: Network,
     fetch_block: Option<BlockHash>,
@@ -155,7 +151,7 @@ struct Options {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NetworkExecutionMode {
-    SafetyGated,
+    Persistent,
     ExperimentalOnce,
     ExperimentalOnceExtend,
 }
@@ -3929,11 +3925,6 @@ async fn sync_validating_node(
             ));
         }
     }
-    if !supports_block_execution(network) && !network_execution.is_experimental() {
-        return Err(PeerRunError::transient(
-            "block execution is currently safety-gated to regtest and Signet until mainnet/testnet activation coverage is complete",
-        ));
-    }
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
     let headers_path = data_dir.join("headers.redb");
@@ -4224,6 +4215,13 @@ async fn sync_validating_node(
             &compact_candidates,
         )
         .await?;
+        let startup_pruned = prune_expired_block_undos(&chainstate, &headers, &ledger)?;
+        if startup_pruned > 0 {
+            println!(
+                "pruned {startup_pruned} expired block undo record{} after ledger reconciliation",
+                if startup_pruned == 1 { "" } else { "s" }
+            );
+        }
         if let Some(explorer) = explorer.as_deref() {
             reconcile_explorer(
                 session,
@@ -4820,6 +4818,23 @@ async fn reconcile_ledger(
         compact_candidates,
     )
     .await
+}
+
+fn prune_expired_block_undos(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    ledger: &PrunedBlockLedger,
+) -> Result<u64, String> {
+    let Some(retain_from_height) = ledger
+        .stats()
+        .map_err(|error| error.to_string())?
+        .first_height
+    else {
+        return Ok(0);
+    };
+    chainstate
+        .prune_block_undos_before(headers, retain_from_height)
+        .map_err(|error| error.to_string())
 }
 
 async fn backfill_ledger(
@@ -5867,6 +5882,7 @@ async fn download_execute_batch(
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
+    let pruned_undos = prune_expired_block_undos(chainstate, headers, ledger)?;
     let published_at = Instant::now();
     println!(
         "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
@@ -5888,6 +5904,12 @@ async fn download_execute_batch(
         published_at.duration_since(indexed_at).as_millis(),
         published_at.duration_since(batch_started).as_millis(),
     );
+    if pruned_undos > 0 {
+        println!(
+            "pruned {pruned_undos} block undo record{} below the retained ledger window",
+            if pruned_undos == 1 { "" } else { "s" }
+        );
+    }
     if execution_prefetch_count > 0 {
         println!(
             "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
@@ -6122,7 +6144,7 @@ fn elapsed_ms(started: Instant) -> u32 {
 
 fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {
     options.dns_seeds.clone().unwrap_or_else(|| {
-        core26_dns_seed_hosts(options.network)
+        pinned_dns_seed_hosts(options.network)
             .iter()
             .map(|host| DnsSeed {
                 host: (*host).to_owned(),
@@ -6132,28 +6154,35 @@ fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {
     })
 }
 
-const fn core26_dns_seed_hosts(network: Network) -> &'static [&'static str] {
+const fn pinned_dns_seed_hosts(network: Network) -> &'static [&'static str] {
     match network {
         Network::Bitcoin => &[
             "seed.bitcoin.sipa.be.",
             "dnsseed.bluematt.me.",
-            "dnsseed.bitcoin.dashjr.org.",
-            "seed.bitcoinstats.com.",
             "seed.bitcoin.jonasschnelli.ch.",
-            "seed.btc.petertodd.org.",
+            "seed.btc.petertodd.net.",
             "seed.bitcoin.sprovoost.nl.",
             "dnsseed.emzy.de.",
             "seed.bitcoin.wiz.biz.",
+            "seed.mainnet.achownodes.xyz.",
         ],
         Network::Testnet => &[
             "testnet-seed.bitcoin.jonasschnelli.ch.",
-            "seed.tbtc.petertodd.org.",
+            "seed.tbtc.petertodd.net.",
             "seed.testnet.bitcoin.sprovoost.nl.",
             "testnet-seed.bluematt.me.",
+            "seed.testnet.achownodes.xyz.",
         ],
-        Network::Signet => &["seed.signet.bitcoin.sprovoost.nl.", "178.128.221.177"],
-        // Core 26 predates testnet4. Regtest intentionally has no public bootstrap source.
-        Network::Testnet4 | Network::Regtest => &[],
+        Network::Testnet4 => &[
+            "seed.testnet4.bitcoin.sprovoost.nl.",
+            "seed.testnet4.wiz.biz.",
+        ],
+        Network::Signet => &[
+            "seed.signet.bitcoin.sprovoost.nl.",
+            "seed.signet.achownodes.xyz.",
+        ],
+        // Regtest intentionally has no public bootstrap source.
+        Network::Regtest => &[],
     }
 }
 
@@ -6894,11 +6923,6 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
-    if data_dir.is_some() && !supports_block_execution(network) && !experimental_network_execution {
-        return Err(
-            "--data-dir block execution currently supports only regtest and Signet".to_owned(),
-        );
-    }
     let mut deployments = parse_deployment_config(
         network,
         data_dir.is_some(),
@@ -6935,7 +6959,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             Some(seeds)
         };
     let has_dns_bootstrap = dns_seeds.as_ref().map_or_else(
-        || !core26_dns_seed_hosts(network).is_empty(),
+        || !pinned_dns_seed_hosts(network).is_empty(),
         |seeds| !seeds.is_empty(),
     );
     if remotes.is_empty() && !has_dns_bootstrap && data_dir.is_none() {
@@ -6957,7 +6981,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         } else if experimental_network_execution {
             NetworkExecutionMode::ExperimentalOnce
         } else {
-            NetworkExecutionMode::SafetyGated
+            NetworkExecutionMode::Persistent
         },
         explorer_listen,
         wallet_api_files,
@@ -7040,16 +7064,16 @@ fn print_usage() {
             "rbtcd {}\n\nUSAGE:\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network regtest|signet --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network regtest|signet --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
-            "  rbtcd --data-dir PATH --network regtest|signet --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n",
-            "  rbtcd --data-dir PATH --network regtest|signet --finalize-assumeutxo VALIDATION_DATA_DIR\n",
+            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "PEER OPTIONS:\n",
-            "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 26 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
+            "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 31 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
         ),
         env!("CARGO_PKG_VERSION")
     );
@@ -7357,7 +7381,7 @@ mod tests {
             headers_db: None,
             data_dir: None,
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -9273,7 +9297,7 @@ mod tests {
         assert!(options.data_dir.is_none());
         assert!(!options.mempool_full_rbf);
         assert!(!options.once);
-        assert_eq!(options.network_execution, NetworkExecutionMode::SafetyGated);
+        assert_eq!(options.network_execution, NetworkExecutionMode::Persistent);
         assert!(options.explorer_listen.is_none());
         assert!(options.wallet_api_files.is_none());
         assert_eq!(
@@ -9597,7 +9621,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -9668,7 +9692,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -10473,9 +10497,26 @@ mod tests {
             .unwrap()
             .unwrap();
         let seeds = selected_dns_seeds(&defaults);
-        assert_eq!(seeds.len(), 9);
+        assert_eq!(seeds.len(), 8);
         assert!(seeds.iter().all(|seed| seed.port == 8_333));
         assert_eq!(seeds[0].host, "seed.bitcoin.sipa.be.");
+
+        let testnet4 = parse_options(["--network", "testnet4"].into_iter().map(str::to_owned))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected_dns_seeds(&testnet4),
+            vec![
+                DnsSeed {
+                    host: "seed.testnet4.bitcoin.sprovoost.nl.".to_owned(),
+                    port: 48_333,
+                },
+                DnsSeed {
+                    host: "seed.testnet4.wiz.biz.".to_owned(),
+                    port: 48_333,
+                },
+            ]
+        );
 
         let custom = parse_options(
             [
@@ -10516,7 +10557,6 @@ mod tests {
         assert!(selected_dns_seeds(&persisted_only).is_empty());
 
         for arguments in [
-            vec!["--network", "testnet4"],
             vec!["--network", "regtest", "--no-dns-seeds"],
             vec![
                 "--connect",
@@ -10617,8 +10657,8 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_execution_network_gate_is_enforced_before_connect() {
-        for network in ["regtest", "signet"] {
+    fn persistent_execution_accepts_every_configured_network() {
+        for network in ["bitcoin", "testnet", "testnet4", "regtest", "signet"] {
             let options = parse_options(
                 [
                     "--connect",
@@ -10634,25 +10674,6 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(options.network.to_string(), network);
-        }
-
-        for network in ["bitcoin", "testnet", "testnet4"] {
-            let result = parse_options(
-                [
-                    "--connect",
-                    "127.0.0.1:1",
-                    "--network",
-                    network,
-                    "--data-dir",
-                    "/tmp/rbtc-execution-network-gate",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            );
-            let Err(error) = result else {
-                panic!("{network} execution must remain safety-gated");
-            };
-            assert!(error.contains("only regtest and Signet"));
         }
     }
 
@@ -10836,7 +10857,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             wallet_api_files: Some(WalletApiFiles {
                 descriptors,
@@ -10889,7 +10910,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
@@ -11267,7 +11288,7 @@ mod tests {
             headers_db: Some(header_path.clone()),
             data_dir: None,
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11351,7 +11372,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11420,7 +11441,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11495,7 +11516,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(active_dir.clone()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11555,7 +11576,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(active_dir.clone()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11604,7 +11625,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(active_dir),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11686,7 +11707,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(active_dir.clone()),
             once: false,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11744,7 +11765,7 @@ mod tests {
                 headers_db: None,
                 data_dir: Some(active_dir.clone()),
                 once: true,
-                network_execution: NetworkExecutionMode::SafetyGated,
+                network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
@@ -11835,7 +11856,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11911,7 +11932,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11945,7 +11966,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -11999,7 +12020,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -12047,7 +12068,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -12140,7 +12161,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -12286,7 +12307,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
@@ -12389,7 +12410,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -12461,7 +12482,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -12569,7 +12590,7 @@ mod tests {
                 headers_db: None,
                 data_dir: Some(directory.path().to_path_buf()),
                 once: true,
-                network_execution: NetworkExecutionMode::SafetyGated,
+                network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
@@ -12712,7 +12733,7 @@ mod tests {
                 headers_db: None,
                 data_dir: Some(directory.path().to_path_buf()),
                 once: true,
-                network_execution: NetworkExecutionMode::SafetyGated,
+                network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
@@ -12825,7 +12846,7 @@ mod tests {
             headers_db: None,
             data_dir: Some(directory.path().to_path_buf()),
             once: true,
-            network_execution: NetworkExecutionMode::SafetyGated,
+            network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,

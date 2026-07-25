@@ -8,7 +8,7 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, Network, hashes::Hash};
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1143,6 +1143,48 @@ impl RedbChainStore {
     #[must_use]
     pub(crate) const fn retains_block_undo(&self) -> bool {
         self.options.retain_block_undo
+    }
+
+    /// Removes disconnect records older than the locally retained block window.
+    ///
+    /// Every hash is first resolved through the authenticated header DAG. Any
+    /// unknown record fails closed before a write transaction begins.
+    pub fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        if !self.options.retain_block_undo {
+            return Ok(0);
+        }
+        let mut expired = self
+            .undos
+            .hashes()?
+            .into_iter()
+            .map(|hash| {
+                headers
+                    .get(&hash)
+                    .map(|header| (header.height, hash))
+                    .ok_or(UndoStoreError::Malformed(
+                        "block undo references an unknown header",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        expired.retain(|(height, _)| *height < retain_from_height);
+        expired.sort_unstable_by_key(|(height, hash)| (*height, hash.to_byte_array()));
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let mut removed = 0_u64;
+        for (_, hash) in expired {
+            removed += u64::from(remove_undo_transaction(&transaction, hash)?);
+        }
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Read-only access to retained block undo records.
@@ -3490,6 +3532,62 @@ mod tests {
             .commit_connect(first.hash, second, &[key(2)], &[(key(3), coin(8))], &[])
             .unwrap();
         assert!(store.undos().get(second.hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn block_undo_pruning_tracks_the_retained_block_floor() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let mut parent = headers.active_tip();
+        let mut tips = Vec::new();
+        for height in 1..=4 {
+            let header = mine_child(parent.hash, parent.header.time + 1);
+            let next = ExecutionTip {
+                height,
+                hash: header.block_hash(),
+            };
+            headers.insert(header).unwrap();
+            store
+                .commit_connect(parent.hash, next, &[], &[], &[])
+                .unwrap();
+            tips.push(next);
+            parent = headers.active_tip();
+        }
+
+        assert_eq!(store.prune_block_undos_before(&headers, 3).unwrap(), 2);
+        assert!(store.undos().get(tips[0].hash).unwrap().is_none());
+        assert!(store.undos().get(tips[1].hash).unwrap().is_none());
+        assert!(store.undos().get(tips[2].hash).unwrap().is_some());
+        assert!(store.undos().get(tips[3].hash).unwrap().is_some());
+        assert_eq!(store.prune_block_undos_before(&headers, 3).unwrap(), 0);
+        assert_eq!(store.execution().tip().unwrap(), tips[3]);
+    }
+
+    #[test]
+    fn block_undo_pruning_fails_closed_for_an_unknown_header() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        let unknown = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([91; 32]),
+        };
+        store
+            .commit_connect(genesis.hash, unknown, &[], &[], &[])
+            .unwrap();
+
+        assert!(matches!(
+            store.prune_block_undos_before(&HeaderDag::new(Network::Regtest), 2),
+            Err(ChainStoreError::Undo(UndoStoreError::Malformed(
+                "block undo references an unknown header"
+            )))
+        ));
+        assert!(store.undos().get(unknown.hash).unwrap().is_some());
     }
 
     #[test]

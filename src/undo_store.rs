@@ -127,6 +127,23 @@ impl RedbUndoStore {
             .transpose()
     }
 
+    /// Returns every block hash with a retained disconnect record.
+    pub(crate) fn hashes(&self) -> Result<Vec<BlockHash>, UndoStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(BLOCK_UNDOS)?;
+        table
+            .iter()?
+            .map(|entry| {
+                let (key, _) = entry?;
+                let bytes: [u8; 32] = key
+                    .value()
+                    .try_into()
+                    .map_err(|_| UndoStoreError::Malformed("invalid block-hash key length"))?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .collect()
+    }
+
     /// Removes an undo record after its block has been permanently pruned.
     pub fn remove(&self, block: BlockHash) -> Result<bool, UndoStoreError> {
         let _guard = self.lock();

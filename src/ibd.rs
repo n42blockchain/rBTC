@@ -59,26 +59,29 @@ pub enum IbdPolicyError {
 }
 
 impl IbdPolicy {
-    /// Returns Bitcoin Core 26's pinned defaults where available.
+    /// Returns Bitcoin Core 31's pinned public-network defaults.
     ///
-    /// Regtest and testnet4 default to a zero work floor and no assume-valid
-    /// anchor. Core 26 predates testnet4, so no trust constants are invented.
+    /// Regtest has no external work floor or assume-valid anchor.
     #[must_use]
     pub fn for_network(network: Network) -> Self {
         let (minimum_chainwork, assume_valid) = match network {
             Network::Bitcoin => (
-                "000000000000000000000000000000000000000052b2559353df4117b7348b64",
-                Some("00000000000000000001a0a448d6cf2546b06801389cc030b2b18c6491266815"),
+                "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
+                Some("00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"),
             ),
             Network::Testnet => (
-                "000000000000000000000000000000000000000000000b6a51f415a67c0da307",
-                Some("0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f"),
+                "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
+                Some("000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
+            ),
+            Network::Testnet4 => (
+                "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
+                Some("0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"),
             ),
             Network::Signet => (
-                "000000000000000000000000000000000000000000000000000001ad46be4862",
-                Some("0000013d778ba3f914530f11f6b69869c9fab54acff85acd7b8201d111f19b7f"),
+                "00000000000000000000000000000000000000000000000000000b463ea0a4b8",
+                Some("00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"),
             ),
-            Network::Testnet4 | Network::Regtest => (
+            Network::Regtest => (
                 "0000000000000000000000000000000000000000000000000000000000000000",
                 None,
             ),
@@ -297,6 +300,24 @@ mod tests {
         assert_eq!(
             mainnet.status(&HeaderDag::new(Network::Regtest)),
             Err(IbdPolicyError::NetworkMismatch)
+        );
+
+        let testnet4 = IbdPolicy::for_network(Network::Testnet4);
+        assert_eq!(
+            testnet4.minimum_chainwork,
+            Work::from_unprefixed_hex(
+                "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            testnet4.assume_valid,
+            Some(
+                BlockHash::from_str(
+                    "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"
+                )
+                .unwrap()
+            )
         );
 
         let mut regtest = IbdPolicy::for_network(Network::Regtest);

@@ -1,183 +1,230 @@
-# Production roadmap and acceptance gates
+# rBTC production roadmap
 
-## Phase 0 — kernel (in progress)
+Status date: 2026-07-25.
 
-- [x] Reuse `rust-bitcoin`, `bitcoinconsensus`, redb, zstd, and BDK rather than reimplementing their domains.
-- [x] Hot/cold UTXO persistence, self-verifying snapshot container, trusted AssumeUTXO identity/active-header gate, immutable archive pieces, and circular pruning policy. Format v3 authenticates UTXO count and canonical byte length as decompression-work bounds. Fresh-chainstate activation streams records directly into one transaction and commits every UTXO, execution tip, authenticated digest, and durable assumed-state marker atomically; a dedicated offline CLI mode requires independently supplied network/height/block-hash/count/length/digest identity and refuses mixed operational modes. Snapshot publication uses synced temporary files and atomic rename. The ledger now physically reclaims every slot retired by its durable index instead of waiting for eventual slot-number reuse.
-- [x] Unit tests for storage atomicity (including disk-full and late-decoder snapshot activation), snapshot integrity/trust/active-anchor rejection, count/digest/order/script/manifest bounds, post-verification file replacement, assumed-base restart and bounded reorg behavior, next-block execution from a snapshot base, archive tamper detection, pruning, bounded/network-bound peer persistence, P2P envelope, and explorer routing.
-- [x] Property/fuzz tests for every untrusted parser and fault-injection tests for every file-ring transition. The v1 P2P envelope has property coverage for arbitrary bounded input, nonce round trips, checksum corruption, declared oversize, and truncation; Core 26's 4,000,000-byte payload, 256-byte user-agent, 101-hash locator, and 1,000-entry address-message limits have explicit boundary tests. Bounded libFuzzer regressions exercise twelve production surfaces: the v1 envelope decoder, transaction Merkle-proof validator, default-Signet block/solution decoder, bounded UTXO snapshot verifier, bounded static-archive decoder, complete embedded-explorer request router, strict bounded JSON-RPC envelope, deployment/IBD configuration parsers, local-token/Bearer-header authentication parser, strict watch-only descriptor JSON parser, strict wallet PSBT-request parser, and strict persisted owner/peer metadata parsers. The full daemon option parser additionally runs 512 weighted arbitrary flag/value combinations and requires deterministic acceptance or rejection. Rejected deployment and IBD overrides are checked for mutation-free failure; accepted wallet headers are rechecked after credential mutation; descriptor failures never echo possible secrets. Owner markers validate their version plus canonical network/hash identity; peer and penalty records are size-bounded, reject unknown fields, and fail without rewriting corrupt storage. Only reviewed human-named seeds and minimized crash/hang regressions are versioned, while generated hash-named coverage corpora remain ignored. Archive v2 authenticates the uncompressed length and enforces global record and per-block ceilings while retaining bounded v1 compatibility. The BIP325 commitment-section parser covers arbitrary bounded scripts and payload preservation. Manifest-bounded index reconstruction, orphan-rename adoption, and restart-safe partial-segment reorg truncation are implemented; interruption tests cover pre-mutation, post-delete, post-prefix-rename, malformed-intent, wrapped-slot rename-before-index, staged-prefix rename-before-index, retired-slot deletion, and legacy unindexed-file cleanup states. Validation owner-marker creation and cleanup sync their parent directories after every namespace transition; injected sync failures cover reusable marker recovery, pre-removal quarantine rollback, and post-removal error reporting. The ledger injects failures at all thirteen archive, slot, index, staging, truncation-intent, mutation, retired-slot reclamation, and removal file/directory sync points; restart tests require either the complete old ring or the complete published state, and slot namespace durability now precedes index publication.
+This file is the forward-looking plan. A checked item means that the code,
+restart/failure tests, and an acceptance run all exist. Historical implementation
+notes belong in the architecture and test history, not in open checkboxes.
 
-## Phase 1 — fully validating node
+## Priority rules
 
-- [x] Header DAG, proof-of-work validation, and cumulative-work fork selection.
-- [x] Durable append-only header journal with replayed contextual validation on restart.
-- [x] Contextual timestamp validation: median-time-past and the two-hour future-time ceiling.
-- [x] Contextual difficulty validation: normal retarget, no-retarget chains, and min-difficulty fallback rules.
-- [x] Atomic UTXO undo records for reverse-order chain disconnects, plus durable block-undo encoding/storage.
-- [x] Transaction-level UTXO transition with script hooks, amount accounting, and coinbase maturity checks.
-- [x] Atomic block UTXO transition with Merkle/coinbase/weight/subsidy checks; UTXO, per-block undo, and execution tip share one physical redb database and one transaction for connect/disconnect.
-- [x] Persisted block/UTXO undo journals drive active-chain rewinds after header reorganization.
-- [x] Contextual header validation enforces the pinned Bitcoin Core 26 mainnet/testnet checkpoints and, once a checkpoint is known, immediately rejects new forks below it instead of retaining work until an eventual exact-height mismatch.
-- [x] Minimum-chainwork IBD completion policy with pinned Core 26 defaults, strict overrides, and low-work peer chains kept in IBD without treating their otherwise valid headers as consensus-invalid.
-- [x] Bounded mainnet activation-era soak through SegWit height 481,824/hash `0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893`. The production path crossed both BIP30 exceptions, the BIP16 exception, P2SH activation, the first subsidy halving, BIP34 activation, BIP66 activation, BIP65 activation, CSV activation, SegWit activation, and Core 26 checkpoints 216,116/225,430/250,000/279,000/295,000; survived repeated interruptions and authenticated in-place target extensions; stopped exactly at each target; and exited completed-target restarts without a block request. Checkpoint-wide script scheduling raised an adjacent live rate from 10.57 to 12.95 blocks/second, producer/consumer overlap reached 15.99 blocks/second, and later UTXO/redb optimization reduced the exact height-346,921–347,928 batch from 117.72 to 72.46 seconds while cutting execution/persistence from 82.95 to 30.77 seconds. A transaction-level Core 26 consensus ABI reduced the same five authenticated activation-block release fixture from 1.47 to 0.44 seconds by sharing transaction decoding and signature-hash precomputation across 23,331 inputs. An append-only RVD3 validation journal reduced activation-era execution/persistence from roughly 35–78 seconds to mostly 7–20 seconds, while atomically persisted row/group Bloom filters reduced a completed-target chainstate reopen to 13.078 seconds. A structure-gated 128-block network lookahead overlaps the next authenticated response window with current execution without staging or committing it; bounded dual-peer windows add failure isolation and slow-auxiliary tail protection. Post-BIP66 batch tuning rejected both 1,008-block dirty-page overflow and 126-block over-fsync, retaining a measured 252-block default. A 171.8-second offline compaction at height 381,113 reduced the file from 10.88 to 7.48 GB and cut the adjacent execution/persistence measurement from 72.31 to 13.48 seconds before normal workload variance resumed. The exact CSV and SegWit targets and their cold completed-target restarts passed while the active header chain advanced independently to 959,452. Taproot/full-chain soak remains open.
-- [x] Exact mainnet Taproot activation soak through height 709,632/hash `0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244`. This closes the Taproot half of the preceding open gate; only full-chain validation remains. Compact complete-batch execution overlap reduced the 28 fully cached checkpoint median to 87.312 seconds from an adjacent pre-overlap 182.653 seconds, and the 252-block tail took 50.817 seconds. The cold completed-target restart opened chainstate in 40.337 seconds, advanced only authenticated headers through 959,520, requested no blocks, and stopped at the same exact target.
-- [x] Archive-byte-aware validation checkpoints. At full-chain height 764,065 a configured 756-block batch first exceeded the independent 1 GiB canonical-record ceiling. The production path now commits the longest byte-safe prefix and carries the verified suffix into the next compact lookahead; the first split atomically committed 726 blocks, retained 30 without re-requesting them, and refilled the complete 756-block prefetch during execution.
-- [x] Bounded physical freezer reclamation. The durable live index is now authoritative for deletion: index publication precedes unlink, directory sync follows it, and startup adopts a provably contiguous interrupted rename before cleaning other unindexed slots. On the continuing mainnet soak this reduced 1,010 files / 346 GiB, of which only one 945 MB segment was live, to the indexed segment plus a transient staged file and immediately returned about 331 GiB to the filesystem. The next 549-block checkpoint committed normally and rotated to the next slot while physical usage remained bounded.
-- [x] Sorted sharded validation-journal reads and online migration. RVD5 groups each checkpoint's already sorted update stream into at most 16 high-prefix shards, batches their monotonic keys in the same atomic tip transaction, retains RVD3/RVD4 read compatibility, and fails closed on a missing manifest shard. A 256-shard live experiment was rejected after write amplification widened checkpoints to 139–172 seconds. Each batch records its hottest legacy rows and atomically migrates up to 32 of them, one transaction per row, during the next archive-stage/UTXO/network prefetch window; live validation migrated 756 hotspot rows while the migration window remained below the longer read branch and naturally fell to zero candidates. Required shards within one immutable row now use bounded parallel redb snapshots and decode inside their workers while rows remain newest-first; adjacent live UTXO prefetch fell from 66–73 seconds to 34–41 seconds, lifting steady throughput from roughly 6.0–6.4 to 8.3–8.7 blocks/second. The read-only UTXO snapshot itself overlaps archive staging and is batch-key checked before mutation; its first 41.156-second sample hid all 7.972 seconds of staging.
-- [x] Full mainnet genesis-to-tip validation and restart acceptance. One production directory executed every block from genesis through the authenticated fixed target height 959,520/hash `000000000000000000003a8648dadb49e67db65326f85b50651661dd7c237299`, naturally exited, then reopened in 14.608 seconds without a block request. It authenticated and executed an extension to height 959,591 and followed the network's next block to height 959,592/hash `000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`. The final cold restart opened in 14.152 seconds, found header and execution tips identical with no newer header, made no block request, and exited zero. Group-wide dynamic RVD5 reads preserved newest-wins across concurrent row/shard jobs; the 71-block live-tip extension spent 19.200 seconds in UTXO prefetch. Physical freezer reclamation left 418 MiB across four files rather than the prior 346 GiB retired-slot footprint; chainstate was 243 GiB and the filesystem retained 661 GiB free. This gate supersedes the earlier historical “full-chain remains” notes.
-Post-SegWit batch tuning first selected 504 blocks: four adjacent
-samples took 60.608–82.237 seconds versus 44.850–69.021 seconds for 252,
-equivalent to 30.3–41.1 seconds per 252 blocks. At heights
-495,433–498,456, three adjacent 1,008-block checkpoints had a
-169.897-second median, 6.0% below twice the preceding nine-checkpoint
-504-block median; the directly adjacent gain was 16.3%. RVD3 avoided the old
-base-tree superlinear commit, but the next 1,008-block batch exceeded the
-ledger's separate 1 GiB canonical-record ceiling and failed without mutation.
-The Taproot leg now uses 756 blocks; its first four checkpoints took
-124.259–148.291 seconds. A four-peer experiment was rejected after independent
-public-peer failures widened complete batches to 73.243–127.829 seconds. The
-retained downloader uses ordered paired 64-block windows with a two-second
-tail guard and per-primary-session auxiliary circuit breaker. Streamed
-four-worker archive compression reduced the first 756-block staging sample
-from 6.723–7.175 seconds to 4.949 seconds, large RVD3 group-Bloom probes now
-partition over bounded CPU workers, and SIGINT/SIGTERM close stores cleanly;
-the first five complete optimized checkpoints reduced the 756-block total
-median from 135.252 to 124.198 seconds, execution/persistence median from
-59.870 to 50.367 seconds, and staging median from 7.098 to 4.453 seconds;
-packetizing script validation into 16-transaction work items then removed
-per-transaction queue/result contention and reduced five adjacent
-756-block execution/persistence samples from the preceding 51.401-second
-median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
-after repeated 756-block unread-response timeouts, a scoped network worker now
-actively downloads and stores the complete next configured batch while the
-current archive stages and UTXO transition executes, reducing each completed
-primary/auxiliary window to compact consensus bytes and bounding the extra
-serialized payload at 4 GiB under the 1,008-block consensus maximum; lagging auxiliary windows preserve
-already received blocks, fetch only missing hashes from the primary, and
-rotate through at most three ready candidates; later block growth then selected
-64-block validation response windows after the first five samples completed
-without failover at a 95.388-second download median and 168.974-second total
-median;
-Taproot exact-stop and completed-target restart remain the active soak gate.
-Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
-with ordered joins and earliest-height failure semantics. Adjacent 1,008-block
-mainnet samples reduced that phase from 11.489 seconds to 1.652 and 1.705
-seconds while preserving the same later sequential transition and atomic
-commit.
+- **P0 — release blocker:** required before describing rBTC as a production
+  validating node on the corresponding public network.
+- **P1 — normal full-node capability:** common in Bitcoin Core, btcd, or other
+  mature nodes and important for operating or contributing a node, but not part
+  of the consensus trust proof.
+- **P2 — deployment-specific:** useful compatibility or product functionality;
+  it must not block a secure outbound-only validating-node release.
+- **External:** cannot be completed by repository code alone.
 
-- [ ] Assume-valid/AssumeUTXO acceleration backed by eventual full validation. Core anchors and overrides are validated against the active header chain, and authenticated UTXO snapshots can safely continue validation above a durably marked base. Restart-safe genesis validation has an immutable height/hash hard ceiling enforced by the atomic execution store. `--background-assumeutxo` runs the active assumed chain and isolated validator concurrently with separate peer/session and complete storage lifecycles, propagates terminal failure, finalizes from the live active loop, and supports bounded `--once` deployment gates; the sequential `--complete-assumeutxo` fallback remains. Both stream the logical hot/cold UTXO identity, excluding only local `last_touched`, and never replace active UTXOs. Configurable limits plus automatic one-block/100-ms yielding prioritize a lagging active node, while the loopback status API reports both tips, target, phase, remaining work, throttle state, and failure. Durable snapshot origin drives a cursor-paged, atomic explorer UTXO baseline without fabricating unavailable history. Explicit post-finalization cleanup is ownership-marker and target revalidation gated, rejects unexpected artifacts, and quarantines before deletion; retention remains the default. Assume-valid still checks every script, and sustained mainnet validation/resource soak remains required.
-- [ ] Complete block/contextual validation: BIP30 follows Core's two historical repeat exceptions, validated BIP34-anchor optimization, and height-1,983,702 re-enforcement; BIP34 height, BIP34/BIP66/BIP65 minimum header versions, BIP68/113 locks, deployment-aware BIP141 witness commitment/unexpected-witness rules, BIP147 NULLDUMMY, default/custom-Signet BIP325 block solutions, Core 26's base P2SH/WITNESS/TAPROOT flag set and historical exceptions, mutated transaction Merkle trees, buried deployments, Taproot BIP9 state, Core-compatible configurable regtest Taproot and buried activation heights, network-specific subsidy halving intervals, Core-compatible unspendable-output UTXO pruning, the 80,000 legacy/P2SH/witness sigop-cost limit, Core-style transaction duplicate/null-input/base-size checks, and per-block accumulated-fee `MoneyRange` are enforced. Taproot state now has Core-boundary coverage for simultaneous start/timeout, threshold-before-timeout lock-in, exact threshold/top-bit signalling, and delayed activation. Completed-period states are cached by period-end block hash and the best-work branch is height-indexed, eliminating the prior genesis rescan and linear active-height lookup from each candidate while keeping side branches isolated; `--vbparams` detaches its cache. Exception flags are layered before later buried flags exactly like Core, so the mainnet Taproot exception removes TAPROOT without losing DERSIG/CLTV/CSV/NULLDUMMY. The complete pinned Core 26 transaction-vector corpus now runs offline through rBTC's production script adapter: all 119 valid cases and all 70 invalid cases expressible by public consensus flags, with 9 `BADTX` structure cases and 14 policy-only cases classified separately. The harness also parses all 1,207 `script_tests.json` cases and executes the 230 cases whose full flag set is public consensus API, while constructed Core-backed cases cover BIP341 commitments and BIP342 tapscript execution. Normal CI now pins ten self-authenticating raw mainnet blocks covering both BIP30 repeats, the BIP16 exception, BIP34/BIP66/BIP65/CSV/SegWit/Taproot activation, and the pre-activation Taproot exception; it verifies their hashes, claimed PoW, Merkle/structure commitments, rule contexts, and tamper rejection. Authenticated raw transaction fixtures additionally execute a real SegWit activation spend, a real exact-144-block BIP68 spend, and the first Taproot key-path spend from UTXOs derived from their raw previous transactions; both transaction and prev-tx inclusion are checked against PoW-valid headers and Merkle branches, while corrupted witnesses are rejected without residue across database reopen. Five real blocks—BIP65, CSV, SegWit, Taproot activation, and the Taproot exception—additionally execute all 8,997 transactions against complete minimal external UTXO views containing 23,331 inputs. Every external input carries its exact creation height and origin-parent MTP, and all 8 coinbase origins are pinned; one-block-early coinbase maturity and BIP68 origin-height boundary tampering are rejected without residue; all successful transaction undo restores the exact starting view, a deliberately late script failure rolls back the whole block, the Taproot exception is proven necessary by forced-flag rejection, and a completed activation state survives redb reopen. A real default Signet block fixture passes the production connection path, while damaged, missing, malformed, and wrong-custom-challenge solutions are rejected without durable residue. Custom Signet accepts Core-compatible challenge/seed arguments, derives its challenge-specific message start, clears unknown-chain IBD trust defaults, and binds the challenge identity before network or wallet startup. Live Core 26 regtest gates compare two sequential valid blocks, twelve invalid structural/contextual classes, configured BIP34/BIP66/BIP65/BIP141/BIP147 boundaries, and 102-block CSV boundaries for height-relative locks, time-relative locks, and BIP113 absolute lock time. A parser- and runtime-enforced `--experimental-network-execution --once` path now lets Bitcoin and legacy testnet exercise this exact execution stack without opening APIs or an indefinite serving node; default execution remains gated and testnet4 remains excluded. On 2026-07-23 the bounded production path validated and persisted the real mainnet active header chain through height 959,340, then downloaded, executed, and stopped exactly at block 1/hash `00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048`. The restart-aware mainnet soak now executes through Core 26's pinned height-105,000 checkpoint. Its first deep run found a batch-overlay mismatch at BIP30 exception height 91,842; after aligning spent-and-recreated outpoints with the durable layer, a fresh run crossed both exceptions and completed in 2,350 seconds using 833,470,464 bytes. Remaining gates include activation-era/full-chain mainnet soak and keeping policy/standardness distinct from consensus.
-- [ ] Differential tests against Bitcoin Core test vectors and `bitcoin-cli`/regtest. Core 26's complete transaction and script JSON files are pinned in normal CI with the public consensus-API boundary made explicit: the script corpus contributes 148 expected passes and 82 expected failures, while 977 policy-only cases remain classified but deliberately unexecuted through `libbitcoinconsensus`. Ten raw historical mainnet blocks, five completely executed minimal UTXO-backed blocks with exact origin metadata, three authenticated historical spends, and thirteen buried-activation/script-exception hashes now run in normal CI. The optional live Core 26 gates additionally prove matching accept/reject outcomes and no rBTC tip/undo/UTXO residue after rejected candidates across seven configurable activation scenarios. Property tests now cover the complete buried-height integer range, mutation-free deployment parser rejection, arbitrary daemon option combinations, bounded transaction Merkle branches, and arbitrary bounded v1 P2P frames, while bounded libFuzzer regressions cover ten consensus/network/storage/API/configuration surfaces. The bounded real-mainnet production gate now covers active-header connection, restart recovery, 105,000 consecutive blocks, both BIP30 exceptions, and an exact fixed checkpoint. Activation-era/full-chain soak, broader parser properties, longer fuzz campaigns, and CI-provisioned Core remain.
-- [x] Async v1 P2P framing with message-size limits, magic validation, and checksum validation.
-- [x] Central post-handshake resource routing caps inventory vectors at 50,000 entries, remote locators at 101 hashes, headers at 2,000, and address vectors at 1,000 even when unrelated frames are injected during another response wait. Protocol-eligible peers receive BIP130 `sendheaders`; the ordinary caught-up polling loop actively requires a nonce-matched pong before the next header request and preserves an earlier header announcement for that sync pass. Ping/pong liveness shares the fixed 32-frame budget and a separate 4,000,000-byte aggregate retained-payload ceiling, answers crossed pings, treats remote vector overages as protocol violations, and treats queue exhaustion or a missing pong as transient failover.
-- [ ] P2P peer manager, addrman, compact blocks, additional DoS limits, peer eviction, block relay, and transaction relay. Outbound v1 handshake, minimum-version/self-connection checks, a process-wide self-connection nonce, Core-compatible message/user-agent/locator/address bounds, Core-ordered BIP339/BIP155 negotiation, bounded legacy `addr` and IPv4/IPv6 `addrv2` discovery, full-history+witness service gating, `getheaders`, duplicate-free bounded 16-block `getdata` requests with up to eight requests/128 responses pipelined through one ordered receive window, unsolicited/notfound response rejection, the 2,000-header response limit, post-handshake duplicate-version rejection, keepalive-aware bounded response budgets, durable continuously polling regtest/default-Signet headers-first/block IBD, and ordered failover across up to 16 candidates are implemented. Candidate TCP/v1 handshakes now run concurrently within that 16-peer ceiling while active-session selection remains deterministic; completed lower-priority handshakes are retained as in-memory hot standbys, and attempt/success state is persisted at the actual task boundaries. Each full-service standby clones the current durable header DAG, then independently performs bounded 30-second ping/pong liveness and one contextually validated `getheaders` step per cycle without mutating shared storage. Invalid header announcements terminate that standby as objective peer failures; activation carries its independently validated height and still resumes authoritative synchronization from durable state. A direct outbound `tx` primitive rejects coinbase and transactions above Core's 400,000-weight-unit standard relay limit before framing, while explicitly making no mempool-acceptance or propagation claim. Explicit candidates have priority, then persisted peers, then lazily queried Core 26 DNS/bootstrap seeds. Concurrent seed resolution has per-seed/result/global bounds, network-routability filtering, cross-seed round-robin selection, custom replacement seeds, and an opt-out. Core 26's absent testnet4 list remains explicit rather than borrowing newer defaults. Learned candidates are atomically persisted in a network-bound redb pool, filtered for service/freshness/routability, bounded per source group and globally, and loaded on restart. A persistent random secret maps up to eight stochastic source references per learned address across 1,024 new buckets and each successful address into an exact hashed slot across 256 tried buckets, each capped at 64 slots; legacy stores migrate atomically, malformed key/reference metadata fails closed, successful handshakes bypass saturated new quotas and promote to tried, and candidate selection round-robins keyed buckets inside target-network groups. Every successful full-history/Witness handshake also persists the verified explicit/DNS peer. Learned attempts, consecutive failures, handshake successes, completed-session time, a saturating completion count, capped successful-handshake latency, and capped successful block-response throughput persist with crash-safe exponential cooldown and success reset; old peer records remain readable, end-to-end-proven peers rank ahead of handshake-only candidates, and lower known latency then higher known throughput break otherwise equal reputation ties before group diversification. Failed or incomplete block batches never contribute to the throughput measurement. A separate 1,024-entry persistent discouragement table classifies objective wire, header-consensus, and downloaded-block violations, escalates one-hour cooldowns to one day, decays after seven quiet days, clears only after a completed synchronization session, excludes DNS results, and protects manual peers and transient failures from false punishment. Pool updates prune stale records and make failure/session-success/latency/throughput-aware bucket and global capacity eviction decisions. A replacement resumes from persisted headers and atomic execution state after an interrupted block response; sync completion remains tied to validated cumulative work rather than an untrusted advertised height. Validated batches feed the pruned ledger through a restart-safe staging/publish protocol, including reorg truncation and missing-suffix backfill. End-to-end mock-peer gates cover concurrent-handshake progress under a stalled higher-priority peer, standby header progress and invalid-PoW eviction, standby keepalive and activation, capability rejection, interrupted-transfer recovery, shared-nonce identity, DNS fallback, verified-peer DNS-free restart, transient-failure exemption, manual-peer exemption, durable malformed-handshake discouragement, invalid-block no-residue discouragement, learned-candidate persistence/use/cooldown, and a real default-Signet block through handshake, header selection, witness-block download, BIP325 validation, atomic chainstate, retained ledger, and persistent explorer projection. Broader standard script flags, package-fee/estimation parity, inbound mempool service, and adaptive capacity-driven connected-peer eviction remain open.
-Bounded outbound transaction relay now replaces unsolicited standby `tx` writes. The handshake records reciprocal BIP339 support, announces wtxids when negotiated and txids otherwise, accepts legacy witness-aware requests, and retains at most 64 transactions/4 MB per session. A nonce-matched ping makes `getdata` service immediate while allowing uninterested peers to return only pong. Matching requests receive the transaction, unknown entries receive `notfound`, duplicate inventory is suppressed, crossed frames retain order, and oversized inventory fails before transaction service. Full-validation active and hot-standby sessions now also consume protocol-60002-or-later BIP35 `mempool` requests. Each request samples the current validated admission pool, applies the peer's BIP133 filter and negotiated BIP339 inventory type, caps the response at the pool's 64-transaction/4 MB bounds, and places the selected payloads in the same bounded `getdata` cache. Empty, obsolete, and header-only sessions remain silent. The active source has no ring subscription, so peer-origin traffic is not directly sent back to its source. A general inbound listener and broader Core mempool/relay policy remain in the open peer-manager gate.
+Bitcoin Core 31 is the current behavior/reference baseline. The vendored Core 26
+fixtures remain useful immutable historical evidence, but Core 26 is no longer a
+current product baseline. btcd is used as an independent implementation reference
+for listener, pruning, index, RPC, and operational behavior. Compatibility means
+matching documented protocol/consensus behavior, not copying every option or RPC.
 
-In the top-level peer-manager gate above, the remaining transaction-rebroadcast scope now means complete Core-style lifecycle and policy coverage beyond this bounded outbound peer-origin schedule.
+Primary references:
 
-A one-second active-session reaper now removes failed hot standbys in deterministic queue order and records their transient or objective failure immediately instead of delaying classification until failover. It also enforces an eight-peer soft capacity for ready automatic standbys, evicting from the tail of the existing manual/persistent-reputation order as handshakes finish while preserving the 16-connection hard ceiling. Manual peers are capacity-protected, locally evicted peers receive no remote-failure penalty, and readiness observation remains activation-safe. Broader Core-style dynamic block-relay scoring and eviction remain open.
+- [Bitcoin Core 31 release notes](https://bitcoincore.org/en/releases/31.0/)
+- [Bitcoin Core RPC surface](https://bitcoincore.org/en/doc/30.0.0/rpc/)
+- [Bitcoin Core node/prune/index startup behavior](https://github.com/bitcoin/bitcoin/blob/master/src/init.cpp)
+- [btcd operator configuration](https://github.com/btcsuite/btcd/blob/master/sample-btcd.conf)
+- [btcd prune/index consistency checks](https://github.com/btcsuite/btcd/blob/master/btcd.go)
 
-Repeated known header prefixes retained across a ping/`getheaders` boundary are now no-ops in both active and standby sync; a duplicate after any unseen header still fails. A public mainnet soak exposed the benign-prefix case simultaneously across hot standbys, and the regression gate now repeats the tip on the second independent poll before activation.
+## Completed trust baseline
 
-The same soak exposed an O(active-height) locator construction path on every hot-standby poll. Locators now read their exponentially spaced entries directly from the active-height index, reducing each height-959,381 poll from roughly one million parent-map lookups to about twenty indexed reads while preserving exact wire order.
+### Consensus and chainstate
 
-Concurrent unsolicited `tx` frames are preserved instead of discarded by bounded headers/address/block response consumers. Each session owns a wire-ordered 64-entry/4 MB FIFO with oldest-first pressure eviction. At an executed active tip above minimum chainwork, its explicit drain feeds a read-only consensus/standardness/conflict pass: confirmed prevouts, maturity, finality, sequence locks, deployment-aware scripts, value accounting, standard outputs and spent-prevout templates, accurate P2SH sigops, P2WSH stack/script limits, native-Taproot annex and tapscript-item limits, dust, fees, and retained-input conflicts are checked without changing the UTXO set. Dependency-connected batches are capped at 25 entries/101,000 vB, ordered parent-first, and applied atomically to a private UTXO overlay; already-admitted parent outputs support later children. Accepted entries move into a process-shared 64-entry/4 MB pool, survive active-peer failover, and join compact-block reconstruction candidates. Oldest-first capacity pressure removes descendants with their ancestor. Core 26-compatible opt-in BIP125 replacement recognizes explicit and inherited signaling, removes direct conflicts with every descendant, forbids new unrelated unconfirmed inputs, enforces higher aggregate absolute fees plus a 1 sat/vB incremental relay fee, and retains the 100-entry replacement ceiling; package admission and all replacement failures are atomic. Explicit `--mempool-full-rbf` bypasses only the signaling predicate, retaining every other replacement and resource rule. The full parent-before-child view is atomically persisted to a network-bound, owner-only redb snapshot before its cloned in-memory state is published. The strict versioned decoder enforces count, length, transaction, duplicate, conflict, and dependency invariants and joins the persisted-metadata fuzz surface. Restart reruns every stored entry through current consensus, scripts, standardness, chain context, and conflict checks, then durably removes stale entries. Reorganization disconnects authenticate each stale block against the retained ledger, skip coinbase, and commit a separate bounded recovery snapshot before mutating chainstate; lower-height parents displace higher descendants under pressure. Catch-up readmits those transactions through ordinary policy and atomically clears the recovery snapshot with the new active pool, including across mid-reorg restart. Broader standard-script/package-fee policy and the complete Core mempool lifecycle remain open.
+- [x] Header PoW, contextual time/difficulty, cumulative-work fork choice,
+  checkpoints, minimum-chainwork policy, durable header replay, and active-chain
+  reorganization.
+- [x] Full contextual block and transaction validation: historical BIP30/BIP16
+  exceptions, buried deployments, BIP68/113, SegWit, Taproot, Signet, subsidy,
+  coinbase maturity, weight, Merkle/witness commitments, sigops, and script
+  execution.
+- [x] Atomic UTXO, execution-tip, and per-block undo commits with disk-full,
+  interruption, reopen, and rollback tests.
+- [x] Differential Core 26 transaction/script vectors, authenticated historical
+  blocks/spends, live regtest comparison gates, and parser/property/fuzz coverage.
+- [x] One production chainstate executed mainnet genesis through active height
+  959,592/hash
+  `000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`,
+  then cold-reopened in 14.385 seconds without requesting a block.
+- [x] Trusted snapshot activation plus independent, restart-safe genesis
+  validation and atomic AssumeUTXO finalization; automatic cleanup is explicit,
+  ownership-bound, quarantined, and fail-closed.
 
-The wallet-independent eight-slot standby transaction ring now relays each newly admitted and durably committed peer transaction to all hot standbys except its active source. Only final surviving pool entries are published. Modern sessions announce wtxid inventory, legacy sessions announce txid inventory and accept witness-aware requests, and a bounded nonce-matched ping services optional `getdata` without penalizing peers that already have the transaction. Protocol-70013-or-later sessions track valid BIP133 sat/kvB filters and suppress only below-threshold inventory using each pool entry's exact fee and sigop-adjusted policy vsize; invalid `MoneyRange` values are ignored, equality is announced, unknown-fee legacy wallet rows remain eligible, and direct active-wallet `tx` writes are unaffected. The per-session 64-transaction/4 MB announcement cache suppresses duplicates. Every full-validation session also has a read-only callback into the process-shared active pool: a BIP35 request takes a fresh snapshot, applies the same BIP133/BIP339 rules, and caches only bounded selected payloads for subsequent `getdata`. Peer transaction inventory received while another response is in flight now drains from active and hot-standby sessions into a memory-only tracker capped at 64 announcements per source and 1,024 overall. Known identifiers are forgotten; one source per hash enters a 60-second in-flight state in announcement order; exact `tx`/`notfound`, timeout, canceled standby tasks, and disconnect cleanup let another announcing source take over without simultaneous duplicate requests. Matching payloads feed the unchanged durable admission path, which forgets both txid and wtxid candidates. One frame per request plus 32 crossed frames and 4 MB of aggregate transaction payload bound each batch. A versioned last-attempt map in the active mempool snapshot makes missing or 12-hour-old peer-origin transactions due in parent-before-child order, at most eight per caught-up pass. Legacy snapshots migrate as immediately due, pool replacement atomically prunes stale rows, and an attempt is recorded only when at least one standby ring receiver existed. A general inbound listener, salted preferred/non-preferred/overload request priority parity, peer acknowledgement tracking, a complete Core relay/mempool lifecycle, and propagation claims remain open.
+### Storage and performance
 
-Core-default mempool graph limits now complement the per-package bound: each accepted transaction may normally have at most 25 ancestors/101,000 ancestor vB including itself, and each affected ancestor may normally have at most 25 descendants/101,000 descendant vB including itself. Core's CPFP carve-out admits one independently submitted child at most 10,000 policy vB with exactly one unconfirmed ancestor when that parent reaches at most 26 descendants/111,000 vB; multi-transaction packages, larger children, and deeper chains remain at the defaults. Count, default/extended size, overlarge-child, and multi-package paths are tested independently, and every failure is atomic because topology is checked on the cloned candidate pool before publication. Consensus-derived sigop cost is capped at Core's 16,000 standard per-transaction limit and raises policy vsize above weight vsize when appropriate at the 20-bytes-per-sigop ratio; that stored value drives the post-validation package ceiling, graph aggregates, base/rolling fees, replacement incremental fees, and eviction fee rates. Core 26's prevout/witness standardness boundaries are covered as well: new bare-multisig outputs stop at valid x-of-3, spends of historical solver-recognized bare multisig remain allowed through 16 keys, data-carrier tails must be push-only, and P2SH redeem extraction evaluates every push or pushnum while rejecting reserved/invalid operations before accurate sigop counting. Statically decidable Core 26 standard-script flags now reject P2SH-wrapped future witness versions (including v1), malformed-length v0 programs, future Taproot leaf versions, and tapscript `OP_SUCCESS`; opcode parsing preserves identical bytes embedded inside data pushes. Full-admission tests construct genuinely consensus-valid committed Taproot leaves and prove each policy failure leaves both UTXO state and the candidate pool unchanged. Remaining standard-script parity is execution-dependent flags unavailable through the public `libbitcoinconsensus` ABI, alongside package-fee policy, estimation, and lifecycle behavior.
+- [x] A checksum-authenticated zstd block freezer with crash-safe staging,
+  circular retention, truncation recovery, physical deletion of retired slots,
+  and bounded default retention of 1,008 blocks/1 GiB.
+- [x] Block undo retention follows the freezer floor: an undo is deleted only
+  after its block leaves the retrievable ledger window; unknown header identities
+  fail the whole cleanup before mutation.
+- [x] Sorted batch UTXO writes, hot/cold read caching, validation-delta
+  row/group/shard indexes, parallel read groups, atomic batch commits, cache-sized
+  checkpoints, dual-peer downloads, next-window prefetch, and overlapping
+  download/stage/execute work.
+- [x] Reproducible storage/IBD benchmarks, compaction verification, simulated
+  disk-full tests, and SIGKILL/reopen coverage. Target-device HDD/NVMe numbers are
+  performance evidence, not a correctness gate.
 
-Peer mempool lifetime is now restart-safe: a complete versioned first-admission-time map expires active entries once older than Core's default 336 hours, removes descendants before revalidation, preserves surviving ages, and atomically prunes relay and time metadata with the pool. Reaccepted expired or reorg-recovered transactions restart their lifetime in the publishing commit. Legacy stores migrate active rows as newly admitted; malformed, duplicate, missing, and non-pool timestamp rows fail closed and the parser is fuzzed. Remaining lifecycle work includes a general inbound listener and Core's salted preferred/non-preferred/overload request priorities rather than basic durable expiry, bounded BIP35 request handling, per-source orphan work scheduling, bounded missing-parent recovery, multi-source single-flight downloading, or recent-confirmed suppression.
+### Network, mempool, and services
 
-Missing-parent peer transactions now enter a process-shared, memory-only orphanage instead of being permanently discarded. Independent 64-transaction/4 MB bounds, the 400,000-weight-unit per-entry ceiling, txid/wtxid deduplication, random pressure eviction, and Core's 20-minute expiry bound untrusted retention. Persisted and reorg-recovery candidates are excluded from peer attribution. Missing parents absent from the submitted package, active pool, orphanage, recent-confirmed set, and exact confirmed UTXO view enter a globally deduplicated 64-txid source request set; requests remain txid-based after BIP339, and responses rejoin ordinary peer admission. Connected blocks add txid and distinct wtxid identifiers to an exact oldest-first set capped at Core 26's 48,000-entry rolling-filter capacity, suppressing redundant inventory and spent-parent downloads; any block disconnection clears it for safe reorg relay. An exact-outpoint index activates only children spending a real output of each admitted parent and removes entries included or conflicted by atomically connected block batches while retaining same-parent/different-output siblings. Activated children enter deduplicated work sets keyed by a locally assigned monotonic session ID rather than the remote-controlled version nonce. Each admission turn pops one source item, runs the unchanged atomic consensus, standardness, replacement, topology, and capacity path, persists the result, and yields before immediately continuing if work remains; accepted children schedule the next generation. A 1,024-entry exact-txid recent-reject cache records only witness-independent failures, resets on an active-tip change, and prevents retention or repeated parent fetch when a dependency was already rejected. Every removal mode rebuilds exact byte accounting and prunes the exact index, work sets, and request state. Still-missing attempts remain for a later parent; terminal failures and successful admissions remove them, and session completion removes the exact source's remaining orphan, work, and request state. Remaining orphan work is probabilistic rolling-filter and full salted request-priority parity rather than bounded dependency recovery, multi-source single-flight requests, recent-confirmed/rejected-parent suppression, parent fetching, per-source scheduling, randomized pressure, exact-output block conflict handling, or disconnect cleanup.
+- [x] Bounded outbound peer manager with concurrent handshakes, hot standbys,
+  DNS/persisted candidates, restart-safe addrman-like buckets, cooldown,
+  discouragement, group diversity, capability checks, failover, and throughput
+  ranking.
+- [x] Headers-first IBD, pipelined/dual-peer full-block download, BIP152 compact
+  block recovery, transaction inventory/download, BIP339, BIP133, BIP35, bounded
+  relay caches, and transaction rebroadcast over established outbound sessions.
+- [x] Persistent bounded mempool with consensus/standardness validation, BIP125
+  and full-RBF modes, ancestor/descendant limits, CPFP carve-out, rolling minimum
+  fee, expiration, orphan recovery, recent-confirmed/reject suppression, reorg
+  recovery, and a bounded empirical fee estimator.
+- [x] Persistent explorer projections, authenticated bounded JSON-RPC, health,
+  readiness, Prometheus metrics, loopback-only REST, strict auth-token rotation,
+  audit logging, and crash-safe reconciliation.
+- [x] Watch-only descriptor wallet, deterministic address state, UTXO/history
+  tracking, coin selection, unsigned PSBT creation, external-signature
+  finalization, policy validation, durable bounded broadcast, and reorg-aware
+  rebroadcast without daemon-held private keys.
+- [x] Ordinary persistent execution is enabled on Bitcoin, legacy testnet,
+  Testnet4, Signet, and regtest. Testnet4 enforces BIP94's retarget base and
+  timewarp boundary and uses pinned Core 31 trust anchors and seeds. The
+  fixed-target experimental mode remains available for reproducible validation
+  journals.
+- [x] Real Testnet4 headers were validated and persisted from genesis through
+  active height 145,734/hash
+  `00000000002eaba2ff41604d0126d09e142f6f2afb79ee12abf9ad818e677abf`;
+  minimum chainwork passed. A separate ordinary persistent run executed block
+  1/hash
+  `0000000012982b6d5f621229286b880e909984df669c2afabb102ce311b13f28`
+  and stopped exactly at the authenticated target; its cold restart reopened
+  chainstate in 34 ms, requested no block, and exited in 3.52 seconds at the
+  identical execution and header tips.
 
-Capacity pressure now produces a Core-style process-local rolling mempool floor. Evicting the oldest eligible descendant closure raises the floor to its aggregate fee rate plus 1 sat/vB. Every new transaction independently pays the 1 sat/vB min-relay floor, while an exact non-replacement child-with-parents package may satisfy only the higher rolling floor with aggregate fees/policy vsize. Total-fee failure, an individually sub-min-relay parent, a deeper chain, and partial submission are atomic rejection tests. Existing entries are not repriced. Decay begins only after a later caught-up block, uses Core's 12-hour half-life with half/quarter-capacity acceleration, and clears below 0.5 sat/vB. The value resets on restart like Core's mempool dump rather than acquiring misleading durability. Remaining fee-policy work is broader estimator parity and package-submission/lifecycle behavior, not a missing capacity feedback loop.
+### Build and release automation
 
-A bounded empirical estimator now persists active-pool transactions with exact fee, sigop-adjusted policy vsize, and first eligible height in network-bound `fee_estimates.redb`. Caught-up active blocks move matches into a consecutive 1,008-block/4,096-observation journal before mempool reconciliation; restart preserves first-seen heights, shallow reorgs restore exact pending entries, and deeper or unavailable history resets explicitly. Target evaluation includes slow confirmations and mature pending failures, requires at least three outcomes, and selects the lowest threshold reaching 85% success. Authenticated Core-shaped `estimatesmartfee` accepts targets 1–1,008, reports BTC/kvB, and returns insufficient data rather than a fabricated fallback. Unsigned PSBT creation now accepts mutually exclusive exact-rate or confirmation-target modes; target resolution has no fallback and must fit the existing 1–1,000 sat/vB wallet bound. The strict snapshot parser joins persisted-metadata fuzzing. Remaining estimator parity is Core's bucketed multi-timescale decay, smart modes, and richer sample and wallet-strategy behavior.
+- [x] Locked formatting, Clippy, full tests, coverage floor, RustSec,
+  cargo-deny, CycloneDX SBOM, bounded fuzz regressions, targeted Miri, ASan,
+  TSan, MSan, deterministic double builds, and public-network smoke workflows.
 
-- [ ] BIP324 v2 transport using the maintained rust-bitcoin BIP324 implementation after interoperability tests with Core.
+## P0 — remaining release blockers
 
-Batched tried-collision handling now uses exact keyed `(bucket, slot)` occupancy: successful challengers remain in new only when their destination slot is occupied, up to ten collision pairs persist atomically, incumbents are prioritized for the next bounded connection stage, and only a failed connection/handshake demotes the incumbent and promotes the best challenger. A live incumbent clears every collision targeting it. Learned rows persist up to eight independently hashed source-group references with exponentially decreasing admission probability; promotion clears those references. Legacy rows default to one source reference and prior successes migrate as tried; malformed/oversized reference and collision metadata fail closed, and the parsers are fuzzed. Core-style terrible entries protect attempts from the preceding minute, then reject impossible future/zero/30-day-old address times, three never-successful failures, or ten failures after seven days without success. Startup physically prunes those rows and stale collision references before selection. Full Core addrman probabilistic selection remains open.
+- [ ] **Move the maintained compatibility baseline from Core 26 to Core 31.**
+  DNS seeds, minimum-chainwork, and assume-valid anchors are refreshed. Verify
+  checkpoint coverage and classify every Core 27–31 consensus, policy, P2P,
+  storage, and security change; add differential fixtures for applicable
+  changes. Core removed
+  `libbitcoinconsensus` in 28, so rBTC must either adopt a maintained script
+  engine/kernel boundary or own and continuously patch the vendored engine. The
+  acceptance gate is a documented dependency/security decision plus identical
+  results across the existing corpus and a new Core 31 regtest matrix.
+- [ ] **Complete Testnet4 public acceptance.** BIP94 difficulty/timewarp rules,
+  current trust anchors and seeds, and ordinary execution are implemented.
+  Genesis-to-tip header validation and exact block-1 execution are accepted.
+  Complete a full block/chainstate sync, cold restart, and reorg soak and add its
+  fixed chainstate acceptance hash. Do not infer any value from legacy testnet.
+- [ ] **Sustained public-network operations soak.** Run Bitcoin and Testnet4 for
+  at least seven consecutive days across natural tip updates, peer churn,
+  controlled restarts, freezer rotation, mempool persistence, and at least one
+  exercised reorg/fault scenario. Record maximum RSS, chainstate/freezer growth,
+  restart time, peer diversity, and final hashes.
+- [ ] **External security review.** Review consensus boundaries, script-engine
+  provenance, P2P resource accounting, snapshot trust, storage recovery,
+  authentication, wallet/PSBT handling, and release supply chain; resolve every
+  critical/high finding and document accepted lower-risk findings.
+- [ ] **Signed supported-platform release.** Exercise the release workflow with
+  operator-controlled keys on the declared Linux/macOS platform matrix, verify
+  byte-identical artifacts and provenance from a clean checkout, publish the
+  SBOM, upgrade/rollback notes, data-format compatibility, and disaster-recovery
+  procedure.
 
-BIP152 now negotiates witness-aware version 2 with high-bandwidth announcements disabled and rejects compact-block transaction/reference vectors above the consensus-derived 16,666 maximum. Reciprocal negotiation enables compact inventory in every block-download path; differential prefilled indexes, unique local wtxid candidates, ordered `getblocktxn` recovery, out-of-order batch completion, and Merkle/witness collision fallback to a full block are implemented and feed the unchanged contextual validator. Up to 64 persisted/revalidated peer transactions plus 64 unique unconfirmed wallet transactions restored from the durable rebroadcast store are snapshotted into every validating, ledger, explorer, and wallet-backfill compact download. High-bandwidth announcements, outbound compact relay, and multi-peer compact download selection remain in the open peer-manager/mempool gate.
+These are the only blockers to the first production **outbound-only,
+watch-only/external-signer validating-node** claim. Inbound service, an internal
+hot wallet, mining, exact Core RPC parity, BIP324, and target-HDD benchmark
+numbers are intentionally not hidden P0 requirements.
 
-Wallet transaction diffusion now keeps the active-socket completion boundary while fanning the exact verified transaction through a separate eight-entry in-memory ring to every hot standby. Before channel handoff, distinct wallet-origin standardness and a 1 sat/vB relay floor run after consensus verification; a reserved slot and atomic `rebroadcast.redb` commit then close the crash window. The network-bound, owner-only queue retains at most 64 unique wtxids for 14 days, persistently rejects retained-input conflicts, retries after restart and every 12 hours, suppresses active-chain confirmations and noncanonical conflicts, and restores eligibility after reorg reconciliation. Standbys independently complete the bounded inventory/request exchange under the peer timeout and terminate on socket failure or ring lag. Peer mempool acknowledgement, a general inbound listener, a complete Core transaction-relay lifecycle, and complete dynamic fee policy remain open.
+## P1 — normal full-node and operator completeness
 
-Core 26's public standard-script subset is now independent of custom consensus activation heights during transaction admission. Active-next-block flags run first; an incomplete set is followed by P2SH/DERSIG/NULLDUMMY/CLTV/CSV/Witness/Taproot verification against the same exact prevouts, while fully activated contexts skip duplicate execution. A pinned Core vector accepted under `VERIFY_NONE` and rejected under DERSIG/NULLDUMMY proves that the failure remains policy-only and leaves both UTXO state and the candidate pool unchanged. Core's `STANDARD_LOCKTIME_VERIFY_FLAGS` is also independent of custom CSV activation: version-2 mempool candidates always undergo read-only BIP68 checks for the next height and parent MTP, with exact height and 512-second equality boundaries, atomic failure, and witness-safe recent-reject caching covered. Policy-only interpreter flags outside the public ABI remain explicit open work.
+- [ ] **Inbound P2P listener and network contribution.** Add explicit bind/listen
+  configuration, inbound handshakes, header/block/compact-block and bounded
+  mempool service, upload targets, per-peer work accounting, preferred/manual
+  peer handling, eviction, ban/discouragement controls, and integration tests
+  against Core and btcd. Listening must be optional; outbound-only mode remains
+  supported.
+- [ ] **Current relay/policy baseline.** Differentially audit Core 31 changes,
+  including current relay fee defaults, package relay, orphan DoS accounting,
+  TRUC behavior, replacement, standard scripts, and estimator behavior.
+  Consensus and local policy must remain separate modules and separate test
+  expectations.
+- [ ] **Operator configuration and diagnostics.** Add a bounded network-scoped
+  config file, explicit cache/freezer/mempool/peer limits, structured
+  rate-limited rotating logs, graceful RPC stop, runtime logging controls, and
+  stable equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`,
+  `getmempoolinfo`, `getindexinfo`, and `verifychain`. Exact response-field
+  parity is not required.
+- [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
+  targets, prune/index incompatibility checks, `reindex` and
+  `reindex-chainstate`, bounded offline verification/repair, schema migration
+  tests, backup/restore instructions, and observable pruning progress. Never
+  silently recreate chainstate from an incomplete freezer.
+- [ ] **Optional indexes commonly used by node clients.** Add independently
+  rebuildable `txindex`, spent-output index, and BIP157/158 compact-filter index
+  with explicit disk cost, sync state, prune compatibility, and peer serving.
+- [ ] **Network privacy and reachability controls.** Add proxy/`onlynet`,
+  Tor/I2P outbound support, bind/whitebind equivalents, and address-network
+  isolation tests. Automatic port mapping is not required.
+- [ ] **Operational API breadth.** Add raw transaction submission, mempool
+  inspection, UTXO scans/proofs, block/header retrieval modes, wait-for-tip
+  primitives, peer controls, and stable error codes. Prefer a small documented
+  surface over nominal Core RPC parity.
 
-Core 26 package-fee subset semantics now prevent parents from paying for children. Aggregate rolling-fee evaluation is available only to a tree of mutually independent direct parents plus one child. Parents already satisfying the rolling floor are excluded before fee and policy-vsize summation; only below-floor parents and the child form the fee-bumping subpackage. A rich-parent/low-child case proves that whole-package fees can exceed the floor while the correct child-only subset is atomically rejected. Individual min-relay, existing-parent, replacement, deeper-chain, and non-tree paths receive no inappropriate aggregation.
+## P2 — role-specific extensions
 
-Core 26 package identity and raw-weight semantics are covered as well. Submitted txids are deduplicated before active-pool lookup, while one submitted alternate-witness transaction whose txid is already admitted is replaced by the validated pool entry for child dependency resolution and cannot overwrite it. Multi-transaction packages use one 404,000-weight-unit aggregate ceiling instead of summing individually rounded virtual sizes; singleton submissions proceed to the ordinary 400,000-weight-unit transaction standardness rule. Boundary and rollback tests cover all three cases.
+- [ ] BIP324 v2 transport with v1 fallback and Core 31 interoperability tests.
+- [ ] Mining interfaces (`getblocktemplate`/`submitblock` or a versioned local
+  IPC boundary) only if rBTC is deployed for mining.
+- [ ] ZMQ-compatible or native bounded event publication for indexers; the
+  existing REST/event path remains sufficient for the base node.
+- [ ] Encrypted daemon-held keys and in-process signing only as a separately
+  threat-modeled wallet product. The default node continues to prefer watch-only
+  descriptors and external signers.
+- [ ] Alternative atomic chainstate backends only after they include UTXO,
+  execution metadata, undo, snapshot markers, and the complete crash matrix in
+  one durability boundary. MDBX benchmark availability alone is insufficient.
+- [ ] GUI, legacy wallet import, exact Core RPC field parity, and specialized
+  index/mining APIs only in response to a concrete deployment requirement.
 
-Core 26's remaining BIP125 direct-conflict rate gate is now explicit. A replacement's integer sat/kvB feerate must strictly exceed every directly conflicting transaction before aggregate removed fees and the incremental relay charge are considered; rBTC applies the same rule to the aggregate fee and policy vsize of its atomic replacement-package extension. A larger candidate that pays both absolute fee rules while lowering the original feerate is rejected without mutation, and a one-sat/kvB-higher boundary succeeds. Rule #5 now also sums every direct conflict's descendant count before deduplicating shared descendants, matching Core's conservative 100-potential-replacement work bound; a topology-valid 25-entry graph whose five roots share twenty descendants produces 105 and fails atomically. Full-RBF still bypasses only signaling.
+## Performance work policy
 
-Core 26's Rule #2 input identity is aligned as well. Allowed prior unconfirmed dependencies are tracked by parent txid, not exact outpoint, so a replacement can move between sibling outputs of the same already-used mempool parent. An input from an unrelated mempool parent remains rejected. Both the successful sibling-output replacement and unrelated-parent rollback boundary are covered.
+Performance changes remain continuous but are profiling-driven rather than
+checkbox-driven. Every optimization must preserve these invariants:
 
-## Phase 2 — data services
+1. Untrusted network bytes are bounded and authenticated before staging.
+2. A complete validated checkpoint is the smallest publication unit.
+3. Download, stage, validation, prefetch, indexing, and cleanup may overlap only
+   when their failure domains cannot publish partial state.
+4. Database batches deduplicate and sort keys before writes; read caches are
+   bounded, network-scoped where persistent, and invalidated by exact state
+   transitions.
+5. Blocking database/filesystem work never occupies the async network executor;
+   queues, workers, in-flight blocks, and retry state always have explicit caps.
+6. A speedup is accepted only with identical final tip, UTXO identity, undo and
+   freezer bounds, restart behavior, and fault-injection results.
 
-- [x] In-memory explorer index implementation for embedded/regtest use.
-- [x] Persistent redb transaction/address/block indexes fed only by validated chain changes, restart-reconciled from the ledger or full-history peers, and correctly rolled back on reorg.
-- [x] Explorer UTXO pagination and endpoint input limits, enforced before bounded reads from the persistent index.
-- [x] Bounded explorer SSE notifications emitted only after persistent connect/disconnect/rebase commits, with an initial durable-tip snapshot, explicit lag/resync signaling, keepalives, a 64-client ceiling, and an embedded live-tip consumer.
-- [x] BDK watch-only wallet changeset persistence: owner-only SQLite, transactional address revelation, restart continuity, exact descriptor/network checks, explicit rejection of secret descriptors, validated-block balance tracking, durable chain checkpoints, and reorg/restart reconciliation from retained blocks or a full-history peer.
-- [x] Descriptor birthday and bounded gap-limit scanning for imported watch-only wallets, including receive/change lookahead convergence, sparse pre-birthday checkpoints, persisted completed-scan boundaries, configuration-lowering rescans, and crash-safe address issuance independent of scan revelation.
-- [x] Authenticated wallet status, canonical transaction history, and current UTXO views with deterministic bounded pagination and reorg-safe confirmation state.
-- [ ] Encrypted wallet secrets, descriptor import/export, PSBT create/sign/finalize, fee policy, coin control, and broadcast. Strict bounded startup import and authenticated canonical public receive/change descriptor export round-trip without private material or implicit network/scan-policy state. Authenticated unsigned PSBT creation now delegates coin selection and BIP174 metadata to BDK, caps request/recipient/input/fee/PSBT sizes, enforces network/dust/`MoneyRange`, supports exclusive selected-UTXO coin control, enables RBF, and durably reserves unique change before response. Creation is limited to SegWit/Taproot descriptors and carries only `witness_utxo` metadata so full previous transactions cannot defeat memory bounds. External-signature finalization, bounded wallet-origin admission, connected-peer diffusion, durable periodic rebroadcast, and explicit exact-rate or estimator-backed confirmation-target selection are complete as described below; encrypted secret import/export, in-process signing, full Core estimator parity, and general peer-facing mempool admission remain open.
-- [x] Authenticated local RPC plus optional REST API. The watch-only status/balance/address/transaction/UTXO REST subset is explicitly enabled with owner-only descriptor/token files, bearer-protected with non-short-circuit comparison, no-store responses, loopback-only binding, bounded pagination, and bounded address-revelation rate. An independently scoped owner-only RPC token enables strict JSON-RPC 2.0 `help`, `getblockhash`, empirical `estimatesmartfee`, block-summary, transaction-summary, and paged current-address-UTXO methods over bounded stores; batches, notifications, unknown fields, invalid IDs, oversize methods/parameters, internal-error details, and bodies above 64 KiB are rejected. RPC and wallet token files cannot alias. The daemon reloads each token file at a bounded interval; atomic replacement rotates its cloned router state together, while missing, over-permissive, oversized, malformed, or non-UTF-8 files fail closed until a valid credential returns. Every authorization attempt is synced before route execution to a shared owner-only, single-link, 16 MiB-capped JSONL audit containing only time, HTTP method, query-free fixed path, and accepted/rejected state; credential, header, query, body, and response data are excluded, and any audit failure returns 503 before protected access.
+Future measurements should publish blocks/second, execution and fsync time,
+cache hit rate, read/write amplification, maximum RSS, disk plateau, and cold
+restart time. Hardware-specific NVMe/HDD reports guide defaults but do not delay
+correctness or security work.
 
-- [x] Authenticated external-signature PSBT finalization and bounded connected-peer broadcast without daemon-held secrets. Strict 768 KiB requests accept at most a 512 KiB PSBT, require 1–100 unique current wallet inputs and at most 17 outputs, match every `witness_utxo` to local validated state, reject full previous transactions, pre-finalized inputs, unsafe sighashes, and excessive fees, then verify BDK-assembled final scripts with the pinned Core 26 consensus engine. Finalization remains side-effect free. The separate broadcast route applies distinct bounded standardness, dust, data-carrier, and 1 sat/vB policy, reserves an eight-entry channel slot, atomically persists the exact verified transaction with retained-input conflict rejection, then hands it to the active peer and returns success only after a complete standard-weight `tx` frame plus attempt update. Socket failure remains eligible on failover; restart and 12-hour periodic scheduling recover without the caller. After active delivery, a separate bounded ring fans out to every hot standby; lagging or failed standbys are removed. Confirmed or noncanonical rows are suppressed, retained for reorg recovery, and expire with all rows after 14 days. This makes no peer-mempool acceptance or acknowledgement claim. Encrypted in-process signing, a general inbound peer listener, and broader Core transaction-relay policy remain open.
+## Execution order
 
-## Phase 3 — performance and release
-
-- [x] Loopback deployment observability: separate liveness/readiness, phase-aware height/hash consistency across header/execution/explorer/wallet state, AssumeUTXO trust visibility, hot/cold UTXO and circular-ledger footprint status, and bounded Prometheus exposition.
-- [x] Parallel block script validation while preserving sequential prevout/UTXO
-  semantics and atomic rollback. On the same debug historical-full-block
-  regression workload, elapsed time fell from about 35.96 seconds to 19.43
-  seconds (about 1.85×). Three isolated release runs fell from a 3.59-second
-  median at `534c28c` to 2.36 seconds (1.52×). Replacing per-block scoped
-  thread creation with a persistent bounded worker pool then reduced an
-  immediately adjacent three-run hot release A/B from 4.00 seconds to a
-  3.30-second median (17.5%); small jobs remain serial, dynamic transaction
-  scheduling preserves the earliest failure, and public-network measurements
-  remain part of the sustained IBD benchmark program. IBD now accumulates the
-  immutable script jobs for a complete atomic checkpoint and crosses one pool
-  barrier before commit instead of joining after every block. An adjacent live
-  mainnet A/B on the same durable directory improved from 5,888 blocks in 557
-  seconds including startup (10.57 blocks/second) to 3,328 blocks in 257
-  seconds including recovery (12.95 blocks/second), a 22.5% throughput gain,
-  while preserving earliest-block/transaction failure order and atomic
-  rollback. A producer/consumer follow-up starts each block's script jobs while
-  the calling thread constructs later cumulative UTXO transitions. Its final
-  6,965-block mainnet leg completed in 435.36 seconds including recovery
-  (15.99 blocks/second), 12.9% above the adjacent checkpoint-barrier leg and
-  about 51% above the original per-block-barrier leg. Checkpoint-wide UTXO
-  folding, fresh-output proofs, single-pass durable mutation, direct publication
-  of verified staged archives, zstd level-1 online encoding, and an explicit
-  1,008-block high-memory checkpoint then reached mainnet height 279,000. The
-  final 4,168 blocks took 246.75 seconds including cold startup; one steady
-  1,008-block checkpoint sustained 25.2 blocks/second, about 47% above the
-  adjacent 256-block single-pass run.
-- [ ] Benchmark IBD, UTXO lookup/mutation, snapshot import/export, compaction, and compression on NVMe and HDD; publish reproducible benchmark fixtures. Bounded, deterministic, runtime-generated workloads now emit versioned JSON for redb/MDBX seeding, block-shaped mutation, mixed hit/miss lookup, redb offline compaction with before/after sizes and verified reopen, snapshot export/verification/import with compressed and canonical sizes, and multi-block local IBD through the production handshake/headers/download/execution/ledger path. The IBD path now commits enabled explorer projections once per atomic batch, reuses deployment contexts, skips duplicate structural checks, reduces progress output, and aggregates four bounded 16-block downloads into each default 64-block persistence checkpoint. An explorer projection is opened only for an explicitly configured API listener, so an ordinary validator avoids an unused full historical transaction/undo index. Three release runs of the indexed 1,000-block fixture improved from a 26.12-second median at `c0e31d1` to 11.03 seconds with identical tips, a 2.37× throughput increase; the first unindexed measurement completed in 8.82 seconds. A manual workflow retains both reports plus CPU/filesystem/block-device metadata without committing generated databases, snapshots, or chains. Controlled target-NVMe/HDD measurements remain.
-- [ ] Complete storage benchmarks on target NVMe and HDD. A deterministic release fixture now compares redb quick-repair on/off with the optional durable MDBX UTXO backend; bounded validation can explicitly defer quick-repair allocator writes while retaining immediate durability, and repeated SIGKILL/reopen now covers both settings. Simulated disk-full, transaction abort, and truncated-copy gates likewise enforce old-or-new atomic state. MDBX cannot become selectable production chainstate until it atomically includes undo and execution metadata and passes the same crash matrix.
-- [ ] CI gates: locked format, clippy, full tests, LCOV generation, a measured 90% line-coverage floor, RustSec audit, cargo-deny license/source policy, CycloneDX 1.5 SBOM, byte-identical double release builds, bounded libFuzzer regression, targeted Miri across header/Merkle/P2P/config/auth/persisted-parser paths, AddressSanitizer across library and integration tests, ThreadSanitizer across wallet/event/token concurrency, MemorySanitizer with origin tracking across pure-Rust Merkle/P2P paths, and signed Sigstore provenance/SBOM attestations are implemented. Disk/time-bounded continuous sync/execution smoke gates run weekly and on demand through default-Signet height 1,000 and mainnet Core 26 checkpoint height 295,000; after observing mainnet block 1,000 the harness interrupts and must resume the same durable validation target. Fully instrumented C/C++ dependency coverage, FFI-constrained Miri coverage, long-running fuzz campaigns, operator-controlled release keys, and full-chain resource-bounded network soak remain required.
-- [ ] External security review and at least a sustained public testnet/regtest soak before any mainnet wallet recommendation.
-
-## Compatibility policy
-
-Wire messages and block/transaction serialization must use Bitcoin's consensus encoding through `rust-bitcoin`. Consensus script checks use the version-pinned Bitcoin Core library. Snapshot and archive formats are rBTC-specific transport/storage formats, so they are versioned and never advertised as Bitcoin P2P messages without a ratified BIP and interoperability testing.
-
-## Current critical path
-
-The durable regtest and default/custom-Signet headers-first/block IBD milestone
-is implemented, including atomic multi-block checkpoints, active-branch
-rewinds, real default-Signet block execution, and custom challenge isolation.
-The bounded mainnet production path has now completed genesis-to-tip execution
-through active height 959,592, including exact authenticated target stops,
-in-place extensions, bounded physical freezer cleanup, and final cold-restart
-recovery without a block request. The next acceptance milestone is sustained
-legacy-testnet operation, completing the remaining policy/standardness and P2P
-service work, and automating the full-chain resource gate in CI before
-widening the execution safety gate. Peer diversity/DoS hardening follows
-before a public long-running node.
-Compression, archive transport, explorer, and wallet work must not be presented
-as a substitute for this validating-node path.
+1. Finish the Core 31/dependency audit and Testnet4 public acceptance soak.
+2. Run the sustained public-network soak while preparing the external review.
+3. Close review findings and produce the signed supported-platform release.
+4. Build inbound service, operator lifecycle, current relay policy, and optional
+   indexes in that order.
+5. Select P2 work only from an actual deployment need.

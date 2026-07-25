@@ -18,6 +18,8 @@ use crate::deployments::DeploymentConfig;
 
 /// Bitcoin Core's maximum permitted future block timestamp offset.
 pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
+/// BIP94 maximum backward timestamp movement at a Testnet4 retarget boundary.
+pub const MAX_TIMEWARP_SECS: u32 = 10 * 60;
 
 /// Stored metadata for a proof-of-work-valid header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +59,14 @@ pub enum HeaderError {
         time: u32,
         /// Median of the previous up-to-eleven timestamps.
         median: u32,
+    },
+    /// A Testnet4 retarget-boundary timestamp violates BIP94.
+    #[error("header timestamp {time} is below BIP94 retarget-boundary minimum {minimum}")]
+    TimeWarp {
+        /// Candidate header timestamp.
+        time: u32,
+        /// Previous block timestamp minus the permitted ten-minute movement.
+        minimum: u32,
     },
     /// The timestamp is too far beyond the network-adjusted clock.
     #[error("header timestamp {time} exceeds adjusted time limit {maximum}")]
@@ -119,6 +129,7 @@ impl HeaderError {
             Self::InvalidTarget
                 | Self::InvalidProofOfWork(_)
                 | Self::TimeTooOld { .. }
+                | Self::TimeWarp { .. }
                 | Self::UnexpectedDifficulty { .. }
                 | Self::CheckpointMismatch { .. }
                 | Self::ForkBeforeCheckpoint { .. }
@@ -286,8 +297,16 @@ impl HeaderDag {
                 .ancestor_at_height(parent, boundary_height)
                 .ok_or(HeaderError::MissingRetargetAncestor(boundary_height))?;
             let elapsed = u64::from(parent.header.time.saturating_sub(boundary.header.time));
+            let base_bits = if self.params.network == Network::Testnet4 {
+                // BIP94 preserves the actual difficulty in the first block of
+                // each period; a minimum-difficulty final block cannot seed a
+                // block storm in the next period.
+                boundary.header.bits
+            } else {
+                parent.header.bits
+            };
             return Ok(CompactTarget::from_next_work_required(
-                parent.header.bits,
+                base_bits,
                 elapsed,
                 &self.params,
             ));
@@ -371,6 +390,7 @@ impl HeaderDag {
                 median,
             });
         }
+        validate_bip94_time(&self.params, height, parent.header.time, header.time)?;
         let maximum = adjusted_time.saturating_add(MAX_FUTURE_BLOCK_TIME_SECS);
         if header.time > maximum {
             return Err(HeaderError::TimeTooNew {
@@ -485,6 +505,26 @@ impl HeaderDag {
                     .is_some_and(|hash| self.headers.contains_key(&hash))
             })
     }
+}
+
+fn validate_bip94_time(
+    params: &Params,
+    height: u32,
+    parent_time: u32,
+    candidate_time: u32,
+) -> Result<(), HeaderError> {
+    let interval =
+        u32::try_from(params.difficulty_adjustment_interval()).expect("Bitcoin interval fits u32");
+    if params.network == Network::Testnet4 && height % interval == 0 {
+        let minimum = parent_time.saturating_sub(MAX_TIMEWARP_SECS);
+        if candidate_time < minimum {
+            return Err(HeaderError::TimeWarp {
+                time: candidate_time,
+                minimum,
+            });
+        }
+    }
+    Ok(())
 }
 
 const fn checkpoint_heights(network: Network) -> &'static [u32] {
@@ -803,6 +843,69 @@ mod tests {
         assert_eq!(
             dag.expected_next_bits(&candidate).unwrap(),
             hard_target.min_transition_threshold().to_compact_lossy()
+        );
+    }
+
+    #[test]
+    fn testnet4_retarget_uses_the_first_period_block_difficulty() {
+        let mut dag = HeaderDag::new(Network::Testnet4);
+        let params = Params::new(Network::Testnet4);
+        let genesis = dag.active_tip();
+        let hard_target = params.max_attainable_target.min_transition_threshold();
+        let boundary_header = Header {
+            time: 1_000,
+            bits: hard_target.to_compact_lossy(),
+            ..genesis.header
+        };
+        let boundary = HeaderInfo {
+            header: boundary_header,
+            hash: boundary_header.block_hash(),
+            height: 0,
+            chainwork: genesis.chainwork,
+        };
+        dag.headers.insert(boundary.hash, boundary);
+        let parent_header = Header {
+            prev_blockhash: boundary.hash,
+            time: boundary.header.time
+                + u32::try_from(params.pow_target_timespan).expect("Bitcoin span fits u32"),
+            bits: params.max_attainable_target.to_compact_lossy(),
+            ..boundary.header
+        };
+        let parent = HeaderInfo {
+            header: parent_header,
+            hash: parent_header.block_hash(),
+            height: 2_015,
+            chainwork: boundary.chainwork + params.max_attainable_target.to_work(),
+        };
+        dag.headers.insert(parent.hash, parent);
+        let candidate = Header {
+            prev_blockhash: parent.hash,
+            time: parent.header.time + 1,
+            ..parent.header
+        };
+
+        assert_eq!(
+            dag.expected_next_bits(&candidate).unwrap(),
+            hard_target.to_compact_lossy()
+        );
+    }
+
+    #[test]
+    fn testnet4_retarget_rejects_timewarp_but_accepts_exact_boundary() {
+        let params = Params::new(Network::Testnet4);
+        let parent_time = 2_000;
+        let minimum = parent_time - MAX_TIMEWARP_SECS;
+        assert!(matches!(
+            validate_bip94_time(&params, 2_016, parent_time, minimum - 1),
+            Err(HeaderError::TimeWarp {
+                time,
+                minimum: required
+            }) if time == minimum - 1 && required == minimum
+        ));
+        assert!(validate_bip94_time(&params, 2_016, parent_time, minimum).is_ok());
+        assert!(validate_bip94_time(&params, 2_015, parent_time, 0).is_ok());
+        assert!(
+            validate_bip94_time(&Params::new(Network::Testnet), 2_016, parent_time, 0,).is_ok()
         );
     }
 
