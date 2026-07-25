@@ -41,7 +41,9 @@ use rbtc::{
         AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
         validate_block_structure_with_deployments_and_txids,
     },
-    chain_store::{ChainStoreOptions, RedbChainStore},
+    chain_store::{
+        ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
+    },
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
@@ -5371,6 +5373,19 @@ async fn download_parallel_block_pair(
     }
 }
 
+fn shard_validation_delta_candidates(
+    chainstate: &RedbChainStore,
+    heights: &[u32],
+) -> Result<Vec<ValidationDeltaShardMigration>, ChainStoreError> {
+    let mut migrations = Vec::with_capacity(heights.len());
+    for height in heights {
+        if let Some(migration) = chainstate.shard_legacy_validation_delta(*height)? {
+            migrations.push(migration);
+        }
+    }
+    Ok(migrations)
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn download_execute_batch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
@@ -5563,9 +5578,11 @@ async fn download_execute_batch(
         Vec::new()
     };
     let now = u64::from(unix_time()?);
-    let delta_shard_candidate = chainstate.take_hottest_legacy_validation_delta();
+    let delta_shard_candidates = (0..2)
+        .filter_map(|_| chainstate.take_hottest_legacy_validation_delta())
+        .collect::<Vec<_>>();
     let staged_at;
-    let delta_shard_migration;
+    let delta_shard_migrations;
     let delta_shard_elapsed;
     let (
         applied_blocks,
@@ -5590,10 +5607,7 @@ async fn download_execute_batch(
             });
             let shard = scope.spawn(|| {
                 let started = Instant::now();
-                let result = delta_shard_candidate
-                    .map(|height| chainstate.shard_legacy_validation_delta(height))
-                    .transpose()
-                    .map(Option::flatten);
+                let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                 (result, started.elapsed())
             });
             let stage_result = ledger.stage(next_height, &serialized);
@@ -5614,7 +5628,7 @@ async fn download_execute_batch(
             )
         });
         stage_result.map_err(|error| error.to_string())?;
-        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
@@ -5669,10 +5683,7 @@ async fn download_execute_batch(
             });
             let shard = scope.spawn(|| {
                 let started = Instant::now();
-                let result = delta_shard_candidate
-                    .map(|height| chainstate.shard_legacy_validation_delta(height))
-                    .transpose()
-                    .map(Option::flatten);
+                let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                 (result, started.elapsed())
             });
             let stage_result = ledger.stage(next_height, &serialized);
@@ -5716,7 +5727,7 @@ async fn download_execute_batch(
             )
         });
         stage_result.map_err(|error| error.to_string())?;
-        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let execution_result =
@@ -5753,10 +5764,7 @@ async fn download_execute_batch(
             });
             let shard = scope.spawn(|| {
                 let started = Instant::now();
-                let result = delta_shard_candidate
-                    .map(|height| chainstate.shard_legacy_validation_delta(height))
-                    .transpose()
-                    .map(Option::flatten);
+                let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                 (result, started.elapsed())
             });
             let stage_result = ledger.stage(next_height, &serialized);
@@ -5777,7 +5785,7 @@ async fn download_execute_batch(
             )
         });
         stage_result.map_err(|error| error.to_string())?;
-        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
@@ -5882,9 +5890,9 @@ async fn download_execute_batch(
             "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
         );
     }
-    if let Some(migration) = delta_shard_migration {
+    for migration in delta_shard_migrations {
         println!(
-            "migrated hot validation delta {} from {} bytes to {} sorted shards in {} ms",
+            "migrated hot validation delta {} from {} bytes to {} sorted shards inside a {} ms migration window",
             migration.height,
             migration.legacy_bytes,
             migration.shard_count,
