@@ -239,8 +239,9 @@ adjacent live sample reduced ordinary median download time only from about
 19.4 to 18.8 seconds, so this remains a tail-latency guard rather than the main
 speedup. An earlier unread 124-block auxiliary lookahead was rejected after it
 exceeded the 30-second bound. The retained execution-overlap path instead
-actively drains primary responses on a scoped worker and stores at most one
-complete configured validation batch as fully received blocks.
+actively drains bounded primary/auxiliary response pairs on a scoped worker
+and stores at most one complete configured validation batch as fully received
+blocks.
 
 The same production directory then stopped exactly at CSV activation height
 419,328/hash
@@ -290,16 +291,17 @@ primary-only batches took 80.482 and 88.089 seconds.
 
 Cross-execution lookahead now actively downloads the complete next configured
 validation batch on a scoped network worker while the current checkpoint
-stages its archive and performs its sequential UTXO transition. Each received
-64-block window is immediately reduced to compact consensus bytes instead of
-retaining an expanded transaction object tree. The next checkpoint decodes
-and validates that exact block-hash prefix before using it and downloads only
-any unfilled remainder. This can hide the complete 756-block transfer behind
-otherwise network-idle persistence; the configured 1,008-block ceiling still
-bounds the additional serialized payload to 4 GiB at Bitcoin's consensus
-maximum. Because the worker continuously drains every response window, it
-does not recreate the unread 128-block response pressure seen in the earlier
-soak.
+stages its archive and performs its sequential UTXO transition. The worker
+uses the same bounded primary/auxiliary 64-block pairs, partial-progress
+fallback, and auxiliary retirement as foreground download. Each received
+window is immediately reduced to compact consensus bytes instead of retaining
+an expanded transaction object tree. The next checkpoint decodes and validates
+that exact block-hash prefix before using it and downloads only any unfilled
+remainder. This can hide the complete 756-block transfer behind otherwise
+network-idle persistence; the configured 1,008-block ceiling still bounds the
+additional serialized payload to 4 GiB at Bitcoin's consensus maximum.
+Because the worker continuously drains every response window, it does not
+recreate the unread 128-block response pressure seen in the earlier soak.
 
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,

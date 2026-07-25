@@ -5124,15 +5124,46 @@ async fn download_block_window(
 
 async fn download_execution_prefetch(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     hashes: &[BlockHash],
     compact_candidates: &[Transaction],
 ) -> Result<Vec<Vec<u8>>, PeerRunError> {
     let mut serialized = Vec::with_capacity(hashes.len());
-    for window in hashes.chunks(VALIDATION_BLOCK_WINDOW_SIZE) {
-        let blocks =
-            download_block_window(session, window, compact_candidates, "execution prefetch")
-                .await?;
-        serialized.extend(blocks.into_iter().map(|block| serialize(&block)));
+    let mut offset = 0;
+    while offset < hashes.len() {
+        let remaining = &hashes[offset..];
+        if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
+            let primary_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
+            let auxiliary_len = (remaining.len() - primary_len).min(VALIDATION_BLOCK_WINDOW_SIZE);
+            let auxiliary = auxiliary_session
+                .as_mut()
+                .expect("auxiliary session was checked");
+            let (primary_blocks, auxiliary_blocks, keep_auxiliary) = download_parallel_block_pair(
+                session,
+                &remaining[..primary_len],
+                auxiliary,
+                &remaining[primary_len..primary_len + auxiliary_len],
+                compact_candidates,
+            )
+            .await?;
+            serialized.extend(primary_blocks.into_iter().map(|block| serialize(&block)));
+            serialized.extend(auxiliary_blocks.into_iter().map(|block| serialize(&block)));
+            offset += primary_len + auxiliary_len;
+            if !keep_auxiliary {
+                *auxiliary_session = None;
+            }
+        } else {
+            let window_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
+            let blocks = download_block_window(
+                session,
+                &remaining[..window_len],
+                compact_candidates,
+                "execution prefetch",
+            )
+            .await?;
+            serialized.extend(blocks.into_iter().map(|block| serialize(&block)));
+            offset += window_len;
+        }
     }
     Ok(serialized)
 }
@@ -5476,13 +5507,13 @@ async fn download_execute_batch(
     };
     let now = u64::from(unix_time()?);
     let staged_at;
-    let (applied_blocks, downloaded_prefetch) = if next_prefetch_hashes.is_empty() {
-        ledger
-            .stage(next_height, &serialized)
-            .map_err(|error| error.to_string())?;
-        staged_at = Instant::now();
-        (
-            connect_prevalidated_active_blocks_with_txids(
+    let (applied_blocks, downloaded_prefetch, execution_core_at, prefetch_elapsed) =
+        if next_prefetch_hashes.is_empty() {
+            ledger
+                .stage(next_height, &serialized)
+                .map_err(|error| error.to_string())?;
+            staged_at = Instant::now();
+            let applied_blocks = connect_prevalidated_active_blocks_with_txids(
                 chainstate,
                 headers,
                 &blocks,
@@ -5491,21 +5522,29 @@ async fn download_execute_batch(
                 DEFAULT_HOT_WINDOW_SECS,
                 &deployment_contexts,
             )
-            .map_err(|error| PeerRunError::block(&error))?,
-            Vec::new(),
-        )
-    } else if tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread
-    {
-        let runtime = tokio::runtime::Handle::current();
-        let (stage_result, branch_staged_at, execution_result, prefetch_result) =
-            std::thread::scope(|scope| {
+            .map_err(|error| PeerRunError::block(&error))?;
+            (applied_blocks, Vec::new(), Instant::now(), Duration::ZERO)
+        } else if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            let runtime = tokio::runtime::Handle::current();
+            let (
+                stage_result,
+                branch_staged_at,
+                execution_result,
+                execution_core_at,
+                prefetch_result,
+                prefetch_elapsed,
+            ) = std::thread::scope(|scope| {
                 let prefetch = scope.spawn(|| {
-                    runtime.block_on(download_execution_prefetch(
+                    let started = Instant::now();
+                    let result = runtime.block_on(download_execution_prefetch(
                         session,
+                        auxiliary_session,
                         &next_prefetch_hashes,
                         compact_candidates,
-                    ))
+                    ));
+                    (result, started.elapsed())
                 });
                 let stage_result = ledger.stage(next_height, &serialized);
                 let branch_staged_at = Instant::now();
@@ -5520,47 +5559,61 @@ async fn download_execute_batch(
                         &deployment_contexts,
                     )
                 });
-                let prefetch_result = prefetch
+                let execution_core_at = Instant::now();
+                let (prefetch_result, prefetch_elapsed) = prefetch
                     .join()
                     .expect("scoped execution-prefetch thread must not panic");
                 (
                     stage_result,
                     branch_staged_at,
                     execution_result,
+                    execution_core_at,
                     prefetch_result,
+                    prefetch_elapsed,
                 )
             });
-        stage_result.map_err(|error| error.to_string())?;
-        staged_at = branch_staged_at;
-        let execution_result =
-            execution_result.expect("successful staging starts chainstate execution");
-        let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
-        let downloaded_prefetch = match prefetch_result {
-            Ok(blocks) => blocks,
-            Err(error) => {
-                prefetch_error = Some(error);
-                Vec::new()
-            }
-        };
-        (applied_blocks, downloaded_prefetch)
-    } else {
-        ledger
-            .stage(next_height, &serialized)
-            .map_err(|error| error.to_string())?;
-        staged_at = Instant::now();
-        let applied_blocks = connect_prevalidated_active_blocks_with_txids(
-            chainstate,
-            headers,
-            &blocks,
-            &transaction_ids,
-            now,
-            DEFAULT_HOT_WINDOW_SECS,
-            &deployment_contexts,
-        )
-        .map_err(|error| PeerRunError::block(&error))?;
-        let downloaded_prefetch =
-            match download_execution_prefetch(session, &next_prefetch_hashes, compact_candidates)
-                .await
+            stage_result.map_err(|error| error.to_string())?;
+            staged_at = branch_staged_at;
+            let execution_result =
+                execution_result.expect("successful staging starts chainstate execution");
+            let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
+            let downloaded_prefetch = match prefetch_result {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    prefetch_error = Some(error);
+                    Vec::new()
+                }
+            };
+            (
+                applied_blocks,
+                downloaded_prefetch,
+                execution_core_at,
+                prefetch_elapsed,
+            )
+        } else {
+            ledger
+                .stage(next_height, &serialized)
+                .map_err(|error| error.to_string())?;
+            staged_at = Instant::now();
+            let applied_blocks = connect_prevalidated_active_blocks_with_txids(
+                chainstate,
+                headers,
+                &blocks,
+                &transaction_ids,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                &deployment_contexts,
+            )
+            .map_err(|error| PeerRunError::block(&error))?;
+            let execution_core_at = Instant::now();
+            let prefetch_started = Instant::now();
+            let downloaded_prefetch = match download_execution_prefetch(
+                session,
+                auxiliary_session,
+                &next_prefetch_hashes,
+                compact_candidates,
+            )
+            .await
             {
                 Ok(blocks) => blocks,
                 Err(error) => {
@@ -5568,8 +5621,13 @@ async fn download_execute_batch(
                     Vec::new()
                 }
             };
-        (applied_blocks, downloaded_prefetch)
-    };
+            (
+                applied_blocks,
+                downloaded_prefetch,
+                execution_core_at,
+                prefetch_started.elapsed(),
+            )
+        };
     let execution_prefetch_count = downloaded_prefetch.len();
     prefetched_blocks.serialized = downloaded_prefetch;
     let executed_at = Instant::now();
@@ -5611,7 +5669,7 @@ async fn download_execute_batch(
         .map_err(|error| error.to_string())?;
     let published_at = Instant::now();
     println!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -5623,6 +5681,8 @@ async fn download_execute_batch(
             .as_millis(),
         staged_at.duration_since(structure_validated_at).as_millis(),
         executed_at.duration_since(staged_at).as_millis(),
+        execution_core_at.duration_since(staged_at).as_millis(),
+        prefetch_elapsed.as_millis(),
         indexed_at.duration_since(executed_at).as_millis(),
         published_at.duration_since(indexed_at).as_millis(),
         published_at.duration_since(batch_started).as_millis(),
@@ -8122,34 +8182,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scoped_execution_prefetch_drains_on_multithread_runtime() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = listener.local_addr().unwrap();
+    async fn scoped_execution_prefetch_drains_dual_peers_on_multithread_runtime() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_remote = primary_listener.local_addr().unwrap();
+        let auxiliary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auxiliary_remote = auxiliary_listener.local_addr().unwrap();
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        let blocks = vec![
-            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 1, 1),
-            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 2, 2),
-        ];
+        let blocks = (1..=65)
+            .map(|height| {
+                regtest_block_at_height(genesis.block_hash(), genesis.header.time + height, height)
+            })
+            .collect::<Vec<_>>();
         let hashes = blocks.iter().map(Block::block_hash).collect::<Vec<_>>();
-        let expected_inventory = hashes
+        let primary_inventory = hashes[..VALIDATION_BLOCK_WINDOW_SIZE]
             .iter()
             .copied()
             .map(Inventory::WitnessBlock)
             .collect::<Vec<_>>();
-        let server = tokio::spawn(async move {
-            let (mut peer, _) = accept_peer(listener, peer_version(643)).await;
+        let auxiliary_inventory = hashes[VALIDATION_BLOCK_WINDOW_SIZE..]
+            .iter()
+            .copied()
+            .map(Inventory::WitnessBlock)
+            .collect::<Vec<_>>();
+        let primary_blocks = blocks[..VALIDATION_BLOCK_WINDOW_SIZE].to_vec();
+        let auxiliary_blocks = blocks[VALIDATION_BLOCK_WINDOW_SIZE..].to_vec();
+        let primary_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(primary_listener, peer_version(643)).await;
+            for inventory in primary_inventory.chunks(MAX_BLOCKS_IN_FLIGHT) {
+                assert_eq!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetData(inventory.to_vec())
+                );
+            }
+            for block in primary_blocks {
+                peer.write_message(NetworkMessage::Block(block))
+                    .await
+                    .unwrap();
+            }
+        });
+        let auxiliary_server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(auxiliary_listener, peer_version(645)).await;
             assert_eq!(
                 peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::GetData(expected_inventory)
+                NetworkMessage::GetData(auxiliary_inventory)
             );
-            for block in blocks {
+            for block in auxiliary_blocks {
                 peer.write_message(NetworkMessage::Block(block))
                     .await
                     .unwrap();
             }
         });
         let mut session = connect_outbound(
-            remote,
+            primary_remote,
             Network::Regtest.magic(),
             644,
             "/rbtcd:test/".to_owned(),
@@ -8157,11 +8241,27 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut auxiliary_session = Some(
+            connect_outbound(
+                auxiliary_remote,
+                Network::Regtest.magic(),
+                646,
+                "/rbtcd:test/".to_owned(),
+                0,
+            )
+            .await
+            .unwrap(),
+        );
         let runtime = tokio::runtime::Handle::current();
 
         let downloaded = std::thread::scope(|scope| {
             let prefetch = scope.spawn(|| {
-                runtime.block_on(download_execution_prefetch(&mut session, &hashes, &[]))
+                runtime.block_on(download_execution_prefetch(
+                    &mut session,
+                    &mut auxiliary_session,
+                    &hashes,
+                    &[],
+                ))
             });
             std::thread::sleep(Duration::from_millis(20));
             prefetch.join().unwrap().unwrap()
@@ -8174,7 +8274,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             hashes
         );
-        server.await.unwrap();
+        assert!(auxiliary_session.is_some());
+        primary_server.await.unwrap();
+        auxiliary_server.await.unwrap();
     }
 
     #[test]
