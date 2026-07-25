@@ -372,6 +372,16 @@ The 28 checkpoints served completely from the cross-execution cache had an
 took 40.337 seconds, persisted six newer headers through 959,520, requested no
 blocks, and stopped again at the exact target.
 
+Configured checkpoint count is also constrained by the archive's canonical
+record-byte ceiling after structure validation. If a downloaded batch would
+exceed 1 GiB, the executor stages and commits its longest byte-safe prefix and
+keeps the verified suffix as the exact beginning of the next compact prefetch
+buffer. Background download fills only the remaining capacity after that
+suffix and starts after its last header, preventing both duplicate requests
+and target overrun. The first full-chain boundary at height 764,065 reduced a
+756-block request to a 726-block atomic commit, carried 30 blocks, and
+replenished the complete 756-block lookahead during execution.
+
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work
 chunks and joins stay in height order, so a failure remains the earliest

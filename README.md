@@ -316,6 +316,14 @@ A cold completed-target restart opened chainstate in 40.337 seconds, advanced
 only the authenticated header DAG from 959,514 to 959,520, made no block
 request, and exited again at the exact Taproot height/hash.
 
+Later full-chain blocks first pushed a configured 756-block checkpoint above
+the archive's independent 1 GiB canonical-record ceiling at height 764,065.
+Validation now selects the longest byte-safe prefix after structure checks,
+atomically executes that prefix, and carries every already downloaded and
+hash-verified suffix block into the next compact prefetch buffer. The first
+live split committed 726 blocks and carried 30 without a duplicate request;
+the buffer was replenished to all 756 next-batch blocks during execution.
+
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,
 deployment context, Merkle/coinbase/weight/witness structure, and transaction
