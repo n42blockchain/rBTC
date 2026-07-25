@@ -197,14 +197,20 @@ pub struct RedbChainStore {
 
 const VALIDATION_DELTA_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_deltas");
+const VALIDATION_DELTA_SHARD_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("validation_utxo_delta_shards");
 const VALIDATION_DELTA_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_delta_blooms");
 const VALIDATION_GROUP_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_group_blooms");
 const MAX_VALIDATION_DELTA_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const VALIDATION_DELTA_MAGIC: [u8; 4] = *b"RVD3";
+const VALIDATION_SHARDED_DELTA_MAGIC: [u8; 4] = *b"RVD4";
 const VALIDATION_DELTA_HEADER_BYTES: usize = 16;
 const VALIDATION_DELTA_INDEX_BYTES: usize = 45;
+const VALIDATION_DELTA_SHARD_COUNT: usize = 256;
+const VALIDATION_DELTA_SHARD_BITMAP_BYTES: usize = VALIDATION_DELTA_SHARD_COUNT / 8;
+const VALIDATION_SHARDED_DELTA_HEADER_BYTES: usize = 16 + VALIDATION_DELTA_SHARD_BITMAP_BYTES;
 const VALIDATION_BLOOM_MAGIC: [u8; 4] = *b"RVB1";
 const VALIDATION_BLOOM_HEADER_BYTES: usize = 48;
 const VALIDATION_BLOOM_BITS_PER_UPDATE: usize = 10;
@@ -235,6 +241,7 @@ struct ValidationUpdate {
 }
 
 type ValidationDeltaUpdates = Vec<(OutPointKey, ValidationUpdate)>;
+type EncodedValidationDeltaShards = Vec<(u8, Vec<u8>)>;
 
 impl ValidationBloom {
     fn with_update_count(update_count: usize) -> Result<Self, UtxoError> {
@@ -431,6 +438,184 @@ fn encode_validation_delta<'a>(
         return Err(UtxoError::Malformed("validation delta record too large"));
     }
     Ok(encoded)
+}
+
+#[derive(Clone, Copy)]
+struct ShardedValidationDeltaHeader {
+    utxo_count: u64,
+    update_count: usize,
+    populated_shards: [u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES],
+}
+
+fn validation_delta_shard(outpoint: OutPointKey) -> u8 {
+    outpoint.as_bytes()[0]
+}
+
+fn validation_delta_shard_key(height: u32, shard: u8) -> [u8; 5] {
+    let mut key = [0_u8; 5];
+    key[..4].copy_from_slice(&height.to_be_bytes());
+    key[4] = shard;
+    key
+}
+
+fn encode_sharded_validation_delta(
+    updates: &ValidationDeltaUpdates,
+    utxo_count: u64,
+) -> Result<(Vec<u8>, EncodedValidationDeltaShards), UtxoError> {
+    let update_count = u32::try_from(updates.len())
+        .map_err(|_| UtxoError::Malformed("validation delta update count"))?;
+    let mut populated_shards = [0_u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES];
+    let mut shards = Vec::new();
+    let mut start = 0;
+    while start < updates.len() {
+        let shard = validation_delta_shard(updates[start].0);
+        let mut end = start + 1;
+        while end < updates.len() && validation_delta_shard(updates[end].0) == shard {
+            end += 1;
+        }
+        populated_shards[usize::from(shard) / 8] |= 1 << (shard % 8);
+        let encoded = encode_validation_delta(
+            updates[start..end]
+                .iter()
+                .map(|(outpoint, update)| (outpoint, update)),
+            utxo_count,
+        )?;
+        shards.push((shard, encoded));
+        start = end;
+    }
+    let mut manifest = Vec::with_capacity(VALIDATION_SHARDED_DELTA_HEADER_BYTES);
+    manifest.extend_from_slice(&VALIDATION_SHARDED_DELTA_MAGIC);
+    manifest.extend_from_slice(&utxo_count.to_le_bytes());
+    manifest.extend_from_slice(&update_count.to_le_bytes());
+    manifest.extend_from_slice(&populated_shards);
+    Ok((manifest, shards))
+}
+
+fn decode_sharded_validation_delta_header(
+    encoded: &[u8],
+) -> Result<ShardedValidationDeltaHeader, UtxoError> {
+    if encoded.len() != VALIDATION_SHARDED_DELTA_HEADER_BYTES
+        || encoded[..4] != VALIDATION_SHARDED_DELTA_MAGIC
+    {
+        return Err(UtxoError::Malformed("sharded validation delta manifest"));
+    }
+    let utxo_count = u64::from_le_bytes(
+        encoded[4..12]
+            .try_into()
+            .expect("eight-byte validation UTXO count"),
+    );
+    let update_count = usize::try_from(u32::from_le_bytes(
+        encoded[12..16]
+            .try_into()
+            .expect("four-byte validation delta count"),
+    ))
+    .expect("u32 fits usize");
+    let mut populated_shards = [0_u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES];
+    populated_shards.copy_from_slice(&encoded[16..]);
+    if update_count == 0 && populated_shards.iter().any(|byte| *byte != 0) {
+        return Err(UtxoError::Malformed(
+            "empty sharded validation delta has populated shards",
+        ));
+    }
+    Ok(ShardedValidationDeltaHeader {
+        utxo_count,
+        update_count,
+        populated_shards,
+    })
+}
+
+fn validation_shard_is_populated(header: ShardedValidationDeltaHeader, shard: u8) -> bool {
+    header.populated_shards[usize::from(shard) / 8] & (1 << (shard % 8)) != 0
+}
+
+enum ValidationDeltaRecordHeader {
+    Legacy {
+        utxo_count: u64,
+        update_count: usize,
+    },
+    Sharded(ShardedValidationDeltaHeader),
+}
+
+fn validation_delta_record_header(
+    encoded: &[u8],
+) -> Result<ValidationDeltaRecordHeader, UtxoError> {
+    if encoded.starts_with(&VALIDATION_DELTA_MAGIC) {
+        let (utxo_count, update_count, _) = validation_delta_header(encoded)?;
+        Ok(ValidationDeltaRecordHeader::Legacy {
+            utxo_count,
+            update_count,
+        })
+    } else if encoded.starts_with(&VALIDATION_SHARDED_DELTA_MAGIC) {
+        decode_sharded_validation_delta_header(encoded).map(ValidationDeltaRecordHeader::Sharded)
+    } else {
+        Err(UtxoError::Malformed("validation delta format"))
+    }
+}
+
+fn decode_validation_delta_record<F>(
+    encoded: &[u8],
+    mut load_shard: F,
+) -> Result<(u64, ValidationDeltaUpdates), UtxoError>
+where
+    F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
+{
+    match validation_delta_record_header(encoded)? {
+        ValidationDeltaRecordHeader::Legacy { .. } => decode_validation_delta(encoded),
+        ValidationDeltaRecordHeader::Sharded(header) => {
+            let mut updates = Vec::with_capacity(header.update_count);
+            for shard in 0..VALIDATION_DELTA_SHARD_COUNT {
+                let shard = u8::try_from(shard).expect("validation shard fits u8");
+                if !validation_shard_is_populated(header, shard) {
+                    continue;
+                }
+                let encoded_shard = load_shard(shard)?;
+                let (shard_utxo_count, shard_updates) = decode_validation_delta(&encoded_shard)?;
+                if shard_utxo_count != header.utxo_count
+                    || shard_updates.is_empty()
+                    || shard_updates
+                        .iter()
+                        .any(|(outpoint, _)| validation_delta_shard(*outpoint) != shard)
+                {
+                    return Err(UtxoError::Malformed(
+                        "validation delta shard content mismatch",
+                    ));
+                }
+                updates.extend(shard_updates);
+            }
+            if updates.len() != header.update_count {
+                return Err(UtxoError::Malformed(
+                    "validation delta shard count mismatch",
+                ));
+            }
+            Ok((header.utxo_count, updates))
+        }
+    }
+}
+
+fn inspect_validation_delta_record<F>(
+    encoded: &[u8],
+    load_shard: F,
+    aggregate_bloom: Option<&mut ValidationBloom>,
+) -> Result<(u64, usize, ValidationBloom), UtxoError>
+where
+    F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
+{
+    if encoded.starts_with(&VALIDATION_DELTA_MAGIC) {
+        return inspect_validation_delta(encoded, aggregate_bloom);
+    }
+    let (utxo_count, updates) = decode_validation_delta_record(encoded, load_shard)?;
+    let mut bloom = ValidationBloom::with_update_count(updates.len())?;
+    if let Some(aggregate_bloom) = aggregate_bloom {
+        for outpoint in updates.iter().map(|(outpoint, _)| *outpoint) {
+            bloom.insert(outpoint);
+            aggregate_bloom.insert(outpoint);
+        }
+    } else {
+        for outpoint in updates.iter().map(|(outpoint, _)| *outpoint) {
+            bloom.insert(outpoint);
+        }
+    }
+    Ok((utxo_count, updates.len(), bloom))
 }
 
 fn fold_validation_updates(
@@ -705,15 +890,19 @@ impl RedbChainStore {
             let transaction = db.begin_write()?;
             {
                 let _deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+                let _delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
                 let _row_blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
                 let _group_blooms = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
             }
             transaction.commit()?;
             let transaction = db.begin_read()?;
             let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
             let row_blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
             let group_blooms = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
-            if !options.validation_delta_journal && !deltas.is_empty()? {
+            if !options.validation_delta_journal
+                && (!deltas.is_empty()? || !delta_shards.is_empty()?)
+            {
                 return Err(ChainStoreError::ValidationDeltaModeRequired);
             }
             if options.validation_delta_journal {
@@ -771,7 +960,16 @@ impl RedbChainStore {
                         .groups
                         .last_mut()
                         .expect("validation row has a bloom group");
-                    let (utxo_count, update_count, _) = validation_delta_header(encoded.value())?;
+                    let record_header = validation_delta_record_header(encoded.value())?;
+                    let (utxo_count, update_count) = match record_header {
+                        ValidationDeltaRecordHeader::Legacy {
+                            utxo_count,
+                            update_count,
+                        } => (utxo_count, update_count),
+                        ValidationDeltaRecordHeader::Sharded(header) => {
+                            (header.utxo_count, header.update_count)
+                        }
+                    };
                     let expected_bloom_bytes = validation_bloom_byte_count(update_count)?;
                     let bloom = if let Some(encoded_bloom) = row_blooms.get(height)? {
                         let (bloom_utxo_count, bloom) =
@@ -783,8 +981,19 @@ impl RedbChainStore {
                             .into());
                         }
                         if !group_is_persisted {
-                            let (_, _, inspected) =
-                                inspect_validation_delta(encoded.value(), Some(aggregate))?;
+                            let (_, _, inspected) = inspect_validation_delta_record(
+                                encoded.value(),
+                                |shard| {
+                                    let key = validation_delta_shard_key(height, shard);
+                                    delta_shards
+                                        .get(key.as_slice())?
+                                        .map(|encoded| encoded.value().to_vec())
+                                        .ok_or(UtxoError::Malformed(
+                                            "missing validation delta shard",
+                                        ))
+                                },
+                                Some(aggregate),
+                            )?;
                             if inspected.bits != bloom.bits {
                                 return Err(UtxoError::Malformed(
                                     "validation delta bloom content mismatch",
@@ -794,8 +1003,15 @@ impl RedbChainStore {
                         }
                         bloom
                     } else {
-                        let (_, _, bloom) = inspect_validation_delta(
+                        let (_, _, bloom) = inspect_validation_delta_record(
                             encoded.value(),
+                            |shard| {
+                                let key = validation_delta_shard_key(height, shard);
+                                delta_shards
+                                    .get(key.as_slice())?
+                                    .map(|encoded| encoded.value().to_vec())
+                                    .ok_or(UtxoError::Malformed("missing validation delta shard"))
+                            },
                             (!group_is_persisted).then_some(aggregate),
                         )?;
                         migrated_rows.push((height, encode_validation_bloom(&bloom, utxo_count)));
@@ -839,6 +1055,7 @@ impl RedbChainStore {
                 }
                 drop(group_blooms);
                 drop(row_blooms);
+                drop(delta_shards);
                 drop(deltas);
                 drop(transaction);
                 if !migrated_rows.is_empty() || !migrated_groups.is_empty() {
@@ -908,12 +1125,20 @@ impl RedbChainStore {
         let updates = {
             let transaction = self.db.begin_read()?;
             let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
             let mut updates: AHashMap<OutPointKey, ValidationUpdate> = AHashMap::new();
             for row in &journal.rows {
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                for (outpoint, update) in decode_validation_delta(encoded.value())?.1 {
+                let decoded = decode_validation_delta_record(encoded.value(), |shard| {
+                    let key = validation_delta_shard_key(row.height, shard);
+                    delta_shards
+                        .get(key.as_slice())?
+                        .map(|encoded| encoded.value().to_vec())
+                        .ok_or(UtxoError::Malformed("missing validation delta shard"))
+                })?;
+                for (outpoint, update) in decoded.1 {
                     if let Some(current) = updates.get_mut(&outpoint) {
                         current.utxo = update.utxo;
                     } else {
@@ -941,6 +1166,8 @@ impl RedbChainStore {
         {
             let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
             deltas.retain(|_, _| false)?;
+            let mut delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+            delta_shards.retain(|_, _| false)?;
             let mut blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
             blooms.retain(|_, _| false)?;
             let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
@@ -1213,10 +1440,7 @@ impl RedbChainStore {
             .checked_sub(spent_count)
             .and_then(|count| count.checked_add(created_count))
             .ok_or(UtxoError::Malformed("validation UTXO count overflow"))?;
-        let encoded = encode_validation_delta(
-            updates.iter().map(|(outpoint, update)| (outpoint, update)),
-            next_utxo_count,
-        )?;
+        let (encoded, encoded_shards) = encode_sharded_validation_delta(&updates, next_utxo_count)?;
         let mut bloom = ValidationBloom::with_update_count(updates.len())?;
         let starts_group = journal.rows.len() % VALIDATION_ROWS_PER_BLOOM_GROUP == 0;
         let mut updated_group = if starts_group {
@@ -1244,6 +1468,11 @@ impl RedbChainStore {
                 return Err(UtxoError::Malformed("duplicate validation delta checkpoint").into());
             }
             deltas.insert(final_height, encoded.as_slice())?;
+            let mut delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+            for (shard, encoded_shard) in &encoded_shards {
+                let key = validation_delta_shard_key(final_height, *shard);
+                delta_shards.insert(key.as_slice(), encoded_shard.as_slice())?;
+            }
             let mut blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
             blooms.insert(final_height, encoded_bloom.as_slice())?;
             let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
@@ -1363,6 +1592,7 @@ impl UtxoStore for RedbChainStore {
                 .expect("validation journal lock not poisoned");
             let transaction = self.db.begin_read()?;
             let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
             for (group_index, group) in journal.groups.iter().enumerate().rev() {
                 if !group.might_contain(outpoint) {
                     continue;
@@ -1376,7 +1606,24 @@ impl UtxoStore for RedbChainStore {
                     let encoded = deltas
                         .get(row.height)?
                         .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                    if let Some(update) = validation_delta_lookup(encoded.value(), outpoint)? {
+                    let update = match validation_delta_record_header(encoded.value())? {
+                        ValidationDeltaRecordHeader::Legacy { .. } => {
+                            validation_delta_lookup(encoded.value(), outpoint)?
+                        }
+                        ValidationDeltaRecordHeader::Sharded(header) => {
+                            let shard = validation_delta_shard(outpoint);
+                            if validation_shard_is_populated(header, shard) {
+                                let key = validation_delta_shard_key(row.height, shard);
+                                let encoded_shard = delta_shards.get(key.as_slice())?.ok_or(
+                                    UtxoError::Malformed("missing validation delta shard"),
+                                )?;
+                                validation_delta_lookup(encoded_shard.value(), outpoint)?
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(update) = update {
                         return Ok(update.utxo);
                     }
                 }
@@ -1385,6 +1632,7 @@ impl UtxoStore for RedbChainStore {
         self.utxos.get(outpoint)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn get_many(
         &self,
         outpoints: &[OutPointKey],
@@ -1397,6 +1645,7 @@ impl UtxoStore for RedbChainStore {
             .expect("validation journal lock not poisoned");
         let transaction = self.db.begin_read()?;
         let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+        let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
         let mut results = vec![None; outpoints.len()];
         let mut unresolved = (0..outpoints.len()).collect::<Vec<_>>();
         for (group_index, group) in journal.groups.iter().enumerate().rev() {
@@ -1423,13 +1672,49 @@ impl UtxoStore for RedbChainStore {
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                for index in row_candidates {
-                    if results[index].is_some() {
-                        continue;
+                match validation_delta_record_header(encoded.value())? {
+                    ValidationDeltaRecordHeader::Legacy { .. } => {
+                        for index in row_candidates {
+                            if results[index].is_some() {
+                                continue;
+                            }
+                            let outpoint = outpoints[index];
+                            if let Some(update) =
+                                validation_delta_lookup(encoded.value(), outpoint)?
+                            {
+                                results[index] = Some((outpoint, update.utxo));
+                            }
+                        }
                     }
-                    let outpoint = outpoints[index];
-                    if let Some(update) = validation_delta_lookup(encoded.value(), outpoint)? {
-                        results[index] = Some((outpoint, update.utxo));
+                    ValidationDeltaRecordHeader::Sharded(header) => {
+                        let mut shard_candidates = vec![Vec::new(); VALIDATION_DELTA_SHARD_COUNT];
+                        for index in row_candidates {
+                            if results[index].is_some() {
+                                continue;
+                            }
+                            let shard = validation_delta_shard(outpoints[index]);
+                            if validation_shard_is_populated(header, shard) {
+                                shard_candidates[usize::from(shard)].push(index);
+                            }
+                        }
+                        for (shard, candidates) in shard_candidates.into_iter().enumerate() {
+                            if candidates.is_empty() {
+                                continue;
+                            }
+                            let shard = u8::try_from(shard).expect("validation shard fits u8");
+                            let key = validation_delta_shard_key(row.height, shard);
+                            let encoded_shard = delta_shards
+                                .get(key.as_slice())?
+                                .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
+                            for index in candidates {
+                                let outpoint = outpoints[index];
+                                if let Some(update) =
+                                    validation_delta_lookup(encoded_shard.value(), outpoint)?
+                                {
+                                    results[index] = Some((outpoint, update.utxo));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1438,6 +1723,7 @@ impl UtxoStore for RedbChainStore {
             unresolved = next_unresolved;
         }
         drop(deltas);
+        drop(delta_shards);
         drop(transaction);
         drop(journal);
         let unresolved_outpoints = unresolved
@@ -1506,11 +1792,19 @@ impl UtxoStore for RedbChainStore {
                 .expect("validation journal lock not poisoned");
             let transaction = self.db.begin_read()?;
             let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
             for row in &journal.rows {
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                for (outpoint, update) in decode_validation_delta(encoded.value())?.1 {
+                let decoded = decode_validation_delta_record(encoded.value(), |shard| {
+                    let key = validation_delta_shard_key(row.height, shard);
+                    delta_shards
+                        .get(key.as_slice())?
+                        .map(|encoded| encoded.value().to_vec())
+                        .ok_or(UtxoError::Malformed("missing validation delta shard"))
+                })?;
+                for (outpoint, update) in decoded.1 {
                     match update.utxo {
                         Some(utxo) => {
                             entries.insert(outpoint, utxo);
@@ -2293,7 +2587,8 @@ mod tests {
         let encoded = encode_validation_delta(updates.iter(), 77).unwrap();
         let (utxo_count, decoded) = decode_validation_delta(&encoded).unwrap();
         assert_eq!(utxo_count, 77);
-        assert_eq!(decoded, updates.into_iter().collect::<Vec<_>>());
+        let expected = updates.clone().into_iter().collect::<Vec<_>>();
+        assert_eq!(decoded, expected);
 
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -2345,6 +2640,57 @@ mod tests {
         assert!(matches!(
             decode_validation_bloom(&damaged_bloom, bloom.bits.len()),
             Err(UtxoError::Malformed("validation bloom checksum"))
+        ));
+    }
+
+    #[test]
+    fn sharded_validation_delta_is_sorted_and_requires_every_manifest_shard() {
+        let updates = BTreeMap::from([
+            (
+                key(1),
+                ValidationUpdate {
+                    spent_in_batch: true,
+                    utxo: None,
+                },
+            ),
+            (
+                key(2),
+                ValidationUpdate {
+                    spent_in_batch: false,
+                    utxo: Some(coin(20)),
+                },
+            ),
+            (
+                key(3),
+                ValidationUpdate {
+                    spent_in_batch: true,
+                    utxo: Some(coin(30)),
+                },
+            ),
+        ])
+        .into_iter()
+        .collect::<Vec<_>>();
+        let (manifest, shards) = encode_sharded_validation_delta(&updates, 77).unwrap();
+        assert_eq!(&manifest[..4], &VALIDATION_SHARDED_DELTA_MAGIC);
+        assert_eq!(
+            shards.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let (utxo_count, decoded) = decode_validation_delta_record(&manifest, |requested| {
+            shards
+                .iter()
+                .find(|(shard, _)| *shard == requested)
+                .map(|(_, encoded)| encoded.clone())
+                .ok_or(UtxoError::Malformed("missing validation delta shard"))
+        })
+        .unwrap();
+        assert_eq!(utxo_count, 77);
+        assert_eq!(decoded, updates);
+        assert!(matches!(
+            decode_validation_delta_record(&manifest, |_| {
+                Err(UtxoError::Malformed("missing validation delta shard"))
+            }),
+            Err(UtxoError::Malformed("missing validation delta shard"))
         ));
     }
 
