@@ -201,11 +201,14 @@ rejected that fan-out because its write amplification outweighed the smaller
 reads. Checksummed `RVB1` per-record Bloom filters and 16-record aggregate
 filters reject old runs before value access. The current aggregate—including
 an unfinished group—is rewritten in the same transaction as every complete
-delta and execution tip. Within one row, required immutable shards are read
-concurrently through bounded independent snapshots, while rows still resolve
-strictly newest-first. Up to 32 hottest RVD3 rows observed by each batch are
-rewritten one transaction at a time to sorted RVD5 shards alongside the next
-batch's read-only UTXO prefetch, archive staging, and network lookahead.
+delta and execution tip. All required row/shard pairs in one fully sharded
+16-row group share a bounded dynamically balanced worker queue; each worker
+reuses one read transaction and decodes in place. Matches merge newest-first,
+so bounded same-group speculation preserves newest-wins semantics. A group
+containing any legacy row retains strict row-at-a-time fallback. Up to 32
+hottest RVD3 rows observed by each batch are rewritten one transaction at a
+time to sorted RVD5 shards alongside the next batch's read-only UTXO
+prefetch, archive staging, and network lookahead.
 Existing RVD3 directories still open without an eager migration; missing
 filters undergo the prior strict reconstruction.
 Ordinary reorganizing stores reject this format. Explicit materialization
@@ -328,6 +331,16 @@ atomically executes that prefix, and carries every already downloaded and
 hash-verified suffix block into the next compact prefetch buffer. The first
 live split committed 726 blocks and carried 30 without a duplicate request;
 the buffer was replenished to all 756 next-batch blocks during execution.
+The same production directory subsequently validated every mainnet block from
+genesis through the authenticated height 959,520/hash
+`000000000000000000003a8648dadb49e67db65326f85b50651661dd7c237299`,
+then extended to the live height 959,592/hash
+`000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`.
+The 71-block live-tip extension spent 19.200 seconds in the new group-wide
+UTXO read queue. Its final cold restart opened chainstate in 14.152 seconds,
+requested no block, observed no newer header, and exited at that exact tip.
+Physical freezer usage was 418 MiB with 661 GiB still free; validation
+chainstate was 243 GiB.
 
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,

@@ -205,17 +205,21 @@ normally skip 16 records with three probes. The row filter and current group
 aggregate are checksummed and committed atomically with every delta manifest,
 including while the newest group is incomplete. Bulk prefetch resolves all
 journal hits newest-first and issues one ordered parallel redb base lookup only
-for unresolved outpoints. Required shards within one immutable row are read
-through up to the host's available parallel redb snapshots and decoded in
-their workers; rows still resolve newest-first, so the implementation never
-speculatively reads an older row that a newer row may satisfy. The batch
+for unresolved outpoints. When every candidate-bearing row in one 16-row group
+is sharded, all required row/shard pairs enter one dynamically balanced queue
+served by at most the host's available workers. Each worker reuses one redb
+snapshot and decodes matches while its shard guard is alive. Results are
+sorted by descending row before publication, preserving newest-wins semantics
+while bounding speculative reads to the current aggregate-Bloom group. A group
+containing a legacy row retains strict row-at-a-time fallback. The batch
 records which legacy rows caused the most candidate reads. The next checkpoint
 rewrites up to 32 of them to RVD5, each in one atomic transaction, while its
 archive stage, UTXO read snapshot, and complete network lookahead run
 independently. The migration window naturally shrinks when fewer rows qualify.
 Live validation migrated 756 hotspot rows without extending the critical path;
-after row-internal parallel reads, adjacent UTXO prefetch fell from 66–73
-seconds to 34–41 seconds.
+row-internal parallel reads reduced adjacent UTXO prefetch from 66–73 seconds
+to 34–41 seconds, and the final group-wide queue read the 71-block live-tip
+extension in 19.200 seconds.
 
 An older RVD3 database without persisted filters undergoes one strict scan of
 record size, ordering, state bits, contiguous offsets, and canonical UTXO
@@ -405,6 +409,17 @@ suffix and starts after its last header, preventing both duplicate requests
 and target overrun. The first full-chain boundary at height 764,065 reduced a
 756-block request to a 726-block atomic commit, carried 30 blocks, and
 replenished the complete 756-block lookahead during execution.
+
+The same production directory completed genesis-to-tip validation at the
+authenticated height 959,520/hash
+`000000000000000000003a8648dadb49e67db65326f85b50651661dd7c237299`,
+then followed the active header chain through height 959,592/hash
+`000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`.
+A completed-target cold restart opened chainstate in 14.608 seconds and made
+no block request. After the two authenticated target extensions, the final
+cold restart opened in 14.152 seconds, observed no newer header, requested no
+block, and exited zero at the exact execution/header tip. The retained freezer
+occupied 418 MiB and chainstate 243 GiB, leaving 661 GiB free.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work

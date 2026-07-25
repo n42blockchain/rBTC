@@ -24,6 +24,7 @@
 - [x] Archive-byte-aware validation checkpoints. At full-chain height 764,065 a configured 756-block batch first exceeded the independent 1 GiB canonical-record ceiling. The production path now commits the longest byte-safe prefix and carries the verified suffix into the next compact lookahead; the first split atomically committed 726 blocks, retained 30 without re-requesting them, and refilled the complete 756-block prefetch during execution.
 - [x] Bounded physical freezer reclamation. The durable live index is now authoritative for deletion: index publication precedes unlink, directory sync follows it, and startup adopts a provably contiguous interrupted rename before cleaning other unindexed slots. On the continuing mainnet soak this reduced 1,010 files / 346 GiB, of which only one 945 MB segment was live, to the indexed segment plus a transient staged file and immediately returned about 331 GiB to the filesystem. The next 549-block checkpoint committed normally and rotated to the next slot while physical usage remained bounded.
 - [x] Sorted sharded validation-journal reads and online migration. RVD5 groups each checkpoint's already sorted update stream into at most 16 high-prefix shards, batches their monotonic keys in the same atomic tip transaction, retains RVD3/RVD4 read compatibility, and fails closed on a missing manifest shard. A 256-shard live experiment was rejected after write amplification widened checkpoints to 139–172 seconds. Each batch records its hottest legacy rows and atomically migrates up to 32 of them, one transaction per row, during the next archive-stage/UTXO/network prefetch window; live validation migrated 756 hotspot rows while the migration window remained below the longer read branch and naturally fell to zero candidates. Required shards within one immutable row now use bounded parallel redb snapshots and decode inside their workers while rows remain newest-first; adjacent live UTXO prefetch fell from 66–73 seconds to 34–41 seconds, lifting steady throughput from roughly 6.0–6.4 to 8.3–8.7 blocks/second. The read-only UTXO snapshot itself overlaps archive staging and is batch-key checked before mutation; its first 41.156-second sample hid all 7.972 seconds of staging.
+- [x] Full mainnet genesis-to-tip validation and restart acceptance. One production directory executed every block from genesis through the authenticated fixed target height 959,520/hash `000000000000000000003a8648dadb49e67db65326f85b50651661dd7c237299`, naturally exited, then reopened in 14.608 seconds without a block request. It authenticated and executed an extension to height 959,591 and followed the network's next block to height 959,592/hash `000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`. The final cold restart opened in 14.152 seconds, found header and execution tips identical with no newer header, made no block request, and exited zero. Group-wide dynamic RVD5 reads preserved newest-wins across concurrent row/shard jobs; the 71-block live-tip extension spent 19.200 seconds in UTXO prefetch. Physical freezer reclamation left 418 MiB across four files rather than the prior 346 GiB retired-slot footprint; chainstate was 243 GiB and the filesystem retained 661 GiB free. This gate supersedes the earlier historical “full-chain remains” notes.
 Post-SegWit batch tuning first selected 504 blocks: four adjacent
 samples took 60.608–82.237 seconds versus 44.850–69.021 seconds for 252,
 equivalent to 30.3–41.1 seconds per 252 blocks. At heights
@@ -167,14 +168,16 @@ Wire messages and block/transaction serialization must use Bitcoin's consensus e
 
 ## Current critical path
 
-The durable regtest and default/custom-Signet headers-first/block IBD milestone is
-implemented, including atomic multi-block checkpoints, active-branch rewinds,
-real default-Signet block execution, and custom challenge isolation. A bounded
-mainnet production-path gate now reaches Core 26 checkpoint height 295,000 with
-restart recovery, both BIP30 exceptions, the BIP16/P2SH activation era, the
-first subsidy halving, and the BIP34 activation block. The next acceptance
-milestone is eventual full-chain mainnet/testnet soak plus the remaining policy/consensus
-separation before widening the execution safety gate. Peer diversity/DoS
-hardening follows before a public long-running node.
+The durable regtest and default/custom-Signet headers-first/block IBD milestone
+is implemented, including atomic multi-block checkpoints, active-branch
+rewinds, real default-Signet block execution, and custom challenge isolation.
+The bounded mainnet production path has now completed genesis-to-tip execution
+through active height 959,592, including exact authenticated target stops,
+in-place extensions, bounded physical freezer cleanup, and final cold-restart
+recovery without a block request. The next acceptance milestone is sustained
+legacy-testnet operation, completing the remaining policy/standardness and P2P
+service work, and automating the full-chain resource gate in CI before
+widening the execution safety gate. Peer diversity/DoS hardening follows
+before a public long-running node.
 Compression, archive transport, explorer, and wallet work must not be presented
 as a substitute for this validating-node path.
