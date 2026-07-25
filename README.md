@@ -305,6 +305,17 @@ additional serialized payload to 4 GiB at Bitcoin's consensus maximum.
 Because the worker continuously drains every response window, it does not
 recreate the unread 128-block response pressure seen in the earlier soak.
 
+The resulting production soak stopped exactly at Taproot activation height
+709,632/hash
+`0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244`.
+Across 28 checkpoints whose complete input came from the execution-overlapped
+cache, foreground download had already fallen below three seconds and total
+time had an 87.312-second median, versus 182.653 seconds for an adjacent
+pre-overlap checkpoint. The final 252-block tail completed in 50.817 seconds.
+A cold completed-target restart opened chainstate in 40.337 seconds, advanced
+only the authenticated header DAG from 959,514 to 959,520, made no block
+request, and exited again at the exact Taproot height/hash.
+
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,
 deployment context, Merkle/coinbase/weight/witness structure, and transaction

@@ -363,6 +363,15 @@ transition without leaving unread responses to time out; the additional
 worst-case serialized payload allocation is bounded at 4 GiB by the 1,008-block
 validation ceiling.
 
+This pipeline completed the authenticated mainnet Taproot target at height
+709,632/hash
+`0000000000000000000687bca986194dc2c1f949318629b44bb54ec0a94d8244`.
+The 28 checkpoints served completely from the cross-execution cache had an
+87.312-second total median; an adjacent checkpoint before active overlap took
+182.653 seconds. The exact 252-block tail took 50.817 seconds. A cold reopen
+took 40.337 seconds, persisted six newer headers through 959,520, requested no
+blocks, and stopped again at the exact target.
+
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work
 chunks and joins stay in height order, so a failure remains the earliest
