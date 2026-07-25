@@ -39,6 +39,10 @@ partition over bounded CPU workers, and SIGINT/SIGTERM close stores cleanly;
 the first five complete optimized checkpoints reduced the 756-block total
 median from 135.252 to 124.198 seconds, execution/persistence median from
 59.870 to 50.367 seconds, and staging median from 7.098 to 4.453 seconds;
+packetizing script validation into 16-transaction work items then removed
+per-transaction queue/result contention and reduced five adjacent
+756-block execution/persistence samples from the preceding 51.401-second
+median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
 Taproot exact-stop and completed-target restart remain the active soak gate.
 Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
 with ordered joins and earliest-height failure semantics. Adjacent 1,008-block

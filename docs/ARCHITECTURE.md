@@ -131,9 +131,12 @@ Within each block, prevout resolution, maturity/lock-time checks, value
 accounting, and UTXO mutation remain sequential so an input can consume an
 output created earlier in that block. The resolved prevouts are then immutable
 script-validation jobs distributed across a persistent, bounded host-CPU
-worker pool. Serialized jobs are scheduled dynamically by transaction instead
-of creating and joining a fresh set of threads for every block; small
-single-block input sets stay serial. After IBD constructs one block's
+worker pool. Large checkpoints append each block's serialized checks to the
+shared queue in 16-transaction work packets under one lock instead of locking
+and returning a channel message for every transaction. Workers still pull
+packets dynamically, return their earliest failure, and the final ordered
+reduction selects the earliest block/transaction globally. Small single-block
+input sets stay serial. After IBD constructs one block's
 sequential transition, it immediately submits that block's immutable jobs
 while the calling thread builds later blocks against the cumulative UTXO
 overlay. One checkpoint-wide barrier remains before commit. This removes up
@@ -352,6 +355,11 @@ median versus 135.252 seconds for the preceding four 756-block checkpoints.
 Execution/persistence median improved from 59.870 to 50.367 seconds (15.9%),
 and staging median improved from 7.098 to 4.453 seconds (37.3%), with identical
 atomic checkpoint semantics.
+The subsequent packetized script scheduler measured 46.015, 46.165, 49.246,
+51.255, and 45.921 seconds for execution/persistence across adjacent
+756-block checkpoints at heights 598,249–602,028. Its 46.165-second median
+was 10.2% below the immediately preceding five-checkpoint 51.401-second
+median, while retaining the same consensus engine, error order, and barrier.
 
 SIGINT and SIGTERM are awaited alongside the daemon future. Cancellation drops
 network tasks and closes the durable stores cleanly; synchronous atomic
