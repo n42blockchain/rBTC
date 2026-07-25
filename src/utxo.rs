@@ -422,6 +422,29 @@ impl RedbUtxoStore {
             .collect()
     }
 
+    fn get_many_sorted_serial(
+        &self,
+        outpoints: &[(OutPointKey, usize)],
+    ) -> Result<Vec<(usize, OutPointKey, Option<Utxo>)>, UtxoError> {
+        let transaction = self.db.begin_read()?;
+        let hot = transaction.open_table(HOT_TABLE)?;
+        let cold = transaction.open_table(COLD_TABLE)?;
+        outpoints
+            .iter()
+            .map(|(outpoint, original_index)| {
+                let key = outpoint.as_bytes();
+                let utxo = match hot.get(key.as_slice())? {
+                    Some(value) => Some(Utxo::decode(value.value())?),
+                    None => cold
+                        .get(key.as_slice())?
+                        .map(|value| Utxo::decode(value.value()))
+                        .transpose()?,
+                };
+                Ok((*original_index, *outpoint, utxo))
+            })
+            .collect()
+    }
+
     /// Computes count, encoded length, and logical UTXO-set identity without
     /// materializing all UTXOs. The digest excludes local `last_touched` time.
     pub(crate) fn snapshot_content_identity(&self) -> Result<(u64, u64, [u8; 32]), UtxoError> {
@@ -576,17 +599,32 @@ impl UtxoStore for RedbUtxoStore {
             return self.get_many_serial(outpoints);
         }
 
-        let chunk_size = outpoints.len().div_ceil(workers);
+        // Execution presents inputs in transaction order, which is effectively
+        // random with respect to the durable B-trees. Sort once so each worker
+        // walks a contiguous key range and can reuse nearby redb pages, then
+        // restore the exact caller order before returning.
+        let mut sorted = outpoints
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, outpoint)| (outpoint, index))
+            .collect::<Vec<_>>();
+        sorted.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+        let chunk_size = sorted.len().div_ceil(workers);
         thread::scope(|scope| {
-            let jobs = outpoints
+            let jobs = sorted
                 .chunks(chunk_size)
-                .map(|chunk| scope.spawn(|| self.get_many_serial(chunk)))
+                .map(|chunk| scope.spawn(|| self.get_many_sorted_serial(chunk)))
                 .collect::<Vec<_>>();
             let mut prefetched = Vec::with_capacity(outpoints.len());
             for job in jobs {
                 prefetched.extend(job.join().expect("UTXO prefetch worker must not panic")?);
             }
-            Ok(prefetched)
+            prefetched.sort_unstable_by_key(|(original_index, _, _)| *original_index);
+            Ok(prefetched
+                .into_iter()
+                .map(|(_, outpoint, utxo)| (outpoint, utxo))
+                .collect())
         })
     }
 
@@ -1115,7 +1153,7 @@ mod tests {
     #[test]
     fn parallel_get_many_preserves_caller_order_and_missing_rows() {
         let (_dir, store) = store();
-        let outpoints = (0..8_193).map(indexed_key).collect::<Vec<_>>();
+        let mut outpoints = (0..8_193).map(indexed_key).collect::<Vec<_>>();
         store
             .apply(
                 &[],
@@ -1126,6 +1164,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        outpoints.push(outpoints[0]);
 
         let rows = store.get_many(&outpoints).unwrap();
         assert_eq!(
@@ -1137,6 +1176,7 @@ mod tests {
         assert_eq!(rows[0].1, Some(coin(10)));
         assert_eq!(rows[4_096].1, Some(coin(20)));
         assert_eq!(rows[8_192].1, Some(coin(30)));
+        assert_eq!(rows[8_193], rows[0]);
         assert!(rows[1].1.is_none());
     }
 }
