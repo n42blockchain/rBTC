@@ -203,6 +203,11 @@ const VALIDATION_DELTA_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_delta_blooms");
 const VALIDATION_GROUP_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_group_blooms");
+const SPENT_AGE_TABLE: TableDefinition<u32, u64> = TableDefinition::new("spent_output_age_blocks");
+const SPENT_AGE_META_TABLE: TableDefinition<u8, u32> =
+    TableDefinition::new("spent_output_age_meta");
+const SPENT_AGE_START_HEIGHT: u8 = 0;
+const SPENT_AGE_END_HEIGHT: u8 = 1;
 const MAX_VALIDATION_DELTA_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const VALIDATION_DELTA_MAGIC: [u8; 4] = *b"RVD3";
 const VALIDATION_SHARDED_DELTA_MAGIC: [u8; 4] = *b"RVD4";
@@ -413,6 +418,31 @@ pub(crate) struct ConnectTransition {
     pub(crate) spent: Vec<OutPointKey>,
     pub(crate) created: Vec<(OutPointKey, Utxo)>,
     pub(crate) transaction_undos: Vec<UtxoUndo>,
+}
+
+/// Reorg-consistent spent-output coin-age observations for one chainstate.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SpentAgeHistogram {
+    /// First connected block represented by this sample.
+    pub start_height: Option<u32>,
+    /// Last connected block represented by this sample.
+    pub end_height: Option<u32>,
+    /// Total observed spent outputs.
+    pub samples: u64,
+    /// Exact `(age_in_blocks, spend_count)` rows in ascending age order.
+    pub rows: Vec<(u32, u64)>,
+}
+
+impl SpentAgeHistogram {
+    /// Returns the number of observed spends whose coin age is at most `blocks`.
+    #[must_use]
+    pub fn hits_within(&self, blocks: u32) -> u64 {
+        self.rows
+            .iter()
+            .take_while(|(age, _)| *age <= blocks)
+            .map(|(_, count)| *count)
+            .sum()
+    }
 }
 
 /// Result of atomically replacing one legacy giant validation row with shards.
@@ -873,6 +903,117 @@ fn decode_validation_delta(encoded: &[u8]) -> Result<(u64, ValidationDeltaUpdate
         ));
     }
     Ok((utxo_count, updates))
+}
+
+fn spent_age_counts<'a>(
+    blocks: impl IntoIterator<Item = (u32, &'a [UtxoUndo])>,
+) -> Result<BTreeMap<u32, u64>, UtxoError> {
+    let mut counts = BTreeMap::new();
+    for (spend_height, transaction_undos) in blocks {
+        for (_, spent) in transaction_undos
+            .iter()
+            .flat_map(|undo| undo.spent().iter())
+        {
+            let age = spend_height
+                .checked_sub(spent.height)
+                .ok_or(UtxoError::Malformed("spent coin height exceeds block"))?;
+            let count = counts.entry(age).or_insert(0_u64);
+            *count = count
+                .checked_add(1)
+                .ok_or(UtxoError::Malformed("spent-age sample overflow"))?;
+        }
+    }
+    Ok(counts)
+}
+
+fn connect_spent_ages_transaction(
+    transaction: &redb::WriteTransaction,
+    counts: &BTreeMap<u32, u64>,
+    start_height: u32,
+    end_height: u32,
+) -> Result<(), UtxoError> {
+    let mut metadata = transaction.open_table(SPENT_AGE_META_TABLE)?;
+    let existing_start = metadata
+        .get(SPENT_AGE_START_HEIGHT)?
+        .map(|value| value.value());
+    let existing_end = metadata
+        .get(SPENT_AGE_END_HEIGHT)?
+        .map(|value| value.value());
+    match (existing_start, existing_end) {
+        (None, None) => {
+            metadata.insert(SPENT_AGE_START_HEIGHT, start_height)?;
+        }
+        (Some(_), Some(previous_end)) if previous_end.checked_add(1) == Some(start_height) => {}
+        _ => {
+            return Err(UtxoError::Malformed(
+                "spent-age histogram coverage is not contiguous",
+            ));
+        }
+    }
+    metadata.insert(SPENT_AGE_END_HEIGHT, end_height)?;
+    drop(metadata);
+
+    let mut histogram = transaction.open_table(SPENT_AGE_TABLE)?;
+    for (age, increment) in counts {
+        let current = histogram.get(*age)?.map_or(0, |value| value.value());
+        let updated = current
+            .checked_add(*increment)
+            .ok_or(UtxoError::Malformed("spent-age histogram overflow"))?;
+        histogram.insert(*age, updated)?;
+    }
+    Ok(())
+}
+
+fn disconnect_spent_ages_transaction(
+    transaction: &redb::WriteTransaction,
+    counts: &BTreeMap<u32, u64>,
+    current_height: u32,
+    parent_height: u32,
+) -> Result<(), UtxoError> {
+    let metadata = transaction.open_table(SPENT_AGE_META_TABLE)?;
+    let Some(start_height) = metadata
+        .get(SPENT_AGE_START_HEIGHT)?
+        .map(|value| value.value())
+    else {
+        return Ok(());
+    };
+    let end_height = metadata
+        .get(SPENT_AGE_END_HEIGHT)?
+        .map(|value| value.value())
+        .ok_or(UtxoError::Malformed("incomplete spent-age metadata"))?;
+    if end_height != current_height {
+        return Err(UtxoError::Malformed(
+            "spent-age histogram tip does not match disconnect",
+        ));
+    }
+    drop(metadata);
+
+    let mut histogram = transaction.open_table(SPENT_AGE_TABLE)?;
+    for (age, decrement) in counts {
+        let current = histogram
+            .get(*age)?
+            .map(|value| value.value())
+            .ok_or(UtxoError::Malformed("missing spent-age histogram row"))?;
+        let updated = current
+            .checked_sub(*decrement)
+            .ok_or(UtxoError::Malformed("spent-age histogram underflow"))?;
+        if updated == 0 {
+            histogram.remove(*age)?;
+        } else {
+            histogram.insert(*age, updated)?;
+        }
+    }
+    if current_height == start_height {
+        histogram.retain(|_, _| false)?;
+        drop(histogram);
+        let mut metadata = transaction.open_table(SPENT_AGE_META_TABLE)?;
+        metadata.retain(|_, _| false)?;
+    } else {
+        drop(histogram);
+        let mut metadata = transaction.open_table(SPENT_AGE_META_TABLE)?;
+        metadata.insert(SPENT_AGE_END_HEIGHT, parent_height)?;
+    }
+    Ok(())
 }
 
 impl RedbChainStore {
@@ -1557,6 +1698,7 @@ impl RedbChainStore {
             )
             .into());
         }
+        let age_counts = spent_age_counts([(next.height, transaction_undos)])?;
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
@@ -1564,6 +1706,7 @@ impl RedbChainStore {
         if self.options.retain_block_undo {
             insert_undo_transaction(&transaction, next.hash, transaction_undos)?;
         }
+        connect_spent_ages_transaction(&transaction, &age_counts, next.height, next.height)?;
         advance_transaction(&transaction, expected_parent, next)?;
         transaction.commit()?;
         Ok(undo)
@@ -1583,6 +1726,17 @@ impl RedbChainStore {
             .expect("non-empty transitions have a final height")
             .next
             .height;
+        let first_height = transitions
+            .first()
+            .expect("non-empty transitions have a first height")
+            .next
+            .height;
+        let age_counts = spent_age_counts(transitions.iter().map(|transition| {
+            (
+                transition.next.height,
+                transition.transaction_undos.as_slice(),
+            )
+        }))?;
         let _guard = self.lock();
         let mut journal = validation_journal
             .lock()
@@ -1634,6 +1788,7 @@ impl RedbChainStore {
         for transition in transitions {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
+        connect_spent_ages_transaction(&transaction, &age_counts, first_height, final_height)?;
         transaction.commit()?;
         if starts_group {
             journal.groups.push(updated_group);
@@ -1684,6 +1839,22 @@ impl RedbChainStore {
         if let Some(validation_journal) = &self.validation_journal {
             return self.commit_validation_batch(validation_journal, transitions, &spent, created);
         }
+        let first_height = transitions
+            .first()
+            .expect("non-empty transitions have a first height")
+            .next
+            .height;
+        let final_height = transitions
+            .last()
+            .expect("non-empty transitions have a final height")
+            .next
+            .height;
+        let age_counts = spent_age_counts(transitions.iter().map(|transition| {
+            (
+                transition.next.height,
+                transition.transaction_undos.as_slice(),
+            )
+        }))?;
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
@@ -1700,6 +1871,7 @@ impl RedbChainStore {
         for transition in transitions {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
+        connect_spent_ages_transaction(&transaction, &age_counts, first_height, final_height)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1711,20 +1883,85 @@ impl RedbChainStore {
         parent: ExecutionTip,
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
+        transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError> {
         if self.validation_journal.is_some() {
             return Err(UtxoError::Malformed("validation journal cannot disconnect blocks").into());
         }
+        let age_counts = spent_age_counts([(expected_current.height, transaction_undos)])?;
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
         let undo = apply_with_undo_transaction(&transaction, spent, created)?;
+        disconnect_spent_ages_transaction(
+            &transaction,
+            &age_counts,
+            expected_current.height,
+            parent.height,
+        )?;
         rewind_transaction(&transaction, expected_current, parent)?;
         if !remove_undo_transaction(&transaction, expected_current.hash)? {
             return Err(UndoStoreError::Malformed("missing atomic disconnect undo").into());
         }
         transaction.commit()?;
         Ok(undo)
+    }
+
+    /// Reads the exact, network-scoped spent-output age histogram.
+    ///
+    /// Coverage begins with the first block connected after this telemetry
+    /// schema is available. Connects and disconnects update it in the same
+    /// transaction as chainstate, so reorgs cannot leave stale samples.
+    pub fn spent_age_histogram(&self) -> Result<SpentAgeHistogram, ChainStoreError> {
+        let transaction = self.db.begin_read()?;
+        let metadata = match transaction.open_table(SPENT_AGE_META_TABLE) {
+            Ok(metadata) => metadata,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return match transaction.open_table(SPENT_AGE_TABLE) {
+                    Err(redb::TableError::TableDoesNotExist(_)) => Ok(SpentAgeHistogram::default()),
+                    Err(error) => Err(error.into()),
+                    Ok(_) => Err(UtxoError::Malformed(
+                        "spent-age rows exist without coverage metadata",
+                    )
+                    .into()),
+                };
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let start_height = metadata
+            .get(SPENT_AGE_START_HEIGHT)?
+            .map(|value| value.value());
+        let end_height = metadata
+            .get(SPENT_AGE_END_HEIGHT)?
+            .map(|value| value.value());
+        if start_height.is_some() != end_height.is_some() {
+            return Err(UtxoError::Malformed("incomplete spent-age metadata").into());
+        }
+        let histogram = transaction.open_table(SPENT_AGE_TABLE)?;
+        let mut rows = Vec::new();
+        let mut samples = 0_u64;
+        for row in histogram.range(0..=u32::MAX)? {
+            let (age, count) = row?;
+            let count = count.value();
+            if count == 0 {
+                return Err(UtxoError::Malformed("empty spent-age histogram row").into());
+            }
+            samples = samples
+                .checked_add(count)
+                .ok_or(UtxoError::Malformed("spent-age sample overflow"))?;
+            rows.push((age.value(), count));
+        }
+        if start_height.is_none() && !rows.is_empty() {
+            return Err(
+                UtxoError::Malformed("spent-age rows exist without coverage metadata").into(),
+            );
+        }
+        Ok(SpentAgeHistogram {
+            start_height,
+            end_height,
+            samples,
+            rows,
+        })
     }
 
     fn configure(&self, transaction: &mut redb::WriteTransaction) {
@@ -2274,6 +2511,51 @@ mod tests {
         assert_eq!(reopened.get(key(2)).unwrap(), Some(coin(9)));
         assert!(reopened.get(key(1)).unwrap().is_none());
         assert!(reopened.undos().get(first.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn spent_age_histogram_is_atomic_sorted_and_reorg_reversible() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        assert_eq!(
+            store.spent_age_histogram().unwrap(),
+            SpentAgeHistogram::default()
+        );
+        let genesis = store.execution().tip().unwrap();
+        let old = coin(10);
+        store.apply(&[], &[(key(1), old.clone())]).unwrap();
+        let next = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([21; 32]),
+        };
+        let transaction_undos = vec![UtxoUndo::from_parts(
+            vec![(key(1), old.clone())],
+            Vec::new(),
+        )];
+        store
+            .commit_connect(genesis.hash, next, &[key(1)], &[], &transaction_undos)
+            .unwrap();
+        assert_eq!(
+            store.spent_age_histogram().unwrap(),
+            SpentAgeHistogram {
+                start_height: Some(1),
+                end_height: Some(1),
+                samples: 1,
+                rows: vec![(1, 1)],
+            }
+        );
+        assert_eq!(store.spent_age_histogram().unwrap().hits_within(0), 0);
+        assert_eq!(store.spent_age_histogram().unwrap().hits_within(1), 1);
+
+        store
+            .commit_disconnect(next, genesis, &[], &[(key(1), old)], &transaction_undos)
+            .unwrap();
+        assert_eq!(
+            store.spent_age_histogram().unwrap(),
+            SpentAgeHistogram::default()
+        );
     }
 
     #[test]

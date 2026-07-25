@@ -98,6 +98,11 @@ const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
+const UTXO_ACTIVITY_PAGE_SIZE: usize = 65_536;
+const UTXO_ACTIVITY_WINDOWS: [u32; 7] = [144, 1_008, 4_320, 8_640, 12_960, 25_920, 52_560];
+const MIN_ACTIVITY_RECOMMENDATION_SAMPLES: u64 = 1_000_000;
+const PERCENT_DECIMAL_SCALE: u64 = 100_000;
+const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 
 const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
     if maximum_batch_size < MAX_VALIDATION_PREFETCH_BATCH_SIZE {
@@ -147,7 +152,13 @@ struct Options {
     background_assumeutxo: Option<PathBuf>,
     mempool_full_rbf: bool,
     cleanup_validation_dir: bool,
+    offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfflineAction {
+    UtxoActivityReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,6 +1207,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             options.network_execution.is_experimental(),
         )?;
     }
+    if let Some(OfflineAction::UtxoActivityReport) = options.offline_action {
+        return report_utxo_activity(&options);
+    }
     if let Some(validation_dir) = &options.complete_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
     }
@@ -1212,6 +1226,160 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         return run_background_assumeutxo(options, validation_dir, local_nonce).await;
     }
     run_peer_pool(&options, local_nonce, None, None).await
+}
+
+fn percentage_units(part: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        let units = u128::from(part) * u128::from(100 * PERCENT_DECIMAL_SCALE) / u128::from(total);
+        u64::try_from(units).expect("percentage is at most 100 percent")
+    }
+}
+
+fn format_percentage(part: u64, total: u64) -> String {
+    let units = percentage_units(part, total);
+    format!(
+        "{}.{:05}",
+        units / PERCENT_DECIMAL_SCALE,
+        units % PERCENT_DECIMAL_SCALE
+    )
+}
+
+struct UtxoPopulation {
+    window_counts: [u64; UTXO_ACTIVITY_WINDOWS.len()],
+    window_bytes: [u64; UTXO_ACTIVITY_WINDOWS.len()],
+    total_count: u64,
+    total_bytes: u64,
+}
+
+fn scan_utxo_population(
+    chainstate: &RedbChainStore,
+    tip_height: u32,
+) -> Result<UtxoPopulation, String> {
+    let mut population = UtxoPopulation {
+        window_counts: [0; UTXO_ACTIVITY_WINDOWS.len()],
+        window_bytes: [0; UTXO_ACTIVITY_WINDOWS.len()],
+        total_count: 0,
+        total_bytes: 0,
+    };
+    let mut cursor = None;
+    loop {
+        let page = chainstate
+            .utxo_snapshot_page(cursor, UTXO_ACTIVITY_PAGE_SIZE)
+            .map_err(|error| error.to_string())?;
+        if page.is_empty() {
+            break;
+        }
+        for (_, utxo) in &page {
+            let age = tip_height.checked_sub(utxo.height).ok_or_else(|| {
+                format!(
+                    "UTXO creation height {} exceeds execution tip {tip_height}",
+                    utxo.height
+                )
+            })?;
+            let record_bytes = u64::try_from(36_usize + 29 + utxo.script_pubkey.len())
+                .map_err(|_| "UTXO record length exceeds u64".to_owned())?;
+            population.total_count = population
+                .total_count
+                .checked_add(1)
+                .ok_or_else(|| "UTXO count overflow".to_owned())?;
+            population.total_bytes = population
+                .total_bytes
+                .checked_add(record_bytes)
+                .ok_or_else(|| "UTXO byte count overflow".to_owned())?;
+            for (index, window) in UTXO_ACTIVITY_WINDOWS.iter().enumerate() {
+                if age <= *window {
+                    population.window_counts[index] = population.window_counts[index]
+                        .checked_add(1)
+                        .ok_or_else(|| "window UTXO count overflow".to_owned())?;
+                    population.window_bytes[index] = population.window_bytes[index]
+                        .checked_add(record_bytes)
+                        .ok_or_else(|| "window UTXO byte count overflow".to_owned())?;
+                }
+            }
+        }
+        cursor = page.last().map(|(outpoint, _)| *outpoint);
+        if page.len() < UTXO_ACTIVITY_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(population)
+}
+
+/// Scans chainstate in fixed-size key order and combines the current UTXO
+/// population with reorg-consistent historical spend ages. The scan is
+/// intentionally offline so it neither competes with IBD nor perturbs cache
+/// measurements.
+fn report_utxo_activity(options: &Options) -> Result<(), String> {
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("activity report parser requires data directory");
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    let tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let spent = chainstate
+        .spent_age_histogram()
+        .map_err(|error| error.to_string())?;
+    let population = scan_utxo_population(&chainstate, tip.height)?;
+
+    let complete_spend_coverage =
+        spent.start_height == Some(1) && spent.end_height == Some(tip.height);
+    println!(
+        "UTXO activity report network={} tip={}:{} utxos={} estimated_record_bytes={}",
+        options.network, tip.height, tip.hash, population.total_count, population.total_bytes
+    );
+    match (spent.start_height, spent.end_height) {
+        (Some(start), Some(end)) => println!(
+            "spent-age coverage={start}-{end} samples={} complete_genesis_to_tip={complete_spend_coverage}",
+            spent.samples
+        ),
+        (None, None) => println!("spent-age coverage=none samples=0 complete_genesis_to_tip=false"),
+        _ => unreachable!("chainstore rejects incomplete spent-age metadata"),
+    }
+    println!(
+        "window_blocks\tapprox_days\tspend_hits\tspend_hit_percent\tcurrent_utxos\tcurrent_utxo_percent\testimated_record_bytes\testimated_byte_percent"
+    );
+    for (index, window) in UTXO_ACTIVITY_WINDOWS.iter().enumerate() {
+        let spend_hits = spent.hits_within(*window);
+        println!(
+            "{window}\t{}\t{spend_hits}\t{}\t{}\t{}\t{}\t{}",
+            window / 144,
+            format_percentage(spend_hits, spent.samples),
+            population.window_counts[index],
+            format_percentage(population.window_counts[index], population.total_count),
+            population.window_bytes[index],
+            format_percentage(population.window_bytes[index], population.total_bytes),
+        );
+    }
+
+    if !complete_spend_coverage {
+        println!(
+            "recommendation=unavailable reason=incomplete_spend_history required_coverage=1-{}",
+            tip.height
+        );
+    } else if spent.samples < MIN_ACTIVITY_RECOMMENDATION_SAMPLES {
+        println!(
+            "recommendation=unavailable reason=insufficient_samples samples={} required={MIN_ACTIVITY_RECOMMENDATION_SAMPLES}",
+            spent.samples
+        );
+    } else if let Some(window) = UTXO_ACTIVITY_WINDOWS.iter().copied().find(|window| {
+        percentage_units(spent.hits_within(*window), spent.samples)
+            >= ACTIVITY_RECOMMENDATION_PERCENT_UNITS
+    }) {
+        println!(
+            "recommendation_blocks={window} criterion=smallest_candidate_with_at_least_99.0_percent_historical_spend_hits"
+        );
+    } else {
+        println!(
+            "recommendation=unavailable reason=no_candidate_reaches_99.0_percent_historical_spend_hits"
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6444,6 +6612,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = false;
     let mut cleanup_validation_dir = false;
+    let mut utxo_activity_report = false;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -6645,6 +6814,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             }
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
+            "--utxo-activity-report" => utxo_activity_report = true,
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -6975,6 +7145,36 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 .to_owned(),
         );
     }
+    if utxo_activity_report {
+        if data_dir.is_none() {
+            return Err("--utxo-activity-report requires --data-dir".to_owned());
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target
+        {
+            return Err(
+                "UTXO activity reporting is offline and conflicts with peer, synchronization, snapshot, validation, serving, wallet, and policy modes"
+                    .to_owned(),
+            );
+        }
+    }
     if mempool_full_rbf && data_dir.is_none() {
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
@@ -7106,6 +7306,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         background_assumeutxo,
         mempool_full_rbf,
         cleanup_validation_dir,
+        offline_action: utxo_activity_report.then_some(OfflineAction::UtxoActivityReport),
         validation_limits,
     }))
 }
@@ -7183,6 +7384,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet --core-assumeutxo-snapshot CORE_DUMPTXOUTSET_FILE\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "PEER OPTIONS:\n",
             "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 31 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
@@ -7506,6 +7708,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         };
         let mut pending =
@@ -9735,6 +9938,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_only_offline_utxo_activity_reporting() {
+        let options = parse_options(
+            [
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-activity-report",
+                "--utxo-activity-report",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.offline_action,
+            Some(OfflineAction::UtxoActivityReport)
+        );
+        assert_eq!(
+            options.data_dir,
+            Some(PathBuf::from("/tmp/rbtc-activity-report"))
+        );
+        for arguments in [
+            vec!["--network", "testnet4", "--utxo-activity-report"],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-activity-report",
+                "--utxo-activity-report",
+                "--once",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-activity-report",
+                "--utxo-activity-report",
+                "--connect",
+                "127.0.0.1:48333",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+        assert_eq!(format_percentage(1, 4), "25.00000");
+        assert_eq!(format_percentage(0, 0), "0.00000");
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn offline_snapshot_cli_activates_and_reopens_the_assumed_base() {
@@ -9799,6 +10051,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -9863,6 +10116,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11031,6 +11285,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11084,6 +11339,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         };
 
@@ -11459,6 +11715,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11546,6 +11803,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11612,6 +11870,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11694,6 +11953,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11747,6 +12007,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11796,6 +12057,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11885,6 +12147,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -11936,6 +12199,7 @@ mod tests {
                 background_assumeutxo: Some(validation_dir.clone()),
                 mempool_full_rbf: false,
                 cleanup_validation_dir: true,
+                offline_action: None,
                 validation_limits: ValidationLimits {
                     max_blocks_per_batch: 1,
                     pause_between_batches: Duration::ZERO,
@@ -12027,6 +12291,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12103,6 +12368,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12137,6 +12403,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12191,6 +12458,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12239,6 +12507,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12332,6 +12601,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12481,6 +12751,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12581,6 +12852,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12653,6 +12925,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await
@@ -12761,6 +13034,7 @@ mod tests {
                 background_assumeutxo: None,
                 mempool_full_rbf: false,
                 cleanup_validation_dir: false,
+                offline_action: None,
                 validation_limits: ValidationLimits::default(),
             }),
         )
@@ -12904,6 +13178,7 @@ mod tests {
                 background_assumeutxo: None,
                 mempool_full_rbf: false,
                 cleanup_validation_dir: false,
+                offline_action: None,
                 validation_limits: ValidationLimits::default(),
             },
             local_nonce,
@@ -13017,6 +13292,7 @@ mod tests {
             background_assumeutxo: None,
             mempool_full_rbf: false,
             cleanup_validation_dir: false,
+            offline_action: None,
             validation_limits: ValidationLimits::default(),
         })
         .await

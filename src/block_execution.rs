@@ -1121,7 +1121,13 @@ pub fn disconnect_execution_tip(
     let overlay = UtxoOverlay::new(chainstate);
     disconnect_block(&overlay, &applied, now, hot_window_secs)?;
     let transition = overlay.net_changes()?;
-    chainstate.commit_disconnect(current, parent_tip, &transition.spent, &transition.created)?;
+    chainstate.commit_disconnect(
+        current,
+        parent_tip,
+        &transition.spent,
+        &transition.created,
+        &applied.transaction_undos,
+    )?;
     Ok(parent_tip)
 }
 

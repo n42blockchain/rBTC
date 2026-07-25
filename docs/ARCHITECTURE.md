@@ -114,6 +114,28 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier; `utxo_cold` currently contains coins not touched within `hot_window_secs` (default 60 days). Moving tiers is a single redb transaction and never changes consensus data. The 60-day boundary is not yet a production default: local wall-clock touch time makes a historical IBD classify old coins as newly hot. The replacement decision must use a complete-replay histogram of consensus coin age at spend time and compare hot-set population against spend-hit rate for candidate block-age windows. Tier metadata remains excluded from snapshot finalization and consensus identity.
 
+Spent-output coin age is now accumulated as exact block-age/count rows in the
+network-bound chainstate. A checkpoint aggregates ages before sorted writes;
+connect and disconnect update the histogram in the same transaction as UTXOs,
+undo, and the execution tip. Coverage metadata starts honestly at the first
+instrumented block, and a reorg crossing that start clears the sample instead
+of presenting a discontinuous history as complete. The remaining selection gate
+is a complete mainnet replay. Offline `--utxo-activity-report` scans the
+outpoint-sorted UTXO tables in fixed 65,536-record pages and reports, for
+1/7/30/60/90/180/365-day block-count candidates, historical spend-hit rate,
+current live-set population, and estimated local record bytes. It emits a
+99%-hit recommendation only when coverage is exactly blocks 1 through the
+execution tip and at least one million spends were observed; partial upgraded
+stores remain useful measurements but cannot silently select a production
+boundary.
+
+The first offline scan against the completed Testnet4 chainstate at height
+145,737 read 14,160,511 UTXOs in 27.67 seconds. Creation-age candidates retained
+0.450% of records at 60 days, 1.029% at 90 days, and 10.037% at 365 days. That
+directory predates spend-age instrumentation, so its zero spend samples
+correctly produced no recommendation; these population figures are storage
+measurements, not evidence for the final activity threshold.
+
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
 Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
