@@ -97,15 +97,14 @@ Primary references:
   timewarp boundary and uses pinned Core 31 trust anchors and seeds. The
   fixed-target experimental mode remains available for reproducible validation
   journals.
-- [x] Real Testnet4 headers were validated and persisted from genesis through
-  active height 145,734/hash
-  `00000000002eaba2ff41604d0126d09e142f6f2afb79ee12abf9ad818e677abf`;
-  minimum chainwork passed. A separate ordinary persistent run executed block
-  1/hash
-  `0000000012982b6d5f621229286b880e909984df669c2afabb102ce311b13f28`
-  and stopped exactly at the authenticated target; its cold restart reopened
-  chainstate in 34 ms, requested no block, and exited in 3.52 seconds at the
-  identical execution and header tips.
+- [x] One ordinary public Testnet4 chainstate validated and executed genesis
+  through height 145,735/hash
+  `0000000000a3f79d1bd3ee3ca31cdde97e9ae86efe34f72a6aac6d4fe15cb03f`;
+  minimum chainwork passed. A cold restart opened chainstate in 52 ms, advanced
+  headers and execution to height 145,737/hash
+  `0000000000c655393aba8556ccb27913faf4fdfcb90d7bd5c0bdf4e62c923769`,
+  and exited in 4.40 seconds. The bounded freezer occupied 5.9 MiB and the full
+  directory 3.1 GiB at that acceptance point.
 
 ### Build and release automation
 
