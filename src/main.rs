@@ -4399,6 +4399,7 @@ async fn sync_validating_node(
                 .map_or(validation_limits, |status| {
                     status.adaptive_limits(validation_limits)
                 });
+            let auxiliary_was_active = auxiliary_session.is_some();
             download_execute_batch(
                 session,
                 deployment_config,
@@ -4417,6 +4418,12 @@ async fn sync_validating_node(
                 validation_target.is_some() && validation_scheduler.is_none(),
             )
             .await?;
+            if auxiliary_was_active && auxiliary_session.is_none() {
+                auxiliary.clear();
+                eprintln!(
+                    "auxiliary block downloads disabled for the remainder of this primary session after the first active-window failure"
+                );
+            }
             if auxiliary_session.is_none() {
                 activate_next_auxiliary_peer(&mut auxiliary, &mut auxiliary_session).await;
             }
