@@ -1407,26 +1407,33 @@ impl UtxoStore for RedbChainStore {
                 partition_validation_bloom_matches(group, outpoints, unresolved);
             let start = group_index * VALIDATION_ROWS_PER_BLOOM_GROUP;
             let end = (start + VALIDATION_ROWS_PER_BLOOM_GROUP).min(journal.rows.len());
-            for row in journal.rows[start..end].iter().rev() {
-                if group_unresolved.is_empty() {
-                    break;
+            let rows = &journal.rows[start..end];
+            let mut row_candidates = vec![Vec::new(); rows.len()];
+            for index in &group_unresolved {
+                for (row_index, row) in rows.iter().enumerate() {
+                    if row.bloom.might_contain(outpoints[*index]) {
+                        row_candidates[row_index].push(*index);
+                    }
+                }
+            }
+            for (row, row_candidates) in rows.iter().zip(row_candidates).rev() {
+                if row_candidates.is_empty() {
+                    continue;
                 }
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                let mut row_unresolved = Vec::with_capacity(group_unresolved.len());
-                for index in group_unresolved {
-                    let outpoint = outpoints[index];
-                    if row.bloom.might_contain(outpoint) {
-                        if let Some(update) = validation_delta_lookup(encoded.value(), outpoint)? {
-                            results[index] = Some((outpoint, update.utxo));
-                            continue;
-                        }
+                for index in row_candidates {
+                    if results[index].is_some() {
+                        continue;
                     }
-                    row_unresolved.push(index);
+                    let outpoint = outpoints[index];
+                    if let Some(update) = validation_delta_lookup(encoded.value(), outpoint)? {
+                        results[index] = Some((outpoint, update.utxo));
+                    }
                 }
-                group_unresolved = row_unresolved;
             }
+            group_unresolved.retain(|index| results[*index].is_none());
             next_unresolved.extend(group_unresolved);
             unresolved = next_unresolved;
         }
