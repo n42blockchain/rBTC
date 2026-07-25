@@ -891,7 +891,7 @@ fn collect_node_status(
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     match parse_options(env::args().skip(1)) {
         Ok(Some(options)) => {
@@ -5481,7 +5481,9 @@ async fn download_execute_batch(
             .map_err(|error| PeerRunError::block(&error))?,
             Vec::new(),
         )
-    } else {
+    } else if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
         let runtime = tokio::runtime::Handle::current();
         let (execution_result, prefetch_result) = std::thread::scope(|scope| {
             let prefetch = scope.spawn(|| {
@@ -5513,6 +5515,28 @@ async fn download_execute_batch(
                 Vec::new()
             }
         };
+        (applied_blocks, downloaded_prefetch)
+    } else {
+        let applied_blocks = connect_prevalidated_active_blocks_with_txids(
+            chainstate,
+            headers,
+            &blocks,
+            &transaction_ids,
+            now,
+            DEFAULT_HOT_WINDOW_SECS,
+            &deployment_contexts,
+        )
+        .map_err(|error| PeerRunError::block(&error))?;
+        let downloaded_prefetch =
+            match download_execution_prefetch(session, &next_prefetch_hashes, compact_candidates)
+                .await
+            {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    prefetch_error = Some(error);
+                    Vec::new()
+                }
+            };
         (applied_blocks, downloaded_prefetch)
     };
     let execution_prefetch_count = downloaded_prefetch.len();
@@ -8064,6 +8088,59 @@ mod tests {
         );
         primary_server.await.unwrap();
         auxiliary_server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scoped_execution_prefetch_drains_on_multithread_runtime() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let blocks = vec![
+            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 1, 1),
+            regtest_block_at_height(genesis.block_hash(), genesis.header.time + 2, 2),
+        ];
+        let hashes = blocks.iter().map(Block::block_hash).collect::<Vec<_>>();
+        let expected_inventory = hashes
+            .iter()
+            .copied()
+            .map(Inventory::WitnessBlock)
+            .collect::<Vec<_>>();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(643)).await;
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetData(expected_inventory)
+            );
+            for block in blocks {
+                peer.write_message(NetworkMessage::Block(block))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            644,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        let downloaded = std::thread::scope(|scope| {
+            let prefetch = scope.spawn(|| {
+                runtime.block_on(download_execution_prefetch(&mut session, &hashes, &[]))
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            prefetch.join().unwrap().unwrap()
+        });
+
+        assert_eq!(
+            downloaded.iter().map(Block::block_hash).collect::<Vec<_>>(),
+            hashes
+        );
+        server.await.unwrap();
     }
 
     #[test]

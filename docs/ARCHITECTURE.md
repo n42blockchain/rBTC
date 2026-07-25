@@ -272,7 +272,10 @@ downloads only the remainder. This double buffer is bounded to 1 GiB at the
 consensus maximum block size and never stages, executes, commits, or requests
 above the immutable target. Continuously draining the response avoids the
 repeatable timeouts caused by leaving 128 responses unread throughout a
-756-block execution phase. A mismatch, timeout, unsolicited response,
+756-block execution phase. The daemon uses two Tokio workers so one can drive
+the network reactor while the execution side blocks; current-thread test or
+embedded runtimes take a deadlock-free serial fallback instead. A mismatch,
+timeout, unsolicited response,
 compact-block failure, or peer replacement retains the existing fail-closed
 path. Although a 126-block checkpoint fits
 entirely in one lookahead window and its first two batches took 29.0 seconds
