@@ -46,7 +46,10 @@ median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
 after repeated 756-block prefetched-response timeouts, cross-execution
 lookahead is now restricted to checkpoints through 256 blocks, and the first
 active auxiliary-window failure circuit-breaks further auxiliary block
-downloads until the primary session changes;
+downloads until the primary session changes; later block growth then selected
+64-block validation response windows after the first five samples completed
+without failover at a 95.388-second download median and 168.974-second total
+median;
 Taproot exact-stop and completed-target restart remain the active soak gate.
 Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
 with ordered joins and earliest-height failure semantics. Adjacent 1,008-block

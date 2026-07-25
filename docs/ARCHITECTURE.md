@@ -366,6 +366,11 @@ The subsequent packetized script scheduler measured 46.015, 46.165, 49.246,
 756-block checkpoints at heights 598,249–602,028. Its 46.165-second median
 was 10.2% below the immediately preceding five-checkpoint 51.401-second
 median, while retaining the same consensus engine, error order, and barrier.
+At heights 651,925–655,704, all first five 64-block-window checkpoints
+completed on one primary session after multiple public peers had failed the
+old 128-block response budget. Download time was 93.017–123.082 seconds with
+a 95.388-second median; total time had a 168.974-second median and incurred no
+chainstate reopen between checkpoints.
 
 SIGINT and SIGTERM are awaited alongside the daemon future. Cancellation drops
 network tasks and closes the durable stores cleanly; synchronous atomic
