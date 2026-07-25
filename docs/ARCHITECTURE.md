@@ -398,10 +398,12 @@ chainstate reopen between checkpoints.
 
 SIGINT and SIGTERM are awaited alongside the daemon future. Cancellation drops
 network tasks and closes the durable stores cleanly; synchronous atomic
-execution reaches its next async boundary first. A stalled-handshake process
-test exits successfully after logging that durable stores are closing, avoiding
-the allocator-repair cost caused by the operating system's default abrupt
-termination.
+execution reaches its next async boundary first. Each completed validation
+checkpoint explicitly yields before beginning a fully prefetched successor,
+so repeated cache hits cannot starve that outer shutdown selector. A
+stalled-handshake process test exits successfully after logging that durable
+stores are closing, avoiding the allocator-repair cost caused by the operating
+system's default abrupt termination.
 
 The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
 

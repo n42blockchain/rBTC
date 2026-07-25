@@ -4468,6 +4468,10 @@ async fn sync_validating_node(
                     tokio::time::sleep(effective_validation_limits.pause_between_batches).await;
                 }
             }
+            // A completely prefetched batch may otherwise run from decode
+            // through commit without yielding, starving the outer shutdown
+            // selector across successive checkpoints.
+            tokio::task::yield_now().await;
         }
     }
 }

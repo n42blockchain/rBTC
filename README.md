@@ -81,8 +81,10 @@ hours, and 252-block high-memory atomic persistence batches filled through
 bounded 16-block peer requests.
 
 After observing mainnet block 1,000, the harness deliberately terminates the
-process; the current atomic batch may finish before the signal arrives, then a
-new process must reopen that exact durable state and stop at the target.
+process; the current atomic batch may finish before the signal arrives, and
+every completed batch explicitly yields so a fully prefetched successor cannot
+starve shutdown delivery. A new process must reopen that exact durable state
+and stop at the target.
 `RBTC_SYNC_RESTART_HEIGHT=0` disables this check or another below-target height
 selects it. Both networks reserve another 2 GiB of free space, clean temporary
 data on every exit, and accept `RBTC_SYNC_MAX_BYTES`,
