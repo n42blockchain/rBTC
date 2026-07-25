@@ -141,7 +141,9 @@ authenticated during Merkle validation are reused during execution. Large
 input-prefetch sets are split across ordered concurrent redb read snapshots
 while preserving caller order. Block requests remain limited to 16 hashes per
 `getdata`, while up to eight such requests (128 responses) are pipelined into
-one ordered receive window. The pinned redb write buffer sorts dirty pages by
+one protocol-bounded receive window. The live validator now uses four-request,
+64-block windows so later, larger blocks stay comfortably inside the same
+30-second peer budget. The pinned redb write buffer sorts dirty pages by
 file offset and coalesces adjacent pages into writes of at most 8 MiB. On the
 exact same 1,008-block height-346,921–347,928 batch, total time fell from
 117.72 to 72.46 seconds and execution/persistence from 82.95 to 30.77 seconds,
@@ -216,12 +218,12 @@ instead of the preceding 11–17 seconds. The retained configuration is
 therefore the measured 252-block checkpoint with one bounded 128-block
 lookahead window.
 
-For experimental mainnet checkpoints wider than 128 blocks, up to three ready
+For experimental mainnet checkpoints wider than 64 blocks, up to three ready
 standby candidates now survive the chainstate-open phase; the first one that
 still passes bounded activation becomes an auxiliary block source. A
-252-block batch requests 128 blocks from the active peer and 124 from the
-auxiliary peer concurrently. Larger configured batches repeat these paired
-windows across the batch, while each peer still has at most 128 ordered block
+252-block batch repeatedly requests paired 64-block windows from the active
+and auxiliary peers concurrently. Larger configured batches repeat the same
+pairing, while each peer has at most 64 ordered block
 responses outstanding. The receiver appends every pair in active-chain order
 and retries its auxiliary half on the primary after any request or response
 failure. The first active auxiliary failure circuit-breaks auxiliary block
@@ -276,8 +278,9 @@ four immediately following checkpoints completed in 124.259–148.291 seconds
 and advanced atomically through height 507,528.
 An experimental four-peer 504-block downloader was rejected after unreliable
 auxiliary peers widened complete-batch time to 73.243–127.829 seconds. The
-retained path reuses one auxiliary for bounded paired 128-block windows, keeps
-the two-second slow-auxiliary guard, and retains ready replacement candidates.
+retained path uses bounded paired 64-block windows and a two-second
+slow-auxiliary guard. Its first active auxiliary failure circuit-breaks
+auxiliary downloads for the remainder of the primary session.
 Expanding each batch across more simultaneous auxiliaries was also rejected after
 five auxiliary-bearing batches took 80.105–105.571 seconds while the following
 primary-only batches took 80.482 and 88.089 seconds.

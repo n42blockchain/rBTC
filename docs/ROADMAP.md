@@ -31,8 +31,8 @@ ledger's separate 1 GiB canonical-record ceiling and failed without mutation.
 The Taproot leg now uses 756 blocks; its first four checkpoints took
 124.259–148.291 seconds. A four-peer experiment was rejected after independent
 public-peer failures widened complete batches to 73.243–127.829 seconds. The
-retained downloader reuses one auxiliary across ordered paired 128-block
-windows with a two-second tail guard and hot replacements. Streamed
+retained downloader uses ordered paired 64-block windows with a two-second
+tail guard and per-primary-session auxiliary circuit breaker. Streamed
 four-worker archive compression reduced the first 756-block staging sample
 from 6.723–7.175 seconds to 4.949 seconds, large RVD3 group-Bloom probes now
 partition over bounded CPU workers, and SIGINT/SIGTERM close stores cleanly;

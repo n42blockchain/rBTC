@@ -72,6 +72,7 @@ use tokio::time::timeout;
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
+const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
 const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_PIPELINED_BLOCKS_IN_FLIGHT * 2;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
@@ -2511,8 +2512,7 @@ async fn try_peer_candidates(
             Ok(connected) => {
                 let auxiliary = if options.network == Network::Bitcoin
                     && options.network_execution.is_experimental()
-                    && options.validation_limits.max_blocks_per_batch
-                        > MAX_PIPELINED_BLOCKS_IN_FLIGHT
+                    && options.validation_limits.max_blocks_per_batch > VALIDATION_BLOCK_WINDOW_SIZE
                 {
                     take_ready_auxiliary_peers(&mut pending)
                 } else {
@@ -5060,9 +5060,9 @@ async fn request_block_window(
 fn split_parallel_block_windows(
     hashes: &[BlockHash],
 ) -> (&[BlockHash], &[BlockHash], &[BlockHash]) {
-    let primary_len = hashes.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+    let primary_len = hashes.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
     let (primary, remaining) = hashes.split_at(primary_len);
-    let auxiliary_len = remaining.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+    let auxiliary_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
     let (auxiliary, primary_remainder) = remaining.split_at(auxiliary_len);
     (primary, auxiliary, primary_remainder)
 }
@@ -5263,7 +5263,7 @@ async fn download_execute_batch(
         .collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(batch_len);
     let prefetched = std::mem::take(prefetched_block_windows);
-    if auxiliary_session.is_some() && hashes.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT {
+    if auxiliary_session.is_some() && hashes.len() > VALIDATION_BLOCK_WINDOW_SIZE {
         let (first_primary, first_auxiliary, _) = split_parallel_block_windows(&hashes);
         if (!prefetched.primary.is_empty() && prefetched.primary != first_primary)
             || (!prefetched.auxiliary.is_empty() && prefetched.auxiliary != first_auxiliary)
@@ -5276,10 +5276,10 @@ async fn download_execute_batch(
         let mut first_pair = true;
         while offset < hashes.len() {
             let remaining = &hashes[offset..];
-            if auxiliary_session.is_some() && remaining.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT {
-                let primary_len = remaining.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+            if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
+                let primary_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
                 let auxiliary_len =
-                    (remaining.len() - primary_len).min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+                    (remaining.len() - primary_len).min(VALIDATION_BLOCK_WINDOW_SIZE);
                 let primary_hashes = &remaining[..primary_len];
                 let auxiliary_hashes = &remaining[primary_len..primary_len + auxiliary_len];
                 let primary_prefetched = first_pair && !prefetched.primary.is_empty();
@@ -5306,7 +5306,7 @@ async fn download_execute_batch(
                     *auxiliary_session = None;
                 }
             } else {
-                let window_len = remaining.len().min(MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+                let window_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
                 blocks.extend(
                     download_block_window(
                         session,
@@ -5323,7 +5323,7 @@ async fn download_execute_batch(
     } else {
         if !prefetched.auxiliary.is_empty()
             || (!prefetched.primary.is_empty()
-                && (prefetched.primary.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT
+                && (prefetched.primary.len() > VALIDATION_BLOCK_WINDOW_SIZE
                     || !hashes.starts_with(&prefetched.primary)))
         {
             return Err(PeerRunError::transient(
@@ -5342,7 +5342,7 @@ async fn download_execute_batch(
                 .await?,
             );
         }
-        for pipelined_hashes in hashes[prefetched_len..].chunks(MAX_PIPELINED_BLOCKS_IN_FLIGHT) {
+        for pipelined_hashes in hashes[prefetched_len..].chunks(VALIDATION_BLOCK_WINDOW_SIZE) {
             blocks.extend(
                 download_block_window(session, pipelined_hashes, compact_candidates, "primary")
                     .await?,
@@ -8005,16 +8005,16 @@ mod tests {
     fn parallel_block_windows_keep_every_configured_batch_bounded() {
         for (batch_len, expected) in [
             (64, (64, 0, 0)),
-            (129, (128, 1, 0)),
-            (252, (128, 124, 0)),
-            (504, (128, 128, 248)),
-            (MAX_VALIDATION_BATCH_SIZE, (128, 128, 752)),
+            (129, (64, 64, 1)),
+            (252, (64, 64, 124)),
+            (504, (64, 64, 376)),
+            (MAX_VALIDATION_BATCH_SIZE, (64, 64, 880)),
         ] {
             let hashes = vec![BlockHash::all_zeros(); batch_len];
             let (primary, auxiliary, remainder) = split_parallel_block_windows(&hashes);
             assert_eq!((primary.len(), auxiliary.len(), remainder.len()), expected);
-            assert!(primary.len() <= MAX_PIPELINED_BLOCKS_IN_FLIGHT);
-            assert!(auxiliary.len() <= MAX_PIPELINED_BLOCKS_IN_FLIGHT);
+            assert!(primary.len() <= VALIDATION_BLOCK_WINDOW_SIZE);
+            assert!(auxiliary.len() <= VALIDATION_BLOCK_WINDOW_SIZE);
             assert_eq!(primary.len() + auxiliary.len() + remainder.len(), batch_len);
         }
     }

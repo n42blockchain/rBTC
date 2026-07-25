@@ -221,14 +221,16 @@ random-write cost.
 Experimental fixed-target mainnet validation can reserve up to three ready
 standby candidates while the chainstate opens asynchronously and the active
 session receives bounded keepalives. It activates the first surviving
-candidate as an auxiliary block source. Checkpoints wider than the 128-block
-single-peer pipeline split into ordered primary and auxiliary windows, request
+candidate as an auxiliary block source. Checkpoints wider than the 64-block
+validation window split into ordered primary and auxiliary windows, request
 and receive both concurrently, then concatenate them in active-chain order.
-Both parallel windows remain capped at 128 blocks; a larger configured
+Production validation caps both parallel windows at 64 blocks—four 16-block
+requests—after later mainnet blocks repeatedly pushed 128-block responses past
+the 30-second peer budget. A larger configured
 checkpoint downloads its remainder through additional bounded primary
 windows. Any auxiliary request or response failure drops that source and
-redownloads only its window from the primary, then activates the next reserved
-candidate without restarting the active session. An unfinished auxiliary window is
+redownloads only its window from the primary, then circuit-breaks auxiliary
+block downloads until the primary session changes. An unfinished auxiliary window is
 given only two seconds after the primary window completes before the same
 fallback runs, avoiding a full auxiliary timeout followed by another
 download. This bounded one observed slow-auxiliary download at 27.684 seconds
@@ -331,11 +333,11 @@ failed before staging or chainstate mutation. The Taproot run therefore uses
 A follow-up that assigned one 128-block window to each of three auxiliaries
 was rejected: public-peer failures and independent response tails widened
 complete-batch time to 73.243–127.829 seconds. Production validation instead
-reuses one auxiliary across successive paired windows, never leaves more than
-128 responses outstanding on either session, and abandons an auxiliary half
+uses one auxiliary across successive paired 64-block windows, never leaves
+more than 64 responses outstanding on either session, and abandons an auxiliary half
 that trails the primary by more than two seconds. Each pair is appended in
-active-chain order. Additional ready candidates remain hot replacements
-rather than independent batch tails.
+active-chain order. The first active auxiliary failure disables further
+auxiliary block downloads for that primary session.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work
