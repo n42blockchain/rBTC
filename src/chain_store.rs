@@ -247,7 +247,7 @@ struct ValidationUpdate {
 type ValidationDeltaUpdates = Vec<(OutPointKey, ValidationUpdate)>;
 type EncodedValidationDeltaShards = Vec<(u8, Vec<u8>)>;
 type ValidationShardReadJob = (u8, Vec<usize>);
-type LoadedValidationShard = (Vec<usize>, Vec<u8>);
+type ValidationShardMatch = (usize, OutPointKey, Option<Utxo>);
 
 impl ValidationBloom {
     fn with_update_count(update_count: usize) -> Result<Self, UtxoError> {
@@ -1675,11 +1675,12 @@ impl RedbChainStore {
         transaction.set_quick_repair(self.options.quick_repair);
     }
 
-    fn load_validation_shards_parallel(
+    fn lookup_validation_shards_parallel(
         &self,
         height: u32,
         jobs: Vec<ValidationShardReadJob>,
-    ) -> Result<Vec<LoadedValidationShard>, UtxoError> {
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<ValidationShardMatch>, UtxoError> {
         let available_workers =
             std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let workers = available_workers.min(jobs.len());
@@ -1694,15 +1695,22 @@ impl RedbChainStore {
                     scope.spawn(move || {
                         let transaction = self.db.begin_read()?;
                         let shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
-                        jobs.into_iter()
-                            .map(|(shard, candidates)| {
-                                let key = validation_delta_shard_key(height, shard);
-                                let encoded = shards.get(key.as_slice())?.ok_or(
-                                    UtxoError::Malformed("missing validation delta shard"),
-                                )?;
-                                Ok((candidates, encoded.value().to_vec()))
-                            })
-                            .collect::<Result<Vec<_>, UtxoError>>()
+                        let mut matches = Vec::new();
+                        for (shard, candidates) in jobs {
+                            let key = validation_delta_shard_key(height, shard);
+                            let encoded = shards
+                                .get(key.as_slice())?
+                                .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
+                            for index in candidates {
+                                let outpoint = outpoints[index];
+                                if let Some(update) =
+                                    validation_delta_lookup(encoded.value(), outpoint)?
+                                {
+                                    matches.push((index, outpoint, update.utxo));
+                                }
+                            }
+                        }
+                        Ok::<_, UtxoError>(matches)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1854,17 +1862,10 @@ impl UtxoStore for RedbChainStore {
                             })
                             .collect::<Vec<_>>();
                         if jobs.len() > 1 {
-                            for (candidates, encoded_shard) in
-                                self.load_validation_shards_parallel(row.height, jobs)?
+                            for (index, outpoint, utxo) in
+                                self.lookup_validation_shards_parallel(row.height, jobs, outpoints)?
                             {
-                                for index in candidates {
-                                    let outpoint = outpoints[index];
-                                    if let Some(update) =
-                                        validation_delta_lookup(&encoded_shard, outpoint)?
-                                    {
-                                        results[index] = Some((outpoint, update.utxo));
-                                    }
-                                }
+                                results[index] = Some((outpoint, utxo));
                             }
                         } else {
                             for (shard, candidates) in jobs {
