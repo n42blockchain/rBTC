@@ -246,8 +246,23 @@ struct ValidationUpdate {
 
 type ValidationDeltaUpdates = Vec<(OutPointKey, ValidationUpdate)>;
 type EncodedValidationDeltaShards = Vec<(u8, Vec<u8>)>;
-type ValidationShardReadJob = (u8, Vec<usize>);
-type ValidationShardMatch = (usize, OutPointKey, Option<Utxo>);
+struct ValidationShardReadJob {
+    height: u32,
+    row_index: usize,
+    shard: u8,
+    candidates: Vec<usize>,
+}
+
+type ValidationShardMatch = (usize, usize, OutPointKey, Option<Utxo>);
+
+enum ValidationRowReadPlan {
+    Empty,
+    Legacy(Vec<usize>),
+    Sharded {
+        header: ShardedValidationDeltaHeader,
+        candidates: Vec<usize>,
+    },
+}
 
 impl ValidationBloom {
     fn with_update_count(update_count: usize) -> Result<Self, UtxoError> {
@@ -1677,36 +1692,37 @@ impl RedbChainStore {
 
     fn lookup_validation_shards_parallel(
         &self,
-        height: u32,
-        jobs: Vec<ValidationShardReadJob>,
+        jobs: &[ValidationShardReadJob],
         outpoints: &[OutPointKey],
     ) -> Result<Vec<ValidationShardMatch>, UtxoError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let available_workers =
             std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let workers = available_workers.min(jobs.len());
-        let mut worker_jobs = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
-        for (index, job) in jobs.into_iter().enumerate() {
-            worker_jobs[index % workers].push(job);
-        }
+        let next_job = AtomicUsize::new(0);
         std::thread::scope(|scope| {
-            let workers = worker_jobs
-                .into_iter()
-                .map(|jobs| {
-                    scope.spawn(move || {
+            let workers = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
                         let transaction = self.db.begin_read()?;
                         let shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
                         let mut matches = Vec::new();
-                        for (shard, candidates) in jobs {
-                            let key = validation_delta_shard_key(height, shard);
+                        loop {
+                            let job_index = next_job.fetch_add(1, Ordering::Relaxed);
+                            let Some(job) = jobs.get(job_index) else {
+                                break;
+                            };
+                            let key = validation_delta_shard_key(job.height, job.shard);
                             let encoded = shards
                                 .get(key.as_slice())?
                                 .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
-                            for index in candidates {
+                            for &index in &job.candidates {
                                 let outpoint = outpoints[index];
                                 if let Some(update) =
                                     validation_delta_lookup(encoded.value(), outpoint)?
                                 {
-                                    matches.push((index, outpoint, update.utxo));
+                                    matches.push((job.row_index, index, outpoint, update.utxo));
                                 }
                             }
                         }
@@ -1722,6 +1738,7 @@ impl RedbChainStore {
                         .expect("validation shard read worker must not panic")?,
                 );
             }
+            loaded.sort_unstable_by_key(|(row_index, ..)| std::cmp::Reverse(*row_index));
             Ok(loaded)
         })
     }
@@ -1813,8 +1830,11 @@ impl UtxoStore for RedbChainStore {
                     }
                 }
             }
-            for (row, row_candidates) in rows.iter().zip(row_candidates).rev() {
-                if row_candidates.is_empty() {
+            let mut row_plans = Vec::with_capacity(rows.len());
+            let mut all_populated_rows_are_sharded = true;
+            for (row, candidates) in rows.iter().zip(row_candidates) {
+                if candidates.is_empty() {
+                    row_plans.push(ValidationRowReadPlan::Empty);
                     continue;
                 }
                 let encoded = deltas
@@ -1822,65 +1842,98 @@ impl UtxoStore for RedbChainStore {
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
                 match validation_delta_record_header(encoded.value())? {
                     ValidationDeltaRecordHeader::Legacy { .. } => {
-                        legacy_hits.push((
-                            row.height,
-                            u64::try_from(row_candidates.len()).unwrap_or(u64::MAX),
-                        ));
-                        for index in row_candidates {
-                            if results[index].is_some() {
-                                continue;
-                            }
-                            let outpoint = outpoints[index];
-                            if let Some(update) =
-                                validation_delta_lookup(encoded.value(), outpoint)?
-                            {
-                                results[index] = Some((outpoint, update.utxo));
-                            }
-                        }
+                        all_populated_rows_are_sharded = false;
+                        row_plans.push(ValidationRowReadPlan::Legacy(candidates));
                     }
                     ValidationDeltaRecordHeader::Sharded(header) => {
-                        let mut shard_candidates = vec![Vec::new(); header.shard_count];
-                        for index in row_candidates {
-                            if results[index].is_some() {
-                                continue;
-                            }
-                            let shard =
-                                validation_delta_shard(outpoints[index], header.shard_count);
-                            if validation_shard_is_populated(header, shard) {
-                                shard_candidates[usize::from(shard)].push(index);
-                            }
+                        row_plans.push(ValidationRowReadPlan::Sharded { header, candidates });
+                    }
+                }
+            }
+            if all_populated_rows_are_sharded {
+                let mut jobs = Vec::new();
+                for (row_index, (row, plan)) in rows.iter().zip(&row_plans).enumerate().rev() {
+                    let ValidationRowReadPlan::Sharded { header, candidates } = plan else {
+                        continue;
+                    };
+                    let mut shard_candidates = vec![Vec::new(); header.shard_count];
+                    for &index in candidates {
+                        let shard = validation_delta_shard(outpoints[index], header.shard_count);
+                        if validation_shard_is_populated(*header, shard) {
+                            shard_candidates[usize::from(shard)].push(index);
                         }
-                        let jobs = shard_candidates
+                    }
+                    jobs.extend(
+                        shard_candidates
                             .into_iter()
                             .enumerate()
                             .filter(|(_, candidates)| !candidates.is_empty())
-                            .map(|(shard, candidates)| {
-                                (
-                                    u8::try_from(shard).expect("validation shard fits u8"),
+                            .map(|(shard, candidates)| ValidationShardReadJob {
+                                height: row.height,
+                                row_index,
+                                shard: u8::try_from(shard).expect("validation shard fits u8"),
+                                candidates,
+                            }),
+                    );
+                }
+                for (_row_index, index, outpoint, utxo) in
+                    self.lookup_validation_shards_parallel(&jobs, outpoints)?
+                {
+                    if results[index].is_none() {
+                        results[index] = Some((outpoint, utxo));
+                    }
+                }
+            } else {
+                for (row_index, (row, plan)) in rows.iter().zip(row_plans).enumerate().rev() {
+                    match plan {
+                        ValidationRowReadPlan::Empty => {}
+                        ValidationRowReadPlan::Legacy(candidates) => {
+                            let encoded = deltas
+                                .get(row.height)?
+                                .ok_or(UtxoError::Malformed("missing validation delta row"))?;
+                            legacy_hits.push((
+                                row.height,
+                                u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+                            ));
+                            for index in candidates {
+                                if results[index].is_some() {
+                                    continue;
+                                }
+                                let outpoint = outpoints[index];
+                                if let Some(update) =
+                                    validation_delta_lookup(encoded.value(), outpoint)?
+                                {
+                                    results[index] = Some((outpoint, update.utxo));
+                                }
+                            }
+                        }
+                        ValidationRowReadPlan::Sharded { header, candidates } => {
+                            let mut shard_candidates = vec![Vec::new(); header.shard_count];
+                            for index in candidates {
+                                if results[index].is_some() {
+                                    continue;
+                                }
+                                let shard =
+                                    validation_delta_shard(outpoints[index], header.shard_count);
+                                if validation_shard_is_populated(header, shard) {
+                                    shard_candidates[usize::from(shard)].push(index);
+                                }
+                            }
+                            let jobs = shard_candidates
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(_, candidates)| !candidates.is_empty())
+                                .map(|(shard, candidates)| ValidationShardReadJob {
+                                    height: row.height,
+                                    row_index,
+                                    shard: u8::try_from(shard).expect("validation shard fits u8"),
                                     candidates,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        if jobs.len() > 1 {
-                            for (index, outpoint, utxo) in
-                                self.lookup_validation_shards_parallel(row.height, jobs, outpoints)?
+                                })
+                                .collect::<Vec<_>>();
+                            for (_, index, outpoint, utxo) in
+                                self.lookup_validation_shards_parallel(&jobs, outpoints)?
                             {
                                 results[index] = Some((outpoint, utxo));
-                            }
-                        } else {
-                            for (shard, candidates) in jobs {
-                                let key = validation_delta_shard_key(row.height, shard);
-                                let encoded_shard = delta_shards.get(key.as_slice())?.ok_or(
-                                    UtxoError::Malformed("missing validation delta shard"),
-                                )?;
-                                for index in candidates {
-                                    let outpoint = outpoints[index];
-                                    if let Some(update) =
-                                        validation_delta_lookup(encoded_shard.value(), outpoint)?
-                                    {
-                                        results[index] = Some((outpoint, update.utxo));
-                                    }
-                                }
                             }
                         }
                     }
@@ -3049,15 +3102,28 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        let first = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([59; 32]),
+        };
         store
             .commit_connect_batch(&[ConnectTransition {
                 expected_parent: genesis.hash,
-                next: ExecutionTip {
-                    height: 1,
-                    hash: BlockHash::from_byte_array([59; 32]),
-                },
+                next: first,
                 spent: Vec::new(),
                 created: created.clone(),
+                transaction_undos: Vec::new(),
+            }])
+            .unwrap();
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: first.hash,
+                next: ExecutionTip {
+                    height: 2,
+                    hash: BlockHash::from_byte_array([60; 32]),
+                },
+                spent: vec![keys[0]],
+                created: Vec::new(),
                 transaction_undos: Vec::new(),
             }])
             .unwrap();
@@ -3066,7 +3132,7 @@ mod tests {
         let expected = created
             .iter()
             .rev()
-            .map(|(outpoint, coin)| (*outpoint, Some(coin.clone())))
+            .map(|(outpoint, coin)| (*outpoint, (*outpoint != keys[0]).then_some(coin.clone())))
             .collect::<Vec<_>>();
         assert_eq!(store.get_many(&requested).unwrap(), expected);
     }

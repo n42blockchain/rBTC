@@ -2976,8 +2976,9 @@ async fn sync_headers(
         )
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
     println!(
-        "resuming headers-first sync from height {} (local-clock fallback until network-time aggregation lands)",
-        dag.active_tip().height
+        "resuming headers-first sync from {}:{} (local-clock fallback until network-time aggregation lands)",
+        dag.active_tip().height,
+        dag.active_tip().hash
     );
 
     loop {
@@ -3000,17 +3001,19 @@ async fn sync_headers(
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         dag = candidate;
         println!(
-            "validated and persisted {} headers; active height {}",
+            "validated and persisted {} headers; active tip {}:{}",
             unseen.len(),
-            dag.active_tip().height
+            dag.active_tip().height,
+            dag.active_tip().hash
         );
         if response_count < MAX_HEADERS_PER_RESPONSE {
             break;
         }
     }
     println!(
-        "peer returned no more headers at height {}",
-        dag.active_tip().height
+        "peer returned no more headers at {}:{}",
+        dag.active_tip().height,
+        dag.active_tip().hash
     );
     Ok(dag)
 }
