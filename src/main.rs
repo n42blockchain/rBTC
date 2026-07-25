@@ -26,6 +26,7 @@ use rbtc::{
         WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
         explorer_events_router, explorer_router, rpc_router, wallet_router_with_sink,
     },
+    archive::bounded_archive_prefix_len,
     block_execution::{
         BlockDeploymentContext, BlockExecutionError, connect_prevalidated_active_blocks_with_txids,
         disconnect_execution_tip,
@@ -5378,7 +5379,7 @@ async fn download_execute_batch(
     let batch_len = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(maximum_batch_size);
-    let expected = (0..batch_len)
+    let mut expected = (0..batch_len)
         .map(|offset| {
             let offset = u32::try_from(offset).expect("block batch fits u32");
             let height = next_height
@@ -5469,6 +5470,23 @@ async fn download_execute_batch(
         transaction_ids.push(txids);
         serialized.push(bytes);
     }
+    let archive_batch_len =
+        bounded_archive_prefix_len(&serialized).map_err(|error| error.to_string())?;
+    let mut carried_prefetch = if archive_batch_len < serialized.len() {
+        let downloaded_len = serialized.len();
+        let carried = serialized.split_off(archive_batch_len);
+        expected.truncate(archive_batch_len);
+        blocks.truncate(archive_batch_len);
+        deployment_contexts.truncate(archive_batch_len);
+        transaction_ids.truncate(archive_batch_len);
+        eprintln!(
+            "validation batch reduced from {downloaded_len} to {archive_batch_len} blocks at the archive record-byte ceiling; carrying {} verified blocks into the next batch",
+            carried.len()
+        );
+        carried
+    } else {
+        Vec::new()
+    };
     let structure_validated_at = Instant::now();
     let mut prefetch_error = None;
     let next_prefetch_hashes = if prefetch_next_batch {
@@ -5476,13 +5494,19 @@ async fn download_execute_batch(
             .last()
             .expect("non-empty block batch has a last header")
             .height;
-        let remaining_after_batch = execution_ceiling.saturating_sub(last_height);
+        let carried_len =
+            u32::try_from(carried_prefetch.len()).expect("validation prefetch length fits u32");
+        let carried_height = last_height
+            .checked_add(carried_len)
+            .expect("bounded carried prefetch height can advance");
+        let remaining_after_carry = execution_ceiling.saturating_sub(carried_height);
         let prefetch_limit = validation_prefetch_limit(maximum_batch_size);
-        let prefetch_len = usize::try_from(remaining_after_batch)
+        let prefetch_capacity = prefetch_limit.saturating_sub(carried_prefetch.len());
+        let prefetch_len = usize::try_from(remaining_after_carry)
             .unwrap_or(usize::MAX)
-            .min(prefetch_limit);
+            .min(prefetch_capacity);
         if prefetch_len > 0 {
-            let next_height = last_height
+            let next_height = carried_height
                 .checked_add(1)
                 .expect("non-final validation batch height can advance");
             let next_hashes = (0..prefetch_len)
@@ -5632,8 +5656,9 @@ async fn download_execute_batch(
                 prefetch_started.elapsed(),
             )
         };
-    let execution_prefetch_count = downloaded_prefetch.len();
-    prefetched_blocks.serialized = downloaded_prefetch;
+    let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
+    carried_prefetch.extend(downloaded_prefetch);
+    prefetched_blocks.serialized = carried_prefetch;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {

@@ -32,6 +32,40 @@ const MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER: u64 = 32 * 1024 * 1024;
 const MIN_ZSTD_WINDOW_LOG: u32 = 23;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 
+/// Returns the longest leading block slice that fits one archive's canonical
+/// record-byte ceiling.
+///
+/// Individual blocks are checked against the same consensus payload bound as
+/// [`encode_archive`]. A non-empty valid input always admits at least one
+/// block because the per-block ceiling is smaller than the archive ceiling.
+pub fn bounded_archive_prefix_len(blocks: &[Vec<u8>]) -> Result<usize, ArchiveError> {
+    bounded_archive_prefix_len_from_lengths(blocks.iter().map(Vec::len))
+}
+
+fn bounded_archive_prefix_len_from_lengths(
+    block_lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, ArchiveError> {
+    let mut records_bytes = 0_u64;
+    let mut block_count = 0;
+    for block_len in block_lengths {
+        if block_len > MAX_BLOCK_BYTES {
+            return Err(ArchiveError::Invalid("block too large"));
+        }
+        let next_records_bytes = records_bytes
+            .checked_add(4)
+            .and_then(|bytes| {
+                bytes.checked_add(u64::try_from(block_len).expect("block length fits u64"))
+            })
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if next_records_bytes > MAX_RECORDS_BYTES {
+            return Ok(block_count);
+        }
+        records_bytes = next_records_bytes;
+        block_count += 1;
+    }
+    Ok(block_count)
+}
+
 /// Archive read/write failure.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -395,6 +429,25 @@ mod tests {
         ));
         assert!(matches!(
             write_archive(&file, 1, &[vec![0; MAX_BLOCK_BYTES + 1]]),
+            Err(ArchiveError::Invalid("block too large"))
+        ));
+    }
+
+    #[test]
+    fn reports_the_longest_prefix_within_the_record_budget() {
+        let record_bytes = u64::try_from(MAX_BLOCK_BYTES).unwrap() + 4;
+        let fitting_blocks = usize::try_from(MAX_RECORDS_BYTES / record_bytes).unwrap();
+        let lengths = vec![MAX_BLOCK_BYTES; fitting_blocks + 1];
+        assert_eq!(
+            bounded_archive_prefix_len_from_lengths(lengths).unwrap(),
+            fitting_blocks
+        );
+        assert_eq!(
+            bounded_archive_prefix_len_from_lengths([1, 2, 3]).unwrap(),
+            3
+        );
+        assert!(matches!(
+            bounded_archive_prefix_len_from_lengths([MAX_BLOCK_BYTES + 1]),
             Err(ArchiveError::Invalid("block too large"))
         ));
     }
