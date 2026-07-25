@@ -44,6 +44,7 @@ use rbtc::{
     chain_store::{
         ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
     },
+    core_snapshot::verify_core31_snapshot,
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
@@ -167,13 +168,16 @@ impl NetworkExecutionMode {
 }
 
 #[derive(Clone)]
-struct SnapshotActivationOptions {
-    path: PathBuf,
-    height: u32,
-    block_hash: BlockHash,
-    utxo_count: u64,
-    records_bytes: u64,
-    records_sha256: String,
+enum SnapshotActivationOptions {
+    Rbtc {
+        path: PathBuf,
+        height: u32,
+        block_hash: BlockHash,
+        utxo_count: u64,
+        records_bytes: u64,
+        records_sha256: String,
+    },
+    Core(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1472,6 +1476,37 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
         .snapshot
         .as_ref()
         .expect("caller checked snapshot activation mode");
+    match snapshot {
+        SnapshotActivationOptions::Rbtc {
+            path,
+            height,
+            block_hash,
+            utxo_count,
+            records_bytes,
+            records_sha256,
+        } => activate_rbtc_assumed_snapshot(
+            options,
+            path,
+            *height,
+            *block_hash,
+            *utxo_count,
+            *records_bytes,
+            records_sha256,
+        ),
+        SnapshotActivationOptions::Core(path) => activate_core_assumed_snapshot(options, path),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_rbtc_assumed_snapshot(
+    options: &Options,
+    snapshot: &std::path::Path,
+    height: u32,
+    block_hash: BlockHash,
+    utxo_count: u64,
+    records_bytes: u64,
+    records_sha256: &str,
+) -> Result<(), String> {
     let data_dir = options
         .data_dir
         .as_ref()
@@ -1483,17 +1518,17 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let trusted = SnapshotTrustAnchor::new(
         options.network,
-        snapshot.height,
-        snapshot.block_hash,
-        snapshot.utxo_count,
-        snapshot.records_bytes,
-        snapshot.records_sha256.clone(),
+        height,
+        block_hash,
+        utxo_count,
+        records_bytes,
+        records_sha256,
     )
     .map_err(|error| error.to_string())?;
     let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
         .map_err(|error| error.to_string())?;
     let now = u64::from(unix_time()?);
-    let manifest = verify_snapshot_with_trust(&snapshot.path, &trusted)
+    let manifest = verify_snapshot_with_trust(snapshot, &trusted)
         .and_then(|verified| {
             verified.assume_into(
                 &chainstate,
@@ -1507,6 +1542,35 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
     println!(
         "activated assumed UTXO snapshot at {}:{} with {} entries/{} canonical bytes; background genesis validation remains required",
         manifest.height, manifest.block_hash, manifest.utxo_count, manifest.records_bytes
+    );
+    Ok(())
+}
+
+fn activate_core_assumed_snapshot(
+    options: &Options,
+    snapshot: &std::path::Path,
+) -> Result<(), String> {
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("Core snapshot parser requires data directory");
+    let header_store =
+        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
+    let headers = header_store
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    let now = u64::from(unix_time()?);
+    let verified =
+        verify_core31_snapshot(snapshot, &headers, now).map_err(|error| error.to_string())?;
+    let anchor = verified.anchor();
+    let metadata = verified
+        .assume_into(&chainstate, &headers, DEFAULT_HOT_WINDOW_SECS)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "activated Bitcoin Core 31 assumed UTXO snapshot at {}:{} with {} entries and chain transaction count {}; background genesis validation remains required",
+        anchor.height, metadata.base_block_hash, metadata.coins_count, anchor.chain_tx_count
     );
     Ok(())
 }
@@ -6367,6 +6431,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut signet_challenges = Vec::new();
     let mut signet_seed_values = Vec::new();
     let mut snapshot_path = None;
+    let mut core_snapshot_path = None;
     let mut snapshot_height = None;
     let mut snapshot_block_hash = None;
     let mut snapshot_utxo_count = None;
@@ -6505,6 +6570,17 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 snapshot_path = Some(PathBuf::from(required_option_value(
                     &mut args,
                     "--assumeutxo-snapshot",
+                )?));
+            }
+            "--core-assumeutxo-snapshot" => {
+                if core_snapshot_path.is_some() {
+                    return Err(
+                        "--core-assumeutxo-snapshot cannot be supplied more than once".to_owned(),
+                    );
+                }
+                core_snapshot_path = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--core-assumeutxo-snapshot",
                 )?));
             }
             "--finalize-assumeutxo" => {
@@ -6754,7 +6830,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                         .to_owned(),
                 );
             }
-            Some(SnapshotActivationOptions {
+            Some(SnapshotActivationOptions::Rbtc {
                 path,
                 height,
                 block_hash,
@@ -6770,11 +6846,41 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     };
+    if core_snapshot_path.is_some() {
+        if data_dir.is_none() {
+            return Err("--core-assumeutxo-snapshot requires --data-dir".to_owned());
+        }
+        if snapshot.is_some() {
+            return Err(
+                "--core-assumeutxo-snapshot conflicts with --assumeutxo-snapshot".to_owned(),
+            );
+        }
+        if fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+        {
+            return Err(
+                "Core snapshot activation is offline and conflicts with peer, fetch, headers-db, once, explorer, and wallet modes"
+                    .to_owned(),
+            );
+        }
+    }
+    let snapshot = match (snapshot, core_snapshot_path) {
+        (snapshot @ Some(_), None) => snapshot,
+        (None, Some(path)) => Some(SnapshotActivationOptions::Core(path)),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("snapshot conflict was checked above"),
+    };
+    let snapshot_activation = snapshot.is_some();
     if finalize_assumeutxo.is_some() {
         if data_dir.is_none() {
             return Err("--finalize-assumeutxo requires --data-dir".to_owned());
         }
-        if snapshot.is_some()
+        if snapshot_activation
             || fetch_block.is_some()
             || headers_db.is_some()
             || once
@@ -6795,7 +6901,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             if data_dir.is_none() {
                 return Err("bounded genesis validation requires --data-dir".to_owned());
             }
-            if snapshot.is_some()
+            if snapshot_activation
                 || finalize_assumeutxo.is_some()
                 || fetch_block.is_some()
                 || headers_db.is_some()
@@ -6819,7 +6925,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         if data_dir.is_none() {
             return Err("--complete-assumeutxo requires --data-dir".to_owned());
         }
-        if snapshot.is_some()
+        if snapshot_activation
             || finalize_assumeutxo.is_some()
             || validation_target.is_some()
             || fetch_block.is_some()
@@ -6838,7 +6944,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         if data_dir.is_none() {
             return Err("--background-assumeutxo requires --data-dir".to_owned());
         }
-        if snapshot.is_some()
+        if snapshot_activation
             || finalize_assumeutxo.is_some()
             || validation_target.is_some()
             || complete_assumeutxo.is_some()
@@ -7075,6 +7181,7 @@ fn print_usage() {
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-batch-size N] [--validation-pause-ms MS]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --assumeutxo-snapshot FILE --snapshot-height HEIGHT --snapshot-blockhash HASH --snapshot-utxo-count COUNT --snapshot-records-bytes BYTES --snapshot-records-sha256 HEX\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet --core-assumeutxo-snapshot CORE_DUMPTXOUTSET_FILE\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "PEER OPTIONS:\n",
@@ -9540,13 +9647,23 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let snapshot = options.snapshot.unwrap();
-        assert_eq!(snapshot.path, PathBuf::from("/tmp/base.rbtc"));
-        assert_eq!(snapshot.height, 100);
-        assert_eq!(snapshot.block_hash, BlockHash::from_str(hash).unwrap());
-        assert_eq!(snapshot.utxo_count, 1);
-        assert_eq!(snapshot.records_bytes, 66);
-        assert_eq!(snapshot.records_sha256, digest);
+        let SnapshotActivationOptions::Rbtc {
+            path,
+            height,
+            block_hash,
+            utxo_count,
+            records_bytes,
+            records_sha256,
+        } = options.snapshot.unwrap()
+        else {
+            panic!("expected rBTC snapshot options");
+        };
+        assert_eq!(path, PathBuf::from("/tmp/base.rbtc"));
+        assert_eq!(height, 100);
+        assert_eq!(block_hash, BlockHash::from_str(hash).unwrap());
+        assert_eq!(utxo_count, 1);
+        assert_eq!(records_bytes, 66);
+        assert_eq!(records_sha256, digest);
 
         for arguments in [
             vec![
@@ -9580,6 +9697,42 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_core31_snapshot_activation_without_manual_identity() {
+        let options = parse_options(
+            [
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-core-snapshot-parser",
+                "--core-assumeutxo-snapshot",
+                "/tmp/utxo.dat",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            options.snapshot,
+            Some(SnapshotActivationOptions::Core(path))
+                if path == PathBuf::from("/tmp/utxo.dat")
+        ));
+        assert!(
+            parse_options(
+                [
+                    "--network",
+                    "testnet4",
+                    "--core-assumeutxo-snapshot",
+                    "/tmp/utxo.dat",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9632,7 +9785,7 @@ mod tests {
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
-            snapshot: Some(SnapshotActivationOptions {
+            snapshot: Some(SnapshotActivationOptions::Rbtc {
                 path,
                 height: 1,
                 block_hash: info.hash,
@@ -11527,7 +11680,7 @@ mod tests {
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
-            snapshot: Some(SnapshotActivationOptions {
+            snapshot: Some(SnapshotActivationOptions::Rbtc {
                 path: snapshot_path,
                 height: 1,
                 block_hash,
@@ -11718,7 +11871,7 @@ mod tests {
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
             ibd_policy: IbdPolicy::for_network(Network::Regtest),
-            snapshot: Some(SnapshotActivationOptions {
+            snapshot: Some(SnapshotActivationOptions::Rbtc {
                 path: snapshot_path,
                 height: 1,
                 block_hash: first_hash,

@@ -481,10 +481,19 @@ membership alone does not authenticate arbitrary snapshot contents. Independent
 genesis-to-base block execution and an exact UTXO-set hash match are what remove
 the assumed-state marker.
 
-The implemented local rBTC snapshot format v3 includes an anchor height/hash,
-count, canonical uncompressed byte length, and a SHA-256 of that entry stream.
-It is not yet compatible with Core's `dumptxoutset` file and has no automatic
-download source. Container self-checks detect damage but do not establish
+The implemented Core 31 loader accepts `dumptxoutset` v2 metadata and grouped
+coins, enforces canonical CompactSize/Core VARINT, amount and script
+decompression, count/order/height/value/EOF bounds, and computes Core's exact
+double-SHA256 UTXO-set commitment before activation. Its second streaming pass
+rechecks an rBTC semantic digest inside the atomic chainstate transaction. Core
+numeric-vout order is retained for the Core commitment, while each bounded
+txid group is reordered for rBTC's existing little-endian-vout database key.
+There is not yet an automatic snapshot download source or a release acceptance
+fixture made by an external Core 31 binary.
+
+The local rBTC snapshot format v3 includes an anchor height/hash, count,
+canonical uncompressed byte length, and a SHA-256 of that entry stream.
+Container self-checks detect damage but do not establish
 authenticity: activation additionally requires an independently distributed
 network/height/block-hash/count/record-bytes/records-SHA-256 tuple and an exact
 match at that height in the selected active header chain. Trusted startup

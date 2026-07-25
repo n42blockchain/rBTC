@@ -133,7 +133,11 @@ Primary references:
   the assumed marker. Add bounded resumable download from explicitly configured
   sources, but do not invent a P2P snapshot service or claim that a file checksum
   proves chainstate correctness. The existing rBTC v3 container remains a local
-  migration format until Core compatibility is accepted.
+  migration format until Core compatibility is accepted. The Core 31 v2 parser,
+  release-pinned identities, exact `hash_serialized` calculation, bounded txid
+  grouping, two-pass race closure, atomic activation API, and offline CLI are
+  implemented; an externally generated Core fixture, download transport, and
+  end-to-end mainnet acceptance remain open.
 - [ ] **Choose the hot/cold UTXO boundary from replay data, not the current
   60-day constant.** Persist a network-scoped histogram of spent-output coin age
   in blocks, and report for candidate windows the share of the current UTXO set

@@ -11,6 +11,7 @@ pub mod blockchain;
 pub mod chain_store;
 pub mod chainstate;
 pub mod consensus;
+pub mod core_snapshot;
 pub mod deployments;
 pub mod execution_store;
 pub mod explorer_store;
