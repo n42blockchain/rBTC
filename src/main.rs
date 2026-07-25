@@ -33,8 +33,9 @@ use rbtc::{
     },
     archive::bounded_archive_prefix_len,
     block_execution::{
-        BlockDeploymentContext, BlockExecutionError, connect_prevalidated_active_blocks_with_txids,
-        disconnect_execution_tip,
+        BlockDeploymentContext, BlockExecutionError,
+        connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
+        prefetch_prevalidated_active_block_utxos,
     },
     blockchain::{
         AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
@@ -5563,127 +5564,192 @@ async fn download_execute_batch(
     };
     let now = u64::from(unix_time()?);
     let staged_at;
-    let (applied_blocks, downloaded_prefetch, execution_core_at, prefetch_elapsed) =
-        if next_prefetch_hashes.is_empty() {
-            ledger
-                .stage(next_height, &serialized)
-                .map_err(|error| error.to_string())?;
-            staged_at = Instant::now();
-            let applied_blocks = connect_prevalidated_active_blocks_with_txids(
-                chainstate,
-                headers,
-                &blocks,
-                &transaction_ids,
-                now,
-                DEFAULT_HOT_WINDOW_SECS,
-                &deployment_contexts,
-            )
-            .map_err(|error| PeerRunError::block(&error))?;
-            (applied_blocks, Vec::new(), Instant::now(), Duration::ZERO)
-        } else if tokio::runtime::Handle::current().runtime_flavor()
-            == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            let runtime = tokio::runtime::Handle::current();
-            let (
+    let (
+        applied_blocks,
+        downloaded_prefetch,
+        execution_core_at,
+        prefetch_elapsed,
+        utxo_prefetch_elapsed,
+    ) = if next_prefetch_hashes.is_empty() {
+        let (stage_result, branch_staged_at, utxo_result, utxo_elapsed) =
+            std::thread::scope(|scope| {
+                let utxos = scope.spawn(|| {
+                    let started = Instant::now();
+                    let result = prefetch_prevalidated_active_block_utxos(
+                        chainstate,
+                        &blocks,
+                        &transaction_ids,
+                    );
+                    (result, started.elapsed())
+                });
+                let stage_result = ledger.stage(next_height, &serialized);
+                let branch_staged_at = Instant::now();
+                let (utxo_result, utxo_elapsed) = utxos
+                    .join()
+                    .expect("scoped UTXO-prefetch thread must not panic");
+                (stage_result, branch_staged_at, utxo_result, utxo_elapsed)
+            });
+        stage_result.map_err(|error| error.to_string())?;
+        staged_at = branch_staged_at;
+        let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
+        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+            chainstate,
+            headers,
+            &blocks,
+            &transaction_ids,
+            prefetched_utxos,
+            now,
+            DEFAULT_HOT_WINDOW_SECS,
+            &deployment_contexts,
+        )
+        .map_err(|error| PeerRunError::block(&error))?;
+        (
+            applied_blocks,
+            Vec::new(),
+            Instant::now(),
+            Duration::ZERO,
+            utxo_elapsed,
+        )
+    } else if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        let runtime = tokio::runtime::Handle::current();
+        let (
+            stage_result,
+            branch_staged_at,
+            execution_result,
+            execution_core_at,
+            prefetch_result,
+            prefetch_elapsed,
+            utxo_prefetch_elapsed,
+        ) = std::thread::scope(|scope| {
+            let prefetch = scope.spawn(|| {
+                let started = Instant::now();
+                let result = runtime.block_on(download_execution_prefetch(
+                    session,
+                    auxiliary_session,
+                    &next_prefetch_hashes,
+                    compact_candidates,
+                ));
+                (result, started.elapsed())
+            });
+            let utxos = scope.spawn(|| {
+                let started = Instant::now();
+                let result =
+                    prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
+                (result, started.elapsed())
+            });
+            let stage_result = ledger.stage(next_height, &serialized);
+            let branch_staged_at = Instant::now();
+            let (utxo_result, utxo_prefetch_elapsed) = utxos
+                .join()
+                .expect("scoped UTXO-prefetch thread must not panic");
+            let execution_result = match (stage_result.as_ref(), utxo_result) {
+                (Ok(()), Ok(prefetched_utxos)) => {
+                    Some(connect_prevalidated_active_blocks_with_txids_and_utxos(
+                        chainstate,
+                        headers,
+                        &blocks,
+                        &transaction_ids,
+                        prefetched_utxos,
+                        now,
+                        DEFAULT_HOT_WINDOW_SECS,
+                        &deployment_contexts,
+                    ))
+                }
+                (Ok(()), Err(error)) => Some(Err(error)),
+                (Err(_), _) => None,
+            };
+            let execution_core_at = Instant::now();
+            let (prefetch_result, prefetch_elapsed) = prefetch
+                .join()
+                .expect("scoped execution-prefetch thread must not panic");
+            (
                 stage_result,
                 branch_staged_at,
                 execution_result,
                 execution_core_at,
                 prefetch_result,
                 prefetch_elapsed,
-            ) = std::thread::scope(|scope| {
-                let prefetch = scope.spawn(|| {
+                utxo_prefetch_elapsed,
+            )
+        });
+        stage_result.map_err(|error| error.to_string())?;
+        staged_at = branch_staged_at;
+        let execution_result =
+            execution_result.expect("successful staging starts chainstate execution");
+        let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
+        let downloaded_prefetch = match prefetch_result {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                prefetch_error = Some(error);
+                Vec::new()
+            }
+        };
+        (
+            applied_blocks,
+            downloaded_prefetch,
+            execution_core_at,
+            prefetch_elapsed,
+            utxo_prefetch_elapsed,
+        )
+    } else {
+        let (stage_result, branch_staged_at, utxo_result, utxo_elapsed) =
+            std::thread::scope(|scope| {
+                let utxos = scope.spawn(|| {
                     let started = Instant::now();
-                    let result = runtime.block_on(download_execution_prefetch(
-                        session,
-                        auxiliary_session,
-                        &next_prefetch_hashes,
-                        compact_candidates,
-                    ));
+                    let result = prefetch_prevalidated_active_block_utxos(
+                        chainstate,
+                        &blocks,
+                        &transaction_ids,
+                    );
                     (result, started.elapsed())
                 });
                 let stage_result = ledger.stage(next_height, &serialized);
                 let branch_staged_at = Instant::now();
-                let execution_result = stage_result.as_ref().ok().map(|()| {
-                    connect_prevalidated_active_blocks_with_txids(
-                        chainstate,
-                        headers,
-                        &blocks,
-                        &transaction_ids,
-                        now,
-                        DEFAULT_HOT_WINDOW_SECS,
-                        &deployment_contexts,
-                    )
-                });
-                let execution_core_at = Instant::now();
-                let (prefetch_result, prefetch_elapsed) = prefetch
+                let (utxo_result, utxo_elapsed) = utxos
                     .join()
-                    .expect("scoped execution-prefetch thread must not panic");
-                (
-                    stage_result,
-                    branch_staged_at,
-                    execution_result,
-                    execution_core_at,
-                    prefetch_result,
-                    prefetch_elapsed,
-                )
+                    .expect("scoped UTXO-prefetch thread must not panic");
+                (stage_result, branch_staged_at, utxo_result, utxo_elapsed)
             });
-            stage_result.map_err(|error| error.to_string())?;
-            staged_at = branch_staged_at;
-            let execution_result =
-                execution_result.expect("successful staging starts chainstate execution");
-            let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
-            let downloaded_prefetch = match prefetch_result {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    prefetch_error = Some(error);
-                    Vec::new()
-                }
-            };
-            (
-                applied_blocks,
-                downloaded_prefetch,
-                execution_core_at,
-                prefetch_elapsed,
-            )
-        } else {
-            ledger
-                .stage(next_height, &serialized)
-                .map_err(|error| error.to_string())?;
-            staged_at = Instant::now();
-            let applied_blocks = connect_prevalidated_active_blocks_with_txids(
-                chainstate,
-                headers,
-                &blocks,
-                &transaction_ids,
-                now,
-                DEFAULT_HOT_WINDOW_SECS,
-                &deployment_contexts,
-            )
-            .map_err(|error| PeerRunError::block(&error))?;
-            let execution_core_at = Instant::now();
-            let prefetch_started = Instant::now();
-            let downloaded_prefetch = match download_execution_prefetch(
-                session,
-                auxiliary_session,
-                &next_prefetch_hashes,
-                compact_candidates,
-            )
-            .await
-            {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    prefetch_error = Some(error);
-                    Vec::new()
-                }
-            };
-            (
-                applied_blocks,
-                downloaded_prefetch,
-                execution_core_at,
-                prefetch_started.elapsed(),
-            )
+        stage_result.map_err(|error| error.to_string())?;
+        staged_at = branch_staged_at;
+        let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
+        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+            chainstate,
+            headers,
+            &blocks,
+            &transaction_ids,
+            prefetched_utxos,
+            now,
+            DEFAULT_HOT_WINDOW_SECS,
+            &deployment_contexts,
+        )
+        .map_err(|error| PeerRunError::block(&error))?;
+        let execution_core_at = Instant::now();
+        let prefetch_started = Instant::now();
+        let downloaded_prefetch = match download_execution_prefetch(
+            session,
+            auxiliary_session,
+            &next_prefetch_hashes,
+            compact_candidates,
+        )
+        .await
+        {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                prefetch_error = Some(error);
+                Vec::new()
+            }
         };
+        (
+            applied_blocks,
+            downloaded_prefetch,
+            execution_core_at,
+            prefetch_started.elapsed(),
+            utxo_elapsed,
+        )
+    };
     let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
     carried_prefetch.extend(downloaded_prefetch);
     prefetched_blocks.serialized = carried_prefetch;
@@ -5726,7 +5792,7 @@ async fn download_execute_batch(
         .map_err(|error| error.to_string())?;
     let published_at = Instant::now();
     println!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -5739,6 +5805,7 @@ async fn download_execute_batch(
         staged_at.duration_since(structure_validated_at).as_millis(),
         executed_at.duration_since(staged_at).as_millis(),
         execution_core_at.duration_since(staged_at).as_millis(),
+        utxo_prefetch_elapsed.as_millis(),
         prefetch_elapsed.as_millis(),
         indexed_at.duration_since(executed_at).as_millis(),
         published_at.duration_since(indexed_at).as_millis(),

@@ -48,6 +48,16 @@ pub struct BlockDeploymentContext {
     pub subsidy_sats: u64,
 }
 
+/// Read-only durable UTXOs prepared for one structurally authenticated batch.
+///
+/// Keeping this value separate from execution lets archive staging and the
+/// chainstate read phase overlap without permitting any chainstate mutation
+/// before the staged archive is durable.
+#[derive(Debug)]
+pub struct ActiveBlockUtxoPrefetch {
+    entries: Vec<(OutPointKey, Option<Utxo>)>,
+}
+
 /// Failures while connecting one downloaded active-chain block.
 #[derive(Debug, Error)]
 pub enum BlockExecutionError {
@@ -119,6 +129,9 @@ pub enum BlockExecutionError {
     /// Precomputed transaction identifiers do not align with their blocks.
     #[error("precomputed transaction identifiers do not match block batch")]
     TransactionIdCount,
+    /// Prepared UTXOs do not belong to the batch being connected.
+    #[error("prepared UTXOs do not match block batch inputs")]
+    UtxoPrefetchMismatch,
     /// A write-ahead transition does not match either its pre- or post-state.
     #[error("pending transition UTXO state is internally inconsistent")]
     InconsistentTransition,
@@ -318,6 +331,7 @@ pub fn connect_active_blocks(
         deployments,
         false,
         None,
+        None,
     )
 }
 
@@ -343,6 +357,7 @@ pub fn connect_prevalidated_active_blocks(
         deployments,
         true,
         None,
+        None,
     )
 }
 
@@ -367,6 +382,60 @@ pub fn connect_prevalidated_active_blocks_with_txids(
         deployments,
         true,
         Some(transaction_ids),
+        None,
+    )
+}
+
+/// Reads the external durable UTXOs required by one prevalidated block batch.
+///
+/// Outputs created earlier in the same batch are deliberately excluded because
+/// execution resolves them through its cumulative in-memory overlay.
+pub fn prefetch_prevalidated_active_block_utxos(
+    chainstate: &RedbChainStore,
+    blocks: &[Block],
+    transaction_ids: &[ValidatedBlockTransactionIds],
+) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
+    if transaction_ids.len() != blocks.len()
+        || transaction_ids
+            .iter()
+            .zip(blocks)
+            .any(|(ids, block)| ids.as_slice().len() != block.txdata.len())
+    {
+        return Err(BlockExecutionError::TransactionIdCount);
+    }
+    let output_count = blocks
+        .iter()
+        .flat_map(|block| &block.txdata)
+        .map(|transaction| transaction.output.len())
+        .sum::<usize>();
+    let input_outpoints =
+        external_batch_input_outpoints(blocks, Some(transaction_ids), output_count);
+    let entries = chainstate.get_many(&input_outpoints)?;
+    Ok(ActiveBlockUtxoPrefetch { entries })
+}
+
+/// Connects a prevalidated batch using UTXOs read before archive staging ended.
+#[allow(clippy::too_many_arguments)]
+pub fn connect_prevalidated_active_blocks_with_txids_and_utxos(
+    chainstate: &RedbChainStore,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    transaction_ids: &[ValidatedBlockTransactionIds],
+    prefetched_utxos: ActiveBlockUtxoPrefetch,
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    connect_active_blocks_inner(
+        chainstate,
+        headers,
+        blocks,
+        now,
+        hot_window_secs,
+        deployments,
+        true,
+        Some(transaction_ids),
+        Some(prefetched_utxos),
     )
 }
 
@@ -427,6 +496,7 @@ fn connect_active_blocks_inner(
     deployments: &[BlockDeploymentContext],
     structure_prevalidated: bool,
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
+    prefetched_utxos: Option<ActiveBlockUtxoPrefetch>,
 ) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
@@ -458,7 +528,20 @@ fn connect_active_blocks_inner(
         chainstate,
         input_outpoints.len().saturating_add(output_count),
     );
-    cumulative.prefetch(&input_outpoints)?;
+    if let Some(prefetched_utxos) = prefetched_utxos {
+        if prefetched_utxos.entries.len() != input_outpoints.len()
+            || prefetched_utxos
+                .entries
+                .iter()
+                .zip(&input_outpoints)
+                .any(|((actual, _), expected)| actual != expected)
+        {
+            return Err(BlockExecutionError::UtxoPrefetchMismatch);
+        }
+        cumulative.seed_prefetched(prefetched_utxos.entries);
+    } else {
+        cumulative.prefetch(&input_outpoints)?;
+    }
     let mut applied_blocks = Vec::with_capacity(blocks.len());
     let mut transitions = Vec::with_capacity(blocks.len());
     let mut deferred_scripts = Vec::new();
@@ -783,12 +866,16 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
 
     fn prefetch(&self, outpoints: &[OutPointKey]) -> Result<(), UtxoError> {
         let prefetched = self.base.get_many(outpoints)?;
+        self.seed_prefetched(prefetched);
+        Ok(())
+    }
+
+    fn seed_prefetched(&self, prefetched: Vec<(OutPointKey, Option<Utxo>)>) {
         let mut state = self.state.lock().expect("overlay lock not poisoned");
         for (outpoint, value) in prefetched {
             state.original.insert(outpoint, value.clone());
             state.current.insert(outpoint, value);
         }
-        Ok(())
     }
 }
 
@@ -1125,6 +1212,103 @@ mod tests {
             ),
             vec![external.into()]
         );
+    }
+
+    #[test]
+    fn prepared_utxos_connect_exact_batch_and_reject_mismatch() {
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let previous = OutPoint::new(Txid::from_byte_array([72; 32]), 0);
+        chainstate
+            .apply(
+                &[],
+                &[(
+                    previous.into(),
+                    Utxo {
+                        value_sats: 1_000,
+                        height: 0,
+                        is_coinbase: false,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51],
+                    },
+                )],
+            )
+            .unwrap();
+        let spend = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: previous,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let active_block = block_with_transactions(
+            genesis.hash,
+            genesis.header.time + 1,
+            vec![coinbase(1), spend],
+        );
+        headers
+            .insert_contextual(active_block.header, active_block.header.time)
+            .unwrap();
+        let transaction_ids = validate_block_structure_with_deployments_and_txids(
+            &active_block,
+            1,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let blocks = [active_block.clone()];
+        let transaction_ids = [transaction_ids];
+        let contexts = [deployments(1)];
+
+        let mut mismatched =
+            prefetch_prevalidated_active_block_utxos(&chainstate, &blocks, &transaction_ids)
+                .unwrap();
+        assert_eq!(mismatched.entries.len(), 1);
+        mismatched.entries.clear();
+        assert!(matches!(
+            connect_prevalidated_active_blocks_with_txids_and_utxos(
+                &chainstate,
+                &headers,
+                &blocks,
+                &transaction_ids,
+                mismatched,
+                1,
+                60,
+                &contexts,
+            ),
+            Err(BlockExecutionError::UtxoPrefetchMismatch)
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+
+        let prefetched =
+            prefetch_prevalidated_active_block_utxos(&chainstate, &blocks, &transaction_ids)
+                .unwrap();
+        connect_prevalidated_active_blocks_with_txids_and_utxos(
+            &chainstate,
+            &headers,
+            &blocks,
+            &transaction_ids,
+            prefetched,
+            1,
+            60,
+            &contexts,
+        )
+        .unwrap();
+        assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+        assert!(chainstate.get(previous.into()).unwrap().is_none());
     }
 
     fn coinbase(height: u32) -> Transaction {
