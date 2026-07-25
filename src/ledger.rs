@@ -122,6 +122,7 @@ enum LedgerSyncPoint {
     SlotPublish,
     IndexFile,
     IndexPublish,
+    RetiredSlotRemoval,
     TruncateIntentFile,
     TruncateIntentPublish,
     TruncateArchive,
@@ -166,6 +167,8 @@ impl PrunedBlockLedger {
         };
         ledger.recover_index()?;
         ledger.recover_truncation()?;
+        let index = ledger.read_index()?;
+        ledger.cleanup_unindexed_slots_locked(&index)?;
         Ok(ledger)
     }
 
@@ -298,7 +301,9 @@ impl PrunedBlockLedger {
         while exceeds(&index.segments, self.retention) {
             index.segments.remove(0);
         }
-        self.write_index(&index)
+        self.write_index(&index)?;
+        self.cleanup_unindexed_slots_locked(&index)?;
+        Ok(())
     }
 
     /// Removes an uncommitted staged segment, if one exists.
@@ -361,6 +366,7 @@ impl PrunedBlockLedger {
             index.segments.remove(0);
         }
         self.write_index(&index)?;
+        self.cleanup_unindexed_slots_locked(&index)?;
         Ok(manifest)
     }
 
@@ -468,6 +474,35 @@ impl PrunedBlockLedger {
         self.sync(LedgerSyncPoint::IndexFile, &temporary)?;
         fs::rename(&temporary, self.index_path())?;
         self.sync_directory(LedgerSyncPoint::IndexPublish)
+    }
+
+    fn cleanup_unindexed_slots_locked(&self, index: &LedgerIndex) -> Result<u64, LedgerError> {
+        let live_slots = index
+            .segments
+            .iter()
+            .map(|segment| segment.slot)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut reclaimed = 0_u64;
+        let mut removed = false;
+        for slot in 0..self.retention.slots {
+            if live_slots.contains(&slot) {
+                continue;
+            }
+            let path = self.slot_path(slot);
+            let bytes = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    reclaimed = reclaimed.saturating_add(bytes);
+                    removed = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed {
+            self.sync_directory(LedgerSyncPoint::RetiredSlotRemoval)?;
+        }
+        Ok(reclaimed)
     }
 
     fn recover_index(&self) -> Result<(), LedgerError> {
@@ -818,6 +853,72 @@ mod tests {
         assert!(stats.bytes > 0);
         assert_eq!(stats.first_height, Some(11));
         assert_eq!(stats.tip_height, Some(13));
+    }
+
+    #[test]
+    fn physically_removes_slots_pruned_before_ring_wraparound() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(
+            dir.path(),
+            LedgerRetention {
+                max_blocks: 2,
+                max_bytes: 1_000_000,
+                slots: 8,
+            },
+        )
+        .unwrap();
+        for height in 10..=13 {
+            ledger
+                .append(height, &[vec![u8::try_from(height).unwrap()]])
+                .unwrap();
+        }
+
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(12, 12), (13, 13)]);
+        assert!(!ledger.slot_path(0).exists());
+        assert!(!ledger.slot_path(1).exists());
+        assert!(ledger.slot_path(2).exists());
+        assert!(ledger.slot_path(3).exists());
+    }
+
+    #[test]
+    fn reopen_removes_legacy_slots_absent_from_the_durable_index() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 8,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        let mut segments = Vec::new();
+        for (slot, height) in (0_u16..4).zip(10_u32..14) {
+            let path = ledger.slot_path(slot);
+            write_archive(&path, height, &[vec![u8::try_from(height).unwrap()]]).unwrap();
+            if slot >= 2 {
+                segments.push(Segment {
+                    first_height: height,
+                    block_count: 1,
+                    slot,
+                    bytes: fs::metadata(path).unwrap().len(),
+                });
+            }
+        }
+        ledger
+            .write_index(&LedgerIndex {
+                next_slot: 4,
+                segments,
+            })
+            .unwrap();
+        drop(ledger);
+
+        let reopened = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(
+            reopened.retained_ranges().unwrap(),
+            vec![(12, 12), (13, 13)]
+        );
+        assert!(!reopened.slot_path(0).exists());
+        assert!(!reopened.slot_path(1).exists());
+        assert!(reopened.slot_path(2).exists());
+        assert!(reopened.slot_path(3).exists());
     }
 
     #[test]
@@ -1231,6 +1332,38 @@ mod tests {
         let recovered = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
         assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
         assert!(recovered.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn retired_slot_sync_failure_reopens_to_the_pruned_ring() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 4,
+        };
+        let durability = Arc::new(FailOnceDurability::new(LedgerSyncPoint::RetiredSlotRemoval));
+        let ledger =
+            PrunedBlockLedger::open_with_durability(dir.path(), retention, durability.clone())
+                .unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        ledger.append(11, &[vec![11]]).unwrap();
+        durability.arm();
+
+        assert!(matches!(
+            ledger.append(12, &[vec![12]]),
+            Err(LedgerError::Io(_))
+        ));
+        assert!(durability.did_fail());
+        drop(ledger);
+
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(
+            recovered.retained_ranges().unwrap(),
+            vec![(11, 11), (12, 12)]
+        );
+        assert_eq!(recovered.read_block(10).unwrap(), None);
+        assert_eq!(recovered.read_block(12).unwrap(), Some(vec![12]));
     }
 
     #[test]
