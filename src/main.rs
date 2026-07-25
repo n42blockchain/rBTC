@@ -8,9 +8,14 @@ use std::{
     path::PathBuf,
     process,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 use bitcoin::{
     Block, BlockHash, Network, Transaction,
@@ -900,7 +905,14 @@ async fn main() {
             // validating future performs bounded synchronous execution work;
             // if signal polling shares that same task, the OS notification can
             // otherwise remain unread until after another checkpoint starts.
-            let signal_task = tokio::spawn(shutdown_signal());
+            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+            let signal_task = tokio::spawn(async {
+                let result = shutdown_signal().await;
+                if result.is_ok() {
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                }
+                result
+            });
             let result = tokio::select! {
                 result = run(options) => result,
                 signal = signal_task => signal
@@ -943,6 +955,14 @@ async fn shutdown_signal() -> Result<(), String> {
         interrupt
             .await
             .map_err(|error| format!("failed to install interrupt handler: {error}"))
+    }
+}
+
+async fn checkpoint_shutdown(requested: &AtomicBool) {
+    if requested.load(Ordering::Acquire) {
+        std::future::pending::<()>().await;
+    } else {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -4480,7 +4500,7 @@ async fn sync_validating_node(
             // A completely prefetched batch may otherwise run from decode
             // through commit without yielding, starving the outer shutdown
             // selector across successive checkpoints.
-            tokio::task::yield_now().await;
+            checkpoint_shutdown(&SHUTDOWN_REQUESTED).await;
         }
     }
 }
@@ -7125,6 +7145,31 @@ mod tests {
             .unwrap();
         peer.write_message(NetworkMessage::Verack).await.unwrap();
         (peer, local_version)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_checkpoint_returns_control_after_synchronous_work() {
+        let requested = Arc::new(AtomicBool::new(false));
+        let watcher_requested = Arc::clone(&requested);
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            watcher_requested.store(true, Ordering::Release);
+        });
+        let validating = async {
+            loop {
+                std::thread::sleep(Duration::from_millis(20));
+                checkpoint_shutdown(&requested).await;
+            }
+        };
+
+        timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                () = validating => unreachable!("validation loop does not finish itself"),
+                result = watcher => result.unwrap(),
+            }
+        })
+        .await
+        .expect("independent signal watcher must stop a synchronous validation loop");
     }
 
     #[tokio::test]
