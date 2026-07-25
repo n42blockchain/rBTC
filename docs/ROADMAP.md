@@ -50,9 +50,11 @@ Primary references:
   959,592/hash
   `000000000000000000019190d596b445008319f199f8ee6f6af0e73cbc440667`,
   then cold-reopened in 14.385 seconds without requesting a block.
-- [x] Trusted snapshot activation plus independent, restart-safe genesis
+- [x] Local rBTC snapshot activation plus independent, restart-safe genesis
   validation and atomic AssumeUTXO finalization; automatic cleanup is explicit,
-  ownership-bound, quarantined, and fail-closed.
+  ownership-bound, quarantined, and fail-closed. The base block must be on the
+  fully validated maximum-work active header chain. This does not yet claim
+  Bitcoin Core snapshot-file compatibility or automatic snapshot distribution.
 
 ### Storage and performance
 
@@ -122,6 +124,25 @@ Primary references:
   engine/kernel boundary or own and continuously patch the vendored engine. The
   acceptance gate is a documented dependency/security decision plus identical
   results across the existing corpus and a new Core 31 regtest matrix.
+- [ ] **Finish the original fast-bootstrap contract using Bitcoin's existing
+  AssumeUTXO model.** Validate the complete header chain and select its
+  maximum-work active branch; accept only a Core 31 chainparams height,
+  blockhash, UTXO-set hash, and chain-transaction count; load a
+  `dumptxoutset`-compatible snapshot; validate ordinary blocks from that base to
+  the live tip; and independently execute genesis to the base before clearing
+  the assumed marker. Add bounded resumable download from explicitly configured
+  sources, but do not invent a P2P snapshot service or claim that a file checksum
+  proves chainstate correctness. The existing rBTC v3 container remains a local
+  migration format until Core compatibility is accepted.
+- [ ] **Choose the hot/cold UTXO boundary from replay data, not the current
+  60-day constant.** Persist a network-scoped histogram of spent-output coin age
+  in blocks, and report for candidate windows the share of the current UTXO set
+  kept hot versus the share of observed spends it would hit. Select the smallest
+  window meeting the documented target (initial evaluation: 99% spend-hit rate)
+  on complete mainnet replay plus a live-tip sample; publish sample count,
+  quantiles, read amplification, RSS, and IBD/restart impact. Until this gate
+  passes, hot/cold is a local storage experiment and never part of snapshot
+  identity or consensus.
 - [ ] **Complete Testnet4 public acceptance.** BIP94 difficulty/timewarp rules,
   current trust anchors and seeds, and ordinary execution are implemented.
   Genesis-to-tip header validation and exact block-1 execution are accepted.
@@ -222,8 +243,10 @@ correctness or security work.
 
 ## Execution order
 
-1. Finish the Core 31/dependency audit and Testnet4 public acceptance soak.
-2. Run the sustained public-network soak while preparing the external review.
+1. Finish the Core 31/dependency audit, Core-compatible fast bootstrap, and
+   data-backed hot/cold decision.
+2. Finish Testnet4 public acceptance, then run the sustained public-network soak
+   while preparing the external review.
 3. Close review findings and produce the signed supported-platform release.
 4. Build inbound service, operator lifecycle, current relay policy, and optional
    indexes in that order.

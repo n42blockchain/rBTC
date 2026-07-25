@@ -35,6 +35,111 @@ const MAX_SCRIPT_PUBKEY_BYTES: usize = 10_000;
 const MIN_ZSTD_WINDOW_LOG: u32 = 23;
 const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 
+/// A Bitcoin Core 31 AssumeUTXO identity compiled into chain parameters.
+///
+/// `hash_serialized` is Bitcoin Core's UTXO-set hash, not the checksum of an
+/// rBTC v3 record stream. These values may authenticate a Core-compatible
+/// snapshot loader only; translating them into an rBTC snapshot trust anchor
+/// would silently weaken the trust model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Core31AssumeUtxoAnchor {
+    /// Snapshot base height.
+    pub height: u32,
+    /// Display-order hash of the exact base block.
+    pub block_hash: &'static str,
+    /// Bitcoin Core's serialized UTXO-set hash.
+    pub hash_serialized: &'static str,
+    /// Number of transactions in the chain through the base block.
+    pub chain_tx_count: u64,
+}
+
+const CORE31_MAINNET_ASSUMEUTXO: &[Core31AssumeUtxoAnchor] = &[
+    Core31AssumeUtxoAnchor {
+        height: 840_000,
+        block_hash: "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+        hash_serialized: "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
+        chain_tx_count: 991_032_194,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 880_000,
+        block_hash: "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+        hash_serialized: "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+        chain_tx_count: 1_145_604_538,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 910_000,
+        block_hash: "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+        hash_serialized: "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+        chain_tx_count: 1_226_586_151,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 935_000,
+        block_hash: "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+        hash_serialized: "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+        chain_tx_count: 1_305_397_408,
+    },
+];
+
+const CORE31_TESTNET_ASSUMEUTXO: &[Core31AssumeUtxoAnchor] = &[
+    Core31AssumeUtxoAnchor {
+        height: 2_500_000,
+        block_hash: "0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f",
+        hash_serialized: "f841584909f68e47897952345234e37fcd9128cd818f41ee6c3ca68db8071be7",
+        chain_tx_count: 66_484_552,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 4_840_000,
+        block_hash: "00000000000000f4971a7fb37fbdff89315b69a2e1920c467654a382f0d64786",
+        hash_serialized: "ce6bb677bb2ee9789c4a1c9d73e6683c53fc20e8fdbedbdaaf468982a0c8db2a",
+        chain_tx_count: 536_078_574,
+    },
+];
+
+const CORE31_TESTNET4_ASSUMEUTXO: &[Core31AssumeUtxoAnchor] = &[
+    Core31AssumeUtxoAnchor {
+        height: 90_000,
+        block_hash: "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b",
+        hash_serialized: "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5",
+        chain_tx_count: 11_347_043,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 120_000,
+        block_hash: "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8",
+        hash_serialized: "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0",
+        chain_tx_count: 14_141_057,
+    },
+];
+
+const CORE31_SIGNET_ASSUMEUTXO: &[Core31AssumeUtxoAnchor] = &[
+    Core31AssumeUtxoAnchor {
+        height: 160_000,
+        block_hash: "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c",
+        hash_serialized: "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a",
+        chain_tx_count: 2_289_496,
+    },
+    Core31AssumeUtxoAnchor {
+        height: 290_000,
+        block_hash: "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0",
+        hash_serialized: "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545",
+        chain_tx_count: 28_547_497,
+    },
+];
+
+/// Returns the exact AssumeUTXO identities shipped by Bitcoin Core 31.
+///
+/// Regtest has only mutable test fixtures and therefore deliberately exposes no
+/// release trust anchor here.
+#[must_use]
+pub fn core31_assumeutxo_anchors(network: Network) -> &'static [Core31AssumeUtxoAnchor] {
+    match network {
+        Network::Bitcoin => CORE31_MAINNET_ASSUMEUTXO,
+        Network::Testnet => CORE31_TESTNET_ASSUMEUTXO,
+        Network::Testnet4 => CORE31_TESTNET4_ASSUMEUTXO,
+        Network::Signet => CORE31_SIGNET_ASSUMEUTXO,
+        Network::Regtest => &[],
+    }
+}
+
 /// Snapshot import and export failures.
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -665,6 +770,37 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core31_assumeutxo_identities_are_well_formed_and_ordered() {
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            let anchors = core31_assumeutxo_anchors(network);
+            assert!(!anchors.is_empty());
+            assert!(
+                anchors
+                    .windows(2)
+                    .all(|pair| pair[0].height < pair[1].height)
+            );
+            for anchor in anchors {
+                assert!(anchor.height > 0);
+                assert!(anchor.chain_tx_count > 0);
+                assert!(anchor.block_hash.parse::<BlockHash>().is_ok());
+                assert_eq!(anchor.hash_serialized.len(), 64);
+                assert!(
+                    anchor
+                        .hash_serialized
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())
+                );
+            }
+        }
+        assert!(core31_assumeutxo_anchors(Network::Regtest).is_empty());
+    }
     use crate::{
         block_execution::{BlockExecutionError, connect_active_block, disconnect_execution_tip},
         deployments::block_deployment_context,

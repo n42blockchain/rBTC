@@ -112,7 +112,7 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 ## UTXO layout
 
-Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier; `utxo_cold` contains coins not touched within `hot_window_secs` (default 60 days). Moving tiers is a single redb transaction and never changes consensus data.
+Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier; `utxo_cold` currently contains coins not touched within `hot_window_secs` (default 60 days). Moving tiers is a single redb transaction and never changes consensus data. The 60-day boundary is not yet a production default: local wall-clock touch time makes a historical IBD classify old coins as newly hot. The replacement decision must use a complete-replay histogram of consensus coin age at spend time and compare hot-set population against spend-hit rate for candidate block-age windows. Tier metadata remains excluded from snapshot finalization and consensus identity.
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
@@ -470,7 +470,42 @@ Recovery gates cover transaction-stage failure, simulated disk-full writes, repe
 
 ## Snapshot trust model
 
-Snapshot format v3 includes an anchor height/hash, count, canonical uncompressed byte length, and a SHA-256 of that entry stream. Container self-checks detect damage but do not establish authenticity: activation additionally requires an independently distributed network/height/block-hash/count/record-bytes/records-SHA-256 tuple and an exact match at that height in the selected active header chain. Trusted startup compares this manifest identity before zstd decompression, then verifies the file in a bounded-memory first pass. Authenticated count and byte length cap total decompression work; records must be strictly outpoint-ordered, manifests are capped at 64 KiB, and scripts at Core's 10,000-byte consensus bound. A second streaming pass inserts directly into redb while recomputing count, length, and SHA-256 inside the activation transaction, closing file-replacement races without retaining the full UTXO set in RAM. Only an untouched unified chainstate can accept the snapshot. All UTXOs, the execution tip, a durable assumed-snapshot marker, and the authenticated count/length/digest enter one immediate-durability redb commit; an existing UTXO, undo, pending transition, advanced tip, prior or incomplete marker, decoder/order/count/length/digest failure, or failed commit rejects the operation without residue. Snapshot exports publish through a same-directory temporary file, file sync, atomic rename, and directory sync instead of exposing partial output. Reorganizations can disconnect blocks added above the base but cannot cross it because the assumed history has no undo. The offline `--assumeutxo-snapshot` mode requires all five explicit trust-identity arguments and conflicts with networking, fetch, explorer, wallet, and one-shot modes.
+The target trust model is Bitcoin Core AssumeUTXO, not a new MPT. The node first
+validates the complete header chain and selects its maximum-cumulative-work
+active branch. A snapshot base block must be the exact blockhash at a
+version-pinned Core chainparams height on that branch. Core's compiled UTXO-set
+hash and chain-transaction count authenticate the decoded state provisionally;
+ordinary validation then advances that state from the base to the live tip.
+Because Bitcoin block headers do not contain a UTXO-set root, maximum-work
+membership alone does not authenticate arbitrary snapshot contents. Independent
+genesis-to-base block execution and an exact UTXO-set hash match are what remove
+the assumed-state marker.
+
+The implemented local rBTC snapshot format v3 includes an anchor height/hash,
+count, canonical uncompressed byte length, and a SHA-256 of that entry stream.
+It is not yet compatible with Core's `dumptxoutset` file and has no automatic
+download source. Container self-checks detect damage but do not establish
+authenticity: activation additionally requires an independently distributed
+network/height/block-hash/count/record-bytes/records-SHA-256 tuple and an exact
+match at that height in the selected active header chain. Trusted startup
+compares this manifest identity before zstd decompression, then verifies the file
+in a bounded-memory first pass. Authenticated count and byte length cap total
+decompression work; records must be strictly outpoint-ordered, manifests are
+capped at 64 KiB, and scripts at Core's 10,000-byte consensus bound. A second
+streaming pass inserts directly into redb while recomputing count, length, and
+SHA-256 inside the activation transaction, closing file-replacement races
+without retaining the full UTXO set in RAM. Only an untouched unified chainstate
+can accept the snapshot. All UTXOs, the execution tip, a durable
+assumed-snapshot marker, and the authenticated count/length/digest enter one
+immediate-durability redb commit; an existing UTXO, undo, pending transition,
+advanced tip, prior or incomplete marker, decoder/order/count/length/digest
+failure, or failed commit rejects the operation without residue. Snapshot
+exports publish through a same-directory temporary file, file sync, atomic
+rename, and directory sync instead of exposing partial output. Reorganizations
+can disconnect blocks added above the base but cannot cross it because the
+assumed history has no undo. The offline `--assumeutxo-snapshot` mode requires
+all five explicit trust-identity arguments and conflicts with networking, fetch,
+explorer, wallet, and one-shot modes.
 
 The marker deliberately survives successful execution and restart, so assumed state is never confused with independent genesis-to-tip validation. Activation persists both the full record-stream digest (which authenticates transport and local tier metadata) and a logical UTXO-set digest over outpoint, value, creation height, coinbase status, creation MTP, and script. The latter deliberately excludes `last_touched`, because independent replay at another wall-clock time must not change consensus identity. `--validate-until-height` plus `--validate-until-blockhash` turns a separate non-assumed data directory into a bounded genesis validator. Header sync may proceed beyond the target, but the target must be on the active header chain and block batching uses it as a hard ceiling; execution, ledger, and projections cannot commit a block above it. A matching restart exits without another block request, while a mismatched hash, assumed source, or already-higher tip is rejected. The resulting directory can be supplied to offline `--finalize-assumeutxo`.
 
