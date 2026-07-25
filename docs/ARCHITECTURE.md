@@ -185,21 +185,31 @@ Fixed-target validation folds a checkpoint's transitions with a keyed hash
 table and one final sort, so outputs created and spent inside the same
 checkpoint never touch disk. Inputs consuming outputs created earlier in that
 same prevalidated batch are removed from the historical prefetch set. The net
-change is encoded as one immutable `RVD3` delta: a strict 16-byte header,
-fixed-width sorted outpoint/state/offset/length index, and contiguous canonical
-UTXO data. Encoding writes each UTXO directly into the aggregate buffer rather
-than allocating one temporary record per coin. One immediate-durability redb
-transaction inserts the complete delta and advances every block transition;
-no prefix is visible after failure.
+change is encoded as immutable sorted validation deltas. Legacy `RVD3` is one
+strict 16-byte header, fixed-width sorted outpoint/state/offset/length index,
+and contiguous canonical UTXO-data value. `RVD5` retains that representation
+inside at most 16 high-prefix shards plus a compact manifest. Shard keys and
+the outpoints inside each shard are inserted monotonically, reducing random
+write-page churn while a Bloom hit reads at most one bounded slice rather than
+one giant fragmented value. The short-lived `RVD4` experiment used 256 shards;
+it remains readable, but live 139–172-second checkpoints rejected its write
+amplification. Encoding writes each UTXO directly into its aggregate shard
+buffer rather than allocating one temporary record per coin. One
+immediate-durability redb transaction inserts every shard, its manifest, and
+all block transitions; no prefix is visible after failure.
 
 Reads search newest deltas first by binary search and decode only a matched
 UTXO. A 10-bit-per-update Bloom filter accompanies every row, and each 16-row
 group shares a fixed aggregate Bloom filter, so historical base inputs
 normally skip 16 records with three probes. The row filter and current group
-aggregate are checksummed and committed atomically with every RVD3 delta,
+aggregate are checksummed and committed atomically with every delta manifest,
 including while the newest group is incomplete. Bulk prefetch resolves all
 journal hits newest-first and issues one ordered parallel redb base lookup only
-for unresolved outpoints.
+for unresolved outpoints. The batch records which legacy row caused the most
+candidate reads. The next checkpoint rewrites that row to RVD5 in one atomic
+transaction while its archive stage, UTXO read snapshot, and complete network
+lookahead run independently. A live 368,825,574-byte row migrated into 16
+sorted shards in 3.448 seconds, entirely inside the longer prefetch window.
 
 An older RVD3 database without persisted filters undergoes one strict scan of
 record size, ordering, state bits, contiguous offsets, and canonical UTXO
@@ -362,6 +372,14 @@ overlap network with both archive staging and the long sequential UTXO
 transition without leaving unread responses to time out; the additional
 worst-case serialized payload allocation is bounded at 4 GiB by the 1,008-block
 validation ceiling.
+
+The durable UTXO read phase is also detached from mutation: it computes the
+exact external sorted outpoint set and opens its read snapshot concurrently
+with archive staging. The resulting batch-bound value is checked against the
+same outpoint sequence before execution, and no chainstate write begins unless
+staging succeeded. On the first 560-block live sample, the 41.156-second UTXO
+read hid the complete 7.972-second archive stage. Hot legacy-row sharding uses
+the same window and must finish before the execution write transaction begins.
 
 This pipeline completed the authenticated mainnet Taproot target at height
 709,632/hash

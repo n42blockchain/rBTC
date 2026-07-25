@@ -191,21 +191,24 @@ advanced only the active header store to height 959,424, requested no blocks,
 and exited at the same BIP65 height/hash.
 
 The next storage pass replaced validation-only random base-tree rewrites with
-immediate-durability, append-only checkpoint deltas. Each `RVD3` record has a
-strict fixed-width sorted outpoint index followed by canonical UTXO bytes, so a
-lookup decodes only its matching coin. Checksummed `RVB1` per-record Bloom
-filters and 16-record aggregate filters reject old runs before redb value
-access. The current aggregate—including an unfinished group—is rewritten in
-the same transaction as every complete delta and execution tip, so a clean
-restart never rescans recent delta payloads. Existing RVD3 directories perform
-one strict scan only for missing row or partial-group filters and atomically
-install them; later restarts validate sizes, checksums, UTXO counts, delta
-headers, and exact execution-tip alignment without rebuilding the historical
-index.
+immediate-durability, append-only checkpoint deltas. Legacy `RVD3` records have
+a strict fixed-width sorted outpoint index followed by canonical UTXO bytes.
+New `RVD5` rows retain that exact per-shard format behind a small manifest but
+partition the sorted keyspace into at most 16 high-prefix shards, so a Bloom
+candidate reads only its shard instead of one giant fragmented redb value.
+Already-written `RVD4` 256-shard rows remain readable; live measurements
+rejected that fan-out because its write amplification outweighed the smaller
+reads. Checksummed `RVB1` per-record Bloom filters and 16-record aggregate
+filters reject old runs before value access. The current aggregate—including
+an unfinished group—is rewritten in the same transaction as every complete
+delta and execution tip. The hottest RVD3 row observed by each batch is
+rewritten to sorted RVD5 shards in one transaction alongside the next batch's
+read-only UTXO prefetch, archive staging, and network lookahead. Existing RVD3
+directories still open without an eager migration; missing filters undergo
+the prior strict reconstruction.
 Ordinary reorganizing stores reject this format. Explicit materialization
 folds all runs and clears the delta and filter tables atomically. There is no
-relaxed durability, automatic periodic materialization, or block undo in this
-fixed-target mode.
+relaxed durability or block undo in this fixed-target mode.
 
 At heights 405,518–408,673, adjacent 252-block checkpoints normally completed
 in 20.97–30.22 seconds with execution/persistence mostly 6.78–9.90 seconds;
