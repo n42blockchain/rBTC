@@ -246,6 +246,8 @@ struct ValidationUpdate {
 
 type ValidationDeltaUpdates = Vec<(OutPointKey, ValidationUpdate)>;
 type EncodedValidationDeltaShards = Vec<(u8, Vec<u8>)>;
+type ValidationShardReadJob = (u8, Vec<usize>);
+type LoadedValidationShard = (Vec<usize>, Vec<u8>);
 
 impl ValidationBloom {
     fn with_update_count(update_count: usize) -> Result<Self, UtxoError> {
@@ -1673,6 +1675,49 @@ impl RedbChainStore {
         transaction.set_quick_repair(self.options.quick_repair);
     }
 
+    fn load_validation_shards_parallel(
+        &self,
+        height: u32,
+        jobs: Vec<ValidationShardReadJob>,
+    ) -> Result<Vec<LoadedValidationShard>, UtxoError> {
+        let available_workers =
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let workers = available_workers.min(jobs.len());
+        let mut worker_jobs = (0..workers).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (index, job) in jobs.into_iter().enumerate() {
+            worker_jobs[index % workers].push(job);
+        }
+        std::thread::scope(|scope| {
+            let workers = worker_jobs
+                .into_iter()
+                .map(|jobs| {
+                    scope.spawn(move || {
+                        let transaction = self.db.begin_read()?;
+                        let shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+                        jobs.into_iter()
+                            .map(|(shard, candidates)| {
+                                let key = validation_delta_shard_key(height, shard);
+                                let encoded = shards.get(key.as_slice())?.ok_or(
+                                    UtxoError::Malformed("missing validation delta shard"),
+                                )?;
+                                Ok((candidates, encoded.value().to_vec()))
+                            })
+                            .collect::<Result<Vec<_>, UtxoError>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut loaded = Vec::new();
+            for worker in workers {
+                loaded.extend(
+                    worker
+                        .join()
+                        .expect("validation shard read worker must not panic")?,
+                );
+            }
+            Ok(loaded)
+        })
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard.lock().expect("write lock not poisoned")
     }
@@ -1797,21 +1842,43 @@ impl UtxoStore for RedbChainStore {
                                 shard_candidates[usize::from(shard)].push(index);
                             }
                         }
-                        for (shard, candidates) in shard_candidates.into_iter().enumerate() {
-                            if candidates.is_empty() {
-                                continue;
+                        let jobs = shard_candidates
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(_, candidates)| !candidates.is_empty())
+                            .map(|(shard, candidates)| {
+                                (
+                                    u8::try_from(shard).expect("validation shard fits u8"),
+                                    candidates,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if jobs.len() > 1 {
+                            for (candidates, encoded_shard) in
+                                self.load_validation_shards_parallel(row.height, jobs)?
+                            {
+                                for index in candidates {
+                                    let outpoint = outpoints[index];
+                                    if let Some(update) =
+                                        validation_delta_lookup(&encoded_shard, outpoint)?
+                                    {
+                                        results[index] = Some((outpoint, update.utxo));
+                                    }
+                                }
                             }
-                            let shard = u8::try_from(shard).expect("validation shard fits u8");
-                            let key = validation_delta_shard_key(row.height, shard);
-                            let encoded_shard = delta_shards
-                                .get(key.as_slice())?
-                                .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
-                            for index in candidates {
-                                let outpoint = outpoints[index];
-                                if let Some(update) =
-                                    validation_delta_lookup(encoded_shard.value(), outpoint)?
-                                {
-                                    results[index] = Some((outpoint, update.utxo));
+                        } else {
+                            for (shard, candidates) in jobs {
+                                let key = validation_delta_shard_key(row.height, shard);
+                                let encoded_shard = delta_shards.get(key.as_slice())?.ok_or(
+                                    UtxoError::Malformed("missing validation delta shard"),
+                                )?;
+                                for index in candidates {
+                                    let outpoint = outpoints[index];
+                                    if let Some(update) =
+                                        validation_delta_lookup(encoded_shard.value(), outpoint)?
+                                    {
+                                        results[index] = Some((outpoint, update.utxo));
+                                    }
                                 }
                             }
                         }
@@ -2954,6 +3021,53 @@ mod tests {
             reopened.tier_stats().unwrap(),
             TierStats { hot: 1, cold: 0 }
         );
+    }
+
+    #[test]
+    fn parallel_validation_shard_reads_preserve_caller_order() {
+        let directory = TempDir::new().unwrap();
+        let store = RedbChainStore::open_with_options(
+            directory.path().join("chainstate.redb"),
+            Network::Regtest,
+            ChainStoreOptions {
+                retain_block_undo: false,
+                validation_delta_journal: true,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        let keys = (0_u8..16).map(|shard| key(shard << 4)).collect::<Vec<_>>();
+        let created = keys
+            .iter()
+            .enumerate()
+            .map(|(index, outpoint)| {
+                (
+                    *outpoint,
+                    coin(u64::try_from(index).expect("small index") + 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([59; 32]),
+                },
+                spent: Vec::new(),
+                created: created.clone(),
+                transaction_undos: Vec::new(),
+            }])
+            .unwrap();
+
+        let requested = keys.iter().copied().rev().collect::<Vec<_>>();
+        let expected = created
+            .iter()
+            .rev()
+            .map(|(outpoint, coin)| (*outpoint, Some(coin.clone())))
+            .collect::<Vec<_>>();
+        assert_eq!(store.get_many(&requested).unwrap(), expected);
     }
 
     #[test]
