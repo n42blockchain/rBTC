@@ -152,8 +152,11 @@ checkpoints took 84.71 seconds combined, and three 252-block checkpoints
 sustained 12.1 blocks/second without the superlinear commit spike. That result
 first moved the soak from 1,008 to 252 blocks while retaining every
 explicit 1–1,008 value for measured hosts and chain eras.
-For bounded standalone validation, the daemon also requests the next batch's
-first window only after the current batch has passed structure validation.
+For bounded standalone validation checkpoints of at most 256 blocks, the
+daemon also requests the next batch's first window only after the current
+batch has passed structure validation. Larger checkpoints read on demand so a
+public peer is not left blocked on an unread 128-block response throughout a
+long script/commit phase.
 The peer can transfer those at most 128 authenticated responses while current
 scripts and chainstate commit, and the normal ordered receiver consumes and
 validates them before requesting anything further. The first two 126-block
@@ -221,8 +224,11 @@ auxiliary peer concurrently. Larger configured batches repeat these paired
 windows across the batch, while each peer still has at most 128 ordered block
 responses outstanding. The receiver appends every pair in active-chain order
 and retries its auxiliary half on the primary after any request or response
-failure. The next retained candidate is then activated without restarting the
-primary session. Once a primary window completes, its unfinished auxiliary response
+failure. The first active auxiliary failure circuit-breaks auxiliary block
+downloads for the remainder of that primary session; a new primary session may
+try one again. This retains bounded failover while preventing a sequence of
+unreliable public standbys from adding the same grace/timeout cost to every
+large checkpoint. Once a primary window completes, its unfinished auxiliary response
 gets two seconds of grace before it is abandoned and retried on the primary;
 this reduced one observed slow-auxiliary download from 40.485 to 27.684
 seconds instead of paying the complete 30-second auxiliary timeout first. An

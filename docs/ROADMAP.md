@@ -43,6 +43,10 @@ packetizing script validation into 16-transaction work items then removed
 per-transaction queue/result contention and reduced five adjacent
 756-block execution/persistence samples from the preceding 51.401-second
 median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
+after repeated 756-block prefetched-response timeouts, cross-execution
+lookahead is now restricted to checkpoints through 256 blocks, and the first
+active auxiliary-window failure circuit-breaks further auxiliary block
+downloads until the primary session changes;
 Taproot exact-stop and completed-target restart remain the active soak gate.
 Checkpoint-wide block-structure validation now uses bounded host-CPU chunks
 with ordered joins and earliest-height failure semantics. Adjacent 1,008-block

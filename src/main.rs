@@ -72,6 +72,7 @@ use tokio::time::timeout;
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
+const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_PIPELINED_BLOCKS_IN_FLIGHT * 2;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -4415,7 +4416,10 @@ async fn sync_validating_node(
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
                 &mut prefetched_block_windows,
-                validation_target.is_some() && validation_scheduler.is_none(),
+                validation_target.is_some()
+                    && validation_scheduler.is_none()
+                    && effective_validation_limits.max_blocks_per_batch
+                        <= MAX_VALIDATION_PREFETCH_BATCH_SIZE,
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {

@@ -257,14 +257,18 @@ took 84.71 seconds combined, and three 252-block checkpoints sustained 12.1
 blocks/second without the superlinear commit tail. The public mainnet soak
 therefore moved first to 252 blocks while the CLI retained the full explicit
 range for measured hosts and chain eras.
-Standalone bounded validation additionally sends one lookahead window only
-after the current batch's downloaded blocks pass header, Merkle, structure, and
-deployment checks. At most 128 future block hashes are requested, still as
-16-entry `getdata` messages. Their bytes can enter the authenticated ordered
-receive stream while current scripts and the atomic chainstate commit run; the
-next iteration consumes that exact hash prefix through the ordinary bounded
-receiver before issuing another request. It never stages, executes, or commits
-lookahead state and never requests above the immutable target. A mismatch,
+Standalone bounded validation checkpoints through 256 blocks additionally
+send one lookahead window only after the current batch's downloaded blocks
+pass header, Merkle, structure, and deployment checks. At most 128 future
+block hashes are requested, still as 16-entry `getdata` messages. Their bytes
+can enter the authenticated ordered receive stream while current scripts and
+the atomic chainstate commit run; the next iteration consumes that exact hash
+prefix through the ordinary bounded receiver before issuing another request.
+Larger checkpoints read on demand instead: leaving a public peer blocked on an
+unread response throughout a long execution phase caused repeatable
+prefetched-response timeouts in the live 756-block soak. Lookahead never
+stages, executes, or commits future state and never requests above the
+immutable target. A mismatch,
 timeout, unsolicited response, compact-block failure, or peer replacement
 retains the existing fail-closed path. Although a 126-block checkpoint fits
 entirely in one lookahead window and its first two batches took 29.0 seconds
