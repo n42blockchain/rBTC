@@ -62,7 +62,9 @@ impl DeferredScriptCheck<'_> {
     }
 }
 
-type ScriptValidationResult = (usize, usize, Result<(), ConsensusError>);
+const SCRIPT_VALIDATION_WORK_SIZE: usize = 16;
+
+type ScriptValidationResult = Option<(usize, usize, ConsensusError)>;
 
 struct ScriptValidationJob {
     index: usize,
@@ -71,12 +73,16 @@ struct ScriptValidationJob {
     input_count: usize,
     prevouts: Vec<Utxo>,
     script_flags: u32,
+}
+
+struct ScriptValidationWork {
+    jobs: Vec<ScriptValidationJob>,
     result: mpsc::Sender<ScriptValidationResult>,
 }
 
 #[derive(Default)]
 struct ScriptValidationQueue {
-    jobs: Mutex<VecDeque<ScriptValidationJob>>,
+    work: Mutex<VecDeque<ScriptValidationWork>>,
     available: Condvar,
 }
 
@@ -101,38 +107,50 @@ impl ScriptValidationPool {
         Self { queue, workers }
     }
 
-    fn enqueue(&self, job: ScriptValidationJob) {
+    fn enqueue(&self, work: Vec<ScriptValidationWork>) {
+        if work.is_empty() {
+            return;
+        }
+        let work_items = work.len();
         self.queue
-            .jobs
+            .work
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(job);
-        self.queue.available.notify_one();
+            .extend(work);
+        if work_items == 1 {
+            self.queue.available.notify_one();
+        } else {
+            self.queue.available.notify_all();
+        }
     }
 }
 
 fn script_validation_worker(queue: &ScriptValidationQueue) {
     loop {
-        let job = {
-            let mut jobs = queue
-                .jobs
+        let work = {
+            let mut work = queue
+                .work
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while jobs.is_empty() {
-                jobs = queue
+            while work.is_empty() {
+                work = queue
                     .available
-                    .wait(jobs)
+                    .wait(work)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            jobs.pop_front().expect("non-empty script queue")
+            work.pop_front().expect("non-empty script queue")
         };
-        let validation = verify_serialized_transaction_scripts_with_flags(
-            &job.raw_transaction,
-            job.input_count,
-            &job.prevouts,
-            job.script_flags,
-        );
-        let _ = job.result.send((job.block_order, job.index, validation));
+        let failure = work.jobs.into_iter().find_map(|job| {
+            verify_serialized_transaction_scripts_with_flags(
+                &job.raw_transaction,
+                job.input_count,
+                &job.prevouts,
+                job.script_flags,
+            )
+            .err()
+            .map(|error| (job.block_order, job.index, error))
+        });
+        let _ = work.result.send(failure);
     }
 }
 
@@ -146,7 +164,7 @@ fn script_validation_pool() -> &'static ScriptValidationPool {
 pub(crate) struct DeferredScriptBatch {
     result: mpsc::Sender<ScriptValidationResult>,
     results: mpsc::Receiver<ScriptValidationResult>,
-    jobs: usize,
+    work_items: usize,
 }
 
 impl DeferredScriptBatch {
@@ -155,34 +173,48 @@ impl DeferredScriptBatch {
         Self {
             result,
             results,
-            jobs: 0,
+            work_items: 0,
         }
     }
 
     pub(crate) fn submit(&mut self, checks: Vec<DeferredScriptCheck<'_>>) {
         let pool = script_validation_pool();
+        let work_items = checks.len().div_ceil(SCRIPT_VALIDATION_WORK_SIZE);
+        let mut work = Vec::with_capacity(work_items);
+        let mut jobs = Vec::with_capacity(SCRIPT_VALIDATION_WORK_SIZE);
         for check in checks {
-            pool.enqueue(ScriptValidationJob {
+            jobs.push(ScriptValidationJob {
                 index: check.index,
                 block_order: check.block_order,
                 raw_transaction: serialize(check.transaction),
                 input_count: check.transaction.input.len(),
                 prevouts: check.prevouts,
                 script_flags: check.script_flags,
+            });
+            if jobs.len() == SCRIPT_VALIDATION_WORK_SIZE {
+                work.push(ScriptValidationWork {
+                    jobs: std::mem::take(&mut jobs),
+                    result: self.result.clone(),
+                });
+                jobs.reserve(SCRIPT_VALIDATION_WORK_SIZE);
+            }
+        }
+        if !jobs.is_empty() {
+            work.push(ScriptValidationWork {
+                jobs,
                 result: self.result.clone(),
             });
-            self.jobs = self.jobs.saturating_add(1);
         }
+        self.work_items = self.work_items.saturating_add(work.len());
+        pool.enqueue(work);
     }
 
     pub(crate) fn finish(self) -> Option<(usize, ConsensusError)> {
-        (0..self.jobs)
+        (0..self.work_items)
             .filter_map(|_| {
-                let (block_order, index, validation) = self
-                    .results
+                self.results
                     .recv()
-                    .expect("script-validation worker terminated without a result");
-                validation.err().map(|error| (block_order, index, error))
+                    .expect("script-validation worker terminated without a result")
             })
             .min_by_key(|(block_order, index, _)| (*block_order, *index))
             .map(|(_, index, error)| (index, error))
