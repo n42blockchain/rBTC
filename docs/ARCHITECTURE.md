@@ -264,17 +264,18 @@ range for measured hosts and chain eras.
 Standalone bounded validation checkpoints additionally compute an exact
 next-batch prefix only after the current batch's downloaded blocks pass
 header, Merkle, structure, and deployment checks. A scoped network worker
-actively requests and drains at most 256 future blocks through ordinary
-64-block response windows while the caller performs the current checkpoint's
-archive staging and sequential UTXO transition. Each completed window is
+actively requests and drains the complete next configured batch through
+ordinary 64-block response windows while the caller performs the current
+checkpoint's archive staging and sequential UTXO transition. Each completed window is
 immediately converted to compact consensus bytes, releasing the expanded
 `Block`/transaction object tree before the next window. The next iteration
 decodes those bytes, verifies the stored blocks against its active-header
 prefix, validates their structure, and downloads only the remainder. This
-double buffer is bounded to 1 GiB at the consensus maximum serialized block
-size and never stages, executes, commits, or requests above the immutable
-target. Archive stage still durably precedes chainstate commit; only the
-independent future-block transfer overlaps both operations. Continuously
+double buffer is bounded to 4 GiB by the 1,008-block validation ceiling and
+Bitcoin's consensus maximum serialized block size, and never stages,
+executes, commits, or requests above the immutable target. Archive stage still
+durably precedes chainstate commit; only the independent future-block transfer
+overlaps both operations. Continuously
 draining the response avoids the
 repeatable timeouts caused by leaving 128 responses unread throughout a
 756-block execution phase. The daemon uses two Tokio workers so one can drive
@@ -349,13 +350,14 @@ that trails the primary by more than two seconds. Each pair is appended in
 active-chain order. Partial progress is retained, only missing hashes fail
 back to the primary, and at most two remaining ready candidates are tried.
 
-Every validation checkpoint may actively receive at most 256 next-batch
-blocks on a scoped network worker while chainstate execution runs. Responses
+Every validation checkpoint may actively receive one complete next configured
+batch on a scoped network worker while chainstate execution runs. Responses
 are continuously drained in 64-block windows, reduced to consensus bytes, and
 retained only as an ordered hash-checked prefix for the next iteration. This
-overlaps network with both archive staging and the long sequential UTXO
-transition without leaving unread responses to time out; the additional
-worst-case serialized payload allocation is bounded at 1 GiB.
+can fully overlap network with both archive staging and the long sequential
+UTXO transition without leaving unread responses to time out; the additional
+worst-case serialized payload allocation is bounded at 4 GiB by the
+1,008-block validation ceiling.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work

@@ -45,8 +45,8 @@ use rbtc::{
     ledger::{LedgerRetention, PrunedBlockLedger},
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
-        MAX_PENDING_TRANSACTION_INVENTORY, MAX_PIPELINED_BLOCKS_IN_FLIGHT, MempoolRelaySource,
-        P2pError, PeerSession, TransactionRelay, connect_outbound,
+        MAX_PENDING_TRANSACTION_INVENTORY, MempoolRelaySource, P2pError, PeerSession,
+        TransactionRelay, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
@@ -73,8 +73,8 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
 const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
-const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_PIPELINED_BLOCKS_IN_FLIGHT * 2;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
+const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_VALIDATION_BATCH_SIZE;
 const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
@@ -8196,7 +8196,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_prefetch_is_bounded_to_256_blocks() {
+    fn execution_prefetch_covers_the_complete_validation_batch() {
         assert_eq!(validation_prefetch_limit(64), 64);
         assert_eq!(
             validation_prefetch_limit(MAX_VALIDATION_PREFETCH_BATCH_SIZE),
@@ -8208,7 +8208,7 @@ mod tests {
         );
         assert_eq!(
             validation_prefetch_limit(MAX_VALIDATION_BATCH_SIZE),
-            MAX_VALIDATION_PREFETCH_BATCH_SIZE
+            MAX_VALIDATION_BATCH_SIZE
         );
     }
 

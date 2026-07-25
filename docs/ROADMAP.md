@@ -44,10 +44,10 @@ per-transaction queue/result contention and reduced five adjacent
 756-block execution/persistence samples from the preceding 51.401-second
 median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
 after repeated 756-block unread-response timeouts, a scoped network worker now
-actively downloads and stores at most 256 next-batch blocks while the current
-archive stages and UTXO transition executes, reducing each completed window
-to compact consensus bytes and bounding the extra serialized payload at
-1 GiB; lagging auxiliary windows preserve
+actively downloads and stores the complete next configured batch while the
+current archive stages and UTXO transition executes, reducing each completed
+64-block window to compact consensus bytes and bounding the extra serialized
+payload at 4 GiB under the 1,008-block consensus maximum; lagging auxiliary windows preserve
 already received blocks, fetch only missing hashes from the primary, and
 rotate through at most three ready candidates; later block growth then selected
 64-block validation response windows after the first five samples completed
