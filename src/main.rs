@@ -5563,7 +5563,10 @@ async fn download_execute_batch(
         Vec::new()
     };
     let now = u64::from(unix_time()?);
+    let delta_shard_candidate = chainstate.take_hottest_legacy_validation_delta();
     let staged_at;
+    let delta_shard_migration;
+    let delta_shard_elapsed;
     let (
         applied_blocks,
         downloaded_prefetch,
@@ -5571,25 +5574,48 @@ async fn download_execute_batch(
         prefetch_elapsed,
         utxo_prefetch_elapsed,
     ) = if next_prefetch_hashes.is_empty() {
-        let (stage_result, branch_staged_at, utxo_result, utxo_elapsed) =
-            std::thread::scope(|scope| {
-                let utxos = scope.spawn(|| {
-                    let started = Instant::now();
-                    let result = prefetch_prevalidated_active_block_utxos(
-                        chainstate,
-                        &blocks,
-                        &transaction_ids,
-                    );
-                    (result, started.elapsed())
-                });
-                let stage_result = ledger.stage(next_height, &serialized);
-                let branch_staged_at = Instant::now();
-                let (utxo_result, utxo_elapsed) = utxos
-                    .join()
-                    .expect("scoped UTXO-prefetch thread must not panic");
-                (stage_result, branch_staged_at, utxo_result, utxo_elapsed)
+        let (
+            stage_result,
+            branch_staged_at,
+            utxo_result,
+            utxo_elapsed,
+            shard_result,
+            shard_elapsed,
+        ) = std::thread::scope(|scope| {
+            let utxos = scope.spawn(|| {
+                let started = Instant::now();
+                let result =
+                    prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
+                (result, started.elapsed())
             });
+            let shard = scope.spawn(|| {
+                let started = Instant::now();
+                let result = delta_shard_candidate
+                    .map(|height| chainstate.shard_legacy_validation_delta(height))
+                    .transpose()
+                    .map(Option::flatten);
+                (result, started.elapsed())
+            });
+            let stage_result = ledger.stage(next_height, &serialized);
+            let branch_staged_at = Instant::now();
+            let (utxo_result, utxo_elapsed) = utxos
+                .join()
+                .expect("scoped UTXO-prefetch thread must not panic");
+            let (shard_result, shard_elapsed) = shard
+                .join()
+                .expect("scoped validation-delta shard thread must not panic");
+            (
+                stage_result,
+                branch_staged_at,
+                utxo_result,
+                utxo_elapsed,
+                shard_result,
+                shard_elapsed,
+            )
+        });
         stage_result.map_err(|error| error.to_string())?;
+        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
         let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
@@ -5622,6 +5648,8 @@ async fn download_execute_batch(
             prefetch_result,
             prefetch_elapsed,
             utxo_prefetch_elapsed,
+            shard_result,
+            shard_elapsed,
         ) = std::thread::scope(|scope| {
             let prefetch = scope.spawn(|| {
                 let started = Instant::now();
@@ -5637,6 +5665,14 @@ async fn download_execute_batch(
                 let started = Instant::now();
                 let result =
                     prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
+                (result, started.elapsed())
+            });
+            let shard = scope.spawn(|| {
+                let started = Instant::now();
+                let result = delta_shard_candidate
+                    .map(|height| chainstate.shard_legacy_validation_delta(height))
+                    .transpose()
+                    .map(Option::flatten);
                 (result, started.elapsed())
             });
             let stage_result = ledger.stage(next_height, &serialized);
@@ -5664,6 +5700,9 @@ async fn download_execute_batch(
             let (prefetch_result, prefetch_elapsed) = prefetch
                 .join()
                 .expect("scoped execution-prefetch thread must not panic");
+            let (shard_result, shard_elapsed) = shard
+                .join()
+                .expect("scoped validation-delta shard thread must not panic");
             (
                 stage_result,
                 branch_staged_at,
@@ -5672,9 +5711,13 @@ async fn download_execute_batch(
                 prefetch_result,
                 prefetch_elapsed,
                 utxo_prefetch_elapsed,
+                shard_result,
+                shard_elapsed,
             )
         });
         stage_result.map_err(|error| error.to_string())?;
+        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let execution_result =
             execution_result.expect("successful staging starts chainstate execution");
@@ -5694,25 +5737,48 @@ async fn download_execute_batch(
             utxo_prefetch_elapsed,
         )
     } else {
-        let (stage_result, branch_staged_at, utxo_result, utxo_elapsed) =
-            std::thread::scope(|scope| {
-                let utxos = scope.spawn(|| {
-                    let started = Instant::now();
-                    let result = prefetch_prevalidated_active_block_utxos(
-                        chainstate,
-                        &blocks,
-                        &transaction_ids,
-                    );
-                    (result, started.elapsed())
-                });
-                let stage_result = ledger.stage(next_height, &serialized);
-                let branch_staged_at = Instant::now();
-                let (utxo_result, utxo_elapsed) = utxos
-                    .join()
-                    .expect("scoped UTXO-prefetch thread must not panic");
-                (stage_result, branch_staged_at, utxo_result, utxo_elapsed)
+        let (
+            stage_result,
+            branch_staged_at,
+            utxo_result,
+            utxo_elapsed,
+            shard_result,
+            shard_elapsed,
+        ) = std::thread::scope(|scope| {
+            let utxos = scope.spawn(|| {
+                let started = Instant::now();
+                let result =
+                    prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
+                (result, started.elapsed())
             });
+            let shard = scope.spawn(|| {
+                let started = Instant::now();
+                let result = delta_shard_candidate
+                    .map(|height| chainstate.shard_legacy_validation_delta(height))
+                    .transpose()
+                    .map(Option::flatten);
+                (result, started.elapsed())
+            });
+            let stage_result = ledger.stage(next_height, &serialized);
+            let branch_staged_at = Instant::now();
+            let (utxo_result, utxo_elapsed) = utxos
+                .join()
+                .expect("scoped UTXO-prefetch thread must not panic");
+            let (shard_result, shard_elapsed) = shard
+                .join()
+                .expect("scoped validation-delta shard thread must not panic");
+            (
+                stage_result,
+                branch_staged_at,
+                utxo_result,
+                utxo_elapsed,
+                shard_result,
+                shard_elapsed,
+            )
+        });
         stage_result.map_err(|error| error.to_string())?;
+        delta_shard_migration = shard_result.map_err(|error| error.to_string())?;
+        delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
         let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
@@ -5814,6 +5880,15 @@ async fn download_execute_batch(
     if execution_prefetch_count > 0 {
         println!(
             "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
+        );
+    }
+    if let Some(migration) = delta_shard_migration {
+        println!(
+            "migrated hot validation delta {} from {} bytes to {} sorted shards in {} ms",
+            migration.height,
+            migration.legacy_bytes,
+            migration.shard_count,
+            delta_shard_elapsed.as_millis()
         );
     }
     if let Some(error) = prefetch_error {

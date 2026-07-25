@@ -206,11 +206,14 @@ const VALIDATION_GROUP_BLOOM_TABLE: TableDefinition<u32, &[u8]> =
 const MAX_VALIDATION_DELTA_RECORD_BYTES: usize = 512 * 1024 * 1024;
 const VALIDATION_DELTA_MAGIC: [u8; 4] = *b"RVD3";
 const VALIDATION_SHARDED_DELTA_MAGIC: [u8; 4] = *b"RVD4";
+const VALIDATION_COMPACT_SHARDED_DELTA_MAGIC: [u8; 4] = *b"RVD5";
 const VALIDATION_DELTA_HEADER_BYTES: usize = 16;
 const VALIDATION_DELTA_INDEX_BYTES: usize = 45;
-const VALIDATION_DELTA_SHARD_COUNT: usize = 256;
-const VALIDATION_DELTA_SHARD_BITMAP_BYTES: usize = VALIDATION_DELTA_SHARD_COUNT / 8;
+const VALIDATION_RVD4_SHARD_COUNT: usize = 256;
+const VALIDATION_DELTA_SHARD_COUNT: usize = 16;
+const VALIDATION_DELTA_SHARD_BITMAP_BYTES: usize = VALIDATION_RVD4_SHARD_COUNT / 8;
 const VALIDATION_SHARDED_DELTA_HEADER_BYTES: usize = 16 + VALIDATION_DELTA_SHARD_BITMAP_BYTES;
+const VALIDATION_COMPACT_SHARDED_DELTA_HEADER_BYTES: usize = 16 + VALIDATION_DELTA_SHARD_COUNT / 8;
 const VALIDATION_BLOOM_MAGIC: [u8; 4] = *b"RVB1";
 const VALIDATION_BLOOM_HEADER_BYTES: usize = 48;
 const VALIDATION_BLOOM_BITS_PER_UPDATE: usize = 10;
@@ -221,6 +224,7 @@ const MIN_PARALLEL_VALIDATION_BLOOM_KEYS: usize = 16_384;
 struct ValidationJournal {
     rows: Vec<ValidationJournalRow>,
     groups: Vec<ValidationBloom>,
+    legacy_hits: BTreeMap<u32, u64>,
     utxo_count: u64,
 }
 
@@ -394,6 +398,17 @@ pub(crate) struct ConnectTransition {
     pub(crate) transaction_undos: Vec<UtxoUndo>,
 }
 
+/// Result of atomically replacing one legacy giant validation row with shards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidationDeltaShardMigration {
+    /// Checkpoint height whose row was rewritten.
+    pub height: u32,
+    /// Bytes in the legacy RVD3 row.
+    pub legacy_bytes: u64,
+    /// Number of non-empty sorted RVD4 shards.
+    pub shard_count: usize,
+}
+
 fn encode_validation_delta<'a>(
     updates: impl ExactSizeIterator<Item = (&'a OutPointKey, &'a ValidationUpdate)>,
     utxo_count: u64,
@@ -444,11 +459,16 @@ fn encode_validation_delta<'a>(
 struct ShardedValidationDeltaHeader {
     utxo_count: u64,
     update_count: usize,
+    shard_count: usize,
     populated_shards: [u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES],
 }
 
-fn validation_delta_shard(outpoint: OutPointKey) -> u8 {
-    outpoint.as_bytes()[0]
+fn validation_delta_shard(outpoint: OutPointKey, shard_count: usize) -> u8 {
+    match shard_count {
+        VALIDATION_RVD4_SHARD_COUNT => outpoint.as_bytes()[0],
+        VALIDATION_DELTA_SHARD_COUNT => outpoint.as_bytes()[0] >> 4,
+        _ => unreachable!("validated shard count"),
+    }
 }
 
 fn validation_delta_shard_key(height: u32, shard: u8) -> [u8; 5] {
@@ -468,9 +488,11 @@ fn encode_sharded_validation_delta(
     let mut shards = Vec::new();
     let mut start = 0;
     while start < updates.len() {
-        let shard = validation_delta_shard(updates[start].0);
+        let shard = validation_delta_shard(updates[start].0, VALIDATION_DELTA_SHARD_COUNT);
         let mut end = start + 1;
-        while end < updates.len() && validation_delta_shard(updates[end].0) == shard {
+        while end < updates.len()
+            && validation_delta_shard(updates[end].0, VALIDATION_DELTA_SHARD_COUNT) == shard
+        {
             end += 1;
         }
         populated_shards[usize::from(shard) / 8] |= 1 << (shard % 8);
@@ -483,22 +505,28 @@ fn encode_sharded_validation_delta(
         shards.push((shard, encoded));
         start = end;
     }
-    let mut manifest = Vec::with_capacity(VALIDATION_SHARDED_DELTA_HEADER_BYTES);
-    manifest.extend_from_slice(&VALIDATION_SHARDED_DELTA_MAGIC);
+    let mut manifest = Vec::with_capacity(VALIDATION_COMPACT_SHARDED_DELTA_HEADER_BYTES);
+    manifest.extend_from_slice(&VALIDATION_COMPACT_SHARDED_DELTA_MAGIC);
     manifest.extend_from_slice(&utxo_count.to_le_bytes());
     manifest.extend_from_slice(&update_count.to_le_bytes());
-    manifest.extend_from_slice(&populated_shards);
+    manifest.extend_from_slice(&populated_shards[..VALIDATION_DELTA_SHARD_COUNT / 8]);
     Ok((manifest, shards))
 }
 
 fn decode_sharded_validation_delta_header(
     encoded: &[u8],
 ) -> Result<ShardedValidationDeltaHeader, UtxoError> {
-    if encoded.len() != VALIDATION_SHARDED_DELTA_HEADER_BYTES
-        || encoded[..4] != VALIDATION_SHARDED_DELTA_MAGIC
+    let shard_count = if encoded.starts_with(&VALIDATION_SHARDED_DELTA_MAGIC)
+        && encoded.len() == VALIDATION_SHARDED_DELTA_HEADER_BYTES
     {
+        VALIDATION_RVD4_SHARD_COUNT
+    } else if encoded.starts_with(&VALIDATION_COMPACT_SHARDED_DELTA_MAGIC)
+        && encoded.len() == VALIDATION_COMPACT_SHARDED_DELTA_HEADER_BYTES
+    {
+        VALIDATION_DELTA_SHARD_COUNT
+    } else {
         return Err(UtxoError::Malformed("sharded validation delta manifest"));
-    }
+    };
     let utxo_count = u64::from_le_bytes(
         encoded[4..12]
             .try_into()
@@ -511,7 +539,7 @@ fn decode_sharded_validation_delta_header(
     ))
     .expect("u32 fits usize");
     let mut populated_shards = [0_u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES];
-    populated_shards.copy_from_slice(&encoded[16..]);
+    populated_shards[..encoded.len() - 16].copy_from_slice(&encoded[16..]);
     if update_count == 0 && populated_shards.iter().any(|byte| *byte != 0) {
         return Err(UtxoError::Malformed(
             "empty sharded validation delta has populated shards",
@@ -520,6 +548,7 @@ fn decode_sharded_validation_delta_header(
     Ok(ShardedValidationDeltaHeader {
         utxo_count,
         update_count,
+        shard_count,
         populated_shards,
     })
 }
@@ -545,7 +574,9 @@ fn validation_delta_record_header(
             utxo_count,
             update_count,
         })
-    } else if encoded.starts_with(&VALIDATION_SHARDED_DELTA_MAGIC) {
+    } else if encoded.starts_with(&VALIDATION_SHARDED_DELTA_MAGIC)
+        || encoded.starts_with(&VALIDATION_COMPACT_SHARDED_DELTA_MAGIC)
+    {
         decode_sharded_validation_delta_header(encoded).map(ValidationDeltaRecordHeader::Sharded)
     } else {
         Err(UtxoError::Malformed("validation delta format"))
@@ -563,7 +594,7 @@ where
         ValidationDeltaRecordHeader::Legacy { .. } => decode_validation_delta(encoded),
         ValidationDeltaRecordHeader::Sharded(header) => {
             let mut updates = Vec::with_capacity(header.update_count);
-            for shard in 0..VALIDATION_DELTA_SHARD_COUNT {
+            for shard in 0..header.shard_count {
                 let shard = u8::try_from(shard).expect("validation shard fits u8");
                 if !validation_shard_is_populated(header, shard) {
                     continue;
@@ -572,9 +603,9 @@ where
                 let (shard_utxo_count, shard_updates) = decode_validation_delta(&encoded_shard)?;
                 if shard_utxo_count != header.utxo_count
                     || shard_updates.is_empty()
-                    || shard_updates
-                        .iter()
-                        .any(|(outpoint, _)| validation_delta_shard(*outpoint) != shard)
+                    || shard_updates.iter().any(|(outpoint, _)| {
+                        validation_delta_shard(*outpoint, header.shard_count) != shard
+                    })
                 {
                     return Err(UtxoError::Malformed(
                         "validation delta shard content mismatch",
@@ -910,6 +941,7 @@ impl RedbChainStore {
                 let mut journal = ValidationJournal {
                     rows: Vec::new(),
                     groups: Vec::new(),
+                    legacy_hits: BTreeMap::new(),
                     utxo_count: base_stats
                         .hot
                         .checked_add(base_stats.cold)
@@ -1104,6 +1136,68 @@ impl RedbChainStore {
     /// Read/write access to execution metadata outside block transitions.
     pub fn execution(&self) -> &RedbExecutionStore {
         &self.execution
+    }
+
+    /// Takes the hottest recently read legacy row as an advisory migration candidate.
+    pub fn take_hottest_legacy_validation_delta(&self) -> Option<u32> {
+        let Some(validation_journal) = &self.validation_journal else {
+            return None;
+        };
+        let mut journal = validation_journal
+            .lock()
+            .expect("validation journal lock not poisoned");
+        let (&height, _) = journal
+            .legacy_hits
+            .iter()
+            .max_by_key(|(height, hits)| (**hits, **height))?;
+        journal.legacy_hits.remove(&height);
+        Some(height)
+    }
+
+    /// Atomically rewrites one legacy giant journal row as sorted shards.
+    ///
+    /// The RVD3-to-RVD4 replacement and every shard insertion share one
+    /// immediate-durability transaction, so concurrent readers observe exactly
+    /// one complete representation.
+    pub fn shard_legacy_validation_delta(
+        &self,
+        height: u32,
+    ) -> Result<Option<ValidationDeltaShardMigration>, ChainStoreError> {
+        if self.validation_journal.is_none() {
+            return Ok(None);
+        };
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let (legacy_bytes, utxo_count, updates) = {
+            let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            let encoded = deltas
+                .get(height)?
+                .ok_or(UtxoError::Malformed("missing validation delta row"))?;
+            if !encoded.value().starts_with(&VALIDATION_DELTA_MAGIC) {
+                return Ok(None);
+            }
+            let legacy_bytes = u64::try_from(encoded.value().len())
+                .map_err(|_| UtxoError::Malformed("validation delta record length"))?;
+            let (utxo_count, updates) = decode_validation_delta(encoded.value())?;
+            (legacy_bytes, utxo_count, updates)
+        };
+        let (manifest, shards) = encode_sharded_validation_delta(&updates, utxo_count)?;
+        {
+            let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+            deltas.insert(height, manifest.as_slice())?;
+            let mut delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+            for (shard, encoded) in &shards {
+                let key = validation_delta_shard_key(height, *shard);
+                delta_shards.insert(key.as_slice(), encoded.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(Some(ValidationDeltaShardMigration {
+            height,
+            legacy_bytes,
+            shard_count: shards.len(),
+        }))
     }
 
     /// Folds every validation-journal update into the base UTXO tables.
@@ -1611,7 +1705,7 @@ impl UtxoStore for RedbChainStore {
                             validation_delta_lookup(encoded.value(), outpoint)?
                         }
                         ValidationDeltaRecordHeader::Sharded(header) => {
-                            let shard = validation_delta_shard(outpoint);
+                            let shard = validation_delta_shard(outpoint, header.shard_count);
                             if validation_shard_is_populated(header, shard) {
                                 let key = validation_delta_shard_key(row.height, shard);
                                 let encoded_shard = delta_shards.get(key.as_slice())?.ok_or(
@@ -1640,7 +1734,7 @@ impl UtxoStore for RedbChainStore {
         let Some(journal) = &self.validation_journal else {
             return self.utxos.get_many(outpoints);
         };
-        let journal = journal
+        let mut journal = journal
             .lock()
             .expect("validation journal lock not poisoned");
         let transaction = self.db.begin_read()?;
@@ -1648,6 +1742,7 @@ impl UtxoStore for RedbChainStore {
         let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
         let mut results = vec![None; outpoints.len()];
         let mut unresolved = (0..outpoints.len()).collect::<Vec<_>>();
+        let mut legacy_hits = Vec::new();
         for (group_index, group) in journal.groups.iter().enumerate().rev() {
             if unresolved.is_empty() {
                 break;
@@ -1674,6 +1769,10 @@ impl UtxoStore for RedbChainStore {
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
                 match validation_delta_record_header(encoded.value())? {
                     ValidationDeltaRecordHeader::Legacy { .. } => {
+                        legacy_hits.push((
+                            row.height,
+                            u64::try_from(row_candidates.len()).unwrap_or(u64::MAX),
+                        ));
                         for index in row_candidates {
                             if results[index].is_some() {
                                 continue;
@@ -1687,12 +1786,13 @@ impl UtxoStore for RedbChainStore {
                         }
                     }
                     ValidationDeltaRecordHeader::Sharded(header) => {
-                        let mut shard_candidates = vec![Vec::new(); VALIDATION_DELTA_SHARD_COUNT];
+                        let mut shard_candidates = vec![Vec::new(); header.shard_count];
                         for index in row_candidates {
                             if results[index].is_some() {
                                 continue;
                             }
-                            let shard = validation_delta_shard(outpoints[index]);
+                            let shard =
+                                validation_delta_shard(outpoints[index], header.shard_count);
                             if validation_shard_is_populated(header, shard) {
                                 shard_candidates[usize::from(shard)].push(index);
                             }
@@ -1721,6 +1821,10 @@ impl UtxoStore for RedbChainStore {
             group_unresolved.retain(|index| results[*index].is_none());
             next_unresolved.extend(group_unresolved);
             unresolved = next_unresolved;
+        }
+        for (height, hits) in legacy_hits {
+            let entry = journal.legacy_hits.entry(height).or_default();
+            *entry = entry.saturating_add(hits);
         }
         drop(deltas);
         drop(delta_shards);
@@ -2654,14 +2758,14 @@ mod tests {
                 },
             ),
             (
-                key(2),
+                key(32),
                 ValidationUpdate {
                     spent_in_batch: false,
                     utxo: Some(coin(20)),
                 },
             ),
             (
-                key(3),
+                key(64),
                 ValidationUpdate {
                     spent_in_batch: true,
                     utxo: Some(coin(30)),
@@ -2671,10 +2775,10 @@ mod tests {
         .into_iter()
         .collect::<Vec<_>>();
         let (manifest, shards) = encode_sharded_validation_delta(&updates, 77).unwrap();
-        assert_eq!(&manifest[..4], &VALIDATION_SHARDED_DELTA_MAGIC);
+        assert_eq!(&manifest[..4], &VALIDATION_COMPACT_SHARDED_DELTA_MAGIC);
         assert_eq!(
             shards.iter().map(|(shard, _)| *shard).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![0, 2, 4]
         );
         let (utxo_count, decoded) = decode_validation_delta_record(&manifest, |requested| {
             shards
@@ -2692,6 +2796,31 @@ mod tests {
             }),
             Err(UtxoError::Malformed("missing validation delta shard"))
         ));
+
+        let mut rvd4_bitmap = [0_u8; VALIDATION_DELTA_SHARD_BITMAP_BYTES];
+        let mut rvd4_shards = Vec::new();
+        for (outpoint, update) in &updates {
+            let shard = validation_delta_shard(*outpoint, VALIDATION_RVD4_SHARD_COUNT);
+            rvd4_bitmap[usize::from(shard) / 8] |= 1 << (shard % 8);
+            rvd4_shards.push((
+                shard,
+                encode_validation_delta(std::iter::once((outpoint, update)), 77).unwrap(),
+            ));
+        }
+        let mut rvd4_manifest = Vec::with_capacity(VALIDATION_SHARDED_DELTA_HEADER_BYTES);
+        rvd4_manifest.extend_from_slice(&VALIDATION_SHARDED_DELTA_MAGIC);
+        rvd4_manifest.extend_from_slice(&77_u64.to_le_bytes());
+        rvd4_manifest.extend_from_slice(&3_u32.to_le_bytes());
+        rvd4_manifest.extend_from_slice(&rvd4_bitmap);
+        let (_, decoded_rvd4) = decode_validation_delta_record(&rvd4_manifest, |requested| {
+            rvd4_shards
+                .iter()
+                .find(|(shard, _)| *shard == requested)
+                .map(|(_, encoded)| encoded.clone())
+                .ok_or(UtxoError::Malformed("missing validation delta shard"))
+        })
+        .unwrap();
+        assert_eq!(decoded_rvd4, updates);
     }
 
     #[test]
@@ -2869,6 +2998,66 @@ mod tests {
         let reopened =
             RedbChainStore::open_with_options(&path, Network::Regtest, base_options).unwrap();
         assert_eq!(reopened.get(key(1)).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn hot_legacy_validation_row_migrates_atomically_to_sorted_shards() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let options = ChainStoreOptions {
+            retain_block_undo: false,
+            validation_delta_journal: true,
+            ..ChainStoreOptions::default()
+        };
+        let store = RedbChainStore::open_with_options(&path, Network::Regtest, options).unwrap();
+        let genesis = store.execution().tip().unwrap();
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([56; 32]),
+                },
+                spent: vec![],
+                created: vec![(key(1), coin(10)), (key(2), coin(20))],
+                transaction_undos: vec![],
+            }])
+            .unwrap();
+        let legacy_updates =
+            fold_validation_updates(&[], vec![(key(1), coin(10)), (key(2), coin(20))]);
+        let legacy = encode_validation_delta(
+            legacy_updates
+                .iter()
+                .map(|(outpoint, update)| (outpoint, update)),
+            2,
+        )
+        .unwrap();
+        let transaction = store.db.begin_write().unwrap();
+        {
+            let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE).unwrap();
+            deltas.insert(1, legacy.as_slice()).unwrap();
+            let mut shards = transaction
+                .open_table(VALIDATION_DELTA_SHARD_TABLE)
+                .unwrap();
+            shards.retain(|_, _| false).unwrap();
+        }
+        transaction.commit().unwrap();
+
+        assert_eq!(
+            store.get_many(&[key(2), key(3)]).unwrap(),
+            vec![(key(2), Some(coin(20))), (key(3), None)]
+        );
+        assert_eq!(store.take_hottest_legacy_validation_delta(), Some(1));
+        let migrated = store.shard_legacy_validation_delta(1).unwrap().unwrap();
+        assert_eq!(migrated.height, 1);
+        assert_eq!(migrated.legacy_bytes, u64::try_from(legacy.len()).unwrap());
+        assert_eq!(migrated.shard_count, 1);
+        assert!(store.take_hottest_legacy_validation_delta().is_none());
+        drop(store);
+
+        let reopened = RedbChainStore::open_with_options(&path, Network::Regtest, options).unwrap();
+        assert_eq!(reopened.get(key(1)).unwrap(), Some(coin(10)));
+        assert_eq!(reopened.get(key(2)).unwrap(), Some(coin(20)));
     }
 
     #[test]
