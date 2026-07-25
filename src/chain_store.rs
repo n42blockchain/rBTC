@@ -9,6 +9,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use bitcoin::{BlockHash, Network};
+use hashlink::LinkedHashMap;
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -220,17 +221,62 @@ const VALIDATION_BLOOM_BITS_PER_UPDATE: usize = 10;
 const VALIDATION_ROWS_PER_BLOOM_GROUP: usize = 16;
 const VALIDATION_GROUP_BLOOM_UPDATES: usize = 16_000_000;
 const MIN_PARALLEL_VALIDATION_BLOOM_KEYS: usize = 16_384;
+const MAX_VALIDATION_SHARD_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 struct ValidationJournal {
     rows: Vec<ValidationJournalRow>,
     groups: Vec<ValidationBloom>,
     legacy_hits: BTreeMap<u32, u64>,
+    shard_cache: ValidationShardCache,
     utxo_count: u64,
 }
 
 struct ValidationJournalRow {
     height: u32,
     bloom: ValidationBloom,
+}
+
+struct ValidationShardCache {
+    rows: LinkedHashMap<(u32, u8), Arc<[u8]>>,
+    bytes: usize,
+    capacity: usize,
+}
+
+impl ValidationShardCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            rows: LinkedHashMap::new(),
+            bytes: 0,
+            capacity,
+        }
+    }
+
+    fn get(&mut self, key: (u32, u8)) -> Option<Arc<[u8]>> {
+        self.rows.to_back(&key).cloned()
+    }
+
+    fn insert(&mut self, key: (u32, u8), encoded: Arc<[u8]>) {
+        if encoded.len() > self.capacity {
+            return;
+        }
+        if let Some(previous) = self.rows.insert(key, encoded) {
+            self.bytes = self.bytes.saturating_sub(previous.len());
+        }
+        self.bytes = self
+            .bytes
+            .saturating_add(self.rows.get(&key).expect("inserted cache row").len());
+        while self.bytes > self.capacity {
+            let Some((_, retired)) = self.rows.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(retired.len());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.bytes = 0;
+    }
 }
 
 #[derive(Clone)]
@@ -942,6 +988,9 @@ impl RedbChainStore {
                     rows: Vec::new(),
                     groups: Vec::new(),
                     legacy_hits: BTreeMap::new(),
+                    shard_cache: ValidationShardCache::new(
+                        (options.cache_size_bytes / 8).min(MAX_VALIDATION_SHARD_CACHE_BYTES),
+                    ),
                     utxo_count: base_stats
                         .hot
                         .checked_add(base_stats.cold)
@@ -1271,6 +1320,7 @@ impl RedbChainStore {
         let count = u64::try_from(updates.len()).expect("usize fits u64");
         journal.rows.clear();
         journal.groups.clear();
+        journal.shard_cache.clear();
         Ok(count)
     }
 
@@ -1737,30 +1787,37 @@ impl UtxoStore for RedbChainStore {
         let mut journal = journal
             .lock()
             .expect("validation journal lock not poisoned");
+        let ValidationJournal {
+            rows,
+            groups,
+            legacy_hits: legacy_hit_counts,
+            shard_cache,
+            ..
+        } = &mut *journal;
         let transaction = self.db.begin_read()?;
         let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
         let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
         let mut results = vec![None; outpoints.len()];
         let mut unresolved = (0..outpoints.len()).collect::<Vec<_>>();
-        let mut legacy_hits = Vec::new();
-        for (group_index, group) in journal.groups.iter().enumerate().rev() {
+        let mut observed_legacy_hits = Vec::new();
+        for (group_index, group) in groups.iter().enumerate().rev() {
             if unresolved.is_empty() {
                 break;
             }
             let (mut group_unresolved, mut next_unresolved) =
                 partition_validation_bloom_matches(group, outpoints, unresolved);
             let start = group_index * VALIDATION_ROWS_PER_BLOOM_GROUP;
-            let end = (start + VALIDATION_ROWS_PER_BLOOM_GROUP).min(journal.rows.len());
-            let rows = &journal.rows[start..end];
-            let mut row_candidates = vec![Vec::new(); rows.len()];
+            let end = (start + VALIDATION_ROWS_PER_BLOOM_GROUP).min(rows.len());
+            let group_rows = &rows[start..end];
+            let mut row_candidates = vec![Vec::new(); group_rows.len()];
             for index in &group_unresolved {
-                for (row_index, row) in rows.iter().enumerate() {
+                for (row_index, row) in group_rows.iter().enumerate() {
                     if row.bloom.might_contain(outpoints[*index]) {
                         row_candidates[row_index].push(*index);
                     }
                 }
             }
-            for (row, row_candidates) in rows.iter().zip(row_candidates).rev() {
+            for (row, row_candidates) in group_rows.iter().zip(row_candidates).rev() {
                 if row_candidates.is_empty() {
                     continue;
                 }
@@ -1769,7 +1826,7 @@ impl UtxoStore for RedbChainStore {
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
                 match validation_delta_record_header(encoded.value())? {
                     ValidationDeltaRecordHeader::Legacy { .. } => {
-                        legacy_hits.push((
+                        observed_legacy_hits.push((
                             row.height,
                             u64::try_from(row_candidates.len()).unwrap_or(u64::MAX),
                         ));
@@ -1802,14 +1859,22 @@ impl UtxoStore for RedbChainStore {
                                 continue;
                             }
                             let shard = u8::try_from(shard).expect("validation shard fits u8");
-                            let key = validation_delta_shard_key(row.height, shard);
-                            let encoded_shard = delta_shards
-                                .get(key.as_slice())?
-                                .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
+                            let cache_key = (row.height, shard);
+                            let encoded_shard = if let Some(encoded) = shard_cache.get(cache_key) {
+                                encoded
+                            } else {
+                                let key = validation_delta_shard_key(row.height, shard);
+                                let encoded = delta_shards.get(key.as_slice())?.ok_or(
+                                    UtxoError::Malformed("missing validation delta shard"),
+                                )?;
+                                let encoded = Arc::<[u8]>::from(encoded.value());
+                                shard_cache.insert(cache_key, Arc::clone(&encoded));
+                                encoded
+                            };
                             for index in candidates {
                                 let outpoint = outpoints[index];
                                 if let Some(update) =
-                                    validation_delta_lookup(encoded_shard.value(), outpoint)?
+                                    validation_delta_lookup(encoded_shard.as_ref(), outpoint)?
                                 {
                                     results[index] = Some((outpoint, update.utxo));
                                 }
@@ -1822,8 +1887,8 @@ impl UtxoStore for RedbChainStore {
             next_unresolved.extend(group_unresolved);
             unresolved = next_unresolved;
         }
-        for (height, hits) in legacy_hits {
-            let entry = journal.legacy_hits.entry(height).or_default();
+        for (height, hits) in observed_legacy_hits {
+            let entry = legacy_hit_counts.entry(height).or_default();
             *entry = entry.saturating_add(hits);
         }
         drop(deltas);
@@ -1973,6 +2038,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn validation_shard_cache_is_byte_bounded_and_refreshes_hits() {
+        let mut cache = ValidationShardCache::new(6);
+        cache.insert((1, 0), Arc::from([1_u8, 2, 3]));
+        cache.insert((2, 0), Arc::from([4_u8, 5, 6]));
+        assert_eq!(cache.get((1, 0)).as_deref(), Some([1_u8, 2, 3].as_slice()));
+
+        cache.insert((3, 0), Arc::from([7_u8, 8, 9]));
+        assert!(cache.get((2, 0)).is_none());
+        assert!(cache.get((1, 0)).is_some());
+        assert!(cache.get((3, 0)).is_some());
+        assert_eq!(cache.bytes, 6);
+
+        cache.insert((4, 0), Arc::from([0_u8; 7]));
+        assert!(cache.get((4, 0)).is_none());
+        assert_eq!(cache.bytes, 6);
+    }
 
     fn key(byte: u8) -> OutPointKey {
         OutPoint::new(Txid::from_byte_array([byte; 32]), 0).into()

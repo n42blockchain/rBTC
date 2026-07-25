@@ -1030,6 +1030,7 @@ dependencies = [
  "bdk_wallet",
  "bitcoin",
  "bitcoinconsensus",
+ "hashlink",
  "libmdbx",
  "proptest",
  "rand 0.9.5",
