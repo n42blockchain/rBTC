@@ -205,11 +205,17 @@ normally skip 16 records with three probes. The row filter and current group
 aggregate are checksummed and committed atomically with every delta manifest,
 including while the newest group is incomplete. Bulk prefetch resolves all
 journal hits newest-first and issues one ordered parallel redb base lookup only
-for unresolved outpoints. The batch records which legacy row caused the most
-candidate reads. The next checkpoint rewrites that row to RVD5 in one atomic
-transaction while its archive stage, UTXO read snapshot, and complete network
-lookahead run independently. A live 368,825,574-byte row migrated into 16
-sorted shards in 3.448 seconds, entirely inside the longer prefetch window.
+for unresolved outpoints. Required shards within one immutable row are read
+through up to the host's available parallel redb snapshots and decoded in
+their workers; rows still resolve newest-first, so the implementation never
+speculatively reads an older row that a newer row may satisfy. The batch
+records which legacy rows caused the most candidate reads. The next checkpoint
+rewrites up to 32 of them to RVD5, each in one atomic transaction, while its
+archive stage, UTXO read snapshot, and complete network lookahead run
+independently. The migration window naturally shrinks when fewer rows qualify.
+Live validation migrated 756 hotspot rows without extending the critical path;
+after row-internal parallel reads, adjacent UTXO prefetch fell from 66–73
+seconds to 34–41 seconds.
 
 An older RVD3 database without persisted filters undergoes one strict scan of
 record size, ordering, state bits, contiguous offsets, and canonical UTXO

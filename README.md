@@ -201,11 +201,13 @@ rejected that fan-out because its write amplification outweighed the smaller
 reads. Checksummed `RVB1` per-record Bloom filters and 16-record aggregate
 filters reject old runs before value access. The current aggregate—including
 an unfinished group—is rewritten in the same transaction as every complete
-delta and execution tip. The hottest RVD3 row observed by each batch is
-rewritten to sorted RVD5 shards in one transaction alongside the next batch's
-read-only UTXO prefetch, archive staging, and network lookahead. Existing RVD3
-directories still open without an eager migration; missing filters undergo
-the prior strict reconstruction.
+delta and execution tip. Within one row, required immutable shards are read
+concurrently through bounded independent snapshots, while rows still resolve
+strictly newest-first. Up to 32 hottest RVD3 rows observed by each batch are
+rewritten one transaction at a time to sorted RVD5 shards alongside the next
+batch's read-only UTXO prefetch, archive staging, and network lookahead.
+Existing RVD3 directories still open without an eager migration; missing
+filters undergo the prior strict reconstruction.
 Ordinary reorganizing stores reject this format. Explicit materialization
 folds all runs and clears the delta and filter tables atomically. There is no
 relaxed durability or block undo in this fixed-target mode.
