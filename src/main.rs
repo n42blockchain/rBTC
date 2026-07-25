@@ -896,11 +896,19 @@ fn collect_node_status(
 async fn main() {
     match parse_options(env::args().skip(1)) {
         Ok(Some(options)) => {
+            // Keep signal collection on an independent runtime task. The
+            // validating future performs bounded synchronous execution work;
+            // if signal polling shares that same task, the OS notification can
+            // otherwise remain unread until after another checkpoint starts.
+            let signal_task = tokio::spawn(shutdown_signal());
             let result = tokio::select! {
                 result = run(options) => result,
-                signal = shutdown_signal() => signal.map(|()| {
-                    eprintln!("rbtcd: shutdown signal received; closing durable stores");
-                }),
+                signal = signal_task => signal
+                    .map_err(|error| format!("shutdown signal task failed: {error}"))
+                    .and_then(std::convert::identity)
+                    .map(|()| {
+                        eprintln!("rbtcd: shutdown signal received; closing durable stores");
+                    }),
             };
             if let Err(error) = result {
                 eprintln!("rbtcd: {error}");
