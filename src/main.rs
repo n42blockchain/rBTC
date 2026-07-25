@@ -5578,7 +5578,7 @@ async fn download_execute_batch(
         Vec::new()
     };
     let now = u64::from(unix_time()?);
-    let delta_shard_candidates = (0..2)
+    let delta_shard_candidates = (0..8)
         .filter_map(|_| chainstate.take_hottest_legacy_validation_delta())
         .collect::<Vec<_>>();
     let staged_at;
