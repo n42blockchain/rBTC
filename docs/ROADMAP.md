@@ -43,10 +43,11 @@ packetizing script validation into 16-transaction work items then removed
 per-transaction queue/result contention and reduced five adjacent
 756-block execution/persistence samples from the preceding 51.401-second
 median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
-after repeated 756-block prefetched-response timeouts, cross-execution
-lookahead is now restricted to checkpoints through 256 blocks, and the first
-active auxiliary-window failure circuit-breaks further auxiliary block
-downloads until the primary session changes; later block growth then selected
+after repeated 756-block prefetched-response timeouts, checkpoints through
+256 blocks retain bounded-window lookahead while larger checkpoints prefetch
+only one safe 16-block wire request; lagging auxiliary windows now preserve
+already received blocks, fetch only missing hashes from the primary, and
+rotate through at most three ready candidates; later block growth then selected
 64-block validation response windows after the first five samples completed
 without failover at a 95.388-second download median and 168.974-second total
 median;

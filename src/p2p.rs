@@ -186,6 +186,16 @@ pub enum P2pError {
         /// Aggregate response count.
         count: usize,
     },
+    /// A caller supplied a progress buffer that cannot hold the requested batch.
+    #[error(
+        "block response progress buffer has {actual} slots; requested batch requires {expected}"
+    )]
+    BlockResponseBufferLength {
+        /// Number of requested block responses.
+        expected: usize,
+        /// Number of slots supplied by the caller.
+        actual: usize,
+    },
     /// A caller attempted to exceed the bounded transaction-inventory request.
     #[error("requested {count} transactions at once; limit is {MAX_PENDING_TRANSACTION_INVENTORY}")]
     TooManyTransactionRequests {
@@ -317,6 +327,7 @@ impl P2pError {
             | Self::MissingServices { .. }
             | Self::TooManyBlockRequests { .. }
             | Self::TooManyPipelinedBlockRequests { .. }
+            | Self::BlockResponseBufferLength { .. }
             | Self::TooManyTransactionRequests { .. }
             | Self::InvalidTransactionRequestInventory(_)
             | Self::DuplicateTransactionRequest(_)
@@ -1570,8 +1581,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         candidates: &[Transaction],
     ) -> Result<Vec<bitcoin::Block>, P2pError> {
         validate_block_request(expected)?;
-        self.receive_block_responses_with_candidates(expected, candidates, MAX_RESPONSE_MESSAGES)
-            .await
+        let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
+        self.receive_block_responses_into_with_candidates(
+            expected,
+            candidates,
+            MAX_RESPONSE_MESSAGES,
+            &mut blocks,
+        )
+        .await?;
+        Ok(blocks
+            .into_iter()
+            .map(|block| block.expect("every requested position was filled"))
+            .collect())
     }
 
     /// Receives the aggregate response to several already-sent, individually
@@ -1581,29 +1602,63 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         expected: &[BlockHash],
         candidates: &[Transaction],
     ) -> Result<Vec<bitcoin::Block>, P2pError> {
+        let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
+        self.receive_pipelined_blocks_into_with_candidates(expected, candidates, &mut blocks)
+            .await?;
+        Ok(blocks
+            .into_iter()
+            .map(|block| block.expect("every requested position was filled"))
+            .collect())
+    }
+
+    /// Receives a pipelined block batch into caller-owned progress slots.
+    ///
+    /// Each completed, checksum-verified response is placed in its requested
+    /// position immediately. This lets a caller retain already received blocks
+    /// if it abandons a slow peer by cancelling the future; the peer session
+    /// itself must not be reused after such cancellation.
+    pub async fn receive_pipelined_blocks_into_with_candidates(
+        &mut self,
+        expected: &[BlockHash],
+        candidates: &[Transaction],
+        blocks: &mut [Option<bitcoin::Block>],
+    ) -> Result<(), P2pError> {
         if expected.len() > MAX_PIPELINED_BLOCKS_IN_FLIGHT {
             return Err(P2pError::TooManyPipelinedBlockRequests {
                 count: expected.len(),
             });
         }
+        if blocks.len() != expected.len() {
+            return Err(P2pError::BlockResponseBufferLength {
+                expected: expected.len(),
+                actual: blocks.len(),
+            });
+        }
+        debug_assert!(blocks.iter().all(Option::is_none));
         validate_unique_block_request(expected)?;
         let response_budget = expected
             .len()
             .saturating_mul(2)
             .saturating_add(MAX_RESPONSE_MESSAGES);
-        self.receive_block_responses_with_candidates(expected, candidates, response_budget)
-            .await
+        self.receive_block_responses_into_with_candidates(
+            expected,
+            candidates,
+            response_budget,
+            blocks,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn receive_block_responses_with_candidates(
+    async fn receive_block_responses_into_with_candidates(
         &mut self,
         expected: &[BlockHash],
         candidates: &[Transaction],
         response_budget: usize,
-    ) -> Result<Vec<bitcoin::Block>, P2pError> {
+        blocks: &mut [Option<bitcoin::Block>],
+    ) -> Result<(), P2pError> {
         if expected.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut positions = HashMap::with_capacity(expected.len());
         for (position, hash) in expected.iter().copied().enumerate() {
@@ -1611,7 +1666,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 return Err(P2pError::DuplicateBlockRequest(hash));
             }
         }
-        let mut blocks = (0..expected.len()).map(|_| None).collect::<Vec<_>>();
         let mut compact_blocks = HashMap::<BlockHash, CompactBlockReconstruction>::new();
         let mut full_block_fallbacks = HashSet::<BlockHash>::new();
         let response_started = Instant::now();
@@ -1716,10 +1770,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     .block_transfer_stats
                     .response_time
                     .saturating_add(response_started.elapsed());
-                return Ok(blocks
-                    .into_iter()
-                    .map(|block| block.expect("every requested position was filled"))
-                    .collect());
+                return Ok(());
             }
         }
         Err(P2pError::BlockResponseIncomplete {

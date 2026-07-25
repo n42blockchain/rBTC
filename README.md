@@ -226,14 +226,15 @@ and auxiliary peers concurrently. Larger configured batches repeat the same
 pairing, while each peer has at most 64 ordered block
 responses outstanding. The receiver appends every pair in active-chain order
 and retries its auxiliary half on the primary after any request or response
-failure. The first active auxiliary failure circuit-breaks auxiliary block
-downloads for the remainder of that primary session; a new primary session may
-try one again. This retains bounded failover while preventing a sequence of
-unreliable public standbys from adding the same grace/timeout cost to every
-large checkpoint. Once a primary window completes, its unfinished auxiliary response
-gets two seconds of grace before it is abandoned and retried on the primary;
-this reduced one observed slow-auxiliary download from 40.485 to 27.684
-seconds instead of paying the complete 30-second auxiliary timeout first. An
+failure. After an unfinished auxiliary response gets two seconds of grace,
+the receiver retains every checksum-verified block already delivered and
+requests only the missing suffix from the primary. The failed session is
+retired and the next of at most three ready auxiliary candidates gets one
+bounded trial. This avoids both whole-window duplicate transfer and unbounded
+cycling through unreliable public peers. The earlier whole-window fallback
+reduced one observed slow-auxiliary download from 40.485 to 27.684 seconds
+instead of paying the complete 30-second auxiliary timeout first; retaining
+partial progress further bounds that fallback by the actual missing blocks. An
 adjacent live sample reduced ordinary median download time only from about
 19.4 to 18.8 seconds, so this remains a tail-latency guard rather than the main
 speedup. Actively receiving the auxiliary lookahead during execution was
@@ -279,11 +280,17 @@ and advanced atomically through height 507,528.
 An experimental four-peer 504-block downloader was rejected after unreliable
 auxiliary peers widened complete-batch time to 73.243–127.829 seconds. The
 retained path uses bounded paired 64-block windows and a two-second
-slow-auxiliary guard. Its first active auxiliary failure circuit-breaks
-auxiliary downloads for the remainder of the primary session.
+slow-auxiliary guard. It preserves partial auxiliary progress and rotates
+through at most three already-ready candidates.
 Expanding each batch across more simultaneous auxiliaries was also rejected after
 five auxiliary-bearing batches took 80.105–105.571 seconds while the following
 primary-only batches took 80.482 and 88.089 seconds.
+
+Cross-execution lookahead remains a full bounded window for checkpoints
+through 256 blocks. Larger checkpoints now prefetch exactly one 16-block wire
+request while execution is busy, hiding the next batch's initial round trip
+without recreating the unread 128-block response pressure seen in the earlier
+756-block soak.
 
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,

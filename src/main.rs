@@ -88,6 +88,14 @@ const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
+
+const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
+    if maximum_batch_size <= MAX_VALIDATION_PREFETCH_BATCH_SIZE {
+        maximum_batch_size
+    } else {
+        MAX_BLOCKS_IN_FLIGHT
+    }
+}
 const MAX_LOCAL_AUTH_TOKEN_FILE_LEN: u64 = 1024;
 #[cfg(not(test))]
 const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_secs(1);
@@ -4416,16 +4424,12 @@ async fn sync_validating_node(
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
                 &mut prefetched_block_windows,
-                validation_target.is_some()
-                    && validation_scheduler.is_none()
-                    && effective_validation_limits.max_blocks_per_batch
-                        <= MAX_VALIDATION_PREFETCH_BATCH_SIZE,
+                validation_target.is_some() && validation_scheduler.is_none(),
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
-                auxiliary.clear();
                 eprintln!(
-                    "auxiliary block downloads disabled for the remainder of this primary session after the first active-window failure"
+                    "auxiliary block-download peer retired after its first active-window failure; trying the next bounded candidate"
                 );
             }
             if auxiliary_session.is_none() {
@@ -5087,6 +5091,27 @@ async fn receive_block_window(
     .map_err(|error| PeerRunError::p2p(&error))
 }
 
+async fn receive_block_window_into(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    hashes: &[BlockHash],
+    compact_candidates: &[Transaction],
+    blocks: &mut [Option<Block>],
+    context: &'static str,
+) -> Result<(), PeerRunError> {
+    timeout(
+        PEER_TIMEOUT,
+        session.receive_pipelined_blocks_into_with_candidates(hashes, compact_candidates, blocks),
+    )
+    .await
+    .map_err(|_| {
+        PeerRunError::transient(format!(
+            "{context} block response timed out for {} blocks",
+            hashes.len()
+        ))
+    })?
+    .map_err(|error| PeerRunError::p2p(&error))
+}
+
 async fn download_block_window(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     hashes: &[BlockHash],
@@ -5104,52 +5129,125 @@ async fn receive_parallel_block_windows(
     auxiliary_hashes: &[BlockHash],
     compact_candidates: &[Transaction],
     auxiliary_grace: Duration,
-) -> Result<(Vec<Block>, Option<Result<Vec<Block>, PeerRunError>>), PeerRunError> {
+) -> Result<
+    (
+        Vec<Block>,
+        Vec<Option<Block>>,
+        Option<Result<(), PeerRunError>>,
+    ),
+    PeerRunError,
+> {
+    let mut auxiliary_blocks = (0..auxiliary_hashes.len())
+        .map(|_| None)
+        .collect::<Vec<_>>();
     let primary_receive =
         receive_block_window(primary, primary_hashes, compact_candidates, "primary");
-    let auxiliary_receive =
-        receive_block_window(auxiliary, auxiliary_hashes, compact_candidates, "auxiliary");
-    tokio::pin!(primary_receive);
-    tokio::pin!(auxiliary_receive);
     let mut auxiliary_result = None;
-    let primary_result = loop {
-        tokio::select! {
-            result = &mut primary_receive => break result,
-            result = &mut auxiliary_receive, if auxiliary_result.is_none() => {
+    let primary_result;
+    {
+        let auxiliary_receive = receive_block_window_into(
+            auxiliary,
+            auxiliary_hashes,
+            compact_candidates,
+            &mut auxiliary_blocks,
+            "auxiliary",
+        );
+        tokio::pin!(primary_receive);
+        tokio::pin!(auxiliary_receive);
+        primary_result = loop {
+            tokio::select! {
+                result = &mut primary_receive => break result,
+                result = &mut auxiliary_receive, if auxiliary_result.is_none() => {
+                    auxiliary_result = Some(result);
+                }
+            }
+        };
+        if auxiliary_result.is_none() {
+            if let Ok(result) = timeout(auxiliary_grace, &mut auxiliary_receive).await {
                 auxiliary_result = Some(result);
             }
         }
+    }
+    primary_result.map(|blocks| (blocks, auxiliary_blocks, auxiliary_result))
+}
+
+async fn recover_lagging_auxiliary_window(
+    primary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    auxiliary_hashes: &[BlockHash],
+    compact_candidates: &[Transaction],
+    mut auxiliary_blocks: Vec<Option<Block>>,
+) -> Result<Vec<Block>, PeerRunError> {
+    let received = auxiliary_blocks
+        .iter()
+        .filter(|block| block.is_some())
+        .count();
+    let missing_hashes = auxiliary_blocks
+        .iter()
+        .zip(auxiliary_hashes)
+        .filter_map(|(block, hash)| block.is_none().then_some(*hash))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "auxiliary block window lagged the primary response by more than {} ms after delivering {received}/{} blocks; requesting only {} missing blocks from primary",
+        AUXILIARY_BLOCK_RESPONSE_GRACE.as_millis(),
+        auxiliary_hashes.len(),
+        missing_hashes.len(),
+    );
+    let missing_blocks = if missing_hashes.is_empty() {
+        Vec::new()
+    } else {
+        download_block_window(
+            primary,
+            &missing_hashes,
+            compact_candidates,
+            "primary fallback",
+        )
+        .await?
     };
-    if auxiliary_result.is_none() {
-        if let Ok(result) = timeout(auxiliary_grace, &mut auxiliary_receive).await {
-            auxiliary_result = Some(result);
+    let mut missing_blocks = missing_blocks.into_iter();
+    for block in &mut auxiliary_blocks {
+        if block.is_none() {
+            *block = Some(
+                missing_blocks
+                    .next()
+                    .expect("primary fallback returned every missing block"),
+            );
         }
     }
-    primary_result.map(|blocks| (blocks, auxiliary_result))
+    debug_assert!(missing_blocks.next().is_none());
+    Ok(auxiliary_blocks
+        .into_iter()
+        .map(|block| block.expect("fallback filled every auxiliary response slot"))
+        .collect())
 }
 
 async fn download_parallel_block_pair(
     primary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     primary_hashes: &[BlockHash],
-    primary_prefetched: bool,
+    primary_prefetched: usize,
     auxiliary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     auxiliary_hashes: &[BlockHash],
-    auxiliary_prefetched: bool,
+    auxiliary_prefetched: usize,
     compact_candidates: &[Transaction],
 ) -> Result<(Vec<Block>, Vec<Block>, bool), PeerRunError> {
     let (primary_request, auxiliary_request) = tokio::join!(
         async {
-            if primary_prefetched {
+            if primary_prefetched == primary_hashes.len() {
                 Ok(())
             } else {
-                request_block_window(primary, primary_hashes, "primary").await
+                request_block_window(primary, &primary_hashes[primary_prefetched..], "primary")
+                    .await
             }
         },
         async {
-            if auxiliary_prefetched {
+            if auxiliary_prefetched == auxiliary_hashes.len() {
                 Ok(())
             } else {
-                request_block_window(auxiliary, auxiliary_hashes, "auxiliary").await
+                request_block_window(
+                    auxiliary,
+                    &auxiliary_hashes[auxiliary_prefetched..],
+                    "auxiliary",
+                )
+                .await
             }
         },
     );
@@ -5168,7 +5266,7 @@ async fn download_parallel_block_pair(
         return Ok((primary_blocks, auxiliary_blocks, false));
     }
 
-    let (primary_blocks, auxiliary_result) = receive_parallel_block_windows(
+    let (primary_blocks, auxiliary_blocks, auxiliary_result) = receive_parallel_block_windows(
         primary,
         primary_hashes,
         auxiliary,
@@ -5178,7 +5276,14 @@ async fn download_parallel_block_pair(
     )
     .await?;
     match auxiliary_result {
-        Some(Ok(auxiliary_blocks)) => Ok((primary_blocks, auxiliary_blocks, true)),
+        Some(Ok(())) => Ok((
+            primary_blocks,
+            auxiliary_blocks
+                .into_iter()
+                .map(|block| block.expect("completed auxiliary response filled every slot"))
+                .collect(),
+            true,
+        )),
         Some(Err(error)) => {
             eprintln!(
                 "auxiliary block window disabled after response failure; retrying on primary: {error}"
@@ -5192,20 +5297,17 @@ async fn download_parallel_block_pair(
             .await?;
             Ok((primary_blocks, auxiliary_blocks, false))
         }
-        None => {
-            eprintln!(
-                "auxiliary block window lagged the primary response by more than {} ms; retrying on primary",
-                AUXILIARY_BLOCK_RESPONSE_GRACE.as_millis()
-            );
-            let auxiliary_blocks = download_block_window(
+        None => Ok((
+            primary_blocks,
+            recover_lagging_auxiliary_window(
                 primary,
                 auxiliary_hashes,
                 compact_candidates,
-                "primary fallback",
+                auxiliary_blocks,
             )
-            .await?;
-            Ok((primary_blocks, auxiliary_blocks, false))
-        }
+            .await?,
+            false,
+        )),
     }
 }
 
@@ -5265,8 +5367,9 @@ async fn download_execute_batch(
     let prefetched = std::mem::take(prefetched_block_windows);
     if auxiliary_session.is_some() && hashes.len() > VALIDATION_BLOCK_WINDOW_SIZE {
         let (first_primary, first_auxiliary, _) = split_parallel_block_windows(&hashes);
-        if (!prefetched.primary.is_empty() && prefetched.primary != first_primary)
-            || (!prefetched.auxiliary.is_empty() && prefetched.auxiliary != first_auxiliary)
+        if (!prefetched.primary.is_empty() && !first_primary.starts_with(&prefetched.primary))
+            || (!prefetched.auxiliary.is_empty()
+                && !first_auxiliary.starts_with(&prefetched.auxiliary))
         {
             return Err(PeerRunError::transient(
                 "prefetched block window does not match the next active-chain batch",
@@ -5282,8 +5385,16 @@ async fn download_execute_batch(
                     (remaining.len() - primary_len).min(VALIDATION_BLOCK_WINDOW_SIZE);
                 let primary_hashes = &remaining[..primary_len];
                 let auxiliary_hashes = &remaining[primary_len..primary_len + auxiliary_len];
-                let primary_prefetched = first_pair && !prefetched.primary.is_empty();
-                let auxiliary_prefetched = first_pair && !prefetched.auxiliary.is_empty();
+                let primary_prefetched = if first_pair {
+                    prefetched.primary.len()
+                } else {
+                    0
+                };
+                let auxiliary_prefetched = if first_pair {
+                    prefetched.auxiliary.len()
+                } else {
+                    0
+                };
                 let auxiliary = auxiliary_session
                     .as_mut()
                     .expect("auxiliary session was checked");
@@ -5368,9 +5479,10 @@ async fn download_execute_batch(
             .expect("non-empty block batch has a last header")
             .height;
         let remaining_after_batch = execution_ceiling.saturating_sub(last_height);
+        let prefetch_limit = validation_prefetch_limit(maximum_batch_size);
         let prefetch_len = usize::try_from(remaining_after_batch)
             .unwrap_or(usize::MAX)
-            .min(maximum_batch_size);
+            .min(prefetch_limit);
         if prefetch_len > 0 {
             let next_height = last_height
                 .checked_add(1)
@@ -8020,6 +8132,23 @@ mod tests {
     }
 
     #[test]
+    fn large_validation_batches_prefetch_only_one_safe_wire_request() {
+        assert_eq!(validation_prefetch_limit(64), 64);
+        assert_eq!(
+            validation_prefetch_limit(MAX_VALIDATION_PREFETCH_BATCH_SIZE),
+            MAX_VALIDATION_PREFETCH_BATCH_SIZE
+        );
+        assert_eq!(
+            validation_prefetch_limit(MAX_VALIDATION_PREFETCH_BATCH_SIZE + 1),
+            MAX_BLOCKS_IN_FLIGHT
+        );
+        assert_eq!(
+            validation_prefetch_limit(MAX_VALIDATION_BATCH_SIZE),
+            MAX_BLOCKS_IN_FLIGHT
+        );
+    }
+
+    #[test]
     fn parallel_structure_validation_preserves_order_and_earliest_error() {
         let headers = HeaderDag::new(Network::Regtest);
         let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
@@ -8052,8 +8181,11 @@ mod tests {
             regtest_block_at_height(genesis.block_hash(), genesis.header.time + 1, 1);
         let auxiliary_block =
             regtest_block_at_height(genesis.block_hash(), genesis.header.time + 2, 2);
+        let second_auxiliary_block =
+            regtest_block_at_height(auxiliary_block.block_hash(), genesis.header.time + 3, 3);
         let primary_hash = primary_block.block_hash();
         let auxiliary_hash = auxiliary_block.block_hash();
+        let second_auxiliary_hash = second_auxiliary_block.block_hash();
         let primary_server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(primary_listener, peer_version(653)).await;
             assert_eq!(
@@ -8069,11 +8201,17 @@ mod tests {
             let (mut peer, _) = accept_peer(auxiliary_listener, peer_version(654)).await;
             assert_eq!(
                 peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::GetData(vec![Inventory::WitnessBlock(auxiliary_hash)])
+                NetworkMessage::GetData(vec![
+                    Inventory::WitnessBlock(auxiliary_hash),
+                    Inventory::WitnessBlock(second_auxiliary_hash),
+                ])
             );
+            peer.write_message(NetworkMessage::Block(auxiliary_block))
+                .await
+                .unwrap();
             let _ = release.await;
             let _ = peer
-                .write_message(NetworkMessage::Block(auxiliary_block))
+                .write_message(NetworkMessage::Block(second_auxiliary_block))
                 .await;
         });
         let (primary, auxiliary) = tokio::join!(
@@ -8095,7 +8233,7 @@ mod tests {
         let mut primary = primary.unwrap();
         let mut auxiliary = auxiliary.unwrap();
         let primary_hashes = [primary_hash];
-        let auxiliary_hashes = [auxiliary_hash];
+        let auxiliary_hashes = [auxiliary_hash, second_auxiliary_hash];
         let (primary_request, auxiliary_request) = tokio::join!(
             request_block_window(&mut primary, &primary_hashes, "primary lag test"),
             request_block_window(&mut auxiliary, &auxiliary_hashes, "auxiliary lag test"),
@@ -8103,7 +8241,7 @@ mod tests {
         primary_request.unwrap();
         auxiliary_request.unwrap();
 
-        let (blocks, auxiliary_result) = receive_parallel_block_windows(
+        let (blocks, auxiliary_blocks, auxiliary_result) = receive_parallel_block_windows(
             &mut primary,
             &primary_hashes,
             &mut auxiliary,
@@ -8116,6 +8254,11 @@ mod tests {
 
         assert_eq!(blocks[0].block_hash(), primary_hash);
         assert!(auxiliary_result.is_none());
+        assert_eq!(
+            auxiliary_blocks[0].as_ref().map(Block::block_hash),
+            Some(auxiliary_hash)
+        );
+        assert!(auxiliary_blocks[1].is_none());
         drop(auxiliary);
         release_sender.send(()).unwrap();
         primary_server.await.unwrap();

@@ -228,12 +228,14 @@ Production validation caps both parallel windows at 64 blocks—four 16-block
 requests—after later mainnet blocks repeatedly pushed 128-block responses past
 the 30-second peer budget. A larger configured
 checkpoint downloads its remainder through additional bounded primary
-windows. Any auxiliary request or response failure drops that source and
-redownloads only its window from the primary, then circuit-breaks auxiliary
-block downloads until the primary session changes. An unfinished auxiliary window is
-given only two seconds after the primary window completes before the same
-fallback runs, avoiding a full auxiliary timeout followed by another
-download. This bounded one observed slow-auxiliary download at 27.684 seconds
+windows. Any auxiliary request or response failure drops that source. An
+unfinished auxiliary window is given only two seconds after the primary
+window completes; every checksum-verified response already placed in its
+caller-owned ordered slot survives cancellation, and the primary requests
+only the missing hashes. The next of at most three already-ready auxiliary
+candidates may then receive one bounded trial. This avoids a full auxiliary
+timeout, whole-window duplicate transfer, and unbounded candidate cycling.
+The earlier whole-window fallback bounded one observed slow-auxiliary download at 27.684 seconds
 instead of 40.485 seconds. The ordinary measured median moved only from about
 19.4 to 18.8 seconds; a more aggressive background-response experiment was
 rejected after it exceeded the existing 30-second peer bound.
@@ -336,8 +338,14 @@ complete-batch time to 73.243–127.829 seconds. Production validation instead
 uses one auxiliary across successive paired 64-block windows, never leaves
 more than 64 responses outstanding on either session, and abandons an auxiliary half
 that trails the primary by more than two seconds. Each pair is appended in
-active-chain order. The first active auxiliary failure disables further
-auxiliary block downloads for that primary session.
+active-chain order. Partial progress is retained, only missing hashes fail
+back to the primary, and at most two remaining ready candidates are tried.
+
+Validation checkpoints through 256 blocks may pre-request a complete bounded
+lookahead window before chainstate execution. Larger checkpoints prefetch
+only one 16-block wire request. That small request overlaps the long
+sequential UTXO transition without leaving the 64- or 128-block unread
+responses that previously timed out during 756-block execution.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work
