@@ -90,10 +90,10 @@ const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 
 const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
-    if maximum_batch_size <= MAX_VALIDATION_PREFETCH_BATCH_SIZE {
+    if maximum_batch_size < MAX_VALIDATION_PREFETCH_BATCH_SIZE {
         maximum_batch_size
     } else {
-        MAX_BLOCKS_IN_FLIGHT
+        MAX_VALIDATION_PREFETCH_BATCH_SIZE
     }
 }
 const MAX_LOCAL_AUTH_TOKEN_FILE_LEN: u64 = 1024;
@@ -185,9 +185,8 @@ struct ValidationLimits {
 }
 
 #[derive(Default)]
-struct PrefetchedBlockWindows {
-    primary: Vec<BlockHash>,
-    auxiliary: Vec<BlockHash>,
+struct PrefetchedBlocks {
+    blocks: Vec<Block>,
 }
 
 impl Default for ValidationLimits {
@@ -4088,7 +4087,7 @@ async fn sync_validating_node(
         if let Some(server) = &mut api_server {
             server.ensure_running().await?;
         }
-        let mut prefetched_block_windows = PrefetchedBlockWindows::default();
+        let mut prefetched_blocks = PrefetchedBlocks::default();
         loop {
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
@@ -4423,7 +4422,7 @@ async fn sync_validating_node(
                 validation_target.map(|target| target.height),
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
-                &mut prefetched_block_windows,
+                &mut prefetched_blocks,
                 validation_target.is_some() && validation_scheduler.is_none(),
             )
             .await?;
@@ -5061,6 +5060,7 @@ async fn request_block_window(
     Ok(())
 }
 
+#[cfg(test)]
 fn split_parallel_block_windows(
     hashes: &[BlockHash],
 ) -> (&[BlockHash], &[BlockHash], &[BlockHash]) {
@@ -5120,6 +5120,21 @@ async fn download_block_window(
 ) -> Result<Vec<Block>, PeerRunError> {
     request_block_window(session, hashes, context).await?;
     receive_block_window(session, hashes, compact_candidates, context).await
+}
+
+async fn download_execution_prefetch(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    hashes: &[BlockHash],
+    compact_candidates: &[Transaction],
+) -> Result<Vec<Block>, PeerRunError> {
+    let mut blocks = Vec::with_capacity(hashes.len());
+    for window in hashes.chunks(VALIDATION_BLOCK_WINDOW_SIZE) {
+        blocks.extend(
+            download_block_window(session, window, compact_candidates, "execution prefetch")
+                .await?,
+        );
+    }
+    Ok(blocks)
 }
 
 async fn receive_parallel_block_windows(
@@ -5223,33 +5238,13 @@ async fn recover_lagging_auxiliary_window(
 async fn download_parallel_block_pair(
     primary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     primary_hashes: &[BlockHash],
-    primary_prefetched: usize,
     auxiliary: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     auxiliary_hashes: &[BlockHash],
-    auxiliary_prefetched: usize,
     compact_candidates: &[Transaction],
 ) -> Result<(Vec<Block>, Vec<Block>, bool), PeerRunError> {
     let (primary_request, auxiliary_request) = tokio::join!(
-        async {
-            if primary_prefetched == primary_hashes.len() {
-                Ok(())
-            } else {
-                request_block_window(primary, &primary_hashes[primary_prefetched..], "primary")
-                    .await
-            }
-        },
-        async {
-            if auxiliary_prefetched == auxiliary_hashes.len() {
-                Ok(())
-            } else {
-                request_block_window(
-                    auxiliary,
-                    &auxiliary_hashes[auxiliary_prefetched..],
-                    "auxiliary",
-                )
-                .await
-            }
-        },
+        request_block_window(primary, primary_hashes, "primary"),
+        request_block_window(auxiliary, auxiliary_hashes, "auxiliary"),
     );
     primary_request?;
     if let Err(error) = auxiliary_request {
@@ -5326,7 +5321,7 @@ async fn download_execute_batch(
     maximum_height: Option<u32>,
     maximum_batch_size: usize,
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
-    prefetched_block_windows: &mut PrefetchedBlockWindows,
+    prefetched_blocks: &mut PrefetchedBlocks,
     prefetch_next_batch: bool,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
@@ -5364,100 +5359,56 @@ async fn download_execute_batch(
         .map(|header| header.hash)
         .collect::<Vec<_>>();
     let mut blocks = Vec::with_capacity(batch_len);
-    let prefetched = std::mem::take(prefetched_block_windows);
-    if auxiliary_session.is_some() && hashes.len() > VALIDATION_BLOCK_WINDOW_SIZE {
-        let (first_primary, first_auxiliary, _) = split_parallel_block_windows(&hashes);
-        if (!prefetched.primary.is_empty() && !first_primary.starts_with(&prefetched.primary))
-            || (!prefetched.auxiliary.is_empty()
-                && !first_auxiliary.starts_with(&prefetched.auxiliary))
-        {
-            return Err(PeerRunError::transient(
-                "prefetched block window does not match the next active-chain batch",
-            ));
-        }
-        let mut offset = 0;
-        let mut first_pair = true;
-        while offset < hashes.len() {
-            let remaining = &hashes[offset..];
-            if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
-                let primary_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
-                let auxiliary_len =
-                    (remaining.len() - primary_len).min(VALIDATION_BLOCK_WINDOW_SIZE);
-                let primary_hashes = &remaining[..primary_len];
-                let auxiliary_hashes = &remaining[primary_len..primary_len + auxiliary_len];
-                let primary_prefetched = if first_pair {
-                    prefetched.primary.len()
-                } else {
-                    0
-                };
-                let auxiliary_prefetched = if first_pair {
-                    prefetched.auxiliary.len()
-                } else {
-                    0
-                };
-                let auxiliary = auxiliary_session
-                    .as_mut()
-                    .expect("auxiliary session was checked");
-                let (primary_blocks, auxiliary_blocks, keep_auxiliary) =
-                    download_parallel_block_pair(
-                        session,
-                        primary_hashes,
-                        primary_prefetched,
-                        auxiliary,
-                        auxiliary_hashes,
-                        auxiliary_prefetched,
-                        compact_candidates,
-                    )
-                    .await?;
-                blocks.extend(primary_blocks);
-                blocks.extend(auxiliary_blocks);
-                offset += primary_len + auxiliary_len;
-                first_pair = false;
-                if !keep_auxiliary {
-                    *auxiliary_session = None;
-                }
-            } else {
-                let window_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
-                blocks.extend(
-                    download_block_window(
-                        session,
-                        &remaining[..window_len],
-                        compact_candidates,
-                        "primary remainder",
-                    )
-                    .await?,
-                );
-                offset += window_len;
-                first_pair = false;
+    let prefetched = std::mem::take(prefetched_blocks);
+    if prefetched.blocks.len() > hashes.len()
+        || prefetched
+            .blocks
+            .iter()
+            .zip(&hashes)
+            .any(|(block, expected_hash)| block.block_hash() != *expected_hash)
+    {
+        return Err(PeerRunError::transient(
+            "prefetched blocks do not match the next active-chain batch",
+        ));
+    }
+    blocks.extend(prefetched.blocks);
+    let mut offset = blocks.len();
+    while offset < hashes.len() {
+        let remaining = &hashes[offset..];
+        if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
+            let primary_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
+            let auxiliary_len = (remaining.len() - primary_len).min(VALIDATION_BLOCK_WINDOW_SIZE);
+            let primary_hashes = &remaining[..primary_len];
+            let auxiliary_hashes = &remaining[primary_len..primary_len + auxiliary_len];
+            let auxiliary = auxiliary_session
+                .as_mut()
+                .expect("auxiliary session was checked");
+            let (primary_blocks, auxiliary_blocks, keep_auxiliary) = download_parallel_block_pair(
+                session,
+                primary_hashes,
+                auxiliary,
+                auxiliary_hashes,
+                compact_candidates,
+            )
+            .await?;
+            blocks.extend(primary_blocks);
+            blocks.extend(auxiliary_blocks);
+            offset += primary_len + auxiliary_len;
+            if !keep_auxiliary {
+                *auxiliary_session = None;
             }
-        }
-    } else {
-        if !prefetched.auxiliary.is_empty()
-            || (!prefetched.primary.is_empty()
-                && (prefetched.primary.len() > VALIDATION_BLOCK_WINDOW_SIZE
-                    || !hashes.starts_with(&prefetched.primary)))
-        {
-            return Err(PeerRunError::transient(
-                "prefetched block window does not match the next active-chain batch",
-            ));
-        }
-        let prefetched_len = prefetched.primary.len();
-        if prefetched_len > 0 {
+        } else {
+            let window_len = remaining.len().min(VALIDATION_BLOCK_WINDOW_SIZE);
             blocks.extend(
-                receive_block_window(
+                download_block_window(
                     session,
-                    &prefetched.primary,
+                    &remaining[..window_len],
                     compact_candidates,
-                    "prefetched",
+                    "primary remainder",
                 )
                 .await?,
             );
-        }
-        for pipelined_hashes in hashes[prefetched_len..].chunks(VALIDATION_BLOCK_WINDOW_SIZE) {
-            blocks.extend(
-                download_block_window(session, pipelined_hashes, compact_candidates, "primary")
-                    .await?,
-            );
+            offset += window_len;
         }
     }
     let downloaded_at = Instant::now();
@@ -5473,7 +5424,7 @@ async fn download_execute_batch(
     }
     let structure_validated_at = Instant::now();
     let mut prefetch_error = None;
-    if prefetch_next_batch {
+    let next_prefetch_hashes = if prefetch_next_batch {
         let last_height = expected
             .last()
             .expect("non-empty block batch has a last header")
@@ -5499,76 +5450,73 @@ async fn download_execute_batch(
                 })
                 .collect::<Result<Vec<_>, String>>();
             match next_hashes {
-                Ok(next_hashes) => {
-                    let (primary_hashes, auxiliary_hashes, _) =
-                        split_parallel_block_windows(&next_hashes);
-                    if let Some(auxiliary) = auxiliary_session.as_mut() {
-                        let (primary_result, auxiliary_result) = tokio::join!(
-                            request_block_window(session, primary_hashes, "primary prefetch"),
-                            async {
-                                if auxiliary_hashes.is_empty() {
-                                    Ok(())
-                                } else {
-                                    request_block_window(
-                                        auxiliary,
-                                        auxiliary_hashes,
-                                        "auxiliary prefetch",
-                                    )
-                                    .await
-                                }
-                            },
-                        );
-                        match primary_result {
-                            Ok(()) => {
-                                prefetched_block_windows.primary = primary_hashes.to_vec();
-                            }
-                            Err(error) => prefetch_error = Some(error),
-                        }
-                        match auxiliary_result {
-                            Ok(()) if !auxiliary_hashes.is_empty() && prefetch_error.is_none() => {
-                                prefetched_block_windows.auxiliary = auxiliary_hashes.to_vec();
-                            }
-                            Ok(()) if !auxiliary_hashes.is_empty() => {
-                                *auxiliary_session = None;
-                            }
-                            Ok(()) => {}
-                            Err(error) => {
-                                eprintln!(
-                                    "auxiliary block prefetch disabled after request failure: {error}"
-                                );
-                                *auxiliary_session = None;
-                            }
-                        }
-                    } else {
-                        match request_block_window(session, primary_hashes, "primary prefetch")
-                            .await
-                        {
-                            Ok(()) => {
-                                prefetched_block_windows.primary = primary_hashes.to_vec();
-                            }
-                            Err(error) => prefetch_error = Some(error),
-                        }
-                    }
+                Ok(next_hashes) => next_hashes,
+                Err(error) => {
+                    prefetch_error = Some(PeerRunError::transient(error));
+                    Vec::new()
                 }
-                Err(error) => prefetch_error = Some(PeerRunError::transient(error)),
             }
+        } else {
+            Vec::new()
         }
-    }
+    } else {
+        Vec::new()
+    };
     ledger
         .stage(next_height, &serialized)
         .map_err(|error| error.to_string())?;
     let staged_at = Instant::now();
     let now = u64::from(unix_time()?);
-    let applied_blocks = connect_prevalidated_active_blocks_with_txids(
-        chainstate,
-        headers,
-        &blocks,
-        &transaction_ids,
-        now,
-        DEFAULT_HOT_WINDOW_SECS,
-        &deployment_contexts,
-    )
-    .map_err(|error| PeerRunError::block(&error))?;
+    let (applied_blocks, downloaded_prefetch) = if next_prefetch_hashes.is_empty() {
+        (
+            connect_prevalidated_active_blocks_with_txids(
+                chainstate,
+                headers,
+                &blocks,
+                &transaction_ids,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                &deployment_contexts,
+            )
+            .map_err(|error| PeerRunError::block(&error))?,
+            Vec::new(),
+        )
+    } else {
+        let runtime = tokio::runtime::Handle::current();
+        let (execution_result, prefetch_result) = std::thread::scope(|scope| {
+            let prefetch = scope.spawn(|| {
+                runtime.block_on(download_execution_prefetch(
+                    session,
+                    &next_prefetch_hashes,
+                    compact_candidates,
+                ))
+            });
+            let execution_result = connect_prevalidated_active_blocks_with_txids(
+                chainstate,
+                headers,
+                &blocks,
+                &transaction_ids,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                &deployment_contexts,
+            );
+            let prefetch_result = prefetch
+                .join()
+                .expect("scoped execution-prefetch thread must not panic");
+            (execution_result, prefetch_result)
+        });
+        let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
+        let downloaded_prefetch = match prefetch_result {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                prefetch_error = Some(error);
+                Vec::new()
+            }
+        };
+        (applied_blocks, downloaded_prefetch)
+    };
+    let execution_prefetch_count = downloaded_prefetch.len();
+    prefetched_blocks.blocks = downloaded_prefetch;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
@@ -5624,6 +5572,11 @@ async fn download_execute_batch(
         published_at.duration_since(indexed_at).as_millis(),
         published_at.duration_since(batch_started).as_millis(),
     );
+    if execution_prefetch_count > 0 {
+        println!(
+            "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
+        );
+    }
     if let Some(error) = prefetch_error {
         return Err(error);
     }
@@ -8132,7 +8085,7 @@ mod tests {
     }
 
     #[test]
-    fn large_validation_batches_prefetch_only_one_safe_wire_request() {
+    fn execution_prefetch_is_bounded_to_256_blocks() {
         assert_eq!(validation_prefetch_limit(64), 64);
         assert_eq!(
             validation_prefetch_limit(MAX_VALIDATION_PREFETCH_BATCH_SIZE),
@@ -8140,11 +8093,11 @@ mod tests {
         );
         assert_eq!(
             validation_prefetch_limit(MAX_VALIDATION_PREFETCH_BATCH_SIZE + 1),
-            MAX_BLOCKS_IN_FLIGHT
+            MAX_VALIDATION_PREFETCH_BATCH_SIZE
         );
         assert_eq!(
             validation_prefetch_limit(MAX_VALIDATION_BATCH_SIZE),
-            MAX_BLOCKS_IN_FLIGHT
+            MAX_VALIDATION_PREFETCH_BATCH_SIZE
         );
     }
 

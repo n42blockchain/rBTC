@@ -237,8 +237,10 @@ instead of paying the complete 30-second auxiliary timeout first; retaining
 partial progress further bounds that fallback by the actual missing blocks. An
 adjacent live sample reduced ordinary median download time only from about
 19.4 to 18.8 seconds, so this remains a tail-latency guard rather than the main
-speedup. Actively receiving the auxiliary lookahead during execution was
-rejected after a 124-block response exceeded the 30-second bound.
+speedup. An earlier unread 124-block auxiliary lookahead was rejected after it
+exceeded the 30-second bound. The retained execution-overlap path instead
+actively drains primary responses on a scoped worker and stores at most 256
+fully received blocks.
 
 The same production directory then stopped exactly at CSV activation height
 419,328/hash
@@ -286,11 +288,14 @@ Expanding each batch across more simultaneous auxiliaries was also rejected afte
 five auxiliary-bearing batches took 80.105–105.571 seconds while the following
 primary-only batches took 80.482 and 88.089 seconds.
 
-Cross-execution lookahead remains a full bounded window for checkpoints
-through 256 blocks. Larger checkpoints now prefetch exactly one 16-block wire
-request while execution is busy, hiding the next batch's initial round trip
-without recreating the unread 128-block response pressure seen in the earlier
-756-block soak.
+Cross-execution lookahead now actively downloads and stores at most 256 blocks
+on a scoped network worker while the current checkpoint performs its
+sequential UTXO transition. The next checkpoint validates that exact block-hash
+prefix before using it and downloads only the remainder. This overlaps roughly
+one third of a 756-block transfer with otherwise network-idle execution while
+bounding additional consensus-maximum payload memory at 1 GiB. Because the
+worker continuously drains each 64-block response window, it does not recreate
+the unread 128-block response pressure seen in the earlier soak.
 
 Block-structure validation now divides sufficiently large downloaded batches
 across bounded host-CPU workers. Each worker validates expected hash,

@@ -261,20 +261,20 @@ took 84.71 seconds combined, and three 252-block checkpoints sustained 12.1
 blocks/second without the superlinear commit tail. The public mainnet soak
 therefore moved first to 252 blocks while the CLI retained the full explicit
 range for measured hosts and chain eras.
-Standalone bounded validation checkpoints through 256 blocks additionally
-send one lookahead window only after the current batch's downloaded blocks
-pass header, Merkle, structure, and deployment checks. At most 128 future
-block hashes are requested, still as 16-entry `getdata` messages. Their bytes
-can enter the authenticated ordered receive stream while current scripts and
-the atomic chainstate commit run; the next iteration consumes that exact hash
-prefix through the ordinary bounded receiver before issuing another request.
-Larger checkpoints read on demand instead: leaving a public peer blocked on an
-unread response throughout a long execution phase caused repeatable
-prefetched-response timeouts in the live 756-block soak. Lookahead never
-stages, executes, or commits future state and never requests above the
-immutable target. A mismatch,
-timeout, unsolicited response, compact-block failure, or peer replacement
-retains the existing fail-closed path. Although a 126-block checkpoint fits
+Standalone bounded validation checkpoints additionally compute an exact
+next-batch prefix only after the current batch's downloaded blocks pass
+header, Merkle, structure, and deployment checks. A scoped network worker
+actively requests and drains at most 256 future blocks through ordinary
+64-block response windows while the caller performs the current checkpoint's
+sequential UTXO transition. The next iteration verifies the stored blocks
+against its active-header prefix before validating their structure and
+downloads only the remainder. This double buffer is bounded to 1 GiB at the
+consensus maximum block size and never stages, executes, commits, or requests
+above the immutable target. Continuously draining the response avoids the
+repeatable timeouts caused by leaving 128 responses unread throughout a
+756-block execution phase. A mismatch, timeout, unsolicited response,
+compact-block failure, or peer replacement retains the existing fail-closed
+path. Although a 126-block checkpoint fits
 entirely in one lookahead window and its first two batches took 29.0 seconds
 combined, the 21-checkpoint long sample fell to 5.41 blocks/second as twice as
 many macOS `F_FULLFSYNC` barriers accumulated. The adjacent 252-block lookahead
@@ -341,11 +341,12 @@ that trails the primary by more than two seconds. Each pair is appended in
 active-chain order. Partial progress is retained, only missing hashes fail
 back to the primary, and at most two remaining ready candidates are tried.
 
-Validation checkpoints through 256 blocks may pre-request a complete bounded
-lookahead window before chainstate execution. Larger checkpoints prefetch
-only one 16-block wire request. That small request overlaps the long
-sequential UTXO transition without leaving the 64- or 128-block unread
-responses that previously timed out during 756-block execution.
+Every validation checkpoint may actively receive at most 256 next-batch
+blocks on a scoped network worker while chainstate execution runs. Responses
+are continuously drained in 64-block windows and retained only as an ordered
+hash-checked prefix for the next iteration. This overlaps network and the long
+sequential UTXO transition without leaving unread responses to time out; the
+additional worst-case payload allocation is bounded at 1 GiB.
 
 Large downloaded batches validate their independent block structure on
 bounded host-CPU workers before the sequential UTXO transition begins. Work

@@ -43,9 +43,10 @@ packetizing script validation into 16-transaction work items then removed
 per-transaction queue/result contention and reduced five adjacent
 756-block execution/persistence samples from the preceding 51.401-second
 median to 46.165 seconds (10.2%) while preserving earliest-failure ordering;
-after repeated 756-block prefetched-response timeouts, checkpoints through
-256 blocks retain bounded-window lookahead while larger checkpoints prefetch
-only one safe 16-block wire request; lagging auxiliary windows now preserve
+after repeated 756-block unread-response timeouts, a scoped network worker now
+actively downloads and stores at most 256 next-batch blocks while the current
+UTXO transition executes, bounding the extra consensus-maximum payload at
+1 GiB; lagging auxiliary windows preserve
 already received blocks, fetch only missing hashes from the primary, and
 rotate through at most three ready candidates; later block growth then selected
 64-block validation response windows after the first five samples completed
