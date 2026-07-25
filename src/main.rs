@@ -4440,6 +4440,12 @@ async fn sync_validating_node(
                 .map_or(validation_limits, |status| {
                     status.adaptive_limits(validation_limits)
                 });
+            // Ordinary IBD and fixed-target validation both consume an immutable
+            // active-header snapshot here, so the already bounded next block
+            // window can download while the current checkpoint executes.
+            // Background validation keeps the adaptive scheduler in control
+            // instead of creating work beyond its current limit.
+            let overlap_next_download = validation_scheduler.is_none();
             let auxiliary_was_active = auxiliary_session.is_some();
             download_execute_batch(
                 session,
@@ -4456,7 +4462,7 @@ async fn sync_validating_node(
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
                 &mut prefetched_blocks,
-                validation_target.is_some() && validation_scheduler.is_none(),
+                overlap_next_download,
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
