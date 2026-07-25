@@ -2545,8 +2545,7 @@ async fn try_peer_candidates(
         let connected = activate_pending_peer(connection).await;
         let result = match connected {
             Ok(connected) => {
-                let auxiliary = if options.network == Network::Bitcoin
-                    && options.network_execution.is_experimental()
+                let auxiliary = if options.data_dir.is_some()
                     && options.validation_limits.max_blocks_per_batch > VALIDATION_BLOCK_WINDOW_SIZE
                 {
                     take_ready_auxiliary_peers(&mut pending)
