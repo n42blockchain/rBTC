@@ -362,7 +362,6 @@ impl<'a, R: Read> CoreCoinReader<'a, R> {
         }
         self.previous_txid = Some(txid_bytes);
         let txid = Txid::from_byte_array(txid_bytes);
-        let mut previous_vout = None;
         let mut group = Vec::with_capacity(
             usize::try_from(group_count).expect("bounded group count fits usize"),
         );
@@ -370,12 +369,9 @@ impl<'a, R: Read> CoreCoinReader<'a, R> {
             let vout = read_compact_size(&mut self.reader)?;
             let vout =
                 u32::try_from(vout).map_err(|_| CoreSnapshotError::Invalid("vout overflow"))?;
-            if vout == u32::MAX || previous_vout.is_some_and(|previous| vout <= previous) {
-                return Err(CoreSnapshotError::Invalid(
-                    "output indexes are not strictly ordered",
-                ));
+            if vout == u32::MAX {
+                return Err(CoreSnapshotError::Invalid("vout overflow"));
             }
-            previous_vout = Some(vout);
 
             let code = read_core_varint(&mut self.reader)?;
             let code = u32::try_from(code)
@@ -414,15 +410,35 @@ impl<'a, R: Read> CoreCoinReader<'a, R> {
                 creation_mtp,
                 script_pubkey,
             };
-            // Core commits in numeric-vout order. rBTC's existing key contains
-            // little-endian vout bytes, so reorder only after this hash update.
-            update_core_utxo_hash(&mut self.core_hash, key, &utxo);
             group.push((key, utxo));
             self.remaining -= 1;
         }
+        self.queue_group(group)?;
+        self.next_coin()
+    }
+
+    fn queue_group(
+        &mut self,
+        mut group: Vec<(OutPointKey, Utxo)>,
+    ) -> Result<(), CoreSnapshotError> {
+        // Core's database cursor order is not necessarily numeric vout order.
+        // ComputeUTXOStats groups into std::map<uint32_t, Coin>, whose hash
+        // order is numeric and whose duplicate keys replace. Reject duplicates
+        // explicitly before producing the same numeric commitment.
+        group.sort_unstable_by_key(|(key, _)| key.to_outpoint().vout);
+        if group
+            .windows(2)
+            .any(|pair| pair[0].0.to_outpoint().vout == pair[1].0.to_outpoint().vout)
+        {
+            return Err(CoreSnapshotError::Invalid("duplicate output index"));
+        }
+        for (key, utxo) in &group {
+            update_core_utxo_hash(&mut self.core_hash, *key, utxo);
+        }
+        // rBTC's fixed little-endian vout suffix has another lexical order.
         group.sort_unstable_by_key(|(key, _)| *key);
         self.ready = group.into();
-        self.next_coin()
+        Ok(())
     }
 }
 
@@ -663,13 +679,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_core_hash_order_but_emits_rbtc_key_order() {
+    fn accepts_database_vout_order_but_hashes_numeric_and_emits_rbtc_key_order() {
         let headers = HeaderDag::new(Network::Regtest);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&[2_u8; 32]);
         bytes.push(2); // two coins for this txid
-        bytes.extend_from_slice(&[1, 0, 0, 6]); // vout 1, height, amount, empty script
         bytes.extend_from_slice(&[253, 0, 1, 0, 0, 6]); // vout 256 and the same coin
+        bytes.extend_from_slice(&[1, 0, 0, 6]); // vout 1, height, amount, empty script
 
         let mut reader = CoreCoinReader::new(Cursor::new(bytes), 2, 0, &headers, 123);
         let first = reader.next_coin().unwrap().unwrap();
@@ -685,6 +701,21 @@ mod tests {
             sha256d::Hash::from_engine(reader.core_hash),
             sha256d::Hash::from_engine(expected)
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_vout_inside_a_group() {
+        let headers = HeaderDag::new(Network::Regtest);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[3_u8; 32]);
+        bytes.push(2);
+        bytes.extend_from_slice(&[1, 0, 0, 6]);
+        bytes.extend_from_slice(&[1, 0, 0, 6]);
+
+        let error = CoreCoinReader::new(Cursor::new(bytes), 2, 0, &headers, 123)
+            .next_coin()
+            .unwrap_err();
+        assert!(matches!(error, CoreSnapshotError::Invalid(_)));
     }
 
     #[test]

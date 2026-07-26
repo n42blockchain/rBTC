@@ -53,8 +53,10 @@ Primary references:
 - [x] Local rBTC snapshot activation plus independent, restart-safe genesis
   validation and atomic AssumeUTXO finalization; automatic cleanup is explicit,
   ownership-bound, quarantined, and fail-closed. The base block must be on the
-  fully validated maximum-work active header chain. This does not yet claim
-  Bitcoin Core snapshot-file compatibility or automatic snapshot distribution.
+  fully validated maximum-work active header chain. Core 31 v2 compatibility is
+  additionally covered by a real external Testnet4 height-120,000 file; snapshot
+  source selection remains an explicit operator decision rather than an
+  automatic trust service.
 
 ### Storage and performance
 
@@ -135,8 +137,8 @@ Primary references:
   migration format until Core compatibility is accepted. The Core 31 v2 parser,
   release-pinned identities, exact `hash_serialized` calculation, bounded txid
   grouping, two-pass race closure, atomic activation API, and offline CLI are
-  implemented; an externally generated Core fixture, download transport, and
-  end-to-end mainnet acceptance remain open.
+  implemented. The external Testnet4 fixture and bounded parallel/resumable
+  HTTPS transport are accepted; only the end-to-end Mainnet run remains open.
 - [ ] **Choose the hot/cold UTXO boundary from replay data, not the current
   60-day constant.** Persist a network-scoped histogram of spent-output coin age
   in blocks, and report for candidate windows the share of the current UTXO set

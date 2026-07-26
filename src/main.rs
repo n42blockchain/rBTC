@@ -22,7 +22,7 @@ use bitcoin::{
     block::Header,
     consensus::{deserialize, serialize},
     hashes::Hash,
-    hex::FromHex,
+    hex::{DisplayHex, FromHex},
     p2p::message_blockdata::Inventory,
 };
 use rbtc::{
@@ -61,6 +61,10 @@ use rbtc::{
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
+    snapshot_download::{
+        DEFAULT_SNAPSHOT_CHUNK_BYTES, DEFAULT_SNAPSHOT_DOWNLOAD_WORKERS,
+        MAX_SNAPSHOT_DOWNLOAD_WORKERS, SnapshotDownloadConfig, download_snapshot,
+    },
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
         TransactionAdmissionContext, TransactionAdmissionPool, TransactionRequestId,
@@ -156,9 +160,10 @@ struct Options {
     validation_limits: ValidationLimits,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OfflineAction {
     UtxoActivityReport,
+    DownloadCoreSnapshot(SnapshotDownloadConfig),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,6 +221,13 @@ impl Default for ValidationLimits {
             pause_between_batches: Duration::ZERO,
             quick_repair: true,
         }
+    }
+}
+
+fn active_assumeutxo_limits(configured: ValidationLimits) -> ValidationLimits {
+    ValidationLimits {
+        max_blocks_per_batch: configured.max_blocks_per_batch,
+        ..ValidationLimits::default()
     }
 }
 
@@ -1189,6 +1201,17 @@ fn read_owner_only_text_file(
 
 #[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
+    if let Some(OfflineAction::DownloadCoreSnapshot(config)) = &options.offline_action {
+        let report = download_snapshot(config).map_err(|error| error.to_string())?;
+        println!(
+            "downloaded snapshot to {}: bytes={} chunks={} transport_sha256={}; Core UTXO authentication is still required",
+            report.output.display(),
+            report.bytes,
+            report.chunks,
+            report.transport_sha256.to_lower_hex_string(),
+        );
+        return Ok(());
+    }
     if options.network_execution.is_experimental() {
         eprintln!(
             "WARNING: experimental {} block execution is enabled for validation only; \
@@ -1553,7 +1576,11 @@ async fn run_background_assumeutxo(
     );
     let mut active_options = options.clone();
     active_options.background_assumeutxo = None;
-    active_options.validation_limits = ValidationLimits::default();
+    // A caller-selected batch cap controls both independent pipelines so an
+    // assumed chain can use the same bounded dual-peer windows while catching
+    // the live tip. Throttling and deferred repair remain validator-only:
+    // serving chainstate keeps immediate quick-repair durability and no pause.
+    active_options.validation_limits = active_assumeutxo_limits(options.validation_limits);
 
     let mut validation_options = options;
     validation_options.data_dir = Some(validation_dir.clone());
@@ -6613,6 +6640,10 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut mempool_full_rbf = false;
     let mut cleanup_validation_dir = false;
     let mut utxo_activity_report = false;
+    let mut snapshot_download_source = None;
+    let mut snapshot_download_output = None;
+    let mut snapshot_download_bytes = None;
+    let mut snapshot_download_workers = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -6815,6 +6846,62 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--utxo-activity-report" => utxo_activity_report = true,
+            "--download-core-assumeutxo" => {
+                if snapshot_download_source.is_some() {
+                    return Err(
+                        "--download-core-assumeutxo cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_download_source = Some(required_option_value(
+                    &mut args,
+                    "--download-core-assumeutxo",
+                )?);
+            }
+            "--snapshot-download-output" => {
+                if snapshot_download_output.is_some() {
+                    return Err(
+                        "--snapshot-download-output cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_download_output = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-download-output",
+                )?));
+            }
+            "--snapshot-download-bytes" => {
+                if snapshot_download_bytes.is_some() {
+                    return Err(
+                        "--snapshot-download-bytes cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-download-bytes")?;
+                snapshot_download_bytes = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid snapshot download length: {value}"))?,
+                );
+            }
+            "--snapshot-download-workers" => {
+                if snapshot_download_workers.is_some() {
+                    return Err(
+                        "--snapshot-download-workers cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-download-workers")?;
+                snapshot_download_workers = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid snapshot download worker count: {value}"))?,
+                );
+                if !matches!(
+                    snapshot_download_workers,
+                    Some(1..=MAX_SNAPSHOT_DOWNLOAD_WORKERS)
+                ) {
+                    return Err(format!(
+                        "snapshot download worker count must be between 1 and {MAX_SNAPSHOT_DOWNLOAD_WORKERS}"
+                    ));
+                }
+            }
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -7145,6 +7232,57 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 .to_owned(),
         );
     }
+    let snapshot_download = match (
+        snapshot_download_source,
+        snapshot_download_output,
+        snapshot_download_bytes,
+        snapshot_download_workers,
+    ) {
+        (None, None, None, None) => None,
+        (Some(source), Some(output), Some(expected_bytes), workers) => {
+            Some(SnapshotDownloadConfig {
+                source,
+                output,
+                expected_bytes,
+                workers: workers.unwrap_or(DEFAULT_SNAPSHOT_DOWNLOAD_WORKERS),
+                chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+            })
+        }
+        _ => {
+            return Err(
+                "--download-core-assumeutxo requires --snapshot-download-output and --snapshot-download-bytes; workers are optional"
+                    .to_owned(),
+            );
+        }
+    };
+    if snapshot_download.is_some()
+        && (utxo_activity_report
+            || data_dir.is_some()
+            || snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target)
+    {
+        return Err(
+            "snapshot download is offline and conflicts with data-dir, peer, synchronization, activation, validation, serving, wallet, and policy modes"
+                .to_owned(),
+        );
+    }
     if utxo_activity_report {
         if data_dir.is_none() {
             return Err("--utxo-activity-report requires --data-dir".to_owned());
@@ -7273,7 +7411,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         || !pinned_dns_seed_hosts(network).is_empty(),
         |seeds| !seeds.is_empty(),
     );
-    if remotes.is_empty() && !has_dns_bootstrap && data_dir.is_none() {
+    if remotes.is_empty() && !has_dns_bootstrap && data_dir.is_none() && snapshot_download.is_none()
+    {
         return Err(
             "no peer bootstrap source; provide --connect or --dns-seed (a data directory may reuse verified peers)"
                 .to_owned(),
@@ -7306,7 +7445,12 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         background_assumeutxo,
         mempool_full_rbf,
         cleanup_validation_dir,
-        offline_action: utxo_activity_report.then_some(OfflineAction::UtxoActivityReport),
+        offline_action: match (utxo_activity_report, snapshot_download) {
+            (true, None) => Some(OfflineAction::UtxoActivityReport),
+            (false, Some(config)) => Some(OfflineAction::DownloadCoreSnapshot(config)),
+            (false, None) => None,
+            (true, Some(_)) => unreachable!("offline action conflict was checked above"),
+        },
         validation_limits,
     }))
 }
@@ -7385,6 +7529,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet --core-assumeutxo-snapshot CORE_DUMPTXOUTSET_FILE\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
+            "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "PEER OPTIONS:\n",
             "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 31 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
@@ -9987,6 +10132,62 @@ mod tests {
         assert_eq!(format_percentage(0, 0), "0.00000");
     }
 
+    #[test]
+    fn parses_only_bounded_parallel_core_snapshot_downloads() {
+        let options = parse_options(
+            [
+                "--download-core-assumeutxo",
+                "https://example.com/utxo.dat",
+                "--snapshot-download-output",
+                "/tmp/utxo.dat",
+                "--snapshot-download-bytes",
+                "850142614",
+                "--snapshot-download-workers",
+                "4",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            options.offline_action,
+            Some(OfflineAction::DownloadCoreSnapshot(SnapshotDownloadConfig {
+                source,
+                output,
+                expected_bytes: 850_142_614,
+                workers: 4,
+                chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
+            })) if source == "https://example.com/utxo.dat"
+                && output == PathBuf::from("/tmp/utxo.dat")
+        ));
+        for arguments in [
+            vec!["--download-core-assumeutxo", "https://example.com/utxo.dat"],
+            vec![
+                "--download-core-assumeutxo",
+                "https://example.com/utxo.dat",
+                "--snapshot-download-output",
+                "/tmp/utxo.dat",
+                "--snapshot-download-bytes",
+                "850142614",
+                "--snapshot-download-workers",
+                "9",
+            ],
+            vec![
+                "--download-core-assumeutxo",
+                "https://example.com/utxo.dat",
+                "--snapshot-download-output",
+                "/tmp/utxo.dat",
+                "--snapshot-download-bytes",
+                "850142614",
+                "--data-dir",
+                "/tmp/rbtc",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn offline_snapshot_cli_activates_and_reopens_the_assumed_base() {
@@ -10441,6 +10642,22 @@ mod tests {
         assert_eq!(response.validation_tip, 25);
         assert_eq!(response.validation_remaining, 75);
         assert!(!response.adaptive_throttled);
+    }
+
+    #[test]
+    fn background_active_chain_preserves_only_the_selected_batch_cap() {
+        assert_eq!(
+            active_assumeutxo_limits(ValidationLimits {
+                max_blocks_per_batch: 252,
+                pause_between_batches: Duration::from_secs(3),
+                quick_repair: false,
+            }),
+            ValidationLimits {
+                max_blocks_per_batch: 252,
+                pause_between_batches: Duration::ZERO,
+                quick_repair: true,
+            }
+        );
     }
 
     #[test]

@@ -507,11 +507,26 @@ The implemented Core 31 loader accepts `dumptxoutset` v2 metadata and grouped
 coins, enforces canonical CompactSize/Core VARINT, amount and script
 decompression, count/order/height/value/EOF bounds, and computes Core's exact
 double-SHA256 UTXO-set commitment before activation. Its second streaming pass
-rechecks an rBTC semantic digest inside the atomic chainstate transaction. Core
-numeric-vout order is retained for the Core commitment, while each bounded
-txid group is reordered for rBTC's existing little-endian-vout database key.
-There is not yet an automatic snapshot download source or a release acceptance
-fixture made by an external Core 31 binary.
+rechecks an rBTC semantic digest inside the atomic chainstate transaction. A
+Core database cursor does not promise numeric vout order inside a txid group:
+the loader sorts the bounded group numerically for Core's commitment, rejects
+duplicate vouts, and then sorts the same group by rBTC's existing
+little-endian-vout database key. On 2026-07-25 an external Core 31 Testnet4
+height-120,000 v2 file with 13,870,119 coins activated against the compiled
+blockhash, `hash_serialized`, and chain-transaction count after both streaming
+passes.
+
+Snapshot distribution remains explicitly operator-selected instead of becoming
+a new trust service. `--download-core-assumeutxo` accepts only a bounded,
+credential-free HTTPS URL plus an exact expected length and a new output file.
+It splits the transfer into independently restartable 64 MiB HTTP ranges, runs
+1–8 workers, requires HTTPS across redirects, HTTP 206, identity encoding, and
+the exact length of every range, fsyncs completed chunks, and atomically
+publishes the assembled file only after a full transport SHA-256 pass. Resume
+metadata binds source, output, length, and chunk size; another identity fails
+closed. The transport digest detects transfer differences but is deliberately
+not a trust anchor: the release-pinned Core UTXO commitment and independent
+genesis replay remain authoritative.
 
 The local rBTC snapshot format v3 includes an anchor height/hash, count,
 canonical uncompressed byte length, and a SHA-256 of that entry stream.
@@ -542,7 +557,7 @@ The marker deliberately survives successful execution and restart, so assumed st
 
 `--background-assumeutxo` orchestrates active assumed-state service and independent genesis validation concurrently. The two futures share only the process self-connection nonce and a small synchronized progress record; each owns a separate outbound connection/failover cycle, peer database, headers, chainstate, and ledger. Only the API-serving side maintains an explorer projection; the isolated validator does not build an unused historical transaction index. The active loop publishes its execution/header tips. Until they match, the validator yields after every block for at least 100 ms; once active serving catches up, its configured batch and pause limits are restored. The loopback explorer exposes this state at `/api/v1/validation`, including the immutable target, both tips, remaining work, lifecycle phase, throttle state, and terminal error. The active loop consumes successful completion, compares the independently streamed UTXO identity, and commits marker removal while its API remains live. An active-side failure cancels validation; a validation or finalization failure terminates the combined service and leaves resumable state. `--once` waits for both futures and performs the same finalization after their stores close. `--complete-assumeutxo` remains the sequential operational fallback.
 
-Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 64; the downloader fills it through 16-block protocol windows so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` yields between checkpoints. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
+Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 64; in background mode the same cap applies independently to active base-to-live execution so both pipelines can use bounded dual-peer windows. The downloader fills a checkpoint through 16-block protocol requests so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` and deferred allocator repair apply only to the validator; serving chainstate retains quick-repair durability and no pause. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
 
 Validation storage is retained by default. The destructive `--cleanup-validation-dir` option is accepted only by the automatic completion modes and is gated by a versioned, owner-only marker created only when rBTC first observed an absent or empty directory. The marker uses strict size-bounded JSON and binds a canonical network and target height/hash; its contents and containing directory are synced on Unix before the claim is considered durable. After successful finalization, cleanup canonicalizes the active and validation paths again, reopens the validation chainstate, requires its non-assumed tip and bound target to equal the snapshot base, allowlists top-level rBTC artifacts, and recursively rejects symlinks and special files. It then atomically renames the directory to a randomized sibling quarantine, syncs the parent, removes the quarantine, and syncs the parent again so both namespace transitions are durable. Failure of the first parent sync rolls the rename back before deletion; failure of the final sync reports that removal completed but its namespace durability is uncertain. An unowned legacy directory or any unexpected artifact is preserved with an error; manual two-step finalization never deletes it.
 

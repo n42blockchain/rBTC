@@ -28,6 +28,7 @@ pub mod peer_store;
 pub mod rebroadcast_store;
 pub mod signet;
 pub mod snapshot;
+pub mod snapshot_download;
 pub mod transaction_admission;
 pub mod transaction_policy;
 pub mod transaction_pool_store;
