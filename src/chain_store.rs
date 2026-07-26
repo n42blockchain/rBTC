@@ -934,6 +934,29 @@ fn spent_age_counts<'a>(
     Ok(counts)
 }
 
+#[cfg(test)]
+fn identity_from_sorted_entries(
+    entries: impl IntoIterator<Item = (OutPointKey, Utxo)>,
+) -> Result<(u64, u64, [u8; 32]), UtxoError> {
+    let mut count = 0_u64;
+    let mut records_bytes = 0_u64;
+    let mut digest = Sha256::new();
+    for (outpoint, utxo) in entries {
+        let encoded = utxo.encode()?;
+        count = count
+            .checked_add(1)
+            .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+        records_bytes = records_bytes
+            .checked_add(
+                u64::try_from(outpoint.as_bytes().len() + encoded.len())
+                    .expect("UTXO record length fits u64"),
+            )
+            .ok_or(UtxoError::Malformed("snapshot records length overflow"))?;
+        update_utxo_set_digest(&mut digest, outpoint.as_bytes(), &utxo);
+    }
+    Ok((count, records_bytes, digest.finalize().into()))
+}
+
 fn connect_spent_ages_transaction(
     transaction: &redb::WriteTransaction,
     counts: &BTreeMap<u32, u64>,
@@ -1071,9 +1094,6 @@ impl RedbChainStore {
         network: Network,
         options: ChainStoreOptions,
     ) -> Result<Self, ChainStoreError> {
-        if options.validation_delta_journal && options.retain_block_undo {
-            return Err(ChainStoreError::ValidationDeltaRetainsUndo);
-        }
         let utxos = RedbUtxoStore::from_database(Arc::clone(&db))?;
         if !execution_metadata_exists(&db)? {
             let stats = utxos.tier_stats()?;
@@ -1097,12 +1117,14 @@ impl RedbChainStore {
             let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
             let row_blooms = transaction.open_table(VALIDATION_DELTA_BLOOM_TABLE)?;
             let group_blooms = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
-            if !options.validation_delta_journal
-                && (!deltas.is_empty()? || !delta_shards.is_empty()?)
-            {
-                return Err(ChainStoreError::ValidationDeltaModeRequired);
-            }
-            if options.validation_delta_journal {
+            // A durable journal is self-describing state, not a caller hint.
+            // Automatically resume it after restart so a crash between a bulk
+            // catch-up checkpoint and final materialization cannot make the
+            // database require an otherwise unrelated CLI flag.
+            let validation_delta_journal = options.validation_delta_journal
+                || !deltas.is_empty()?
+                || !delta_shards.is_empty()?;
+            if validation_delta_journal {
                 let base_stats = utxos.tier_stats()?;
                 let mut journal = ValidationJournal {
                     rows: Vec::new(),
@@ -1417,6 +1439,7 @@ impl RedbChainStore {
         let Some(validation_journal) = &self.validation_journal else {
             return Ok(0);
         };
+        let _bulk_guard = bulk_commit_guard();
         let _guard = self.lock();
         let mut journal = validation_journal
             .lock()
@@ -1500,13 +1523,9 @@ impl RedbChainStore {
     }
 
     fn snapshot_content_identity(&self) -> Result<(u64, u64, [u8; 32]), UtxoError> {
-        if self.validation_journal.is_none() {
-            return self.utxos.snapshot_content_identity();
-        }
-        let entries = self.snapshot_entries()?;
         let mut records_bytes = 0_u64;
         let mut digest = Sha256::new();
-        for (outpoint, utxo) in &entries {
+        let count = self.visit_utxo_snapshot(|outpoint, utxo| {
             let encoded = utxo.encode()?;
             records_bytes = records_bytes
                 .checked_add(
@@ -1515,12 +1534,171 @@ impl RedbChainStore {
                 )
                 .ok_or(UtxoError::Malformed("snapshot records length overflow"))?;
             update_utxo_set_digest(&mut digest, outpoint.as_bytes(), utxo);
+            Ok(())
+        })?;
+        Ok((count, records_bytes, digest.finalize().into()))
+    }
+
+    /// Visits the complete logical UTXO set in lexical key order with bounded
+    /// memory, including any durable validation overlay.
+    ///
+    /// Journal-backed callers load and fold one key prefix at a time. This is
+    /// the production path for finalization, activity reporting, and explorer
+    /// snapshot baselines; none materializes the complete set in memory.
+    #[allow(clippy::too_many_lines)]
+    pub fn visit_utxo_snapshot<F>(&self, mut visitor: F) -> Result<u64, UtxoError>
+    where
+        F: FnMut(OutPointKey, &Utxo) -> Result<(), UtxoError>,
+    {
+        if self.validation_journal.is_none() {
+            let mut cursor = None;
+            let mut count = 0_u64;
+            loop {
+                let page = self.utxos.snapshot_page(cursor, 4_096)?;
+                if page.is_empty() {
+                    break;
+                }
+                for (outpoint, utxo) in &page {
+                    visitor(*outpoint, utxo)?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+                }
+                cursor = page.last().map(|(outpoint, _)| *outpoint);
+                if page.len() < 4_096 {
+                    break;
+                }
+            }
+            return Ok(count);
         }
-        Ok((
-            u64::try_from(entries.len()).expect("usize fits u64"),
-            records_bytes,
-            digest.finalize().into(),
-        ))
+        let journal = self
+            .validation_journal
+            .as_ref()
+            .expect("caller checked validation journal")
+            .lock()
+            .expect("validation journal lock not poisoned");
+        let transaction = self.db.begin_read()?;
+        let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+        let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+        if journal.rows.is_empty() {
+            drop(delta_shards);
+            drop(deltas);
+            drop(transaction);
+            drop(journal);
+            let mut count = 0_u64;
+            let mut cursor = None;
+            loop {
+                let page = self.utxos.snapshot_page(cursor, 4_096)?;
+                if page.is_empty() {
+                    break;
+                }
+                for (outpoint, utxo) in &page {
+                    visitor(*outpoint, utxo)?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+                }
+                cursor = page.last().map(|(outpoint, _)| *outpoint);
+                if page.len() < 4_096 {
+                    break;
+                }
+            }
+            return Ok(count);
+        }
+        let mut shard_count = VALIDATION_DELTA_SHARD_COUNT;
+        for row in &journal.rows {
+            let encoded = deltas
+                .get(row.height)?
+                .ok_or(UtxoError::Malformed("missing validation delta row"))?;
+            match validation_delta_record_header(encoded.value())? {
+                ValidationDeltaRecordHeader::Legacy { .. } => {
+                    // Legacy journals are bounded compatibility state. Keep
+                    // their existing path; all newly written rows are sharded.
+                    drop(delta_shards);
+                    drop(deltas);
+                    drop(transaction);
+                    drop(journal);
+                    let entries = self.snapshot_entries()?;
+                    let count = u64::try_from(entries.len()).expect("usize fits u64");
+                    for (outpoint, utxo) in &entries {
+                        visitor(*outpoint, utxo)?;
+                    }
+                    return Ok(count);
+                }
+                ValidationDeltaRecordHeader::Sharded(header) => {
+                    shard_count = shard_count.max(header.shard_count);
+                }
+            }
+        }
+
+        let mut count = 0_u64;
+        for lexical_shard in 0..shard_count {
+            let lexical_shard =
+                u8::try_from(lexical_shard).expect("validation shard count fits u8");
+            let mut entries = self
+                .utxos
+                .snapshot_shard_entries(lexical_shard, shard_count)?
+                .into_iter()
+                .collect::<AHashMap<_, _>>();
+            for row in &journal.rows {
+                let encoded = deltas
+                    .get(row.height)?
+                    .ok_or(UtxoError::Malformed("missing validation delta row"))?;
+                let ValidationDeltaRecordHeader::Sharded(header) =
+                    validation_delta_record_header(encoded.value())?
+                else {
+                    unreachable!("legacy rows returned through compatibility path");
+                };
+                let scale = shard_count / header.shard_count;
+                let stored_shard = usize::from(lexical_shard) / scale;
+                let stored_shard =
+                    u8::try_from(stored_shard).expect("validation shard count fits u8");
+                if !validation_shard_is_populated(header, stored_shard) {
+                    continue;
+                }
+                let key = validation_delta_shard_key(row.height, stored_shard);
+                let encoded = delta_shards
+                    .get(key.as_slice())?
+                    .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
+                let (utxo_count, updates) = decode_validation_delta(encoded.value())?;
+                if utxo_count != header.utxo_count {
+                    return Err(UtxoError::Malformed(
+                        "validation delta shard UTXO count mismatch",
+                    ));
+                }
+                for (outpoint, update) in updates {
+                    if validation_delta_shard(outpoint, shard_count) != lexical_shard {
+                        continue;
+                    }
+                    if update.spent_in_batch && entries.remove(&outpoint).is_none() {
+                        return Err(UtxoError::Malformed(
+                            "validation delta spends an absent output",
+                        ));
+                    }
+                    if let Some(utxo) = update.utxo {
+                        if entries.insert(outpoint, utxo).is_some() && !update.spent_in_batch {
+                            return Err(UtxoError::Malformed(
+                                "validation delta recreates an unspent output",
+                            ));
+                        }
+                    }
+                }
+            }
+            let mut entries = entries.into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+            for (outpoint, utxo) in entries {
+                visitor(outpoint, &utxo)?;
+                count = count
+                    .checked_add(1)
+                    .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
+            }
+        }
+        if count != journal.utxo_count {
+            return Err(UtxoError::Malformed(
+                "validation journal final UTXO count mismatch",
+            ));
+        }
+        Ok(count)
     }
 
     /// Atomically initializes an empty chainstate from an externally trusted UTXO snapshot.
@@ -1794,6 +1972,15 @@ impl RedbChainStore {
             let mut groups = transaction.open_table(VALIDATION_GROUP_BLOOM_TABLE)?;
             groups.insert(group_index, encoded_group.as_slice())?;
         }
+        if self.options.retain_block_undo {
+            for transition in transitions {
+                insert_undo_transaction(
+                    &transaction,
+                    transition.next.hash,
+                    &transition.transaction_undos,
+                )?;
+            }
+        }
         for transition in transitions {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
@@ -1895,10 +2082,20 @@ impl RedbChainStore {
         created: &[(OutPointKey, Utxo)],
         transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError> {
-        if self.validation_journal.is_some() {
-            return Err(UtxoError::Malformed("validation journal cannot disconnect blocks").into());
+        if self.validation_journal.as_ref().is_some_and(|journal| {
+            !journal
+                .lock()
+                .expect("validation journal lock not poisoned")
+                .rows
+                .is_empty()
+        }) {
+            // Reorganizations are rare during bulk catch-up. Materialize the
+            // complete overlay first so the ordinary block-addressable undo
+            // path remains the single rollback implementation.
+            self.materialize_validation_deltas()?;
         }
         let age_counts = spent_age_counts([(expected_current.height, transaction_undos)])?;
+        let _bulk_guard = bulk_commit_guard();
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);
@@ -2705,9 +2902,16 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let active =
             RedbChainStore::open(directory.path().join("active.redb"), Network::Regtest).unwrap();
-        let validation =
-            RedbChainStore::open(directory.path().join("validation.redb"), Network::Regtest)
-                .unwrap();
+        let validation = RedbChainStore::open_with_options(
+            directory.path().join("validation.redb"),
+            Network::Regtest,
+            ChainStoreOptions {
+                retain_block_undo: false,
+                validation_delta_journal: true,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
         active
             .execution()
             .bind_consensus_config(b"rules", b"rules")
@@ -2740,7 +2944,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         validation
-            .commit_connect(genesis.hash, anchor, &[], &independently_replayed, &[])
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: anchor,
+                spent: Vec::new(),
+                created: independently_replayed,
+                transaction_undos: Vec::new(),
+            }])
             .unwrap();
         let next_header = mine_child(anchor.hash, header.time + 1);
         let active_tip = ExecutionTip {
@@ -3377,13 +3587,8 @@ mod tests {
         assert_eq!(store.execution().tip().unwrap(), third);
         drop(store);
 
-        assert!(matches!(
-            RedbChainStore::open_with_options(&path, Network::Regtest, base_options),
-            Err(ChainStoreError::ValidationDeltaModeRequired)
-        ));
-
         let store =
-            RedbChainStore::open_with_options(&path, Network::Regtest, journal_options).unwrap();
+            RedbChainStore::open_with_options(&path, Network::Regtest, base_options).unwrap();
         assert_eq!(store.execution().tip().unwrap(), third);
         assert_eq!(
             store.snapshot_entries().unwrap(),
@@ -3513,6 +3718,56 @@ mod tests {
         let reopened =
             RedbChainStore::open_with_options(&path, Network::Regtest, base_options).unwrap();
         assert_eq!(reopened.get(key(1)).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn journal_identity_streams_a_nonempty_base_by_prefix() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let base_options = ChainStoreOptions {
+            retain_block_undo: false,
+            ..ChainStoreOptions::default()
+        };
+        let store =
+            RedbChainStore::open_with_options(&path, Network::Regtest, base_options).unwrap();
+        store
+            .apply(&[], &[(key(1), coin(1)), (key(240), coin(2))])
+            .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        drop(store);
+
+        let store = RedbChainStore::open_with_options(
+            &path,
+            Network::Regtest,
+            ChainStoreOptions {
+                validation_delta_journal: true,
+                ..base_options
+            },
+        )
+        .unwrap();
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([91; 32]),
+                },
+                spent: vec![key(1)],
+                created: vec![(key(16), coin(3)), (key(255), coin(4))],
+                transaction_undos: Vec::new(),
+            }])
+            .unwrap();
+        let expected =
+            BTreeMap::from([(key(16), coin(3)), (key(240), coin(2)), (key(255), coin(4))]);
+        let (count, bytes, digest) = store.snapshot_content_identity().unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(bytes, snapshot_bytes(&expected));
+        assert_eq!(
+            digest,
+            identity_from_sorted_entries(expected.into_iter())
+                .unwrap()
+                .2
+        );
     }
 
     #[test]
@@ -3684,19 +3939,45 @@ mod tests {
     }
 
     #[test]
-    fn validation_delta_journal_rejects_reorganizing_store() {
+    fn retained_undo_journal_materializes_before_disconnect() {
         let directory = TempDir::new().unwrap();
-        assert!(matches!(
-            RedbChainStore::open_with_options(
-                directory.path().join("chainstate.redb"),
-                Network::Regtest,
-                ChainStoreOptions {
-                    validation_delta_journal: true,
-                    ..ChainStoreOptions::default()
-                },
-            ),
-            Err(ChainStoreError::ValidationDeltaRetainsUndo)
-        ));
+        let store = RedbChainStore::open_with_options(
+            directory.path().join("chainstate.redb"),
+            Network::Regtest,
+            ChainStoreOptions {
+                validation_delta_journal: true,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        let next = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([49; 32]),
+        };
+        let block_undo = UtxoUndo::new(Vec::new(), vec![key(1)]);
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next,
+                spent: Vec::new(),
+                created: vec![(key(1), coin(1))],
+                transaction_undos: vec![block_undo.clone()],
+            }])
+            .unwrap();
+        assert_eq!(
+            store.undos().get(next.hash).unwrap(),
+            Some(vec![block_undo.clone()])
+        );
+        assert_eq!(store.get(key(1)).unwrap(), Some(coin(1)));
+
+        store
+            .commit_disconnect(next, genesis, &[key(1)], &[], &[block_undo])
+            .unwrap();
+        assert_eq!(store.execution().tip().unwrap(), genesis);
+        assert_eq!(store.get(key(1)).unwrap(), None);
+        assert_eq!(store.undos().get(next.hash).unwrap(), None);
+        assert_eq!(store.materialize_validation_deltas().unwrap(), 0);
     }
 
     #[test]

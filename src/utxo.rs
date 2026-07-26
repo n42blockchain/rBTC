@@ -445,65 +445,54 @@ impl RedbUtxoStore {
             .collect()
     }
 
-    /// Computes count, encoded length, and logical UTXO-set identity without
-    /// materializing all UTXOs. The digest excludes local `last_touched` time.
-    pub(crate) fn snapshot_content_identity(&self) -> Result<(u64, u64, [u8; 32]), UtxoError> {
+    /// Loads one lexically contiguous outpoint prefix from both physical tiers.
+    ///
+    /// `shard_count` is either 16 (high nibble) or 256 (complete first byte).
+    /// This bounds callers such as journal finalization to one UTXO prefix
+    /// instead of materializing the complete set.
+    pub(crate) fn snapshot_shard_entries(
+        &self,
+        shard: u8,
+        shard_count: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, UtxoError> {
+        if !matches!(shard_count, 16 | 256) || usize::from(shard) >= shard_count {
+            return Err(UtxoError::Malformed("invalid UTXO snapshot shard"));
+        }
         let _guard = self.lock();
         let transaction = self.db.begin_read()?;
-        let hot = transaction.open_table(HOT_TABLE)?;
-        let cold = transaction.open_table(COLD_TABLE)?;
-        let mut hot_rows = hot.iter()?;
-        let mut cold_rows = cold.iter()?;
-        let mut hot_next = hot_rows
-            .next()
-            .transpose()?
-            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
-        let mut cold_next = cold_rows
-            .next()
-            .transpose()?
-            .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
-        let mut count = 0_u64;
-        let mut records_bytes = 0_u64;
-        let mut digest = Sha256::new();
-        while hot_next.is_some() || cold_next.is_some() {
-            let take_hot = match (&hot_next, &cold_next) {
-                (Some((hot_key, _)), Some((cold_key, _))) => match hot_key.cmp(cold_key) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Equal => {
-                        return Err(UtxoError::Malformed("outpoint in both tiers"));
-                    }
-                },
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => break,
+        let start_prefix = if shard_count == 16 { shard << 4 } else { shard };
+        let next_prefix = if shard_count == 16 {
+            (shard != 15).then(|| (shard + 1) << 4)
+        } else {
+            (shard != u8::MAX).then(|| shard + 1)
+        };
+        let mut start = [0_u8; 36];
+        start[0] = start_prefix;
+        let mut entries = BTreeMap::new();
+        for definition in [HOT_TABLE, COLD_TABLE] {
+            let table = transaction.open_table(definition)?;
+            let mut collect = |key: &[u8], value: &[u8]| -> Result<(), UtxoError> {
+                let key = OutPointKey::from_bytes(key)?;
+                if entries.insert(key, Utxo::decode(value)?).is_some() {
+                    return Err(UtxoError::Malformed("outpoint in both tiers"));
+                }
+                Ok(())
             };
-            let (key, value) = if take_hot {
-                let row = hot_next.take().expect("selected populated hot iterator");
-                hot_next = hot_rows
-                    .next()
-                    .transpose()?
-                    .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
-                row
+            if let Some(next_prefix) = next_prefix {
+                let mut end = [0_u8; 36];
+                end[0] = next_prefix;
+                for row in table.range(start.as_slice()..end.as_slice())? {
+                    let (key, value) = row?;
+                    collect(key.value(), value.value())?;
+                }
             } else {
-                let row = cold_next.take().expect("selected populated cold iterator");
-                cold_next = cold_rows
-                    .next()
-                    .transpose()?
-                    .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
-                row
-            };
-            OutPointKey::from_bytes(&key)?;
-            let utxo = Utxo::decode(&value)?;
-            update_utxo_set_digest(&mut digest, &key, &utxo);
-            count = count
-                .checked_add(1)
-                .ok_or(UtxoError::Malformed("snapshot UTXO count overflow"))?;
-            records_bytes = records_bytes
-                .checked_add(u64::try_from(key.len() + value.len()).expect("record fits u64"))
-                .ok_or(UtxoError::Malformed("snapshot records length overflow"))?;
+                for row in table.range(start.as_slice()..)? {
+                    let (key, value) = row?;
+                    collect(key.value(), value.value())?;
+                }
+            }
         }
-        Ok((count, records_bytes, digest.finalize().into()))
+        Ok(entries.into_iter().collect())
     }
 
     /// Returns one sorted page across both physical tiers without materializing
@@ -1104,6 +1093,45 @@ mod tests {
             store.apply(&[], &[(key, coin(1))]),
             Err(UtxoError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_shards_cover_each_fixed_key_once_in_lexical_order() {
+        let (_dir, store) = store();
+        let entries = [
+            (key(0x01), coin(100)),
+            (key(0x10), coin(100)),
+            (key(0xf0), coin(100)),
+            (key(0xff), coin(100)),
+        ];
+        store.apply(&[], &entries).unwrap();
+        assert_eq!(
+            store
+                .snapshot_shard_entries(0, 16)
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![key(0x01)]
+        );
+        assert_eq!(
+            store
+                .snapshot_shard_entries(15, 16)
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![key(0xf0), key(0xff)]
+        );
+        assert_eq!(
+            store
+                .snapshot_shard_entries(0xff, 256)
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![key(0xff)]
+        );
     }
 
     #[test]

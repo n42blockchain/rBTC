@@ -30,7 +30,6 @@ const BLOCK_UNDOS: TableDefinition<u32, &[u8]> = TableDefinition::new("explorer_
 const GENESIS_KEY: &str = "genesis";
 const TIP_KEY: &str = "tip";
 const BASELINE_KEY: &str = "utxo_baseline";
-const BASELINE_PAGE_SIZE: usize = 4_096;
 
 /// Persistent explorer projection errors.
 #[derive(Debug, Error)]
@@ -165,44 +164,33 @@ impl RedbExplorerIndex {
             transactions.retain(|_, _| false)?;
             utxos.retain(|_, _| false)?;
             undos.retain(|_, _| false)?;
-            let mut cursor = None;
-            loop {
-                let page = chainstate.utxo_snapshot_page(cursor, BASELINE_PAGE_SIZE)?;
-                if page.is_empty() {
-                    break;
+            chainstate.visit_utxo_snapshot(|outpoint, utxo| {
+                if is_unspendable(bitcoin::Script::from_bytes(&utxo.script_pubkey)) {
+                    return Ok(());
                 }
-                for (outpoint, utxo) in &page {
-                    if is_unspendable(bitcoin::Script::from_bytes(&utxo.script_pubkey)) {
-                        continue;
-                    }
-                    let bitcoin_outpoint = outpoint.to_outpoint();
-                    let key = address_utxo_key(&utxo.script_pubkey, *outpoint);
-                    if utxos
-                        .insert(
-                            key.as_slice(),
-                            serde_json::to_vec(&ExplorerUtxo {
-                                txid: bitcoin_outpoint.txid.to_string(),
-                                vout: bitcoin_outpoint.vout,
-                                value_sats: utxo.value_sats,
-                                height: utxo.height,
-                            })?
-                            .as_slice(),
-                        )?
-                        .is_some()
-                    {
-                        return Err(ExplorerStoreError::Invalid(
-                            "duplicate baseline explorer UTXO",
-                        ));
-                    }
-                    count = count
-                        .checked_add(1)
-                        .ok_or(ExplorerStoreError::Invalid("baseline UTXO count"))?;
+                let bitcoin_outpoint = outpoint.to_outpoint();
+                let key = address_utxo_key(&utxo.script_pubkey, outpoint);
+                if utxos
+                    .insert(
+                        key.as_slice(),
+                        serde_json::to_vec(&ExplorerUtxo {
+                            txid: bitcoin_outpoint.txid.to_string(),
+                            vout: bitcoin_outpoint.vout,
+                            value_sats: utxo.value_sats,
+                            height: utxo.height,
+                        })
+                        .map_err(|_| UtxoError::Malformed("serialize explorer baseline UTXO"))?
+                        .as_slice(),
+                    )?
+                    .is_some()
+                {
+                    return Err(UtxoError::Malformed("duplicate baseline explorer UTXO"));
                 }
-                cursor = page.last().map(|(outpoint, _)| *outpoint);
-                if page.len() < BASELINE_PAGE_SIZE {
-                    break;
-                }
-            }
+                count = count
+                    .checked_add(1)
+                    .ok_or(UtxoError::Malformed("baseline UTXO count"))?;
+                Ok(())
+            })?;
             let mut meta = transaction.open_table(META)?;
             let encoded = encode_tip(tip);
             meta.insert(TIP_KEY, encoded.as_slice())?;

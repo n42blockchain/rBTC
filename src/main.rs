@@ -103,7 +103,6 @@ const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
-const UTXO_ACTIVITY_PAGE_SIZE: usize = 65_536;
 const UTXO_ACTIVITY_WINDOWS: [u32; 7] = [144, 1_008, 4_320, 8_640, 12_960, 25_920, 52_560];
 const MIN_ACTIVITY_RECOMMENDATION_SAMPLES: u64 = 1_000_000;
 const PERCENT_DECIMAL_SCALE: u64 = 100_000;
@@ -1308,47 +1307,40 @@ fn scan_utxo_population(
         total_count: 0,
         total_bytes: 0,
     };
-    let mut cursor = None;
-    loop {
-        let page = chainstate
-            .utxo_snapshot_page(cursor, UTXO_ACTIVITY_PAGE_SIZE)
-            .map_err(|error| error.to_string())?;
-        if page.is_empty() {
-            break;
-        }
-        for (_, utxo) in &page {
-            let age = tip_height.checked_sub(utxo.height).ok_or_else(|| {
-                format!(
-                    "UTXO creation height {} exceeds execution tip {tip_height}",
-                    utxo.height
-                )
-            })?;
+    chainstate
+        .visit_utxo_snapshot(|_, utxo| {
+            let age =
+                tip_height
+                    .checked_sub(utxo.height)
+                    .ok_or(rbtc::utxo::UtxoError::Malformed(
+                        "UTXO creation height exceeds execution tip",
+                    ))?;
             let record_bytes = u64::try_from(36_usize + 29 + utxo.script_pubkey.len())
-                .map_err(|_| "UTXO record length exceeds u64".to_owned())?;
+                .map_err(|_| rbtc::utxo::UtxoError::Malformed("UTXO record length exceeds u64"))?;
             population.total_count = population
                 .total_count
                 .checked_add(1)
-                .ok_or_else(|| "UTXO count overflow".to_owned())?;
+                .ok_or(rbtc::utxo::UtxoError::Malformed("UTXO count overflow"))?;
             population.total_bytes = population
                 .total_bytes
                 .checked_add(record_bytes)
-                .ok_or_else(|| "UTXO byte count overflow".to_owned())?;
+                .ok_or(rbtc::utxo::UtxoError::Malformed("UTXO byte count overflow"))?;
             for (index, window) in UTXO_ACTIVITY_WINDOWS.iter().enumerate() {
                 if age <= *window {
-                    population.window_counts[index] = population.window_counts[index]
-                        .checked_add(1)
-                        .ok_or_else(|| "window UTXO count overflow".to_owned())?;
+                    population.window_counts[index] =
+                        population.window_counts[index].checked_add(1).ok_or(
+                            rbtc::utxo::UtxoError::Malformed("window UTXO count overflow"),
+                        )?;
                     population.window_bytes[index] = population.window_bytes[index]
                         .checked_add(record_bytes)
-                        .ok_or_else(|| "window UTXO byte count overflow".to_owned())?;
+                        .ok_or(rbtc::utxo::UtxoError::Malformed(
+                            "window UTXO byte count overflow",
+                        ))?;
                 }
             }
-        }
-        cursor = page.last().map(|(outpoint, _)| *outpoint);
-        if page.len() < UTXO_ACTIVITY_PAGE_SIZE {
-            break;
-        }
-    }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
     Ok(population)
 }
 
@@ -1847,8 +1839,16 @@ fn finalize_assumed_snapshot_from(
     let headers = header_store
         .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
         .map_err(|error| error.to_string())?;
-    let active =
-        RedbChainStore::open(active_path, options.network).map_err(|error| error.to_string())?;
+    let active = RedbChainStore::open_with_options(
+        active_path,
+        options.network,
+        ChainStoreOptions {
+            cache_size_bytes: BULK_VALIDATION_CHAINSTATE_CACHE_BYTES,
+            validation_delta_journal: true,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     finalize_assumed_snapshot_with(
         options.network,
         &options.deployments,
@@ -1866,8 +1866,16 @@ fn finalize_assumed_snapshot_with(
     headers: &HeaderDag,
 ) -> Result<(), String> {
     let validation_path = validation_dir.join("chainstate.redb");
-    let validation =
-        RedbChainStore::open(validation_path, network).map_err(|error| error.to_string())?;
+    let validation = RedbChainStore::open_with_options(
+        validation_path,
+        network,
+        ChainStoreOptions {
+            cache_size_bytes: BULK_VALIDATION_CHAINSTATE_CACHE_BYTES,
+            validation_delta_journal: true,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     validation
         .execution()
         .bind_consensus_config(
@@ -1875,6 +1883,14 @@ fn finalize_assumed_snapshot_with(
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
+    let materialized = active
+        .materialize_validation_deltas()
+        .map_err(|error| error.to_string())?;
+    if materialized > 0 {
+        println!(
+            "materialized {materialized} net active-chain UTXO updates before AssumeUTXO finalization"
+        );
+    }
     let finalized = active
         .finalize_assumed_snapshot(&validation, headers)
         .map_err(|error| error.to_string())?;
@@ -4239,7 +4255,9 @@ async fn sync_validating_node(
             network_execution,
             background_validation.is_some() || validation_scheduler.is_some(),
         ),
-        validation_delta_journal: network_execution.is_experimental(),
+        validation_delta_journal: network_execution.is_experimental()
+            || background_validation.is_some()
+            || validation_scheduler.is_some(),
     };
     let chainstate_open_started = Instant::now();
     let mut open_chainstate = tokio::task::spawn_blocking(move || {
@@ -5923,35 +5941,50 @@ async fn download_execute_batch(
             utxo_elapsed,
             shard_result,
             shard_elapsed,
-        ) = std::thread::scope(|scope| {
-            let utxos = scope.spawn(|| {
-                let started = Instant::now();
-                let result =
-                    prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
-                (result, started.elapsed())
-            });
-            let shard = scope.spawn(|| {
-                let started = Instant::now();
-                let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
-                (result, started.elapsed())
-            });
-            let stage_result = ledger.stage(next_height, &serialized);
-            let branch_staged_at = Instant::now();
-            let (utxo_result, utxo_elapsed) = utxos
-                .join()
-                .expect("scoped UTXO-prefetch thread must not panic");
-            let (shard_result, shard_elapsed) = shard
-                .join()
-                .expect("scoped validation-delta shard thread must not panic");
-            (
-                stage_result,
-                branch_staged_at,
-                utxo_result,
-                utxo_elapsed,
-                shard_result,
-                shard_elapsed,
-            )
-        });
+        ) = {
+            let work = || {
+                std::thread::scope(|scope| {
+                    let utxos = scope.spawn(|| {
+                        let started = Instant::now();
+                        let result = prefetch_prevalidated_active_block_utxos(
+                            chainstate,
+                            &blocks,
+                            &transaction_ids,
+                        );
+                        (result, started.elapsed())
+                    });
+                    let shard = scope.spawn(|| {
+                        let started = Instant::now();
+                        let result =
+                            shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
+                        (result, started.elapsed())
+                    });
+                    let stage_result = ledger.stage(next_height, &serialized);
+                    let branch_staged_at = Instant::now();
+                    let (utxo_result, utxo_elapsed) = utxos
+                        .join()
+                        .expect("scoped UTXO-prefetch thread must not panic");
+                    let (shard_result, shard_elapsed) = shard
+                        .join()
+                        .expect("scoped validation-delta shard thread must not panic");
+                    (
+                        stage_result,
+                        branch_staged_at,
+                        utxo_result,
+                        utxo_elapsed,
+                        shard_result,
+                        shard_elapsed,
+                    )
+                })
+            };
+            if tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+            {
+                tokio::task::block_in_place(work)
+            } else {
+                work()
+            }
+        };
         stage_result.map_err(|error| error.to_string())?;
         delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
@@ -5989,67 +6022,73 @@ async fn download_execute_batch(
             utxo_prefetch_elapsed,
             shard_result,
             shard_elapsed,
-        ) = std::thread::scope(|scope| {
-            let prefetch = scope.spawn(|| {
-                let started = Instant::now();
-                let result = runtime.block_on(download_execution_prefetch(
-                    session,
-                    auxiliary_session,
-                    &next_prefetch_hashes,
-                    compact_candidates,
-                ));
-                (result, started.elapsed())
-            });
-            let utxos = scope.spawn(|| {
-                let started = Instant::now();
-                let result =
-                    prefetch_prevalidated_active_block_utxos(chainstate, &blocks, &transaction_ids);
-                (result, started.elapsed())
-            });
-            let shard = scope.spawn(|| {
-                let started = Instant::now();
-                let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
-                (result, started.elapsed())
-            });
-            let stage_result = ledger.stage(next_height, &serialized);
-            let branch_staged_at = Instant::now();
-            let (utxo_result, utxo_prefetch_elapsed) = utxos
-                .join()
-                .expect("scoped UTXO-prefetch thread must not panic");
-            let execution_result = match (stage_result.as_ref(), utxo_result) {
-                (Ok(()), Ok(prefetched_utxos)) => {
-                    Some(connect_prevalidated_active_blocks_with_txids_and_utxos(
+        ) = tokio::task::block_in_place(|| {
+            std::thread::scope(|scope| {
+                let prefetch = scope.spawn(|| {
+                    let started = Instant::now();
+                    let result = runtime.block_on(download_execution_prefetch(
+                        session,
+                        auxiliary_session,
+                        &next_prefetch_hashes,
+                        compact_candidates,
+                    ));
+                    (result, started.elapsed())
+                });
+                let utxos = scope.spawn(|| {
+                    let started = Instant::now();
+                    let result = prefetch_prevalidated_active_block_utxos(
                         chainstate,
-                        headers,
                         &blocks,
                         &transaction_ids,
-                        prefetched_utxos,
-                        now,
-                        DEFAULT_HOT_WINDOW_SECS,
-                        &deployment_contexts,
-                    ))
-                }
-                (Ok(()), Err(error)) => Some(Err(error)),
-                (Err(_), _) => None,
-            };
-            let execution_core_at = Instant::now();
-            let (prefetch_result, prefetch_elapsed) = prefetch
-                .join()
-                .expect("scoped execution-prefetch thread must not panic");
-            let (shard_result, shard_elapsed) = shard
-                .join()
-                .expect("scoped validation-delta shard thread must not panic");
-            (
-                stage_result,
-                branch_staged_at,
-                execution_result,
-                execution_core_at,
-                prefetch_result,
-                prefetch_elapsed,
-                utxo_prefetch_elapsed,
-                shard_result,
-                shard_elapsed,
-            )
+                    );
+                    (result, started.elapsed())
+                });
+                let shard = scope.spawn(|| {
+                    let started = Instant::now();
+                    let result =
+                        shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
+                    (result, started.elapsed())
+                });
+                let stage_result = ledger.stage(next_height, &serialized);
+                let branch_staged_at = Instant::now();
+                let (utxo_result, utxo_prefetch_elapsed) = utxos
+                    .join()
+                    .expect("scoped UTXO-prefetch thread must not panic");
+                let execution_result = match (stage_result.as_ref(), utxo_result) {
+                    (Ok(()), Ok(prefetched_utxos)) => {
+                        Some(connect_prevalidated_active_blocks_with_txids_and_utxos(
+                            chainstate,
+                            headers,
+                            &blocks,
+                            &transaction_ids,
+                            prefetched_utxos,
+                            now,
+                            DEFAULT_HOT_WINDOW_SECS,
+                            &deployment_contexts,
+                        ))
+                    }
+                    (Ok(()), Err(error)) => Some(Err(error)),
+                    (Err(_), _) => None,
+                };
+                let execution_core_at = Instant::now();
+                let (prefetch_result, prefetch_elapsed) = prefetch
+                    .join()
+                    .expect("scoped execution-prefetch thread must not panic");
+                let (shard_result, shard_elapsed) = shard
+                    .join()
+                    .expect("scoped validation-delta shard thread must not panic");
+                (
+                    stage_result,
+                    branch_staged_at,
+                    execution_result,
+                    execution_core_at,
+                    prefetch_result,
+                    prefetch_elapsed,
+                    utxo_prefetch_elapsed,
+                    shard_result,
+                    shard_elapsed,
+                )
+            })
         });
         stage_result.map_err(|error| error.to_string())?;
         delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
