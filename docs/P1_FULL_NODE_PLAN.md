@@ -54,6 +54,10 @@ cannot expose a partial checkpoint, two isolated regtest instances can run in
 one Tokio process, and the standalone CLI passes its unchanged end-to-end
 suite.
 
+Implemented on 2026-07-26: items 1–3 and the two-instance acceptance test.
+Items 4–6 remain the next ordered P1.0 work; direct `n42-26` linkage remains
+behind the licensing decision described above.
+
 ### P1.1 — operator lifecycle and diagnostics
 
 1. Add a strict network-scoped config file with CLI override precedence and

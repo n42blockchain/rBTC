@@ -15,8 +15,11 @@ use std::{
 };
 use thiserror::Error;
 
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-static CHECKPOINTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct RuntimeControl {
+    shutdown_requested: AtomicBool,
+    checkpoints_in_flight: AtomicUsize,
+}
 
 struct InFlightCheckpoint<'a> {
     count: &'a AtomicUsize,
@@ -159,7 +162,6 @@ const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
-static EMBEDDED_NODE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
@@ -191,6 +193,7 @@ struct Options {
     offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+    runtime_control: Arc<RuntimeControl>,
 }
 
 /// Builder for one outbound validating node owned by a host Tokio runtime.
@@ -261,20 +264,9 @@ impl NodeBuilder {
     pub fn launch(self) -> Result<NodeHandle, NodeError> {
         let options = self.into_options()?;
         tokio::runtime::Handle::try_current().map_err(|_| NodeError::MissingRuntime)?;
-        EMBEDDED_NODE_RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| NodeError::AlreadyRunning)?;
-        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        let runtime_control = Arc::clone(&options.runtime_control);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            struct RunningGuard;
-            impl Drop for RunningGuard {
-                fn drop(&mut self) {
-                    EMBEDDED_NODE_RUNNING.store(false, Ordering::Release);
-                    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-                }
-            }
-            let _guard = RunningGuard;
             let run = run(options);
             tokio::pin!(run);
             tokio::select! {
@@ -283,8 +275,8 @@ impl NodeBuilder {
                     if changed.is_ok() && !*shutdown_rx.borrow() {
                         return Err(NodeError::ControlChannelClosed);
                     }
-                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-                    wait_for_in_flight_checkpoints(&CHECKPOINTS_IN_FLIGHT).await;
+                    runtime_control.shutdown_requested.store(true, Ordering::Release);
+                    wait_for_in_flight_checkpoints(&runtime_control.checkpoints_in_flight).await;
                     Ok(())
                 }
             }
@@ -342,6 +334,7 @@ impl NodeBuilder {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: self.ledger_retention,
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
     }
 }
@@ -410,9 +403,6 @@ pub enum NodeError {
     /// The builder configuration violates a bounded runtime contract.
     #[error("invalid node configuration: {0}")]
     InvalidConfig(String),
-    /// Only one embedded node may own the current process-global checkpoint barrier.
-    #[error("an embedded rBTC node is already running in this process")]
-    AlreadyRunning,
     /// Launch must occur from the host application's Tokio runtime.
     #[error("embedded node launch requires an active Tokio runtime")]
     MissingRuntime,
@@ -1254,11 +1244,14 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
             // validating future performs bounded synchronous execution work;
             // if signal polling shares that same task, the OS notification can
             // otherwise remain unread until after another checkpoint starts.
-            SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-            let mut signal_task = tokio::spawn(async {
+            let runtime_control = Arc::clone(&options.runtime_control);
+            let signal_runtime_control = Arc::clone(&runtime_control);
+            let mut signal_task = tokio::spawn(async move {
                 let result = shutdown_signal().await;
                 if result.is_ok() {
-                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                    signal_runtime_control
+                        .shutdown_requested
+                        .store(true, Ordering::Release);
                 }
                 result
             });
@@ -1272,7 +1265,10 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                         .map_err(|error| format!("shutdown signal task failed: {error}"))
                         .and_then(std::convert::identity);
                     if signal.is_ok() {
-                        wait_for_in_flight_checkpoints(&CHECKPOINTS_IN_FLIGHT).await;
+                        wait_for_in_flight_checkpoints(
+                            &runtime_control.checkpoints_in_flight,
+                        )
+                        .await;
                         eprintln!("rbtcd: shutdown signal received; closing durable stores");
                     }
                     signal
@@ -3404,6 +3400,7 @@ async fn run_connected_peer(
                 &options.deployments,
                 options.ibd_policy,
                 path.clone(),
+                &options.runtime_control,
                 options.once,
                 options.validation_target,
                 options.validation_limits,
@@ -3518,6 +3515,7 @@ async fn complete_assumeutxo_validation(
         &options.deployments,
         options.ibd_policy,
         validation_dir.clone(),
+        &options.runtime_control,
         false,
         Some(ValidationTarget {
             height: assumed.base.height,
@@ -4650,6 +4648,7 @@ async fn sync_validating_node(
     deployment_config: &DeploymentConfig,
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
+    runtime_control: &RuntimeControl,
     once: bool,
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
@@ -5193,9 +5192,10 @@ async fn sync_validating_node(
                 .map_or(validation_limits, |status| {
                     status.adaptive_limits(validation_limits)
                 });
-            let Some(checkpoint) =
-                InFlightCheckpoint::try_enter(&SHUTDOWN_REQUESTED, &CHECKPOINTS_IN_FLIGHT)
-            else {
+            let Some(checkpoint) = InFlightCheckpoint::try_enter(
+                &runtime_control.shutdown_requested,
+                &runtime_control.checkpoints_in_flight,
+            ) else {
                 std::future::pending::<()>().await;
                 unreachable!("a rejected checkpoint remains parked until runtime shutdown");
             };
@@ -5273,7 +5273,7 @@ async fn sync_validating_node(
             // A completely prefetched batch may otherwise run from decode
             // through commit without yielding, starving the outer shutdown
             // selector across successive checkpoints.
-            checkpoint_shutdown(&SHUTDOWN_REQUESTED).await;
+            checkpoint_shutdown(&runtime_control.shutdown_requested).await;
         }
     }
 }
@@ -8086,6 +8086,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         },
         validation_limits,
         ledger_retention,
+        runtime_control: Arc::new(RuntimeControl::default()),
     }))
 }
 
@@ -8521,6 +8522,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         };
         let mut pending =
             spawn_peer_connections(&options, &options.remotes, 100, None, None, None, None)
@@ -11099,6 +11101,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -11165,6 +11168,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -12376,6 +12380,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap_err();
@@ -12431,6 +12436,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -12808,6 +12814,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -12897,6 +12904,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -12965,6 +12973,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13049,6 +13058,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13104,6 +13114,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13155,6 +13166,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap_err();
@@ -13246,6 +13258,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13303,6 +13316,7 @@ mod tests {
                     quick_repair: true,
                 },
                 ledger_retention: LedgerRetention::default(),
+                runtime_control: Arc::new(RuntimeControl::default()),
             }),
         )
         .await
@@ -13392,6 +13406,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13470,6 +13485,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13506,6 +13522,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13562,6 +13579,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap_err();
@@ -13612,6 +13630,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap_err();
@@ -13707,6 +13726,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap_err();
@@ -13858,6 +13878,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -13960,6 +13981,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -14034,6 +14056,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();
@@ -14144,6 +14167,7 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                runtime_control: Arc::new(RuntimeControl::default()),
             }),
         )
         .await
@@ -14289,6 +14313,7 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                runtime_control: Arc::new(RuntimeControl::default()),
             },
             local_nonce,
         )
@@ -14404,6 +14429,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
         })
         .await
         .unwrap();

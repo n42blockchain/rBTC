@@ -2,9 +2,21 @@
 
 use bitcoin::Network;
 use rbtc::node::{NodeBuilder, NodeError};
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
+
+async fn hold_one_connection() -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let (accepted, accepted_rx) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let _connection = listener.accept().await.unwrap();
+        let _ = accepted.send(());
+        std::future::pending::<()>().await;
+    });
+    (remote, accepted_rx, peer)
+}
 
 #[test]
 fn external_host_can_configure_the_public_node_builder() {
@@ -24,12 +36,7 @@ fn external_host_can_configure_the_public_node_builder() {
 
 #[tokio::test]
 async fn host_controller_stops_the_embedded_task() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let remote = listener.local_addr().unwrap();
-    let peer = tokio::spawn(async move {
-        let _connection = listener.accept().await.unwrap();
-        std::future::pending::<()>().await;
-    });
+    let (remote, _accepted, peer) = hold_one_connection().await;
     let directory = TempDir::new().unwrap();
     let handle = NodeBuilder::new(Network::Regtest, directory.path())
         .connect(remote)
@@ -42,4 +49,43 @@ async fn host_controller_stops_the_embedded_task() {
         .expect("embedded shutdown must not depend on process signals")
         .unwrap();
     peer.abort();
+}
+
+#[tokio::test]
+async fn host_can_run_two_isolated_nodes_in_one_runtime() {
+    let (first_remote, first_accepted, first_peer) = hold_one_connection().await;
+    let (second_remote, second_accepted, second_peer) = hold_one_connection().await;
+    let first_directory = TempDir::new().unwrap();
+    let second_directory = TempDir::new().unwrap();
+
+    let first = NodeBuilder::new(Network::Regtest, first_directory.path())
+        .connect(first_remote)
+        .launch()
+        .unwrap();
+    let second = NodeBuilder::new(Network::Regtest, second_directory.path())
+        .connect(second_remote)
+        .launch()
+        .unwrap();
+
+    timeout(Duration::from_secs(2), async {
+        first_accepted.await.unwrap();
+        second_accepted.await.unwrap();
+    })
+    .await
+    .expect("both isolated nodes must establish their own peer session");
+
+    first.controller().request_shutdown();
+    second.controller().request_shutdown();
+    let (first_result, second_result) = tokio::join!(
+        timeout(Duration::from_secs(2), first.wait()),
+        timeout(Duration::from_secs(2), second.wait()),
+    );
+    first_result
+        .expect("first node must stop independently")
+        .unwrap();
+    second_result
+        .expect("second node must stop independently")
+        .unwrap();
+    first_peer.abort();
+    second_peer.abort();
 }

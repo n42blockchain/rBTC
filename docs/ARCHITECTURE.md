@@ -25,10 +25,11 @@ signals. A Tokio host launches ordinary persistent execution through
 `rbtc::node::NodeBuilder`, hands `NodeHandle::wait` to its task executor, and
 retains a cloneable `NodeController` for checkpoint-safe shutdown. This matches
 the critical-task assembly used by `n42-26` without moving consensus or storage
-truth into the host. The first embedding slice still serializes embedded
-instances around the existing process-global checkpoint barrier; P1.0 removes
-that barrier and adds typed status/events before multi-network in-process
-hosting is accepted.
+truth into the host. Each launch owns its shutdown flag and in-flight checkpoint
+barrier; an external-crate acceptance test runs two isolated regtest instances
+concurrently in one Tokio runtime and shuts them down independently. P1.0 still
+adds typed status/events and the host task-executor fixture before the embedding
+surface is complete.
 
 The header DAG keeps a height-indexed view of the selected best-work branch, so
 active-height lookups stay constant-time while an ordinary extension appends
