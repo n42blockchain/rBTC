@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-07-25.
+Status date: 2026-07-26.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -134,7 +134,7 @@ Primary references:
   daemon passed all seven live regtest differential matrices. Current relay
   policy is correctly retained as a separate P1 gate rather than conflated
   with consensus compatibility.
-- [ ] **Finish the original fast-bootstrap contract using Bitcoin's existing
+- [x] **Finish the original fast-bootstrap contract using Bitcoin's existing
   AssumeUTXO model.** Validate the complete header chain and select its
   maximum-work active branch; accept only a Core 31 chainparams height,
   blockhash, UTXO-set hash, and chain-transaction count; load a
@@ -147,24 +147,42 @@ Primary references:
   release-pinned identities, exact `hash_serialized` calculation, bounded txid
   grouping, two-pass race closure, atomic activation API, and offline CLI are
   implemented. The external Testnet4 fixture, complete assumed/live/background
-  lifecycle, and bounded parallel/resumable HTTPS transport are accepted; only
-  the end-to-end Mainnet run remains open.
-- [ ] **Choose the hot/cold UTXO boundary from replay data, not the current
+  lifecycle, and bounded parallel/resumable HTTPS transport are accepted.
+  On 2026-07-26 the Core 31 Mainnet height-935,000 snapshot served and validated
+  ordinary blocks through live height 959,688 while the independent chainstate
+  replayed genesis through the exact base hash. A simultaneous 11-peer failure
+  stopped at atomic height 732,941; restart resumed at 732,942, caught the
+  serving chain up, and completed without replaying a committed batch. The
+  final identity matched 164,241,311 entries and 15,334,473,795 canonical bytes,
+  50,340,320 net active-overlay updates were materialized, and the assumed
+  marker cleared. The resumed run took 24,998.34 seconds; the complete two-run
+  acceptance including the exercised recovery took about 14.4 hours.
+- [x] **Choose the hot/cold UTXO boundary from replay data, not the current
   60-day constant.** Persist a network-scoped histogram of spent-output coin age
   in blocks, and report for candidate windows the share of the current UTXO set
   kept hot versus the share of observed spends it would hit. Select the smallest
   window meeting the documented target (initial evaluation: 99% spend-hit rate)
   on complete mainnet replay plus a live-tip sample; publish sample count,
-  quantiles, read amplification, RSS, and IBD/restart impact. Until this gate
-  passes, hot/cold is a local storage experiment and never part of snapshot
-  identity or consensus. Exact network-scoped block-age rows, sorted batch
+  quantiles, read amplification, RSS, and IBD/restart impact. Hot/cold remains
+  local storage policy and never becomes part of snapshot identity or
+  consensus. Exact network-scoped block-age rows, sorted batch
   updates, honest coverage metadata, and same-transaction reorg reversal are
   implemented. Fixed-memory current-UTXO population/byte reporting and a
   fail-closed 99%-hit recommendation gate are implemented. The report also
   emits spend-age quantiles and expected hot-first tier probes, and the chosen
   window can be applied through crash-resumable, sorted 65,536-record atomic
-  re-tier batches; the
-  complete-mainnet data run and published operational measurements remain open.
+  re-tier batches. Complete replay observed 3,257,609,051 spends: P99 age was
+  122,194 blocks, and the smallest candidate reaching the 99% target was
+  157,680 blocks (three years) at 99.38467%. The post-base live sample observed
+  179,211,528 spends through height 959,730 and confirmed 99.42139%, P99
+  129,338, and 1.00578 expected hot-first probes per spend. Applying that
+  boundary scanned 166,269,013 UTXOs in 1,029.64 seconds; after a 42-block live
+  advance, a resumable re-scan moved only 43,427 newly aged rows and finished
+  with 97,862,624 hot / 68,429,071 cold UTXOs. The report's predicted hot count
+  exactly matched physical storage. The final active/audit directories occupied
+  76/237 GiB, sampled process physical memory peaked at 58.0 GiB during
+  finalization, and the re-tiered chainstate cold-opened in 46 ms before
+  validating the next 42 blocks.
 - [ ] **Sustained public-network operations soak.** Run Bitcoin and Testnet4 for
   at least seven consecutive days across natural tip updates, peer churn,
   controlled restarts, freezer rotation, mempool persistence, and at least one
@@ -260,11 +278,9 @@ correctness or security work.
 
 ## Execution order
 
-1. Finish the Core-compatible Mainnet fast-bootstrap acceptance and data-backed
-   hot/cold decision.
-2. Finish Testnet4 public acceptance, then run the sustained public-network soak
-   while preparing the external review.
-3. Close review findings and produce the signed supported-platform release.
-4. Build inbound service, operator lifecycle, current relay policy, and optional
+1. Run the sustained Bitcoin/Testnet4 public-network soak while preparing the
+   external review.
+2. Close review findings and produce the signed supported-platform release.
+3. Build inbound service, operator lifecycle, current relay policy, and optional
    indexes in that order.
-5. Select P2 work only from an actual deployment need.
+4. Select P2 work only from an actual deployment need.

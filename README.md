@@ -29,7 +29,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 public-chain and external Core 31 AssumeUTXO acceptance are complete, and the repository-owned script boundary now has a documented Core 31 compatibility decision and live differential matrix. The remaining release blockers are the end-to-end Mainnet fast-bootstrap/hot-cold data gates, a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 and Mainnet Core 31 AssumeUTXO acceptance, the data-backed Mainnet hot/cold boundary, and the repository-owned script boundary's Core 31 compatibility decision/live differential matrix are complete. The remaining release blockers are a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 
@@ -401,6 +401,34 @@ Completed 64 MiB chunks survive restart, while partial current chunks are
 retried. The printed SHA-256 is transport evidence only; activation still
 requires the compiled Core identity on validated maximum-work headers.
 
+To start a new node from a recent authenticated height rather than replaying
+genesis before it can serve, use the explicit three-stage path:
+
+```sh
+# 1. Validate and persist the complete header chain and maximum-work branch.
+rbtcd --network bitcoin \
+  --headers-db /srv/rbtc-active/headers.redb
+
+# 2. Install only a release-pinned Core 31 AssumeUTXO identity on that branch.
+rbtcd --network bitcoin --data-dir /srv/rbtc-active \
+  --core-assumeutxo-snapshot /srv/snapshots/utxo-935000.dat
+
+# 3. Catch the assumed chain up from 935001 and enter live mode immediately,
+#    while a separate chainstate validates genesis through 935000.
+rbtcd --network bitcoin --data-dir /srv/rbtc-active \
+  --background-assumeutxo /srv/rbtc-genesis-validation
+```
+
+The current Core 31 Mainnet anchor is height 935,000. This is deliberately not
+an arbitrary-height snapshot interface: Bitcoin headers commit to transactions,
+not to the UTXO set. A different recent height is acceptable only after its
+block hash, `hash_serialized`, UTXO count, and chain-transaction count become a
+reviewed, compiled Core chainparams identity (or after this node has produced
+and authenticated its own migration snapshot). The serving chain validates
+every post-base block normally. The historical validator independently rebuilds
+the base UTXO set, and only an exact identity match clears the assumed marker.
+No MPT or new consensus commitment is introduced.
+
 An experimental validation directory remains bound to its original hard
 ceiling during ordinary restarts. Once that exact target has completed,
 `--extend-validation-target` may raise it to a higher authenticated height/hash
@@ -429,6 +457,17 @@ On 2026-07-23 this exact production path validated and persisted headers through
 The normal live-service path is `rbtcd --data-dir ACTIVE --network NETWORK [PEER OPTIONS] --background-assumeutxo VALIDATION`. It derives the authenticated height/hash from the active marker and starts the assumed active chain and independent genesis validator as separate runtime tasks with separate connections, peer failover, headers, chainstate, ledger, explorer, and peer databases. Both bulk paths publish sorted, prefix-sharded UTXO deltas instead of randomly rewriting a multi-gigabyte base B-tree at every checkpoint. Reads resolve newest deltas through bounded group/row Bloom filters and parallel shard reads before the immutable base. The serving chain retains block undo; a reorganization first atomically materializes its overlay and then uses the ordinary rollback path. Finalization computes the independent UTXO identity one lexical key prefix at a time, bounds peak memory to one final-set shard, materializes the much smaller base-to-live active overlay once, and clears the assumed marker without taking the explorer or wallet API offline. Durable delta state is self-identifying and resumes after a crash without a special flag.
 
 A long synchronous checkpoint on one task cannot starve the other task's network receive deadlines: blocking stage, UTXO prefetch, validation, and commit sections explicitly yield their Tokio worker, including while an owned prefetch thread drives the next network window. Each concurrent bulk chainstate has an 8 GiB redb cache cap (16 GiB aggregate), instead of the ordinary live node's 1 GiB cache or two competing 16 GiB single-validator caches. Network receive, structure validation, freezer staging, and next-window prefetch remain concurrent, while final redb publication transactions take a process-wide commit turn so random I/O on one physical device does not thrash both stores. If either side exhausts its peers or validation/finalization fails, the combined service cancels the sibling task, fails closed, and retains both resumable directories. `--once` waits for both sides and finalizes before returning, which is useful for bounded deployment gates. The older sequential `--complete-assumeutxo` path remains available. Both modes reject same-directory, parent/child-directory, symlink, and Unix hardlink aliases before validation state is opened.
+
+On 2026-07-26 the Core 31 Mainnet height-935,000 snapshot entered live
+service, validated post-base blocks through height 959,688, and concurrently
+replayed genesis to the base. A simultaneous 11-peer exhaustion stopped at
+height 732,941; restart resumed at 732,942 without replaying a committed batch.
+Finalization matched 164,241,311 UTXOs / 15,334,473,795 canonical bytes and
+cleared the assumed marker after materializing 50,340,320 net active-overlay
+updates. The resumed run took 24,998.34 seconds. After data-backed re-tiering,
+the chainstate cold-opened in 46 ms and validated 42 new blocks through height
+959,730/hash
+`0000000000000000000171bbbd6e93d945499dc33a30747cd1603372a7a1f513`.
 
 The ordinary “successful handshake promotes to tried” rule is conditional on its exact keyed tried slot being vacant. An occupied slot leaves the successful challenger selectable from new and enters the bounded collision queue. Incumbent probes use the same pre-I/O attempt accounting and full-service handshake checks as normal connections; success cancels its collisions, while connection/handshake failure atomically demotes it and promotes the best queued challenger. Learned records persist up to eight independently keyed source-group references, admitted with exponentially decreasing probability; full Core addrman probabilistic selection remains open.
 

@@ -119,8 +119,8 @@ network-bound chainstate. A checkpoint aggregates ages before sorted writes;
 connect and disconnect update the histogram in the same transaction as UTXOs,
 undo, and the execution tip. Coverage metadata starts honestly at the first
 instrumented block, and a reorg crossing that start clears the sample instead
-of presenting a discontinuous history as complete. The remaining selection gate
-is a complete mainnet replay. Offline `--utxo-activity-report` scans the
+of presenting a discontinuous history as complete. Offline
+`--utxo-activity-report` scans the
 outpoint-sorted UTXO tables in fixed-memory pages and reports, for
 1/7/30/60/90/180/365-day and 2/3/5/10-year block-count candidates, historical
 spend-hit rate, P50/P90/P95/P99/P99.9 spend-age quantiles, expected hot-first
@@ -129,6 +129,24 @@ bytes. It emits a 99%-hit recommendation only when coverage is exactly blocks
 1 through the execution tip and at least one million spends were observed;
 partial upgraded stores remain useful measurements but cannot silently select
 a production boundary.
+
+The completed Mainnet genesis-to-935,000 replay observed 3,257,609,051 spends.
+Its spend-age quantiles were P50 42, P90 8,299, P95 33,082, P99 122,194, and
+P99.9 323,668 blocks. The smallest evaluated window reaching the 99% target was
+157,680 blocks (approximately three years): 99.38467% historical spend hits,
+65.95593% of base UTXOs, and 67.19178% of estimated base record bytes. A
+separate height-935,001-through-959,730 sample contained 179,211,528 spends and
+confirmed 99.42139% hits, P99 129,338 blocks, and 1.00578 expected hot-first
+lookups per spend.
+
+The selected 157,680-block boundary was physically applied to the live
+height-959,688 chainstate by scanning 166,269,013 rows and moving 68,387,004 to
+cold in 1,029.64 seconds. After the node cold-opened in 46 ms and validated 42
+new blocks, a fresh-tip scan moved only 43,427 newly aged rows and ended with
+97,862,624 hot / 68,429,071 cold rows. The report's predicted hot population
+matched that physical count exactly. This boundary remains storage policy, not
+snapshot or consensus identity; periodic operators may rerun the resumable
+command after substantial tip movement.
 
 The first offline scan against the completed Testnet4 chainstate at height
 145,737 read 14,160,511 UTXOs in 27.67 seconds. Creation-age candidates retained
