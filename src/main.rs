@@ -125,7 +125,7 @@ const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
 const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
-const ADAPTIVE_VALIDATION_BUSY_PAUSE: Duration = Duration::from_millis(100);
+const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = DEFAULT_VALIDATION_BATCH_SIZE;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 
@@ -555,10 +555,16 @@ impl BackgroundValidationStatus {
         progress.adaptive_throttled = active_busy;
         if active_busy {
             ValidationLimits {
-                max_blocks_per_batch: 1,
-                pause_between_batches: configured
-                    .pause_between_batches
-                    .max(ADAPTIVE_VALIDATION_BUSY_PAUSE),
+                // The active and background pipelines have independent peers
+                // and stores. Keep a bounded background window running while
+                // the serving chain downloads its much newer blocks: reducing
+                // to single-block request/commit cycles adds hundreds of
+                // thousands of network round trips and durable transactions
+                // without freeing the active pipeline's bottleneck.
+                max_blocks_per_batch: configured
+                    .max_blocks_per_batch
+                    .min(ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE),
+                pause_between_batches: configured.pause_between_batches,
                 quick_repair: configured.quick_repair,
             }
         } else {
@@ -10614,7 +10620,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_validation_yields_until_active_execution_catches_up() {
+    fn adaptive_validation_uses_bounded_batches_until_active_execution_catches_up() {
         let target = ValidationTarget {
             height: 100,
             block_hash: BlockHash::from_byte_array([5; 32]),
@@ -10628,15 +10634,24 @@ mod tests {
         assert_eq!(
             status.adaptive_limits(configured),
             ValidationLimits {
-                max_blocks_per_batch: 1,
-                pause_between_batches: ADAPTIVE_VALIDATION_BUSY_PAUSE,
+                max_blocks_per_batch: 8,
+                pause_between_batches: Duration::from_millis(5),
                 quick_repair: false,
             }
         );
         status.update_active(40, 50);
-        assert_eq!(status.adaptive_limits(configured).max_blocks_per_batch, 1);
-        status.update_active(50, 50);
         assert_eq!(status.adaptive_limits(configured), configured);
+        let large = ValidationLimits {
+            max_blocks_per_batch: 252,
+            pause_between_batches: Duration::ZERO,
+            quick_repair: false,
+        };
+        assert_eq!(
+            status.adaptive_limits(large).max_blocks_per_batch,
+            DEFAULT_VALIDATION_BATCH_SIZE
+        );
+        status.update_active(50, 50);
+        assert_eq!(status.adaptive_limits(large), large);
         status.update_validation(25);
         let response = status.response();
         assert_eq!(response.validation_tip, 25);
