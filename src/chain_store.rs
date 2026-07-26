@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -32,6 +32,14 @@ use crate::{
         insert_snapshot_entries_transaction, tables_empty_transaction, update_utxo_set_digest,
     },
 };
+
+fn bulk_commit_guard() -> MutexGuard<'static, ()> {
+    static BULK_COMMIT: OnceLock<Mutex<()>> = OnceLock::new();
+    BULK_COMMIT
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("bulk chainstate commit lock not poisoned")
+}
 
 /// Persistence behavior for unified chain-state commits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1737,6 +1745,7 @@ impl RedbChainStore {
                 transition.transaction_undos.as_slice(),
             )
         }))?;
+        let _bulk_guard = bulk_commit_guard();
         let _guard = self.lock();
         let mut journal = validation_journal
             .lock()
@@ -1855,6 +1864,7 @@ impl RedbChainStore {
                 transition.transaction_undos.as_slice(),
             )
         }))?;
+        let _bulk_guard = bulk_commit_guard();
         let _guard = self.lock();
         let mut transaction = self.db.begin_write()?;
         self.configure(&mut transaction);

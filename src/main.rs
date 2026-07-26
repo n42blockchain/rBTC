@@ -90,6 +90,7 @@ const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_VALIDATION_BATCH_SIZE;
 const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
+const BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -125,7 +126,7 @@ const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
 const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
-const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = DEFAULT_VALIDATION_BATCH_SIZE;
+const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 
@@ -227,7 +228,21 @@ impl Default for ValidationLimits {
 fn active_assumeutxo_limits(configured: ValidationLimits) -> ValidationLimits {
     ValidationLimits {
         max_blocks_per_batch: configured.max_blocks_per_batch,
+        quick_repair: configured.quick_repair,
         ..ValidationLimits::default()
+    }
+}
+
+const fn chainstate_cache_bytes(
+    network_execution: NetworkExecutionMode,
+    background_pipeline: bool,
+) -> usize {
+    if background_pipeline {
+        BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES
+    } else if network_execution.is_experimental() {
+        BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
+    } else {
+        1024 * 1024 * 1024
     }
 }
 
@@ -558,9 +573,10 @@ impl BackgroundValidationStatus {
                 // The active and background pipelines have independent peers
                 // and stores. Keep a bounded background window running while
                 // the serving chain downloads its much newer blocks: reducing
-                // to single-block request/commit cycles adds hundreds of
-                // thousands of network round trips and durable transactions
-                // without freeing the active pipeline's bottleneck.
+                // to small request/commit cycles adds network round trips,
+                // freezer publication, and durable transactions without
+                // freeing the active pipeline's bottleneck. Keep the busy
+                // ceiling below one consensus-maximum GiB of block payload.
                 max_blocks_per_batch: configured
                     .max_blocks_per_batch
                     .min(ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE),
@@ -1584,8 +1600,10 @@ async fn run_background_assumeutxo(
     active_options.background_assumeutxo = None;
     // A caller-selected batch cap controls both independent pipelines so an
     // assumed chain can use the same bounded dual-peer windows while catching
-    // the live tip. Throttling and deferred repair remain validator-only:
-    // serving chainstate keeps immediate quick-repair durability and no pause.
+    // the live tip. Pause throttling remains validator-only. The selected redb
+    // repair policy applies to both bulk pipelines: deferred repair preserves
+    // atomic durable commits and writes allocator state once at orderly close
+    // instead of after every catch-up checkpoint.
     active_options.validation_limits = active_assumeutxo_limits(options.validation_limits);
 
     let mut validation_options = options;
@@ -1602,7 +1620,7 @@ async fn run_background_assumeutxo(
         assumed.base.height, assumed.base.hash
     );
     let validation_status = status.clone();
-    let validation = async {
+    let validation = tokio::spawn(async move {
         let result = run_peer_pool(
             &validation_options,
             local_nonce,
@@ -1617,21 +1635,41 @@ async fn run_background_assumeutxo(
             }
         }
         result
-    };
-    let active = run_peer_pool(&active_options, local_nonce, Some(&status), None);
+    });
+    let finalize_options = active_options.clone();
+    let active_status = status;
+    let active = tokio::spawn(async move {
+        run_peer_pool(&active_options, local_nonce, Some(&active_status), None).await
+    });
     tokio::pin!(active);
     tokio::pin!(validation);
     tokio::select! {
         active_result = &mut active => {
-            active_result?;
-            validation.await?;
+            let active_result = active_result
+                .map_err(|error| format!("active-chain task failed: {error}"))?;
+            if let Err(error) = active_result {
+                validation.abort();
+                let _ = validation.await;
+                return Err(error);
+            }
+            validation
+                .await
+                .map_err(|error| format!("genesis-validation task failed: {error}"))??;
         }
         validation_result = &mut validation => {
-            validation_result?;
-            active.await?;
+            let validation_result = validation_result
+                .map_err(|error| format!("genesis-validation task failed: {error}"))?;
+            if let Err(error) = validation_result {
+                active.abort();
+                let _ = active.await;
+                return Err(error);
+            }
+            active
+                .await
+                .map_err(|error| format!("active-chain task failed: {error}"))??;
         }
     }
-    finalize_background_if_pending(&active_options, &validation_dir)
+    finalize_background_if_pending(&finalize_options, &validation_dir)
 }
 
 fn finalize_background_if_pending(
@@ -4197,11 +4235,10 @@ async fn sync_validating_node(
     let chainstate_options = ChainStoreOptions {
         quick_repair: validation_limits.quick_repair,
         retain_block_undo: !network_execution.is_experimental(),
-        cache_size_bytes: if network_execution.is_experimental() {
-            BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
-        } else {
-            ChainStoreOptions::default().cache_size_bytes
-        },
+        cache_size_bytes: chainstate_cache_bytes(
+            network_execution,
+            background_validation.is_some() || validation_scheduler.is_some(),
+        ),
         validation_delta_journal: network_execution.is_experimental(),
     };
     let chainstate_open_started = Instant::now();
@@ -10648,7 +10685,7 @@ mod tests {
         };
         assert_eq!(
             status.adaptive_limits(large).max_blocks_per_batch,
-            DEFAULT_VALIDATION_BATCH_SIZE
+            ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE
         );
         status.update_active(50, 50);
         assert_eq!(status.adaptive_limits(large), large);
@@ -10660,7 +10697,7 @@ mod tests {
     }
 
     #[test]
-    fn background_active_chain_preserves_only_the_selected_batch_cap() {
+    fn background_active_chain_preserves_batch_and_repair_policy_without_pause() {
         assert_eq!(
             active_assumeutxo_limits(ValidationLimits {
                 max_blocks_per_batch: 252,
@@ -10670,8 +10707,24 @@ mod tests {
             ValidationLimits {
                 max_blocks_per_batch: 252,
                 pause_between_batches: Duration::ZERO,
-                quick_repair: true,
+                quick_repair: false,
             }
+        );
+    }
+
+    #[test]
+    fn concurrent_background_pipelines_share_a_bounded_bulk_cache_budget() {
+        assert_eq!(
+            chainstate_cache_bytes(NetworkExecutionMode::Persistent, true),
+            BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES
+        );
+        assert_eq!(
+            chainstate_cache_bytes(NetworkExecutionMode::ExperimentalOnce, false),
+            BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
+        );
+        assert_eq!(
+            chainstate_cache_bytes(NetworkExecutionMode::Persistent, false),
+            ChainStoreOptions::default().cache_size_bytes
         );
     }
 
