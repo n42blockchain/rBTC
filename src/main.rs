@@ -10,12 +10,38 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CHECKPOINTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct InFlightCheckpoint<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> InFlightCheckpoint<'a> {
+    fn try_enter(requested: &AtomicBool, count: &'a AtomicUsize) -> Option<Self> {
+        if requested.load(Ordering::Acquire) {
+            return None;
+        }
+        count.fetch_add(1, Ordering::AcqRel);
+        if requested.load(Ordering::Acquire) {
+            count.fetch_sub(1, Ordering::AcqRel);
+            None
+        } else {
+            Some(Self { count })
+        }
+    }
+}
+
+impl Drop for InFlightCheckpoint<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 use bitcoin::{
     Block, BlockHash, Network, Transaction,
@@ -962,12 +988,16 @@ async fn main() {
             });
             let result = tokio::select! {
                 result = run(options) => result,
-                signal = signal_task => signal
-                    .map_err(|error| format!("shutdown signal task failed: {error}"))
-                    .and_then(std::convert::identity)
-                    .map(|()| {
+                signal = signal_task => {
+                    let signal = signal
+                        .map_err(|error| format!("shutdown signal task failed: {error}"))
+                        .and_then(std::convert::identity);
+                    if signal.is_ok() {
+                        wait_for_in_flight_checkpoints(&CHECKPOINTS_IN_FLIGHT).await;
                         eprintln!("rbtcd: shutdown signal received; closing durable stores");
-                    }),
+                    }
+                    signal
+                },
             };
             if let Err(error) = result {
                 eprintln!("rbtcd: {error}");
@@ -1010,6 +1040,12 @@ async fn checkpoint_shutdown(requested: &AtomicBool) {
         std::future::pending::<()>().await;
     } else {
         tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_in_flight_checkpoints(count: &AtomicUsize) {
+    while count.load(Ordering::Acquire) != 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -4759,6 +4795,12 @@ async fn sync_validating_node(
                 .map_or(validation_limits, |status| {
                     status.adaptive_limits(validation_limits)
                 });
+            let Some(checkpoint) =
+                InFlightCheckpoint::try_enter(&SHUTDOWN_REQUESTED, &CHECKPOINTS_IN_FLIGHT)
+            else {
+                std::future::pending::<()>().await;
+                unreachable!("a rejected checkpoint remains parked until runtime shutdown");
+            };
             // Ordinary IBD and fixed-target validation both consume an immutable
             // active-header snapshot here, so the already bounded next block
             // window can download while the current checkpoint executes.
@@ -4829,6 +4871,7 @@ async fn sync_validating_node(
                     tokio::time::sleep(effective_validation_limits.pause_between_batches).await;
                 }
             }
+            drop(checkpoint);
             // A completely prefetched batch may otherwise run from decode
             // through commit without yielding, starving the outer shutdown
             // selector across successive checkpoints.
@@ -7891,6 +7934,36 @@ mod tests {
         })
         .await
         .expect("independent signal watcher must stop a synchronous validation loop");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_checkpoint_and_rejects_the_next_one() {
+        let requested = AtomicBool::new(false);
+        let in_flight = AtomicUsize::new(0);
+        let checkpoint = InFlightCheckpoint::try_enter(&requested, &in_flight)
+            .expect("checkpoint starts before shutdown");
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
+
+        requested.store(true, Ordering::Release);
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                wait_for_in_flight_checkpoints(&in_flight)
+            )
+            .await
+            .is_err(),
+            "shutdown must retain the runtime while a checkpoint is active"
+        );
+
+        drop(checkpoint);
+        timeout(
+            Duration::from_millis(100),
+            wait_for_in_flight_checkpoints(&in_flight),
+        )
+        .await
+        .expect("shutdown barrier clears after the checkpoint drops");
+        assert!(InFlightCheckpoint::try_enter(&requested, &in_flight).is_none());
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
