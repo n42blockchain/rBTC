@@ -160,14 +160,6 @@ Primary references:
   implemented. Fixed-memory current-UTXO population/byte reporting and a
   fail-closed 99%-hit recommendation gate are implemented; the
   complete-mainnet data run and published operational measurements remain open.
-- [ ] **Complete Testnet4 public acceptance.** BIP94 difficulty/timewarp rules,
-  current trust anchors and seeds, and ordinary execution are implemented.
-  Genesis-to-tip header validation and exact block-1 execution are accepted.
-  A public genesis-to-height-145,735 block/chainstate sync completed on
-  2026-07-25; a cold restart opened chainstate in 52 ms, advanced to 145,737,
-  executed two blocks, and exited in 4.40 seconds. The reorg soak and fixed
-  chainstate acceptance hash remain open. Do not infer any value from legacy
-  testnet.
 - [ ] **Sustained public-network operations soak.** Run Bitcoin and Testnet4 for
   at least seven consecutive days across natural tip updates, peer churn,
   controlled restarts, freezer rotation, mempool persistence, and at least one

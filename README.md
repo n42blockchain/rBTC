@@ -26,7 +26,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. The remaining release blockers are a maintained Core 31/dependency baseline, full Testnet4 public-chain acceptance, a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 public-chain and external Core 31 AssumeUTXO acceptance are complete. The remaining release blockers are the end-to-end Mainnet fast-bootstrap/hot-cold data gates, a maintained Core 31 script/dependency baseline, a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 
