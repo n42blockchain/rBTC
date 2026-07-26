@@ -123,15 +123,17 @@ Primary references:
 
 ## P0 — remaining release blockers
 
-- [ ] **Move the maintained compatibility baseline from Core 26 to Core 31.**
-  DNS seeds, minimum-chainwork, and assume-valid anchors are refreshed. Verify
-  checkpoint coverage and classify every Core 27–31 consensus, policy, P2P,
-  storage, and security change; add differential fixtures for applicable
-  changes. Core removed
-  `libbitcoinconsensus` in 28, so rBTC must either adopt a maintained script
-  engine/kernel boundary or own and continuously patch the vendored engine. The
-  acceptance gate is a documented dependency/security decision plus identical
-  results across the existing corpus and a new Core 31 regtest matrix.
+- [x] **Move the maintained consensus/reference baseline from Core 26 to Core
+  31.** DNS seeds, minimum-chainwork, assume-valid, checkpoints, Testnet4, and
+  AssumeUTXO identities are refreshed. The Core 27–31 consensus, policy, P2P,
+  storage, RPC, wallet, and security changes are classified in
+  [the compatibility decision](CORE31_COMPATIBILITY.md). rBTC explicitly owns
+  and patches its narrow vendored script-engine boundary after Core removed
+  `libbitcoinconsensus`; it does not claim upstream maintenance. The immutable
+  Core 26 corpus remains historical evidence, while an official Core 31.0
+  daemon passed all seven live regtest differential matrices. Current relay
+  policy is correctly retained as a separate P1 gate rather than conflated
+  with consensus compatibility.
 - [ ] **Finish the original fast-bootstrap contract using Bitcoin's existing
   AssumeUTXO model.** Validate the complete header chain and select its
   maximum-work active branch; accept only a Core 31 chainparams height,
@@ -255,8 +257,8 @@ correctness or security work.
 
 ## Execution order
 
-1. Finish the Core 31/dependency audit, Core-compatible fast bootstrap, and
-   data-backed hot/cold decision.
+1. Finish the Core-compatible Mainnet fast-bootstrap acceptance and data-backed
+   hot/cold decision.
 2. Finish Testnet4 public acceptance, then run the sustained public-network soak
    while preparing the external review.
 3. Close review findings and produce the signed supported-platform release.

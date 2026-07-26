@@ -26,7 +26,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 public-chain and external Core 31 AssumeUTXO acceptance are complete. The remaining release blockers are the end-to-end Mainnet fast-bootstrap/hot-cold data gates, a maintained Core 31 script/dependency baseline, a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
+rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 public-chain and external Core 31 AssumeUTXO acceptance are complete, and the repository-owned script boundary now has a documented Core 31 compatibility decision and live differential matrix. The remaining release blockers are the end-to-end Mainnet fast-bootstrap/hot-cold data gates, a sustained public-network operations soak, external security review, and a signed supported-platform release. Inbound P2P service and broader operator compatibility remain post-release full-node work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Design choices
 
@@ -51,7 +51,7 @@ scripts/verify-reproducible-build.sh
 scripts/public-network-sync-smoke.sh
 RBTC_FUZZ_RUNS=10000 scripts/run-fuzz-regression.sh
 cargo +nightly miri test --lib merkle_proof::tests::verifies_left_and_right_transaction_positions
-RBTC_BITCOIND=/path/to/bitcoin-core-26/bin/bitcoind cargo test --test core_block_differential -- --ignored --nocapture
+RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind cargo test --release --test core_block_differential -- --ignored --nocapture
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
 ```
 
@@ -73,7 +73,7 @@ The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character
 hash names remain local and are ignored rather than accumulated in commits.
 
-The optional live differential gate requires the matching `bitcoin-cli` beside a Bitcoin Core 26.0 `bitcoind`. It submits the same mined regtest blocks to Core and through rBTC's production header-DAG/block-connection path, including atomic rejection checks for the persisted tip, undo record, and candidate UTXO.
+The optional live differential gate requires the matching `bitcoin-cli` beside a Bitcoin Core 31.0 `bitcoind` and rejects another daemon version. It submits the same mined regtest blocks to Core and through rBTC's production header-DAG/block-connection path, including atomic rejection checks for the persisted tip, undo record, and candidate UTXO. The dependency and Core 27–31 change classification is documented in [docs/CORE31_COMPATIBILITY.md](docs/CORE31_COMPATIBILITY.md).
 
 The weekly/manual public-network smoke gate authenticates and continuously
 executes default-Signet blocks 1 through 1,000 and mainnet blocks 1 through

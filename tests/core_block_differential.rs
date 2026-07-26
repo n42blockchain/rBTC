@@ -1,4 +1,4 @@
-//! Optional live block-level differential test against Bitcoin Core 26.
+//! Optional live block-level differential test against Bitcoin Core 31.
 
 use std::{
     path::{Path, PathBuf},
@@ -140,6 +140,21 @@ fn unused_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn core_31_bitcoind() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("RBTC_BITCOIND")
+            .expect("RBTC_BITCOIND must identify Bitcoin Core 31 bitcoind"),
+    )
+}
+
+fn assert_core_31(core: &CoreNode) {
+    let network_info = core.rpc(&["getnetworkinfo"]).unwrap();
+    assert!(
+        network_info.contains("\"version\": 310000"),
+        "RBTC_BITCOIND must be Bitcoin Core 31.0: {network_info}"
+    );
 }
 
 fn coinbase(height: u32, value: u64) -> Transaction {
@@ -357,18 +372,12 @@ fn rbtc_outcome_with_config(blocks: &[Block], deployments: &DeploymentConfig) ->
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
 #[allow(clippy::too_many_lines)]
-fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+fn core_31_and_rbtc_agree_on_end_to_end_block_results() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start(&bitcoind);
-    let network_info = core.rpc(&["getnetworkinfo"]).unwrap();
-    assert!(
-        network_info.contains("\"version\": 260000"),
-        "RBTC_BITCOIND must be Bitcoin Core 26.0: {network_info}"
-    );
+    assert_core_31(&core);
 
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
     let subsidy = block_subsidy_with_interval(1, 150);
@@ -421,7 +430,7 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
     invalid.push(("bad transaction merkle root", "bad-txnmrklroot", bad_merkle));
 
     let empty = mine_block(first.block_hash(), first.header.time + 6, Vec::new());
-    invalid.push(("empty block", "Block does not start with a coinbase", empty));
+    invalid.push(("empty block", "bad-blk-length", empty));
 
     let ordinary_input = TxIn {
         previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0),
@@ -444,11 +453,7 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
         first.header.time + 7,
         vec![ordinary.clone()],
     );
-    invalid.push((
-        "missing coinbase",
-        "Block does not start with a coinbase",
-        missing_coinbase,
-    ));
+    invalid.push(("missing coinbase", "bad-cb-missing", missing_coinbase));
 
     let mut short_coinbase = coinbase(2, subsidy);
     short_coinbase.input[0].script_sig = ScriptBuf::from_bytes(vec![0x52]);
@@ -556,17 +561,11 @@ fn core_26_and_rbtc_agree_on_end_to_end_block_results() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_bip34_override_boundary() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=bip34@2"]);
-    assert!(
-        core.rpc(&["getnetworkinfo"])
-            .unwrap()
-            .contains("\"version\": 260000")
-    );
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments.apply_test_activation_height("bip34@2").unwrap();
 
@@ -613,11 +612,9 @@ fn core_26_and_rbtc_agree_on_bip34_override_boundary() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(
         &bitcoind,
         &[
@@ -625,6 +622,7 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
             "-testactivationheight=cltv@3",
         ],
     );
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments
         .apply_test_activation_height("dersig@2")
@@ -696,12 +694,11 @@ fn core_26_and_rbtc_agree_on_bip66_and_bip65_header_boundaries() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_segwit_override_boundary() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_segwit_override_boundary() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=segwit@2"]);
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments
         .apply_test_activation_height("segwit@2")
@@ -745,12 +742,11 @@ fn core_26_and_rbtc_agree_on_segwit_override_boundary() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_csv_relative_lock_boundary() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=csv@102"]);
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments.apply_test_activation_height("csv@102").unwrap();
     let subsidy = block_subsidy_with_interval(1, 150);
@@ -811,12 +807,11 @@ fn core_26_and_rbtc_agree_on_csv_relative_lock_boundary() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=csv@102"]);
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments.apply_test_activation_height("csv@102").unwrap();
     let subsidy = block_subsidy_with_interval(1, 150);
@@ -914,12 +909,11 @@ fn core_26_and_rbtc_agree_on_bip113_and_time_based_bip68_boundaries() {
 }
 
 #[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 26 bitcoind and run explicitly"]
-fn core_26_and_rbtc_agree_on_bip147_nulldummy_boundary() {
-    let bitcoind = PathBuf::from(
-        std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND must identify Core 26 bitcoind"),
-    );
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn core_31_and_rbtc_agree_on_bip147_nulldummy_boundary() {
+    let bitcoind = core_31_bitcoind();
     let core = CoreNode::start_with_args(&bitcoind, &["-testactivationheight=segwit@102"]);
+    assert_core_31(&core);
     let mut deployments = DeploymentConfig::for_network(Network::Regtest);
     deployments
         .apply_test_activation_height("segwit@102")
