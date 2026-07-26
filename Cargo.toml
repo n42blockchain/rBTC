@@ -19,7 +19,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "rbtcd"
-path = "src/main.rs"
+path = "src/bin/rbtcd.rs"
 
 [dependencies]
 ahash = "0.8"

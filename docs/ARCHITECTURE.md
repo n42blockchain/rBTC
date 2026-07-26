@@ -19,6 +19,17 @@ embedded explorer index                 └── wallet sync source
         └──────────── REST / embedded browser ────┘
 ```
 
+The production runtime is a library module rather than a binary-owned
+singleton. `src/bin/rbtcd.rs` only adapts command-line arguments and process
+signals. A Tokio host launches ordinary persistent execution through
+`rbtc::node::NodeBuilder`, hands `NodeHandle::wait` to its task executor, and
+retains a cloneable `NodeController` for checkpoint-safe shutdown. This matches
+the critical-task assembly used by `n42-26` without moving consensus or storage
+truth into the host. The first embedding slice still serializes embedded
+instances around the existing process-global checkpoint barrier; P1.0 removes
+that barrier and adds typed status/events before multi-network in-process
+hosting is accepted.
+
 The header DAG keeps a height-indexed view of the selected best-work branch, so
 active-height lookups stay constant-time while an ordinary extension appends
 one entry. A stronger side branch rebuilds that index from its committed

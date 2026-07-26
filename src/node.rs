@@ -1,12 +1,11 @@
-//! Command line entry point for the rBTC node daemon.
+//! Embeddable node runtime and command-line adapter.
 
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
-    env, fs,
+    fs,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    process,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -14,6 +13,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CHECKPOINTS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
@@ -106,7 +106,7 @@ use rbtc::{
         parse_wallet_descriptor_config,
     },
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -159,6 +159,7 @@ const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
+static EMBEDDED_NODE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
@@ -190,6 +191,240 @@ struct Options {
     offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+}
+
+/// Builder for one outbound validating node owned by a host Tokio runtime.
+///
+/// The first embedding surface deliberately covers the ordinary persistent
+/// node. Snapshot activation, wallet/RPC mounting, and background AssumeUTXO
+/// orchestration remain explicit higher-level modules instead of hidden
+/// side-effects of this builder.
+#[derive(Clone, Debug)]
+pub struct NodeBuilder {
+    network: Network,
+    data_dir: PathBuf,
+    remotes: Vec<SocketAddr>,
+    once: bool,
+    mempool_full_rbf: bool,
+    ledger_retention: LedgerRetention,
+}
+
+impl NodeBuilder {
+    /// Creates a persistent node using network-scoped Core 31 defaults.
+    #[must_use]
+    pub fn new(network: Network, data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            network,
+            data_dir: data_dir.into(),
+            remotes: Vec::new(),
+            once: false,
+            mempool_full_rbf: false,
+            ledger_retention: LedgerRetention::default(),
+        }
+    }
+
+    /// Adds one preferred outbound peer before persisted peers and DNS seeds.
+    #[must_use]
+    pub fn connect(mut self, remote: SocketAddr) -> Self {
+        if !self.remotes.contains(&remote) {
+            self.remotes.push(remote);
+        }
+        self
+    }
+
+    /// Returns after reaching the current peer-advertised maximum-work tip.
+    #[must_use]
+    pub const fn once(mut self, enabled: bool) -> Self {
+        self.once = enabled;
+        self
+    }
+
+    /// Enables opt-in full-RBF transaction admission policy.
+    #[must_use]
+    pub const fn mempool_full_rbf(mut self, enabled: bool) -> Self {
+        self.mempool_full_rbf = enabled;
+        self
+    }
+
+    /// Sets bounded circular block retention.
+    ///
+    /// Block retention is currently constrained to 288–1,008 blocks and the
+    /// compressed-byte target must be at least 550 MiB.
+    #[must_use]
+    pub const fn ledger_retention(mut self, max_blocks: u32, max_bytes: u64) -> Self {
+        self.ledger_retention.max_blocks = max_blocks;
+        self.ledger_retention.max_bytes = max_bytes;
+        self
+    }
+
+    /// Starts the node as a host-owned Tokio task.
+    pub fn launch(self) -> Result<NodeHandle, NodeError> {
+        let options = self.into_options()?;
+        tokio::runtime::Handle::try_current().map_err(|_| NodeError::MissingRuntime)?;
+        EMBEDDED_NODE_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| NodeError::AlreadyRunning)?;
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            struct RunningGuard;
+            impl Drop for RunningGuard {
+                fn drop(&mut self) {
+                    EMBEDDED_NODE_RUNNING.store(false, Ordering::Release);
+                    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+                }
+            }
+            let _guard = RunningGuard;
+            let run = run(options);
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result.map_err(NodeError::Runtime),
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && !*shutdown_rx.borrow() {
+                        return Err(NodeError::ControlChannelClosed);
+                    }
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                    wait_for_in_flight_checkpoints(&CHECKPOINTS_IN_FLIGHT).await;
+                    Ok(())
+                }
+            }
+        });
+        Ok(NodeHandle {
+            shutdown,
+            task: Some(task),
+        })
+    }
+
+    fn into_options(self) -> Result<Options, NodeError> {
+        if self.data_dir.as_os_str().is_empty() {
+            return Err(NodeError::InvalidConfig(
+                "data directory must not be empty".to_owned(),
+            ));
+        }
+        if self.remotes.len() > MAX_CONFIGURED_PEERS {
+            return Err(NodeError::InvalidConfig(format!(
+                "at most {MAX_CONFIGURED_PEERS} preferred peers are supported"
+            )));
+        }
+        if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS)
+            .contains(&self.ledger_retention.max_blocks)
+        {
+            return Err(NodeError::InvalidConfig(format!(
+                "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+            )));
+        }
+        if self.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
+            return Err(NodeError::InvalidConfig(format!(
+                "prune byte target must be at least {MIN_PRUNE_MAX_BYTES}"
+            )));
+        }
+        Ok(Options {
+            remotes: self.remotes,
+            dns_seeds: None,
+            network: self.network,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(self.data_dir),
+            once: self.once,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(self.network),
+            ibd_policy: IbdPolicy::for_network(self.network),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: None,
+            mempool_full_rbf: self.mempool_full_rbf,
+            cleanup_validation_dir: false,
+            offline_action: None,
+            validation_limits: ValidationLimits::default(),
+            ledger_retention: self.ledger_retention,
+        })
+    }
+}
+
+/// Host-owned handle for an embedded node task.
+pub struct NodeHandle {
+    shutdown: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<Result<(), NodeError>>>,
+}
+
+impl NodeHandle {
+    /// Returns a cloneable shutdown controller that can be retained while the
+    /// handle's `wait` future is owned by a host task executor.
+    #[must_use]
+    pub fn controller(&self) -> NodeController {
+        NodeController {
+            shutdown: self.shutdown.clone(),
+        }
+    }
+
+    /// Requests graceful shutdown without consuming the handle.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Requests shutdown and waits for durable work to close.
+    pub async fn shutdown(mut self) -> Result<(), NodeError> {
+        self.request_shutdown();
+        self.join().await
+    }
+
+    /// Waits until the node exits on its own or fails.
+    pub async fn wait(mut self) -> Result<(), NodeError> {
+        self.join().await
+    }
+
+    async fn join(&mut self) -> Result<(), NodeError> {
+        let task = self.task.take().ok_or(NodeError::ControlChannelClosed)?;
+        task.await
+            .map_err(|error| NodeError::Task(error.to_string()))?
+    }
+}
+
+/// Cloneable control plane for a node whose wait future is host-owned.
+#[derive(Clone)]
+pub struct NodeController {
+    shutdown: watch::Sender<bool>,
+}
+
+impl NodeController {
+    /// Requests graceful shutdown at the next safe checkpoint boundary.
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+/// Embedded node configuration, runtime, or task failure.
+#[derive(Debug, Error)]
+pub enum NodeError {
+    /// The builder configuration violates a bounded runtime contract.
+    #[error("invalid node configuration: {0}")]
+    InvalidConfig(String),
+    /// Only one embedded node may own the current process-global checkpoint barrier.
+    #[error("an embedded rBTC node is already running in this process")]
+    AlreadyRunning,
+    /// Launch must occur from the host application's Tokio runtime.
+    #[error("embedded node launch requires an active Tokio runtime")]
+    MissingRuntime,
+    /// The node runtime returned a validation, storage, or network failure.
+    #[error("node runtime: {0}")]
+    Runtime(String),
+    /// The host task could not be joined.
+    #[error("node task: {0}")]
+    Task(String),
+    /// The host dropped or reused the control channel unexpectedly.
+    #[error("node control channel is closed")]
+    ControlChannelClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -977,16 +1212,50 @@ fn collect_node_status(
     })
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
-    match parse_options(env::args().skip(1)) {
+/// Failure returned by the thin command-line adapter.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct CliError {
+    message: String,
+    exit_code: i32,
+}
+
+impl CliError {
+    /// Process exit code preserving the daemon's parse/runtime distinction.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    fn parse(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 2,
+        }
+    }
+
+    fn runtime(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 1,
+        }
+    }
+}
+
+/// Runs the command-line adapter inside the caller's Tokio runtime.
+///
+/// The binary is intentionally a thin wrapper around this function. Embedders
+/// should use [`NodeBuilder`] so shutdown and task ownership remain under the
+/// host application's control.
+pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliError> {
+    match parse_options(arguments) {
         Ok(Some(options)) => {
             // Keep signal collection on an independent runtime task. The
             // validating future performs bounded synchronous execution work;
             // if signal polling shares that same task, the OS notification can
             // otherwise remain unread until after another checkpoint starts.
             SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-            let signal_task = tokio::spawn(async {
+            let mut signal_task = tokio::spawn(async {
                 let result = shutdown_signal().await;
                 if result.is_ok() {
                     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
@@ -994,8 +1263,11 @@ async fn main() {
                 result
             });
             let result = tokio::select! {
-                result = run(options) => result,
-                signal = signal_task => {
+                result = run(options) => {
+                    signal_task.abort();
+                    result
+                },
+                signal = &mut signal_task => {
                     let signal = signal
                         .map_err(|error| format!("shutdown signal task failed: {error}"))
                         .and_then(std::convert::identity);
@@ -1006,16 +1278,15 @@ async fn main() {
                     signal
                 },
             };
-            if let Err(error) = result {
-                eprintln!("rbtcd: {error}");
-                process::exit(1);
-            }
+            result.map_err(CliError::runtime)
         }
-        Ok(None) => print_usage(),
-        Err(error) => {
-            eprintln!("rbtcd: {error}\n");
+        Ok(None) => {
             print_usage();
-            process::exit(2);
+            Ok(())
+        }
+        Err(error) => {
+            print_usage();
+            Err(CliError::parse(error))
         }
     }
 }
@@ -10194,6 +10465,52 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn embedded_builder_owns_bounded_persistent_node_configuration() {
+        let first: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:18444".parse().unwrap();
+        let options = NodeBuilder::new(Network::Regtest, "/tmp/rbtc-embedded")
+            .connect(first)
+            .connect(first)
+            .connect(second)
+            .once(true)
+            .mempool_full_rbf(true)
+            .ledger_retention(576, DEFAULT_MAX_BYTES)
+            .into_options()
+            .unwrap();
+        assert_eq!(options.network, Network::Regtest);
+        assert_eq!(options.data_dir, Some(PathBuf::from("/tmp/rbtc-embedded")));
+        assert_eq!(options.remotes, vec![first, second]);
+        assert!(options.once);
+        assert!(options.mempool_full_rbf);
+        assert_eq!(options.ledger_retention.max_blocks, 576);
+        assert_eq!(options.ledger_retention.max_bytes, DEFAULT_MAX_BYTES);
+
+        assert!(matches!(
+            NodeBuilder::new(Network::Regtest, "")
+                .into_options()
+                .err()
+                .unwrap(),
+            NodeError::InvalidConfig(_)
+        ));
+        assert!(matches!(
+            NodeBuilder::new(Network::Regtest, "/tmp/rbtc-embedded")
+                .ledger_retention(287, DEFAULT_MAX_BYTES)
+                .into_options()
+                .err()
+                .unwrap(),
+            NodeError::InvalidConfig(_)
+        ));
+        assert!(matches!(
+            NodeBuilder::new(Network::Regtest, "/tmp/rbtc-embedded")
+                .ledger_retention(576, MIN_PRUNE_MAX_BYTES - 1)
+                .into_options()
+                .err()
+                .unwrap(),
+            NodeError::InvalidConfig(_)
+        ));
     }
 
     #[test]

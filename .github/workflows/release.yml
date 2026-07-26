@@ -50,3 +50,65 @@ jobs:
           name: rbtc-linux-release-evidence
           path: dist/
           if-no-files-found: error
+
+  native-platform-matrix:
+    name: native ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable: rbtcd
+            artifact: rbtcd-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: rbtcd
+            artifact: rbtcd-aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: rbtcd
+            artifact: rbtcd-x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            executable: rbtcd
+            artifact: rbtcd-aarch64-apple-darwin
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable: rbtcd.exe
+            artifact: rbtcd-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+      - name: Test native library and embedding boundary
+        run: cargo test --locked --lib --test embedded_node_api
+      - name: Build locked release artifact
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Stage Unix artifact and checksum
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${{ matrix.artifact }}"
+          shasum -a 256 "dist/${{ matrix.artifact }}" > "dist/${{ matrix.artifact }}.sha256"
+      - name: Stage Windows artifact and checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${{ matrix.artifact }}"
+          $digest = (Get-FileHash "dist/${{ matrix.artifact }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  ${{ matrix.artifact }}" | Set-Content -NoNewline "dist/${{ matrix.artifact }}.sha256"
+      - name: Attest native artifact provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/${{ matrix.artifact }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rbtc-${{ matrix.target }}-release-evidence
+          path: dist/
+          if-no-files-found: error

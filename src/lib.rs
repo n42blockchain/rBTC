@@ -4,6 +4,8 @@
 //! boundaries explicit. It is not yet a complete mainnet node; see
 //! `docs/ROADMAP.md` for the completion gates.
 
+extern crate self as rbtc;
+
 pub mod api;
 pub mod archive;
 pub mod block_execution;
@@ -23,6 +25,7 @@ pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod merkle_proof;
+pub mod node;
 pub mod p2p;
 pub mod peer_store;
 pub mod rebroadcast_store;

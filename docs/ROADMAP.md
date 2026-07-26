@@ -193,10 +193,14 @@ Primary references:
   authentication, wallet/PSBT handling, and release supply chain; resolve every
   critical/high finding and document accepted lower-risk findings.
 - [ ] **Signed supported-platform release.** Exercise the release workflow with
-  operator-controlled keys on the declared Linux/macOS platform matrix, verify
-  byte-identical artifacts and provenance from a clean checkout, publish the
-  SBOM, upgrade/rollback notes, data-format compatibility, and disaster-recovery
-  procedure.
+  operator-controlled keys on the declared Linux/macOS/Windows platform matrix,
+  verify byte-identical artifacts and provenance from a clean checkout, publish
+  the SBOM, upgrade/rollback notes, data-format compatibility, and
+  disaster-recovery procedure. The local `n42appv2` Android/Apple signing inventory, required
+  native identities, common manifest signature, and expanded
+  Linux/macOS/Windows matrix are recorded in
+  [RELEASE_SIGNING.md](RELEASE_SIGNING.md); a Developer ID Application identity
+  and Windows Authenticode identity still need provisioning.
 
 These are the only blockers to the first production **outbound-only,
 watch-only/external-signer validating-node** claim. Inbound service, an internal
@@ -204,6 +208,12 @@ hot wallet, mining, exact Core RPC parity, BIP324, and target-HDD benchmark
 numbers are intentionally not hidden P0 requirements.
 
 ## P1 — normal full-node and operator completeness
+
+The dependency order, module boundaries, `n42-26` embedding contract, and
+phase-specific acceptance gates are expanded in
+[P1_FULL_NODE_PLAN.md](P1_FULL_NODE_PLAN.md). P1 is library-first: `rbtcd`
+remains a thin adapter and every new service must be independently bounded,
+optional where appropriate, and host-runtime compatible.
 
 - [ ] **Inbound P2P listener and network contribution.** Add explicit bind/listen
   configuration, inbound handshakes, header/block/compact-block and bounded
