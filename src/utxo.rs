@@ -16,6 +16,11 @@ use thiserror::Error;
 pub const DEFAULT_HOT_WINDOW_SECS: u64 = 60 * 24 * 60 * 60;
 const HOT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxo_hot");
 const COLD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxo_cold");
+const RETIER_PROGRESS_TABLE: TableDefinition<u8, &[u8]> =
+    TableDefinition::new("utxo_retier_progress");
+const RETIER_PROGRESS_KEY: u8 = 0;
+const RETIER_PROGRESS_MAGIC: [u8; 4] = *b"URT1";
+const RETIER_PROGRESS_BYTES: usize = 4 + 4 + 4 + 1 + 36 + 8 + 8 + 8;
 
 /// Errors emitted by UTXO storage and encoding.
 #[derive(Debug, Error)]
@@ -179,6 +184,85 @@ pub struct TierStats {
     pub hot: u64,
     /// Number of inactive UTXOs.
     pub cold: u64,
+}
+
+/// Durable progress from one bounded height-based hot/cold re-tiering batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeightRetierProgress {
+    /// Entries examined for this exact tip/window target.
+    pub scanned: u64,
+    /// Cold entries promoted into the selected hot window.
+    pub moved_to_hot: u64,
+    /// Hot entries demoted beyond the selected hot window.
+    pub moved_to_cold: u64,
+    /// Whether every current UTXO was classified for this target.
+    pub complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeightRetierState {
+    tip_height: u32,
+    hot_window_blocks: u32,
+    after: Option<OutPointKey>,
+    scanned: u64,
+    moved_to_hot: u64,
+    moved_to_cold: u64,
+}
+
+impl HeightRetierState {
+    fn new(tip_height: u32, hot_window_blocks: u32) -> Self {
+        Self {
+            tip_height,
+            hot_window_blocks,
+            after: None,
+            scanned: 0,
+            moved_to_hot: 0,
+            moved_to_cold: 0,
+        }
+    }
+
+    fn encode(self) -> [u8; RETIER_PROGRESS_BYTES] {
+        let mut encoded = [0_u8; RETIER_PROGRESS_BYTES];
+        encoded[..4].copy_from_slice(&RETIER_PROGRESS_MAGIC);
+        encoded[4..8].copy_from_slice(&self.tip_height.to_le_bytes());
+        encoded[8..12].copy_from_slice(&self.hot_window_blocks.to_le_bytes());
+        if let Some(after) = self.after {
+            encoded[12] = 1;
+            encoded[13..49].copy_from_slice(after.as_bytes());
+        }
+        encoded[49..57].copy_from_slice(&self.scanned.to_le_bytes());
+        encoded[57..65].copy_from_slice(&self.moved_to_hot.to_le_bytes());
+        encoded[65..73].copy_from_slice(&self.moved_to_cold.to_le_bytes());
+        encoded
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, UtxoError> {
+        if encoded.len() != RETIER_PROGRESS_BYTES
+            || encoded[..4] != RETIER_PROGRESS_MAGIC
+            || !matches!(encoded[12], 0 | 1)
+        {
+            return Err(UtxoError::Malformed("height re-tier progress"));
+        }
+        Ok(Self {
+            tip_height: u32::from_le_bytes(encoded[4..8].try_into().expect("fixed length")),
+            hot_window_blocks: u32::from_le_bytes(encoded[8..12].try_into().expect("fixed length")),
+            after: (encoded[12] == 1)
+                .then(|| OutPointKey::from_bytes(&encoded[13..49]))
+                .transpose()?,
+            scanned: u64::from_le_bytes(encoded[49..57].try_into().expect("fixed length")),
+            moved_to_hot: u64::from_le_bytes(encoded[57..65].try_into().expect("fixed length")),
+            moved_to_cold: u64::from_le_bytes(encoded[65..73].try_into().expect("fixed length")),
+        })
+    }
+
+    const fn progress(self, complete: bool) -> HeightRetierProgress {
+        HeightRetierProgress {
+            scanned: self.scanned,
+            moved_to_hot: self.moved_to_hot,
+            moved_to_cold: self.moved_to_cold,
+            complete,
+        }
+    }
 }
 
 /// The information required to reverse one successful atomic UTXO mutation.
@@ -387,6 +471,7 @@ impl RedbUtxoStore {
         {
             let _hot = transaction.open_table(HOT_TABLE)?;
             let _cold = transaction.open_table(COLD_TABLE)?;
+            let _retier = transaction.open_table(RETIER_PROGRESS_TABLE)?;
         }
         transaction.commit()?;
         Ok(Self {
@@ -561,6 +646,168 @@ impl RedbUtxoStore {
             page.push((OutPointKey::from_bytes(&key)?, Utxo::decode(&value)?));
         }
         Ok(page)
+    }
+
+    /// Reclassifies one sorted, crash-resumable page using output age in blocks.
+    ///
+    /// A different tip or window safely starts a fresh full scan; already moved
+    /// entries remain valid input and may be promoted or demoted by the new
+    /// target. The physical tier is local metadata and never changes snapshot
+    /// or consensus identity.
+    #[allow(clippy::too_many_lines)]
+    pub fn retier_by_height_batch(
+        &self,
+        tip_height: u32,
+        hot_window_blocks: u32,
+        scan_limit: usize,
+        quick_repair: bool,
+    ) -> Result<HeightRetierProgress, UtxoError> {
+        if scan_limit == 0 {
+            return Err(UtxoError::Malformed("height re-tier scan limit"));
+        }
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        transaction.set_quick_repair(quick_repair);
+        let mut state = {
+            let progress = transaction.open_table(RETIER_PROGRESS_TABLE)?;
+            progress
+                .get(RETIER_PROGRESS_KEY)?
+                .map(|encoded| HeightRetierState::decode(encoded.value()))
+                .transpose()?
+                .filter(|state| {
+                    state.tip_height == tip_height && state.hot_window_blocks == hot_window_blocks
+                })
+                .unwrap_or_else(|| HeightRetierState::new(tip_height, hot_window_blocks))
+        };
+
+        let page = {
+            let hot = transaction.open_table(HOT_TABLE)?;
+            let cold = transaction.open_table(COLD_TABLE)?;
+            let after_bytes = state.after.map(|outpoint| *outpoint.as_bytes());
+            let mut hot_rows = if let Some(bytes) = &after_bytes {
+                hot.range(bytes.as_slice()..)?
+            } else {
+                hot.iter()?
+            };
+            let mut cold_rows = if let Some(bytes) = &after_bytes {
+                cold.range(bytes.as_slice()..)?
+            } else {
+                cold.iter()?
+            };
+            let next_row = |rows: &mut redb::Range<'_, &[u8], &[u8]>, is_hot| {
+                loop {
+                    let row = rows
+                        .next()
+                        .transpose()?
+                        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec(), is_hot));
+                    if row.as_ref().is_none_or(|(key, _, _)| {
+                        state
+                            .after
+                            .is_none_or(|after| key.as_slice() > after.as_bytes().as_slice())
+                    }) {
+                        return Ok::<_, UtxoError>(row);
+                    }
+                }
+            };
+            let mut hot_next = next_row(&mut hot_rows, true)?;
+            let mut cold_next = next_row(&mut cold_rows, false)?;
+            let mut page = Vec::with_capacity(scan_limit);
+            while page.len() < scan_limit && (hot_next.is_some() || cold_next.is_some()) {
+                let take_hot = match (&hot_next, &cold_next) {
+                    (Some((hot_key, _, _)), Some((cold_key, _, _))) => {
+                        match hot_key.cmp(cold_key) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Greater => false,
+                            std::cmp::Ordering::Equal => {
+                                return Err(UtxoError::Malformed("outpoint in both tiers"));
+                            }
+                        }
+                    }
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                let row = if take_hot {
+                    let row = hot_next.take().expect("selected populated hot iterator");
+                    hot_next = next_row(&mut hot_rows, true)?;
+                    row
+                } else {
+                    let row = cold_next.take().expect("selected populated cold iterator");
+                    cold_next = next_row(&mut cold_rows, false)?;
+                    row
+                };
+                page.push(row);
+            }
+            page
+        };
+
+        if page.is_empty() {
+            {
+                let mut progress = transaction.open_table(RETIER_PROGRESS_TABLE)?;
+                progress.remove(RETIER_PROGRESS_KEY)?;
+            }
+            transaction.commit()?;
+            return Ok(state.progress(true));
+        }
+
+        {
+            let mut hot = transaction.open_table(HOT_TABLE)?;
+            let mut cold = transaction.open_table(COLD_TABLE)?;
+            for (key, encoded, is_hot) in &page {
+                let utxo = Utxo::decode(encoded)?;
+                let age = tip_height
+                    .checked_sub(utxo.height)
+                    .ok_or(UtxoError::Malformed(
+                        "UTXO creation height exceeds re-tier tip",
+                    ))?;
+                let should_be_hot = age <= hot_window_blocks;
+                match (*is_hot, should_be_hot) {
+                    (true, false) => {
+                        if cold.get(key.as_slice())?.is_some() {
+                            return Err(UtxoError::Malformed("outpoint in both tiers"));
+                        }
+                        hot.remove(key.as_slice())?;
+                        cold.insert(key.as_slice(), encoded.as_slice())?;
+                        state.moved_to_cold = state
+                            .moved_to_cold
+                            .checked_add(1)
+                            .ok_or(UtxoError::Malformed("height re-tier cold count overflow"))?;
+                    }
+                    (false, true) => {
+                        if hot.get(key.as_slice())?.is_some() {
+                            return Err(UtxoError::Malformed("outpoint in both tiers"));
+                        }
+                        cold.remove(key.as_slice())?;
+                        hot.insert(key.as_slice(), encoded.as_slice())?;
+                        state.moved_to_hot = state
+                            .moved_to_hot
+                            .checked_add(1)
+                            .ok_or(UtxoError::Malformed("height re-tier hot count overflow"))?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        state.scanned = state
+            .scanned
+            .checked_add(u64::try_from(page.len()).expect("usize fits u64"))
+            .ok_or(UtxoError::Malformed("height re-tier scan count overflow"))?;
+        state.after = page
+            .last()
+            .map(|(key, _, _)| OutPointKey::from_bytes(key))
+            .transpose()?;
+        let complete = page.len() < scan_limit;
+        {
+            let mut progress = transaction.open_table(RETIER_PROGRESS_TABLE)?;
+            if complete {
+                progress.remove(RETIER_PROGRESS_KEY)?;
+            } else {
+                let encoded = state.encode();
+                progress.insert(RETIER_PROGRESS_KEY, encoded.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(state.progress(complete))
     }
 }
 
@@ -1080,6 +1327,53 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn height_retiering_is_bounded_bidirectional_and_restart_resumable() {
+        let (dir, store) = store();
+        let mut old = coin(100);
+        old.height = 100;
+        let mut middle = coin(100);
+        middle.height = 150;
+        let mut recent = coin(100);
+        recent.height = 180;
+        store
+            .apply(&[], &[(key(1), old), (key(2), middle), (key(3), recent)])
+            .unwrap();
+
+        assert_eq!(
+            store.retier_by_height_batch(200, 30, 2, true).unwrap(),
+            HeightRetierProgress {
+                scanned: 2,
+                moved_to_hot: 0,
+                moved_to_cold: 2,
+                complete: false,
+            }
+        );
+        drop(store);
+        let store = RedbUtxoStore::open(dir.path().join("chainstate.redb")).unwrap();
+        assert_eq!(
+            store.retier_by_height_batch(200, 30, 2, true).unwrap(),
+            HeightRetierProgress {
+                scanned: 3,
+                moved_to_hot: 0,
+                moved_to_cold: 2,
+                complete: true,
+            }
+        );
+        assert_eq!(store.tier_stats().unwrap(), TierStats { hot: 1, cold: 2 });
+
+        assert!(
+            !store
+                .retier_by_height_batch(200, 200, 2, true)
+                .unwrap()
+                .complete
+        );
+        let completed = store.retier_by_height_batch(200, 200, 2, true).unwrap();
+        assert_eq!(completed.moved_to_hot, 2);
+        assert!(completed.complete);
+        assert_eq!(store.tier_stats().unwrap(), TierStats { hot: 3, cold: 0 });
     }
 
     #[test]

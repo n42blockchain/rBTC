@@ -135,6 +135,7 @@ const UTXO_ACTIVITY_WINDOWS: [u32; 11] = [
 const MIN_ACTIVITY_RECOMMENDATION_SAMPLES: u64 = 1_000_000;
 const PERCENT_DECIMAL_SCALE: u64 = 100_000;
 const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
+const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
 
 const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
     if maximum_batch_size < MAX_VALIDATION_PREFETCH_BATCH_SIZE {
@@ -191,6 +192,7 @@ struct Options {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OfflineAction {
     UtxoActivityReport,
+    RetierUtxos { hot_window_blocks: u32 },
     DownloadCoreSnapshot(SnapshotDownloadConfig),
 }
 
@@ -1289,8 +1291,12 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             options.network_execution.is_experimental(),
         )?;
     }
-    if let Some(OfflineAction::UtxoActivityReport) = options.offline_action {
-        return report_utxo_activity(&options);
+    match &options.offline_action {
+        Some(OfflineAction::UtxoActivityReport) => return report_utxo_activity(&options),
+        Some(OfflineAction::RetierUtxos { hot_window_blocks }) => {
+            return retier_utxos(&options, *hot_window_blocks);
+        }
+        Some(OfflineAction::DownloadCoreSnapshot(_)) | None => {}
     }
     if let Some(validation_dir) = &options.complete_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
@@ -1500,6 +1506,69 @@ fn report_utxo_activity(options: &Options) -> Result<(), String> {
             "recommendation=unavailable reason=no_candidate_reaches_99.0_percent_historical_spend_hits"
         );
     }
+    Ok(())
+}
+
+fn retier_utxos(options: &Options, hot_window_blocks: u32) -> Result<(), String> {
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("UTXO re-tier parser requires data directory");
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    if chainstate
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(
+            "height-based UTXO re-tiering requires completed AssumeUTXO finalization".to_owned(),
+        );
+    }
+    let tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let mut next_report = 10_000_000_u64;
+    let progress = loop {
+        let progress = chainstate
+            .retier_utxos_by_height_batch(
+                tip.height,
+                hot_window_blocks,
+                UTXO_RETIER_SCAN_BATCH_SIZE,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        if progress.complete {
+            break progress;
+        }
+        if progress.scanned >= next_report {
+            println!(
+                "UTXO re-tier progress scanned={} moved_to_hot={} moved_to_cold={} elapsed_seconds={}",
+                progress.scanned,
+                progress.moved_to_hot,
+                progress.moved_to_cold,
+                started.elapsed().as_secs()
+            );
+            next_report = progress.scanned.saturating_add(10_000_000);
+        }
+    };
+    let tiers = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    println!(
+        "UTXO re-tier complete network={} tip={}:{} hot_window_blocks={} scanned={} moved_to_hot={} moved_to_cold={} hot={} cold={} elapsed_seconds={}",
+        options.network,
+        tip.height,
+        tip.hash,
+        hot_window_blocks,
+        progress.scanned,
+        progress.moved_to_hot,
+        progress.moved_to_cold,
+        tiers.hot,
+        tiers.cold,
+        started.elapsed().as_secs()
+    );
     Ok(())
 }
 
@@ -6816,6 +6885,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut mempool_full_rbf = false;
     let mut cleanup_validation_dir = false;
     let mut utxo_activity_report = false;
+    let mut utxo_retier_window_blocks = None;
     let mut snapshot_download_source = None;
     let mut snapshot_download_output = None;
     let mut snapshot_download_bytes = None;
@@ -7022,6 +7092,19 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--utxo-activity-report" => utxo_activity_report = true,
+            "--retier-utxos-window-blocks" => {
+                if utxo_retier_window_blocks.is_some() {
+                    return Err(
+                        "--retier-utxos-window-blocks cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--retier-utxos-window-blocks")?;
+                utxo_retier_window_blocks = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid UTXO hot window in blocks: {value}"))?,
+                );
+            }
             "--download-core-assumeutxo" => {
                 if snapshot_download_source.is_some() {
                     return Err(
@@ -7433,6 +7516,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     };
     if snapshot_download.is_some()
         && (utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
             || data_dir.is_some()
             || snapshot_activation
             || finalize_assumeutxo.is_some()
@@ -7463,7 +7547,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         if data_dir.is_none() {
             return Err("--utxo-activity-report requires --data-dir".to_owned());
         }
-        if snapshot_activation
+        if utxo_retier_window_blocks.is_some()
+            || snapshot_activation
             || finalize_assumeutxo.is_some()
             || validation_target.is_some()
             || complete_assumeutxo.is_some()
@@ -7485,6 +7570,36 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         {
             return Err(
                 "UTXO activity reporting is offline and conflicts with peer, synchronization, snapshot, validation, serving, wallet, and policy modes"
+                    .to_owned(),
+            );
+        }
+    }
+    if utxo_retier_window_blocks.is_some() {
+        if data_dir.is_none() {
+            return Err("--retier-utxos-window-blocks requires --data-dir".to_owned());
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target
+        {
+            return Err(
+                "UTXO re-tiering is offline and conflicts with peer, synchronization, snapshot, validation, serving, wallet, and policy modes"
                     .to_owned(),
             );
         }
@@ -7621,11 +7736,18 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         background_assumeutxo,
         mempool_full_rbf,
         cleanup_validation_dir,
-        offline_action: match (utxo_activity_report, snapshot_download) {
-            (true, None) => Some(OfflineAction::UtxoActivityReport),
-            (false, Some(config)) => Some(OfflineAction::DownloadCoreSnapshot(config)),
-            (false, None) => None,
-            (true, Some(_)) => unreachable!("offline action conflict was checked above"),
+        offline_action: match (
+            utxo_activity_report,
+            utxo_retier_window_blocks,
+            snapshot_download,
+        ) {
+            (true, None, None) => Some(OfflineAction::UtxoActivityReport),
+            (false, Some(hot_window_blocks), None) => {
+                Some(OfflineAction::RetierUtxos { hot_window_blocks })
+            }
+            (false, None, Some(config)) => Some(OfflineAction::DownloadCoreSnapshot(config)),
+            (false, None, None) => None,
+            _ => unreachable!("offline action conflict was checked above"),
         },
         validation_limits,
     }))
@@ -7705,6 +7827,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet --core-assumeutxo-snapshot CORE_DUMPTXOUTSET_FILE\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "PEER OPTIONS:\n",
@@ -10347,6 +10470,66 @@ mod tests {
         assert_eq!(spent_age_quantile(&[], 0, 990), None);
         assert_eq!(format_tier_probes_per_spend(99, 100), "1.01000");
         assert_eq!(format_tier_probes_per_spend(0, 0), "unavailable");
+    }
+
+    #[test]
+    fn parses_only_offline_height_based_utxo_retiering() {
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-retier",
+                "--retier-utxos-window-blocks",
+                "52560",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.offline_action,
+            Some(OfflineAction::RetierUtxos {
+                hot_window_blocks: 52_560
+            })
+        );
+        for arguments in [
+            vec![
+                "--network",
+                "bitcoin",
+                "--retier-utxos-window-blocks",
+                "52560",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-retier",
+                "--retier-utxos-window-blocks",
+                "invalid",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-retier",
+                "--retier-utxos-window-blocks",
+                "52560",
+                "--once",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-retier",
+                "--retier-utxos-window-blocks",
+                "52560",
+                "--utxo-activity-report",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
     }
 
     #[test]

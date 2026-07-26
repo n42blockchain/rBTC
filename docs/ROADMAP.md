@@ -160,7 +160,10 @@ Primary references:
   identity or consensus. Exact network-scoped block-age rows, sorted batch
   updates, honest coverage metadata, and same-transaction reorg reversal are
   implemented. Fixed-memory current-UTXO population/byte reporting and a
-  fail-closed 99%-hit recommendation gate are implemented; the
+  fail-closed 99%-hit recommendation gate are implemented. The report also
+  emits spend-age quantiles and expected hot-first tier probes, and the chosen
+  window can be applied through crash-resumable, sorted 65,536-record atomic
+  re-tier batches; the
   complete-mainnet data run and published operational measurements remain open.
 - [ ] **Sustained public-network operations soak.** Run Bitcoin and Testnet4 for
   at least seven consecutive days across natural tip updates, peer churn,

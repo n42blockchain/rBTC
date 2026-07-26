@@ -27,8 +27,8 @@ use crate::{
         tables_empty_transaction as undo_tables_empty_transaction,
     },
     utxo::{
-        OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo,
-        apply_validated_changes_transaction, apply_with_undo_transaction,
+        HeightRetierProgress, OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore,
+        UtxoUndo, apply_validated_changes_transaction, apply_with_undo_transaction,
         insert_snapshot_entries_transaction, tables_empty_transaction, update_utxo_set_digest,
     },
 };
@@ -1520,6 +1520,23 @@ impl RedbChainStore {
                 .collect());
         }
         self.utxos.snapshot_page(after, limit)
+    }
+
+    /// Reclassifies one bounded, durable UTXO page by block-age.
+    pub fn retier_utxos_by_height_batch(
+        &self,
+        tip_height: u32,
+        hot_window_blocks: u32,
+        scan_limit: usize,
+        quick_repair: bool,
+    ) -> Result<HeightRetierProgress, UtxoError> {
+        if self.validation_journal.is_some() {
+            return Err(UtxoError::Malformed(
+                "height re-tier requires materialized chainstate",
+            ));
+        }
+        self.utxos
+            .retier_by_height_batch(tip_height, hot_window_blocks, scan_limit, quick_repair)
     }
 
     fn snapshot_content_identity(&self) -> Result<(u64, u64, [u8; 32]), UtxoError> {

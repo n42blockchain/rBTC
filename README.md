@@ -18,8 +18,11 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 - Reorg-consistent spent-output ages are aggregated before sorted chainstate
   writes. Offline `--utxo-activity-report` scans current UTXOs in fixed-size
   pages and compares candidate block-age windows against historical spend-hit
-  rates; incomplete history can be inspected but cannot produce a recommended
-  hot/cold boundary.
+  rates, spend-age quantiles, and estimated two-tier lookup amplification;
+  incomplete history can be inspected but cannot produce a recommended
+  hot/cold boundary. Once selected,
+  `--retier-utxos-window-blocks BLOCKS` applies it offline through sorted
+  65,536-record atomic batches with durable restart progress.
 - Immutable zstd block archives with 4 MiB piece hashes, authenticated uncompressed-length limits, and legacy-v1 read compatibility, ready for a BitTorrent/webseed transport adapter.
 - Configurable circular pruned ledger: defaults are 1,008 blocks (about one week) and 1 GiB. Validated IBD batches are published through a restart-safe staging protocol; archive-slot renames are directory-synced before their indexes are published, then slots retired by the durable index are physically removed and the directory is synced. Block undo older than the ledger floor is removed in one sorted atomic transaction only after every hash resolves through the authenticated header DAG. UTXO state and headers remain, so long IBD runs do not accumulate logically pruned archives or obsolete disconnect records.
 - Optional embedded block-explorer UI and REST API, an authenticated bounded read-only JSON-RPC route, plus an optional authenticated, transactionally persisted BDK watch-only descriptor wallet panel/API. The historical explorer projection is maintained only when a loopback API listener is explicitly configured, so ordinary validation does not pay for an unused full transaction index.

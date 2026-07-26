@@ -112,7 +112,7 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 ## UTXO layout
 
-Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier; `utxo_cold` currently contains coins not touched within `hot_window_secs` (default 60 days). Moving tiers is a single redb transaction and never changes consensus data. The 60-day boundary is not yet a production default: local wall-clock touch time makes a historical IBD classify old coins as newly hot. The replacement decision must use a complete-replay histogram of consensus coin age at spend time and compare hot-set population against spend-hit rate for candidate block-age windows. Tier metadata remains excluded from snapshot finalization and consensus identity.
+Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier and `utxo_cold` is the inactive tier. Moving tiers never changes consensus data. The legacy in-process aging interface uses a 60-day wall-clock window, but it is not a production boundary: historical snapshot import necessarily observes old coins as newly loaded. The operational replacement uses complete-replay consensus coin age in blocks. After the report selects a boundary, offline `--retier-utxos-window-blocks BLOCKS` scans the merged tiers in key order, classifies by creation height relative to the fixed execution tip, and commits at most 65,536 records per transaction. Its cursor and counters share the same transaction as every move, so a restart resumes without a giant transaction or ambiguous partial result; selecting a different tip/window safely starts a fresh idempotent scan. Tier metadata remains excluded from snapshot finalization and consensus identity.
 
 Spent-output coin age is now accumulated as exact block-age/count rows in the
 network-bound chainstate. A checkpoint aggregates ages before sorted writes;
@@ -121,13 +121,14 @@ undo, and the execution tip. Coverage metadata starts honestly at the first
 instrumented block, and a reorg crossing that start clears the sample instead
 of presenting a discontinuous history as complete. The remaining selection gate
 is a complete mainnet replay. Offline `--utxo-activity-report` scans the
-outpoint-sorted UTXO tables in fixed 65,536-record pages and reports, for
-1/7/30/60/90/180/365-day block-count candidates, historical spend-hit rate,
-current live-set population, and estimated local record bytes. It emits a
-99%-hit recommendation only when coverage is exactly blocks 1 through the
-execution tip and at least one million spends were observed; partial upgraded
-stores remain useful measurements but cannot silently select a production
-boundary.
+outpoint-sorted UTXO tables in fixed-memory pages and reports, for
+1/7/30/60/90/180/365-day and 2/3/5/10-year block-count candidates, historical
+spend-hit rate, P50/P90/P95/P99/P99.9 spend-age quantiles, expected hot-first
+tier probes per spend, current live-set population, and estimated local record
+bytes. It emits a 99%-hit recommendation only when coverage is exactly blocks
+1 through the execution tip and at least one million spends were observed;
+partial upgraded stores remain useful measurements but cannot silently select
+a production boundary.
 
 The first offline scan against the completed Testnet4 chainstate at height
 145,737 read 14,160,511 UTXOs in 27.67 seconds. Creation-age candidates retained
