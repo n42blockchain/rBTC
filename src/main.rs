@@ -78,7 +78,7 @@ use rbtc::{
     header_store::RedbHeaderStore,
     headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
-    ledger::{LedgerRetention, PrunedBlockLedger},
+    ledger::{DEFAULT_MAX_BYTES, DEFAULT_RETENTION_BLOCKS, LedgerRetention, PrunedBlockLedger},
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
         MAX_PENDING_TRANSACTION_INVENTORY, MempoolRelaySource, P2pError, PeerSession,
@@ -136,6 +136,8 @@ const MIN_ACTIVITY_RECOMMENDATION_SAMPLES: u64 = 1_000_000;
 const PERCENT_DECIMAL_SCALE: u64 = 100_000;
 const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
+const MIN_PRUNE_RETENTION_BLOCKS: u32 = 288;
+const MIN_PRUNE_MAX_BYTES: u64 = 550 * 1024 * 1024;
 
 const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
     if maximum_batch_size < MAX_VALIDATION_PREFETCH_BATCH_SIZE {
@@ -187,6 +189,7 @@ struct Options {
     cleanup_validation_dir: bool,
     offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
+    ledger_retention: LedgerRetention,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3133,6 +3136,7 @@ async fn run_connected_peer(
                 options.once,
                 options.validation_target,
                 options.validation_limits,
+                options.ledger_retention,
                 options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
@@ -3249,6 +3253,7 @@ async fn complete_assumeutxo_validation(
             block_hash: assumed.base.hash,
         }),
         options.validation_limits,
+        options.ledger_retention,
         options.mempool_full_rbf,
         None,
         None,
@@ -4377,6 +4382,7 @@ async fn sync_validating_node(
     once: bool,
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
+    ledger_retention: LedgerRetention,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -4487,8 +4493,12 @@ async fn sync_validating_node(
         .then(|| RedbFeeEstimator::open(data_dir.join("fee_estimates.redb"), network).map(Arc::new))
         .transpose()
         .map_err(|error| error.to_string())?;
-    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), LedgerRetention::default())
+    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), ledger_retention)
         .map_err(|error| error.to_string())?;
+    println!(
+        "opened pruned ledger with targets max_blocks={} max_bytes={}",
+        ledger_retention.max_blocks, ledger_retention.max_bytes
+    );
     let explorer = api_runtime
         .map(|_| {
             RedbExplorerIndex::open(data_dir.join("explorer.redb"), network)
@@ -6893,6 +6903,8 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
+    let mut prune_blocks = None;
+    let mut prune_max_bytes = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -7196,6 +7208,36 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 validation_pause_ms = Some(pause);
             }
             "--validation-deferred-repair" => validation_deferred_repair = true,
+            "--prune-blocks" => {
+                if prune_blocks.is_some() {
+                    return Err("--prune-blocks cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--prune-blocks")?;
+                let blocks = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid prune block target: {value}"))?;
+                if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS).contains(&blocks) {
+                    return Err(format!(
+                        "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+                    ));
+                }
+                prune_blocks = Some(blocks);
+            }
+            "--prune-max-bytes" => {
+                if prune_max_bytes.is_some() {
+                    return Err("--prune-max-bytes cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--prune-max-bytes")?;
+                let bytes = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid prune byte target: {value}"))?;
+                if bytes < MIN_PRUNE_MAX_BYTES {
+                    return Err(format!(
+                        "prune byte target must be at least {MIN_PRUNE_MAX_BYTES}"
+                    ));
+                }
+                prune_max_bytes = Some(bytes);
+            }
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
                     return Err("--snapshot-height cannot be supplied more than once".to_owned());
@@ -7604,6 +7646,23 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             );
         }
     }
+    if (prune_blocks.is_some() || prune_max_bytes.is_some()) && data_dir.is_none() {
+        return Err("--prune-blocks and --prune-max-bytes require --data-dir".to_owned());
+    }
+    if (prune_blocks.is_some() || prune_max_bytes.is_some())
+        && (snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || snapshot_download.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some())
+    {
+        return Err(
+            "prune targets apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
+                .to_owned(),
+        );
+    }
     if mempool_full_rbf && data_dir.is_none() {
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
@@ -7611,6 +7670,11 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         max_blocks_per_batch: validation_batch_size.unwrap_or(DEFAULT_VALIDATION_BATCH_SIZE),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
         quick_repair: !validation_deferred_repair,
+    };
+    let ledger_retention = LedgerRetention {
+        max_blocks: prune_blocks.unwrap_or(DEFAULT_RETENTION_BLOCKS),
+        max_bytes: prune_max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
+        ..LedgerRetention::default()
     };
     if experimental_network_execution {
         if data_dir.is_none() {
@@ -7750,6 +7814,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
             _ => unreachable!("offline action conflict was checked above"),
         },
         validation_limits,
+        ledger_retention,
     }))
 }
 
@@ -7818,7 +7883,7 @@ fn print_usage() {
             "rbtcd {}\n\nUSAGE:\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -8184,6 +8249,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         };
         let mut pending =
             spawn_peer_connections(&options, &options.remotes, 100, None, None, None, None)
@@ -10029,6 +10095,8 @@ mod tests {
                 "--background-assumeutxo",
                 "--mempool-full-rbf",
                 "--cleanup-validation-dir",
+                "--prune-blocks",
+                "--prune-max-bytes",
                 "--validation-batch-size",
                 "--validation-pause-ms",
                 "--snapshot-height",
@@ -10066,6 +10134,65 @@ mod tests {
             let second = parse_options(arguments.into_iter())
                 .map(|options| options.is_some());
             prop_assert_eq!(first, second);
+        }
+    }
+
+    #[test]
+    fn parses_bounded_pruned_ledger_targets() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "576",
+                "--prune-max-bytes",
+                "1073741824",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.ledger_retention,
+            LedgerRetention {
+                max_blocks: 576,
+                max_bytes: 1_073_741_824,
+                slots: LedgerRetention::default().slots,
+            }
+        );
+
+        for arguments in [
+            vec!["--prune-blocks", "576"],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "287",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "1009",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-max-bytes",
+                "576716799",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "576",
+                "--utxo-activity-report",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
     }
 
@@ -10654,6 +10781,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -10719,6 +10847,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -11929,6 +12058,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap_err();
@@ -11983,6 +12113,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -12359,6 +12490,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12447,6 +12579,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12514,6 +12647,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12597,6 +12731,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12651,6 +12786,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12701,6 +12837,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap_err();
@@ -12791,6 +12928,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -12847,6 +12985,7 @@ mod tests {
                     pause_between_batches: Duration::ZERO,
                     quick_repair: true,
                 },
+                ledger_retention: LedgerRetention::default(),
             }),
         )
         .await
@@ -12935,6 +13074,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13012,6 +13152,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13047,6 +13188,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13102,6 +13244,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap_err();
@@ -13151,6 +13294,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap_err();
@@ -13245,6 +13389,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap_err();
@@ -13395,6 +13540,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13496,6 +13642,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13569,6 +13716,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();
@@ -13678,6 +13826,7 @@ mod tests {
                 cleanup_validation_dir: false,
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
+                ledger_retention: LedgerRetention::default(),
             }),
         )
         .await
@@ -13822,6 +13971,7 @@ mod tests {
                 cleanup_validation_dir: false,
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
+                ledger_retention: LedgerRetention::default(),
             },
             local_nonce,
         )
@@ -13936,6 +14086,7 @@ mod tests {
             cleanup_validation_dir: false,
             offline_action: None,
             validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
         })
         .await
         .unwrap();

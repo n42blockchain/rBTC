@@ -226,7 +226,11 @@ numbers are intentionally not hidden P0 requirements.
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration
   tests, backup/restore instructions, and observable pruning progress. Never
-  silently recreate chainstate from an incomplete freezer.
+  silently recreate chainstate from an incomplete freezer. Bounded
+  `--prune-blocks` (288–1,008) and `--prune-max-bytes` (at least 550 MiB)
+  startup targets now drive the existing crash-safe physical freezer rotation
+  and sorted undo cleanup; reindex/repair/migration and operator recovery
+  workflows keep this broader item open.
 - [ ] **Optional indexes commonly used by node clients.** Add independently
   rebuildable `txindex`, spent-output index, and BIP157/158 compact-filter index
   with explicit disk cost, sync state, prune compatibility, and peer serving.
