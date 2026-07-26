@@ -129,7 +129,9 @@ const MAX_CONFIGURED_PEERS: usize = 16;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
-const UTXO_ACTIVITY_WINDOWS: [u32; 7] = [144, 1_008, 4_320, 8_640, 12_960, 25_920, 52_560];
+const UTXO_ACTIVITY_WINDOWS: [u32; 11] = [
+    144, 1_008, 4_320, 8_640, 12_960, 25_920, 52_560, 105_120, 157_680, 262_800, 525_600,
+];
 const MIN_ACTIVITY_RECOMMENDATION_SAMPLES: u64 = 1_000_000;
 const PERCENT_DECIMAL_SCALE: u64 = 100_000;
 const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
@@ -1326,6 +1328,34 @@ fn format_percentage(part: u64, total: u64) -> String {
     )
 }
 
+fn spent_age_quantile(rows: &[(u32, u64)], samples: u64, numerator: u64) -> Option<u32> {
+    if samples == 0 || numerator == 0 || numerator > 1_000 {
+        return None;
+    }
+    let rank = u128::from(samples)
+        .checked_mul(u128::from(numerator))?
+        .div_ceil(1_000);
+    let mut cumulative = 0_u128;
+    rows.iter().find_map(|(age, count)| {
+        cumulative = cumulative.checked_add(u128::from(*count))?;
+        (cumulative >= rank).then_some(*age)
+    })
+}
+
+fn format_tier_probes_per_spend(hot_hits: u64, samples: u64) -> String {
+    if samples == 0 {
+        return "unavailable".to_owned();
+    }
+    let cold_misses = samples.saturating_sub(hot_hits);
+    let fractional =
+        u128::from(cold_misses) * u128::from(PERCENT_DECIMAL_SCALE) / u128::from(samples);
+    format!(
+        "{}.{:05}",
+        1 + fractional / u128::from(PERCENT_DECIMAL_SCALE),
+        fractional % u128::from(PERCENT_DECIMAL_SCALE)
+    )
+}
+
 struct UtxoPopulation {
     window_counts: [u64; UTXO_ACTIVITY_WINDOWS.len()],
     window_bytes: [u64; UTXO_ACTIVITY_WINDOWS.len()],
@@ -1414,15 +1444,33 @@ fn report_utxo_activity(options: &Options) -> Result<(), String> {
         (None, None) => println!("spent-age coverage=none samples=0 complete_genesis_to_tip=false"),
         _ => unreachable!("chainstore rejects incomplete spent-age metadata"),
     }
+    if spent.samples == 0 {
+        println!("spent-age quantiles_blocks=unavailable");
+    } else {
+        println!(
+            "spent-age quantiles_blocks p50={} p90={} p95={} p99={} p99.9={}",
+            spent_age_quantile(&spent.rows, spent.samples, 500)
+                .expect("non-empty validated histogram has a median"),
+            spent_age_quantile(&spent.rows, spent.samples, 900)
+                .expect("non-empty validated histogram has a p90"),
+            spent_age_quantile(&spent.rows, spent.samples, 950)
+                .expect("non-empty validated histogram has a p95"),
+            spent_age_quantile(&spent.rows, spent.samples, 990)
+                .expect("non-empty validated histogram has a p99"),
+            spent_age_quantile(&spent.rows, spent.samples, 999)
+                .expect("non-empty validated histogram has a p99.9"),
+        );
+    }
     println!(
-        "window_blocks\tapprox_days\tspend_hits\tspend_hit_percent\tcurrent_utxos\tcurrent_utxo_percent\testimated_record_bytes\testimated_byte_percent"
+        "window_blocks\tapprox_days\tspend_hits\tspend_hit_percent\testimated_tier_probes_per_spend\tcurrent_utxos\tcurrent_utxo_percent\testimated_record_bytes\testimated_byte_percent"
     );
     for (index, window) in UTXO_ACTIVITY_WINDOWS.iter().enumerate() {
         let spend_hits = spent.hits_within(*window);
         println!(
-            "{window}\t{}\t{spend_hits}\t{}\t{}\t{}\t{}\t{}",
+            "{window}\t{}\t{spend_hits}\t{}\t{}\t{}\t{}\t{}\t{}",
             window / 144,
             format_percentage(spend_hits, spent.samples),
+            format_tier_probes_per_spend(spend_hits, spent.samples),
             population.window_counts[index],
             format_percentage(population.window_counts[index], population.total_count),
             population.window_bytes[index],
@@ -10288,6 +10336,17 @@ mod tests {
         }
         assert_eq!(format_percentage(1, 4), "25.00000");
         assert_eq!(format_percentage(0, 0), "0.00000");
+        assert_eq!(
+            spent_age_quantile(&[(0, 1), (2, 2), (10, 1)], 4, 500),
+            Some(2)
+        );
+        assert_eq!(
+            spent_age_quantile(&[(0, 1), (2, 2), (10, 1)], 4, 999),
+            Some(10)
+        );
+        assert_eq!(spent_age_quantile(&[], 0, 990), None);
+        assert_eq!(format_tier_probes_per_spend(99, 100), "1.01000");
+        assert_eq!(format_tier_probes_per_spend(0, 0), "unavailable");
     }
 
     #[test]
