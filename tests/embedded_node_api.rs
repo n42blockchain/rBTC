@@ -1,8 +1,13 @@
 //! External-crate acceptance tests for the host-owned node runtime API.
 
 use bitcoin::Network;
-use rbtc::node::{NodeBuilder, NodeError};
-use std::{net::SocketAddr, time::Duration};
+use rbtc::node::{NodeBuilder, NodeError, NodeEvent, NodeLifecycle};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 
@@ -16,6 +21,21 @@ async fn hold_one_connection() -> (SocketAddr, oneshot::Receiver<()>, JoinHandle
         std::future::pending::<()>().await;
     });
     (remote, accepted_rx, peer)
+}
+
+#[derive(Default)]
+struct CriticalTaskExecutor {
+    spawned: AtomicUsize,
+}
+
+impl CriticalTaskExecutor {
+    fn spawn_critical_task(
+        &self,
+        future: impl Future<Output = Result<(), NodeError>> + Send + 'static,
+    ) -> JoinHandle<Result<(), NodeError>> {
+        self.spawned.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(future)
+    }
 }
 
 #[test]
@@ -43,11 +63,39 @@ async fn host_controller_stops_the_embedded_task() {
         .launch()
         .unwrap();
     let controller = handle.controller();
+    let mut events = controller.subscribe_events();
+    let mut lifecycle = controller.subscribe_lifecycle();
+    timeout(Duration::from_secs(2), async {
+        while *lifecycle.borrow_and_update() != NodeLifecycle::Running {
+            lifecycle.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("host must observe the running lifecycle state");
+    let executor = CriticalTaskExecutor::default();
+    let critical_task = executor.spawn_critical_task(handle.wait());
+    assert_eq!(executor.spawned.load(Ordering::Relaxed), 1);
     controller.request_shutdown();
-    timeout(Duration::from_secs(2), handle.wait())
+    assert_eq!(
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event == NodeEvent::ShutdownRequested {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("shutdown event must be bounded"),
+        NodeEvent::ShutdownRequested
+    );
+    timeout(Duration::from_secs(2), critical_task)
         .await
         .expect("embedded shutdown must not depend on process signals")
+        .unwrap()
         .unwrap();
+    assert_eq!(controller.lifecycle(), NodeLifecycle::Stopped);
+    assert_eq!(events.recv().await.unwrap(), NodeEvent::Stopped);
     peer.abort();
 }
 

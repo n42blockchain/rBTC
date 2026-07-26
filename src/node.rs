@@ -162,6 +162,7 @@ const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
+const NODE_EVENT_CAPACITY: usize = 32;
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
@@ -266,24 +267,50 @@ impl NodeBuilder {
         tokio::runtime::Handle::try_current().map_err(|_| NodeError::MissingRuntime)?;
         let runtime_control = Arc::clone(&options.runtime_control);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (lifecycle, lifecycle_rx) = watch::channel(NodeLifecycle::Starting);
+        let (events, _) = broadcast::channel(NODE_EVENT_CAPACITY);
+        let task_lifecycle = lifecycle.clone();
+        let task_events = events.clone();
         let task = tokio::spawn(async move {
+            task_lifecycle.send_replace(NodeLifecycle::Running);
+            let _ = task_events.send(NodeEvent::Started);
             let run = run(options);
             tokio::pin!(run);
-            tokio::select! {
+            let result = tokio::select! {
                 result = &mut run => result.map_err(NodeError::Runtime),
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && !*shutdown_rx.borrow() {
-                        return Err(NodeError::ControlChannelClosed);
+                        Err(NodeError::ControlChannelClosed)
+                    } else {
+                        task_lifecycle.send_replace(NodeLifecycle::Stopping);
+                        runtime_control.shutdown_requested.store(true, Ordering::Release);
+                        wait_for_in_flight_checkpoints(
+                            &runtime_control.checkpoints_in_flight,
+                        )
+                        .await;
+                        Ok(())
                     }
-                    runtime_control.shutdown_requested.store(true, Ordering::Release);
-                    wait_for_in_flight_checkpoints(&runtime_control.checkpoints_in_flight).await;
-                    Ok(())
+                }
+            };
+            match &result {
+                Ok(()) => {
+                    task_lifecycle.send_replace(NodeLifecycle::Stopped);
+                    let _ = task_events.send(NodeEvent::Stopped);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    task_lifecycle.send_replace(NodeLifecycle::Failed(message.clone()));
+                    let _ = task_events.send(NodeEvent::Failed { message });
                 }
             }
+            result
         });
         Ok(NodeHandle {
             shutdown,
             task: Some(task),
+            lifecycle_sender: lifecycle,
+            lifecycle: lifecycle_rx,
+            events,
         })
     }
 
@@ -343,6 +370,9 @@ impl NodeBuilder {
 pub struct NodeHandle {
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<(), NodeError>>>,
+    lifecycle_sender: watch::Sender<NodeLifecycle>,
+    lifecycle: watch::Receiver<NodeLifecycle>,
+    events: broadcast::Sender<NodeEvent>,
 }
 
 impl NodeHandle {
@@ -352,12 +382,35 @@ impl NodeHandle {
     pub fn controller(&self) -> NodeController {
         NodeController {
             shutdown: self.shutdown.clone(),
+            lifecycle: self.lifecycle.clone(),
+            events: self.events.clone(),
         }
+    }
+
+    /// Returns the latest host-visible task lifecycle state.
+    #[must_use]
+    pub fn lifecycle(&self) -> NodeLifecycle {
+        self.lifecycle.borrow().clone()
+    }
+
+    /// Subscribes to latest-value lifecycle changes without an unbounded queue.
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<NodeLifecycle> {
+        self.lifecycle.clone()
+    }
+
+    /// Subscribes to the bounded lifecycle event stream.
+    ///
+    /// A lagging receiver observes Tokio's `Lagged` error rather than retaining
+    /// unbounded history in the node.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<NodeEvent> {
+        self.events.subscribe()
     }
 
     /// Requests graceful shutdown without consuming the handle.
     pub fn request_shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        request_node_shutdown(&self.shutdown, &self.events);
     }
 
     /// Requests shutdown and waits for durable work to close.
@@ -373,8 +426,17 @@ impl NodeHandle {
 
     async fn join(&mut self) -> Result<(), NodeError> {
         let task = self.task.take().ok_or(NodeError::ControlChannelClosed)?;
-        task.await
-            .map_err(|error| NodeError::Task(error.to_string()))?
+        match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                let error = NodeError::Task(error.to_string());
+                let message = error.to_string();
+                self.lifecycle_sender
+                    .send_replace(NodeLifecycle::Failed(message.clone()));
+                let _ = self.events.send(NodeEvent::Failed { message });
+                Err(error)
+            }
+        }
     }
 }
 
@@ -382,19 +444,88 @@ impl NodeHandle {
 #[derive(Clone)]
 pub struct NodeController {
     shutdown: watch::Sender<bool>,
+    lifecycle: watch::Receiver<NodeLifecycle>,
+    events: broadcast::Sender<NodeEvent>,
 }
 
 impl NodeController {
+    /// Returns the latest host-visible task lifecycle state.
+    #[must_use]
+    pub fn lifecycle(&self) -> NodeLifecycle {
+        self.lifecycle.borrow().clone()
+    }
+
+    /// Subscribes to latest-value lifecycle changes without an unbounded queue.
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<NodeLifecycle> {
+        self.lifecycle.clone()
+    }
+
+    /// Subscribes to the bounded lifecycle event stream.
+    #[must_use]
+    pub fn subscribe_events(&self) -> broadcast::Receiver<NodeEvent> {
+        self.events.subscribe()
+    }
+
     /// Requests graceful shutdown at the next safe checkpoint boundary.
     pub fn request_shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        request_node_shutdown(&self.shutdown, &self.events);
     }
 }
 
 impl Drop for NodeHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
+        if !matches!(
+            &*self.lifecycle.borrow(),
+            NodeLifecycle::Stopped | NodeLifecycle::Failed(_)
+        ) {
+            request_node_shutdown(&self.shutdown, &self.events);
+        }
     }
+}
+
+fn request_node_shutdown(shutdown: &watch::Sender<bool>, events: &broadcast::Sender<NodeEvent>) {
+    if shutdown.send_if_modified(|requested| {
+        if *requested {
+            false
+        } else {
+            *requested = true;
+            true
+        }
+    }) {
+        let _ = events.send(NodeEvent::ShutdownRequested);
+    }
+}
+
+/// Latest-value lifecycle state for a host-owned node task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeLifecycle {
+    /// The task has been spawned but has not begun polling the node runtime.
+    Starting,
+    /// The node runtime is active; network readiness is reported separately.
+    Running,
+    /// Shutdown was accepted and in-flight durable work is draining.
+    Stopping,
+    /// The node exited successfully or completed graceful shutdown.
+    Stopped,
+    /// The node exited with a validation, storage, network, or task error.
+    Failed(String),
+}
+
+/// Bounded edge-triggered lifecycle event for host observability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeEvent {
+    /// The host task began polling the node runtime.
+    Started,
+    /// A controller requested graceful shutdown.
+    ShutdownRequested,
+    /// The node exited successfully or completed graceful shutdown.
+    Stopped,
+    /// The node exited with an error.
+    Failed {
+        /// Stable human-readable error text; no credentials are included.
+        message: String,
+    },
 }
 
 /// Embedded node configuration, runtime, or task failure.

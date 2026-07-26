@@ -34,6 +34,9 @@ The intended module boundaries are:
 | `indexes` | rebuildable optional projections | consensus truth |
 | `api` | bounded authenticated operator surface | unbounded storage scans |
 
+The concrete sibling ownership and critical-task adapter are specified in
+[`N42_EMBEDDING.md`](N42_EMBEDDING.md).
+
 ## Ordered delivery
 
 ### P1.0 — embeddable runtime and configuration
@@ -54,9 +57,11 @@ cannot expose a partial checkpoint, two isolated regtest instances can run in
 one Tokio process, and the standalone CLI passes its unchanged end-to-end
 suite.
 
-Implemented on 2026-07-26: items 1–3 and the two-instance acceptance test.
-Items 4–6 remain the next ordered P1.0 work; direct `n42-26` linkage remains
-behind the licensing decision described above.
+Implemented on 2026-07-26: items 1–3, bounded lifecycle status/events from item
+5, a critical-task-shaped external-crate ownership test from item 6, and the
+two-instance acceptance test. Full typed configuration, subsystem events, and
+the exact sibling executor fixture remain the next ordered P1.0 work; direct
+`n42-26` linkage remains behind the licensing decision described above.
 
 ### P1.1 — operator lifecycle and diagnostics
 

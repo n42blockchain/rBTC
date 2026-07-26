@@ -28,8 +28,11 @@ the critical-task assembly used by `n42-26` without moving consensus or storage
 truth into the host. Each launch owns its shutdown flag and in-flight checkpoint
 barrier; an external-crate acceptance test runs two isolated regtest instances
 concurrently in one Tokio runtime and shuts them down independently. P1.0 still
-adds typed status/events and the host task-executor fixture before the embedding
-surface is complete.
+adds typed subsystem status/events and the exact sibling task-executor fixture
+before the embedding surface is complete. The current controller exposes
+latest-value `NodeLifecycle` through a Tokio watch receiver plus a 32-entry
+broadcast stream of typed lifecycle edges. Lagging observers receive an
+explicit lag error instead of growing node memory.
 
 The header DAG keeps a height-indexed view of the selected best-work branch, so
 active-height lookups stay constant-time while an ordinary extension appends
