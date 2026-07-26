@@ -4762,9 +4762,12 @@ async fn sync_validating_node(
             // Ordinary IBD and fixed-target validation both consume an immutable
             // active-header snapshot here, so the already bounded next block
             // window can download while the current checkpoint executes.
-            // Background validation keeps the adaptive scheduler in control
-            // instead of creating work beyond its current limit.
-            let overlap_next_download = validation_scheduler.is_none();
+            // A zero-pause background validator may prefetch exactly one
+            // already-effective bounded checkpoint too. If the operator
+            // configures a pause, leave the socket idle so that throttle still
+            // controls both execution and speculative network work.
+            let overlap_next_download = validation_scheduler.is_none()
+                || effective_validation_limits.pause_between_batches.is_zero();
             let auxiliary_was_active = auxiliary_session.is_some();
             download_execute_batch(
                 session,
