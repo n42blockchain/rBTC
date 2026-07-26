@@ -107,6 +107,13 @@ Primary references:
   `0000000000c655393aba8556ccb27913faf4fdfcb90d7bd5c0bdf4e62c923769`,
   and exited in 4.40 seconds. The bounded freezer occupied 5.9 MiB and the full
   directory 3.1 GiB at that acceptance point.
+- [x] A real external Core 31 Testnet4 height-120,000 v2 snapshot activated,
+  served and executed through live height 145,763 while an independent
+  genesis-to-120,000 replay matched all 13,870,119 entries and
+  1,350,756,785 canonical bytes. Finalization cleared the assumed marker. A
+  cold restart opened in 173 ms, advanced to height 145,766/hash
+  `000000000074ec24258d33c6e340032db208128adde0f7841c83fdbbeb3e25ea`,
+  and exited in 6.16 seconds.
 
 ### Build and release automation
 
@@ -137,8 +144,9 @@ Primary references:
   migration format until Core compatibility is accepted. The Core 31 v2 parser,
   release-pinned identities, exact `hash_serialized` calculation, bounded txid
   grouping, two-pass race closure, atomic activation API, and offline CLI are
-  implemented. The external Testnet4 fixture and bounded parallel/resumable
-  HTTPS transport are accepted; only the end-to-end Mainnet run remains open.
+  implemented. The external Testnet4 fixture, complete assumed/live/background
+  lifecycle, and bounded parallel/resumable HTTPS transport are accepted; only
+  the end-to-end Mainnet run remains open.
 - [ ] **Choose the hot/cold UTXO boundary from replay data, not the current
   60-day constant.** Persist a network-scoped histogram of spent-output coin age
   in blocks, and report for candidate windows the share of the current UTXO set

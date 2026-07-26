@@ -514,7 +514,14 @@ duplicate vouts, and then sorts the same group by rBTC's existing
 little-endian-vout database key. On 2026-07-25 an external Core 31 Testnet4
 height-120,000 v2 file with 13,870,119 coins activated against the compiled
 blockhash, `hash_serialized`, and chain-transaction count after both streaming
-passes.
+passes. The assumed chain then executed ordinary blocks through live height
+145,763 while a separate directory replayed genesis through exactly 120,000.
+That replay matched 13,870,119 entries and 1,350,756,785 canonical bytes, so
+finalization cleared the assumed marker. A subsequent cold launch opened the
+fully validated chainstate in 173 ms, executed three new blocks through
+145,766/hash
+`000000000074ec24258d33c6e340032db208128adde0f7841c83fdbbeb3e25ea`,
+and exited in 6.16 seconds.
 
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,
