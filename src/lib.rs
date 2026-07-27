@@ -22,6 +22,7 @@ pub mod fee_estimator;
 pub mod header_store;
 pub mod headers;
 pub mod ibd;
+pub mod index_policy;
 pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;

@@ -183,6 +183,23 @@ as local freezer reindex apply. If a stronger chain no longer contains the
 pinned target during the run, the command fails closed; rerun against an
 updated, independently validated source header directory.
 
+Index activation and pruning use one compatibility matrix:
+
+| Projection | Clean-build history | Snapshot/baseline shortcut | Safe after caught up |
+| --- | --- | --- | --- |
+| Explorer | Genesis for complete block/transaction history | Current UTXO view only, explicitly marked as a baseline | Yes |
+| Watch-only wallet | Configured birthday | Descriptor-scoped current state only | Yes |
+| Transaction index | Genesis | Never | Yes |
+| Spent-output index | Genesis | Never | Yes |
+| BIP158 basic filters | Genesis | Never | Yes |
+
+An enabled projection records its own durable tip. If its next required block
+precedes the freezer floor, activation requires a full-history+witness peer;
+otherwise it refuses instead of silently calling a partial index “synced”.
+Pruning cannot pass a lagging index's next required height. Disabling or
+removing an optional index is an explicit projection-only action and never
+mutates headers, UTXOs, execution metadata, undo, or freezer state.
+
 Manual freezer pruning uses a mandatory two-phase plan:
 
 ```text

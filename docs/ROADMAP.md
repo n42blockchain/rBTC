@@ -244,7 +244,7 @@ optional where appropriate, and host-runtime compatible.
   the current forecast. An owner-only per-data-directory process lock rejects
   aliases and reports the holding PID/network/start time before any database or
   network open. Exact response-field parity is not required.
-- [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
+- [x] **Explicit storage lifecycle.** Add configurable automatic/manual prune
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration
   tests, backup/restore instructions, and observable pruning progress. Never
@@ -267,8 +267,10 @@ optional where appropriate, and host-runtime compatible.
   exact-target cross-store verification. `--reindex-chainstate OUTPUT` covers
   incomplete local history by pinning the replayed maximum-work header tip and
   reacquiring witness blocks through bounded full-history peers under complete
-  consensus/script validation. Prune/index policy keeps this broader item
-  open.
+  consensus/script validation. The shared code-level index policy now refuses
+  activation without required local/peer history and refuses pruning past a
+  lagging enabled projection; only explorer/wallet baselines may substitute
+  for historical UTXO views.
   The strict network-bound root manifest now inventories every subsystem
   schema, migrates legacy absence only after successful preflight, and refuses
   future rollback before mutable database open. Backup/restore, rollback, and

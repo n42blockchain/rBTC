@@ -104,9 +104,13 @@ use rbtc::{
     header_store::RedbHeaderStore,
     headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
+    index_policy::{
+        IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
+        validate_prune_boundary,
+    },
     ledger::{
-        DEFAULT_MAX_BYTES, DEFAULT_RETENTION_BLOCKS, LedgerBlockBatch, LedgerRetention,
-        PrunedBlockLedger,
+        DEFAULT_MAX_BYTES, DEFAULT_RETENTION_BLOCKS, LedgerBlockBatch, LedgerPrunePlan,
+        LedgerRetention, PrunedBlockLedger,
     },
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
@@ -134,7 +138,7 @@ use rbtc::{
     },
     wallet::{
         EmbeddedWallet, MAX_WALLET_DESCRIPTOR_CONFIG_BYTES, WalletTip,
-        parse_wallet_descriptor_config,
+        parse_wallet_descriptor_config, read_persisted_wallet_sync_height,
     },
 };
 use tokio::sync::{broadcast, mpsc, watch};
@@ -3504,6 +3508,10 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             let ledger =
                 PrunedBlockLedger::open_persisted(&blocks).map_err(|error| error.to_string())?;
             let plan = ledger
+                .plan_prune_through(*through_height, MIN_PRUNE_RETENTION_BLOCKS)
+                .map_err(|error| error.to_string())?;
+            validate_manual_prune_indexes(data_dir, options.network, &plan)?;
+            let plan = ledger
                 .apply_prune_plan(*through_height, MIN_PRUNE_RETENTION_BLOCKS, plan_token)
                 .map_err(|error| error.to_string())?;
             println!(
@@ -4295,6 +4303,68 @@ fn promote_reindex_output(output: &std::path::Path) -> Result<(), String> {
         .map_err(|error| format!("remove completed reindex owner marker: {error}"))?;
     sync_directory(output)
         .map_err(|error| format!("sync completed reindex output directory: {error}"))
+}
+
+fn validate_manual_prune_indexes(
+    data_dir: &std::path::Path,
+    network: Network,
+    plan: &LedgerPrunePlan,
+) -> Result<(), String> {
+    let (Some(first_retained_height), Some(execution_height)) =
+        (plan.first_retained_height, plan.tip_height)
+    else {
+        return Ok(());
+    };
+    let explorer_path = data_dir.join("explorer.redb");
+    if explorer_path.exists() {
+        let explorer =
+            RedbExplorerIndex::open(explorer_path, network).map_err(|error| error.to_string())?;
+        let tip = explorer.tip().map_err(|error| error.to_string())?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: IndexKind::Explorer,
+                best_height: tip.height,
+                required_from_height: 1,
+                utxo_baseline_height: explorer
+                    .baseline()
+                    .map_err(|error| error.to_string())?
+                    .map(|base| base.height),
+            },
+            first_retained_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            format!(
+                "manual prune would strand the enabled explorer index at height {}: {error:?}",
+                tip.height
+            )
+        })?;
+    }
+    let wallet_path = data_dir.join("wallet.sqlite");
+    if wallet_path.exists() {
+        let best_height = read_persisted_wallet_sync_height(&wallet_path)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "manual prune refuses a legacy wallet without a conservative sync cursor; start the node once with its descriptors to migrate it"
+                    .to_owned()
+            })?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: IndexKind::Wallet,
+                best_height,
+                required_from_height: 0,
+                utxo_baseline_height: None,
+            },
+            first_retained_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            format!(
+                "manual prune would strand the enabled wallet index at height {best_height}: {error:?}"
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn require_existing_verify_chain_data(
@@ -8915,6 +8985,26 @@ async fn reconcile_explorer(
     let execution_store = chainstate.execution();
     let undo_store = chainstate.undos();
     let execution_tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let initial_explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
+    let initial_baseline = explorer.baseline().map_err(|error| error.to_string())?;
+    let retained = ledger.stats().map_err(|error| error.to_string())?;
+    validate_index_activation(
+        IndexBuildState {
+            kind: IndexKind::Explorer,
+            best_height: initial_explorer_tip.height,
+            required_from_height: 1,
+            utxo_baseline_height: initial_baseline.map(|tip| tip.height),
+        },
+        IndexHistoryAvailability {
+            local_first_height: retained.first_height,
+            // `reconcile_explorer` is entered only with an established
+            // full-history+witness session. Missing local history is fetched
+            // through that authenticated active-chain path below.
+            authenticated_peer_history: true,
+        },
+        execution_tip.height,
+    )
+    .map_err(|error| format!("explorer prune compatibility refusal: {error:?}"))?;
     if execution_store
         .snapshot_origin()
         .map_err(|error| error.to_string())?
@@ -9861,6 +9951,7 @@ async fn download_execute_batch(
     let last = expected
         .last()
         .expect("non-empty block batch has a last header");
+    validate_live_indexes_before_prune(explorer, wallet, last.height)?;
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
@@ -9908,6 +9999,58 @@ async fn download_execute_batch(
     }
     if let Some(error) = prefetch_error {
         return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_live_indexes_before_prune(
+    explorer: Option<&RedbExplorerIndex>,
+    wallet: Option<&EmbeddedWallet>,
+    execution_height: u32,
+) -> Result<(), PeerRunError> {
+    if let Some(explorer) = explorer {
+        let tip = explorer.tip().map_err(|error| error.to_string())?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: IndexKind::Explorer,
+                best_height: tip.height,
+                required_from_height: 1,
+                utxo_baseline_height: explorer
+                    .baseline()
+                    .map_err(|error| error.to_string())?
+                    .map(|base| base.height),
+            },
+            execution_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            PeerRunError::local(format!(
+                "refusing freezer publication past explorer height {}: {error:?}",
+                tip.height
+            ))
+        })?;
+    }
+    if let Some(wallet) = wallet {
+        let tip = wallet.chain_tip().map_err(|error| error.to_string())?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: IndexKind::Wallet,
+                best_height: tip.height,
+                required_from_height: wallet
+                    .scan_start_height()
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(0),
+                utxo_baseline_height: None,
+            },
+            execution_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            PeerRunError::local(format!(
+                "refusing freezer publication past wallet height {}: {error:?}",
+                tip.height
+            ))
+        })?;
     }
     Ok(())
 }
@@ -15957,6 +16100,25 @@ mod tests {
         );
         assert!(!directory.path().join("chainstate.redb").exists());
         assert!(!directory.path().join("logs").exists());
+    }
+
+    #[test]
+    fn manual_prune_refuses_to_strand_a_lagging_enabled_index() {
+        let directory = TempDir::new().unwrap();
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        ledger.append(1, &vec![vec![1]; 100]).unwrap();
+        ledger.append(101, &vec![vec![2]; 300]).unwrap();
+        let plan = ledger.plan_prune_through(100, 288).unwrap();
+        RedbExplorerIndex::open(directory.path().join("explorer.redb"), Network::Regtest).unwrap();
+        let error =
+            validate_manual_prune_indexes(directory.path(), Network::Regtest, &plan).unwrap_err();
+        assert!(error.contains("would strand the enabled explorer index"));
+        assert_eq!(
+            ledger.retained_ranges().unwrap(),
+            vec![(1, 100), (101, 400)]
+        );
     }
 
     #[test]

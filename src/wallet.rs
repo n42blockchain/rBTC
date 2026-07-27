@@ -17,7 +17,7 @@ use bdk_wallet::{
     chain::{BlockId, ChainPosition},
     miniscript::{Descriptor, DescriptorPublicKey},
     psbt::PsbtUtils,
-    rusqlite::{Connection, OptionalExtension, params},
+    rusqlite::{Connection, OpenFlags, OptionalExtension, params},
     signer::SignOptions,
 };
 use bitcoin::{
@@ -50,6 +50,7 @@ const MAX_DERIVATION_INDEX: u32 = (1 << 31) - 1;
 const NEXT_RECEIVE_INDEX_KEY: &str = "next_receive_index";
 const NEXT_CHANGE_INDEX_KEY: &str = "next_change_index";
 const SCAN_START_HEIGHT_KEY: &str = "scan_start_height";
+const SYNC_HEIGHT_KEY: &str = "sync_height";
 const MAX_WALLET_PAGE_OFFSET: u32 = 10_000;
 const MAX_WALLET_PAGE_READ: u32 = 101;
 
@@ -466,6 +467,7 @@ impl EmbeddedWallet {
                     target.height
                 )));
             }
+            write_metadata_u32(&state.database, SYNC_HEIGHT_KEY, current.height())?;
             return Ok(());
         }
         let update = current
@@ -483,6 +485,7 @@ impl EmbeddedWallet {
             .map_err(|error| WalletError::Chain(error.to_string()))?;
         let WalletState { wallet, database } = &mut *state;
         wallet.persist(database)?;
+        write_metadata_u32(database, SYNC_HEIGHT_KEY, target.height)?;
         Ok(())
     }
 
@@ -879,6 +882,7 @@ impl EmbeddedWallet {
             .map_err(|error| WalletError::Chain(error.to_string()))?;
         let WalletState { wallet, database } = &mut *state;
         wallet.persist(database)?;
+        write_metadata_u32(database, SYNC_HEIGHT_KEY, height)?;
         Ok(())
     }
 
@@ -928,6 +932,7 @@ impl EmbeddedWallet {
             &self.change_descriptor,
             self.network,
         )?;
+        write_metadata_u32(database, SYNC_HEIGHT_KEY, target.height)?;
         Ok(())
     }
 
@@ -1146,7 +1151,35 @@ fn initialize_metadata(
             )?;
         }
     }
+    if read_metadata_u32(database, SYNC_HEIGHT_KEY)?.is_none() {
+        write_metadata_u32(
+            database,
+            SYNC_HEIGHT_KEY,
+            wallet.latest_checkpoint().height(),
+        )?;
+    }
     Ok(())
+}
+
+/// Reads the conservative wallet synchronization cursor without descriptors
+/// or a writable SQLite connection.
+///
+/// Old wallets without the cursor return `None`; opening them normally
+/// backfills it from BDK's durable checkpoint before a manual prune may rely on
+/// the value.
+pub fn read_persisted_wallet_sync_height(
+    database_path: impl AsRef<Path>,
+) -> Result<Option<u32>, WalletError> {
+    let path = database_path.as_ref();
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WalletError::File(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "wallet database must be a regular file, not a symlink",
+        )));
+    }
+    let database = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    read_metadata_u32(&database, SYNC_HEIGHT_KEY)
 }
 
 fn reserve_receive_index(database: &mut Connection) -> Result<u32, WalletError> {
@@ -1196,6 +1229,15 @@ fn read_metadata_u32(database: &Connection, key: &str) -> Result<Option<u32>, Wa
                 .map_err(|_| WalletError::Chain(format!("wallet metadata {key} is out of range")))
         })
         .transpose()
+}
+
+fn write_metadata_u32(database: &Connection, key: &str, value: u32) -> Result<(), WalletError> {
+    database.execute(
+        "INSERT INTO rbtc_wallet_metadata (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, i64::from(value)],
+    )?;
+    Ok(())
 }
 
 fn ensure_query_window(offset: u32, limit: u32) -> Result<(), WalletError> {
@@ -1253,12 +1295,41 @@ mod tests {
         absolute::LockTime, blockdata::constants::genesis_block, hashes::Hash,
         transaction::Version,
     };
+    use tempfile::TempDir;
 
     use super::*;
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
     const PRIVATE_DESCRIPTOR: &str = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)";
+
+    #[test]
+    fn conservative_sync_cursor_is_readable_without_descriptors() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("wallet.sqlite");
+        let wallet = EmbeddedWallet::open_or_create(
+            &database,
+            RECEIVE_DESCRIPTOR,
+            CHANGE_DESCRIPTOR,
+            Network::Regtest,
+        )
+        .unwrap();
+        assert_eq!(
+            read_persisted_wallet_sync_height(&database).unwrap(),
+            Some(0)
+        );
+        wallet
+            .advance_checkpoint(WalletTip {
+                height: 1,
+                hash: BlockHash::from_byte_array([7; 32]),
+            })
+            .unwrap();
+        drop(wallet);
+        assert_eq!(
+            read_persisted_wallet_sync_height(&database).unwrap(),
+            Some(1)
+        );
+    }
 
     fn signing_descriptors() -> (String, String, String, String) {
         let secp = bitcoin::secp256k1::Secp256k1::new();

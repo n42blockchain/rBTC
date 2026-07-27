@@ -179,7 +179,7 @@ crash-resume, and verified promotion. The authenticated-peer half is also
 complete: `--reindex-chainstate OUTPUT` pins the fully replayed maximum-work
 source header tip, reacquires witness blocks through bounded full-history
 peers, applies the normal dual-window and full consensus/script pipeline, and
-promotes only an exact verified target. Item 2 is complete; item 5 remains.
+promotes only an exact verified target. Item 2 is complete.
 
 Item 4 is complete. Every persistent subsystem has an
 explicit version in the strict network-bound data-format inventory. A missing
@@ -190,6 +190,15 @@ version preservation, aliases, and failure-before-publication. Backup, restore,
 upgrade/rollback, and corruption decisions are published in
 [`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md). Schema changes beyond v1 must
 add their forward migration and crash matrix before changing the inventory.
+
+Item 5 is complete. The shared `index_policy` gate models every current and
+planned projection by required first height, durable best height, authenticated
+history availability, and baseline semantics. Activation refuses missing
+history; pruning refuses to overtake a lagging enabled index. Only
+explorer/wallet current-state projections may declare an explicit UTXO
+baseline. Transaction, spent-output, and BIP158 indexes always require blocks.
+All five families are prune-safe only after their own records are caught up,
+and the module has no consensus-store mutation path. P1.4 is complete.
 
 ### P1.5 — optional indexes
 
