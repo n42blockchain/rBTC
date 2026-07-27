@@ -750,16 +750,30 @@ fn hex_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Decodes a 64-character hexadecimal SHA-256 digest from an untrusted manifest.
+///
+/// Snapshot manifests are attacker-supplied JSON, so this works on bytes: a
+/// 64-*byte* string may contain multi-byte characters, and slicing it by byte
+/// offsets would panic on a character boundary.
 fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    let value = value.as_bytes();
     if value.len() != 64 {
         return None;
     }
     let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
+    for (byte, pair) in digest.iter_mut().zip(value.chunks_exact(2)) {
+        *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Some(digest)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn zstd_window_log(records_bytes: u64) -> u32 {
@@ -1313,5 +1327,32 @@ mod tests {
             None
         );
         assert!(chainstate.snapshot_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_non_ascii_manifest_digests_without_panicking() {
+        // Twenty-one three-byte characters plus one ASCII byte is 64 bytes long
+        // but has no character boundary at byte offset two.
+        let multibyte = "\u{20ac}".repeat(21) + "0";
+        assert_eq!(multibyte.len(), 64);
+        assert_eq!(decode_sha256(&multibyte), None);
+        assert_eq!(decode_sha256(&"g".repeat(64)), None);
+        assert_eq!(decode_sha256("00"), None);
+        assert_eq!(decode_sha256(&"aB".repeat(32)), Some([0xab; 32]));
+
+        let manifest = SnapshotManifest {
+            format_version: VERSION,
+            network: Network::Regtest.to_string(),
+            height: 1,
+            block_hash: BlockHash::all_zeros().to_string(),
+            utxo_count: 1,
+            records_bytes: 65,
+            records_sha256: multibyte,
+            compression: "zstd".to_owned(),
+        };
+        assert!(matches!(
+            validate_snapshot_manifest(&manifest),
+            Err(SnapshotError::Invalid("records checksum encoding"))
+        ));
     }
 }

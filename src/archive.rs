@@ -622,16 +622,30 @@ fn hash_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Decodes a lowercase 64-character hexadecimal SHA-256 digest.
+///
+/// Manifests come from untrusted archive files, so this works on bytes. A
+/// 64-*byte* string may contain multi-byte characters, and slicing such a value
+/// by byte offsets would panic on a character boundary.
 fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    let value = value.as_bytes();
     if value.len() != 64 {
         return None;
     }
     let mut digest = [0_u8; 32];
-    for (index, byte) in digest.iter_mut().enumerate() {
-        let offset = index * 2;
-        *byte = u8::from_str_radix(&value[offset..offset + 2], 16).ok()?;
+    for (byte, pair) in digest.iter_mut().zip(value.chunks_exact(2)) {
+        *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Some(digest)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn zstd_window_log(records_bytes: u64) -> u32 {
@@ -816,5 +830,46 @@ mod tests {
         archive.extend_from_slice(&compressed);
 
         assert!(matches!(decode_archive(&archive), Err(ArchiveError::Io(_))));
+    }
+
+    #[test]
+    fn rejects_non_ascii_manifest_digests_without_panicking() {
+        // Twenty-one three-byte characters plus one ASCII byte is 64 bytes long
+        // but has no character boundary at byte offset two.
+        let multibyte = "\u{20ac}".repeat(21) + "0";
+        assert_eq!(multibyte.len(), 64);
+        assert_eq!(decode_sha256(&multibyte), None);
+        assert_eq!(decode_sha256(&"g".repeat(64)), None);
+        assert_eq!(decode_sha256("00"), None);
+        assert_eq!(decode_sha256(&"aB".repeat(32)), Some([0xab; 32]));
+
+        let manifest = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "first_height": 0,
+            "block_count": 1,
+            "records_bytes": 8,
+            "records_sha256": multibyte,
+            "piece_size": PIECE_SIZE,
+            "piece_sha256": ["00".repeat(32)],
+        });
+        let metadata = serde_json::to_vec(&manifest).unwrap();
+        let mut archive = MAGIC.to_vec();
+        archive.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+        archive.extend_from_slice(&metadata);
+        assert!(matches!(
+            decode_archive(&archive),
+            Err(ArchiveError::Invalid("manifest fields"))
+        ));
+        assert!(matches!(
+            read_archive_manifest_from_bytes(&archive),
+            Err(ArchiveError::Invalid("manifest fields"))
+        ));
+    }
+
+    fn read_archive_manifest_from_bytes(bytes: &[u8]) -> Result<ArchiveManifest, ArchiveError> {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("manifest.rblk");
+        fs::write(&file, bytes).unwrap();
+        read_archive_manifest(file)
     }
 }
