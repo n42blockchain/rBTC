@@ -97,7 +97,10 @@ item 4. Standalone diagnostics are now newline-delimited JSON behind a bounded
 non-blocking queue, a fixed per-second limiter, owner-only size rotation, and
 authenticated `getloginfo`/`setloglevel`; embedded hosts retain typed
 status/event receivers and do not install the process-global sink. This
-completes item 3 and the remaining runtime-control portion of item 4. Item 5 is
+completes item 3 and the remaining runtime-control portion of item 4. The
+owner-only per-data-directory process lock now fails early with bounded
+PID/network/start diagnostics and rejects symlink/hardlink aliases, completing
+the startup-lock portion of item 4. Item 5 is
 also complete: startup and every safe checkpoint boundary enforce an
 operator-configured reserve plus worst-case batch/mempool/log/database
 headroom, classify exhaustion as a local failure without peer punishment, and

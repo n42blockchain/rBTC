@@ -2,10 +2,11 @@
 
 mod config_file;
 
+use fs2::FileExt;
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     str::FromStr,
@@ -194,6 +195,8 @@ const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
+const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
+const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const NODE_EVENT_CAPACITY: usize = 32;
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
@@ -1676,6 +1679,108 @@ impl DiskSpaceMonitor {
     }
 }
 
+#[derive(Debug)]
+struct DataDirectoryLock {
+    file: fs::File,
+}
+
+impl DataDirectoryLock {
+    fn acquire(data_dir: &std::path::Path, network: Network) -> Result<Self, String> {
+        let path = data_dir.join(DATA_DIRECTORY_LOCK_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(format!(
+                    "data-directory lock {} must be a regular file, not a symlink",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect data-directory lock {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|error| format!("open data-directory lock {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if file
+                .metadata()
+                .map_err(|error| format!("inspect data-directory lock: {error}"))?
+                .nlink()
+                != 1
+            {
+                return Err("data-directory lock must have exactly one hard link".to_owned());
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("restrict data-directory lock permissions: {error}"))?;
+        }
+        if let Err(error) = file.try_lock_exclusive() {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                let marker = read_lock_marker(&mut file);
+                return Err(format!(
+                    "data directory {} is already locked{}",
+                    data_dir.display(),
+                    marker.map_or_else(String::new, |marker| format!(" ({marker})"))
+                ));
+            }
+            return Err(format!(
+                "lock data directory {}: {error}",
+                data_dir.display()
+            ));
+        }
+        let marker = format!(
+            "pid={} network={} started_unix={}\n",
+            std::process::id(),
+            network,
+            unix_time().unwrap_or(0)
+        );
+        file.set_len(0)
+            .and_then(|()| file.rewind())
+            .and_then(|()| file.write_all(marker.as_bytes()))
+            .and_then(|()| file.sync_data())
+            .map_err(|error| {
+                format!(
+                    "persist data-directory lock marker {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DataDirectoryLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn read_lock_marker(file: &mut fs::File) -> Option<String> {
+    file.rewind().ok()?;
+    let mut marker = String::new();
+    file.take(MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES)
+        .read_to_string(&mut marker)
+        .ok()?;
+    let marker = marker.trim();
+    (!marker.is_empty()
+        && marker
+            .chars()
+            .all(|character| character.is_ascii_graphic() || character == ' '))
+    .then(|| marker.to_owned())
+}
+
 impl From<String> for PeerRunError {
     fn from(message: String) -> Self {
         Self::transient(message)
@@ -2983,9 +3088,17 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if options.mempool_full_rbf {
         rbtc_info!("peer transaction admission full-RBF policy enabled");
     }
+    let _data_directory_lock = options
+        .data_dir
+        .as_ref()
+        .map(|data_dir| {
+            fs::create_dir_all(data_dir).map_err(|error| {
+                format!("create data directory {}: {error}", data_dir.display())
+            })?;
+            DataDirectoryLock::acquire(data_dir, options.network)
+        })
+        .transpose()?;
     if let Some(data_dir) = &options.data_dir {
-        fs::create_dir_all(data_dir)
-            .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
         if options.offline_action.is_none() {
             let disk_space = DiskSpaceMonitor::for_options(&options, data_dir.clone())
                 .check()
@@ -4091,6 +4204,7 @@ fn cleanup_completed_validation_dir(
             entry.file_name().to_str(),
             Some(
                 VALIDATION_OWNER_FILE
+                    | DATA_DIRECTORY_LOCK_FILE
                     | "chainstate.redb"
                     | "headers.redb"
                     | "peers.redb"
@@ -14177,6 +14291,52 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, PeerFailureKind::LocalResource);
         assert!(error.message.contains("insufficient disk space"));
+    }
+
+    #[test]
+    fn data_directory_lock_reports_owner_and_releases_cleanly() {
+        let directory = TempDir::new().unwrap();
+        let first = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        let error = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap_err();
+        assert!(error.contains("already locked"));
+        assert!(error.contains("pid="));
+        assert!(error.contains("network=regtest"));
+        drop(first);
+        DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(directory.path().join(DATA_DIRECTORY_LOCK_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_directory_lock_rejects_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, "not a lock").unwrap();
+        let lock = directory.path().join(DATA_DIRECTORY_LOCK_FILE);
+        symlink(&outside, &lock).unwrap();
+        assert!(
+            DataDirectoryLock::acquire(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("regular file")
+        );
+        fs::remove_file(&lock).unwrap();
+        fs::hard_link(&outside, &lock).unwrap();
+        assert!(
+            DataDirectoryLock::acquire(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("exactly one hard link")
+        );
     }
 
     #[tokio::test]

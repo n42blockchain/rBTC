@@ -241,7 +241,9 @@ optional where appropriate, and host-runtime compatible.
   receivers. Startup and every checkpoint boundary also enforce a configurable
   free-space reserve plus worst-case atomic-write headroom; low space is a
   local fail-safe, never a peer fault, and `getdiskinfo`/status/metrics expose
-  the current forecast. Exact response-field parity is not required.
+  the current forecast. An owner-only per-data-directory process lock rejects
+  aliases and reports the holding PID/network/start time before any database or
+  network open. Exact response-field parity is not required.
 - [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration

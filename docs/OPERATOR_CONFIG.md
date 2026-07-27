@@ -77,6 +77,15 @@ targets, hot-standby and mempool ceilings, validation resources, and enabled API
 booleans for RPC/wallet enablement and never prints authentication paths,
 descriptor paths, or credential contents.
 
+The daemon also takes an exclusive advisory lock on the owner-only
+`DATA_DIR/.rbtc.lock` before opening any database. A conflicting process fails
+immediately with the recorded PID, network, and start time instead of surfacing
+an arbitrary redb open error or connecting peers. The lock path rejects
+symlinks, non-regular files, and (on Unix) hard links; the OS releases the lock
+after crashes, while the retained marker improves the next conflict
+diagnostic. Distinct embedded node instances therefore require distinct data
+directories.
+
 Every persistent data directory is checked before database open and before
 each atomic validation checkpoint or live transaction-persistence cycle.
 `minimum_free_bytes` is the operator reserve (default 5 GiB). The enforced
