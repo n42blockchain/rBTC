@@ -98,6 +98,7 @@ use rbtc::{
     },
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
+        MAX_CONFIGURED_MEMPOOL_BYTES, MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
         TransactionAdmissionContext, TransactionAdmissionPool, TransactionRequestId,
         dependency_packages, transaction_descendant_closure,
     },
@@ -131,7 +132,8 @@ const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_AGENT: &str = "/rbtcd:0.1.0/";
 const MAX_CONFIGURED_PEERS: usize = 16;
-const MAX_AUTOMATIC_HOT_STANDBYS: usize = 8;
+const DEFAULT_AUTOMATIC_HOT_STANDBYS: usize = 8;
+const MAX_AUTOMATIC_HOT_STANDBYS: usize = 16;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const UTXO_ACTIVITY_WINDOWS: [u32; 11] = [
@@ -199,6 +201,7 @@ struct Options {
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
     cache: NodeCacheConfig,
+    resources: NodeResourceConfig,
     runtime_control: Arc<RuntimeControl>,
     observer: Option<NodeObserver>,
 }
@@ -224,6 +227,8 @@ pub struct NodeConfig {
     pub mempool_full_rbf: bool,
     /// Bounded chainstate cache budgets.
     pub cache: NodeCacheConfig,
+    /// Peer and transaction-pool resource ceilings.
+    pub resources: NodeResourceConfig,
     /// Bounded local freezer retention.
     pub storage: NodeStorageConfig,
     /// Optional loopback explorer/RPC/wallet services.
@@ -246,6 +251,7 @@ impl NodeConfig {
             once: false,
             mempool_full_rbf: false,
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             storage: NodeStorageConfig::default(),
             api: None,
             consensus: NodeConsensusConfig::default(),
@@ -351,6 +357,7 @@ impl NodeConfig {
                 ..LedgerRetention::default()
             },
             cache: self.cache,
+            resources: self.resources,
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -463,6 +470,27 @@ impl Default for NodeStorageConfig {
         Self {
             prune_blocks: DEFAULT_RETENTION_BLOCKS,
             prune_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+/// Bounded peer and transaction-pool resources for one node instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeResourceConfig {
+    /// Maximum automatically discovered hot standby sessions.
+    pub automatic_hot_standbys: usize,
+    /// Maximum admitted mempool transactions.
+    pub mempool_max_transactions: usize,
+    /// Maximum witness-serialized mempool bytes.
+    pub mempool_max_bytes: usize,
+}
+
+impl Default for NodeResourceConfig {
+    fn default() -> Self {
+        Self {
+            automatic_hot_standbys: DEFAULT_AUTOMATIC_HOT_STANDBYS,
+            mempool_max_transactions: MAX_ADMITTED_TRANSACTIONS,
+            mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
         }
     }
 }
@@ -612,6 +640,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Sets bounded hot-standby and transaction-pool resources.
+    #[must_use]
+    pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
+        self.config.resources = resources;
+        self
+    }
+
     /// Mounts optional loopback explorer/RPC/watch-only-wallet services.
     #[must_use]
     pub fn api(mut self, api: NodeApiConfig) -> Self {
@@ -740,6 +775,11 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
             return Err("DNS seeds must be unique".to_owned());
         }
     }
+    if options.resources.automatic_hot_standbys > MAX_AUTOMATIC_HOT_STANDBYS {
+        return Err(format!(
+            "automatic hot standbys cannot exceed {MAX_AUTOMATIC_HOT_STANDBYS}"
+        ));
+    }
     Ok(())
 }
 
@@ -769,6 +809,20 @@ fn validate_storage_options(options: &Options) -> Result<(), String> {
                 "{name} cache must be between {MIN_CHAINSTATE_CACHE_BYTES} and {MAX_CHAINSTATE_CACHE_BYTES} bytes"
             ));
         }
+    }
+    if !(1..=MAX_CONFIGURED_MEMPOOL_TRANSACTIONS)
+        .contains(&options.resources.mempool_max_transactions)
+    {
+        return Err(format!(
+            "mempool transaction target must be between 1 and {MAX_CONFIGURED_MEMPOOL_TRANSACTIONS}"
+        ));
+    }
+    if !(MAX_ADMITTED_TRANSACTION_BYTES..=MAX_CONFIGURED_MEMPOOL_BYTES)
+        .contains(&options.resources.mempool_max_bytes)
+    {
+        return Err(format!(
+            "mempool byte target must be between {MAX_ADMITTED_TRANSACTION_BYTES} and {MAX_CONFIGURED_MEMPOOL_BYTES}"
+        ));
     }
     Ok(())
 }
@@ -2541,7 +2595,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         "none"
     };
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} once={} full_rbf={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -2549,8 +2603,11 @@ fn startup_configuration_summary(options: &Options) -> String {
             .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
         options.remotes.len(),
         dns,
+        options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
+        options.resources.mempool_max_transactions,
+        options.resources.mempool_max_bytes,
         options.cache.active_chainstate_bytes,
         options.cache.background_chainstate_bytes,
         options.cache.bulk_validation_bytes,
@@ -2830,7 +2887,10 @@ async fn run_peer_pool(
     validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), String> {
     let api_runtime = prepare_api_runtime(options)?;
-    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::with_capacity(
+        options.resources.mempool_max_transactions,
+        options.resources.mempool_max_bytes,
+    )));
     let mempool_pool = Arc::clone(&transaction_pool);
     let mempool_relay_source = MempoolRelaySource::new(move || {
         mempool_pool
@@ -4171,6 +4231,7 @@ async fn evict_excess_ready_standbys(
     peer_store: Option<&RedbPeerStore>,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
+    maximum_automatic: usize,
 ) -> Vec<SocketAddr> {
     let ready_automatic = pending
         .iter_mut()
@@ -4179,9 +4240,7 @@ async fn evict_excess_ready_standbys(
             (!manual_remotes.contains(remote) && connection.observe_ready()).then_some(index)
         })
         .collect::<Vec<_>>();
-    let excess = ready_automatic
-        .len()
-        .saturating_sub(MAX_AUTOMATIC_HOT_STANDBYS);
+    let excess = ready_automatic.len().saturating_sub(maximum_automatic);
     let mut victims = ready_automatic
         .into_iter()
         .rev()
@@ -4196,7 +4255,7 @@ async fn evict_excess_ready_standbys(
         match connection.task.await {
             Err(error) if error.is_cancelled() => {
                 println!(
-                    "evicted standby peer {remote} under the {MAX_AUTOMATIC_HOT_STANDBYS}-peer automatic hot-standby capacity"
+                    "evicted standby peer {remote} under the {maximum_automatic}-peer automatic hot-standby capacity"
                 );
                 evicted.push(remote);
             }
@@ -4324,6 +4383,7 @@ async fn try_peer_candidates(
                                 peer_store.map(Arc::as_ref),
                                 manual_remotes,
                                 failures,
+                                options.resources.automatic_hot_standbys,
                             ).await;
                         }
                     }
@@ -4962,7 +5022,16 @@ fn compact_transaction_candidates(
     candidates
 }
 
-fn retain_disconnected_block_transactions(pending: &mut VecDeque<Transaction>, block: &Block) {
+fn retain_disconnected_block_transactions(
+    pending: &mut VecDeque<Transaction>,
+    block: &Block,
+    max_transactions: usize,
+    max_bytes: usize,
+) {
+    let mut pending_bytes = pending
+        .iter()
+        .map(|transaction| serialize(transaction).len())
+        .sum::<usize>();
     for transaction in block
         .txdata
         .iter()
@@ -4970,18 +5039,18 @@ fn retain_disconnected_block_transactions(pending: &mut VecDeque<Transaction>, b
         .rev()
         .filter(|transaction| !transaction.is_coinbase())
     {
-        if serialize(transaction).len() > MAX_ADMITTED_TRANSACTION_BYTES {
+        let transaction_bytes = serialize(transaction).len();
+        if transaction_bytes > MAX_ADMITTED_TRANSACTION_BYTES {
             continue;
         }
         pending.push_front(transaction.clone());
-        while pending.len() > MAX_ADMITTED_TRANSACTIONS
-            || pending
-                .iter()
-                .map(|transaction| serialize(transaction).len())
-                .sum::<usize>()
-                > MAX_ADMITTED_TRANSACTION_BYTES
-        {
-            let _ = pending.pop_back();
+        pending_bytes = pending_bytes.saturating_add(transaction_bytes);
+        while pending.len() > max_transactions || pending_bytes > max_bytes {
+            if let Some(evicted) = pending.pop_back() {
+                pending_bytes = pending_bytes.saturating_sub(serialize(&evicted).len());
+            } else {
+                break;
+            }
         }
     }
 }
@@ -5764,9 +5833,22 @@ async fn sync_validating_node(
     } else {
         persisted_validation_target.or(validation_target)
     };
+    let (mempool_max_transactions, mempool_max_bytes) = {
+        let pool = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (pool.max_transactions(), pool.max_bytes())
+    };
     let transaction_store = validation_target
         .is_none()
-        .then(|| RedbTransactionPoolStore::open(data_dir.join("mempool.redb"), network))
+        .then(|| {
+            RedbTransactionPoolStore::open_with_capacity(
+                data_dir.join("mempool.redb"),
+                network,
+                mempool_max_transactions,
+                mempool_max_bytes,
+            )
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
     let fee_estimator = validation_target
@@ -5930,6 +6012,8 @@ async fn sync_validating_node(
                     retain_disconnected_block_transactions(
                         &mut disconnected_transactions,
                         &disconnected,
+                        mempool_max_transactions,
+                        mempool_max_bytes,
                     );
                     if let Some(store) = &transaction_store {
                         store
@@ -8244,6 +8328,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut active_chainstate_cache_bytes = None;
     let mut background_chainstate_cache_bytes = None;
     let mut bulk_validation_cache_bytes = None;
+    let mut automatic_hot_standbys = None;
+    let mut mempool_max_transactions = None;
+    let mut mempool_max_bytes = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -8552,6 +8639,43 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             }
             "--validation-deferred-repair" => validation_deferred_repair = true,
             "--validation-quick-repair" => validation_deferred_repair = false,
+            "--automatic-hot-standbys" => {
+                if automatic_hot_standbys.is_some() {
+                    return Err(
+                        "--automatic-hot-standbys cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--automatic-hot-standbys")?;
+                automatic_hot_standbys = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid automatic hot-standby limit: {value}"))?,
+                );
+            }
+            "--mempool-max-transactions" => {
+                if mempool_max_transactions.is_some() {
+                    return Err(
+                        "--mempool-max-transactions cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--mempool-max-transactions")?;
+                mempool_max_transactions = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid mempool transaction target: {value}"))?,
+                );
+            }
+            "--mempool-max-bytes" => {
+                if mempool_max_bytes.is_some() {
+                    return Err("--mempool-max-bytes cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--mempool-max-bytes")?;
+                mempool_max_bytes = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid mempool byte target: {value}"))?,
+                );
+            }
             "--chainstate-cache-bytes" => {
                 if active_chainstate_cache_bytes.is_some() {
                     return Err(
@@ -9045,6 +9169,26 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     if mempool_full_rbf && data_dir.is_none() {
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
+    let resource_overridden = automatic_hot_standbys.is_some()
+        || mempool_max_transactions.is_some()
+        || mempool_max_bytes.is_some();
+    if resource_overridden && data_dir.is_none() {
+        return Err("peer and mempool resource options require --data-dir".to_owned());
+    }
+    if resource_overridden
+        && (snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || snapshot_download.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some())
+    {
+        return Err(
+            "peer and mempool resource options apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
+                .to_owned(),
+        );
+    }
     let cache_overridden = active_chainstate_cache_bytes.is_some()
         || background_chainstate_cache_bytes.is_some()
         || bulk_validation_cache_bytes.is_some();
@@ -9224,6 +9368,12 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         validation_limits,
         ledger_retention,
         cache,
+        resources: NodeResourceConfig {
+            automatic_hot_standbys: automatic_hot_standbys
+                .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
+            mempool_max_transactions: mempool_max_transactions.unwrap_or(MAX_ADMITTED_TRANSACTIONS),
+            mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
+        },
         runtime_control: Arc::new(RuntimeControl::default()),
         observer: None,
     })
@@ -9308,7 +9458,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -9678,6 +9828,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         };
@@ -9776,7 +9927,7 @@ mod tests {
             }
         }
 
-        let automatic = (0..MAX_AUTOMATIC_HOT_STANDBYS + 2)
+        let automatic = (0..DEFAULT_AUTOMATIC_HOT_STANDBYS + 2)
             .map(|offset| {
                 (
                     format!("127.0.0.1:{}", 18_500 + offset).parse().unwrap(),
@@ -9792,8 +9943,14 @@ mod tests {
         let mut pending = automatic.into_iter().chain(manual).collect::<VecDeque<_>>();
         let mut failures = Vec::new();
 
-        let evicted =
-            evict_excess_ready_standbys(&mut pending, None, &manual_remotes, &mut failures).await;
+        let evicted = evict_excess_ready_standbys(
+            &mut pending,
+            None,
+            &manual_remotes,
+            &mut failures,
+            DEFAULT_AUTOMATIC_HOT_STANDBYS,
+        )
+        .await;
 
         assert!(failures.is_empty());
         assert_eq!(
@@ -9803,13 +9960,13 @@ mod tests {
                 "127.0.0.1:18509".parse().unwrap(),
             ]
         );
-        assert_eq!(pending.len(), MAX_AUTOMATIC_HOT_STANDBYS + 2);
+        assert_eq!(pending.len(), DEFAULT_AUTOMATIC_HOT_STANDBYS + 2);
         assert_eq!(
             pending
                 .iter()
                 .map(|(remote, _)| *remote)
                 .collect::<Vec<_>>(),
-            (18_500_usize..18_500 + MAX_AUTOMATIC_HOT_STANDBYS)
+            (18_500_usize..18_500 + DEFAULT_AUTOMATIC_HOT_STANDBYS)
                 .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
                 .chain([
                     "127.0.0.1:18600".parse().unwrap(),
@@ -10483,7 +10640,12 @@ mod tests {
             transaction.input[0].previous_output.txid = Txid::from_byte_array([marker; 32]);
             higher.txdata.push(transaction);
         }
-        retain_disconnected_block_transactions(&mut pending, &higher);
+        retain_disconnected_block_transactions(
+            &mut pending,
+            &higher,
+            MAX_ADMITTED_TRANSACTIONS,
+            MAX_ADMITTED_TRANSACTION_BYTES,
+        );
         assert_eq!(pending.len(), 10);
 
         let mut lower = regtest_block(BlockHash::all_zeros(), 2);
@@ -10494,7 +10656,12 @@ mod tests {
             expected.push(transaction.compute_txid());
             lower.txdata.push(transaction);
         }
-        retain_disconnected_block_transactions(&mut pending, &lower);
+        retain_disconnected_block_transactions(
+            &mut pending,
+            &lower,
+            MAX_ADMITTED_TRANSACTIONS,
+            MAX_ADMITTED_TRANSACTION_BYTES,
+        );
 
         assert_eq!(pending.len(), MAX_ADMITTED_TRANSACTIONS);
         assert_eq!(
@@ -11524,6 +11691,9 @@ mod tests {
                 "--complete-assumeutxo",
                 "--background-assumeutxo",
                 "--mempool-full-rbf",
+                "--automatic-hot-standbys",
+                "--mempool-max-transactions",
+                "--mempool-max-bytes",
                 "--cleanup-validation-dir",
                 "--prune-blocks",
                 "--prune-max-bytes",
@@ -11684,6 +11854,72 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_bounds_peer_and_mempool_resource_budgets() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--automatic-hot-standbys",
+                "12",
+                "--mempool-max-transactions",
+                "4096",
+                "--mempool-max-bytes",
+                "314572800",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.resources,
+            NodeResourceConfig {
+                automatic_hot_standbys: 12,
+                mempool_max_transactions: 4_096,
+                mempool_max_bytes: 300 * 1024 * 1024,
+            }
+        );
+
+        for arguments in [
+            vec!["--automatic-hot-standbys", "1"],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--automatic-hot-standbys",
+                "17",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--mempool-max-transactions",
+                "0",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--mempool-max-transactions",
+                "300001",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--mempool-max-bytes",
+                "3999999",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-resource-parser",
+                "--mempool-max-bytes",
+                "1073741825",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn strict_network_config_is_bounded_and_cli_groups_replace_file_values() {
         let directory = TempDir::new().unwrap();
         let config_path = directory.path().join("rbtc.conf");
@@ -11693,6 +11929,9 @@ mod tests {
              data_dir=/from-global\n\
              connect=127.0.0.1:8333\n\
              once=true\n\
+             automatic_hot_standbys=10\n\
+             mempool_max_transactions=2048\n\
+             mempool_max_bytes=314572800\n\
              prune_blocks=500\n\
              explorer_listen=127.0.0.1:3000\n\
              rpc_auth_token_file=/secret/token\n\
@@ -11725,9 +11964,19 @@ mod tests {
             vec!["127.0.0.3:48333".parse::<SocketAddr>().unwrap()]
         );
         assert!(!options.once);
+        assert_eq!(
+            options.resources,
+            NodeResourceConfig {
+                automatic_hot_standbys: 10,
+                mempool_max_transactions: 2_048,
+                mempool_max_bytes: 300 * 1024 * 1024,
+            }
+        );
         assert_eq!(options.ledger_retention.max_blocks, 600);
         let summary = startup_configuration_summary(&options);
         assert!(summary.contains("prune_blocks=600"));
+        assert!(summary.contains("automatic_hot_standbys=10"));
+        assert!(summary.contains("mempool_max_transactions=2048"));
         assert!(summary.contains("api=true rpc=true wallet=false"));
         assert!(!summary.contains("/secret/token"));
 
@@ -11754,6 +12003,11 @@ mod tests {
             active_chainstate_bytes: 256 * 1024 * 1024,
             background_chainstate_bytes: 512 * 1024 * 1024,
             bulk_validation_bytes: 1024 * 1024 * 1024,
+        };
+        config.resources = NodeResourceConfig {
+            automatic_hot_standbys: 4,
+            mempool_max_transactions: 4_096,
+            mempool_max_bytes: 300 * 1024 * 1024,
         };
         config.storage = NodeStorageConfig {
             prune_blocks: 576,
@@ -11786,6 +12040,14 @@ mod tests {
         assert_eq!(options.dns_seeds.unwrap()[0].host, "seed.example.");
         assert!(options.mempool_full_rbf);
         assert_eq!(options.cache.active_chainstate_bytes, 256 * 1024 * 1024);
+        assert_eq!(
+            options.resources,
+            NodeResourceConfig {
+                automatic_hot_standbys: 4,
+                mempool_max_transactions: 4_096,
+                mempool_max_bytes: 300 * 1024 * 1024,
+            }
+        );
         assert_eq!(options.ledger_retention.max_blocks, 576);
         assert_eq!(
             options.background_assumeutxo,
@@ -11816,6 +12078,16 @@ mod tests {
         );
 
         config.cache = NodeCacheConfig::default();
+        config.resources.mempool_max_transactions = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mempool transaction target")
+        );
+
+        config.resources = NodeResourceConfig::default();
         config.api = Some(NodeApiConfig {
             listen: "0.0.0.0:3000".parse().unwrap(),
             rpc_auth_token: None,
@@ -11856,6 +12128,11 @@ mod tests {
             .connect(second)
             .once(true)
             .mempool_full_rbf(true)
+            .resources(NodeResourceConfig {
+                automatic_hot_standbys: 2,
+                mempool_max_transactions: 1_024,
+                mempool_max_bytes: 64 * 1024 * 1024,
+            })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()
             .unwrap();
@@ -11864,6 +12141,8 @@ mod tests {
         assert_eq!(options.remotes, vec![first, second]);
         assert!(options.once);
         assert!(options.mempool_full_rbf);
+        assert_eq!(options.resources.automatic_hot_standbys, 2);
+        assert_eq!(options.resources.mempool_max_transactions, 1_024);
         assert_eq!(options.ledger_retention.max_blocks, 576);
         assert_eq!(options.ledger_retention.max_bytes, DEFAULT_MAX_BYTES);
 
@@ -12479,6 +12758,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -12548,6 +12828,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -13854,6 +14135,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -13912,6 +14194,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         };
@@ -14292,6 +14575,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14384,6 +14668,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14455,6 +14740,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14542,6 +14828,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14600,6 +14887,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14654,6 +14942,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14748,6 +15037,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14808,6 +15098,7 @@ mod tests {
                 },
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
+                resources: NodeResourceConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             }),
@@ -14900,6 +15191,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14921,6 +15213,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn daemon_falls_back_to_dns_and_reuses_the_verified_peer_without_dns() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dns_remote = listener.local_addr().unwrap();
@@ -14981,6 +15274,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15020,6 +15314,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15079,6 +15374,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15132,6 +15428,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15230,6 +15527,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15384,6 +15682,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15489,6 +15788,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15566,6 +15866,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15679,6 +15980,7 @@ mod tests {
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
+                resources: NodeResourceConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             }),
@@ -15827,6 +16129,7 @@ mod tests {
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
+                resources: NodeResourceConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             },
@@ -15945,6 +16248,7 @@ mod tests {
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
+            resources: NodeResourceConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })

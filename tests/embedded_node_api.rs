@@ -6,7 +6,7 @@ use bitcoin::{
 };
 use rbtc::node::{
     NodeApiConfig, NodeBuilder, NodeCacheConfig, NodeConfig, NodeDnsSeed, NodeDnsSeedPolicy,
-    NodeError, NodeEvent, NodeLifecycle, NodeStorageConfig,
+    NodeError, NodeEvent, NodeLifecycle, NodeResourceConfig, NodeStorageConfig,
 };
 use rbtc::p2p::V1Transport;
 use std::{
@@ -133,6 +133,11 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         active_chainstate_bytes: 256 * 1024 * 1024,
         background_chainstate_bytes: 512 * 1024 * 1024,
         bulk_validation_bytes: 1024 * 1024 * 1024,
+    };
+    config.resources = NodeResourceConfig {
+        automatic_hot_standbys: 4,
+        mempool_max_transactions: 4_096,
+        mempool_max_bytes: 300 * 1024 * 1024,
     };
     config.storage = NodeStorageConfig {
         prune_blocks: 576,

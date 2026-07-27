@@ -25,7 +25,8 @@ const BOOL_KEYS: [&str; 5] = [
     "once",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 18] = [
+const VALUE_KEYS: [&str; 21] = [
+    "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
     "background_chainstate_cache_bytes",
@@ -35,6 +36,8 @@ const VALUE_KEYS: [&str; 18] = [
     "data_dir",
     "explorer_listen",
     "minimum_chainwork",
+    "mempool_max_bytes",
+    "mempool_max_transactions",
     "network",
     "prune_blocks",
     "prune_max_bytes",
@@ -320,6 +323,7 @@ fn known_key(key: &str) -> bool {
 fn flag_for_key(key: &str) -> &'static str {
     match key {
         "assumevalid" => "--assumevalid",
+        "automatic_hot_standbys" => "--automatic-hot-standbys",
         "background_assumeutxo" => "--background-assumeutxo",
         "background_chainstate_cache_bytes" => "--background-chainstate-cache-bytes",
         "bulk_validation_cache_bytes" => "--bulk-validation-cache-bytes",
@@ -330,6 +334,8 @@ fn flag_for_key(key: &str) -> &'static str {
         "dns_seed" => "--dns-seed",
         "explorer_listen" => "--explorer-listen",
         "minimum_chainwork" => "--minimum-chainwork",
+        "mempool_max_bytes" => "--mempool-max-bytes",
+        "mempool_max_transactions" => "--mempool-max-transactions",
         "network" => "--network",
         "prune_blocks" => "--prune-blocks",
         "prune_max_bytes" => "--prune-max-bytes",
@@ -359,6 +365,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
         argument,
         "--assumevalid"
             | "--assume-valid"
+            | "--automatic-hot-standbys"
             | "--background-assumeutxo"
             | "--background-chainstate-cache-bytes"
             | "--bulk-validation-cache-bytes"
@@ -371,6 +378,8 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--dns-seeds"
             | "--explorer-listen"
             | "--mempool-full-rbf"
+            | "--mempool-max-bytes"
+            | "--mempool-max-transactions"
             | "--minimum-chainwork"
             | "--network"
             | "--no-cleanup-validation-dir"
@@ -398,6 +407,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
 fn option_group(flag: &str) -> &'static str {
     match flag {
         "--assume-valid" | "--assumevalid" => "assumevalid",
+        "--automatic-hot-standbys" => "automatic-hot-standbys",
         "--cleanup-validation-dir" | "--no-cleanup-validation-dir" => "cleanup-validation-dir",
         "--dns-seed" | "--dns-seeds" | "--no-dns-seeds" | "--signetseednode" => "dns-seeds",
         "--mempool-full-rbf" | "--no-mempool-full-rbf" => "mempool-full-rbf",
@@ -412,6 +422,8 @@ fn option_group(flag: &str) -> &'static str {
         "--data-dir" => "data-dir",
         "--explorer-listen" => "explorer-listen",
         "--minimum-chainwork" => "minimum-chainwork",
+        "--mempool-max-bytes" => "mempool-max-bytes",
+        "--mempool-max-transactions" => "mempool-max-transactions",
         "--network" => "network",
         "--prune-blocks" => "prune-blocks",
         "--prune-max-bytes" => "prune-max-bytes",

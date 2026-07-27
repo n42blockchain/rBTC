@@ -21,6 +21,9 @@ data_dir=/var/lib/rbtc/bitcoin
 dns_seeds=true
 once=false
 mempool_full_rbf=false
+automatic_hot_standbys=8
+mempool_max_transactions=64
+mempool_max_bytes=4000000
 prune_blocks=1008
 prune_max_bytes=1073741824
 chainstate_cache_bytes=1073741824
@@ -45,6 +48,8 @@ The supported scalar keys are:
   `validation_batch_size`, `validation_pause_ms`
 - `prune_blocks`, `prune_max_bytes`, `chainstate_cache_bytes`,
   `background_chainstate_cache_bytes`, `bulk_validation_cache_bytes`
+- `automatic_hot_standbys` (0–16), `mempool_max_transactions`
+  (1–300,000), and `mempool_max_bytes` (4,000,000–1,073,741,824)
 - Boolean `dns_seeds`, `once`, `mempool_full_rbf`,
   `cleanup_validation_dir`, and `validation_deferred_repair`
 
@@ -61,6 +66,6 @@ destructive or exceptional operating mode.
 Before opening durable state or connecting peers, a persistent launch prints
 one bounded effective-configuration summary covering the selected network,
 data directory, peer/DNS counts, active/background/bulk cache bytes, freezer
-targets, validation resources, and enabled API surfaces. It reports only
+targets, hot-standby and mempool ceilings, validation resources, and enabled API surfaces. It reports only
 booleans for RPC/wallet enablement and never prints authentication paths,
 descriptor paths, or credential contents.

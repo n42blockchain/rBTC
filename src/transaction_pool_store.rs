@@ -16,7 +16,10 @@ use bitcoin::{
 use redb::{Database, ReadableTable, TableDefinition};
 use thiserror::Error;
 
-use crate::transaction_admission::{MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS};
+use crate::transaction_admission::{
+    MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS, MAX_CONFIGURED_MEMPOOL_BYTES,
+    MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
+};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("transaction_pool_metadata");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("transaction_pool_snapshots");
@@ -27,18 +30,53 @@ const RELAY_ATTEMPTS_KEY: &str = "relay_attempts";
 const ADMISSION_TIMES_KEY: &str = "admission_times";
 const SNAPSHOT_VERSION: u8 = 1;
 const SNAPSHOT_HEADER_BYTES: usize = 5;
-const MAX_SNAPSHOT_BYTES: usize =
-    SNAPSHOT_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * 4 + MAX_ADMITTED_TRANSACTION_BYTES;
 const RELAY_ATTEMPTS_VERSION: u8 = 1;
 const RELAY_ATTEMPTS_HEADER_BYTES: usize = 5;
 const RELAY_ATTEMPT_BYTES: usize = 36;
-const MAX_RELAY_ATTEMPTS_BYTES: usize =
-    RELAY_ATTEMPTS_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * RELAY_ATTEMPT_BYTES;
 const ADMISSION_TIMES_VERSION: u8 = 1;
 const ADMISSION_TIMES_HEADER_BYTES: usize = 5;
 const ADMISSION_TIME_BYTES: usize = 36;
-const MAX_ADMISSION_TIMES_BYTES: usize =
-    ADMISSION_TIMES_HEADER_BYTES + MAX_ADMITTED_TRANSACTIONS * ADMISSION_TIME_BYTES;
+
+#[derive(Clone, Copy)]
+struct PoolLimits {
+    max_transactions: usize,
+    max_bytes: usize,
+}
+
+impl PoolLimits {
+    const DEFAULT: Self = Self {
+        max_transactions: MAX_ADMITTED_TRANSACTIONS,
+        max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
+    };
+    const HARD: Self = Self {
+        max_transactions: MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
+        max_bytes: MAX_CONFIGURED_MEMPOOL_BYTES,
+    };
+
+    fn validate(self) -> Result<Self, TransactionPoolStoreError> {
+        if !(1..=MAX_CONFIGURED_MEMPOOL_TRANSACTIONS).contains(&self.max_transactions)
+            || !(MAX_ADMITTED_TRANSACTION_BYTES..=MAX_CONFIGURED_MEMPOOL_BYTES)
+                .contains(&self.max_bytes)
+        {
+            return Err(TransactionPoolStoreError::Malformed(
+                "invalid transaction-pool capacity",
+            ));
+        }
+        Ok(self)
+    }
+
+    const fn snapshot_bytes(self) -> usize {
+        SNAPSHOT_HEADER_BYTES + self.max_transactions * 4 + self.max_bytes
+    }
+
+    const fn relay_attempt_bytes(self) -> usize {
+        RELAY_ATTEMPTS_HEADER_BYTES + self.max_transactions * RELAY_ATTEMPT_BYTES
+    }
+
+    const fn admission_time_bytes(self) -> usize {
+        ADMISSION_TIMES_HEADER_BYTES + self.max_transactions * ADMISSION_TIME_BYTES
+    }
+}
 
 /// Bitcoin Core's default 336-hour mempool expiry.
 pub const DEFAULT_MEMPOOL_EXPIRY_SECS: u32 = 14 * 24 * 60 * 60;
@@ -79,6 +117,7 @@ pub enum TransactionPoolStoreError {
 pub struct RedbTransactionPoolStore {
     db: Database,
     write_guard: Mutex<()>,
+    limits: PoolLimits,
 }
 
 /// Validates one raw persisted transaction-pool snapshot without opening a database.
@@ -87,21 +126,21 @@ pub struct RedbTransactionPoolStore {
 pub fn validate_persisted_transaction_pool_snapshot(
     bytes: &[u8],
 ) -> Result<(), TransactionPoolStoreError> {
-    decode_snapshot(bytes).map(|_| ())
+    decode_snapshot(bytes, PoolLimits::HARD).map(|_| ())
 }
 
 /// Validates raw persisted peer-transaction relay metadata without opening a database.
 pub fn validate_persisted_transaction_relay_attempts(
     bytes: &[u8],
 ) -> Result<(), TransactionPoolStoreError> {
-    decode_relay_attempts(bytes).map(|_| ())
+    decode_relay_attempts(bytes, PoolLimits::HARD).map(|_| ())
 }
 
 /// Validates raw persisted transaction admission times without opening a database.
 pub fn validate_persisted_transaction_admission_times(
     bytes: &[u8],
 ) -> Result<(), TransactionPoolStoreError> {
-    decode_admission_times(bytes).map(|_| ())
+    decode_admission_times(bytes, PoolLimits::HARD).map(|_| ())
 }
 
 impl RedbTransactionPoolStore {
@@ -110,7 +149,29 @@ impl RedbTransactionPoolStore {
         path: impl AsRef<Path>,
         network: Network,
     ) -> Result<Self, TransactionPoolStoreError> {
-        Self::open_at(path, network, current_unix_time()?)
+        Self::open_at_with_capacity(
+            path,
+            network,
+            current_unix_time()?,
+            PoolLimits::DEFAULT.max_transactions,
+            PoolLimits::DEFAULT.max_bytes,
+        )
+    }
+
+    /// Opens a store with the same validated capacity as its in-memory pool.
+    pub fn open_with_capacity(
+        path: impl AsRef<Path>,
+        network: Network,
+        max_transactions: usize,
+        max_bytes: usize,
+    ) -> Result<Self, TransactionPoolStoreError> {
+        Self::open_at_with_capacity(
+            path,
+            network,
+            current_unix_time()?,
+            max_transactions,
+            max_bytes,
+        )
     }
 
     /// Opens a store using an explicit wall-clock time for deterministic migration.
@@ -119,6 +180,28 @@ impl RedbTransactionPoolStore {
         network: Network,
         now: u32,
     ) -> Result<Self, TransactionPoolStoreError> {
+        Self::open_at_with_capacity(
+            path,
+            network,
+            now,
+            PoolLimits::DEFAULT.max_transactions,
+            PoolLimits::DEFAULT.max_bytes,
+        )
+    }
+
+    /// Opens a capacity-aware store using an explicit wall clock.
+    pub fn open_at_with_capacity(
+        path: impl AsRef<Path>,
+        network: Network,
+        now: u32,
+        max_transactions: usize,
+        max_bytes: usize,
+    ) -> Result<Self, TransactionPoolStoreError> {
+        let limits = PoolLimits {
+            max_transactions,
+            max_bytes,
+        }
+        .validate()?;
         let path = path.as_ref();
         validate_file_before_open(path)?;
         let db = Database::create(path)?;
@@ -137,9 +220,9 @@ impl RedbTransactionPoolStore {
             let mut snapshots = write.open_table(SNAPSHOTS)?;
             for key in [SNAPSHOT_KEY, DISCONNECTED_KEY] {
                 if let Some(snapshot) = snapshots.get(key)? {
-                    decode_snapshot(snapshot.value())?;
+                    decode_snapshot(snapshot.value(), limits)?;
                 } else {
-                    let empty = encode_snapshot(&[])?;
+                    let empty = encode_snapshot(&[], limits)?;
                     snapshots.insert(key, empty.as_slice())?;
                 }
             }
@@ -148,12 +231,13 @@ impl RedbTransactionPoolStore {
                     .get(SNAPSHOT_KEY)?
                     .expect("active snapshot was initialized above")
                     .value(),
+                limits,
             )?
             .into_iter()
             .map(|transaction| transaction.compute_txid())
             .collect::<HashSet<_>>();
             if let Some(attempts) = snapshots.get(RELAY_ATTEMPTS_KEY)? {
-                if !decode_relay_attempts(attempts.value())?
+                if !decode_relay_attempts(attempts.value(), limits)?
                     .keys()
                     .all(|txid| active.contains(txid))
                 {
@@ -162,11 +246,11 @@ impl RedbTransactionPoolStore {
                     ));
                 }
             } else {
-                let empty = encode_relay_attempts(&BTreeMap::new())?;
+                let empty = encode_relay_attempts(&BTreeMap::new(), limits)?;
                 snapshots.insert(RELAY_ATTEMPTS_KEY, empty.as_slice())?;
             }
             if let Some(times) = snapshots.get(ADMISSION_TIMES_KEY)? {
-                let times = decode_admission_times(times.value())?;
+                let times = decode_admission_times(times.value(), limits)?;
                 if times.keys().copied().collect::<HashSet<_>>() != active {
                     return Err(TransactionPoolStoreError::Malformed(
                         "admission times do not match active transactions",
@@ -178,7 +262,7 @@ impl RedbTransactionPoolStore {
                     .copied()
                     .map(|txid| (txid, now))
                     .collect::<BTreeMap<_, _>>();
-                let migrated = encode_admission_times(&migrated)?;
+                let migrated = encode_admission_times(&migrated, limits)?;
                 snapshots.insert(ADMISSION_TIMES_KEY, migrated.as_slice())?;
             }
         }
@@ -186,6 +270,7 @@ impl RedbTransactionPoolStore {
         Ok(Self {
             db,
             write_guard: Mutex::new(()),
+            limits,
         })
     }
 
@@ -210,7 +295,7 @@ impl RedbTransactionPoolStore {
             .ok_or(TransactionPoolStoreError::Malformed(
                 "missing transaction-pool snapshot",
             ))?;
-        decode_snapshot(snapshot.value())
+        decode_snapshot(snapshot.value(), self.limits)
     }
 
     /// Atomically replaces the durable snapshot after validating every invariant.
@@ -224,7 +309,7 @@ impl RedbTransactionPoolStore {
         transactions: &[Transaction],
         now: u32,
     ) -> Result<(), TransactionPoolStoreError> {
-        let encoded = encode_snapshot(transactions)?;
+        let encoded = encode_snapshot(transactions, self.limits)?;
         self.replace_active_encoded(&encoded, transactions, now, &BTreeSet::new())
     }
 
@@ -233,7 +318,7 @@ impl RedbTransactionPoolStore {
         &self,
         transactions: &[Transaction],
     ) -> Result<(), TransactionPoolStoreError> {
-        let encoded = encode_snapshot(transactions)?;
+        let encoded = encode_snapshot(transactions, self.limits)?;
         self.replace_encoded(DISCONNECTED_KEY, &encoded)
     }
 
@@ -273,19 +358,19 @@ impl RedbTransactionPoolStore {
                 let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
                     TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
                 )?;
-                decode_relay_attempts(stored.value())?
+                decode_relay_attempts(stored.value(), self.limits)?
             };
             let active = transactions
                 .iter()
                 .map(Transaction::compute_txid)
                 .collect::<HashSet<_>>();
             attempts.retain(|txid, _| active.contains(txid));
-            let attempts = encode_relay_attempts(&attempts)?;
+            let attempts = encode_relay_attempts(&attempts, self.limits)?;
             let mut admission_times = {
                 let stored = snapshots.get(ADMISSION_TIMES_KEY)?.ok_or(
                     TransactionPoolStoreError::Malformed("missing transaction admission times"),
                 )?;
-                decode_admission_times(stored.value())?
+                decode_admission_times(stored.value(), self.limits)?
             };
             admission_times.retain(|txid, _| active.contains(txid));
             for txid in &active {
@@ -295,7 +380,7 @@ impl RedbTransactionPoolStore {
                     admission_times.entry(*txid).or_insert(now);
                 }
             }
-            let admission_times = encode_admission_times(&admission_times)?;
+            let admission_times = encode_admission_times(&admission_times, self.limits)?;
             snapshots.insert(SNAPSHOT_KEY, encoded)?;
             snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
             snapshots.insert(ADMISSION_TIMES_KEY, admission_times.as_slice())?;
@@ -319,8 +404,8 @@ impl RedbTransactionPoolStore {
         now: u32,
         reset_admission_times: &BTreeSet<Txid>,
     ) -> Result<(), TransactionPoolStoreError> {
-        let encoded = encode_snapshot(transactions)?;
-        let empty = encode_snapshot(&[])?;
+        let encoded = encode_snapshot(transactions, self.limits)?;
+        let empty = encode_snapshot(&[], self.limits)?;
         self.replace_active_and_disconnected_encoded(
             &encoded,
             &empty,
@@ -349,19 +434,19 @@ impl RedbTransactionPoolStore {
                 let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
                     TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
                 )?;
-                decode_relay_attempts(stored.value())?
+                decode_relay_attempts(stored.value(), self.limits)?
             };
             let active = transactions
                 .iter()
                 .map(Transaction::compute_txid)
                 .collect::<HashSet<_>>();
             attempts.retain(|txid, _| active.contains(txid));
-            let attempts = encode_relay_attempts(&attempts)?;
+            let attempts = encode_relay_attempts(&attempts, self.limits)?;
             let mut admission_times = {
                 let stored = snapshots.get(ADMISSION_TIMES_KEY)?.ok_or(
                     TransactionPoolStoreError::Malformed("missing transaction admission times"),
                 )?;
-                decode_admission_times(stored.value())?
+                decode_admission_times(stored.value(), self.limits)?
             };
             admission_times.retain(|txid, _| active.contains(txid));
             for txid in &active {
@@ -371,7 +456,7 @@ impl RedbTransactionPoolStore {
                     admission_times.entry(*txid).or_insert(now);
                 }
             }
-            let admission_times = encode_admission_times(&admission_times)?;
+            let admission_times = encode_admission_times(&admission_times, self.limits)?;
             snapshots.insert(SNAPSHOT_KEY, active_encoded)?;
             snapshots.insert(DISCONNECTED_KEY, disconnected_encoded)?;
             snapshots.insert(RELAY_ATTEMPTS_KEY, attempts.as_slice())?;
@@ -397,6 +482,7 @@ impl RedbTransactionPoolStore {
                     "missing transaction-pool snapshot",
                 ))?
                 .value(),
+            self.limits,
         )?;
         let attempts = decode_relay_attempts(
             snapshots
@@ -405,6 +491,7 @@ impl RedbTransactionPoolStore {
                     "missing transaction relay attempts",
                 ))?
                 .value(),
+            self.limits,
         )?;
         Ok(transactions
             .into_iter()
@@ -413,7 +500,7 @@ impl RedbTransactionPoolStore {
                     .get(&transaction.compute_txid())
                     .is_none_or(|attempt| now.saturating_sub(*attempt) >= interval_secs)
             })
-            .take(limit.min(MAX_ADMITTED_TRANSACTIONS))
+            .take(limit.min(self.limits.max_transactions))
             .collect())
     }
 
@@ -432,6 +519,7 @@ impl RedbTransactionPoolStore {
                     "missing transaction-pool snapshot",
                 ))?
                 .value(),
+            self.limits,
         )?
         .into_iter()
         .map(|transaction| transaction.compute_txid())
@@ -443,6 +531,7 @@ impl RedbTransactionPoolStore {
                     "missing transaction admission times",
                 ))?
                 .value(),
+            self.limits,
         )?;
         if admission_times.keys().copied().collect::<BTreeSet<_>>() != active {
             return Err(TransactionPoolStoreError::Malformed(
@@ -463,7 +552,7 @@ impl RedbTransactionPoolStore {
         txids: &[Txid],
         now: u32,
     ) -> Result<usize, TransactionPoolStoreError> {
-        if txids.len() > MAX_ADMITTED_TRANSACTIONS {
+        if txids.len() > self.limits.max_transactions {
             return Err(TransactionPoolStoreError::Malformed(
                 "too many transaction relay attempts",
             ));
@@ -486,7 +575,7 @@ impl RedbTransactionPoolStore {
                     let stored = snapshots.get(SNAPSHOT_KEY)?.ok_or(
                         TransactionPoolStoreError::Malformed("missing transaction-pool snapshot"),
                     )?;
-                    decode_snapshot(stored.value())?
+                    decode_snapshot(stored.value(), self.limits)?
                         .into_iter()
                         .map(|transaction| transaction.compute_txid())
                         .collect::<HashSet<_>>()
@@ -500,14 +589,14 @@ impl RedbTransactionPoolStore {
                 let stored = snapshots.get(RELAY_ATTEMPTS_KEY)?.ok_or(
                     TransactionPoolStoreError::Malformed("missing transaction relay attempts"),
                 )?;
-                decode_relay_attempts(stored.value())?
+                decode_relay_attempts(stored.value(), self.limits)?
             };
             attempts.retain(|txid, _| active.contains(txid));
             for txid in requested {
                 attempts.insert(txid, now);
             }
             let recorded = attempts.len();
-            let encoded = encode_relay_attempts(&attempts)?;
+            let encoded = encode_relay_attempts(&attempts, self.limits)?;
             snapshots.insert(RELAY_ATTEMPTS_KEY, encoded.as_slice())?;
             recorded
         };
@@ -516,8 +605,11 @@ impl RedbTransactionPoolStore {
     }
 }
 
-fn encode_snapshot(transactions: &[Transaction]) -> Result<Vec<u8>, TransactionPoolStoreError> {
-    validate_transactions(transactions)?;
+fn encode_snapshot(
+    transactions: &[Transaction],
+    limits: PoolLimits,
+) -> Result<Vec<u8>, TransactionPoolStoreError> {
+    validate_transactions(transactions, limits)?;
     let count = u32::try_from(transactions.len())
         .map_err(|_| TransactionPoolStoreError::Malformed("transaction count overflow"))?;
     let mut encoded = Vec::with_capacity(
@@ -537,7 +629,7 @@ fn encode_snapshot(transactions: &[Transaction]) -> Result<Vec<u8>, TransactionP
         encoded.extend_from_slice(&len.to_le_bytes());
         encoded.extend_from_slice(&raw);
     }
-    if encoded.len() > MAX_SNAPSHOT_BYTES {
+    if encoded.len() > limits.snapshot_bytes() {
         return Err(TransactionPoolStoreError::Malformed(
             "transaction-pool snapshot is oversized",
         ));
@@ -545,8 +637,11 @@ fn encode_snapshot(transactions: &[Transaction]) -> Result<Vec<u8>, TransactionP
     Ok(encoded)
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
-    if bytes.len() < SNAPSHOT_HEADER_BYTES || bytes.len() > MAX_SNAPSHOT_BYTES {
+fn decode_snapshot(
+    bytes: &[u8],
+    limits: PoolLimits,
+) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
+    if bytes.len() < SNAPSHOT_HEADER_BYTES || bytes.len() > limits.snapshot_bytes() {
         return Err(TransactionPoolStoreError::Malformed(
             "invalid transaction-pool snapshot length",
         ));
@@ -562,13 +657,14 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Vec<Transaction>, TransactionPoolStor
             .expect("snapshot header has exact length"),
     ))
     .map_err(|_| TransactionPoolStoreError::Malformed("transaction count overflow"))?;
-    if count > MAX_ADMITTED_TRANSACTIONS {
+    if count > limits.max_transactions {
         return Err(TransactionPoolStoreError::Malformed(
             "too many persisted transactions",
         ));
     }
     let mut cursor = SNAPSHOT_HEADER_BYTES;
-    let mut transactions = Vec::with_capacity(count);
+    let mut transactions =
+        Vec::with_capacity(count.min(bytes.len().saturating_sub(SNAPSHOT_HEADER_BYTES) / 5));
     let mut serialized_bytes = 0_usize;
     for _ in 0..count {
         let length_end = cursor
@@ -586,7 +682,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Vec<Transaction>, TransactionPoolStor
         cursor = length_end;
         serialized_bytes = serialized_bytes
             .checked_add(transaction_len)
-            .filter(|total| *total <= MAX_ADMITTED_TRANSACTION_BYTES)
+            .filter(|total| *total <= limits.max_bytes)
             .ok_or(TransactionPoolStoreError::Malformed(
                 "persisted transactions exceed the byte limit",
             ))?;
@@ -616,12 +712,15 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Vec<Transaction>, TransactionPoolStor
             "trailing transaction-pool snapshot bytes",
         ));
     }
-    validate_transactions(&transactions)?;
+    validate_transactions(&transactions, limits)?;
     Ok(transactions)
 }
 
-fn validate_transactions(transactions: &[Transaction]) -> Result<(), TransactionPoolStoreError> {
-    if transactions.len() > MAX_ADMITTED_TRANSACTIONS {
+fn validate_transactions(
+    transactions: &[Transaction],
+    limits: PoolLimits,
+) -> Result<(), TransactionPoolStoreError> {
+    if transactions.len() > limits.max_transactions {
         return Err(TransactionPoolStoreError::Malformed(
             "too many persisted transactions",
         ));
@@ -641,7 +740,7 @@ fn validate_transactions(transactions: &[Transaction]) -> Result<(), Transaction
         }
         retained_bytes = retained_bytes
             .checked_add(serialize(transaction).len())
-            .filter(|total| *total <= MAX_ADMITTED_TRANSACTION_BYTES)
+            .filter(|total| *total <= limits.max_bytes)
             .ok_or(TransactionPoolStoreError::Malformed(
                 "persisted transactions exceed the byte limit",
             ))?;
@@ -676,8 +775,9 @@ fn validate_transactions(transactions: &[Transaction]) -> Result<(), Transaction
 
 fn encode_relay_attempts(
     attempts: &BTreeMap<Txid, u32>,
+    limits: PoolLimits,
 ) -> Result<Vec<u8>, TransactionPoolStoreError> {
-    if attempts.len() > MAX_ADMITTED_TRANSACTIONS {
+    if attempts.len() > limits.max_transactions {
         return Err(TransactionPoolStoreError::Malformed(
             "too many transaction relay attempts",
         ));
@@ -695,8 +795,11 @@ fn encode_relay_attempts(
     Ok(encoded)
 }
 
-fn decode_relay_attempts(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
-    if bytes.len() < RELAY_ATTEMPTS_HEADER_BYTES || bytes.len() > MAX_RELAY_ATTEMPTS_BYTES {
+fn decode_relay_attempts(
+    bytes: &[u8],
+    limits: PoolLimits,
+) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
+    if bytes.len() < RELAY_ATTEMPTS_HEADER_BYTES || bytes.len() > limits.relay_attempt_bytes() {
         return Err(TransactionPoolStoreError::Malformed(
             "invalid transaction relay attempts length",
         ));
@@ -712,7 +815,7 @@ fn decode_relay_attempts(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, Transactio
             .expect("relay attempts header has exact length"),
     ))
     .map_err(|_| TransactionPoolStoreError::Malformed("relay attempt count overflow"))?;
-    if count > MAX_ADMITTED_TRANSACTIONS
+    if count > limits.max_transactions
         || bytes.len() != RELAY_ATTEMPTS_HEADER_BYTES + count * RELAY_ATTEMPT_BYTES
     {
         return Err(TransactionPoolStoreError::Malformed(
@@ -745,8 +848,9 @@ fn decode_relay_attempts(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, Transactio
 
 fn encode_admission_times(
     admission_times: &BTreeMap<Txid, u32>,
+    limits: PoolLimits,
 ) -> Result<Vec<u8>, TransactionPoolStoreError> {
-    if admission_times.len() > MAX_ADMITTED_TRANSACTIONS {
+    if admission_times.len() > limits.max_transactions {
         return Err(TransactionPoolStoreError::Malformed(
             "too many transaction admission times",
         ));
@@ -765,8 +869,11 @@ fn encode_admission_times(
     Ok(encoded)
 }
 
-fn decode_admission_times(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
-    if bytes.len() < ADMISSION_TIMES_HEADER_BYTES || bytes.len() > MAX_ADMISSION_TIMES_BYTES {
+fn decode_admission_times(
+    bytes: &[u8],
+    limits: PoolLimits,
+) -> Result<BTreeMap<Txid, u32>, TransactionPoolStoreError> {
+    if bytes.len() < ADMISSION_TIMES_HEADER_BYTES || bytes.len() > limits.admission_time_bytes() {
         return Err(TransactionPoolStoreError::Malformed(
             "invalid transaction admission times length",
         ));
@@ -782,7 +889,7 @@ fn decode_admission_times(bytes: &[u8]) -> Result<BTreeMap<Txid, u32>, Transacti
             .expect("admission times header has exact length"),
     ))
     .map_err(|_| TransactionPoolStoreError::Malformed("admission time count overflow"))?;
-    if count > MAX_ADMITTED_TRANSACTIONS
+    if count > limits.max_transactions
         || bytes.len() != ADMISSION_TIMES_HEADER_BYTES + count * ADMISSION_TIME_BYTES
     {
         return Err(TransactionPoolStoreError::Malformed(
@@ -1156,15 +1263,19 @@ mod tests {
     #[test]
     fn admission_times_parser_rejects_duplicates_and_bad_lengths() {
         let txid = transaction(45).compute_txid();
-        let valid = encode_admission_times(&BTreeMap::from([(txid, 1)])).unwrap();
-        assert_eq!(decode_admission_times(&valid).unwrap()[&txid], 1);
-        assert!(decode_admission_times(&valid[..valid.len() - 1]).is_err());
+        let valid =
+            encode_admission_times(&BTreeMap::from([(txid, 1)]), PoolLimits::DEFAULT).unwrap();
+        assert_eq!(
+            decode_admission_times(&valid, PoolLimits::DEFAULT).unwrap()[&txid],
+            1
+        );
+        assert!(decode_admission_times(&valid[..valid.len() - 1], PoolLimits::DEFAULT).is_err());
         let mut duplicate = valid.clone();
         duplicate[1..5].copy_from_slice(&2_u32.to_le_bytes());
         duplicate.extend_from_slice(&txid.to_byte_array());
         duplicate.extend_from_slice(&2_u32.to_le_bytes());
         assert!(matches!(
-            decode_admission_times(&duplicate),
+            decode_admission_times(&duplicate, PoolLimits::DEFAULT),
             Err(TransactionPoolStoreError::Malformed(
                 "duplicate transaction admission time"
             ))
@@ -1185,7 +1296,7 @@ mod tests {
             {
                 let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
                 let unknown = BTreeMap::from([(transaction(47).compute_txid(), 100)]);
-                let encoded = encode_admission_times(&unknown).unwrap();
+                let encoded = encode_admission_times(&unknown, PoolLimits::DEFAULT).unwrap();
                 snapshots
                     .insert(ADMISSION_TIMES_KEY, encoded.as_slice())
                     .unwrap();
@@ -1228,15 +1339,19 @@ mod tests {
     #[test]
     fn relay_schedule_parser_rejects_duplicates_and_bad_lengths() {
         let txid = transaction(34).compute_txid();
-        let valid = encode_relay_attempts(&BTreeMap::from([(txid, 1)])).unwrap();
-        assert_eq!(decode_relay_attempts(&valid).unwrap()[&txid], 1);
-        assert!(decode_relay_attempts(&valid[..valid.len() - 1]).is_err());
+        let valid =
+            encode_relay_attempts(&BTreeMap::from([(txid, 1)]), PoolLimits::DEFAULT).unwrap();
+        assert_eq!(
+            decode_relay_attempts(&valid, PoolLimits::DEFAULT).unwrap()[&txid],
+            1
+        );
+        assert!(decode_relay_attempts(&valid[..valid.len() - 1], PoolLimits::DEFAULT).is_err());
         let mut duplicate = valid.clone();
         duplicate[1..5].copy_from_slice(&2_u32.to_le_bytes());
         duplicate.extend_from_slice(&txid.to_byte_array());
         duplicate.extend_from_slice(&2_u32.to_le_bytes());
         assert!(matches!(
-            decode_relay_attempts(&duplicate),
+            decode_relay_attempts(&duplicate, PoolLimits::DEFAULT),
             Err(TransactionPoolStoreError::Malformed(
                 "duplicate transaction relay attempt"
             ))
@@ -1257,7 +1372,7 @@ mod tests {
             {
                 let mut snapshots = write.open_table(SNAPSHOTS).unwrap();
                 let unknown = BTreeMap::from([(transaction(36).compute_txid(), 1_800_000_000_u32)]);
-                let encoded = encode_relay_attempts(&unknown).unwrap();
+                let encoded = encode_relay_attempts(&unknown, PoolLimits::DEFAULT).unwrap();
                 snapshots
                     .insert(RELAY_ATTEMPTS_KEY, encoded.as_slice())
                     .unwrap();
@@ -1372,19 +1487,53 @@ mod tests {
     #[test]
     fn parser_rejects_truncation_trailing_bytes_and_oversized_counts() {
         let transaction = transaction(3);
-        let valid = encode_snapshot(&[transaction]).unwrap();
-        assert!(decode_snapshot(&valid).is_ok());
-        assert!(decode_snapshot(&valid[..valid.len() - 1]).is_err());
+        let valid = encode_snapshot(&[transaction], PoolLimits::DEFAULT).unwrap();
+        assert!(decode_snapshot(&valid, PoolLimits::DEFAULT).is_ok());
+        assert!(decode_snapshot(&valid[..valid.len() - 1], PoolLimits::DEFAULT).is_err());
         let mut trailing = valid.clone();
         trailing.push(0);
-        assert!(decode_snapshot(&trailing).is_err());
+        assert!(decode_snapshot(&trailing, PoolLimits::DEFAULT).is_err());
         let mut excessive = vec![SNAPSHOT_VERSION];
         excessive.extend_from_slice(
             &u32::try_from(MAX_ADMITTED_TRANSACTIONS + 1)
                 .unwrap()
                 .to_le_bytes(),
         );
-        assert!(decode_snapshot(&excessive).is_err());
+        assert!(decode_snapshot(&excessive, PoolLimits::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn configured_capacity_is_preserved_across_reopen() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mempool.redb");
+        let transactions = (1..=65).map(transaction).collect::<Vec<_>>();
+        {
+            let store = RedbTransactionPoolStore::open_at_with_capacity(
+                &path,
+                Network::Regtest,
+                100,
+                65,
+                MAX_ADMITTED_TRANSACTION_BYTES,
+            )
+            .unwrap();
+            store.replace_at(&transactions, 100).unwrap();
+        }
+        let reopened = RedbTransactionPoolStore::open_at_with_capacity(
+            &path,
+            Network::Regtest,
+            101,
+            65,
+            MAX_ADMITTED_TRANSACTION_BYTES,
+        )
+        .unwrap();
+        assert_eq!(reopened.transactions().unwrap(), transactions);
+        drop(reopened);
+        assert!(matches!(
+            RedbTransactionPoolStore::open(&path, Network::Regtest),
+            Err(TransactionPoolStoreError::Malformed(
+                "too many persisted transactions"
+            ))
+        ));
     }
 
     #[cfg(unix)]

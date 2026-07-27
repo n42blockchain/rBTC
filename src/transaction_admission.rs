@@ -29,6 +29,10 @@ use crate::{
 pub const MAX_ADMITTED_TRANSACTIONS: usize = 64;
 /// Maximum witness-serialized bytes retained by the local admission pool.
 pub const MAX_ADMITTED_TRANSACTION_BYTES: usize = 4_000_000;
+/// Hard operator-configurable transaction-count ceiling.
+pub const MAX_CONFIGURED_MEMPOOL_TRANSACTIONS: usize = 300_000;
+/// Hard operator-configurable retained-byte ceiling.
+pub const MAX_CONFIGURED_MEMPOOL_BYTES: usize = 1024 * 1024 * 1024;
 /// Maximum number of missing-parent transactions retained across peer failover.
 pub const MAX_ORPHAN_TRANSACTIONS: usize = 64;
 /// Maximum witness-serialized bytes retained by the orphan pool.
@@ -357,7 +361,7 @@ struct ReplacementPlan {
 }
 
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TransactionAdmissionPool {
     entries: VecDeque<AdmittedTransaction>,
     spent: BTreeMap<OutPoint, Txid>,
@@ -377,9 +381,59 @@ pub struct TransactionAdmissionPool {
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
     observed_chain_tip: Option<BlockHash>,
+    max_transactions: usize,
+    max_bytes: usize,
+}
+
+impl Default for TransactionAdmissionPool {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            spent: BTreeMap::new(),
+            retained_bytes: 0,
+            orphans: VecDeque::new(),
+            orphan_bytes: 0,
+            orphans_by_outpoint: BTreeMap::new(),
+            orphan_work_by_source: BTreeMap::new(),
+            orphan_parent_requests_by_source: BTreeMap::new(),
+            recent_rejected_txids: VecDeque::new(),
+            recent_rejected_txid_set: BTreeSet::new(),
+            recent_confirmed_ids: VecDeque::new(),
+            recent_confirmed_id_set: BTreeSet::new(),
+            transaction_request_announcements: VecDeque::new(),
+            next_transaction_request_sequence: 0,
+            rolling_minimum_fee_sat_kvb: 0,
+            rolling_fee_last_update: 0,
+            rolling_fee_decay_enabled: false,
+            observed_chain_tip: None,
+            max_transactions: MAX_ADMITTED_TRANSACTIONS,
+            max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
+        }
+    }
 }
 
 impl TransactionAdmissionPool {
+    /// Creates an empty pool with node-validated resource ceilings.
+    pub(crate) fn with_capacity(max_transactions: usize, max_bytes: usize) -> Self {
+        Self {
+            max_transactions,
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
+    /// Configured transaction-count ceiling.
+    #[must_use]
+    pub const fn max_transactions(&self) -> usize {
+        self.max_transactions
+    }
+
+    /// Configured retained-byte ceiling.
+    #[must_use]
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Returns the number of retained transactions.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1377,9 +1431,7 @@ impl TransactionAdmissionPool {
         protected: &BTreeSet<Txid>,
     ) -> Result<usize, TransactionAdmissionError> {
         let mut evicted = 0;
-        while self.entries.len() > MAX_ADMITTED_TRANSACTIONS
-            || self.retained_bytes > MAX_ADMITTED_TRANSACTION_BYTES
-        {
+        while self.entries.len() > self.max_transactions || self.retained_bytes > self.max_bytes {
             let removed = self
                 .entries
                 .iter()
@@ -1428,9 +1480,9 @@ impl TransactionAdmissionPool {
             return;
         }
         let mut half_life = f64::from(ROLLING_FEE_HALFLIFE_SECS);
-        if self.retained_bytes < MAX_ADMITTED_TRANSACTION_BYTES / 4 {
+        if self.retained_bytes < self.max_bytes / 4 {
             half_life /= 4.0;
-        } else if self.retained_bytes < MAX_ADMITTED_TRANSACTION_BYTES / 2 {
+        } else if self.retained_bytes < self.max_bytes / 2 {
             half_life /= 2.0;
         }
         let elapsed = f64::from(now.saturating_sub(self.rolling_fee_last_update));
