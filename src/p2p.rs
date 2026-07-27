@@ -11,7 +11,7 @@ use bitcoin::{
     consensus::{deserialize, encode::Error as EncodeError, serialize},
     p2p::{
         Address, Magic, ServiceFlags,
-        address::AddrV2Message,
+        address::{AddrV2, AddrV2Message},
         message::{MAX_INV_SIZE, NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
         message_compact_blocks::{GetBlockTxn, SendCmpct},
@@ -20,7 +20,7 @@ use bitcoin::{
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -647,6 +647,12 @@ impl<S> InboundPeerSession<S> {
     pub const fn wtxid_relay(&self) -> bool {
         self.wtxid_relay
     }
+
+    /// Returns whether the peer requested BIP155 address relay.
+    #[must_use]
+    pub const fn addrv2_relay(&self) -> bool {
+        self.transport.peer_addrv2
+    }
 }
 
 /// Exact resolution of one bounded transaction `getdata` batch.
@@ -769,6 +775,7 @@ pub struct V1Transport<S> {
     magic: Magic,
     max_payload_len: u32,
     peer_wtxid_relay: bool,
+    peer_addrv2: bool,
 }
 
 impl<S> V1Transport<S> {
@@ -780,6 +787,7 @@ impl<S> V1Transport<S> {
             magic,
             max_payload_len: MAX_PROTOCOL_MESSAGE_LEN,
             peer_wtxid_relay: false,
+            peer_addrv2: false,
         }
     }
 
@@ -897,6 +905,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
                 {
                     self.peer_wtxid_relay = true;
                 }
+                NetworkMessage::SendAddrV2
+                    if remote_version
+                        .as_ref()
+                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+                {
+                    self.peer_addrv2 = true;
+                }
                 NetworkMessage::Ping(nonce) => {
                     self.write_message(NetworkMessage::Pong(nonce)).await?;
                 }
@@ -970,6 +985,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
                         .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
                 {
                     self.peer_wtxid_relay = true;
+                }
+                NetworkMessage::SendAddrV2
+                    if remote_version
+                        .as_ref()
+                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+                {
+                    self.peer_addrv2 = true;
                 }
                 NetworkMessage::Ping(nonce) => {
                     self.write_message(NetworkMessage::Pong(nonce)).await?;
@@ -1572,6 +1594,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// Requests a one-shot address sample from the connected peer.
     pub async fn request_addresses(&mut self) -> Result<(), P2pError> {
         self.transport.write_message(NetworkMessage::GetAddr).await
+    }
+
+    /// Announces one explicitly configured reachable local address.
+    ///
+    /// Callers must validate routability for the selected network and must not
+    /// infer this value from a wildcard or ephemeral bind socket.
+    pub async fn advertise_address(
+        &mut self,
+        address: SocketAddr,
+        services: ServiceFlags,
+        last_seen: u32,
+    ) -> Result<(), P2pError> {
+        if address.port() == 0 {
+            return Ok(());
+        }
+        if self.transport.peer_addrv2 {
+            let addr = match address.ip() {
+                IpAddr::V4(address) => AddrV2::Ipv4(address),
+                IpAddr::V6(address) => AddrV2::Ipv6(address),
+            };
+            return self
+                .transport
+                .write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
+                    time: last_seen,
+                    services,
+                    addr,
+                    port: address.port(),
+                }]))
+                .await;
+        }
+        self.transport
+            .write_message(NetworkMessage::Addr(vec![(
+                last_seen,
+                Address::new(&address, services),
+            )]))
+            .await
     }
 
     /// Receives one bounded legacy `addr` or BIP155 `addrv2` response.
@@ -3537,6 +3595,80 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_local_address_advertisement_preserves_services() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session
+                .advertise_address(
+                    "1.2.3.4:8333".parse().unwrap(),
+                    ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+                    123,
+                )
+                .await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            let NetworkMessage::Addr(addresses) =
+                transport.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected addr");
+            };
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(addresses[0].0, 123);
+            assert_eq!(
+                addresses[0].1.socket_addr().unwrap(),
+                "1.2.3.4:8333".parse().unwrap()
+            );
+            assert!(
+                addresses[0]
+                    .1
+                    .services
+                    .has(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS)
+            );
+        });
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                V1Transport::new(client_stream, Network::Regtest.magic()),
+                version(1),
+            );
+            session.transport.peer_addrv2 = true;
+            session
+                .advertise_address(
+                    "[2001:4860:4860::8888]:8333".parse().unwrap(),
+                    ServiceFlags::NETWORK_LIMITED,
+                    124,
+                )
+                .await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            let NetworkMessage::AddrV2(addresses) =
+                transport.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected addrv2");
+            };
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(addresses[0].time, 124);
+            assert_eq!(addresses[0].port, 8333);
+            assert_eq!(
+                addresses[0].addr,
+                AddrV2::Ipv6("2001:4860:4860::8888".parse().unwrap())
+            );
+            assert!(addresses[0].services.has(ServiceFlags::NETWORK_LIMITED));
+        });
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ const BOOL_KEYS: [&str; 9] = [
     "txindex",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 31] = [
+const VALUE_KEYS: [&str; 32] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -39,6 +39,7 @@ const VALUE_KEYS: [&str; 31] = [
     "complete_assumeutxo",
     "data_dir",
     "explorer_listen",
+    "external_address",
     "inbound_listen",
     "inbound_requests_per_minute",
     "log_dir",
@@ -360,6 +361,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "data_dir" => "--data-dir",
         "dns_seed" => "--dns-seed",
         "explorer_listen" => "--explorer-listen",
+        "external_address" => "--external-address",
         "inbound_listen" => "--listen",
         "inbound_requests_per_minute" => "--inbound-requests-per-minute",
         "log_dir" => "--log-dir",
@@ -415,6 +417,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--dns-seed"
             | "--dns-seeds"
             | "--explorer-listen"
+            | "--external-address"
             | "--inbound-requests-per-minute"
             | "--listen"
             | "--log-dir"
@@ -478,6 +481,7 @@ fn option_group(flag: &str) -> &'static str {
         "--connect" => "connect",
         "--data-dir" => "data-dir",
         "--explorer-listen" => "explorer-listen",
+        "--external-address" => "external-address",
         "--log-dir" => "log-dir",
         "--log-level" => "log-level",
         "--log-max-bytes" => "log-max-bytes",

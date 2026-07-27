@@ -142,8 +142,8 @@ leases a new reconciled read view without rebinding. The independent
 AssumeUTXO validator explicitly disables listening. The basic-filter schema
 was advanced because the original index omitted the genesis filter and
 therefore chained height 1 from the wrong predecessor. P1.2 remains open for
-preferred/manual inbound roles, routability advertisement controls,
-and recorded Core 31/btcd interoperability evidence.
+preferred/manual inbound roles and recorded Core 31/btcd interoperability
+evidence.
 
 The observable-accounting portion is now complete. The status API and
 authenticated network/peer RPC expose the live inbound set, handshake identity,
@@ -156,8 +156,11 @@ newly connected peer only when the new source adds a network group: completed
 handshakes and useful request/upload work are protected, duplicate groups are
 selected first, same-group arrivals cannot churn incumbents, cancellation is
 reaped before the replacement receives its semaphore permit, and the eviction
-counter is exported. Preferred/manual inbound roles, explicit routability advertisement,
-and recorded Core 31/btcd interoperability remain. Validated mempool and wallet
+counter is exported. An optional independently validated external address is
+now advertised once to outbound peers and placed first in inbound address
+samples with exact pruned/filter service bits; wildcard binds are never
+inferred. Preferred/manual inbound roles and recorded Core 31/btcd
+interoperability remain. Validated mempool and wallet
 relay events now also feed every accepted inbound session through the same
 bounded broadcast ring. Each session negotiates txid/wtxid inventory, applies
 the peer's latest BIP133 fee filter using policy vsize, suppresses duplicate

@@ -20,6 +20,7 @@ use bitcoin::{
     hashes::Hash,
     p2p::{
         Address, ServiceFlags,
+        address::{AddrV2, AddrV2Message},
         message::NetworkMessage,
         message_blockdata::Inventory,
         message_compact_blocks::{BlockTxn, CmpctBlock, SendCmpct},
@@ -62,6 +63,8 @@ pub struct InboundLimits {
     pub max_requests_per_minute: u32,
     /// Idle/read timeout for one accepted session.
     pub idle_timeout: Duration,
+    /// Explicit publicly reachable address; never inferred from a bind socket.
+    pub advertised_address: Option<SocketAddr>,
 }
 
 impl Default for InboundLimits {
@@ -72,6 +75,7 @@ impl Default for InboundLimits {
             max_upload_bytes_per_day: 1024 * 1024 * 1024,
             max_requests_per_minute: 1_200,
             idle_timeout: Duration::from_secs(20 * 60),
+            advertised_address: None,
         }
     }
 }
@@ -463,6 +467,10 @@ pub trait InboundDataSource: Send + Sync + 'static {
     /// Diverse, already-vetted IPv4/IPv6 peers suitable for bounded address relay.
     fn addresses(&self) -> Result<Vec<SocketAddr>, String> {
         Ok(Vec::new())
+    }
+    /// Explicit local address and exact service bits suitable for relay.
+    fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
+        None
     }
     /// Current local minimum mempool fee in satoshis per 1,000 virtual bytes.
     fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
@@ -1230,22 +1238,44 @@ async fn serve_addresses(
     let now = u32::try_from(now).unwrap_or(u32::MAX);
     let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
     let mut seen = HashSet::new();
-    let addresses = source
-        .addresses()
-        .map_err(InboundError::Data)?
-        .into_iter()
-        .filter(|address| address.port() != 0 && seen.insert(*address))
-        .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
-        .map(|address| (now, Address::new(&address, services)))
-        .collect();
-    send_accounted(
-        peer,
-        NetworkMessage::Addr(addresses),
-        upload,
-        account,
-        false,
-    )
-    .await
+    let mut addresses = Vec::new();
+    if let Some((address, local_services)) = source.advertised_address() {
+        seen.insert(address);
+        addresses.push((now, Address::new(&address, local_services)));
+    }
+    addresses.extend(
+        source
+            .addresses()
+            .map_err(InboundError::Data)?
+            .into_iter()
+            .filter(|address| address.port() != 0 && seen.insert(*address))
+            .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE.saturating_sub(addresses.len()))
+            .map(|address| (now, Address::new(&address, services))),
+    );
+    let message = if peer.addrv2_relay() {
+        NetworkMessage::AddrV2(
+            addresses
+                .into_iter()
+                .map(|(time, address)| {
+                    let socket = address
+                        .socket_addr()
+                        .expect("locally constructed IP address is representable");
+                    AddrV2Message {
+                        time,
+                        services: address.services,
+                        addr: match socket.ip() {
+                            IpAddr::V4(address) => AddrV2::Ipv4(address),
+                            IpAddr::V6(address) => AddrV2::Ipv6(address),
+                        },
+                        port: socket.port(),
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        NetworkMessage::Addr(addresses)
+    };
+    send_accounted(peer, message, upload, account, false).await
 }
 
 fn headers_after_locator(
@@ -1634,6 +1664,13 @@ mod tests {
             Ok(vec!["1.2.3.4:8333".parse().unwrap()])
         }
 
+        fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
+            Some((
+                "5.6.7.8:8333".parse().unwrap(),
+                ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            ))
+        }
+
         fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
             Ok(2_345)
         }
@@ -1837,8 +1874,14 @@ mod tests {
         );
         peer.request_addresses().await.unwrap();
         let addresses = peer.receive_addresses().await.unwrap();
-        assert_eq!(addresses.len(), 1);
-        assert_eq!(addresses[0].socket, "1.2.3.4:8333".parse().unwrap());
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0].socket, "5.6.7.8:8333".parse().unwrap());
+        assert!(
+            addresses[0]
+                .services
+                .has(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS)
+        );
+        assert_eq!(addresses[1].socket, "1.2.3.4:8333".parse().unwrap());
         assert_eq!(peer.fee_filter_sat_kvb(), 2_345);
         let mut relayed = source.block.txdata[0].clone();
         relayed.input[0].previous_output.vout = 1;

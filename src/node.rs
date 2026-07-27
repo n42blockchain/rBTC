@@ -629,6 +629,8 @@ pub struct NodeIndexConfig {
 pub struct NodeInboundConfig {
     /// Explicit socket address to bind. No listener is opened when absent.
     pub listen: SocketAddr,
+    /// Publicly reachable address advertised to peers. Wildcard binds are never inferred.
+    pub advertise: Option<SocketAddr>,
     /// Maximum concurrent inbound handshakes and established peers.
     pub max_connections: usize,
     /// Maximum concurrent inbound sockets from one IP or source network group.
@@ -647,6 +649,7 @@ impl NodeInboundConfig {
             max_upload_bytes_per_day: self.max_upload_bytes_per_day,
             max_requests_per_minute: self.max_requests_per_minute,
             idle_timeout: Duration::from_secs(20 * 60),
+            advertised_address: self.advertise,
         }
     }
 }
@@ -982,6 +985,17 @@ fn validate_runtime_options(options: Options) -> Result<Options, String> {
 }
 
 fn validate_inbound_options(options: &Options) -> Result<(), String> {
+    if let Some(address) = options.inbound_limits.advertised_address {
+        if options.inbound_listen.is_none() {
+            return Err("an advertised inbound address requires --listen ADDRESS".to_owned());
+        }
+        if !is_acceptable_peer_address(address, options.network) {
+            return Err(format!(
+                "advertised inbound address {address} is not routable on {}",
+                options.network
+            ));
+        }
+    }
     if options.inbound_listen.is_none() {
         return Ok(());
     }
@@ -3448,14 +3462,22 @@ struct SharedInboundSource {
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
     stats: Arc<InboundStats>,
+    advertised_address: Option<SocketAddr>,
+    services: ServiceFlags,
 }
 
 impl SharedInboundSource {
-    fn new(max_upload_bytes_per_day: u64) -> Self {
+    fn new(
+        max_upload_bytes_per_day: u64,
+        advertised_address: Option<SocketAddr>,
+        services: ServiceFlags,
+    ) -> Self {
         Self {
             current: RwLock::new(None),
             peer_store: RwLock::new(None),
             stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
+            advertised_address,
+            services,
         }
     }
 
@@ -3562,6 +3584,11 @@ impl InboundDataSource for SharedInboundSource {
 
     fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
         self.current()?.fee_filter_sat_kvb()
+    }
+
+    fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
+        self.advertised_address
+            .map(|address| (address, self.services))
     }
 }
 
@@ -3743,6 +3770,14 @@ struct InboundServer {
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
+fn inbound_service_flags(serve_compact_filters: bool) -> ServiceFlags {
+    let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    if serve_compact_filters {
+        services |= ServiceFlags::COMPACT_FILTERS;
+    }
+    services
+}
+
 impl InboundServer {
     #[allow(clippy::too_many_arguments)]
     async fn bind(
@@ -3761,10 +3796,7 @@ impl InboundServer {
         let bound = listener
             .local_addr()
             .map_err(|error| format!("read inbound P2P address: {error}"))?;
-        let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
-        if serve_compact_filters {
-            services |= ServiceFlags::COMPACT_FILTERS;
-        }
+        let services = inbound_service_flags(serve_compact_filters);
         rbtc_info!(
             "inbound P2P listening on {bound}; max_peers={} per_ip={} daily_upload_bytes={} requests_per_minute={}",
             limits.max_connections,
@@ -6239,6 +6271,8 @@ async fn run_peer_pool(
     let inbound_source = options.inbound_listen.map(|_| {
         Arc::new(SharedInboundSource::new(
             options.inbound_limits.max_upload_bytes_per_day,
+            options.inbound_limits.advertised_address,
+            inbound_service_flags(options.indexes.basic_filter),
         ))
     });
     let mut inbound_server = if let (Some(address), Some(source)) =
@@ -7468,6 +7502,7 @@ async fn connect_and_maintain_standby(
     header_dag: Option<HeaderDag>,
     mempool_relay_source: Option<MempoolRelaySource>,
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
+    advertised_address: Option<(SocketAddr, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer(
@@ -7490,6 +7525,17 @@ async fn connect_and_maintain_standby(
         observed.offset_seconds,
         observed.usable
     );
+    if let Some((address, services)) = advertised_address {
+        timeout(
+            PEER_TIMEOUT,
+            connected
+                .session
+                .advertise_address(address, services, local_time),
+        )
+        .await
+        .map_err(|_| PeerRunError::transient("local address advertisement timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    }
     if let Some(source) = mempool_relay_source {
         connected.session.set_mempool_relay_source(source);
     }
@@ -7571,6 +7617,10 @@ fn spawn_peer_connections(
                 .then(|| transaction_pool.cloned())
                 .flatten();
             let network_time = Arc::clone(network_time);
+            let advertised_address = options
+                .inbound_limits
+                .advertised_address
+                .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -7583,6 +7633,7 @@ fn spawn_peer_connections(
                 header_dag,
                 mempool_relay_source,
                 transaction_pool,
+                advertised_address,
                 network_time,
             ));
             (
@@ -12307,6 +12358,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
     let mut inbound_listen = None;
+    let mut inbound_advertise = None;
     let mut no_inbound_listen = false;
     let mut max_inbound_peers = None;
     let mut max_inbound_peers_per_ip = None;
@@ -12566,6 +12618,17 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-listen" => {
                 inbound_listen = None;
                 no_inbound_listen = true;
+            }
+            "--external-address" => {
+                if inbound_advertise.is_some() {
+                    return Err("--external-address cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--external-address")?;
+                inbound_advertise = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid external address: {value}"))?,
+                );
             }
             "--max-inbound-peers" => {
                 if max_inbound_peers.is_some() {
@@ -13851,7 +13914,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         && (max_inbound_peers.is_some()
             || max_inbound_peers_per_ip.is_some()
             || max_upload_bytes_per_day.is_some()
-            || inbound_requests_per_minute.is_some())
+            || inbound_requests_per_minute.is_some()
+            || inbound_advertise.is_some())
     {
         return Err("inbound resource limits require --listen ADDRESS".to_owned());
     }
@@ -13933,6 +13997,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             max_requests_per_minute: inbound_requests_per_minute
                 .unwrap_or(default_inbound.max_requests_per_minute),
             idle_timeout: default_inbound.idle_timeout,
+            advertised_address: inbound_advertise,
         },
         resources: NodeResourceConfig {
             automatic_hot_standbys: automatic_hot_standbys
@@ -14030,7 +14095,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -14933,6 +14998,7 @@ mod tests {
             None,
             None,
             Some(source),
+            None,
             None,
             Arc::new(NetworkTime::default()),
         ));
@@ -16709,6 +16775,8 @@ mod tests {
                 "/tmp/rbtc-inbound-parser",
                 "--listen",
                 "127.0.0.1:18444",
+                "--external-address",
+                "127.0.0.1:18444",
                 "--max-inbound-peers",
                 "12",
                 "--max-inbound-peers-per-ip",
@@ -16731,8 +16799,23 @@ mod tests {
         assert_eq!(options.inbound_limits.max_connections_per_ip, 3);
         assert_eq!(options.inbound_limits.max_upload_bytes_per_day, 1_048_576);
         assert_eq!(options.inbound_limits.max_requests_per_minute, 600);
+        assert_eq!(
+            options.inbound_limits.advertised_address,
+            Some("127.0.0.1:18444".parse().unwrap())
+        );
 
         for arguments in [
+            vec!["--external-address", "1.2.3.4:8333"],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-inbound-parser",
+                "--listen",
+                "0.0.0.0:8333",
+                "--external-address",
+                "10.0.0.1:8333",
+            ],
             vec![
                 "--data-dir",
                 "/tmp/rbtc-inbound-parser",

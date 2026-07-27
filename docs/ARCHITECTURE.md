@@ -788,8 +788,13 @@ outbound failover reopen its databases without leaving stale consensus state
 reachable and prevents the separate AssumeUTXO genesis validator from opening
 the active chain's public port. Active hashes come from the O(1) maximum-work
 height map and are clipped at the execution tip. Block payloads must then exist
-in the freezer and decode to the exact requested hash. Global/per-IP
-connection admission, a 20-minute idle limit, per-peer minute work accounting,
+in the freezer and decode to the exact requested hash. Reachability is never
+inferred from a wildcard listener. An
+optional external socket is validated against the selected network before any
+dial or bind, announced once on each outbound session, and placed first in
+inbound `getaddr` samples with the exact `NETWORK_LIMITED`, witness, and
+compact-filter service bits. Global/per-IP connection admission, a 20-minute
+idle limit, per-peer minute work accounting,
 bounded vectors, a rolling historical-upload target, and a recent-288-block
 exception contain socket work. BIP157 replies come only from the independently
 reconciled basic-filter index. Peer transactions are requested before intake
