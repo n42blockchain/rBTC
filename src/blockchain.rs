@@ -145,7 +145,7 @@ fn script_validation_worker(queue: &ScriptValidationQueue) {
         // channel never disconnects the receiver. An unwinding job would
         // therefore block `DeferredScriptBatch::finish` forever; report the
         // failure instead so the candidate block is rejected.
-        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let failure = contain_script_worker_panic(|| {
             jobs.into_iter().find_map(|job| {
                 verify_serialized_transaction_scripts_with_flags(
                     &job.raw_transaction,
@@ -156,10 +156,19 @@ fn script_validation_worker(queue: &ScriptValidationQueue) {
                 .err()
                 .map(|error| (job.block_order, job.index, error))
             })
-        }))
-        .unwrap_or(Some((0, 0, ConsensusError::WorkerPanicked)));
+        });
         let _ = result.send(failure);
     }
+}
+
+fn contain_script_worker_panic(
+    validate: impl FnOnce() -> ScriptValidationResult,
+) -> ScriptValidationResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(validate)).unwrap_or(Some((
+        0,
+        0,
+        ConsensusError::WorkerPanicked,
+    )))
 }
 
 fn script_validation_pool() -> &'static ScriptValidationPool {
@@ -1385,5 +1394,14 @@ mod tests {
             })
         ));
         assert!(store.snapshot_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn panicking_script_worker_fails_closed_instead_of_losing_its_result() {
+        let result = contain_script_worker_panic(|| panic!("injected script worker failure"));
+        assert!(matches!(
+            result,
+            Some((0, 0, ConsensusError::WorkerPanicked))
+        ));
     }
 }

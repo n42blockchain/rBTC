@@ -1759,6 +1759,61 @@ mod tests {
     }
 
     #[test]
+    fn write_ahead_recovery_accepts_a_transition_without_a_net_utxo_effect() {
+        let directory = TempDir::new().unwrap();
+        let chainstate = RedbUtxoStore::open(directory.path().join("chainstate.redb")).unwrap();
+        let undo_store = RedbUndoStore::open(directory.path().join("undo.redb")).unwrap();
+        let execution_store =
+            RedbExecutionStore::open(directory.path().join("execution.redb"), Network::Regtest)
+                .unwrap();
+        let parent = execution_store.tip().unwrap();
+        let next = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([8; 32]),
+        };
+        let empty_undo = UtxoUndo::new(Vec::new(), Vec::new());
+        let mut pending = PendingTransition {
+            kind: TransitionKind::Connect,
+            parent,
+            next,
+            undo: empty_undo.clone(),
+            created: Vec::new(),
+        };
+
+        // A crash before execution-tip publication observes both the pre- and
+        // post-UTXO state because the transition has no coin effect.
+        undo_store.prepare_transition(&pending).unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert_eq!(execution_store.tip().unwrap(), parent);
+        assert!(undo_store.pending_transition().unwrap().is_none());
+
+        // The same ambiguous UTXO observation must also be accepted after the
+        // execution tip and empty undo have become durable.
+        undo_store.prepare_transition(&pending).unwrap();
+        undo_store
+            .insert(next.hash, std::slice::from_ref(&empty_undo))
+            .unwrap();
+        execution_store.advance(parent.hash, next).unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert_eq!(execution_store.tip().unwrap(), next);
+        assert!(undo_store.get(next.hash).unwrap().is_some());
+        assert!(undo_store.pending_transition().unwrap().is_none());
+
+        pending.kind = TransitionKind::Disconnect;
+        undo_store.prepare_transition(&pending).unwrap();
+        assert!(
+            recover_pending_transition(&chainstate, &undo_store, &execution_store, 1, 60).unwrap()
+        );
+        assert_eq!(execution_store.tip().unwrap(), parent);
+        assert!(undo_store.get(next.hash).unwrap().is_none());
+        assert!(undo_store.pending_transition().unwrap().is_none());
+    }
+
+    #[test]
     fn bip30_rejects_collisions_and_exception_undo_restores_overwritten_coin() {
         let directory = TempDir::new().unwrap();
         let chainstate =
