@@ -45,10 +45,7 @@ fn main() {
             // never emitted and the final link fails.
             .define("ENABLE_MODULE_ELLSWIFT", "1")
             // Technically libconsensus doesn't require the recovery feautre, but `pubkey.cpp` does.
-            .define("ENABLE_MODULE_RECOVERY", "1")
-            .file("depend/bitcoin/src/secp256k1/src/precomputed_ecmult_gen.c")
-            .file("depend/bitcoin/src/secp256k1/src/precomputed_ecmult.c")
-            .file("depend/bitcoin/src/secp256k1/src/secp256k1.c");
+            .define("ENABLE_MODULE_RECOVERY", "1");
 
         if is_big_endian {
             secp_config.define("WORDS_BIGENDIAN", "1");
@@ -77,7 +74,11 @@ fn main() {
             );
         }
 
-        secp_config.compile("libsecp256k1.a");
+        secp_config
+            .file("depend/bitcoin/src/secp256k1/src/precomputed_ecmult_gen.c")
+            .file("depend/bitcoin/src/secp256k1/src/precomputed_ecmult.c")
+            .file("depend/bitcoin/src/secp256k1/src/secp256k1.c")
+            .compile("libsecp256k1.a");
     }
 
     let tool = consensus_config.get_compiler();
