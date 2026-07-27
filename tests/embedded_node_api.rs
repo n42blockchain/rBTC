@@ -142,6 +142,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
     config.storage = NodeStorageConfig {
         prune_blocks: 576,
         prune_bytes: 768 * 1024 * 1024,
+        minimum_free_bytes: 2 * 1024 * 1024 * 1024,
     };
     config.api = Some(NodeApiConfig {
         listen: "127.0.0.1:0".parse().unwrap(),

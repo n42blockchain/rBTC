@@ -97,8 +97,12 @@ item 4. Standalone diagnostics are now newline-delimited JSON behind a bounded
 non-blocking queue, a fixed per-second limiter, owner-only size rotation, and
 authenticated `getloginfo`/`setloglevel`; embedded hosts retain typed
 status/event receivers and do not install the process-global sink. This
-completes item 3 and the remaining runtime-control portion of item 4. Disk
-forecasting and upload/index budgets stay open.
+completes item 3 and the remaining runtime-control portion of item 4. Item 5 is
+also complete: startup and every safe checkpoint boundary enforce an
+operator-configured reserve plus worst-case batch/mempool/log/database
+headroom, classify exhaustion as a local failure without peer punishment, and
+publish the forecast through status, authenticated RPC, and Prometheus.
+Upload/index budgets stay open.
 
 ### P1.2 — inbound P2P service
 

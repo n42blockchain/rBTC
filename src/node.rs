@@ -166,6 +166,11 @@ const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
 const MIN_PRUNE_RETENTION_BLOCKS: u32 = 288;
 const MIN_PRUNE_MAX_BYTES: u64 = 550 * 1024 * 1024;
+const DEFAULT_MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const MINIMUM_FREE_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
+const MAXIMUM_FREE_BYTES_RESERVE: u64 = 1024 * 1024 * 1024 * 1024;
+const DATABASE_COMMIT_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_SERIALIZED_BLOCK_BYTES: u64 = 4_000_000;
 const MIN_CHAINSTATE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CHAINSTATE_CACHE_BYTES: usize = 64 * 1024 * 1024 * 1024;
 
@@ -221,6 +226,7 @@ struct Options {
     offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+    minimum_free_bytes: u64,
     cache: NodeCacheConfig,
     resources: NodeResourceConfig,
     logging: NodeLogConfig,
@@ -381,6 +387,7 @@ impl NodeConfig {
                 max_bytes: self.storage.prune_bytes,
                 ..LedgerRetention::default()
             },
+            minimum_free_bytes: self.storage.minimum_free_bytes,
             cache: self.cache,
             resources: self.resources,
             logging: self.logging,
@@ -489,6 +496,8 @@ pub struct NodeStorageConfig {
     pub prune_blocks: u32,
     /// Maximum compressed freezer bytes.
     pub prune_bytes: u64,
+    /// Free bytes preserved beyond one worst-case atomic checkpoint.
+    pub minimum_free_bytes: u64,
 }
 
 impl Default for NodeStorageConfig {
@@ -496,6 +505,7 @@ impl Default for NodeStorageConfig {
         Self {
             prune_blocks: DEFAULT_RETENTION_BLOCKS,
             prune_bytes: DEFAULT_MAX_BYTES,
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
         }
     }
 }
@@ -708,6 +718,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Preserves free space beyond the forecast worst-case atomic checkpoint.
+    #[must_use]
+    pub const fn minimum_free_bytes(mut self, bytes: u64) -> Self {
+        self.config.storage.minimum_free_bytes = bytes;
+        self
+    }
+
     /// Starts the node as a host-owned Tokio task.
     pub fn launch(self) -> Result<NodeHandle, NodeError> {
         let mut options = self.into_options()?;
@@ -840,6 +857,13 @@ fn validate_storage_options(options: &Options) -> Result<(), String> {
     if options.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
         return Err(format!(
             "prune byte target must be at least {MIN_PRUNE_MAX_BYTES}"
+        ));
+    }
+    if !(MINIMUM_FREE_BYTES_FLOOR..=MAXIMUM_FREE_BYTES_RESERVE)
+        .contains(&options.minimum_free_bytes)
+    {
+        return Err(format!(
+            "minimum free-space reserve must be between {MINIMUM_FREE_BYTES_FLOOR} and {MAXIMUM_FREE_BYTES_RESERVE} bytes"
         ));
     }
     for (name, bytes) in [
@@ -1160,6 +1184,21 @@ pub struct NodeFreezerStatus {
     pub tip_height: Option<u32>,
 }
 
+/// Filesystem capacity and atomic-checkpoint safety forecast.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeDiskStatus {
+    /// Total filesystem bytes.
+    pub total_bytes: u64,
+    /// Currently available filesystem bytes.
+    pub available_bytes: u64,
+    /// Minimum bytes required before another atomic checkpoint may start.
+    pub required_bytes: u64,
+    /// Operator-selected reserve included in the required threshold.
+    pub reserve_bytes: u64,
+    /// Bounded freezer, mempool, and rotating-log storage ceiling.
+    pub projected_storage_ceiling_bytes: u64,
+}
+
 /// Initial-download and snapshot trust state.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NodeTrustStatus {
@@ -1194,6 +1233,8 @@ pub struct NodeRuntimeStatus {
     pub utxo_cold: u64,
     /// Current bounded freezer footprint.
     pub freezer: NodeFreezerStatus,
+    /// Current disk-capacity safety forecast.
+    pub disk: NodeDiskStatus,
     /// Current trust/validation state.
     pub trust: NodeTrustStatus,
     /// Most recent terminal task error.
@@ -1217,6 +1258,13 @@ impl NodeRuntimeStatus {
                 bytes: 0,
                 first_height: None,
                 tip_height: None,
+            },
+            disk: NodeDiskStatus {
+                total_bytes: 0,
+                available_bytes: 0,
+                required_bytes: 0,
+                reserve_bytes: 0,
+                projected_storage_ceiling_bytes: 0,
             },
             trust: NodeTrustStatus {
                 minimum_chainwork_reached: false,
@@ -1274,6 +1322,11 @@ pub enum NodeEvent {
     FreezerChanged {
         /// New durable freezer state.
         status: NodeFreezerStatus,
+    },
+    /// Disk availability or checkpoint threshold changed.
+    DiskSpaceChanged {
+        /// New host-visible disk forecast.
+        status: NodeDiskStatus,
     },
     /// The node exited successfully or completed graceful shutdown.
     Stopped,
@@ -1343,6 +1396,11 @@ impl NodeObserver {
             let _ = self.events.send(NodeEvent::FreezerChanged {
                 status: next.freezer,
             });
+        }
+        if previous.disk != next.disk {
+            let _ = self
+                .events
+                .send(NodeEvent::DiskSpaceChanged { status: next.disk });
         }
         self.status.send_replace(next);
     }
@@ -1475,6 +1533,7 @@ struct DnsSeed {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PeerFailureKind {
+    LocalResource,
     Transient,
     ProtocolViolation,
 }
@@ -1486,6 +1545,13 @@ struct PeerRunError {
 }
 
 impl PeerRunError {
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            kind: PeerFailureKind::LocalResource,
+            message: message.into(),
+        }
+    }
+
     fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: PeerFailureKind::Transient,
@@ -1526,6 +1592,87 @@ impl PeerRunError {
         } else {
             Self::transient(error.to_string())
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[allow(clippy::struct_field_names)]
+struct DiskSpaceSnapshot {
+    total_bytes: u64,
+    available_bytes: u64,
+    required_bytes: u64,
+    reserve_bytes: u64,
+    projected_storage_ceiling_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct DiskSpaceMonitor {
+    data_dir: PathBuf,
+    required_bytes: u64,
+    reserve_bytes: u64,
+    projected_storage_ceiling_bytes: u64,
+}
+
+impl DiskSpaceMonitor {
+    fn for_options(options: &Options, data_dir: PathBuf) -> Self {
+        let checkpoint_bytes = u64::try_from(options.validation_limits.max_blocks_per_batch)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(MAX_SERIALIZED_BLOCK_BYTES)
+            .saturating_mul(2);
+        let mempool_bytes = u64::try_from(options.resources.mempool_max_bytes).unwrap_or(u64::MAX);
+        let required_bytes = options
+            .minimum_free_bytes
+            .saturating_add(checkpoint_bytes)
+            .saturating_add(mempool_bytes)
+            .saturating_add(options.logging.max_file_bytes)
+            .saturating_add(DATABASE_COMMIT_HEADROOM_BYTES);
+        let log_ceiling = options
+            .logging
+            .max_file_bytes
+            .saturating_mul(u64::from(options.logging.max_files));
+        let projected_storage_ceiling_bytes = options
+            .ledger_retention
+            .max_bytes
+            .saturating_add(mempool_bytes)
+            .saturating_add(log_ceiling);
+        Self {
+            data_dir,
+            required_bytes,
+            reserve_bytes: options.minimum_free_bytes,
+            projected_storage_ceiling_bytes,
+        }
+    }
+
+    fn check(&self) -> Result<DiskSpaceSnapshot, PeerRunError> {
+        let available_bytes = fs2::available_space(&self.data_dir).map_err(|error| {
+            PeerRunError::local(format!(
+                "read available disk space for {}: {error}",
+                self.data_dir.display()
+            ))
+        })?;
+        let total_bytes = fs2::total_space(&self.data_dir).map_err(|error| {
+            PeerRunError::local(format!(
+                "read total disk space for {}: {error}",
+                self.data_dir.display()
+            ))
+        })?;
+        let snapshot = DiskSpaceSnapshot {
+            total_bytes,
+            available_bytes,
+            required_bytes: self.required_bytes,
+            reserve_bytes: self.reserve_bytes,
+            projected_storage_ceiling_bytes: self.projected_storage_ceiling_bytes,
+        };
+        if available_bytes < self.required_bytes {
+            return Err(PeerRunError::local(format!(
+                "insufficient disk space for atomic checkpoint in {}: available={} required={} reserve={}",
+                self.data_dir.display(),
+                available_bytes,
+                self.required_bytes,
+                self.reserve_bytes
+            )));
+        }
+        Ok(snapshot)
     }
 }
 
@@ -1685,6 +1832,7 @@ struct NodeStatusProgress {
     ledger_bytes: u64,
     ledger_first_height: Option<u32>,
     ledger_tip_height: Option<u32>,
+    disk_space: DiskSpaceSnapshot,
 }
 
 #[derive(Clone)]
@@ -1708,6 +1856,7 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "getindexinfo",
     "verifychain",
     "getloginfo",
+    "getdiskinfo",
     "setloglevel",
     "stop",
 ];
@@ -1816,6 +1965,8 @@ impl LocalRpcOperator for NodeRpcOperator {
                 "write_errors": rbtc::diagnostics::write_errors(),
                 "host_managed": !rbtc::diagnostics::is_installed(),
             }),
+            "getdiskinfo" => serde_json::to_value(status.disk_space)
+                .expect("disk-space status serialization is infallible"),
             "stop" => {
                 let runtime_control = Arc::clone(&self.runtime_control);
                 tokio::spawn(async move {
@@ -1901,6 +2052,7 @@ struct NodeStatusResponse {
     ledger_bytes: u64,
     ledger_first_height: Option<u32>,
     ledger_tip_height: Option<u32>,
+    disk_space: DiskSpaceSnapshot,
 }
 
 impl BackgroundValidationStatus {
@@ -2043,11 +2195,15 @@ impl NodeStatus {
             .wallet
             .as_ref()
             .is_none_or(|wallet| *wallet == progress.execution);
+        let disk_safe = progress.disk_space.available_bytes >= progress.disk_space.required_bytes;
         let ready = progress.minimum_chainwork_reached
             && chain_caught_up
             && explorer_caught_up
-            && wallet_caught_up;
-        let phase = if !progress.minimum_chainwork_reached {
+            && wallet_caught_up
+            && disk_safe;
+        let phase = if !disk_safe {
+            "low_disk"
+        } else if !progress.minimum_chainwork_reached {
             "ibd"
         } else if !chain_caught_up {
             "syncing_blocks"
@@ -2080,6 +2236,7 @@ impl NodeStatus {
             ledger_bytes: progress.ledger_bytes,
             ledger_first_height: progress.ledger_first_height,
             ledger_tip_height: progress.ledger_tip_height,
+            disk_space: progress.disk_space,
         }
     }
 }
@@ -2143,8 +2300,13 @@ async fn node_metrics(
     let utxo_total = status.utxo_hot.saturating_add(status.utxo_cold);
     let dropped_logs = rbtc::diagnostics::dropped_records();
     let log_write_errors = rbtc::diagnostics::write_errors();
+    let disk_total = status.disk_space.total_bytes;
+    let disk_available = status.disk_space.available_bytes;
+    let disk_required = status.disk_space.required_bytes;
+    let disk_reserve = status.disk_space.reserve_bytes;
+    let storage_ceiling = status.disk_space.projected_storage_ceiling_bytes;
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -2300,6 +2462,7 @@ impl Drop for ApiServer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_node_status(
     network: Network,
     ibd_policy: IbdPolicy,
@@ -2308,6 +2471,7 @@ fn collect_node_status(
     explorer: &RedbExplorerIndex,
     ledger: &PrunedBlockLedger,
     wallet: Option<&EmbeddedWallet>,
+    disk_space: DiskSpaceSnapshot,
 ) -> Result<NodeStatusProgress, String> {
     let header = headers.active_tip();
     let execution = chainstate
@@ -2357,6 +2521,7 @@ fn collect_node_status(
         ledger_bytes: ledger.bytes,
         ledger_first_height: ledger.first_height,
         ledger_tip_height: ledger.tip_height,
+        disk_space,
     })
 }
 
@@ -2369,6 +2534,7 @@ struct RuntimeStatusSources<'a> {
     explorer: Option<&'a RedbExplorerIndex>,
     ledger: &'a PrunedBlockLedger,
     wallet: Option<&'a EmbeddedWallet>,
+    disk_space: DiskSpaceSnapshot,
 }
 
 fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRuntimeStatus, String> {
@@ -2380,6 +2546,7 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
         explorer,
         ledger,
         wallet,
+        disk_space,
     } = sources;
     let header = headers.active_tip();
     let execution = chainstate
@@ -2429,6 +2596,13 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
             bytes: freezer.bytes,
             first_height: freezer.first_height,
             tip_height: freezer.tip_height,
+        },
+        disk: NodeDiskStatus {
+            total_bytes: disk_space.total_bytes,
+            available_bytes: disk_space.available_bytes,
+            required_bytes: disk_space.required_bytes,
+            reserve_bytes: disk_space.reserve_bytes,
+            projected_storage_ceiling_bytes: disk_space.projected_storage_ceiling_bytes,
         },
         trust: NodeTrustStatus {
             minimum_chainwork_reached: ibd.minimum_chainwork_reached,
@@ -2810,6 +2984,20 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         rbtc_info!("peer transaction admission full-RBF policy enabled");
     }
     if let Some(data_dir) = &options.data_dir {
+        fs::create_dir_all(data_dir)
+            .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+        if options.offline_action.is_none() {
+            let disk_space = DiskSpaceMonitor::for_options(&options, data_dir.clone())
+                .check()
+                .map_err(|error| error.message)?;
+            rbtc_info!(
+                "startup disk preflight total={} available={} required={} reserve={}",
+                disk_space.total_bytes,
+                disk_space.available_bytes,
+                disk_space.required_bytes,
+                disk_space.reserve_bytes
+            );
+        }
         preflight_data_dir(
             data_dir,
             options.network,
@@ -2826,9 +3014,15 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     }
     if let Some(validation_dir) = &options.complete_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
+        DiskSpaceMonitor::for_options(&options, validation_dir.clone())
+            .check()
+            .map_err(|error| error.message)?;
     }
     if let Some(validation_dir) = &options.background_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
+        DiskSpaceMonitor::for_options(&options, validation_dir.clone())
+            .check()
+            .map_err(|error| error.message)?;
     }
     if options.snapshot.is_some() {
         return activate_assumed_snapshot(&options);
@@ -2858,7 +3052,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         "none"
     };
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -2876,6 +3070,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         options.cache.bulk_validation_bytes,
         options.ledger_retention.max_blocks,
         options.ledger_retention.max_bytes,
+        options.minimum_free_bytes,
         options.logging.level.as_str(),
         options.logging.max_file_bytes,
         options.logging.max_files,
@@ -3229,7 +3424,7 @@ async fn run_peer_pool(
         &manual_remotes,
         &mut failures,
     )
-    .await
+    .await?
     {
         return Ok(());
     }
@@ -3272,7 +3467,7 @@ async fn run_peer_pool(
             &manual_remotes,
             &mut failures,
         )
-        .await
+        .await?
         {
             return Ok(());
         }
@@ -4610,7 +4805,7 @@ async fn try_peer_candidates(
     mempool_relay_source: &MempoolRelaySource,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
-) -> bool {
+) -> Result<bool, String> {
     let mut pending = match spawn_peer_connections(
         options,
         remotes,
@@ -4623,7 +4818,7 @@ async fn try_peer_candidates(
         Ok(pending) => pending,
         Err(error) => {
             failures.push(format!("standby header seed: {error}"));
-            return false;
+            return Ok(false);
         }
     };
     while let Some((remote, connection)) = pending.pop_front() {
@@ -4678,9 +4873,13 @@ async fn try_peer_candidates(
                     record_peer_session_success(peer_store.map(Arc::as_ref), remote);
                 }
                 abort_pending_connections(&mut pending).await;
-                return true;
+                return Ok(true);
             }
             Err(error) => {
+                if error.kind == PeerFailureKind::LocalResource {
+                    abort_pending_connections(&mut pending).await;
+                    return Err(error.message);
+                }
                 rbtc_warn!("peer {remote} failed: {error}");
                 record_peer_failure(
                     peer_store.map(Arc::as_ref),
@@ -4692,7 +4891,7 @@ async fn try_peer_candidates(
             }
         }
     }
-    false
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4737,6 +4936,7 @@ async fn run_connected_peer(
             )
             .await
         } else {
+            let disk_monitor = DiskSpaceMonitor::for_options(options, path.clone());
             sync_validating_node(
                 &mut session,
                 auxiliary,
@@ -4752,6 +4952,7 @@ async fn run_connected_peer(
                 options.validation_target,
                 options.validation_limits,
                 options.ledger_retention,
+                disk_monitor,
                 options.cache,
                 options.mempool_full_rbf,
                 api_runtime,
@@ -4873,6 +5074,7 @@ async fn complete_assumeutxo_validation(
         }),
         options.validation_limits,
         options.ledger_retention,
+        DiskSpaceMonitor::for_options(options, validation_dir.clone()),
         options.cache,
         options.mempool_full_rbf,
         None,
@@ -6018,6 +6220,7 @@ async fn sync_validating_node(
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+    disk_monitor: DiskSpaceMonitor,
     cache: NodeCacheConfig,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
@@ -6040,6 +6243,15 @@ async fn sync_validating_node(
     }
     fs::create_dir_all(&data_dir)
         .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+    let mut disk_space = disk_monitor.check()?;
+    rbtc_info!(
+        "disk forecast total={} available={} required={} reserve={} bounded_storage_ceiling={}",
+        disk_space.total_bytes,
+        disk_space.available_bytes,
+        disk_space.required_bytes,
+        disk_space.reserve_bytes,
+        disk_space.projected_storage_ceiling_bytes
+    );
     let headers_path = data_dir.join("headers.redb");
     reject_legacy_split_chainstate(&data_dir)?;
     let chainstate_path = data_dir.join("chainstate.redb");
@@ -6209,6 +6421,7 @@ async fn sync_validating_node(
                     .expect("API runtime has an explorer index"),
                 &ledger,
                 wallet,
+                disk_space,
             )
             .map(NodeStatus::new)
         })
@@ -6223,9 +6436,11 @@ async fn sync_validating_node(
             explorer: explorer.as_deref(),
             ledger: &ledger,
             wallet,
+            disk_space,
         },
     )?;
     'resync: loop {
+        disk_space = disk_monitor.check()?;
         let compact_candidates = compact_transaction_candidates(transaction_pool, wallet_runtime);
         let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
         if let Some(status) = background_validation {
@@ -6421,6 +6636,7 @@ async fn sync_validating_node(
                     .expect("node status has an explorer index"),
                 &ledger,
                 wallet,
+                disk_space,
             )?);
         }
         publish_runtime_status(
@@ -6433,6 +6649,7 @@ async fn sync_validating_node(
                 explorer: explorer.as_deref(),
                 ledger: &ledger,
                 wallet,
+                disk_space,
             },
         )?;
         if api_server.is_none() {
@@ -6467,6 +6684,7 @@ async fn sync_validating_node(
         }
 
         loop {
+            disk_space = disk_monitor.check()?;
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
             }
@@ -6482,6 +6700,7 @@ async fn sync_validating_node(
                         .expect("node status has an explorer index"),
                     &ledger,
                     wallet,
+                    disk_space,
                 )?);
             }
             publish_runtime_status(
@@ -6494,6 +6713,7 @@ async fn sync_validating_node(
                     explorer: explorer.as_deref(),
                     ledger: &ledger,
                     wallet,
+                    disk_space,
                 },
             )?;
             if let Some(status) = background_validation {
@@ -8623,6 +8843,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut validation_deferred_repair = false;
     let mut prune_blocks = None;
     let mut prune_max_bytes = None;
+    let mut minimum_free_bytes = None;
     let mut active_chainstate_cache_bytes = None;
     let mut background_chainstate_cache_bytes = None;
     let mut bulk_validation_cache_bytes = None;
@@ -9083,6 +9304,17 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 }
                 prune_max_bytes = Some(bytes);
             }
+            "--minimum-free-bytes" => {
+                if minimum_free_bytes.is_some() {
+                    return Err("--minimum-free-bytes cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--minimum-free-bytes")?;
+                minimum_free_bytes = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid minimum free-space reserve: {value}"))?,
+                );
+            }
             "--snapshot-height" => {
                 if snapshot_height.is_some() {
                     return Err("--snapshot-height cannot be supplied more than once".to_owned());
@@ -9491,10 +9723,15 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             );
         }
     }
-    if (prune_blocks.is_some() || prune_max_bytes.is_some()) && data_dir.is_none() {
-        return Err("--prune-blocks and --prune-max-bytes require --data-dir".to_owned());
+    if (prune_blocks.is_some() || prune_max_bytes.is_some() || minimum_free_bytes.is_some())
+        && data_dir.is_none()
+    {
+        return Err(
+            "--prune-blocks, --prune-max-bytes, and --minimum-free-bytes require --data-dir"
+                .to_owned(),
+        );
     }
-    if (prune_blocks.is_some() || prune_max_bytes.is_some())
+    if (prune_blocks.is_some() || prune_max_bytes.is_some() || minimum_free_bytes.is_some())
         && (snapshot_activation
             || finalize_assumeutxo.is_some()
             || utxo_activity_report
@@ -9504,7 +9741,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || headers_db.is_some())
     {
         return Err(
-            "prune targets apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
+            "storage targets apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
                 .to_owned(),
         );
     }
@@ -9570,6 +9807,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         max_bytes: prune_max_bytes.unwrap_or(DEFAULT_MAX_BYTES),
         ..LedgerRetention::default()
     };
+    let minimum_free_bytes = minimum_free_bytes.unwrap_or(DEFAULT_MINIMUM_FREE_BYTES);
     if experimental_network_execution {
         if data_dir.is_none() {
             return Err("--experimental-network-execution requires --data-dir".to_owned());
@@ -9712,6 +9950,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         },
         validation_limits,
         ledger_retention,
+        minimum_free_bytes,
         cache,
         resources: NodeResourceConfig {
             automatic_hot_standbys: automatic_hot_standbys
@@ -9809,7 +10048,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -9951,6 +10190,13 @@ mod tests {
             ledger_bytes: 0,
             ledger_first_height: None,
             ledger_tip_height: None,
+            disk_space: DiskSpaceSnapshot {
+                total_bytes: 10_000,
+                available_bytes: 8_000,
+                required_bytes: 2_000,
+                reserve_bytes: 1_000,
+                projected_storage_ceiling_bytes: 3_000,
+            },
         })
     }
 
@@ -10010,6 +10256,13 @@ mod tests {
         );
         assert_eq!(
             operator
+                .execute("getdiskinfo", &serde_json::json!([]))
+                .unwrap()
+                .unwrap()["available_bytes"],
+            8_000
+        );
+        assert_eq!(
+            operator
                 .execute("setloglevel", &serde_json::json!(["debug"]))
                 .unwrap(),
             Err(LocalRpcOperatorError {
@@ -10065,6 +10318,7 @@ mod tests {
         assert!(response.contains("cache-control: no-store"));
         assert!(response.contains("rbtc_ready 1"));
         assert!(response.contains("rbtc_utxos{tier=\"total\"} 3"));
+        assert!(response.contains("rbtc_disk_bytes{kind=\"available\"} 8000"));
     }
 
     fn write_owner_only(path: &std::path::Path, contents: &str) {
@@ -10264,6 +10518,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -12139,6 +12394,7 @@ mod tests {
                 "--cleanup-validation-dir",
                 "--prune-blocks",
                 "--prune-max-bytes",
+                "--minimum-free-bytes",
                 "--chainstate-cache-bytes",
                 "--background-chainstate-cache-bytes",
                 "--bulk-validation-cache-bytes",
@@ -12194,6 +12450,8 @@ mod tests {
                 "576",
                 "--prune-max-bytes",
                 "1073741824",
+                "--minimum-free-bytes",
+                "2147483648",
             ]
             .into_iter()
             .map(str::to_owned),
@@ -12208,6 +12466,7 @@ mod tests {
                 slots: LedgerRetention::default().slots,
             }
         );
+        assert_eq!(options.minimum_free_bytes, 2 * 1024 * 1024 * 1024);
 
         for arguments in [
             vec!["--prune-blocks", "576"],
@@ -12228,6 +12487,18 @@ mod tests {
                 "/tmp/rbtc-prune-parser",
                 "--prune-max-bytes",
                 "576716799",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--minimum-free-bytes",
+                "536870911",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--minimum-free-bytes",
+                "1099511627777",
             ],
             vec![
                 "--data-dir",
@@ -12433,6 +12704,7 @@ mod tests {
              log_max_bytes=2097152\n\
              log_max_files=3\n\
              prune_blocks=500\n\
+             minimum_free_bytes=2147483648\n\
              explorer_listen=127.0.0.1:3000\n\
              rpc_auth_token_file=/secret/token\n\
              [testnet4]\n\
@@ -12476,6 +12748,7 @@ mod tests {
         assert_eq!(options.logging.max_file_bytes, 2 * 1024 * 1024);
         assert_eq!(options.logging.max_files, 3);
         assert_eq!(options.ledger_retention.max_blocks, 600);
+        assert_eq!(options.minimum_free_bytes, 2 * 1024 * 1024 * 1024);
         let summary = startup_configuration_summary(&options);
         assert!(summary.contains("prune_blocks=600"));
         assert!(summary.contains("automatic_hot_standbys=10"));
@@ -12521,6 +12794,7 @@ mod tests {
         config.storage = NodeStorageConfig {
             prune_blocks: 576,
             prune_bytes: 768 * 1024 * 1024,
+            minimum_free_bytes: 2 * 1024 * 1024 * 1024,
         };
         config.api = Some(NodeApiConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -12559,6 +12833,7 @@ mod tests {
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
         assert_eq!(options.ledger_retention.max_blocks, 576);
+        assert_eq!(options.minimum_free_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(
             options.background_assumeutxo,
             Some(PathBuf::from("/tmp/rbtc-typed-validation"))
@@ -13267,6 +13542,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -13338,6 +13614,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -13737,6 +14014,13 @@ mod tests {
             first_height: Some(1),
             tip_height: Some(1),
         };
+        let disk = NodeDiskStatus {
+            total_bytes: 10_000,
+            available_bytes: 8_000,
+            required_bytes: 2_000,
+            reserve_bytes: 1_000,
+            projected_storage_ceiling_bytes: 3_000,
+        };
         let next = NodeRuntimeStatus {
             network: Network::Regtest,
             active_peer: None,
@@ -13747,6 +14031,7 @@ mod tests {
             utxo_hot: 1,
             utxo_cold: 2,
             freezer,
+            disk,
             trust: NodeTrustStatus {
                 minimum_chainwork_reached: true,
                 active_assume_valid_height: None,
@@ -13774,6 +14059,10 @@ mod tests {
         assert_eq!(
             receiver.try_recv().unwrap(),
             NodeEvent::FreezerChanged { status: freezer }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::DiskSpaceChanged { status: disk }
         );
         assert!(receiver.try_recv().is_err());
         observer.publish(next);
@@ -13825,6 +14114,13 @@ mod tests {
             ledger_bytes: 1_024,
             ledger_first_height: Some(1),
             ledger_tip_height: Some(10),
+            disk_space: DiskSpaceSnapshot {
+                total_bytes: 10_000,
+                available_bytes: 8_000,
+                required_bytes: 2_000,
+                reserve_bytes: 1_000,
+                projected_storage_ceiling_bytes: 3_000,
+            },
         };
         let status = NodeStatus::new(progress.clone());
         assert!(status.response().ready);
@@ -13847,9 +14143,40 @@ mod tests {
         assert_eq!(status.response().phase, "assumed_ready");
 
         progress.minimum_chainwork_reached = false;
-        status.update(progress);
+        status.update(progress.clone());
         assert!(!status.response().ready);
         assert_eq!(status.response().phase, "ibd");
+
+        progress.minimum_chainwork_reached = true;
+        progress.disk_space.available_bytes = 1_999;
+        status.update(progress);
+        assert!(!status.response().ready);
+        assert_eq!(status.response().phase, "low_disk");
+    }
+
+    #[test]
+    fn disk_monitor_fails_locally_before_an_unsafe_checkpoint() {
+        let directory = TempDir::new().unwrap();
+        let safe = DiskSpaceMonitor {
+            data_dir: directory.path().to_path_buf(),
+            required_bytes: 1,
+            reserve_bytes: 1,
+            projected_storage_ceiling_bytes: 1,
+        }
+        .check()
+        .unwrap();
+        assert!(safe.available_bytes >= safe.required_bytes);
+
+        let error = DiskSpaceMonitor {
+            data_dir: directory.path().to_path_buf(),
+            required_bytes: u64::MAX,
+            reserve_bytes: u64::MAX,
+            projected_storage_ceiling_bytes: 1,
+        }
+        .check()
+        .unwrap_err();
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("insufficient disk space"));
     }
 
     #[tokio::test]
@@ -14646,6 +14973,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -14706,6 +15034,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15097,6 +15426,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15191,6 +15521,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15264,6 +15595,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15353,6 +15685,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15413,6 +15746,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15469,6 +15803,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15565,6 +15900,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15627,6 +15963,7 @@ mod tests {
                     quick_repair: true,
                 },
                 ledger_retention: LedgerRetention::default(),
+                minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
@@ -15721,6 +16058,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15805,6 +16143,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15846,6 +16185,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15907,6 +16247,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15962,6 +16303,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -15983,6 +16325,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn daemon_discourages_a_learned_peer_serving_an_invalid_block() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
@@ -16062,6 +16405,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -16218,6 +16562,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -16325,6 +16670,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -16404,6 +16750,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
@@ -16519,6 +16866,7 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
@@ -16669,6 +17017,7 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
@@ -16789,6 +17138,7 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),

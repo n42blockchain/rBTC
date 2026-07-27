@@ -29,6 +29,7 @@ log_max_bytes=16777216
 log_max_files=5
 prune_blocks=1008
 prune_max_bytes=1073741824
+minimum_free_bytes=5368709120
 chainstate_cache_bytes=1073741824
 background_chainstate_cache_bytes=8589934592
 bulk_validation_cache_bytes=17179869184
@@ -49,7 +50,8 @@ The supported scalar keys are:
 - `minimum_chainwork`, `assumevalid`, `signetchallenge`
 - `complete_assumeutxo`, `background_assumeutxo`,
   `validation_batch_size`, `validation_pause_ms`
-- `prune_blocks`, `prune_max_bytes`, `chainstate_cache_bytes`,
+- `prune_blocks`, `prune_max_bytes`, `minimum_free_bytes`
+  (512 MiB–1 TiB), `chainstate_cache_bytes`,
   `background_chainstate_cache_bytes`, `bulk_validation_cache_bytes`
 - `automatic_hot_standbys` (0–16), `mempool_max_transactions`
   (1–300,000), and `mempool_max_bytes` (4,000,000–1,073,741,824)
@@ -74,6 +76,18 @@ data directory, peer/DNS counts, active/background/bulk cache bytes, freezer
 targets, hot-standby and mempool ceilings, validation resources, and enabled API surfaces. It reports only
 booleans for RPC/wallet enablement and never prints authentication paths,
 descriptor paths, or credential contents.
+
+Every persistent data directory is checked before database open and before
+each atomic validation checkpoint or live transaction-persistence cycle.
+`minimum_free_bytes` is the operator reserve (default 5 GiB). The enforced
+threshold additionally forecasts two consensus-maximum serialized copies of
+the configured block batch, one complete bounded mempool image, one rotating
+log file, and 512 MiB of database commit headroom. Falling below the threshold
+is a local-resource failure: the daemon does not blame or retry peers, does not
+begin another checkpoint, and leaves the last atomic state resumable.
+Authenticated `getdiskinfo`, `/api/v1/status`, and `rbtc_disk_bytes` metrics
+report total/available/required/reserve bytes and the bounded freezer,
+mempool, and log storage ceiling.
 
 The standalone daemon writes newline-delimited JSON diagnostics to
 `DATA_DIR/logs/rbtc.log` by default. A 4,096-record non-blocking queue and a

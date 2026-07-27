@@ -25,7 +25,7 @@ const BOOL_KEYS: [&str; 5] = [
     "once",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 25] = [
+const VALUE_KEYS: [&str; 26] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -42,6 +42,7 @@ const VALUE_KEYS: [&str; 25] = [
     "minimum_chainwork",
     "mempool_max_bytes",
     "mempool_max_transactions",
+    "minimum_free_bytes",
     "network",
     "prune_blocks",
     "prune_max_bytes",
@@ -344,6 +345,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "minimum_chainwork" => "--minimum-chainwork",
         "mempool_max_bytes" => "--mempool-max-bytes",
         "mempool_max_transactions" => "--mempool-max-transactions",
+        "minimum_free_bytes" => "--minimum-free-bytes",
         "network" => "--network",
         "prune_blocks" => "--prune-blocks",
         "prune_max_bytes" => "--prune-max-bytes",
@@ -392,6 +394,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--mempool-full-rbf"
             | "--mempool-max-bytes"
             | "--mempool-max-transactions"
+            | "--minimum-free-bytes"
             | "--minimum-chainwork"
             | "--network"
             | "--no-cleanup-validation-dir"
@@ -440,6 +443,7 @@ fn option_group(flag: &str) -> &'static str {
         "--minimum-chainwork" => "minimum-chainwork",
         "--mempool-max-bytes" => "mempool-max-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",
+        "--minimum-free-bytes" => "minimum-free-bytes",
         "--network" => "network",
         "--prune-blocks" => "prune-blocks",
         "--prune-max-bytes" => "prune-max-bytes",

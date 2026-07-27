@@ -238,7 +238,10 @@ optional where appropriate, and host-runtime compatible.
   Standalone JSON diagnostics now use a bounded non-blocking queue, a fixed
   per-second limiter, owner-only size rotation, dropped/error metrics, and
   authenticated runtime level control; embedded hosts use typed event/status
-  receivers. Exact response-field parity is not required.
+  receivers. Startup and every checkpoint boundary also enforce a configurable
+  free-space reserve plus worst-case atomic-write headroom; low space is a
+  local fail-safe, never a peer fault, and `getdiskinfo`/status/metrics expose
+  the current forecast. Exact response-field parity is not required.
 - [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration
