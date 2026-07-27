@@ -63,6 +63,13 @@ preflight succeeds. An unknown future version, higher minimum reader, different
 network, unknown field, or component mismatch fails before mutable database
 open and is never rewritten.
 
+The current root inventory is v3. Version 2 used basic-filter component schema
+1, whose filter-header chain omitted the genesis filter. A v2 directory without
+that optional database migrates forward normally. A directory containing the
+old filter database fails closed and must rebuild that projection from complete
+freezer history or with `--reindex-chainstate`; deleting or editing the
+manifest is not a supported migration.
+
 Before an upgrade, take a stopped consistent backup. A rollback is supported
 only when the older binary accepts the manifest and all component versions.
 Never delete or edit the manifest to force a rollback. Restore the prior

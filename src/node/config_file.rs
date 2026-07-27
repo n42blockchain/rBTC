@@ -18,17 +18,18 @@ const LIST_KEYS: [&str; 5] = [
     "testactivationheight",
     "vbparams",
 ];
-const BOOL_KEYS: [&str; 8] = [
+const BOOL_KEYS: [&str; 9] = [
     "block_filter_index",
     "cleanup_validation_dir",
     "dns_seeds",
     "mempool_full_rbf",
+    "listen",
     "once",
     "spent_output_index",
     "txindex",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 26] = [
+const VALUE_KEYS: [&str; 31] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -38,6 +39,8 @@ const VALUE_KEYS: [&str; 26] = [
     "complete_assumeutxo",
     "data_dir",
     "explorer_listen",
+    "inbound_listen",
+    "inbound_requests_per_minute",
     "log_dir",
     "log_level",
     "log_max_bytes",
@@ -45,6 +48,9 @@ const VALUE_KEYS: [&str; 26] = [
     "minimum_chainwork",
     "mempool_max_bytes",
     "mempool_max_transactions",
+    "max_inbound_peers",
+    "max_inbound_peers_per_ip",
+    "max_upload_bytes_per_day",
     "minimum_free_bytes",
     "network",
     "prune_blocks",
@@ -291,6 +297,12 @@ fn selected_arguments(
 fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
     if BOOL_KEYS.contains(&entry.key.as_str()) {
         let enabled = parse_bool(entry)?;
+        if entry.key == "listen" && enabled {
+            return Err(format!(
+                "config key 'listen=true' at line {} requires an explicit address; use inbound_listen=IP:PORT",
+                entry.line
+            ));
+        }
         let flag = match (entry.key.as_str(), enabled) {
             ("block_filter_index", true) => "--block-filter-index",
             ("block_filter_index", false) => "--no-block-filter-index",
@@ -300,6 +312,7 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
             ("dns_seeds", false) => "--no-dns-seeds",
             ("mempool_full_rbf", true) => "--mempool-full-rbf",
             ("mempool_full_rbf", false) => "--no-mempool-full-rbf",
+            ("listen", false) => "--no-listen",
             ("once", true) => "--once",
             ("once", false) => "--no-once",
             ("spent_output_index", true) => "--spent-output-index",
@@ -347,6 +360,8 @@ fn flag_for_key(key: &str) -> &'static str {
         "data_dir" => "--data-dir",
         "dns_seed" => "--dns-seed",
         "explorer_listen" => "--explorer-listen",
+        "inbound_listen" => "--listen",
+        "inbound_requests_per_minute" => "--inbound-requests-per-minute",
         "log_dir" => "--log-dir",
         "log_level" => "--log-level",
         "log_max_bytes" => "--log-max-bytes",
@@ -354,6 +369,9 @@ fn flag_for_key(key: &str) -> &'static str {
         "minimum_chainwork" => "--minimum-chainwork",
         "mempool_max_bytes" => "--mempool-max-bytes",
         "mempool_max_transactions" => "--mempool-max-transactions",
+        "max_inbound_peers" => "--max-inbound-peers",
+        "max_inbound_peers_per_ip" => "--max-inbound-peers-per-ip",
+        "max_upload_bytes_per_day" => "--max-upload-bytes-per-day",
         "minimum_free_bytes" => "--minimum-free-bytes",
         "network" => "--network",
         "prune_blocks" => "--prune-blocks",
@@ -397,6 +415,8 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--dns-seed"
             | "--dns-seeds"
             | "--explorer-listen"
+            | "--inbound-requests-per-minute"
+            | "--listen"
             | "--log-dir"
             | "--log-level"
             | "--log-max-bytes"
@@ -404,6 +424,9 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--mempool-full-rbf"
             | "--mempool-max-bytes"
             | "--mempool-max-transactions"
+            | "--max-inbound-peers"
+            | "--max-inbound-peers-per-ip"
+            | "--max-upload-bytes-per-day"
             | "--minimum-free-bytes"
             | "--minimum-chainwork"
             | "--network"
@@ -411,6 +434,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--no-block-filter-index"
             | "--no-dns-seeds"
             | "--no-mempool-full-rbf"
+            | "--no-listen"
             | "--no-once"
             | "--no-spent-output-index"
             | "--no-txindex"

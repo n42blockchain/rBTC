@@ -28,7 +28,8 @@ const GENESIS_KEY: &str = "genesis";
 const KIND_KEY: &str = "kind";
 const TIP_KEY: &str = "tip";
 const SCHEMA_KEY: &str = "schema";
-const SCHEMA_VERSION: u32 = 1;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
+const BASIC_FILTER_SCHEMA_VERSION: u32 = 2;
 
 /// One independently persisted optional index family.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -48,6 +49,13 @@ impl AuxiliaryIndexKind {
             Self::Transaction => 1,
             Self::SpentOutput => 2,
             Self::BasicFilter => 3,
+        }
+    }
+
+    const fn schema_version(self) -> u32 {
+        match self {
+            Self::Transaction | Self::SpentOutput => LEGACY_SCHEMA_VERSION,
+            Self::BasicFilter => BASIC_FILTER_SCHEMA_VERSION,
         }
     }
 }
@@ -148,7 +156,9 @@ impl RedbAuxiliaryIndex {
     ) -> Result<Self, AuxiliaryIndexError> {
         let path = path.as_ref();
         validate_database_path(path)?;
-        let genesis = bitcoin::blockdata::constants::genesis_block(network).block_hash();
+        let genesis_block = bitcoin::blockdata::constants::genesis_block(network);
+        let genesis = genesis_block.block_hash();
+        let schema_version = kind.schema_version();
         let db = Database::create(path)?;
         restrict_database_permissions(path)?;
         let transaction = db.begin_write()?;
@@ -166,7 +176,7 @@ impl RedbAuxiliaryIndex {
                 }
                 if meta
                     .get(SCHEMA_KEY)?
-                    .is_none_or(|value| value.value() != SCHEMA_VERSION.to_le_bytes())
+                    .is_none_or(|value| value.value() != schema_version.to_le_bytes())
                 {
                     return Err(AuxiliaryIndexError::Invalid("unsupported schema"));
                 }
@@ -176,7 +186,7 @@ impl RedbAuxiliaryIndex {
             } else {
                 meta.insert(GENESIS_KEY, genesis.to_byte_array().as_slice())?;
                 meta.insert(KIND_KEY, [kind.tag()].as_slice())?;
-                meta.insert(SCHEMA_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
+                meta.insert(SCHEMA_KEY, schema_version.to_le_bytes().as_slice())?;
                 meta.insert(
                     TIP_KEY,
                     encode_tip(ExecutionTip {
@@ -186,7 +196,28 @@ impl RedbAuxiliaryIndex {
                     .as_slice(),
                 )?;
             }
-            transaction.open_table(RECORDS)?;
+            let mut records = transaction.open_table(RECORDS)?;
+            if kind == AuxiliaryIndexKind::BasicFilter
+                && records.get(0_u32.to_be_bytes().as_slice())?.is_none()
+            {
+                let filter = BlockFilter::new_script_filter(&genesis_block, |outpoint| {
+                    Err::<ScriptBuf, _>(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+                })?;
+                let filter_hash = FilterHash::hash(&filter.content);
+                let record = BasicFilterRecord {
+                    filter: filter.content,
+                    filter_hash,
+                    filter_header: filter_hash.filter_header(&FilterHeader::all_zeros()),
+                };
+                records.insert(
+                    0_u32.to_be_bytes().as_slice(),
+                    encode_filter_record(&record).as_slice(),
+                )?;
+                let mut hash_key = Vec::with_capacity(33);
+                hash_key.push(b'h');
+                hash_key.extend_from_slice(&genesis.to_byte_array());
+                records.insert(hash_key.as_slice(), 0_u32.to_be_bytes().as_slice())?;
+            }
             transaction.open_table(UNDOS)?;
         }
         transaction.commit()?;
@@ -533,14 +564,10 @@ fn build_records(
                     .cloned()
                     .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
             })?;
-            let previous_header = if height == 1 {
-                FilterHeader::all_zeros()
-            } else {
-                let previous = records
-                    .get((height - 1).to_be_bytes().as_slice())?
-                    .ok_or(AuxiliaryIndexError::Invalid("missing previous filter"))?;
-                decode_filter_record(previous.value())?.filter_header
-            };
+            let previous = records
+                .get((height - 1).to_be_bytes().as_slice())?
+                .ok_or(AuxiliaryIndexError::Invalid("missing previous filter"))?;
+            let previous_header = decode_filter_record(previous.value())?.filter_header;
             let filter_hash = FilterHash::hash(&filter.content);
             let record = BasicFilterRecord {
                 filter_header: filter_hash.filter_header(&previous_header),
@@ -805,12 +832,13 @@ mod tests {
         let created = OutPoint::new(coinbase.compute_txid(), 0);
         let first = block(genesis.hash, 1, vec![coinbase]);
         index.connect_block(1, &first, &[]).unwrap();
+        let genesis_filter = index.basic_filter(0).unwrap().unwrap();
         let first_filter = index.basic_filter(1).unwrap().unwrap();
         assert_eq!(
             first_filter.filter_header,
             first_filter
                 .filter_hash
-                .filter_header(&FilterHeader::all_zeros())
+                .filter_header(&genesis_filter.filter_header)
         );
 
         let second = block(

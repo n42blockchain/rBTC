@@ -11,7 +11,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -71,7 +71,7 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::Hash,
     hex::{DisplayHex, FromHex},
-    p2p::message_blockdata::Inventory,
+    p2p::{ServiceFlags, message_blockdata::Inventory},
 };
 use rbtc::{
     api::{
@@ -105,6 +105,7 @@ use rbtc::{
     header_store::RedbHeaderStore,
     headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
+    inbound::{InboundBasicFilter, InboundDataSource, InboundLimits, run_listener},
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
         validate_prune_boundary,
@@ -115,8 +116,8 @@ use rbtc::{
     },
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
-        MAX_PENDING_TRANSACTION_INVENTORY, MempoolRelaySource, P2pError, PeerSession,
-        TransactionRelay, connect_outbound,
+        MAX_PENDING_TRANSACTION_INVENTORY, MAX_PENDING_TRANSACTIONS, MAX_PROTOCOL_MESSAGE_LEN,
+        MempoolRelaySource, P2pError, PeerSession, TransactionRelay, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rbtc_info, rbtc_warn,
@@ -206,7 +207,7 @@ const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
-const DATA_FORMAT_SCHEMA_VERSION: u32 = 2;
+const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
 const MAX_DATA_FORMAT_MANIFEST_BYTES: u64 = 4 * 1024;
 const NODE_EVENT_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
@@ -253,6 +254,8 @@ struct Options {
     minimum_free_bytes: u64,
     cache: NodeCacheConfig,
     indexes: NodeIndexConfig,
+    inbound_listen: Option<SocketAddr>,
+    inbound_limits: InboundLimits,
     resources: NodeResourceConfig,
     logging: NodeLogConfig,
     runtime_control: Arc<RuntimeControl>,
@@ -352,6 +355,8 @@ pub struct NodeConfig {
     pub cache: NodeCacheConfig,
     /// Independently persisted optional indexes.
     pub indexes: NodeIndexConfig,
+    /// Optional bounded inbound P2P listener.
+    pub inbound: Option<NodeInboundConfig>,
     /// Peer and transaction-pool resource ceilings.
     pub resources: NodeResourceConfig,
     /// Standalone structured logging policy; embedded hosts may consume events.
@@ -379,6 +384,7 @@ impl NodeConfig {
             mempool_full_rbf: false,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound: None,
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             storage: NodeStorageConfig::default(),
@@ -394,6 +400,7 @@ impl NodeConfig {
         self.clone().into_options().map(drop)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn into_options(self) -> Result<Options, NodeConfigError> {
         let deployments = parse_deployment_config(
             self.network,
@@ -488,6 +495,10 @@ impl NodeConfig {
             minimum_free_bytes: self.storage.minimum_free_bytes,
             cache: self.cache,
             indexes: self.indexes,
+            inbound_listen: self.inbound.as_ref().map(|inbound| inbound.listen),
+            inbound_limits: self
+                .inbound
+                .map_or_else(InboundLimits::default, NodeInboundConfig::limits),
             resources: self.resources,
             logging: self.logging,
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -608,6 +619,33 @@ pub struct NodeIndexConfig {
     pub spent_output: bool,
     /// BIP157/158 basic compact filters and filter headers.
     pub basic_filter: bool,
+}
+
+/// Optional inbound P2P listener and resource policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeInboundConfig {
+    /// Explicit socket address to bind. No listener is opened when absent.
+    pub listen: SocketAddr,
+    /// Maximum concurrent inbound handshakes and established peers.
+    pub max_connections: usize,
+    /// Maximum concurrent inbound sockets from one IP address.
+    pub max_connections_per_ip: usize,
+    /// Rolling 24-hour historical upload target; zero means unlimited.
+    pub max_upload_bytes_per_day: u64,
+    /// Maximum non-keepalive requests accepted per peer per minute.
+    pub max_requests_per_minute: u32,
+}
+
+impl NodeInboundConfig {
+    const fn limits(self) -> InboundLimits {
+        InboundLimits {
+            max_connections: self.max_connections,
+            max_connections_per_ip: self.max_connections_per_ip,
+            max_upload_bytes_per_day: self.max_upload_bytes_per_day,
+            max_requests_per_minute: self.max_requests_per_minute,
+            idle_timeout: Duration::from_secs(20 * 60),
+        }
+    }
 }
 
 impl Default for NodeStorageConfig {
@@ -796,6 +834,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Enables a bounded inbound Bitcoin P2P listener.
+    #[must_use]
+    pub const fn inbound(mut self, inbound: NodeInboundConfig) -> Self {
+        self.config.inbound = Some(inbound);
+        self
+    }
+
     /// Sets bounded hot-standby and transaction-pool resources.
     #[must_use]
     pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
@@ -929,7 +974,46 @@ fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_validation_options(&options)?;
     validate_api_options(&options)?;
     validate_index_options(&options)?;
+    validate_inbound_options(&options)?;
     Ok(options)
+}
+
+fn validate_inbound_options(options: &Options) -> Result<(), String> {
+    if options.inbound_listen.is_none() {
+        return Ok(());
+    }
+    if options.data_dir.is_none()
+        || options.once
+        || options.validation_target.is_some()
+        || options.offline_action.is_some()
+    {
+        return Err(
+            "inbound P2P requires an ordinary persistent data-directory node without --once or an offline/fixed validation target"
+                .to_owned(),
+        );
+    }
+    let limits = options.inbound_limits;
+    if !(1..=256).contains(&limits.max_connections) {
+        return Err("maximum inbound peers must be between 1 and 256".to_owned());
+    }
+    if limits.max_connections_per_ip == 0 || limits.max_connections_per_ip > limits.max_connections
+    {
+        return Err(
+            "maximum inbound peers per IP must be between 1 and the total inbound-peer limit"
+                .to_owned(),
+        );
+    }
+    if limits.max_upload_bytes_per_day != 0
+        && !(1024 * 1024..=1024_u64.pow(4)).contains(&limits.max_upload_bytes_per_day)
+    {
+        return Err(
+            "inbound daily upload target must be zero or between 1 MiB and 1 TiB".to_owned(),
+        );
+    }
+    if !(60..=100_000).contains(&limits.max_requests_per_minute) {
+        return Err("inbound requests per minute must be between 60 and 100000".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_index_options(options: &Options) -> Result<(), String> {
@@ -2152,9 +2236,17 @@ impl DataFormatManifest {
                 rebroadcast: 1,
                 transaction_index: 1,
                 spent_output_index: 1,
-                basic_filter_index: 1,
+                basic_filter_index: 2,
             },
         }
+    }
+
+    fn version2(network: Network) -> Self {
+        let mut manifest = Self::current(network);
+        manifest.schema_version = 2;
+        manifest.minimum_reader_version = 2;
+        manifest.stores.basic_filter_index = 1;
+        manifest
     }
 }
 
@@ -2251,7 +2343,7 @@ fn validate_data_format_manifest(
     let actual: DataFormatManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode data-format manifest: {error}"))?;
     if actual.schema_version == 1 && actual.minimum_reader_version == 1 {
-        let mut legacy = DataFormatManifest::current(network);
+        let mut legacy = DataFormatManifest::version2(network);
         legacy.schema_version = 1;
         legacy.minimum_reader_version = 1;
         if actual == legacy {
@@ -2260,6 +2352,20 @@ fn validate_data_format_manifest(
         return Err(format!(
             "data-format manifest does not match the {network} legacy schema inventory"
         ));
+    }
+    if actual.schema_version == 2 && actual.minimum_reader_version == 2 {
+        if actual != DataFormatManifest::version2(network) {
+            return Err(format!(
+                "data-format manifest does not match the {network} version-2 schema inventory"
+            ));
+        }
+        if data_dir.join("basic-filter-index.redb").exists() {
+            return Err(
+                "version-1 basic-filter index omitted the genesis filter; rebuild it with a complete freezer or --reindex-chainstate"
+                    .to_owned(),
+            );
+        }
+        return Ok(true);
     }
     if actual.schema_version != DATA_FORMAT_SCHEMA_VERSION
         || actual.minimum_reader_version != DATA_FORMAT_SCHEMA_VERSION
@@ -3236,6 +3342,333 @@ struct ApiServer {
     address: SocketAddr,
     task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     token_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+struct NodeInboundSource {
+    headers: Arc<RwLock<HeaderDag>>,
+    chainstate: Arc<RedbChainStore>,
+    ledger: Arc<PrunedBlockLedger>,
+    transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
+    pending_transactions: Arc<Mutex<InboundTransactionQueue>>,
+    basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
+}
+
+#[derive(Default)]
+struct SharedInboundSource {
+    current: RwLock<Option<Arc<dyn InboundDataSource>>>,
+}
+
+impl SharedInboundSource {
+    fn current(&self) -> Result<Arc<dyn InboundDataSource>, String> {
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| "active consensus data is not ready".to_owned())
+    }
+
+    fn install(self: &Arc<Self>, source: Arc<dyn InboundDataSource>) -> SharedInboundSourceLease {
+        *self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&source));
+        SharedInboundSourceLease {
+            shared: Arc::clone(self),
+            source,
+        }
+    }
+}
+
+struct SharedInboundSourceLease {
+    shared: Arc<SharedInboundSource>,
+    source: Arc<dyn InboundDataSource>,
+}
+
+impl Drop for SharedInboundSourceLease {
+    fn drop(&mut self) {
+        let mut current = self
+            .shared
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|source| Arc::ptr_eq(source, &self.source))
+        {
+            *current = None;
+        }
+    }
+}
+
+impl InboundDataSource for SharedInboundSource {
+    fn start_height(&self) -> Result<u32, String> {
+        self.current()?.start_height()
+    }
+
+    fn active_header(&self, height: u32) -> Result<Option<Header>, String> {
+        self.current()?.active_header(height)
+    }
+
+    fn active_height(&self, hash: BlockHash) -> Result<Option<u32>, String> {
+        self.current()?.active_height(hash)
+    }
+
+    fn block(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.current()?.block(hash)
+    }
+
+    fn mempool(&self) -> Result<Vec<Transaction>, String> {
+        self.current()?.mempool()
+    }
+
+    fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
+        self.current()?.transaction(inventory)
+    }
+
+    fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String> {
+        self.current()?.submit_transaction(transaction)
+    }
+
+    fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
+        self.current()?.basic_filter(height)
+    }
+}
+
+#[derive(Default)]
+struct InboundTransactionQueue {
+    transactions: VecDeque<(Transaction, usize)>,
+    bytes: usize,
+}
+
+impl InboundTransactionQueue {
+    fn push(&mut self, transaction: Transaction) -> bool {
+        if transaction.is_coinbase()
+            || transaction.weight().to_wu() > u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT)
+        {
+            return false;
+        }
+        let bytes = serialize(&transaction).len();
+        if bytes > MAX_PROTOCOL_MESSAGE_LEN as usize {
+            return false;
+        }
+        let wtxid = transaction.compute_wtxid();
+        if self
+            .transactions
+            .iter()
+            .any(|(existing, _)| existing.compute_wtxid() == wtxid)
+        {
+            return false;
+        }
+        while self.transactions.len() >= MAX_PENDING_TRANSACTIONS
+            || self.bytes.saturating_add(bytes) > MAX_PROTOCOL_MESSAGE_LEN as usize
+        {
+            let Some((_, removed)) = self.transactions.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(removed);
+        }
+        self.transactions.push_back((transaction, bytes));
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+
+    fn drain(&mut self) -> Vec<Transaction> {
+        self.bytes = 0;
+        self.transactions
+            .drain(..)
+            .map(|(transaction, _)| transaction)
+            .collect()
+    }
+}
+
+impl NodeInboundSource {
+    fn execution_height(&self) -> Result<u32, String> {
+        self.chainstate
+            .execution()
+            .tip()
+            .map(|tip| tip.height)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl InboundDataSource for NodeInboundSource {
+    fn start_height(&self) -> Result<u32, String> {
+        self.execution_height()
+    }
+
+    fn active_header(&self, height: u32) -> Result<Option<Header>, String> {
+        if height > self.execution_height()? {
+            return Ok(None);
+        }
+        Ok(self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_header_at(height)
+            .map(|info| info.header))
+    }
+
+    fn active_height(&self, hash: BlockHash) -> Result<Option<u32>, String> {
+        let executed = self.execution_height()?;
+        Ok(self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_height_of(hash)
+            .filter(|height| *height <= executed))
+    }
+
+    fn block(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, String> {
+        let Some(height) = self.active_height(hash)? else {
+            return Ok(None);
+        };
+        let raw = self
+            .ledger
+            .read_block(height)
+            .map_err(|error| error.to_string())?;
+        if let Some(raw) = &raw {
+            let block = deserialize::<Block>(raw)
+                .map_err(|error| format!("decode retained active block {height}: {error}"))?;
+            if block.block_hash() != hash {
+                return Err(format!(
+                    "retained active block at height {height} has hash {}, expected {hash}",
+                    block.block_hash()
+                ));
+            }
+        }
+        Ok(raw)
+    }
+
+    fn mempool(&self) -> Result<Vec<Transaction>, String> {
+        Ok(self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot())
+    }
+
+    fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
+        Ok(self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+            .into_iter()
+            .find(|transaction| match inventory {
+                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                    transaction.compute_txid() == txid
+                }
+                Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
+                _ => false,
+            }))
+    }
+
+    fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String> {
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(transaction))
+    }
+
+    fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
+        if height > self.execution_height()? {
+            return Ok(None);
+        }
+        let Some(index) = &self.basic_filter else {
+            return Ok(None);
+        };
+        let Some(header) = self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_header_at(height)
+        else {
+            return Ok(None);
+        };
+        index
+            .basic_filter(height)
+            .map_err(|error| error.to_string())
+            .map(|record| {
+                record.map(|record| InboundBasicFilter {
+                    block_hash: header.hash,
+                    filter: record.filter,
+                    filter_hash: record.filter_hash,
+                    filter_header: record.filter_header,
+                })
+            })
+    }
+}
+
+struct InboundServer {
+    task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl InboundServer {
+    async fn bind(
+        address: SocketAddr,
+        network: Network,
+        local_nonce: u64,
+        limits: InboundLimits,
+        source: Arc<dyn InboundDataSource>,
+        serve_compact_filters: bool,
+    ) -> Result<Self, String> {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|error| format!("bind inbound P2P at {address}: {error}"))?;
+        let bound = listener
+            .local_addr()
+            .map_err(|error| format!("read inbound P2P address: {error}"))?;
+        let mut services = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+        if serve_compact_filters {
+            services |= ServiceFlags::COMPACT_FILTERS;
+        }
+        rbtc_info!(
+            "inbound P2P listening on {bound}; max_peers={} per_ip={} daily_upload_bytes={} requests_per_minute={}",
+            limits.max_connections,
+            limits.max_connections_per_ip,
+            limits.max_upload_bytes_per_day,
+            limits.max_requests_per_minute
+        );
+        let task = tokio::spawn(async move {
+            run_listener(
+                listener,
+                network.magic(),
+                local_nonce,
+                USER_AGENT.to_owned(),
+                services,
+                limits,
+                source,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        });
+        Ok(Self { task: Some(task) })
+    }
+
+    async fn wait_for_exit(&mut self) -> Result<(), String> {
+        self.task
+            .take()
+            .ok_or_else(|| "inbound P2P listener task missing".to_owned())?
+            .await
+            .map_err(|error| format!("inbound P2P listener task: {error}"))?
+    }
+}
+
+async fn wait_for_inbound_exit(server: &mut Option<InboundServer>) -> Result<(), String> {
+    match server {
+        Some(server) => server.wait_for_exit().await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Drop for InboundServer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl ApiServer {
@@ -5330,8 +5763,11 @@ fn startup_configuration_summary(options: &Options) -> String {
     } else {
         "none"
     };
+    let inbound = options
+        .inbound_listen
+        .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -5345,6 +5781,11 @@ fn startup_configuration_summary(options: &Options) -> String {
         options.indexes.transaction,
         options.indexes.spent_output,
         options.indexes.basic_filter,
+        inbound,
+        options.inbound_limits.max_connections,
+        options.inbound_limits.max_connections_per_ip,
+        options.inbound_limits.max_upload_bytes_per_day,
+        options.inbound_limits.max_requests_per_minute,
         options.resources.mempool_max_transactions,
         options.resources.mempool_max_bytes,
         options.cache.active_chainstate_bytes,
@@ -5649,6 +6090,27 @@ async fn run_peer_pool(
             .collect()
     });
     let (transaction_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+    let inbound_source = options
+        .inbound_listen
+        .map(|_| Arc::new(SharedInboundSource::default()));
+    let mut inbound_server = if let (Some(address), Some(source)) =
+        (options.inbound_listen, inbound_source.as_ref())
+    {
+        let source: Arc<dyn InboundDataSource> = Arc::clone(source) as Arc<dyn InboundDataSource>;
+        Some(
+            InboundServer::bind(
+                address,
+                options.network,
+                local_nonce,
+                options.inbound_limits,
+                source,
+                options.indexes.basic_filter,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
             RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
@@ -5703,6 +6165,8 @@ async fn run_peer_pool(
         &transaction_pool,
         &transaction_relay,
         &mempool_relay_source,
+        inbound_source.as_ref(),
+        &mut inbound_server,
         &manual_remotes,
         &mut failures,
     )
@@ -5746,6 +6210,8 @@ async fn run_peer_pool(
             &transaction_pool,
             &transaction_relay,
             &mempool_relay_source,
+            inbound_source.as_ref(),
+            &mut inbound_server,
             &manual_remotes,
             &mut failures,
         )
@@ -5808,6 +6274,7 @@ async fn run_background_assumeutxo(
     validation_options.data_dir = Some(validation_dir.clone());
     validation_options.once = false;
     validation_options.explorer_listen = None;
+    validation_options.inbound_listen = None;
     validation_options.wallet_api_files = None;
     validation_options.complete_assumeutxo = None;
     validation_options.background_assumeutxo = None;
@@ -7086,6 +7553,8 @@ async fn try_peer_candidates(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     mempool_relay_source: &MempoolRelaySource,
+    inbound_source: Option<&Arc<SharedInboundSource>>,
+    inbound_server: &mut Option<InboundServer>,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
 ) -> Result<bool, String> {
@@ -7125,6 +7594,7 @@ async fn try_peer_candidates(
                     validation_scheduler,
                     transaction_pool,
                     transaction_relay,
+                    inbound_source,
                 ));
                 let mut standby_reaper = tokio::time::interval(STANDBY_REAP_INTERVAL);
                 loop {
@@ -7144,6 +7614,12 @@ async fn try_peer_candidates(
                                 failures,
                                 options.resources.automatic_hot_standbys,
                             ).await;
+                        }
+                        listener = wait_for_inbound_exit(inbound_server) => {
+                            break Err(PeerRunError::local(match listener {
+                                Ok(()) => "inbound P2P listener stopped unexpectedly".to_owned(),
+                                Err(error) => error,
+                            }));
                         }
                     }
                 }
@@ -7177,7 +7653,7 @@ async fn try_peer_candidates(
     Ok(false)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_connected_peer(
     options: &Options,
     connected: ConnectedPeer,
@@ -7188,6 +7664,7 @@ async fn run_connected_peer(
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
+    inbound_source: Option<&Arc<SharedInboundSource>>,
 ) -> Result<(), PeerRunError> {
     let ConnectedPeer {
         remote,
@@ -7238,6 +7715,7 @@ async fn run_connected_peer(
                 disk_monitor,
                 options.cache,
                 options.indexes,
+                inbound_source,
                 options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
@@ -7361,6 +7839,7 @@ async fn complete_assumeutxo_validation(
         DiskSpaceMonitor::for_options(options, validation_dir.clone()),
         options.cache,
         options.indexes,
+        None,
         options.mempool_full_rbf,
         None,
         None,
@@ -8508,6 +8987,7 @@ async fn sync_validating_node(
     disk_monitor: DiskSpaceMonitor,
     cache: NodeCacheConfig,
     index_config: NodeIndexConfig,
+    inbound_source: Option<&Arc<SharedInboundSource>>,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -8583,6 +9063,7 @@ async fn sync_validating_node(
             }
         }
     };
+    let chainstate = Arc::new(chainstate);
     rbtc_info!(
         "opened chainstate in {} ms",
         chainstate_open_started.elapsed().as_millis()
@@ -8641,8 +9122,10 @@ async fn sync_validating_node(
         .then(|| RedbFeeEstimator::open(data_dir.join("fee_estimates.redb"), network).map(Arc::new))
         .transpose()
         .map_err(|error| error.to_string())?;
-    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), ledger_retention)
-        .map_err(|error| error.to_string())?;
+    let ledger = Arc::new(
+        PrunedBlockLedger::open(data_dir.join("blocks"), ledger_retention)
+            .map_err(|error| error.to_string())?,
+    );
     rbtc_info!(
         "opened pruned ledger with targets max_blocks={} max_bytes={}",
         ledger_retention.max_blocks,
@@ -8670,7 +9153,10 @@ async fn sync_validating_node(
     let wallet_runtime = api_runtime.and_then(|api| api.wallet.as_ref());
     let wallet = wallet_runtime.map(|runtime| runtime.wallet.as_ref());
     let mut api_server: Option<ApiServer> = None;
+    let mut inbound_source_lease: Option<SharedInboundSourceLease> = None;
+    let inbound_transactions = Arc::new(Mutex::new(InboundTransactionQueue::default()));
     let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+    let inbound_headers = Arc::new(RwLock::new(headers.clone()));
     if network_execution.extends_validation_target() {
         let target = validation_target.expect("parser requires an explicit extension target");
         let active = headers.active_header_at(target.height).ok_or_else(|| {
@@ -8987,6 +9473,20 @@ async fn sync_validating_node(
                 );
             }
         }
+        if inbound_source_lease.is_none() {
+            if let Some(shared) = inbound_source {
+                let source = Arc::new(NodeInboundSource {
+                    headers: Arc::clone(&inbound_headers),
+                    chainstate: Arc::clone(&chainstate),
+                    ledger: Arc::clone(&ledger),
+                    transaction_pool: Arc::clone(transaction_pool),
+                    pending_transactions: Arc::clone(&inbound_transactions),
+                    basic_filter: auxiliary_indexes.basic_filter.as_ref().map(Arc::clone),
+                });
+                let source: Arc<dyn InboundDataSource> = source;
+                inbound_source_lease = Some(shared.install(source));
+            }
+        }
 
         loop {
             disk_space = disk_monitor.check()?;
@@ -9060,6 +9560,15 @@ async fn sync_validating_node(
                     .status(&headers)
                     .map_err(|error| error.to_string())?;
                 if ibd_status.minimum_chainwork_reached {
+                    let queued_inbound = inbound_transactions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .drain();
+                    for transaction in queued_inbound {
+                        session
+                            .queue_pending_transaction(transaction)
+                            .map_err(|error| PeerRunError::p2p(&error))?;
+                    }
                     fetch_announced_peer_transactions(session, transaction_pool, wallet_runtime)
                         .await?;
                     loop {
@@ -9150,6 +9659,9 @@ async fn sync_validating_node(
                         .map_err(|error| PeerRunError::p2p(&error))?;
                 }
                 headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+                *inbound_headers
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.clone();
                 continue 'resync;
             }
             let effective_validation_limits = validation_scheduler
@@ -11463,6 +11975,12 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
+    let mut inbound_listen = None;
+    let mut no_inbound_listen = false;
+    let mut max_inbound_peers = None;
+    let mut max_inbound_peers_per_ip = None;
+    let mut max_upload_bytes_per_day = None;
+    let mut inbound_requests_per_minute = None;
     let mut cleanup_validation_dir = false;
     let mut utxo_activity_report = false;
     let mut utxo_retier_window_blocks = None;
@@ -11702,6 +12220,72 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-spent-output-index" => spent_output_index = false,
             "--block-filter-index" => basic_filter_index = true,
             "--no-block-filter-index" => basic_filter_index = false,
+            "--listen" => {
+                if inbound_listen.is_some() {
+                    return Err("--listen cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--listen")?;
+                inbound_listen = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid inbound listen address: {value}"))?,
+                );
+                no_inbound_listen = false;
+            }
+            "--no-listen" => {
+                inbound_listen = None;
+                no_inbound_listen = true;
+            }
+            "--max-inbound-peers" => {
+                if max_inbound_peers.is_some() {
+                    return Err("--max-inbound-peers cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--max-inbound-peers")?;
+                max_inbound_peers = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid maximum inbound peer count: {value}"))?,
+                );
+            }
+            "--max-inbound-peers-per-ip" => {
+                if max_inbound_peers_per_ip.is_some() {
+                    return Err(
+                        "--max-inbound-peers-per-ip cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--max-inbound-peers-per-ip")?;
+                max_inbound_peers_per_ip = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid maximum inbound peers per IP: {value}"))?,
+                );
+            }
+            "--max-upload-bytes-per-day" => {
+                if max_upload_bytes_per_day.is_some() {
+                    return Err(
+                        "--max-upload-bytes-per-day cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--max-upload-bytes-per-day")?;
+                max_upload_bytes_per_day = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid daily upload target: {value}"))?,
+                );
+            }
+            "--inbound-requests-per-minute" => {
+                if inbound_requests_per_minute.is_some() {
+                    return Err(
+                        "--inbound-requests-per-minute cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--inbound-requests-per-minute")?;
+                inbound_requests_per_minute =
+                    Some(value.parse::<u32>().map_err(|_| {
+                        format!("invalid inbound requests-per-minute limit: {value}")
+                    })?);
+            }
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--no-cleanup-validation-dir" => cleanup_validation_dir = false,
             "--utxo-activity-report" => utxo_activity_report = true,
@@ -12932,7 +13516,16 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .to_owned(),
         );
     }
+    if inbound_listen.is_none()
+        && (max_inbound_peers.is_some()
+            || max_inbound_peers_per_ip.is_some()
+            || max_upload_bytes_per_day.is_some()
+            || inbound_requests_per_minute.is_some())
+    {
+        return Err("inbound resource limits require --listen ADDRESS".to_owned());
+    }
     let default_logging = NodeLogConfig::default();
+    let default_inbound = InboundLimits::default();
     let logging_directory =
         log_dir.or_else(|| data_dir.as_ref().map(|directory| directory.join("logs")));
     validate_runtime_options(Options {
@@ -12998,6 +13591,17 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             transaction: transaction_index,
             spent_output: spent_output_index,
             basic_filter: basic_filter_index,
+        },
+        inbound_listen: (!no_inbound_listen).then_some(inbound_listen).flatten(),
+        inbound_limits: InboundLimits {
+            max_connections: max_inbound_peers.unwrap_or(default_inbound.max_connections),
+            max_connections_per_ip: max_inbound_peers_per_ip
+                .unwrap_or(default_inbound.max_connections_per_ip),
+            max_upload_bytes_per_day: max_upload_bytes_per_day
+                .unwrap_or(default_inbound.max_upload_bytes_per_day),
+            max_requests_per_minute: inbound_requests_per_minute
+                .unwrap_or(default_inbound.max_requests_per_minute),
+            idle_timeout: default_inbound.idle_timeout,
         },
         resources: NodeResourceConfig {
             automatic_hot_standbys: automatic_hot_standbys
@@ -13095,7 +13699,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -13668,6 +14272,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -15709,6 +16315,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_bounds_inbound_listener_resources() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-inbound-parser",
+                "--listen",
+                "127.0.0.1:18444",
+                "--max-inbound-peers",
+                "12",
+                "--max-inbound-peers-per-ip",
+                "3",
+                "--max-upload-bytes-per-day",
+                "1048576",
+                "--inbound-requests-per-minute",
+                "600",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.inbound_listen,
+            Some("127.0.0.1:18444".parse().unwrap())
+        );
+        assert_eq!(options.inbound_limits.max_connections, 12);
+        assert_eq!(options.inbound_limits.max_connections_per_ip, 3);
+        assert_eq!(options.inbound_limits.max_upload_bytes_per_day, 1_048_576);
+        assert_eq!(options.inbound_limits.max_requests_per_minute, 600);
+
+        for arguments in [
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-inbound-parser",
+                "--listen",
+                "127.0.0.1:18444",
+                "--max-inbound-peers",
+                "0",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-inbound-parser",
+                "--listen",
+                "127.0.0.1:18444",
+                "--max-inbound-peers",
+                "2",
+                "--max-inbound-peers-per-ip",
+                "3",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-inbound-parser",
+                "--listen",
+                "127.0.0.1:18444",
+                "--once",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_and_bounds_explicit_chainstate_cache_budgets() {
         let options = parse_options(
             [
@@ -17466,6 +18136,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -17539,6 +18211,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18212,12 +18886,28 @@ mod tests {
         assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["schema_version"],
-            2
+            3
         );
 
+        let version2 = serde_json::to_vec(&DataFormatManifest::version2(Network::Regtest)).unwrap();
+        fs::write(&path, &version2).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        let obsolete_filter = directory.path().join("basic-filter-index.redb");
+        fs::write(&obsolete_filter, []).unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("omitted the genesis filter")
+        );
+        fs::remove_file(obsolete_filter).unwrap();
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+
         let future = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 3,
-            "minimum_reader_version": 3,
+            "schema_version": 4,
+            "minimum_reader_version": 4,
             "network": "regtest",
             "stores": {
                 "headers": 1,
@@ -19093,6 +19783,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19156,6 +19848,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19554,6 +20248,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19650,6 +20346,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19725,6 +20423,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19816,6 +20516,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19878,6 +20580,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19936,6 +20640,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20034,6 +20740,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20098,6 +20806,8 @@ mod tests {
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 indexes: NodeIndexConfig::default(),
+                inbound_listen: None,
+                inbound_limits: InboundLimits::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -20194,6 +20904,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20280,6 +20992,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20323,6 +21037,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20386,6 +21102,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20443,6 +21161,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20546,6 +21266,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20704,6 +21426,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20813,6 +21537,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20894,6 +21620,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21011,6 +21739,8 @@ mod tests {
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 indexes: NodeIndexConfig::default(),
+                inbound_listen: None,
+                inbound_limits: InboundLimits::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -21163,6 +21893,8 @@ mod tests {
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
                 indexes: NodeIndexConfig::default(),
+                inbound_listen: None,
+                inbound_limits: InboundLimits::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -21204,6 +21936,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn daemon_downloads_and_executes_a_real_default_signet_block() {
         let encoded = include_str!("../tests/data/bitcoin-core-26/signet-block-1.hex");
         let block: Block = deserialize(&Vec::<u8>::from_hex(encoded.trim()).unwrap()).unwrap();
@@ -21285,6 +22018,8 @@ mod tests {
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),

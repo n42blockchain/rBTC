@@ -200,6 +200,18 @@ impl HeaderDag {
             .copied()
     }
 
+    /// Returns the active-chain height of `hash`, excluding known side-chain
+    /// headers.
+    #[must_use]
+    pub fn active_height_of(&self, hash: BlockHash) -> Option<u32> {
+        let info = self.headers.get(&hash)?;
+        let index = usize::try_from(info.height).ok()?;
+        self.active_chain
+            .get(index)
+            .is_some_and(|active| *active == hash)
+            .then_some(info.height)
+    }
+
     /// Builds a standard newest-to-oldest block locator for `getheaders`.
     ///
     /// The first ten entries walk one header at a time; thereafter the step

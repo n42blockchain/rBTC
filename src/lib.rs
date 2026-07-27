@@ -23,6 +23,7 @@ pub mod fee_estimator;
 pub mod header_store;
 pub mod headers;
 pub mod ibd;
+pub mod inbound;
 pub mod index_policy;
 pub mod ledger;
 #[cfg(feature = "mdbx")]

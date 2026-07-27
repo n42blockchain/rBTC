@@ -615,6 +615,39 @@ pub struct PeerSession<S> {
     block_transfer_stats: BlockTransferStats,
 }
 
+/// An accepted inbound Bitcoin peer after a bounded v1 handshake.
+///
+/// Unlike [`PeerSession`], this type does not contain outbound synchronization
+/// state or implicitly answer application requests. The node's inbound service
+/// owns request routing, upload accounting, and access to authenticated local
+/// data, while this type keeps framing and negotiation rules shared.
+pub struct InboundPeerSession<S> {
+    transport: V1Transport<S>,
+    local_id: u64,
+    remote_version: VersionMessage,
+    wtxid_relay: bool,
+}
+
+impl<S> InboundPeerSession<S> {
+    /// Returns the peer's negotiated `version` message.
+    #[must_use]
+    pub const fn remote_version(&self) -> &VersionMessage {
+        &self.remote_version
+    }
+
+    /// Returns this accepted session's process-local, peer-independent ID.
+    #[must_use]
+    pub const fn local_id(&self) -> u64 {
+        self.local_id
+    }
+
+    /// Returns whether the peer negotiated BIP339 wtxid relay.
+    #[must_use]
+    pub const fn wtxid_relay(&self) -> bool {
+        self.wtxid_relay
+    }
+}
+
 /// Exact resolution of one bounded transaction `getdata` batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionRequestOutcome {
@@ -877,6 +910,104 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
         }
         Err(P2pError::HandshakeIncomplete)
     }
+
+    /// Performs the accepting side of the bounded v1 `version`/`verack`
+    /// handshake.
+    ///
+    /// The remote must identify itself before acknowledging the connection.
+    /// Modern feature messages are emitted before the local `verack`, matching
+    /// the outbound negotiation order. Pings are answered but still consume
+    /// the fixed pre-authentication message budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed framing, obsolete or duplicate versions,
+    /// a self-connection nonce, invalid ordering, or an incomplete handshake.
+    pub async fn handshake_inbound(
+        &mut self,
+        local: VersionMessage,
+    ) -> Result<VersionMessage, P2pError> {
+        validate_user_agent(&local.user_agent)?;
+        let local_protocol_version = local.version;
+        let local_nonce = local.nonce;
+        let mut remote_version = None;
+        let mut received_verack = false;
+        for _ in 0..MAX_HANDSHAKE_MESSAGES {
+            match self.read_message().await?.into_payload() {
+                NetworkMessage::Version(version) => {
+                    if version.version < MIN_PEER_PROTOCOL_VERSION {
+                        return Err(P2pError::ObsoleteVersion {
+                            actual: version.version,
+                            minimum: MIN_PEER_PROTOCOL_VERSION,
+                        });
+                    }
+                    validate_user_agent(&version.user_agent)?;
+                    if version.nonce == local_nonce {
+                        return Err(P2pError::SelfConnection);
+                    }
+                    let common_version = local_protocol_version.min(version.version);
+                    if remote_version.replace(version).is_some() {
+                        return Err(P2pError::DuplicateVersion);
+                    }
+                    self.write_message(NetworkMessage::Version(local.clone()))
+                        .await?;
+                    if common_version >= ADDRESS_RELAY_VERSION {
+                        self.write_message(NetworkMessage::WtxidRelay).await?;
+                        self.write_message(NetworkMessage::SendAddrV2).await?;
+                    }
+                    self.write_message(NetworkMessage::Verack).await?;
+                }
+                NetworkMessage::Verack => {
+                    if remote_version.is_none() {
+                        return Err(P2pError::VerackBeforeVersion);
+                    }
+                    received_verack = true;
+                }
+                NetworkMessage::WtxidRelay
+                    if remote_version
+                        .as_ref()
+                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+                {
+                    self.peer_wtxid_relay = true;
+                }
+                NetworkMessage::Ping(nonce) => {
+                    self.write_message(NetworkMessage::Pong(nonce)).await?;
+                }
+                _ => {}
+            }
+            if received_verack {
+                if let Some(version) = remote_version {
+                    return Ok(version);
+                }
+            }
+        }
+        Err(P2pError::HandshakeIncomplete)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> InboundPeerSession<S> {
+    /// Receives one checksum-validated, protocol-bounded application message.
+    ///
+    /// # Errors
+    ///
+    /// Returns framing, protocol-limit, or post-handshake ordering errors.
+    pub async fn receive_message(&mut self) -> Result<NetworkMessage, P2pError> {
+        let message = self.transport.read_message().await?.into_payload();
+        validate_post_handshake_message(&message)?;
+        if matches!(message, NetworkMessage::Version(_)) {
+            return Err(P2pError::PostHandshakeVersion);
+        }
+        Ok(message)
+    }
+
+    /// Sends one Bitcoin v1 application message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the complete frame cannot be written.
+    pub async fn send_message(&mut self, message: NetworkMessage) -> Result<(), P2pError> {
+        self.transport.write_message(message).await
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
@@ -889,6 +1020,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         if weight > limit {
             return Err(P2pError::OutboundTransactionTooHeavy { weight, limit });
         }
+        Ok(())
+    }
+
+    /// Queues one transaction received by another bounded transport for the
+    /// existing full admission path.
+    ///
+    /// This is used by the optional inbound listener so consensus, script,
+    /// package, replacement, orphan, and persistence checks remain centralized
+    /// in the active-node loop.
+    pub fn queue_pending_transaction(&mut self, transaction: Transaction) -> Result<(), P2pError> {
+        Self::validate_outbound_transaction(&transaction)?;
+        let payload_len = serialize(&transaction).len();
+        self.retain_pending_transaction(transaction, payload_len);
         Ok(())
     }
 
@@ -1946,6 +2090,51 @@ pub async fn connect_outbound(
     Ok(PeerSession::new(transport, remote_version))
 }
 
+/// Accepts an established TCP stream and completes the inbound Bitcoin v1
+/// handshake without granting it access to node state.
+///
+/// The caller owns accept/handshake timeouts, connection admission, and all
+/// post-handshake upload/work budgets.
+///
+/// # Errors
+///
+/// Returns an error when framing or the bounded inbound handshake fails.
+pub async fn accept_inbound(
+    stream: TcpStream,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+    services: ServiceFlags,
+) -> Result<InboundPeerSession<TcpStream>, P2pError> {
+    validate_user_agent(&user_agent)?;
+    let remote = stream.peer_addr()?;
+    let local = stream.local_addr()?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let timestamp = i64::try_from(timestamp).unwrap_or(i64::MAX);
+    let mut local_version = VersionMessage::new(
+        services,
+        timestamp,
+        Address::new(&remote, ServiceFlags::NONE),
+        Address::new(&local, services),
+        nonce,
+        user_agent,
+        start_height,
+    );
+    local_version.version = PROTOCOL_VERSION;
+    let mut transport = V1Transport::new(stream, magic);
+    let remote_version = transport.handshake_inbound(local_version).await?;
+    Ok(InboundPeerSession {
+        wtxid_relay: transport.peer_wtxid_relay,
+        transport,
+        local_id: next_session_id(),
+        remote_version,
+    })
+}
+
 /// Builds a protocol-compatible v1 P2P envelope.
 #[must_use]
 pub fn encode_v1(magic: Magic, payload: NetworkMessage) -> Vec<u8> {
@@ -2336,6 +2525,68 @@ mod tests {
 
         assert_eq!(client.await.unwrap().nonce, 2);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_handshake_is_bounded_and_negotiates_before_verack() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let mut inbound = V1Transport::new(server_stream, Network::Regtest.magic());
+        let server = tokio::spawn(async move {
+            let mut local = version(22);
+            local.version = ADDRESS_RELAY_VERSION;
+            let remote = inbound.handshake_inbound(local).await.unwrap();
+            assert_eq!(remote.nonce, 11);
+            assert!(inbound.peer_wtxid_relay);
+        });
+        let mut client = V1Transport::new(client_stream, Network::Regtest.magic());
+        let mut remote = version(11);
+        remote.version = ADDRESS_RELAY_VERSION;
+        client
+            .write_message(NetworkMessage::Version(remote))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Version(_)
+        ));
+        assert!(matches!(
+            client.read_message().await.unwrap().into_payload(),
+            NetworkMessage::WtxidRelay
+        ));
+        assert!(matches!(
+            client.read_message().await.unwrap().into_payload(),
+            NetworkMessage::SendAddrV2
+        ));
+        assert!(matches!(
+            client.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Verack
+        ));
+        client
+            .write_message(NetworkMessage::WtxidRelay)
+            .await
+            .unwrap();
+        client.write_message(NetworkMessage::Verack).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inbound_handshake_rejects_self_connection_before_local_version() {
+        let (client_stream, server_stream) = duplex(4096);
+        let mut inbound = V1Transport::new(server_stream, Network::Regtest.magic());
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                inbound.handshake_inbound(version(7)).await,
+                Err(P2pError::SelfConnection)
+            ));
+        });
+        let mut client = V1Transport::new(client_stream, Network::Regtest.magic());
+        client
+            .write_message(NetworkMessage::Version(version(7)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(20), client.read_message()).await;
+        assert!(result.is_err() || matches!(result, Ok(Err(P2pError::Io(_)))));
     }
 
     #[tokio::test]

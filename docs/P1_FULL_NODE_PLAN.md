@@ -124,6 +124,20 @@ Acceptance: Core 31 and btcd can sync a regtest chain from rBTC, malformed and
 slow peers remain memory/CPU/bandwidth bounded, pruning never produces a false
 service claim, and outbound-only mode remains unchanged.
 
+Implemented foundation on 2026-07-27: typed/CLI/config-file listen controls,
+bounded accepting-side v1 handshake, process-global and per-IP admission,
+idle/request/upload budgets, active-chain header service, freezer-only
+witness/full/compact block service, bounded BIP35/transaction intake, and
+BIP157/158 serving are covered by real TCP tests. The listener is owned by the
+node peer pool rather than an active outbound session, so failover atomically
+leases a new reconciled read view without rebinding. The independent
+AssumeUTXO validator explicitly disables listening. The basic-filter schema
+was advanced because the original index omitted the genesis filter and
+therefore chained height 1 from the wrong predecessor. P1.2 remains open for
+netgroup-aware eviction/preference, address relay/routability controls,
+observable per-peer accounting, inbound transaction fan-out, and recorded
+Core 31/btcd interoperability evidence.
+
 ### P1.3 — current transaction relay and policy
 
 1. Differentially pin Core 31 relay fee, standardness, dust, script, RBF, TRUC,
