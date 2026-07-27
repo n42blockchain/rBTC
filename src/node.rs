@@ -21,6 +21,22 @@ use thiserror::Error;
 struct RuntimeControl {
     shutdown_requested: AtomicBool,
     checkpoints_in_flight: AtomicUsize,
+    shutdown_notify: tokio::sync::Notify,
+}
+
+impl RuntimeControl {
+    fn request_shutdown(&self) {
+        if !self.shutdown_requested.swap(true, Ordering::AcqRel) {
+            self.shutdown_notify.notify_one();
+        }
+    }
+
+    async fn shutdown_requested(&self) {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return;
+        }
+        self.shutdown_notify.notified().await;
+    }
 }
 
 struct InFlightCheckpoint<'a> {
@@ -59,8 +75,9 @@ use bitcoin::{
 use rbtc::{
     api::{
         AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
-        WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
-        explorer_events_router, explorer_router, rpc_router, wallet_router_with_sink,
+        LocalRpcOperator, LocalRpcOperatorError, WALLET_BROADCAST_QUEUE_CAPACITY,
+        WalletBroadcastRequest, WalletBroadcastSink, explorer_events_router, explorer_router,
+        rpc_router_with_operator, wallet_router_with_sink,
     },
     archive::bounded_archive_prefix_len,
     block_execution::{
@@ -695,6 +712,8 @@ impl NodeBuilder {
             let _ = task_events.send(NodeEvent::Started);
             let run = run(options);
             tokio::pin!(run);
+            let wait_for_runtime_shutdown = runtime_control.shutdown_requested();
+            tokio::pin!(wait_for_runtime_shutdown);
             let result = tokio::select! {
                 result = &mut run => result.map_err(NodeError::Runtime),
                 changed = shutdown_rx.changed() => {
@@ -702,13 +721,21 @@ impl NodeBuilder {
                         Err(NodeError::ControlChannelClosed)
                     } else {
                         task_lifecycle.send_replace(NodeLifecycle::Stopping);
-                        runtime_control.shutdown_requested.store(true, Ordering::Release);
+                        runtime_control.request_shutdown();
                         wait_for_in_flight_checkpoints(
                             &runtime_control.checkpoints_in_flight,
                         )
                         .await;
                         Ok(())
                     }
+                },
+                () = &mut wait_for_runtime_shutdown => {
+                    task_lifecycle.send_replace(NodeLifecycle::Stopping);
+                    wait_for_in_flight_checkpoints(
+                        &runtime_control.checkpoints_in_flight,
+                    )
+                    .await;
+                    Ok(())
                 }
             };
             match &result {
@@ -1629,6 +1656,146 @@ struct NodeStatus {
     progress: Arc<Mutex<NodeStatusProgress>>,
 }
 
+struct NodeRpcOperator {
+    status: NodeStatus,
+    transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
+    runtime_control: Arc<RuntimeControl>,
+    active_peer: Option<SocketAddr>,
+}
+
+const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
+    "getblockchaininfo",
+    "getnetworkinfo",
+    "getpeerinfo",
+    "getmempoolinfo",
+    "getindexinfo",
+    "verifychain",
+    "stop",
+];
+
+impl LocalRpcOperator for NodeRpcOperator {
+    fn methods(&self) -> &'static [&'static str] {
+        NODE_OPERATOR_RPC_METHODS
+    }
+
+    fn execute(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, LocalRpcOperatorError>> {
+        if !NODE_OPERATOR_RPC_METHODS.contains(&method) {
+            return None;
+        }
+        if !rpc_has_no_params(params) {
+            return Some(Err(LocalRpcOperatorError {
+                code: -32602,
+                message: "Invalid params",
+            }));
+        }
+        let status = self.status.response();
+        Some(Ok(match method {
+            "getblockchaininfo" => serde_json::json!({
+                "chain": status.network,
+                "blocks": status.execution.height,
+                "headers": status.header.height,
+                "bestblockhash": status.execution.hash,
+                "initialblockdownload": !status.trust.minimum_chainwork_reached,
+                "verificationprogress": verification_progress(
+                    status.execution.height,
+                    status.header.height,
+                ),
+                "pruned": true,
+                "pruneheight": status.ledger_first_height,
+                "rbtc_phase": status.phase,
+                "rbtc_independently_validated": status.trust.independently_validated,
+            }),
+            "getnetworkinfo" => serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "subversion": USER_AGENT,
+                "networkactive": true,
+                "connections": usize::from(self.active_peer.is_some()),
+                "connections_in": 0,
+                "connections_out": usize::from(self.active_peer.is_some()),
+                "networks": [{
+                    "name": status.network,
+                    "reachable": self.active_peer.is_some(),
+                }],
+            }),
+            "getpeerinfo" => self.active_peer.map_or_else(
+                || serde_json::json!([]),
+                |address| {
+                    serde_json::json!([{
+                        "addr": address.to_string(),
+                        "inbound": false,
+                        "role": "active",
+                    }])
+                },
+            ),
+            "getmempoolinfo" => {
+                let pool = self
+                    .transaction_pool
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                serde_json::json!({
+                    "loaded": true,
+                    "size": pool.len(),
+                    "bytes": pool.retained_bytes(),
+                    "maxmempool": pool.max_bytes(),
+                    "maxtransactions": pool.max_transactions(),
+                    "orphan_count": pool.orphan_len(),
+                    "orphan_bytes": pool.orphan_bytes(),
+                })
+            }
+            "getindexinfo" => serde_json::json!({
+                "explorer": {
+                    "synced": status.explorer == status.execution,
+                    "best_block_height": status.explorer.height,
+                },
+                "wallet": status.wallet.as_ref().map(|wallet| serde_json::json!({
+                    "synced": *wallet == status.execution,
+                    "best_block_height": wallet.height,
+                })),
+            }),
+            "verifychain" => serde_json::Value::Bool(status_consistent(&status)),
+            "stop" => {
+                let runtime_control = Arc::clone(&self.runtime_control);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    runtime_control.request_shutdown();
+                });
+                serde_json::Value::String("rBTC stopping".to_owned())
+            }
+            _ => unreachable!("method membership checked above"),
+        }))
+    }
+}
+
+fn rpc_has_no_params(params: &serde_json::Value) -> bool {
+    params.is_null() || params.as_array().is_some_and(Vec::is_empty)
+}
+
+fn verification_progress(execution: u32, headers: u32) -> f64 {
+    if headers == 0 {
+        1.0
+    } else {
+        (f64::from(execution) / f64::from(headers)).min(1.0)
+    }
+}
+
+fn status_consistent(status: &NodeStatusResponse) -> bool {
+    status.execution.height <= status.header.height
+        && (status.execution.height != status.header.height
+            || status.execution.hash == status.header.hash)
+        && status.explorer.height <= status.execution.height
+        && (status.explorer.height != status.execution.height
+            || status.explorer.hash == status.execution.hash)
+        && status.wallet.as_ref().is_none_or(|wallet| {
+            wallet.height <= status.execution.height
+                && (wallet.height != status.execution.height
+                    || wallet.hash == status.execution.hash)
+        })
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 struct NodeTrustResponse {
     minimum_chainwork_reached: bool,
@@ -1951,6 +2118,9 @@ impl ApiServer {
         rpc: Option<&RpcApiRuntime>,
         fee_estimator: Option<&Arc<RedbFeeEstimator>>,
         background_validation: Option<&BackgroundValidationStatus>,
+        transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
+        runtime_control: Arc<RuntimeControl>,
+        active_peer: Option<SocketAddr>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -1960,7 +2130,7 @@ impl ApiServer {
             .map_err(|error| format!("read explorer address: {error}"))?;
         let mut router = explorer_router(Arc::clone(&index))
             .merge(explorer_events_router(explorer_events))
-            .merge(node_status_router(node_status));
+            .merge(node_status_router(node_status.clone()));
         let mut token_tasks = Vec::new();
         if let Some(wallet) = wallet {
             let token = wallet.token.clone();
@@ -1987,11 +2157,18 @@ impl ApiServer {
             token_tasks.push(tokio::spawn(watch_local_auth_token(
                 token_path, token, "RPC",
             )));
-            router = router.merge(rpc_router(
+            let operator: Arc<dyn LocalRpcOperator> = Arc::new(NodeRpcOperator {
+                status: node_status.clone(),
+                transaction_pool: Arc::clone(&transaction_pool),
+                runtime_control: Arc::clone(&runtime_control),
+                active_peer,
+            });
+            router = router.merge(rpc_router_with_operator(
                 Arc::clone(&index),
                 fee_estimator.map(Arc::clone),
                 rpc.token.clone(),
                 rpc.audit.clone(),
+                Some(operator),
             ));
         }
         if let Some(status) = background_validation {
@@ -2235,16 +2412,9 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
             // if signal polling shares that same task, the OS notification can
             // otherwise remain unread until after another checkpoint starts.
             let runtime_control = Arc::clone(&options.runtime_control);
-            let signal_runtime_control = Arc::clone(&runtime_control);
-            let mut signal_task = tokio::spawn(async move {
-                let result = shutdown_signal().await;
-                if result.is_ok() {
-                    signal_runtime_control
-                        .shutdown_requested
-                        .store(true, Ordering::Release);
-                }
-                result
-            });
+            let mut signal_task = tokio::spawn(shutdown_signal());
+            let wait_for_runtime_shutdown = runtime_control.shutdown_requested();
+            tokio::pin!(wait_for_runtime_shutdown);
             let result = tokio::select! {
                 result = run(options) => {
                     signal_task.abort();
@@ -2255,6 +2425,7 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                         .map_err(|error| format!("shutdown signal task failed: {error}"))
                         .and_then(std::convert::identity);
                     if signal.is_ok() {
+                        runtime_control.request_shutdown();
                         wait_for_in_flight_checkpoints(
                             &runtime_control.checkpoints_in_flight,
                         )
@@ -2262,6 +2433,15 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                         eprintln!("rbtcd: shutdown signal received; closing durable stores");
                     }
                     signal
+                },
+                () = &mut wait_for_runtime_shutdown => {
+                    signal_task.abort();
+                    wait_for_in_flight_checkpoints(
+                        &runtime_control.checkpoints_in_flight,
+                    )
+                    .await;
+                    eprintln!("rbtcd: authenticated shutdown requested; closing durable stores");
+                    Ok(())
                 },
             };
             result.map_err(CliError::runtime)
@@ -4466,6 +4646,7 @@ async fn run_connected_peer(
                 path.clone(),
                 &options.runtime_control,
                 options.observer.as_ref(),
+                Some(remote),
                 options.once,
                 options.validation_target,
                 options.validation_limits,
@@ -4583,6 +4764,7 @@ async fn complete_assumeutxo_validation(
         validation_dir.clone(),
         &options.runtime_control,
         options.observer.as_ref(),
+        None,
         false,
         Some(ValidationTarget {
             height: assumed.base.height,
@@ -5725,8 +5907,9 @@ async fn sync_validating_node(
     deployment_config: &DeploymentConfig,
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
-    runtime_control: &RuntimeControl,
+    runtime_control: &Arc<RuntimeControl>,
     observer: Option<&NodeObserver>,
+    active_peer: Option<SocketAddr>,
     once: bool,
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
@@ -6167,6 +6350,9 @@ async fn sync_validating_node(
                         api.rpc.as_ref(),
                         fee_estimator.as_ref(),
                         background_validation,
+                        Arc::clone(transaction_pool),
+                        Arc::clone(runtime_control),
+                        active_peer,
                     )
                     .await?,
                 );
@@ -9601,6 +9787,76 @@ mod tests {
             ledger_first_height: None,
             ledger_tip_height: None,
         })
+    }
+
+    #[tokio::test]
+    async fn operator_rpc_reports_bounded_status_and_requests_graceful_shutdown() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let runtime_control = Arc::new(RuntimeControl::default());
+        let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(genesis),
+            transaction_pool,
+            runtime_control: Arc::clone(&runtime_control),
+            active_peer: Some("127.0.0.1:18444".parse().unwrap()),
+        };
+
+        let blockchain = operator
+            .execute("getblockchaininfo", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(blockchain["chain"], "regtest");
+        assert_eq!(blockchain["blocks"], 0);
+        assert_eq!(blockchain["initialblockdownload"], false);
+        assert_eq!(
+            operator
+                .execute("getnetworkinfo", &serde_json::Value::Null)
+                .unwrap()
+                .unwrap()["connections_out"],
+            1
+        );
+        assert_eq!(
+            operator
+                .execute("getpeerinfo", &serde_json::json!([]))
+                .unwrap()
+                .unwrap()[0]["addr"],
+            "127.0.0.1:18444"
+        );
+        assert_eq!(
+            operator
+                .execute("getmempoolinfo", &serde_json::json!([]))
+                .unwrap()
+                .unwrap()["size"],
+            0
+        );
+        assert_eq!(
+            operator
+                .execute("verifychain", &serde_json::json!([]))
+                .unwrap()
+                .unwrap(),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            operator
+                .execute("getindexinfo", &serde_json::json!([1]))
+                .unwrap(),
+            Err(LocalRpcOperatorError {
+                code: -32602,
+                message: "Invalid params",
+            })
+        );
+
+        let shutdown = runtime_control.shutdown_requested();
+        assert_eq!(
+            operator
+                .execute("stop", &serde_json::json!([]))
+                .unwrap()
+                .unwrap(),
+            "rBTC stopping"
+        );
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("RPC stop notifies the outer runtime after returning a response");
     }
 
     async fn assert_node_observability(address: SocketAddr) {
@@ -14339,6 +14595,9 @@ mod tests {
             Some(&rpc),
             None,
             Some(&validation),
+            Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            Arc::new(RuntimeControl::default()),
+            Some("127.0.0.1:18444".parse().unwrap()),
         )
         .await
         .unwrap();
@@ -14410,6 +14669,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::json!("getblockhash"))
+        );
+        assert!(
+            rpc_result["result"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("getblockchaininfo"))
         );
 
         let rotated_rpc_text = "d".repeat(32);

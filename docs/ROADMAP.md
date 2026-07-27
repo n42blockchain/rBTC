@@ -230,11 +230,13 @@ optional where appropriate, and host-runtime compatible.
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
   host. The strict bounded `key=value` config file now supports global/per-network
-  scopes, unknown-key rejection, and CLI override precedence. Add structured
-  rate-limited rotating logs, graceful RPC stop, runtime logging controls, and
-  stable equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`,
-  `getmempoolinfo`, `getindexinfo`, and `verifychain`. Exact response-field
-  parity is not required.
+  scopes, unknown-key rejection, and CLI override precedence. Hot-standby and
+  mempool budgets now remain identical across memory, reorg recovery, durable
+  persistence, and reopen. Authenticated stable equivalents of
+  `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`,
+  `getindexinfo`, and `verifychain`, plus delayed graceful `stop`, are complete.
+  Add structured rate-limited rotating logs and runtime logging controls. Exact
+  response-field parity is not required.
 - [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration

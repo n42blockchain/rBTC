@@ -803,19 +803,54 @@ struct LocalRpcRequest {
 ///
 /// The initial read-only method set is `help`, `getblockhash`,
 /// `rbtc.getblocksummary`, `rbtc.gettransaction`, and
-/// `rbtc.getaddressutxos`, and `estimatesmartfee`. Request bodies, identifiers,
-/// parameters, and result sizes are bounded.
+/// `rbtc.getaddressutxos`, and `estimatesmartfee`. A node may attach a bounded
+/// operator extension for status and lifecycle methods. Request bodies,
+/// identifiers, parameters, and result sizes are bounded.
 pub fn rpc_router<I: ExplorerIndex>(
     index: Arc<I>,
     fee_estimator: Option<Arc<RedbFeeEstimator>>,
     token: LocalAuthToken,
     audit: AuthorizationAuditLog,
 ) -> Router {
+    rpc_router_with_operator(index, fee_estimator, token, audit, None)
+}
+
+/// One bounded operator-control extension for the authenticated local RPC.
+pub trait LocalRpcOperator: Send + Sync + 'static {
+    /// Stable method names appended to `help`.
+    fn methods(&self) -> &'static [&'static str];
+
+    /// Executes one recognized method, or returns `None` for an unknown name.
+    fn execute(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, LocalRpcOperatorError>>;
+}
+
+/// Stable error returned by an operator RPC extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalRpcOperatorError {
+    /// JSON-RPC error code.
+    pub code: i64,
+    /// Static, non-secret error text.
+    pub message: &'static str,
+}
+
+/// Creates the authenticated RPC router with an optional node control plane.
+pub fn rpc_router_with_operator<I: ExplorerIndex>(
+    index: Arc<I>,
+    fee_estimator: Option<Arc<RedbFeeEstimator>>,
+    token: LocalAuthToken,
+    audit: AuthorizationAuditLog,
+    operator: Option<Arc<dyn LocalRpcOperator>>,
+) -> Router {
     Router::new()
         .route("/rpc", post(rpc_call::<I>))
         .with_state(RpcState {
             index,
             fee_estimator,
+            operator,
         })
         .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
@@ -827,6 +862,7 @@ pub fn rpc_router<I: ExplorerIndex>(
 struct RpcState<I> {
     index: Arc<I>,
     fee_estimator: Option<Arc<RedbFeeEstimator>>,
+    operator: Option<Arc<dyn LocalRpcOperator>>,
 }
 
 impl<I> Clone for RpcState<I> {
@@ -834,6 +870,7 @@ impl<I> Clone for RpcState<I> {
         Self {
             index: Arc::clone(&self.index),
             fee_estimator: self.fee_estimator.as_ref().map(Arc::clone),
+            operator: self.operator.as_ref().map(Arc::clone),
         }
     }
 }
@@ -849,6 +886,7 @@ async fn rpc_call<I: ExplorerIndex>(
     match execute_rpc(
         state.index.as_ref(),
         state.fee_estimator.as_deref(),
+        state.operator.as_deref(),
         &request.method,
         &request.params,
     ) {
@@ -897,6 +935,7 @@ fn valid_rpc_id(id: &serde_json::Value) -> bool {
 fn execute_rpc<I: ExplorerIndex>(
     index: &I,
     fee_estimator: Option<&RedbFeeEstimator>,
+    operator: Option<&dyn LocalRpcOperator>,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, (i64, &'static str)> {
@@ -905,13 +944,17 @@ fn execute_rpc<I: ExplorerIndex>(
             if !params.is_null() && params.as_array().is_none_or(|params| !params.is_empty()) {
                 return Err((-32602, "Invalid params"));
             }
-            Ok(serde_json::json!([
+            let mut methods = vec![
                 "getblockhash",
                 "estimatesmartfee",
                 "rbtc.getblocksummary",
                 "rbtc.gettransaction",
-                "rbtc.getaddressutxos"
-            ]))
+                "rbtc.getaddressutxos",
+            ];
+            if let Some(operator) = operator {
+                methods.extend_from_slice(operator.methods());
+            }
+            Ok(serde_json::json!(methods))
         }
         "getblockhash" => {
             let (height,) = rpc_one_u32(params)?;
@@ -967,7 +1010,11 @@ fn execute_rpc<I: ExplorerIndex>(
             serde_json::to_value(transaction).map_err(|_| (-32603, "Internal error"))
         }
         "rbtc.getaddressutxos" => rpc_address_utxos(index, params),
-        _ => Err((-32601, "Method not found")),
+        _ => operator
+            .and_then(|operator| operator.execute(method, params))
+            .map_or(Err((-32601, "Method not found")), |result| {
+                result.map_err(|error| (error.code, error.message))
+            }),
     }
 }
 
@@ -1928,6 +1975,7 @@ mod tests {
         let response = execute_rpc(
             &TestIndex,
             Some(&estimator),
+            None,
             "estimatesmartfee",
             &serde_json::json!([1]),
         )
@@ -1965,6 +2013,7 @@ mod tests {
         let insufficient = execute_rpc(
             &TestIndex,
             None,
+            None,
             "estimatesmartfee",
             &serde_json::json!([1]),
         )
@@ -1980,6 +2029,7 @@ mod tests {
             execute_rpc(
                 &TestIndex,
                 Some(&estimator),
+                None,
                 "estimatesmartfee",
                 &serde_json::json!([0]),
             )

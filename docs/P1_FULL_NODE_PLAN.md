@@ -83,13 +83,18 @@ Acceptance: config round-trips without secrets, incompatible settings fail
 before opening network sockets, log volume is bounded under hostile peers, and
 every durable subsystem exposes tip, lag, footprint, and last error.
 
-Implemented on 2026-07-27: item 1. `rbtcd --config` accepts a strict 64 KiB
+Implemented on 2026-07-27: item 1 and the peer/mempool portion of item 2.
+`rbtcd --config` accepts a strict 64 KiB
 Core/btcd-style file with global and network sections, rejects unknown keys and
 duplicate scalars, keeps secrets in referenced owner-only files, and applies
-explicit CLI option groups last. Existing typed cache/freezer limits and
-their secret-free startup summary cover part of item 2, while embedded
-subsystem status covers part of item 4. Logging, RPC controls, disk
-forecasting, and the remaining peer/mempool/upload/index budgets stay open.
+explicit CLI option groups last. Typed hot-standby and mempool ceilings now
+govern memory, reorg recovery, persistence, and reopen parsing together;
+cache/freezer/resource limits appear in the secret-free startup summary.
+Embedded subsystem status plus authenticated `getblockchaininfo`,
+`getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`, `getindexinfo`,
+`verifychain`, and delayed graceful `stop` complete the status/stop portion of
+item 4. Structured logging, runtime log-level control, disk forecasting, and
+upload/index budgets stay open.
 
 ### P1.2 — inbound P2P service
 
