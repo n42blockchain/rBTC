@@ -70,6 +70,31 @@ The detailed finding text below records what was observed at audited revision
 disposition. The actual fixes were reviewed and integrated by commit rather
 than treating the report as proof:
 
+| Audit branch commit | Main integration | Disposition |
+| --- | --- | --- |
+| `a779831` | `a589372`, `01e1d32` | Static/ellswift build flags retained; limb probe no longer recompiles secp256k1 |
+| `a4a9371` | `bbdb24f` | Windows-safe ledger/store directory durability handling and recovery coverage |
+| `2b2c8de` | `bee0a33` | Non-ASCII archive/snapshot digests reject without panic |
+| `3c7fbf9` | `8454db8` | No-net-UTXO write-ahead transition recovery |
+| `7612df4` | `98a13c7` | Core sigop and BIP68 parity |
+| `4b8fb4b` | `29f8a77` | Full-tree report imported |
+| `d95a50c` | `7c50ce5`, `01e1d32` | Native limb-width assertion retained and optimized |
+| `9b333df`, `5b18a4c` | `05e9529` | Consensus identity, hot paths, Testnet4 BIP94/parameters, and migrations |
+| `0a4d899` | `c43268a` | Cross-platform abrupt-kill recovery test |
+| `442a8ab` | `8d66b1a` | In-place bounded header batch rollback |
+| `75a0392` | `0943b67` | Corrected second-pass report integrated |
+| `1b887c5` | `ee3ac1a` | 144-block regtest interval retained; incorrect unconditional BIP94 portion rejected |
+| `7095993` | reviewed disposition below | Review-only; no valid code delta was missing |
+| `da76a5c` | `77b8aae` plus disposition below | Review accepted; information-level relay scan replaced by bounded hash index |
+
+This manifest is the current rolling main-branch audit integration checkpoint.
+It deliberately does not create merge ancestry to
+`audit/consensus-and-portability-fixes`: doing so would mark the rejected
+default-regtest BIP94 change as integrated and make future containment checks
+lie. Every accepted code delta through `da76a5c` is present on `main` under the
+commits above. Later auditor pushes remain subject to the same commit-by-commit
+review, verification, and integration before the final audit closure.
+
 - A-01 through A-10 were integrated with additional no-net-UTXO recovery and
   script-worker panic-containment tests. The current main branch passed strict
   all-target/all-feature clippy, the complete library and historical Core
