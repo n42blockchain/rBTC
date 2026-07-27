@@ -612,6 +612,7 @@ pub struct PeerSession<S> {
     pending_transaction_bytes: usize,
     pending_transaction_inventory: VecDeque<Inventory>,
     announced_transactions: VecDeque<(Inventory, Transaction, usize)>,
+    announced_transaction_index: HashMap<Inventory, usize>,
     announced_transaction_bytes: usize,
     mempool_relay_source: Option<MempoolRelaySource>,
     block_transfer_stats: BlockTransferStats,
@@ -684,6 +685,7 @@ impl<S> PeerSession<S> {
             pending_transaction_bytes: 0,
             pending_transaction_inventory: VecDeque::new(),
             announced_transactions: VecDeque::new(),
+            announced_transaction_index: HashMap::with_capacity(MAX_ANNOUNCED_TRANSACTIONS * 2),
             announced_transaction_bytes: 0,
             mempool_relay_source: None,
             block_transfer_stats: BlockTransferStats::default(),
@@ -1068,14 +1070,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         }
     }
 
-    fn inventory_matches(announced: Inventory, requested: Inventory) -> bool {
-        match (announced, requested) {
-            (Inventory::WTx(announced), Inventory::WTx(requested)) => announced == requested,
-            (
-                Inventory::Transaction(announced),
-                Inventory::Transaction(requested) | Inventory::WitnessTransaction(requested),
-            ) => announced == requested,
-            _ => false,
+    fn rebuild_announced_transaction_index(&mut self) {
+        self.announced_transaction_index.clear();
+        for (position, (inventory, _, _)) in self.announced_transactions.iter().enumerate() {
+            self.announced_transaction_index
+                .insert(*inventory, position);
+            if let Inventory::Transaction(txid) = inventory {
+                self.announced_transaction_index
+                    .insert(Inventory::WitnessTransaction(*txid), position);
+            }
         }
     }
 
@@ -1095,11 +1098,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         transaction: Transaction,
         payload_len: usize,
     ) {
-        if let Some(position) = self
-            .announced_transactions
-            .iter()
-            .position(|(announced, _, _)| *announced == inventory)
-        {
+        if let Some(position) = self.announced_transaction_index.get(&inventory).copied() {
             let (_, _, removed_len) = self
                 .announced_transactions
                 .remove(position)
@@ -1127,6 +1126,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .announced_transaction_bytes
             .checked_add(payload_len)
             .expect("bounded announced transaction payload total fits usize");
+        self.rebuild_announced_transaction_index();
     }
 
     async fn serve_mempool_request(&mut self) -> Result<(), P2pError> {
@@ -1229,9 +1229,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                 continue;
             }
             let transaction = self
-                .announced_transactions
-                .iter()
-                .find(|(announced, _, _)| Self::inventory_matches(*announced, request))
+                .announced_transaction_index
+                .get(&request)
+                .and_then(|position| self.announced_transactions.get(*position))
                 .map(|(_, transaction, _)| transaction.clone());
             if let Some(transaction) = transaction {
                 transactions.push(transaction);
@@ -1426,12 +1426,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         let below_fee_filter = relay
             .fee_sats
             .is_some_and(|fee_sats| fee_sats < fee_for_filter(self.fee_filter_sat_kvb, vbytes));
-        if !below_fee_filter
-            && !self
-                .announced_transactions
-                .iter()
-                .any(|(announced, _, _)| *announced == inventory)
-        {
+        if !below_fee_filter && !self.announced_transaction_index.contains_key(&inventory) {
             let payload_len = serialize(transaction).len();
             self.retain_announced_transaction(inventory, transaction.clone(), payload_len);
             self.transport
@@ -3908,6 +3903,70 @@ mod tests {
 
         client.await.unwrap().unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn announced_transaction_index_tracks_aliases_replacement_and_fifo_eviction() {
+        let (client_stream, _server_stream) = duplex(64);
+        let mut session = PeerSession::new(
+            V1Transport::new(client_stream, Network::Regtest.magic()),
+            version(1),
+        );
+        let mut retained = Vec::new();
+        for index in 0..=MAX_ANNOUNCED_TRANSACTIONS {
+            let mut transaction = relay_test_transaction();
+            transaction.output[0].value = Amount::from_sat(
+                transaction.output[0]
+                    .value
+                    .to_sat()
+                    .saturating_sub(u64::try_from(index).unwrap()),
+            );
+            let inventory = Inventory::Transaction(transaction.compute_txid());
+            let payload_len = serialize(&transaction).len();
+            session.retain_announced_transaction(inventory, transaction.clone(), payload_len);
+            retained.push((inventory, transaction, payload_len));
+        }
+
+        assert_eq!(
+            session.announced_transactions.len(),
+            MAX_ANNOUNCED_TRANSACTIONS
+        );
+        assert!(
+            !session
+                .announced_transaction_index
+                .contains_key(&retained[0].0)
+        );
+        let (last_inventory, last_transaction, last_payload_len) =
+            retained.last().cloned().unwrap();
+        let Inventory::Transaction(last_txid) = last_inventory else {
+            panic!("fixture uses legacy transaction inventory");
+        };
+        assert!(
+            session
+                .announced_transaction_index
+                .contains_key(&Inventory::Transaction(last_txid))
+        );
+        assert!(
+            session
+                .announced_transaction_index
+                .contains_key(&Inventory::WitnessTransaction(last_txid))
+        );
+        assert_eq!(
+            session.announced_transaction_index.len(),
+            MAX_ANNOUNCED_TRANSACTIONS * 2
+        );
+
+        let bytes_before = session.announced_transaction_bytes;
+        session.retain_announced_transaction(last_inventory, last_transaction, last_payload_len);
+        assert_eq!(
+            session.announced_transactions.len(),
+            MAX_ANNOUNCED_TRANSACTIONS
+        );
+        assert_eq!(session.announced_transaction_bytes, bytes_before);
+        assert_eq!(
+            session.announced_transaction_index.len(),
+            MAX_ANNOUNCED_TRANSACTIONS * 2
+        );
     }
 
     #[tokio::test]

@@ -744,8 +744,9 @@ rBTC accordingly. Core v31.1 does not do that by default:
 equivalent test-only switch, so its default regtest must remain off. Testnet4
 continues to enforce BIP94.
 
-The corrected third-wave disposition passed strict all-target/all-feature
-Clippy and the complete main-branch suite (569 library tests passed, two
+The corrected third-wave disposition and later relay-index integration passed
+strict all-target/all-feature Clippy and the complete main-branch suite (570
+library tests passed, two
 explicitly ignored), in addition to the release-mode Core 31/btcd inbound
 interoperability gate.
 
@@ -770,6 +771,28 @@ property/adversarial tests, real Core 31/btcd handshake evidence, storage
 restart/crash coverage, and the seven-matrix Core block differential, but the
 report does not relabel that evidence as a line-by-line audit. No code from
 `7095993` required integration.
+
+### Disposition of the compact-block/dispatch review (`da76a5c`)
+
+The next audit commit completed the previously open line-by-line review of
+BIP152 reconstruction and post-handshake vector/message bounds and reported no
+consensus, safety, or resource-bound defect. Its differential-prefill,
+short-ID-collision, exact missing-response, Merkle/witness, repeated-version,
+and response-budget conclusions were rechecked against the current main branch
+and remain applicable. The document commit itself is not merged because its
+base still contains the rejected unconditional-regtest-BIP94 claim and the
+pre-Core-31 mempool narrative described above.
+
+The review did identify one information-level CPU amplification: a maximum
+50,000-entry `getdata` performed a linear scan of the 64-entry per-peer relay
+cache for every distinct request, or about 3.2 million comparisons. Main now
+maintains a bounded `HashMap<Inventory, usize>` beside the FIFO. Legacy txid
+announcements index both ordinary and witness-aware request aliases; BIP339
+wtxid announcements remain namespace-separated. FIFO insertion, duplicate
+replacement, and eviction rebuild at most 128 index rows, while request lookup
+is expected O(1) and a maximum batch is expected O(50,000), not O(3.2 million).
+Regression coverage exercises aliasing, replacement, byte accounting, and the
+64-entry eviction boundary.
 
 ## Recommendations
 
