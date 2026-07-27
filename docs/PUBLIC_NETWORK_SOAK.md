@@ -18,6 +18,14 @@ Testnet4 nodes run from separate data directories and PID files. Updating a PID
 file after a restart preserves one metrics timeline; it does not reset the
 baseline clock.
 
+The two recovery exercises are scheduled immediately after the one-day boundary
+at `2026-07-27T22:19:44Z`. The supervisor uses the frozen helper
+`state/public-network-soak-exercise-start`, SHA-256
+`022473ba8e8cffae5279ab7662ad6deddf08d3439b1ff20b712caae5f6a029d6`,
+and records its own progress in `logs/exercise-supervisor.log`. It executes the
+Bitcoin graceful restart first and the Testnet4 abrupt-kill recovery second;
+the evidence monitor remains independent and running throughout.
+
 At `2026-07-27T12:18Z`, both nodes had remained alive for about 14 hours.
 Bitcoin was at height 959840 and Testnet4 at 145944, with execution equal to the
 maximum-work header tip. The monitor observed six current Bitcoin peer network
