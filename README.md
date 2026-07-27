@@ -46,7 +46,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production full node** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, a bounded optional inbound serving path, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 and Mainnet Core 31 AssumeUTXO acceptance, the data-backed Mainnet hot/cold boundary, and the repository-owned script boundary's Core 31 compatibility decision/live differential matrix are complete. The remaining release blockers are completion of the sustained public-network operations soak, closure of external security-review findings, and a signed supported-platform release. Inbound eviction/address relay/reachability interoperability and broader operator compatibility remain P1 work. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md); the `../n42-26` host ownership, tested task-executor fixture, and licensing boundary are in [docs/N42_EMBEDDING.md](docs/N42_EMBEDDING.md).
+rBTC is **not yet a production release** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, bounded optional inbound contribution, current Core 31 relay-policy bounds, explicit storage/index lifecycle, authenticated operator APIs, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 and Mainnet Core 31 AssumeUTXO acceptance, the data-backed Mainnet hot/cold boundary, the repository-owned script boundary's Core 31 compatibility/live differential matrix, P1 full-node scope, and external audit integration are complete. The remaining release blockers are the time-based seven-day public-network operations soak and exercising a signed supported-platform release with provisioned native identities. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md); the `../n42-26` host ownership, tested task-executor fixture, and licensing boundary are in [docs/N42_EMBEDDING.md](docs/N42_EMBEDDING.md).
 
 ### Supported platforms
 
@@ -63,7 +63,8 @@ Findings and per-platform verification status are recorded in [docs/AUDIT.md](do
 | Concern | Choice | Reason |
 | --- | --- | --- |
 | Bitcoin types and v1 P2P encoding | `rust-bitcoin` | Maintained Rust Bitcoin primitives and consensus serialization. |
-| Script interpreter | `bitcoinconsensus` | Reuses Bitcoin Core's consensus library, including Taproot spent-output API. |
+| Script interpreter | `bitcoinconsensus` | Repository-owned Core v26.0 boundary, the last release line shipping `libbitcoinconsensus`; includes the Taproot spent-output API. |
+| Consensus rules | tracked through Core v31.1 | Public-network rules include Testnet4/BIP94; Core's default regtest keeps BIP94 disabled and uses its 144-block interval. The interpreter pin and tracked rules are separate decisions. |
 | UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust; `--features mdbx` enables a durable hot/cold UTXO comparison backend, not yet a production chainstate selector. |
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |

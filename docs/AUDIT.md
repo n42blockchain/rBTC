@@ -54,11 +54,14 @@ parser panic (A-03) are platform independent.
 | A-19 | Info | Hygiene | Deployment context accepts two unused parameters | Fixed |
 | A-20 | Info | Hygiene | Block locator step schedule differs from Core by one | Fixed |
 
-A-21 below was found while fixing A-17 and is not in the original numbering.
+A-21 was found while fixing A-17 and is not in the original numbering. A-22
+and the rejected A-23 proposal came from the later third audit wave.
 
 | ID | Severity | Area | Title | Status |
 | --- | --- | --- | --- | --- |
 | A-21 | Low | Consensus | Testnet4 used Signet's BIP9 threshold and had no trust anchors | Fixed |
+| A-22 | Low | Consensus | Regtest inherited rust-bitcoin's 2,016-block interval instead of Core's 144 | Fixed |
+| A-23 | Info | Consensus | Proposed unconditional regtest BIP94 enforcement | Rejected — Core v31.1 defaults it off |
 
 ## Post-audit integration disposition
 
@@ -89,6 +92,13 @@ than treating the report as proof:
 - A-15, A-16, and A-18 through A-21 were integrated with migration and
   regression coverage. Testnet4 uses the Core release family that defines it
   for BIP94, threshold, minimum-chainwork, and assume-valid values.
+- The third audit wave's A-22 parameter correction was independently confirmed
+  against Core v31.1 and integrated. Its accompanying A-23 change was rejected:
+  Core's `RegTestOptions::enforce_bip94` defaults to `false` and is enabled only
+  by the testing-only `-test=bip94` option. Unconditionally enabling it would
+  have created the divergence the change claimed to remove. The main branch
+  keeps default regtest BIP94 disabled, uses Core's one-day target timespan and
+  144-block interval, and has a regression covering both facts.
 - A-12's abrupt-kill test is now portable (`SIGKILL` on Unix,
   `TerminateProcess` on Windows). Windows ACL inheritance, audit-log file
   identity, and directory-flush behavior remain explicitly documented platform
@@ -716,6 +726,51 @@ through its merged ordered walk.
 
 ---
 
+### A-22 — Regtest difficulty interval differed from Core — fixed
+
+`rust-bitcoin`'s `Params::REGTEST` carries mainnet's two-week
+`pow_target_timespan`, yielding a 2,016-block interval. Bitcoin Core v31.1 uses
+one day with ten-minute spacing, yielding 144. rBTC now constructs its header
+parameters through a narrow `core_params` correction and leaves every other
+network unchanged. Regtest's no-retarget rule still returns the parent's target.
+
+### A-23 — Unconditional regtest BIP94 proposal — rejected
+
+The proposed follow-up stated that Core enables BIP94 for regtest and changed
+rBTC accordingly. Core v31.1 does not do that by default:
+`RegTestOptions::enforce_bip94` initializes to `false`;
+`ReadRegTestArgs` changes it only for `-test=bip94`; and
+`CRegTestParams` copies that option into consensus parameters. rBTC has no
+equivalent test-only switch, so its default regtest must remain off. Testnet4
+continues to enforce BIP94.
+
+The corrected third-wave disposition passed strict all-target/all-feature
+Clippy and the complete main-branch suite (569 library tests passed, two
+explicitly ignored), in addition to the release-mode Core 31/btcd inbound
+interoperability gate.
+
+### Disposition of the later depth-review note (`7095993`)
+
+The additional audit commit changed documentation only and reported no new
+defects. Its address-manager constants, wallet PSBT defence-in-depth, explorer
+atomic disconnect, and reorg-termination observations remain valid on main and
+are retained as review evidence.
+
+Its RBF/ancestor/CPFP narrative describes the pre-Core-31 admission code and is
+not merged as a current claim. Main has since moved to Core 31's 0.1 sat/vB
+incremental fee, 64-transaction/101-kvB clusters, TRUC, one-parent/one-child
+package relay, ephemeral dust, and full-RBF default. The supported replacement
+path is intentionally conservative; exact Core 31 feerate-diagram and
+sibling-eviction ordering is documented P2 work. The note's `main.rs` wording
+is also historical because the daemon is now a thin adapter over `node`.
+
+The note explicitly left the post-handshake P2P/BIP152 state machine and several
+small stores without line-by-line Core comparison. Those paths have bounded
+property/adversarial tests, real Core 31/btcd handshake evidence, storage
+restart/crash coverage, and the seven-matrix Core block differential, but the
+report does not relabel that evidence as a line-by-line audit. No code from
+`7095993` required integration.
+
 ## Recommendations
 
 1. Add a Windows job to `.github/workflows` that runs `cargo test --locked --all-features`.
@@ -729,16 +784,13 @@ through its merged ordered walk.
    `check_witness_commitment` is only safe here because of a load-bearing
    pre-check. A short list of "verified-equivalent upstream helpers" in
    `docs/ARCHITECTURE.md` would make that dependency explicit.
-4. Decide whether testnet4 should track Core 28 generally. A-17 and A-21 pinned
-   its consensus rules, BIP9 threshold, and trust anchors from Core 28 while the
-   rest of the tree pins Core 26. That split is currently narrow and documented,
-   but it will widen with each Core release, and the differential harness in
-   `tests/core_block_differential.rs` cannot exercise testnet4 against a Core 26
-   `bitcoind`.
-5. Consider whether regtest should adopt BIP94. Core 28 enables it there; rBTC
-   deliberately does not, to stay with its pinned reference. Anyone testing rBTC
-   regtest against a Core 28 regtest node will see the difference at difficulty
-   period boundaries.
+4. Keep the pinned Core v26 interpreter boundary separate from the tracked
+   Core v31.1 consensus parameters. Testnet4 and later consensus changes require
+   source comparison and dedicated vectors even though the frozen C ABI cannot
+   be re-pinned past Core 27.
+5. Add a test-only regtest BIP94 switch only if Core's `-test=bip94`
+   interoperability is needed. It must never silently change the default
+   regtest rule set.
 6. Give the validation journal a paged read path. It is the last remaining
    whole-set materialization (A-14), reachable from the API's UTXO page endpoint
    while a journal is unmaterialized.

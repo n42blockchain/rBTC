@@ -21,6 +21,20 @@ pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
 /// BIP94 maximum backward timestamp movement at a Testnet4 retarget boundary.
 pub const MAX_TIMEWARP_SECS: u32 = 10 * 60;
 
+/// Consensus parameters corrected where rust-bitcoin differs from Core.
+///
+/// rust-bitcoin reuses mainnet's two-week target timespan for regtest, while
+/// Core uses one day. Regtest still disables retargeting and leaves BIP94 off
+/// by default; the 144-block interval is nevertheless consensus-observable to
+/// callers and must match Core.
+fn core_params(network: Network) -> Params {
+    let mut params = Params::new(network);
+    if network == Network::Regtest {
+        params.pow_target_timespan = 24 * 60 * 60;
+    }
+    params
+}
+
 /// Stored metadata for a proof-of-work-valid header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeaderInfo {
@@ -220,7 +234,7 @@ impl HeaderDag {
         let mut headers = HashMap::new();
         headers.insert(hash, info);
         Self {
-            params: Params::new(network),
+            params: core_params(network),
             deployments,
             headers,
             active_tip: hash,
@@ -956,6 +970,29 @@ mod tests {
             dag.expected_next_bits(&candidate).unwrap(),
             hard_target.min_transition_threshold().to_compact_lossy()
         );
+    }
+
+    #[test]
+    fn regtest_difficulty_interval_matches_core_without_enabling_bip94() {
+        assert_eq!(Params::REGTEST.difficulty_adjustment_interval(), 2_016);
+        let dag = HeaderDag::new(Network::Regtest);
+        assert_eq!(dag.params.pow_target_timespan, 24 * 60 * 60);
+        assert_eq!(dag.params.difficulty_adjustment_interval(), 144);
+
+        // Core 31.1's default RegTestOptions keeps enforce_bip94=false. The
+        // testing-only `-test=bip94` knob is not the default network rule.
+        assert!(validate_bip94_time(&dag.params, 144, 1_000, 0).is_ok());
+        for network in [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+        ] {
+            assert_eq!(
+                HeaderDag::new(network).params.pow_target_timespan,
+                Params::new(network).pow_target_timespan
+            );
+        }
     }
 
     #[test]
