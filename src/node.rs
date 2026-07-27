@@ -197,6 +197,9 @@ const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
+const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
+const DATA_FORMAT_SCHEMA_VERSION: u32 = 1;
+const MAX_DATA_FORMAT_MANIFEST_BYTES: u64 = 4 * 1024;
 const NODE_EVENT_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
 const MAX_STORAGE_AUDIT_SEGMENTS: u32 = 4_096;
@@ -1796,6 +1799,50 @@ struct DataDirectoryReadLock {
     file: fs::File,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct DataStoreSchemaVersions {
+    headers: u32,
+    chainstate: u32,
+    freezer: u32,
+    peers: u32,
+    mempool: u32,
+    fee_estimates: u32,
+    explorer: u32,
+    wallet: u32,
+    rebroadcast: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct DataFormatManifest {
+    schema_version: u32,
+    minimum_reader_version: u32,
+    network: String,
+    stores: DataStoreSchemaVersions,
+}
+
+impl DataFormatManifest {
+    fn current(network: Network) -> Self {
+        Self {
+            schema_version: DATA_FORMAT_SCHEMA_VERSION,
+            minimum_reader_version: DATA_FORMAT_SCHEMA_VERSION,
+            network: network.to_string(),
+            stores: DataStoreSchemaVersions {
+                headers: 1,
+                chainstate: 1,
+                freezer: 1,
+                peers: 1,
+                mempool: 1,
+                fee_estimates: 1,
+                explorer: 1,
+                wallet: 1,
+                rebroadcast: 1,
+            },
+        }
+    }
+}
+
 impl DataDirectoryReadLock {
     fn acquire(data_dir: &std::path::Path) -> Result<Self, String> {
         let path = data_dir.join(DATA_DIRECTORY_LOCK_FILE);
@@ -1841,6 +1888,125 @@ impl Drop for DataDirectoryReadLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+fn validate_data_format_manifest(
+    data_dir: &std::path::Path,
+    network: Network,
+) -> Result<bool, String> {
+    let path = data_dir.join(DATA_FORMAT_MANIFEST_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(format!(
+                "inspect data-format manifest {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_DATA_FORMAT_MANIFEST_BYTES
+    {
+        return Err(format!(
+            "data-format manifest {} must be a bounded regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(
+                "data-format manifest must be owner-only with exactly one hard link".to_owned(),
+            );
+        }
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .and_then(|file| {
+            file.take(MAX_DATA_FORMAT_MANIFEST_BYTES.saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| format!("read data-format manifest {}: {error}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_DATA_FORMAT_MANIFEST_BYTES {
+        return Err("data-format manifest exceeds its byte bound".to_owned());
+    }
+    let actual: DataFormatManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode data-format manifest: {error}"))?;
+    if actual.schema_version != DATA_FORMAT_SCHEMA_VERSION
+        || actual.minimum_reader_version > DATA_FORMAT_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "unsupported data-format schema version {} (minimum reader {})",
+            actual.schema_version, actual.minimum_reader_version
+        ));
+    }
+    let expected = DataFormatManifest::current(network);
+    if actual != expected {
+        return Err(format!(
+            "data-format manifest does not match the {network} schema inventory"
+        ));
+    }
+    Ok(false)
+}
+
+fn publish_data_format_manifest(
+    data_dir: &std::path::Path,
+    network: Network,
+) -> Result<(), String> {
+    let path = data_dir.join(DATA_FORMAT_MANIFEST_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => return validate_data_format_manifest(data_dir, network).map(drop),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect data-format manifest before publish: {error}"
+            ));
+        }
+    }
+    let temporary = data_dir.join(".rbtc-data-format.json.new");
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("temporary data-format manifest must be a regular file".to_owned());
+        }
+        #[cfg(unix)]
+        Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 => {
+            return Err("temporary data-format manifest must not be hard-linked".to_owned());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect temporary data-format manifest: {error}")),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create temporary data-format manifest: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &temporary,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .map_err(|error| format!("restrict temporary data-format manifest: {error}"))?;
+    file.write_all(
+        &serde_json::to_vec(&DataFormatManifest::current(network))
+            .expect("data-format manifest serialization is infallible"),
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| format!("persist temporary data-format manifest: {error}"))?;
+    drop(file);
+    fs::rename(&temporary, &path)
+        .map_err(|error| format!("publish data-format manifest: {error}"))?;
+    fs::File::open(data_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync data-format manifest directory: {error}"))
 }
 
 fn read_lock_marker(file: &mut fs::File) -> Option<String> {
@@ -3309,12 +3475,17 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
                 disk_space.reserve_bytes
             );
         }
+        let data_format_manifest_missing =
+            validate_data_format_manifest(data_dir, options.network)?;
         preflight_data_dir(
             data_dir,
             options.network,
             &options.deployments,
             options.network_execution.is_experimental(),
         )?;
+        if data_format_manifest_missing {
+            publish_data_format_manifest(data_dir, options.network)?;
+        }
     }
     match &options.offline_action {
         Some(OfflineAction::UtxoActivityReport) => return report_utxo_activity(&options),
@@ -14981,6 +15152,82 @@ mod tests {
         assert_eq!(fs::read(marker_path).unwrap(), marker);
     }
 
+    #[test]
+    fn data_format_manifest_migrates_absence_and_rejects_future_rollback() {
+        let directory = TempDir::new().unwrap();
+        assert!(validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        let path = directory.path().join(DATA_FORMAT_MANIFEST_FILE);
+        let current = fs::read(&path).unwrap();
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), current);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let future = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 2,
+            "minimum_reader_version": 2,
+            "network": "regtest",
+            "stores": {
+                "headers": 1,
+                "chainstate": 1,
+                "freezer": 1,
+                "peers": 1,
+                "mempool": 1,
+                "fee_estimates": 1,
+                "explorer": 1,
+                "wallet": 1,
+                "rebroadcast": 1,
+            }
+        }))
+        .unwrap();
+        fs::write(&path, &future).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("unsupported data-format schema version")
+        );
+        assert_eq!(fs::read(path).unwrap(), future);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_format_manifest_rejects_symlink_and_hardlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let outside = directory.path().join("outside");
+        fs::write(&outside, "{}").unwrap();
+        let manifest = directory.path().join(DATA_FORMAT_MANIFEST_FILE);
+        symlink(&outside, &manifest).unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("bounded regular file")
+        );
+        fs::remove_file(&manifest).unwrap();
+        fs::hard_link(&outside, &manifest).unwrap();
+        fs::set_permissions(
+            &manifest,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("exactly one hard link")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn data_directory_lock_rejects_symlinks_and_hardlinks() {
@@ -15812,6 +16059,7 @@ mod tests {
         assert!(error.contains("legacy split chain-state file"));
         assert!(!directory.path().join("peers.redb").exists());
         assert!(!directory.path().join("wallet.sqlite").exists());
+        assert!(!directory.path().join(DATA_FORMAT_MANIFEST_FILE).exists());
     }
 
     #[test]

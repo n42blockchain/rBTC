@@ -165,7 +165,17 @@ and resumes a versioned intent after any post-publication crash. The freezer
 portion of item 3 is also implemented: `--verify-storage` uses fixed memory and explicit work
 budgets, refuses concurrent node access, never opens mutable databases, and
 returns machine-readable findings plus an ordered, non-executed repair plan.
-Cross-store offline `verifychain` remains open, as do items 2, 4, and 5.
+Cross-store offline `verifychain` remains open, as do items 2 and 5.
+
+Item 4 is complete. Every persistent subsystem has an
+explicit version in the strict network-bound data-format inventory. A missing
+manifest is the only v0 input and migrates atomically to v1 only after legacy
+preflight; future/minimum-reader/component mismatches refuse rollback before a
+mutable database opens. Tests cover migration, idempotent reopen, future
+version preservation, aliases, and failure-before-publication. Backup, restore,
+upgrade/rollback, and corruption decisions are published in
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md). Schema changes beyond v1 must
+add their forward migration and crash matrix before changing the inventory.
 
 ### P1.5 — optional indexes
 

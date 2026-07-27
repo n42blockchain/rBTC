@@ -86,6 +86,15 @@ after crashes, while the retained marker improves the next conflict
 diagnostic. Distinct embedded node instances therefore require distinct data
 directories.
 
+`.rbtc-data-format.json` binds the directory to one network and inventories the
+schema version of headers, chainstate, freezer, peers, mempool, fee estimates,
+explorer, wallet, and rebroadcast state. It is checked after taking the lock but
+before any mutable database open. A legacy directory without the manifest is
+migrated to v1 only after its existing preflight succeeds; a future root or
+minimum-reader version and any component mismatch fail without rewriting it.
+Do not edit or delete this file to force a downgrade. See
+[`DISASTER_RECOVERY.md`](DISASTER_RECOVERY.md).
+
 Stop the node before running a freezer audit:
 
 ```text

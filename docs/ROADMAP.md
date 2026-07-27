@@ -257,8 +257,11 @@ optional where appropriate, and host-runtime compatible.
   restart-resumable versioned intent. A fixed-memory, count/byte-bounded `--verify-storage` command
   now verifies freezer pieces and decompressed records without opening mutable
   databases and emits a JSON dry-run repair plan; cross-store verification,
-  reindex/repair execution, migration, and operator recovery workflows keep
-  this broader item open.
+  reindex/repair execution and cross-store recovery keep this broader item
+  open. The strict network-bound root manifest now inventories every subsystem
+  schema, migrates legacy absence only after successful preflight, and refuses
+  future rollback before mutable database open. Backup/restore, rollback, and
+  disaster decisions are published in `docs/DISASTER_RECOVERY.md`.
 - [ ] **Optional indexes commonly used by node clients.** Add independently
   rebuildable `txindex`, spent-output index, and BIP157/158 compact-filter index
   with explicit disk cost, sync state, prune compatibility, and peer serving.
