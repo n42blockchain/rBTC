@@ -198,6 +198,11 @@ const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const NODE_EVENT_CAPACITY: usize = 32;
+const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
+const MAX_STORAGE_AUDIT_SEGMENTS: u32 = 4_096;
+const DEFAULT_STORAGE_AUDIT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MIN_STORAGE_AUDIT_BYTES: u64 = 1024 * 1024;
+const MAX_STORAGE_AUDIT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
@@ -1455,6 +1460,7 @@ enum OfflineAction {
     UtxoActivityReport,
     RetierUtxos { hot_window_blocks: u32 },
     DownloadCoreSnapshot(SnapshotDownloadConfig),
+    VerifyStorage { max_segments: u32, max_bytes: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1771,6 +1777,58 @@ impl DataDirectoryLock {
 }
 
 impl Drop for DataDirectoryLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+#[derive(Debug)]
+struct DataDirectoryReadLock {
+    file: fs::File,
+}
+
+impl DataDirectoryReadLock {
+    fn acquire(data_dir: &std::path::Path) -> Result<Self, String> {
+        let path = data_dir.join(DATA_DIRECTORY_LOCK_FILE);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "read-only storage audit requires the existing data-directory lock {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "data-directory lock {} must be a regular file, not a symlink",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+            return Err("data-directory lock must have exactly one hard link".to_owned());
+        }
+        let file = fs::File::open(&path).map_err(|error| {
+            format!(
+                "open data-directory lock {} read-only: {error}",
+                path.display()
+            )
+        })?;
+        if let Err(error) = FileExt::try_lock_shared(&file) {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(format!(
+                    "data directory {} is in use; stop the node before a storage audit",
+                    data_dir.display()
+                ));
+            }
+            return Err(format!(
+                "lock data directory {} for read-only audit: {error}",
+                data_dir.display()
+            ));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DataDirectoryReadLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
@@ -2801,7 +2859,16 @@ impl CliError {
 pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliError> {
     match parse_options(arguments) {
         Ok(Some(options)) => {
-            rbtc::diagnostics::install(&options.logging).map_err(CliError::runtime)?;
+            let mut logging = options.logging.clone();
+            if matches!(
+                options.offline_action.as_ref(),
+                Some(OfflineAction::VerifyStorage { .. })
+            ) {
+                // A read-only audit must not create or rotate a data-directory
+                // log merely because diagnostics were initialized.
+                logging.directory = None;
+            }
+            rbtc::diagnostics::install(&logging).map_err(CliError::runtime)?;
             // Keep signal collection on an independent runtime task. The
             // validating future performs bounded synchronous execution work;
             // if signal polling shares that same task, the OS notification can
@@ -3109,6 +3176,30 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         );
         return Ok(());
     }
+    if let Some(OfflineAction::VerifyStorage {
+        max_segments,
+        max_bytes,
+    }) = &options.offline_action
+    {
+        let data_dir = options
+            .data_dir
+            .as_ref()
+            .expect("storage audit parser requires data directory");
+        let _read_lock = DataDirectoryReadLock::acquire(data_dir)?;
+        let report = PrunedBlockLedger::audit(data_dir.join("blocks"), *max_segments, *max_bytes)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .expect("ledger audit report serialization is infallible")
+        );
+        if !report.complete || !report.issues.is_empty() {
+            return Err(
+                "read-only storage audit found issues; no repair action was executed".to_owned(),
+            );
+        }
+        return Ok(());
+    }
     if options.network_execution.is_experimental() {
         rbtc_warn!(
             "WARNING: experimental {} block execution is enabled for validation only; \
@@ -3157,7 +3248,8 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         Some(OfflineAction::RetierUtxos { hot_window_blocks }) => {
             return retier_utxos(&options, *hot_window_blocks);
         }
-        Some(OfflineAction::DownloadCoreSnapshot(_)) | None => {}
+        Some(OfflineAction::DownloadCoreSnapshot(_) | OfflineAction::VerifyStorage { .. })
+        | None => {}
     }
     if let Some(validation_dir) = &options.complete_assumeutxo {
         prepare_assumeutxo_validation(&options, validation_dir)?;
@@ -8982,6 +9074,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut cleanup_validation_dir = false;
     let mut utxo_activity_report = false;
     let mut utxo_retier_window_blocks = None;
+    let mut verify_storage = false;
+    let mut storage_audit_max_segments = None;
+    let mut storage_audit_max_bytes = None;
     let mut snapshot_download_source = None;
     let mut snapshot_download_output = None;
     let mut snapshot_download_bytes = None;
@@ -9205,6 +9300,42 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--no-cleanup-validation-dir" => cleanup_validation_dir = false,
             "--utxo-activity-report" => utxo_activity_report = true,
+            "--verify-storage" => verify_storage = true,
+            "--verify-storage-max-segments" => {
+                if storage_audit_max_segments.is_some() {
+                    return Err(
+                        "--verify-storage-max-segments cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--verify-storage-max-segments")?;
+                let segments = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid storage audit segment budget: {value}"))?;
+                if !(1..=MAX_STORAGE_AUDIT_SEGMENTS).contains(&segments) {
+                    return Err(format!(
+                        "storage audit segment budget must be between 1 and {MAX_STORAGE_AUDIT_SEGMENTS}"
+                    ));
+                }
+                storage_audit_max_segments = Some(segments);
+            }
+            "--verify-storage-max-bytes" => {
+                if storage_audit_max_bytes.is_some() {
+                    return Err(
+                        "--verify-storage-max-bytes cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--verify-storage-max-bytes")?;
+                let bytes = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid storage audit byte budget: {value}"))?;
+                if !(MIN_STORAGE_AUDIT_BYTES..=MAX_STORAGE_AUDIT_BYTES).contains(&bytes) {
+                    return Err(format!(
+                        "storage audit byte budget must be between {MIN_STORAGE_AUDIT_BYTES} and {MAX_STORAGE_AUDIT_BYTES}"
+                    ));
+                }
+                storage_audit_max_bytes = Some(bytes);
+            }
             "--retier-utxos-window-blocks" => {
                 if utxo_retier_window_blocks.is_some() {
                     return Err(
@@ -9781,9 +9912,63 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             );
         }
     };
+    if !verify_storage
+        && (storage_audit_max_segments.is_some() || storage_audit_max_bytes.is_some())
+    {
+        return Err(
+            "--verify-storage-max-segments and --verify-storage-max-bytes require --verify-storage"
+                .to_owned(),
+        );
+    }
+    if verify_storage {
+        if data_dir.is_none() {
+            return Err("--verify-storage requires --data-dir".to_owned());
+        }
+        if utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || snapshot_download.is_some()
+            || snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target
+            || prune_blocks.is_some()
+            || prune_max_bytes.is_some()
+            || minimum_free_bytes.is_some()
+            || active_chainstate_cache_bytes.is_some()
+            || background_chainstate_cache_bytes.is_some()
+            || bulk_validation_cache_bytes.is_some()
+            || automatic_hot_standbys.is_some()
+            || mempool_max_transactions.is_some()
+            || mempool_max_bytes.is_some()
+            || log_dir.is_some()
+            || log_max_bytes.is_some()
+            || log_max_files.is_some()
+        {
+            return Err(
+                "storage verification is read-only and conflicts with peer, synchronization, snapshot, validation, serving, mutation, storage-target, and file-logging modes"
+                    .to_owned(),
+            );
+        }
+    }
     if snapshot_download.is_some()
         && (utxo_activity_report
             || utxo_retier_window_blocks.is_some()
+            || verify_storage
             || data_dir.is_some()
             || snapshot_activation
             || finalize_assumeutxo.is_some()
@@ -9815,6 +10000,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             return Err("--utxo-activity-report requires --data-dir".to_owned());
         }
         if utxo_retier_window_blocks.is_some()
+            || verify_storage
             || snapshot_activation
             || finalize_assumeutxo.is_some()
             || validation_target.is_some()
@@ -9845,7 +10031,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         if data_dir.is_none() {
             return Err("--retier-utxos-window-blocks requires --data-dir".to_owned());
         }
-        if snapshot_activation
+        if verify_storage
+            || snapshot_activation
             || finalize_assumeutxo.is_some()
             || validation_target.is_some()
             || complete_assumeutxo.is_some()
@@ -9884,6 +10071,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || finalize_assumeutxo.is_some()
             || utxo_activity_report
             || utxo_retier_window_blocks.is_some()
+            || verify_storage
             || snapshot_download.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
@@ -9907,6 +10095,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || finalize_assumeutxo.is_some()
             || utxo_activity_report
             || utxo_retier_window_blocks.is_some()
+            || verify_storage
             || snapshot_download.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
@@ -9927,6 +10116,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || finalize_assumeutxo.is_some()
             || utxo_activity_report
             || utxo_retier_window_blocks.is_some()
+            || verify_storage
             || snapshot_download.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
@@ -10083,18 +10273,20 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         background_assumeutxo,
         mempool_full_rbf,
         cleanup_validation_dir,
-        offline_action: match (
-            utxo_activity_report,
-            utxo_retier_window_blocks,
-            snapshot_download,
-        ) {
-            (true, None, None) => Some(OfflineAction::UtxoActivityReport),
-            (false, Some(hot_window_blocks), None) => {
-                Some(OfflineAction::RetierUtxos { hot_window_blocks })
-            }
-            (false, None, Some(config)) => Some(OfflineAction::DownloadCoreSnapshot(config)),
-            (false, None, None) => None,
-            _ => unreachable!("offline action conflict was checked above"),
+        offline_action: if utxo_activity_report {
+            Some(OfflineAction::UtxoActivityReport)
+        } else if let Some(hot_window_blocks) = utxo_retier_window_blocks {
+            Some(OfflineAction::RetierUtxos { hot_window_blocks })
+        } else if let Some(config) = snapshot_download {
+            Some(OfflineAction::DownloadCoreSnapshot(config))
+        } else if verify_storage {
+            Some(OfflineAction::VerifyStorage {
+                max_segments: storage_audit_max_segments
+                    .unwrap_or(DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS),
+                max_bytes: storage_audit_max_bytes.unwrap_or(DEFAULT_STORAGE_AUDIT_MAX_BYTES),
+            })
+        } else {
+            None
         },
         validation_limits,
         ledger_retention,
@@ -10206,6 +10398,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --finalize-assumeutxo VALIDATION_DATA_DIR\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-storage [--verify-storage-max-segments 1..4096] [--verify-storage-max-bytes 1048576..17179869184]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
@@ -13511,6 +13704,109 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_bounded_read_only_storage_audits() {
+        let options = parse_options(
+            [
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-storage-audit",
+                "--verify-storage",
+                "--verify-storage-max-segments",
+                "512",
+                "--verify-storage-max-bytes",
+                "2147483648",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.offline_action,
+            Some(OfflineAction::VerifyStorage {
+                max_segments: 512,
+                max_bytes: 2_147_483_648,
+            })
+        );
+
+        for arguments in [
+            vec!["--network", "testnet4", "--verify-storage"],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-storage-audit",
+                "--verify-storage-max-segments",
+                "10",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-storage-audit",
+                "--verify-storage",
+                "--verify-storage-max-segments",
+                "4097",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-storage-audit",
+                "--verify-storage",
+                "--connect",
+                "127.0.0.1:48333",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-storage-audit",
+                "--verify-storage",
+                "--prune-blocks",
+                "576",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_audit_command_does_not_open_or_modify_node_databases() {
+        let directory = TempDir::new().unwrap();
+        drop(DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap());
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        ledger.append(1, &[vec![1, 2, 3]]).unwrap();
+        drop(ledger);
+        let marker_path = directory.path().join(DATA_DIRECTORY_LOCK_FILE);
+        let index_path = directory.path().join("blocks").join("ledger-index.json");
+        let marker = fs::read(&marker_path).unwrap();
+        let index = fs::read(&index_path).unwrap();
+
+        let options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--verify-storage".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        run_with_nonce(options, 1).await.unwrap();
+
+        assert_eq!(fs::read(marker_path).unwrap(), marker);
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        assert!(!directory.path().join("chainstate.redb").exists());
+        assert!(!directory.path().join("logs").exists());
+    }
+
+    #[test]
     fn parses_only_offline_height_based_utxo_retiering() {
         let options = parse_options(
             [
@@ -14356,6 +14652,27 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    #[test]
+    fn read_only_audit_lock_never_rewrites_marker_and_excludes_the_node() {
+        let directory = TempDir::new().unwrap();
+        let exclusive = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        let marker_path = directory.path().join(DATA_DIRECTORY_LOCK_FILE);
+        let marker = fs::read(&marker_path).unwrap();
+        assert!(
+            DataDirectoryReadLock::acquire(directory.path())
+                .unwrap_err()
+                .contains("in use")
+        );
+        drop(exclusive);
+
+        let first = DataDirectoryReadLock::acquire(directory.path()).unwrap();
+        let second = DataDirectoryReadLock::acquire(directory.path()).unwrap();
+        assert_eq!(fs::read(&marker_path).unwrap(), marker);
+        assert!(DataDirectoryLock::acquire(directory.path(), Network::Regtest).is_err());
+        drop((first, second));
+        assert_eq!(fs::read(marker_path).unwrap(), marker);
     }
 
     #[cfg(unix)]

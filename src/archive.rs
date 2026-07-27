@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -267,6 +267,184 @@ pub(crate) fn verify_archive(path: impl AsRef<Path>) -> Result<ArchiveManifest, 
     Ok(manifest)
 }
 
+/// Fully verifies one immutable archive with bounded memory.
+///
+/// Compressed piece hashes and the decompressed record hash/framing are checked
+/// in two sequential passes. This is intended for offline freezer audits where
+/// materializing as much as 1 GiB of block records would be unnecessary.
+pub(crate) fn verify_archive_streaming(
+    path: impl AsRef<Path>,
+) -> Result<ArchiveManifest, ArchiveError> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArchiveError::Invalid("archive must be a regular file"));
+    }
+    if metadata.len() > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+
+    let (manifest, records_limit, payload_offset) = read_manifest_header(path)?;
+    verify_compressed_pieces(path, payload_offset, &manifest)?;
+    verify_record_stream(path, payload_offset, records_limit, &manifest)?;
+    Ok(manifest)
+}
+
+fn read_manifest_header(path: &Path) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header)?;
+    if &header[..8] != MAGIC {
+        return Err(ArchiveError::Invalid("magic"));
+    }
+    let metadata_len = usize::try_from(u32::from_le_bytes(
+        header[8..12].try_into().expect("fixed manifest header"),
+    ))
+    .expect("u32 fits usize");
+    if metadata_len == 0 || metadata_len > MAX_MANIFEST_SIZE {
+        return Err(ArchiveError::Invalid("manifest length"));
+    }
+    let mut metadata = vec![0_u8; metadata_len];
+    file.read_exact(&mut metadata)?;
+    let manifest: ArchiveManifest = serde_json::from_slice(&metadata)?;
+    let records_limit = validate_manifest(&manifest)?;
+    let payload_offset = 12_u64
+        .checked_add(u64::try_from(metadata_len).expect("manifest length fits u64"))
+        .ok_or(ArchiveError::Invalid("manifest length"))?;
+    Ok((manifest, records_limit, payload_offset))
+}
+
+fn verify_compressed_pieces(
+    path: &Path,
+    payload_offset: u64,
+    manifest: &ArchiveManifest,
+) -> Result<(), ArchiveError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(payload_offset))?;
+    let mut piece = vec![0_u8; PIECE_SIZE];
+    let mut piece_index = 0_usize;
+    loop {
+        let mut filled = 0_usize;
+        while filled < piece.len() {
+            let read = file.read(&mut piece[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        let actual = hash_hex(&piece[..filled]);
+        if manifest.piece_sha256.get(piece_index) != Some(&actual) {
+            return Err(ArchiveError::Invalid("piece checksum"));
+        }
+        piece_index += 1;
+    }
+    if piece_index != manifest.piece_sha256.len() {
+        return Err(ArchiveError::Invalid("piece checksum"));
+    }
+    Ok(())
+}
+
+fn verify_record_stream(
+    path: &Path,
+    payload_offset: u64,
+    records_limit: u64,
+    manifest: &ArchiveManifest,
+) -> Result<(), ArchiveError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(payload_offset))?;
+    let mut decoder = zstd::stream::Decoder::new(file)?;
+    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let mut bounded = decoder.take(records_limit.saturating_add(1));
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut verifier = RecordStreamVerifier::default();
+    let mut digest = Sha256::new();
+    let mut records_bytes = 0_u64;
+    loop {
+        let read = bounded.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        records_bytes = records_bytes
+            .checked_add(u64::try_from(read).expect("buffer read fits u64"))
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if records_bytes > records_limit {
+            return Err(ArchiveError::Invalid("records too large"));
+        }
+        digest.update(&buffer[..read]);
+        verifier.feed(&buffer[..read])?;
+    }
+    verifier.finish(manifest.block_count)?;
+    if manifest.format_version == FORMAT_VERSION && records_bytes != manifest.records_bytes {
+        return Err(ArchiveError::Invalid("records length"));
+    }
+    if format!("{:x}", digest.finalize()) != manifest.records_sha256 {
+        return Err(ArchiveError::Invalid("records checksum"));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordStreamVerifier {
+    length: [u8; 4],
+    length_bytes: usize,
+    remaining_block_bytes: usize,
+    blocks: u32,
+}
+
+impl RecordStreamVerifier {
+    fn feed(&mut self, mut records: &[u8]) -> Result<(), ArchiveError> {
+        while !records.is_empty() {
+            if self.remaining_block_bytes > 0 {
+                let consumed = self.remaining_block_bytes.min(records.len());
+                self.remaining_block_bytes -= consumed;
+                records = &records[consumed..];
+                if self.remaining_block_bytes == 0 {
+                    self.blocks = self
+                        .blocks
+                        .checked_add(1)
+                        .ok_or(ArchiveError::Invalid("block count"))?;
+                }
+                continue;
+            }
+
+            let consumed = (4 - self.length_bytes).min(records.len());
+            self.length[self.length_bytes..self.length_bytes + consumed]
+                .copy_from_slice(&records[..consumed]);
+            self.length_bytes += consumed;
+            records = &records[consumed..];
+            if self.length_bytes == 4 {
+                let length =
+                    usize::try_from(u32::from_le_bytes(self.length)).expect("u32 fits usize");
+                if length > MAX_BLOCK_BYTES {
+                    return Err(ArchiveError::Invalid("block length"));
+                }
+                self.length_bytes = 0;
+                self.remaining_block_bytes = length;
+                if length == 0 {
+                    self.blocks = self
+                        .blocks
+                        .checked_add(1)
+                        .ok_or(ArchiveError::Invalid("block count"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, expected_blocks: u32) -> Result<(), ArchiveError> {
+        if self.length_bytes != 0 || self.remaining_block_bytes != 0 {
+            return Err(ArchiveError::Invalid("block length"));
+        }
+        if self.blocks != expected_blocks {
+            return Err(ArchiveError::Invalid("block count"));
+        }
+        Ok(())
+    }
+}
+
 fn verify_archive_container(file: &[u8]) -> Result<(ArchiveManifest, u64, &[u8]), ArchiveError> {
     if u64::try_from(file.len()).expect("slice length fits u64") > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
@@ -401,6 +579,42 @@ mod tests {
         assert!(matches!(
             read_archive(&file),
             Err(ArchiveError::Invalid("piece checksum"))
+        ));
+    }
+
+    #[test]
+    fn streaming_verifier_checks_complete_records_with_bounded_memory() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("streaming.rblk");
+        let blocks = vec![vec![1], vec![2; 70_000], Vec::new()];
+        let manifest = write_archive(&file, 100, &blocks).unwrap();
+        assert_eq!(verify_archive_streaming(&file).unwrap(), manifest);
+
+        let mut bytes = fs::read(&file).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(&file, bytes).unwrap();
+        assert!(matches!(
+            verify_archive_streaming(file),
+            Err(ArchiveError::Invalid("piece checksum"))
+        ));
+    }
+
+    #[test]
+    fn fragmented_record_stream_verification_preserves_framing() {
+        let one = 1_u32.to_le_bytes();
+        let zero = 0_u32.to_le_bytes();
+        let records = [one.as_slice(), &[7], zero.as_slice()].concat();
+        let mut verifier = RecordStreamVerifier::default();
+        for byte in records {
+            verifier.feed(&[byte]).unwrap();
+        }
+        verifier.finish(2).unwrap();
+
+        let mut truncated = RecordStreamVerifier::default();
+        truncated.feed(&[2, 0, 0, 0, 1]).unwrap();
+        assert!(matches!(
+            truncated.finish(1),
+            Err(ArchiveError::Invalid("block length"))
         ));
     }
 

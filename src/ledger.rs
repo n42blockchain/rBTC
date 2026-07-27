@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::archive::{
     ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, verify_archive,
-    write_archive,
+    verify_archive_streaming, write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -24,6 +24,8 @@ const STAGED_FILE: &str = "ledger-staged.rblk";
 const POLICY_FILE: &str = "ledger-policy.json";
 const LEDGER_POLICY_SCHEMA_VERSION: u32 = 1;
 const MAX_LEDGER_POLICY_BYTES: u64 = 1_024;
+const MAX_LEDGER_INDEX_BYTES: u64 = 1024 * 1024;
+const MAX_AUDIT_SLOT_NAMESPACE: u16 = 4_096;
 
 /// Default approximate one-week historical retention at ten-minute blocks.
 pub const DEFAULT_RETENTION_BLOCKS: u32 = 1_008;
@@ -31,7 +33,7 @@ pub const DEFAULT_RETENTION_BLOCKS: u32 = 1_008;
 pub const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Retention settings for the rotating archive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LedgerRetention {
     /// At most this many blocks remain retrievable from local historical storage.
     pub max_blocks: u32,
@@ -54,6 +56,37 @@ pub struct LedgerStats {
     pub first_height: Option<u32>,
     /// Newest retained block height, if the ledger is non-empty.
     pub tip_height: Option<u32>,
+}
+
+/// Read-only, work-bounded verification result for one freezer directory.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LedgerAuditReport {
+    /// The audit never repairs or opens a mutable database.
+    pub read_only: bool,
+    /// Every discovered archive inside the configured namespace was verified.
+    pub complete: bool,
+    /// Persisted policy when its supported schema decoded successfully.
+    pub policy: Option<LedgerRetention>,
+    /// Maximum archive count this invocation was allowed to verify.
+    pub max_segments: u32,
+    /// Maximum compressed archive bytes this invocation was allowed to read.
+    pub max_bytes: u64,
+    /// Archives whose compressed pieces and decompressed records both verified.
+    pub verified_segments: u32,
+    /// Blocks authenticated by those verified archives.
+    pub verified_blocks: u64,
+    /// Compressed bytes read from verified archives.
+    pub verified_bytes: u64,
+    /// Oldest verified height in the selected contiguous chain.
+    pub first_height: Option<u32>,
+    /// Newest verified height in the selected contiguous chain.
+    pub tip_height: Option<u32>,
+    /// Whether the durable index selected that verified chain exactly.
+    pub index_valid: bool,
+    /// Bounded integrity or lifecycle findings.
+    pub issues: Vec<String>,
+    /// Non-executed recovery actions in safe dependency order.
+    pub repair_plan: Vec<String>,
 }
 
 impl Default for LedgerRetention {
@@ -168,6 +201,25 @@ impl LedgerDurability for OsLedgerDurability {
 }
 
 impl PrunedBlockLedger {
+    /// Verifies the freezer without creating, deleting, renaming, or opening a
+    /// mutable database.
+    ///
+    /// Both archive count and compressed bytes are bounded. When either budget
+    /// is exhausted, the report is explicitly incomplete and contains only a
+    /// dry-run repair plan.
+    pub fn audit(
+        root: impl AsRef<Path>,
+        max_segments: u32,
+        max_bytes: u64,
+    ) -> Result<LedgerAuditReport, LedgerError> {
+        if max_segments == 0 || max_bytes == 0 {
+            return Err(LedgerError::Invalid(
+                "ledger audit budgets must be non-zero",
+            ));
+        }
+        audit_ledger(root.as_ref(), max_segments, max_bytes)
+    }
+
     /// Opens a ledger rooted in an application-specific directory.
     pub fn open(root: impl AsRef<Path>, retention: LedgerRetention) -> Result<Self, LedgerError> {
         Self::open_with_durability(root, retention, Arc::new(OsLedgerDurability))
@@ -787,6 +839,294 @@ impl PrunedBlockLedger {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn audit_ledger(
+    root: &Path,
+    max_segments: u32,
+    max_bytes: u64,
+) -> Result<LedgerAuditReport, LedgerError> {
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(LedgerError::Invalid(
+            "ledger audit root must be a directory",
+        ));
+    }
+    let mut report = LedgerAuditReport {
+        read_only: true,
+        complete: true,
+        policy: None,
+        max_segments,
+        max_bytes,
+        verified_segments: 0,
+        verified_blocks: 0,
+        verified_bytes: 0,
+        first_height: None,
+        tip_height: None,
+        index_valid: false,
+        issues: Vec::new(),
+        repair_plan: Vec::new(),
+    };
+
+    let policy_path = root.join(POLICY_FILE);
+    let policy = match read_bounded_audit_file(&policy_path, MAX_LEDGER_POLICY_BYTES) {
+        Ok(Some(bytes)) => match serde_json::from_slice::<LedgerPolicy>(&bytes) {
+            Ok(policy) if policy.schema_version == LEDGER_POLICY_SCHEMA_VERSION => Some(policy),
+            Ok(_) => {
+                push_unique(
+                    &mut report.issues,
+                    "unsupported ledger policy schema version",
+                );
+                None
+            }
+            Err(_) => {
+                push_unique(&mut report.issues, "malformed ledger policy");
+                None
+            }
+        },
+        Ok(None) => {
+            push_unique(&mut report.issues, "ledger policy is missing");
+            None
+        }
+        Err(_) => {
+            push_unique(
+                &mut report.issues,
+                "ledger policy is unreadable, oversized, or not a regular file",
+            );
+            None
+        }
+    };
+    report.policy = policy.map(|policy| LedgerRetention {
+        max_blocks: policy.max_blocks,
+        max_bytes: policy.max_bytes,
+        slots: policy.slots,
+    });
+    let slot_namespace = policy
+        .filter(|policy| policy.slots > 0 && policy.slots <= MAX_AUDIT_SLOT_NAMESPACE)
+        .map_or(
+            u16::try_from(DEFAULT_RETENTION_BLOCKS).expect("default slot count fits u16"),
+            |policy| policy.slots,
+        );
+    if policy.is_some_and(|policy| policy.slots == 0 || policy.slots > MAX_AUDIT_SLOT_NAMESPACE) {
+        push_unique(
+            &mut report.issues,
+            "ledger policy slot namespace exceeds the audit bound",
+        );
+        report.complete = false;
+    }
+
+    let mut scanned = Vec::new();
+    let mut attempted_segments = 0_u32;
+    let mut attempted_bytes = 0_u64;
+    for slot in 0..slot_namespace {
+        let path = root.join(format!("blk-{slot:04}.rblk"));
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                push_unique(&mut report.issues, "an archive slot is unreadable");
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            push_unique(&mut report.issues, "an archive slot is not a regular file");
+            continue;
+        }
+        if attempted_segments >= max_segments
+            || metadata.len() > max_bytes.saturating_sub(attempted_bytes)
+        {
+            report.complete = false;
+            push_unique(&mut report.issues, "ledger audit work budget was exhausted");
+            continue;
+        }
+        attempted_segments += 1;
+        attempted_bytes = attempted_bytes.saturating_add(metadata.len());
+        if let Ok(manifest) = verify_archive_streaming(&path) {
+            report.verified_segments += 1;
+            report.verified_blocks = report
+                .verified_blocks
+                .saturating_add(u64::from(manifest.block_count));
+            report.verified_bytes = report.verified_bytes.saturating_add(metadata.len());
+            scanned.push(Segment {
+                first_height: manifest.first_height,
+                block_count: manifest.block_count,
+                slot,
+                bytes: metadata.len(),
+            });
+        } else {
+            push_unique(
+                &mut report.issues,
+                "an archive failed checksum, decompression, or record framing verification",
+            );
+            push_unique(
+                &mut report.repair_plan,
+                "restore the failed archive from an authenticated source before rebuilding any index",
+            );
+        }
+    }
+
+    let index = match read_bounded_audit_file(&root.join(INDEX_FILE), MAX_LEDGER_INDEX_BYTES) {
+        Ok(Some(bytes)) => {
+            if let Ok(index) = serde_json::from_slice::<LedgerIndex>(&bytes) {
+                Some(index)
+            } else {
+                push_unique(&mut report.issues, "ledger index is malformed");
+                None
+            }
+        }
+        Ok(None) if scanned.is_empty() => Some(LedgerIndex::default()),
+        Ok(None) => {
+            push_unique(&mut report.issues, "ledger index is missing");
+            None
+        }
+        Err(_) => {
+            push_unique(
+                &mut report.issues,
+                "ledger index is unreadable, oversized, or not a regular file",
+            );
+            None
+        }
+    };
+
+    let selected = if report.complete {
+        match index {
+            Some(index) if valid_index(&index, &scanned, slot_namespace) => {
+                report.index_valid = true;
+                index.segments
+            }
+            _ => {
+                push_unique(
+                    &mut report.issues,
+                    "ledger index does not select the verified contiguous archive chain",
+                );
+                best_contiguous_chain(&scanned)
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if report.complete && !report.index_valid {
+        push_unique(
+            &mut report.repair_plan,
+            "rebuild the ledger index from the newest verified contiguous archive chain",
+        );
+    }
+    if !report.complete {
+        push_unique(
+            &mut report.repair_plan,
+            "rerun the read-only audit with larger explicit work budgets before planning repairs",
+        );
+    }
+
+    if let Some(first) = selected.first() {
+        report.first_height = Some(first.first_height);
+    }
+    if let Some(last) = selected.last() {
+        report.tip_height = Some(segment_end_inclusive(last)?);
+    }
+    if let Some(retention) = report.policy {
+        if report.complete && exceeds(&selected, retention) {
+            push_unique(
+                &mut report.issues,
+                "selected ledger chain exceeds its persisted retention policy",
+            );
+            push_unique(
+                &mut report.repair_plan,
+                "apply normal crash-safe startup recovery to enforce the persisted retention policy",
+            );
+        }
+    }
+
+    if report.complete {
+        let selected_slots = selected
+            .iter()
+            .map(|segment| segment.slot)
+            .collect::<std::collections::BTreeSet<_>>();
+        if scanned
+            .iter()
+            .any(|segment| !selected_slots.contains(&segment.slot))
+        {
+            push_unique(
+                &mut report.issues,
+                "verified archive slots exist outside the selected ledger chain",
+            );
+            push_unique(
+                &mut report.repair_plan,
+                "remove only verified unindexed archive slots after the rebuilt index is durable",
+            );
+        }
+    }
+
+    for (path, issue, action) in [
+        (
+            root.join(STAGED_FILE),
+            "a staged archive awaits recovery",
+            "recover or discard the staged archive only after comparing it with the active execution tip",
+        ),
+        (
+            root.join(TRUNCATE_FILE),
+            "a truncation intent awaits recovery",
+            "resume the durable truncation intent before serving blocks",
+        ),
+        (
+            root.join("ledger-index.json.new"),
+            "a temporary ledger index awaits recovery",
+            "run normal startup recovery to adopt or remove the temporary index safely",
+        ),
+        (
+            root.join("ledger-policy.json.new"),
+            "a temporary ledger policy awaits recovery",
+            "run normal startup recovery to publish or remove the temporary policy safely",
+        ),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                push_unique(&mut report.issues, issue);
+                push_unique(&mut report.repair_plan, action);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => push_unique(&mut report.issues, "a recovery marker is unreadable"),
+        }
+    }
+    if report.policy.is_none() {
+        push_unique(
+            &mut report.repair_plan,
+            "publish a supported retention policy only after archive recovery and trimming succeed",
+        );
+    }
+    Ok(report)
+}
+
+fn read_bounded_audit_file(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audit input is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audit input exceeds its byte bound",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+    }
+}
+
 fn valid_index(index: &LedgerIndex, scanned: &[Segment], slots: u16) -> bool {
     if index.next_slot >= slots {
         return false;
@@ -1074,6 +1414,132 @@ mod tests {
             ))
         ));
         assert_eq!(fs::read(source).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn read_only_audit_verifies_complete_freezer_without_mutation() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 3,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        ledger.append(11, &[vec![11]]).unwrap();
+        let paths = [
+            dir.path().join(POLICY_FILE),
+            dir.path().join(INDEX_FILE),
+            ledger.slot_path(0),
+            ledger.slot_path(1),
+        ];
+        let before = paths
+            .iter()
+            .map(|path| fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        drop(ledger);
+
+        let report = PrunedBlockLedger::audit(dir.path(), 3, 1_000_000).unwrap();
+        assert!(report.read_only);
+        assert!(report.complete);
+        assert!(report.index_valid);
+        assert_eq!(report.policy, Some(retention));
+        assert_eq!(report.verified_segments, 2);
+        assert_eq!(report.verified_blocks, 2);
+        assert_eq!(report.first_height, Some(10));
+        assert_eq!(report.tip_height, Some(11));
+        assert!(report.issues.is_empty());
+        assert!(report.repair_plan.is_empty());
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| fs::read(path).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn read_only_audit_reports_corruption_and_index_repair_plan() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(
+            dir.path(),
+            LedgerRetention {
+                max_blocks: 2,
+                max_bytes: 1_000_000,
+                slots: 2,
+            },
+        )
+        .unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        ledger.append(11, &[vec![11]]).unwrap();
+        let damaged_path = ledger.slot_path(1);
+        let mut damaged = fs::read(&damaged_path).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        fs::write(&damaged_path, &damaged).unwrap();
+        drop(ledger);
+
+        let report = PrunedBlockLedger::audit(dir.path(), 2, 1_000_000).unwrap();
+        assert!(report.complete);
+        assert!(!report.index_valid);
+        assert_eq!(report.verified_segments, 1);
+        assert!(report.issues.iter().any(|issue| issue.contains("checksum")));
+        assert!(
+            report
+                .repair_plan
+                .iter()
+                .any(|action| action.contains("rebuild the ledger index"))
+        );
+        assert_eq!(fs::read(damaged_path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn incomplete_audit_never_plans_a_destructive_repair() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(
+            dir.path(),
+            LedgerRetention {
+                max_blocks: 2,
+                max_bytes: 1_000_000,
+                slots: 2,
+            },
+        )
+        .unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        ledger.append(11, &[vec![11]]).unwrap();
+        drop(ledger);
+
+        let report = PrunedBlockLedger::audit(dir.path(), 1, 1_000_000).unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.verified_segments, 1);
+        assert!(
+            report
+                .repair_plan
+                .iter()
+                .any(|action| action.contains("rerun the read-only audit"))
+        );
+        assert!(
+            !report
+                .repair_plan
+                .iter()
+                .any(|action| action.contains("remove"))
+        );
+    }
+
+    #[test]
+    fn missing_index_audit_plans_rebuild_but_does_not_create_it() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.append(10, &[vec![10]]).unwrap();
+        drop(ledger);
+        fs::remove_file(dir.path().join(INDEX_FILE)).unwrap();
+
+        let report = PrunedBlockLedger::audit(dir.path(), 2, 1_000_000).unwrap();
+        assert!(report.complete);
+        assert!(!report.index_valid);
+        assert_eq!(report.first_height, Some(10));
+        assert_eq!(report.tip_height, Some(10));
+        assert!(!dir.path().join(INDEX_FILE).exists());
     }
 
     #[test]

@@ -86,6 +86,22 @@ after crashes, while the retained marker improves the next conflict
 diagnostic. Distinct embedded node instances therefore require distinct data
 directories.
 
+Stop the node before running a freezer audit:
+
+```text
+rbtcd --network bitcoin --data-dir /srv/rbtc/bitcoin --verify-storage
+```
+
+The command takes a shared lock on the existing `.rbtc.lock` without rewriting
+its marker and fails if the daemon still owns the exclusive lock. Defaults
+bound verification to 1,008 archives and 2 GiB of compressed input;
+`--verify-storage-max-segments` and `--verify-storage-max-bytes` can change
+those ceilings within the documented CLI bounds. It verifies compressed piece
+hashes and the complete decompressed record stream with fixed memory, prints a
+JSON dry-run repair plan, and returns failure for any issue or incomplete
+budget. It never opens chainstate, creates a database, writes a file log, or
+executes a repair.
+
 Every persistent data directory is checked before database open and before
 each atomic validation checkpoint or live transaction-persistence cycle.
 `minimum_free_bytes` is the operator reserve (default 5 GiB). The enforced

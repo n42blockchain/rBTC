@@ -251,8 +251,12 @@ optional where appropriate, and host-runtime compatible.
   silently recreate chainstate from an incomplete freezer. Bounded
   `--prune-blocks` (288–1,008) and `--prune-max-bytes` (at least 550 MiB)
   startup targets now drive the existing crash-safe physical freezer rotation
-  and sorted undo cleanup; reindex/repair/migration and operator recovery
-  workflows keep this broader item open.
+  and sorted undo cleanup. Targets and physical-prefix progress are persisted
+  and observable. A fixed-memory, count/byte-bounded `--verify-storage` command
+  now verifies freezer pieces and decompressed records without opening mutable
+  databases and emits a JSON dry-run repair plan; cross-store verification,
+  reindex/repair execution, migration, and operator recovery workflows keep
+  this broader item open.
 - [ ] **Optional indexes commonly used by node clients.** Add independently
   rebuildable `txindex`, spent-output index, and BIP157/158 compact-filter index
   with explicit disk cost, sync state, prune compatibility, and peer serving.
