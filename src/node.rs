@@ -206,6 +206,11 @@ const MAX_STORAGE_AUDIT_SEGMENTS: u32 = 4_096;
 const DEFAULT_STORAGE_AUDIT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MIN_STORAGE_AUDIT_BYTES: u64 = 1024 * 1024;
 const MAX_STORAGE_AUDIT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const DEFAULT_VERIFY_CHAIN_DEPTH: u32 = 288;
+const MAX_VERIFY_CHAIN_DEPTH: u32 = DEFAULT_RETENTION_BLOCKS;
+const DEFAULT_VERIFY_CHAIN_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_VERIFY_CHAIN_BLOCK_BYTES: u64 = 1024 * 1024;
+const MAX_VERIFY_CHAIN_BLOCK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 const fn supports_experimental_block_execution(network: Network) -> bool {
     matches!(network, Network::Bitcoin | Network::Testnet)
@@ -1469,10 +1474,54 @@ enum OfflineAction {
         max_segments: u32,
         max_bytes: u64,
     },
+    VerifyChain {
+        depth: u32,
+        max_block_bytes: u64,
+    },
     PruneStorage {
         through_height: u32,
         plan_token: Option<String>,
     },
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OfflineVerifyChainReport {
+    schema_version: u32,
+    network: String,
+    exclusive: bool,
+    database_open_mode: &'static str,
+    header_records: u64,
+    header_height: u32,
+    header_hash: String,
+    chainwork: String,
+    execution_height: u32,
+    execution_hash: String,
+    assumed_snapshot_height: Option<u32>,
+    independently_validated: bool,
+    utxo_hot: u64,
+    utxo_cold: u64,
+    freezer_first_height: Option<u32>,
+    freezer_tip_height: Option<u32>,
+    requested_depth: u32,
+    checked_first_height: Option<u32>,
+    checked_blocks: u32,
+    checked_block_record_bytes: u64,
+    checked_undos: u32,
+    clean: bool,
+    issues: Vec<String>,
+    repair_plan: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FreezerCrossCheck {
+    first_height: Option<u32>,
+    tip_height: Option<u32>,
+    checked_first_height: Option<u32>,
+    checked_blocks: u32,
+    checked_block_record_bytes: u64,
+    checked_undos: u32,
+    issues: Vec<String>,
+    repair_plan: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3037,10 +3086,14 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
             let mut logging = options.logging.clone();
             if matches!(
                 options.offline_action.as_ref(),
-                Some(OfflineAction::VerifyStorage { .. } | OfflineAction::PruneStorage { .. })
+                Some(
+                    OfflineAction::VerifyStorage { .. }
+                        | OfflineAction::VerifyChain { .. }
+                        | OfflineAction::PruneStorage { .. },
+                )
             ) {
-                // A read-only audit must not create or rotate a data-directory
-                // log merely because diagnostics were initialized.
+                // Offline storage maintenance must not create or rotate a
+                // data-directory log merely because diagnostics initialized.
                 logging.directory = None;
             }
             rbtc::diagnostics::install(&logging).map_err(CliError::runtime)?;
@@ -3439,6 +3492,16 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         }
         return Ok(());
     }
+    if matches!(
+        options.offline_action.as_ref(),
+        Some(OfflineAction::VerifyChain { .. })
+    ) {
+        let data_dir = options
+            .data_dir
+            .as_ref()
+            .expect("chain verification parser requires data directory");
+        require_existing_verify_chain_data(data_dir, options.network)?;
+    }
     if options.network_execution.is_experimental() {
         rbtc_warn!(
             "WARNING: experimental {} block execution is enabled for validation only; \
@@ -3492,6 +3555,10 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         Some(OfflineAction::RetierUtxos { hot_window_blocks }) => {
             return retier_utxos(&options, *hot_window_blocks);
         }
+        Some(OfflineAction::VerifyChain {
+            depth,
+            max_block_bytes,
+        }) => return verify_chain_offline(&options, *depth, *max_block_bytes),
         Some(
             OfflineAction::DownloadCoreSnapshot(_)
             | OfflineAction::VerifyStorage { .. }
@@ -3521,6 +3588,275 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         return run_background_assumeutxo(options, validation_dir, local_nonce).await;
     }
     run_peer_pool(&options, local_nonce, None, None).await
+}
+
+fn require_existing_verify_chain_data(
+    data_dir: &std::path::Path,
+    network: Network,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(data_dir).map_err(|error| {
+        format!(
+            "offline chain verification requires an existing data directory {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("offline chain verification data directory must not be a symlink".to_owned());
+    }
+    for required in ["headers.redb", "chainstate.redb"] {
+        let path = data_dir.join(required);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "offline chain verification requires existing {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "offline chain verification requires {} to be a regular file",
+                path.display()
+            ));
+        }
+    }
+    let blocks = data_dir.join("blocks");
+    let metadata = fs::symlink_metadata(&blocks).map_err(|error| {
+        format!(
+            "offline chain verification requires existing freezer {}: {error}",
+            blocks.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("offline chain verification freezer must not be a symlink".to_owned());
+    }
+    if validate_data_format_manifest(data_dir, network)? {
+        return Err(
+            "offline chain verification requires an existing data-format manifest; start the matching release once to migrate a legacy directory"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_chain_offline(options: &Options, depth: u32, max_block_bytes: u64) -> Result<(), String> {
+    let data_dir = options
+        .data_dir
+        .as_ref()
+        .expect("chain verification parser requires data directory");
+    let header_store =
+        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
+    let header_records = header_store.len().map_err(|error| error.to_string())?;
+    let headers = header_store
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    let header = headers.active_tip();
+    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
+        .map_err(|error| error.to_string())?;
+    let execution = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let assumed = chainstate
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?;
+    let utxos = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    let mut issues = Vec::new();
+    let mut repair_plan = Vec::new();
+    if headers
+        .active_header_at(execution.height)
+        .map(|info| info.hash)
+        != Some(execution.hash)
+    {
+        issues.push(
+            "execution tip is not the maximum-work header chain at the same height".to_owned(),
+        );
+        repair_plan.push(
+            "preserve the directory and rebuild chainstate separately from authenticated active-chain blocks"
+                .to_owned(),
+        );
+    }
+    if execution.height > header.height {
+        issues.push("execution tip is above the validated header tip".to_owned());
+    }
+    if chainstate
+        .undos()
+        .pending_transition()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        issues
+            .push("an interrupted chainstate transition remains after exclusive reopen".to_owned());
+        repair_plan.push(
+            "do not serve the directory; preserve it and complete recovery with the same release"
+                .to_owned(),
+        );
+    }
+    let freezer = verify_freezer_cross_store(
+        data_dir,
+        &headers,
+        &chainstate,
+        execution.height,
+        depth,
+        max_block_bytes,
+    )?;
+    issues.extend(freezer.issues);
+    repair_plan.extend(freezer.repair_plan);
+    repair_plan.dedup();
+    let mut report = OfflineVerifyChainReport {
+        schema_version: 1,
+        network: options.network.to_string(),
+        exclusive: true,
+        database_open_mode: "recovery-capable; may complete redb crash recovery",
+        header_records,
+        header_height: header.height,
+        header_hash: header.hash.to_string(),
+        chainwork: header.chainwork.to_string(),
+        execution_height: execution.height,
+        execution_hash: execution.hash.to_string(),
+        assumed_snapshot_height: assumed.map(|snapshot| snapshot.base.height),
+        independently_validated: assumed.is_none(),
+        utxo_hot: utxos.hot,
+        utxo_cold: utxos.cold,
+        freezer_first_height: freezer.first_height,
+        freezer_tip_height: freezer.tip_height,
+        requested_depth: depth,
+        checked_first_height: freezer.checked_first_height,
+        checked_blocks: freezer.checked_blocks,
+        checked_block_record_bytes: freezer.checked_block_record_bytes,
+        checked_undos: freezer.checked_undos,
+        clean: false,
+        issues,
+        repair_plan,
+    };
+    report.clean = report.issues.is_empty();
+    print_offline_verify_chain_report(&report);
+    if !report.clean {
+        return Err(
+            "offline chain verification found cross-store inconsistencies; no semantic repair was executed"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn print_offline_verify_chain_report(report: &OfflineVerifyChainReport) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(report)
+            .expect("offline chain verification report serialization is infallible")
+    );
+}
+
+fn verify_freezer_cross_store(
+    data_dir: &std::path::Path,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    execution_height: u32,
+    depth: u32,
+    max_block_bytes: u64,
+) -> Result<FreezerCrossCheck, String> {
+    let audit = PrunedBlockLedger::audit(
+        data_dir.join("blocks"),
+        MAX_STORAGE_AUDIT_SEGMENTS,
+        MAX_STORAGE_AUDIT_BYTES,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut result = FreezerCrossCheck {
+        first_height: audit.first_height,
+        tip_height: audit.tip_height,
+        checked_first_height: None,
+        checked_blocks: 0,
+        checked_block_record_bytes: 0,
+        checked_undos: 0,
+        issues: Vec::new(),
+        repair_plan: Vec::new(),
+    };
+    if !audit.complete || !audit.issues.is_empty() {
+        result
+            .issues
+            .push("the complete freezer integrity audit is not clean".to_owned());
+        result.repair_plan.extend(audit.repair_plan);
+        return Ok(result);
+    }
+    if audit.tip_height != (execution_height > 0).then_some(execution_height) {
+        result
+            .issues
+            .push("freezer tip does not equal the durable execution tip".to_owned());
+        result.repair_plan.push(
+            "restore the missing active-chain freezer suffix from authenticated blocks before reopening service"
+                .to_owned(),
+        );
+    }
+    if let (Some(first), Some(tip)) = (audit.first_height, audit.tip_height) {
+        verify_retained_suffix(
+            data_dir,
+            headers,
+            chainstate,
+            first,
+            tip,
+            depth,
+            max_block_bytes,
+            &mut result,
+        )?;
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_retained_suffix(
+    data_dir: &std::path::Path,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    first: u32,
+    tip: u32,
+    depth: u32,
+    max_block_bytes: u64,
+    result: &mut FreezerCrossCheck,
+) -> Result<(), String> {
+    let requested_first = tip.saturating_add(1).saturating_sub(depth).max(first);
+    let ledger = PrunedBlockLedger::open_persisted(data_dir.join("blocks"))
+        .map_err(|error| error.to_string())?;
+    let blocks = ledger
+        .verify_block_hashes(requested_first, tip, max_block_bytes)
+        .map_err(|error| error.to_string())?;
+    result.checked_first_height = Some(requested_first);
+    result.checked_blocks =
+        u32::try_from(blocks.hashes.len()).expect("verification depth bounds block count");
+    result.checked_block_record_bytes = blocks.verified_record_bytes;
+    let mut block_mismatch = false;
+    let mut missing_undo = false;
+    for (height, hash) in blocks.hashes {
+        block_mismatch |= headers.active_header_at(height).map(|info| info.hash) != Some(hash);
+        if chainstate
+            .undos()
+            .get(hash)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            result.checked_undos = result.checked_undos.saturating_add(1);
+        } else {
+            missing_undo = true;
+        }
+    }
+    if block_mismatch {
+        result.issues.push(
+            "a retained block payload does not match the maximum-work header at its height"
+                .to_owned(),
+        );
+        result.repair_plan.push(
+            "replace the mismatched freezer archive only from an authenticated active-chain source"
+                .to_owned(),
+        );
+    }
+    if missing_undo {
+        result
+            .issues
+            .push("disconnect undo is missing for a checked retained block".to_owned());
+        result.repair_plan.push(
+            "do not advertise reorganization readiness; rebuild chainstate separately".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn startup_configuration_summary(options: &Options) -> String {
@@ -9325,6 +9661,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut verify_storage = false;
     let mut storage_audit_max_segments = None;
     let mut storage_audit_max_bytes = None;
+    let mut verify_chain = false;
+    let mut verify_chain_depth = None;
+    let mut verify_chain_block_bytes = None;
     let mut manual_prune_through_height = None;
     let mut manual_prune_token = None;
     let mut snapshot_download_source = None;
@@ -9551,6 +9890,40 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-cleanup-validation-dir" => cleanup_validation_dir = false,
             "--utxo-activity-report" => utxo_activity_report = true,
             "--verify-storage" => verify_storage = true,
+            "--verify-chain" => verify_chain = true,
+            "--verify-chain-depth" => {
+                if verify_chain_depth.is_some() {
+                    return Err("--verify-chain-depth cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--verify-chain-depth")?;
+                let depth = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid chain verification depth: {value}"))?;
+                if !(1..=MAX_VERIFY_CHAIN_DEPTH).contains(&depth) {
+                    return Err(format!(
+                        "chain verification depth must be between 1 and {MAX_VERIFY_CHAIN_DEPTH}"
+                    ));
+                }
+                verify_chain_depth = Some(depth);
+            }
+            "--verify-chain-max-block-bytes" => {
+                if verify_chain_block_bytes.is_some() {
+                    return Err(
+                        "--verify-chain-max-block-bytes cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--verify-chain-max-block-bytes")?;
+                let bytes = value.parse::<u64>().map_err(|_| {
+                    format!("invalid chain verification block-byte budget: {value}")
+                })?;
+                if !(MIN_VERIFY_CHAIN_BLOCK_BYTES..=MAX_VERIFY_CHAIN_BLOCK_BYTES).contains(&bytes) {
+                    return Err(format!(
+                        "chain verification block-byte budget must be between {MIN_VERIFY_CHAIN_BLOCK_BYTES} and {MAX_VERIFY_CHAIN_BLOCK_BYTES}"
+                    ));
+                }
+                verify_chain_block_bytes = Some(bytes);
+            }
             "--verify-storage-max-segments" => {
                 if storage_audit_max_segments.is_some() {
                     return Err(
@@ -10196,6 +10569,21 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .to_owned(),
         );
     }
+    if !verify_chain && (verify_chain_depth.is_some() || verify_chain_block_bytes.is_some()) {
+        return Err(
+            "--verify-chain-depth and --verify-chain-max-block-bytes require --verify-chain"
+                .to_owned(),
+        );
+    }
+    let offline_action_count = usize::from(utxo_activity_report)
+        + usize::from(utxo_retier_window_blocks.is_some())
+        + usize::from(snapshot_download.is_some())
+        + usize::from(verify_storage)
+        + usize::from(verify_chain)
+        + usize::from(manual_prune_through_height.is_some());
+    if offline_action_count > 1 {
+        return Err("offline maintenance actions cannot be combined".to_owned());
+    }
     if verify_storage {
         if data_dir.is_none() {
             return Err("--verify-storage requires --data-dir".to_owned());
@@ -10239,6 +10627,48 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         {
             return Err(
                 "storage verification is read-only and conflicts with peer, synchronization, snapshot, validation, serving, mutation, storage-target, and file-logging modes"
+                    .to_owned(),
+            );
+        }
+    }
+    if verify_chain {
+        if data_dir.is_none() {
+            return Err("--verify-chain requires --data-dir".to_owned());
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target
+            || prune_blocks.is_some()
+            || prune_max_bytes.is_some()
+            || minimum_free_bytes.is_some()
+            || active_chainstate_cache_bytes.is_some()
+            || background_chainstate_cache_bytes.is_some()
+            || bulk_validation_cache_bytes.is_some()
+            || automatic_hot_standbys.is_some()
+            || mempool_max_transactions.is_some()
+            || mempool_max_bytes.is_some()
+            || log_dir.is_some()
+            || log_max_bytes.is_some()
+            || log_max_files.is_some()
+        {
+            return Err(
+                "chain verification is exclusively offline and conflicts with peer, synchronization, snapshot, validation, serving, mutation, storage-target, and file-logging modes"
                     .to_owned(),
             );
         }
@@ -10612,6 +11042,12 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     .unwrap_or(DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS),
                 max_bytes: storage_audit_max_bytes.unwrap_or(DEFAULT_STORAGE_AUDIT_MAX_BYTES),
             })
+        } else if verify_chain {
+            Some(OfflineAction::VerifyChain {
+                depth: verify_chain_depth.unwrap_or(DEFAULT_VERIFY_CHAIN_DEPTH),
+                max_block_bytes: verify_chain_block_bytes
+                    .unwrap_or(DEFAULT_VERIFY_CHAIN_BLOCK_BYTES),
+            })
         } else {
             manual_prune_through_height.map(|through_height| OfflineAction::PruneStorage {
                 through_height,
@@ -10729,6 +11165,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-storage [--verify-storage-max-segments 1..4096] [--verify-storage-max-bytes 1048576..17179869184]\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-chain [--verify-chain-depth 1..1008] [--verify-chain-max-block-bytes 1048576..4294967296]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
@@ -14104,6 +14541,73 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_bounded_exclusive_chain_verification() {
+        let options = parse_options(
+            [
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-chain-audit",
+                "--verify-chain",
+                "--verify-chain-depth",
+                "576",
+                "--verify-chain-max-block-bytes",
+                "2147483648",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.offline_action,
+            Some(OfflineAction::VerifyChain {
+                depth: 576,
+                max_block_bytes: 2_147_483_648,
+            })
+        );
+        for arguments in [
+            vec!["--network", "testnet4", "--verify-chain"],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-chain-audit",
+                "--verify-chain-depth",
+                "10",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-chain-audit",
+                "--verify-chain",
+                "--verify-chain-depth",
+                "1009",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-chain-audit",
+                "--verify-chain",
+                "--connect",
+                "127.0.0.1:48333",
+            ],
+            vec![
+                "--network",
+                "testnet4",
+                "--data-dir",
+                "/tmp/rbtc-chain-audit",
+                "--verify-chain",
+                "--verify-storage",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_two_phase_offline_manual_pruning() {
         let dry_run = parse_options(
             [
@@ -14215,6 +14719,77 @@ mod tests {
         assert_eq!(fs::read(marker_path).unwrap(), marker);
         assert_eq!(fs::read(index_path).unwrap(), index);
         assert!(!directory.path().join("chainstate.redb").exists());
+        assert!(!directory.path().join("logs").exists());
+    }
+
+    #[tokio::test]
+    async fn offline_chain_verification_requires_existing_state_and_accepts_a_clean_suffix() {
+        let absent = TempDir::new().unwrap().path().join("absent");
+        let absent_options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                absent.display().to_string(),
+                "--verify-chain".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(run_with_nonce(absent_options, 1).await.is_err());
+        assert!(!absent.exists());
+
+        let directory = TempDir::new().unwrap();
+        drop(DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap());
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let block = regtest_block_at_height(
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(1),
+            1,
+        );
+        let block_hash = block.block_hash();
+        let headers = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
+        headers.append(block.header).unwrap();
+        drop(headers);
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        chainstate
+            .commit_connect(
+                genesis.block_hash(),
+                rbtc::execution_store::ExecutionTip {
+                    height: 1,
+                    hash: block_hash,
+                },
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        drop(chainstate);
+        let ledger =
+            PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
+                .unwrap();
+        ledger.append(1, &[serialize(&block)]).unwrap();
+        drop(ledger);
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        let options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--verify-chain".to_owned(),
+                "--verify-chain-depth".to_owned(),
+                "1".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        run_with_nonce(options, 1).await.unwrap();
+        assert!(!directory.path().join("peers.redb").exists());
         assert!(!directory.path().join("logs").exists());
     }
 

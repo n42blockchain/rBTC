@@ -111,6 +111,24 @@ JSON dry-run repair plan, and returns failure for any issue or incomplete
 budget. It never opens chainstate, creates a database, writes a file log, or
 executes a repair.
 
+For cross-store verification, keep the node stopped and run:
+
+```text
+rbtcd --network NETWORK --data-dir DATA_DIR --verify-chain \
+  --verify-chain-depth 288 \
+  --verify-chain-max-block-bytes 1073741824
+```
+
+Depth is bounded to 1–1,008 blocks and defaults to 288. The byte limit counts
+the complete decompressed record streams of overlapping archives and ranges
+from 1 MiB to 4 GiB. The command validates the whole header graph regardless
+of depth, takes the exclusive lock, and may complete redb's own interrupted
+container recovery. It does not repair semantic inconsistencies. Missing
+headers, chainstate, freezer, or the root manifest is a refusal rather than an
+empty-store initialization. A clean JSON report proves the checked
+maximum-work-header/execution/freezer/undo relationships, not that pruned
+history is locally available for reindex.
+
 Manual freezer pruning uses a mandatory two-phase plan:
 
 ```text

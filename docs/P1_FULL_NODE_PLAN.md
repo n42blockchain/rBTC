@@ -165,7 +165,12 @@ and resumes a versioned intent after any post-publication crash. The freezer
 portion of item 3 is also implemented: `--verify-storage` uses fixed memory and explicit work
 budgets, refuses concurrent node access, never opens mutable databases, and
 returns machine-readable findings plus an ordered, non-executed repair plan.
-Cross-store offline `verifychain` remains open, as do items 2 and 5.
+The cross-store portion is also complete: exclusive `--verify-chain` fully
+replays the header graph and correlates the maximum-work active chain,
+execution tip, complete freezer audit, and a bounded retained block/undo
+suffix. Its one-pass-per-archive decoder uses one block-sized buffer, reports
+redb's recovery-capable open semantics, refuses missing stores, and emits no
+semantic repair. Item 3 is complete; items 2 and 5 remain.
 
 Item 4 is complete. Every persistent subsystem has an
 explicit version in the strict network-bound data-format inventory. A missing

@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::archive::{
     ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, verify_archive,
-    verify_archive_streaming, write_archive,
+    verify_archive_block_hashes_streaming, verify_archive_streaming, write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -91,6 +91,19 @@ pub struct LedgerAuditReport {
     pub issues: Vec<String>,
     /// Non-executed recovery actions in safe dependency order.
     pub repair_plan: Vec<String>,
+}
+
+/// Bounded result of correlating retained block payloads with their heights.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerBlockHashReport {
+    /// First requested active-chain height.
+    pub first_height: u32,
+    /// Last requested active-chain height.
+    pub last_height: u32,
+    /// Exact decompressed record bytes verified in overlapping archives.
+    pub verified_record_bytes: u64,
+    /// Consensus block hashes in ascending height order.
+    pub hashes: Vec<(u32, bitcoin::BlockHash)>,
 }
 
 /// Deterministic manual-prefix prune plan.
@@ -656,6 +669,86 @@ impl PrunedBlockLedger {
         let _guard = self.lock();
         let index = self.read_index()?;
         self.read_block_from_index(&index, height)
+    }
+
+    /// Verifies a retained inclusive range using one sequential decompression
+    /// pass per overlapping archive.
+    ///
+    /// Piece hashes, record framing/digest, strict block decoding, continuity,
+    /// and the explicit decompressed-byte budget are all checked. Only
+    /// `(height, block_hash)` pairs are retained in memory.
+    pub fn verify_block_hashes(
+        &self,
+        first_height: u32,
+        last_height: u32,
+        max_record_bytes: u64,
+    ) -> Result<LedgerBlockHashReport, LedgerError> {
+        if first_height > last_height || max_record_bytes == 0 {
+            return Err(LedgerError::Invalid(
+                "invalid retained block verification range",
+            ));
+        }
+        let _guard = self.lock();
+        let index = self.read_index()?;
+        let expected = last_height
+            .checked_sub(first_height)
+            .and_then(|difference| difference.checked_add(1))
+            .ok_or(LedgerError::Invalid("height range overflow"))?;
+        if expected > u32::from(MAX_AUDIT_SLOT_NAMESPACE) {
+            return Err(LedgerError::Invalid(
+                "retained block verification range exceeds its block bound",
+            ));
+        }
+        let mut hashes = Vec::with_capacity(usize::try_from(expected).expect("u32 fits usize"));
+        let mut verified_record_bytes = 0_u64;
+        for segment in index.segments.iter().filter(|segment| {
+            segment_contains(segment, first_height)
+                || segment_contains(segment, last_height)
+                || (segment.first_height > first_height && segment.first_height < last_height)
+        }) {
+            let (manifest, segment_hashes, record_bytes) =
+                verify_archive_block_hashes_streaming(self.slot_path(segment.slot))?;
+            if manifest.first_height != segment.first_height
+                || manifest.block_count != segment.block_count
+            {
+                return Err(LedgerError::Invalid("archive does not match ledger index"));
+            }
+            verified_record_bytes = verified_record_bytes
+                .checked_add(record_bytes)
+                .ok_or(LedgerError::Invalid("verified record byte count overflow"))?;
+            if verified_record_bytes > max_record_bytes {
+                return Err(LedgerError::Invalid(
+                    "retained block verification byte budget was exhausted",
+                ));
+            }
+            for (offset, hash) in segment_hashes.into_iter().enumerate() {
+                let height = segment
+                    .first_height
+                    .checked_add(u32::try_from(offset).expect("archive block offset fits u32"))
+                    .ok_or(LedgerError::Invalid("height overflow"))?;
+                if (first_height..=last_height).contains(&height) {
+                    hashes.push((height, hash));
+                }
+            }
+        }
+        if hashes.len() != usize::try_from(expected).expect("u32 fits usize")
+            || hashes.iter().enumerate().any(|(offset, (height, _))| {
+                *height
+                    != first_height
+                        .checked_add(u32::try_from(offset).expect("range offset fits u32"))
+                        .expect("bounded range cannot overflow")
+            })
+        {
+            return Err(LedgerError::Invalid(
+                "requested retained block range is incomplete",
+            ));
+        }
+        Ok(LedgerBlockHashReport {
+            first_height,
+            last_height,
+            verified_record_bytes,
+            hashes,
+        })
     }
 
     /// Removes every retained block at or above `first_removed_height`.
@@ -2328,6 +2421,42 @@ mod tests {
         assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
         assert_eq!(ledger.read_block(12).unwrap(), Some(vec![12]));
         assert_eq!(ledger.read_block(13).unwrap(), None);
+    }
+
+    #[test]
+    fn verifies_retained_block_hash_ranges_once_per_archive_and_bounds_work() {
+        let dir = TempDir::new().unwrap();
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let encoded = bitcoin::consensus::serialize(&block);
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 10_000_000,
+            slots: 10,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger
+            .append(100, &[encoded.clone(), encoded.clone(), encoded])
+            .unwrap();
+        let report = ledger.verify_block_hashes(101, 102, 10_000_000).unwrap();
+        assert_eq!(report.first_height, 101);
+        assert_eq!(report.last_height, 102);
+        assert_eq!(
+            report.hashes,
+            vec![(101, block.block_hash()), (102, block.block_hash())]
+        );
+        assert!(report.verified_record_bytes > 0);
+        assert!(matches!(
+            ledger.verify_block_hashes(101, 102, 1),
+            Err(LedgerError::Invalid(
+                "retained block verification byte budget was exhausted"
+            ))
+        ));
+        assert!(matches!(
+            ledger.verify_block_hashes(99, 102, 10_000_000),
+            Err(LedgerError::Invalid(
+                "requested retained block range is incomplete"
+            ))
+        ));
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::{
     path::Path,
 };
 
+use bitcoin::{Block, BlockHash, consensus::deserialize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -288,6 +289,87 @@ pub(crate) fn verify_archive_streaming(
     verify_compressed_pieces(path, payload_offset, &manifest)?;
     verify_record_stream(path, payload_offset, records_limit, &manifest)?;
     Ok(manifest)
+}
+
+/// Fully verifies one archive and returns its consensus block hashes without
+/// materializing the complete decompressed record stream.
+///
+/// The compressed payload is piece-verified first. The second pass keeps at
+/// most one consensus-sized block in memory while checking framing, the
+/// decompressed record digest, and strict Bitcoin block decoding.
+pub(crate) fn verify_archive_block_hashes_streaming(
+    path: impl AsRef<Path>,
+) -> Result<(ArchiveManifest, Vec<BlockHash>, u64), ArchiveError> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ArchiveError::Invalid("archive must be a regular file"));
+    }
+    if metadata.len() > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+    let (manifest, records_limit, payload_offset) = read_manifest_header(path)?;
+    verify_compressed_pieces(path, payload_offset, &manifest)?;
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(payload_offset))?;
+    let mut decoder = zstd::stream::Decoder::new(file)?;
+    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let mut bounded = decoder.take(records_limit.saturating_add(1));
+    let mut digest = Sha256::new();
+    let mut records_bytes = 0_u64;
+    let mut hashes = Vec::with_capacity(
+        usize::try_from(manifest.block_count)
+            .expect("u32 fits usize")
+            .min(1_024),
+    );
+    for _ in 0..manifest.block_count {
+        let mut length = [0_u8; 4];
+        bounded
+            .read_exact(&mut length)
+            .map_err(|error| map_record_read_error(error, "block length"))?;
+        digest.update(length);
+        records_bytes = records_bytes
+            .checked_add(4)
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        let length = usize::try_from(u32::from_le_bytes(length)).expect("u32 fits usize");
+        if length > MAX_BLOCK_BYTES {
+            return Err(ArchiveError::Invalid("block length"));
+        }
+        let mut block = vec![0_u8; length];
+        bounded
+            .read_exact(&mut block)
+            .map_err(|error| map_record_read_error(error, "block length"))?;
+        digest.update(&block);
+        records_bytes = records_bytes
+            .checked_add(u64::try_from(length).expect("block length fits u64"))
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if records_bytes > records_limit {
+            return Err(ArchiveError::Invalid("records too large"));
+        }
+        let block: Block =
+            deserialize(&block).map_err(|_| ArchiveError::Invalid("block consensus encoding"))?;
+        hashes.push(block.block_hash());
+    }
+    let mut trailing = [0_u8; 1];
+    if bounded.read(&mut trailing)? != 0 {
+        return Err(ArchiveError::Invalid("block count"));
+    }
+    if manifest.format_version == FORMAT_VERSION && records_bytes != manifest.records_bytes {
+        return Err(ArchiveError::Invalid("records length"));
+    }
+    if format!("{:x}", digest.finalize()) != manifest.records_sha256 {
+        return Err(ArchiveError::Invalid("records checksum"));
+    }
+    Ok((manifest, hashes, records_bytes))
+}
+
+fn map_record_read_error(error: std::io::Error, field: &'static str) -> ArchiveError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        ArchiveError::Invalid(field)
+    } else {
+        ArchiveError::Io(error)
+    }
 }
 
 fn read_manifest_header(path: &Path) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
@@ -596,6 +678,26 @@ mod tests {
         assert!(matches!(
             verify_archive_streaming(file),
             Err(ArchiveError::Invalid("piece checksum"))
+        ));
+    }
+
+    #[test]
+    fn streaming_block_hash_verifier_decodes_each_consensus_record_once() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("block-hashes.rblk");
+        let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let blocks = vec![bitcoin::consensus::serialize(&block); 3];
+        let manifest = write_archive(&file, 10, &blocks).unwrap();
+        let (actual, hashes, records_bytes) = verify_archive_block_hashes_streaming(&file).unwrap();
+        assert_eq!(actual, manifest);
+        assert_eq!(hashes, vec![block.block_hash(); 3]);
+        assert_eq!(records_bytes, manifest.records_bytes);
+
+        let arbitrary = dir.path().join("not-blocks.rblk");
+        write_archive(&arbitrary, 10, &[vec![1, 2, 3]]).unwrap();
+        assert!(matches!(
+            verify_archive_block_hashes_streaming(arbitrary),
+            Err(ArchiveError::Invalid("block consensus encoding"))
         ));
     }
 

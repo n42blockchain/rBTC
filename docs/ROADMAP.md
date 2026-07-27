@@ -256,9 +256,12 @@ optional where appropriate, and host-runtime compatible.
   a clean full audit, an unchanged index, a 288-block retained suffix, and a
   restart-resumable versioned intent. A fixed-memory, count/byte-bounded `--verify-storage` command
   now verifies freezer pieces and decompressed records without opening mutable
-  databases and emits a JSON dry-run repair plan; cross-store verification,
-  reindex/repair execution and cross-store recovery keep this broader item
-  open. The strict network-bound root manifest now inventories every subsystem
+  databases and emits a JSON dry-run repair plan. Exclusive `--verify-chain`
+  fully replays stored headers and checks maximum-work header/execution/freezer/
+  retained-block/undo consistency with bounded one-pass archive decoding,
+  refusing missing stores and making redb recovery semantics explicit.
+  Reindex/repair execution and prune/index policy keep this broader item open.
+  The strict network-bound root manifest now inventories every subsystem
   schema, migrates legacy absence only after successful preflight, and refuses
   future rollback before mutable database open. Backup/restore, rollback, and
   disaster decisions are published in `docs/DISASTER_RECOVERY.md`.

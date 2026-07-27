@@ -48,6 +48,9 @@ backup mechanism.
    The data-format manifest is checked before any database opens. Confirm
    network, header/execution/freezer tips, AssumeUTXO trust state, index lag,
    and disk forecast before restoring ordinary peer/API access.
+   With the node stopped again, run `--verify-chain` at the intended reorg
+   depth. This second command is exclusive and recovery-capable rather than
+   read-only; preserve the pre-open backup generation until it reports clean.
 5. After a clean checkpoint and restart, retire the previous directory only
    under the deployment's retention policy.
 
