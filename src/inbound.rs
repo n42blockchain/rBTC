@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bitcoin::{
@@ -19,10 +19,10 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::Hash,
     p2p::{
-        ServiceFlags,
+        Address, ServiceFlags,
         message::NetworkMessage,
         message_blockdata::Inventory,
-        message_compact_blocks::{BlockTxn, CmpctBlock},
+        message_compact_blocks::{BlockTxn, CmpctBlock, SendCmpct},
         message_filter::{CFCheckpt, CFHeaders, CFilter},
     },
 };
@@ -43,6 +43,9 @@ const MAX_GETBLOCKS_RESULTS: usize = 500;
 const BASIC_FILTER_TYPE: u8 = 0;
 const FILTER_HEADER_INTERVAL: u32 = 1_000;
 const RECENT_BLOCK_UPLOAD_WINDOW: u32 = 288;
+const SENDHEADERS_VERSION: u32 = 70_012;
+const FEEFILTER_VERSION: u32 = 70_013;
+const SENDCMPCT_VERSION: u32 = 70_014;
 
 /// Resource ceilings for one optional inbound listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +109,14 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String>;
     /// BIP158 basic filter data at one active height, when indexed.
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String>;
+    /// Diverse, already-vetted IPv4/IPv6 peers suitable for bounded address relay.
+    fn addresses(&self) -> Result<Vec<SocketAddr>, String> {
+        Ok(Vec::new())
+    }
+    /// Current local minimum mempool fee in satoshis per 1,000 virtual bytes.
+    fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
+        Ok(0)
+    }
 }
 
 /// Inbound listener or peer-service failure.
@@ -154,8 +165,8 @@ impl UploadBudget {
         }
     }
 
-    fn charge(&self, bytes: usize, recent_block: bool) -> Result<(), InboundError> {
-        if recent_block || self.target == 0 {
+    fn charge(&self, bytes: usize, historical_block: bool) -> Result<(), InboundError> {
+        if !historical_block || self.target == 0 {
             return Ok(());
         }
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
@@ -209,20 +220,52 @@ impl RequestBudget {
 
 struct IpAdmission {
     ip: IpAddr,
-    counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    group: NetworkGroup,
+    ip_counts: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    group_counts: Arc<Mutex<HashMap<NetworkGroup, usize>>>,
     _global: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NetworkGroup {
+    Ipv4([u8; 2]),
+    Ipv6([u8; 4]),
+}
+
+fn network_group(ip: IpAddr) -> NetworkGroup {
+    match ip {
+        IpAddr::V4(ip) => NetworkGroup::Ipv4([ip.octets()[0], ip.octets()[1]]),
+        IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return NetworkGroup::Ipv4([ip.octets()[0], ip.octets()[1]]);
+            }
+            let octets = ip.octets();
+            NetworkGroup::Ipv6([octets[0], octets[1], octets[2], octets[3]])
+        }
+    }
 }
 
 impl Drop for IpAdmission {
     fn drop(&mut self) {
-        let mut counts = self
-            .counts
+        let mut ip_counts = self
+            .ip_counts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&self.ip) {
+        if let Some(count) = ip_counts.get_mut(&self.ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                counts.remove(&self.ip);
+                ip_counts.remove(&self.ip);
+            }
+        }
+        drop(ip_counts);
+        let mut group_counts = self
+            .group_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = group_counts.get_mut(&self.group) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                group_counts.remove(&self.group);
             }
         }
     }
@@ -231,22 +274,32 @@ impl Drop for IpAdmission {
 fn admit_ip(
     remote: SocketAddr,
     limit: usize,
-    counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip_counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    group_counts: &Arc<Mutex<HashMap<NetworkGroup, usize>>>,
     global: OwnedSemaphorePermit,
 ) -> Option<IpAdmission> {
     let ip = remote.ip();
-    let mut locked = counts
+    let group = network_group(ip);
+    let mut ips = ip_counts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let count = locked.entry(ip).or_default();
-    if *count >= limit {
+    let mut groups = group_counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ips.get(&ip).copied().unwrap_or_default() >= limit
+        || groups.get(&group).copied().unwrap_or_default() >= limit
+    {
         return None;
     }
-    *count += 1;
-    drop(locked);
+    *ips.entry(ip).or_default() += 1;
+    *groups.entry(group).or_default() += 1;
+    drop(groups);
+    drop(ips);
     Some(IpAdmission {
         ip,
-        counts: Arc::clone(counts),
+        group,
+        ip_counts: Arc::clone(ip_counts),
+        group_counts: Arc::clone(group_counts),
         _global: global,
     })
 }
@@ -266,6 +319,7 @@ pub async fn run_listener(
 ) -> Result<(), InboundError> {
     let global = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(Mutex::new(HashMap::new()));
+    let per_group = Arc::new(Mutex::new(HashMap::new()));
     let upload = Arc::new(UploadBudget::new(limits.max_upload_bytes_per_day));
     let mut peers = JoinSet::new();
     loop {
@@ -277,7 +331,13 @@ pub async fn run_listener(
                     continue;
                 };
                 let Some(admission) =
-                    admit_ip(remote, limits.max_connections_per_ip, &per_ip, global_permit)
+                    admit_ip(
+                        remote,
+                        limits.max_connections_per_ip,
+                        &per_ip,
+                        &per_group,
+                        global_permit,
+                    )
                 else {
                     drop(stream);
                     continue;
@@ -338,6 +398,32 @@ async fn serve_peer(
             "inbound handshake timed out",
         ))
     })??;
+    if peer.remote_version().version >= SENDHEADERS_VERSION {
+        send_accounted(&mut peer, NetworkMessage::SendHeaders, &upload, false).await?;
+    }
+    if peer.remote_version().version >= SENDCMPCT_VERSION {
+        send_accounted(
+            &mut peer,
+            NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }),
+            &upload,
+            false,
+        )
+        .await?;
+    }
+    if peer.remote_version().version >= FEEFILTER_VERSION {
+        let fee_filter = source.fee_filter_sat_kvb().map_err(InboundError::Data)?;
+        let fee_filter = i64::try_from(fee_filter).unwrap_or(i64::MAX);
+        send_accounted(
+            &mut peer,
+            NetworkMessage::FeeFilter(fee_filter),
+            &upload,
+            false,
+        )
+        .await?;
+    }
     let mut request_budget = RequestBudget::new(limits.max_requests_per_minute);
     let mut requested_transactions = HashSet::new();
     loop {
@@ -376,9 +462,9 @@ async fn send_accounted(
     peer: &mut InboundPeerSession<TcpStream>,
     message: NetworkMessage,
     upload: &UploadBudget,
-    recent_block: bool,
+    historical_block: bool,
 ) -> Result<(), InboundError> {
-    upload.charge(serialize(&message).len(), recent_block)?;
+    upload.charge(serialize(&message).len(), historical_block)?;
     peer.send_message(message).await?;
     Ok(())
 }
@@ -417,6 +503,7 @@ async fn route_message(
                 .collect();
             send_accounted(peer, NetworkMessage::Inv(inventory), upload, false).await
         }
+        NetworkMessage::GetAddr => serve_addresses(peer, source, upload).await,
         NetworkMessage::GetData(requests) => serve_getdata(peer, requests, source, upload).await,
         NetworkMessage::Inv(inventory) => {
             let mut requests = Vec::new();
@@ -503,7 +590,7 @@ async fn route_message(
                     },
                 }),
                 upload,
-                is_recent_block(source, hash)?,
+                !is_recent_block(source, hash)?,
             )
             .await
         }
@@ -517,6 +604,29 @@ async fn route_message(
         NetworkMessage::Version(_) => Err(InboundError::Protocol(P2pError::PostHandshakeVersion)),
         _ => Ok(()),
     }
+}
+
+async fn serve_addresses(
+    peer: &mut InboundPeerSession<TcpStream>,
+    source: &dyn InboundDataSource,
+    upload: &UploadBudget,
+) -> Result<(), InboundError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| InboundError::Data(format!("system clock: {error}")))?
+        .as_secs();
+    let now = u32::try_from(now).unwrap_or(u32::MAX);
+    let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let mut seen = HashSet::new();
+    let addresses = source
+        .addresses()
+        .map_err(InboundError::Data)?
+        .into_iter()
+        .filter(|address| address.port() != 0 && seen.insert(*address))
+        .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
+        .map(|address| (now, Address::new(&address, services)))
+        .collect();
+    send_accounted(peer, NetworkMessage::Addr(addresses), upload, false).await
 }
 
 fn headers_after_locator(
@@ -574,7 +684,7 @@ async fn serve_getdata(
                         peer,
                         NetworkMessage::Block(block),
                         upload,
-                        is_recent_block(source, hash)?,
+                        !is_recent_block(source, hash)?,
                     )
                     .await?;
                 } else {
@@ -600,7 +710,7 @@ async fn serve_getdata(
                             compact_block: compact,
                         }),
                         upload,
-                        is_recent_block(source, hash)?,
+                        !is_recent_block(source, hash)?,
                     )
                     .await?;
                 } else {
@@ -862,6 +972,14 @@ mod tests {
         fn basic_filter(&self, _height: u32) -> Result<Option<InboundBasicFilter>, String> {
             Ok(None)
         }
+
+        fn addresses(&self) -> Result<Vec<SocketAddr>, String> {
+            Ok(vec!["1.2.3.4:8333".parse().unwrap()])
+        }
+
+        fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
+            Ok(2_345)
+        }
     }
 
     #[test]
@@ -874,20 +992,22 @@ mod tests {
                 .is_empty()
         );
         let upload = UploadBudget::new(1);
-        assert!(upload.charge(2, false).is_err());
-        assert!(upload.charge(usize::MAX, true).is_ok());
+        assert!(upload.charge(2, true).is_err());
+        assert!(upload.charge(usize::MAX, false).is_ok());
         assert!(is_recent_block(&source, hash).unwrap());
     }
 
     #[test]
     fn per_ip_admission_and_request_work_are_bounded() {
-        let counts = Arc::new(Mutex::new(HashMap::new()));
-        let semaphore = Arc::new(Semaphore::new(2));
+        let ip_counts = Arc::new(Mutex::new(HashMap::new()));
+        let group_counts = Arc::new(Mutex::new(HashMap::new()));
+        let semaphore = Arc::new(Semaphore::new(4));
         let remote = "127.0.0.1:18444".parse().unwrap();
         let first = admit_ip(
             remote,
             1,
-            &counts,
+            &ip_counts,
+            &group_counts,
             Arc::clone(&semaphore).try_acquire_owned().unwrap(),
         )
         .unwrap();
@@ -895,18 +1015,50 @@ mod tests {
             admit_ip(
                 remote,
                 1,
-                &counts,
+                &ip_counts,
+                &group_counts,
                 Arc::clone(&semaphore).try_acquire_owned().unwrap()
             )
             .is_none()
         );
+        // A different address in the same IPv4 /16 cannot bypass the network
+        // group ceiling; a distinct /16 remains independently admissible.
+        assert!(
+            admit_ip(
+                "127.0.0.2:18444".parse().unwrap(),
+                1,
+                &ip_counts,
+                &group_counts,
+                Arc::clone(&semaphore).try_acquire_owned().unwrap()
+            )
+            .is_none()
+        );
+        let other_group = admit_ip(
+            "126.1.0.2:18444".parse().unwrap(),
+            1,
+            &ip_counts,
+            &group_counts,
+            Arc::clone(&semaphore).try_acquire_owned().unwrap(),
+        )
+        .unwrap();
         drop(first);
         assert_eq!(
-            counts
+            ip_counts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&remote.ip()),
             None
+        );
+        drop(other_group);
+        assert!(
+            group_counts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(
+            network_group("::ffff:1.2.3.4".parse().unwrap()),
+            network_group("1.2.3.4".parse().unwrap())
         );
 
         let mut budget = RequestBudget::new(2);
@@ -945,6 +1097,11 @@ mod tests {
                 .services
                 .has(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS)
         );
+        peer.request_addresses().await.unwrap();
+        let addresses = peer.receive_addresses().await.unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].socket, "1.2.3.4:8333".parse().unwrap());
+        assert_eq!(peer.fee_filter_sat_kvb(), 2_345);
         peer.request_blocks(&[hash]).await.unwrap();
         let block = peer.receive_requested_block(hash).await.unwrap();
         assert_eq!(block.block_hash(), hash);

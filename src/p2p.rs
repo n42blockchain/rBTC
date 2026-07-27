@@ -54,7 +54,8 @@ const SENDCMPCT_VERSION: u32 = 70_014;
 const MEMPOOL_VERSION: u32 = 60_002;
 const COMPACT_BLOCK_VERSION: u64 = 2;
 const ADDRESS_RELAY_VERSION: u32 = 70_016;
-const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
+/// Bitcoin Core's maximum `addr`/`addrv2` entries accepted in one message.
+pub const MAX_ADDRESSES_PER_MESSAGE: usize = 1_000;
 /// Maximum inventory entries accepted in `inv`, `getdata`, or `notfound`.
 pub const MAX_INVENTORY_ENTRIES: usize = MAX_INV_SIZE;
 /// Maximum headers permitted in one protocol `headers` response.

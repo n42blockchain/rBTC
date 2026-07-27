@@ -628,7 +628,7 @@ pub struct NodeInboundConfig {
     pub listen: SocketAddr,
     /// Maximum concurrent inbound handshakes and established peers.
     pub max_connections: usize,
-    /// Maximum concurrent inbound sockets from one IP address.
+    /// Maximum concurrent inbound sockets from one IP or source network group.
     pub max_connections_per_ip: usize,
     /// Rolling 24-hour historical upload target; zero means unlimited.
     pub max_upload_bytes_per_day: u64,
@@ -3356,6 +3356,7 @@ struct NodeInboundSource {
 #[derive(Default)]
 struct SharedInboundSource {
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
+    peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
 }
 
 impl SharedInboundSource {
@@ -3377,6 +3378,13 @@ impl SharedInboundSource {
             shared: Arc::clone(self),
             source,
         }
+    }
+
+    fn install_peer_store(&self, peer_store: Option<Arc<RedbPeerStore>>) {
+        *self
+            .peer_store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = peer_store;
     }
 }
 
@@ -3432,6 +3440,25 @@ impl InboundDataSource for SharedInboundSource {
 
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
         self.current()?.basic_filter(height)
+    }
+
+    fn addresses(&self) -> Result<Vec<SocketAddr>, String> {
+        let peer_store = self
+            .peer_store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone);
+        let Some(peer_store) = peer_store else {
+            return Ok(Vec::new());
+        };
+        peer_store
+            .candidates(unix_time()?, rbtc::p2p::MAX_ADDRESSES_PER_MESSAGE)
+            .map_err(|error| error.to_string())
+    }
+
+    fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
+        self.current()?.fee_filter_sat_kvb()
     }
 }
 
@@ -3598,6 +3625,14 @@ impl InboundDataSource for NodeInboundSource {
                     filter_header: record.filter_header,
                 })
             })
+    }
+
+    fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
+        Ok(self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rolling_minimum_fee_sat_kvb(unix_time()?))
     }
 }
 
@@ -6119,6 +6154,9 @@ async fn run_peer_pool(
     } else {
         None
     };
+    if let Some(source) = &inbound_source {
+        source.install_peer_store(peer_store.as_ref().map(Arc::clone));
+    }
     let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
     let mut remotes = options.remotes.clone();
     if let Some(store) = &peer_store {
