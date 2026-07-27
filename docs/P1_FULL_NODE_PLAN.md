@@ -134,7 +134,7 @@ leases a new reconciled read view without rebinding. The independent
 AssumeUTXO validator explicitly disables listening. The basic-filter schema
 was advanced because the original index omitted the genesis filter and
 therefore chained height 1 from the wrong predecessor. P1.2 remains open for
-adaptive eviction/preference, routability advertisement controls,
+preferred/manual inbound roles, routability advertisement controls,
 and recorded Core 31/btcd interoperability evidence.
 
 The observable-accounting portion is now complete. The status API and
@@ -143,7 +143,12 @@ request work, and per-peer upload; Prometheus exposes bounded-cardinality
 listener admission, rejection, disconnect-reason, active-session, and rolling
 historical-upload counters. A real TCP lifecycle test proves that disconnect
 and listener cancellation cannot leave a stale peer consuming observable
-capacity. Adaptive eviction/preference, explicit routability advertisement,
+capacity. At the hard global ceiling, admission now replaces a low-work,
+newly connected peer only when the new source adds a network group: completed
+handshakes and useful request/upload work are protected, duplicate groups are
+selected first, same-group arrivals cannot churn incumbents, cancellation is
+reaped before the replacement receives its semaphore permit, and the eviction
+counter is exported. Preferred/manual inbound roles, explicit routability advertisement,
 and recorded Core 31/btcd interoperability remain. Validated mempool and wallet
 relay events now also feed every accepted inbound session through the same
 bounded broadcast ring. Each session negotiates txid/wtxid inventory, applies

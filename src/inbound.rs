@@ -121,6 +121,8 @@ pub struct InboundStatsSnapshot {
     pub rejected_source_total: u64,
     /// Sessions which completed or failed after admission.
     pub completed_total: u64,
+    /// Low-value sessions replaced to improve source-network diversity.
+    pub evicted_total: u64,
     /// Sessions closed because their request-work budget was exhausted.
     pub request_budget_disconnects: u64,
     /// Sessions closed because the historical upload target was exhausted.
@@ -146,6 +148,7 @@ pub struct InboundStatsSnapshot {
 #[derive(Debug)]
 struct LiveInboundPeer {
     address: SocketAddr,
+    group: NetworkGroup,
     connected: Instant,
     handshake_complete: bool,
     protocol_version: Option<u32>,
@@ -162,6 +165,7 @@ struct InboundStatsState {
     rejected_capacity_total: u64,
     rejected_source_total: u64,
     completed_total: u64,
+    evicted_total: u64,
     request_budget_disconnects: u64,
     upload_target_disconnects: u64,
     protocol_disconnects: u64,
@@ -181,6 +185,7 @@ impl Default for InboundStatsState {
             rejected_capacity_total: 0,
             rejected_source_total: 0,
             completed_total: 0,
+            evicted_total: 0,
             request_budget_disconnects: 0,
             upload_target_disconnects: 0,
             protocol_disconnects: 0,
@@ -242,6 +247,7 @@ impl InboundStats {
             rejected_capacity_total: state.rejected_capacity_total,
             rejected_source_total: state.rejected_source_total,
             completed_total: state.completed_total,
+            evicted_total: state.evicted_total,
             request_budget_disconnects: state.request_budget_disconnects,
             upload_target_disconnects: state.upload_target_disconnects,
             protocol_disconnects: state.protocol_disconnects,
@@ -283,6 +289,7 @@ impl InboundStats {
             id,
             LiveInboundPeer {
                 address,
+                group: network_group(address.ip()),
                 connected: Instant::now(),
                 handshake_complete: false,
                 protocol_version: None,
@@ -296,6 +303,41 @@ impl InboundStats {
             id,
             stats: Arc::clone(self),
         }
+    }
+
+    fn eviction_candidate(&self, incoming: SocketAddr) -> Option<u64> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let incoming_group = network_group(incoming.ip());
+        if state
+            .peers
+            .values()
+            .any(|peer| peer.group == incoming_group)
+        {
+            return None;
+        }
+        let mut group_counts = HashMap::new();
+        for peer in state.peers.values() {
+            *group_counts.entry(peer.group).or_insert(0_usize) += 1;
+        }
+        state
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                !peer.handshake_complete
+                    || group_counts.get(&peer.group).copied().unwrap_or_default() > 1
+            })
+            .min_by_key(|(_, peer)| {
+                (
+                    peer.handshake_complete,
+                    peer.requests,
+                    peer.uploaded_bytes,
+                    peer.connected.elapsed(),
+                )
+            })
+            .map(|(id, _)| *id)
     }
 }
 
@@ -382,6 +424,9 @@ impl InboundPeerAccount {
             Some(InboundError::Data(_)) => {
                 state.data_disconnects = state.data_disconnects.saturating_add(1);
             }
+            Some(InboundError::Evicted) => {
+                state.evicted_total = state.evicted_total.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -446,6 +491,9 @@ pub enum InboundError {
     /// A request was structurally valid but exceeded the service work bound.
     #[error("inbound request exceeds service bound: {0}")]
     RequestBound(&'static str),
+    /// A new source network replaced this low-value session at hard capacity.
+    #[error("inbound peer evicted for network-group diversity")]
+    Evicted,
 }
 
 #[derive(Debug)]
@@ -610,6 +658,53 @@ fn admit_ip(
     })
 }
 
+fn source_at_limit(
+    remote: SocketAddr,
+    limit: usize,
+    ip_counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
+    group_counts: &Arc<Mutex<HashMap<NetworkGroup, usize>>>,
+) -> bool {
+    let ips = ip_counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let groups = group_counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ips.get(&remote.ip()).copied().unwrap_or_default() >= limit
+        || groups
+            .get(&network_group(remote.ip()))
+            .copied()
+            .unwrap_or_default()
+            >= limit
+}
+
+async fn acquire_global_slot(
+    global: &Arc<Semaphore>,
+    peers: &mut JoinSet<u64>,
+    cancellations: &mut HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    stats: &InboundStats,
+    remote: SocketAddr,
+) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = Arc::clone(global).try_acquire_owned() {
+        return Some(permit);
+    }
+    let candidate = stats.eviction_candidate(remote)?;
+    let cancel = cancellations.remove(&candidate)?;
+    let _ = cancel.send(());
+    loop {
+        if let Ok(permit) = Arc::clone(global).try_acquire_owned() {
+            return Some(permit);
+        }
+        match peers.join_next().await {
+            Some(Ok(id)) => {
+                cancellations.remove(&id);
+            }
+            Some(Err(_)) => {}
+            None => return None,
+        }
+    }
+}
+
 /// Runs one bounded listener until the task is cancelled or the listener fails.
 ///
 /// Individual malformed, idle, over-budget, or disconnected peers are isolated
@@ -681,11 +776,28 @@ pub async fn run_listener_with_stats_and_relay(
     let per_group = Arc::new(Mutex::new(HashMap::new()));
     let upload = Arc::new(UploadBudget::new(limits.max_upload_bytes_per_day));
     let mut peers = JoinSet::new();
+    let mut cancellations: HashMap<u64, tokio::sync::oneshot::Sender<()>> = HashMap::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, remote) = accepted?;
-                let Ok(global_permit) = Arc::clone(&global).try_acquire_owned() else {
+                if source_at_limit(
+                    remote,
+                    limits.max_connections_per_ip,
+                    &per_ip,
+                    &per_group,
+                ) {
+                    stats.reject_source();
+                    drop(stream);
+                    continue;
+                }
+                let Some(global_permit) = acquire_global_slot(
+                    &global,
+                    &mut peers,
+                    &mut cancellations,
+                    stats.as_ref(),
+                    remote,
+                ).await else {
                     stats.reject_capacity();
                     drop(stream);
                     continue;
@@ -708,26 +820,33 @@ pub async fn run_listener_with_stats_and_relay(
                 let upload = Arc::clone(&upload);
                 let user_agent = user_agent.clone();
                 let relay = transaction_relay.as_ref().map(broadcast::Sender::subscribe);
+                let id = account.id;
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 peers.spawn(async move {
                     let _admission = admission;
-                    let result = serve_peer(
-                        stream,
-                        magic,
-                        local_nonce,
-                        user_agent,
-                        services,
-                        limits,
-                        source,
-                        upload,
-                        relay,
-                        &account,
-                    )
-                    .await;
-                    account.finish(result.as_ref().err());
+                    tokio::select! {
+                        result = serve_peer(
+                            stream,
+                            magic,
+                            local_nonce,
+                            user_agent,
+                            services,
+                            limits,
+                            source,
+                            upload,
+                            relay,
+                            &account,
+                        ) => account.finish(result.as_ref().err()),
+                        _ = cancelled => account.finish(Some(&InboundError::Evicted)),
+                    }
+                    id
                 });
+                cancellations.insert(id, cancel);
             }
             completed = peers.join_next(), if !peers.is_empty() => {
-                let _ = completed;
+                if let Some(Ok(id)) = completed {
+                    cancellations.remove(&id);
+                }
             }
         }
     }
@@ -1603,6 +1722,36 @@ mod tests {
         budget.charge().unwrap();
         budget.charge().unwrap();
         assert!(matches!(budget.charge(), Err(InboundError::RequestBudget)));
+    }
+
+    #[test]
+    fn adaptive_eviction_improves_network_diversity_without_churn() {
+        let stats = Arc::new(InboundStats::new(0));
+        let useful = stats.accept("10.1.0.1:8333".parse().unwrap());
+        useful.handshake(70_016, "/useful/".to_owned());
+        useful.request();
+        useful.upload(1_000, false);
+        let duplicate = stats.accept("10.1.1.1:8333".parse().unwrap());
+        duplicate.handshake(70_016, "/duplicate/".to_owned());
+        let unique = stats.accept("11.1.0.1:8333".parse().unwrap());
+        unique.handshake(70_016, "/unique/".to_owned());
+
+        assert_eq!(
+            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap()),
+            Some(duplicate.id)
+        );
+        assert_eq!(
+            stats.eviction_candidate("10.1.2.1:8333".parse().unwrap()),
+            None
+        );
+        duplicate.finish(Some(&InboundError::Evicted));
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.evicted_total, 1);
+        assert_eq!(snapshot.active, 2);
+        assert_eq!(
+            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap()),
+            None
+        );
     }
 
     #[test]

@@ -433,10 +433,15 @@ unlimited historical upload. Pruned nodes advertise `NETWORK_LIMITED`, never
 `NETWORK`, and answer block requests only from the verified freezer suffix.
 The listener remains bound across active outbound-peer failover, but refuses
 new handshakes while no reconciled execution view is installed.
-When the local API is enabled, `/api/v1/status`, `getnetworkinfo`,
+At the hard inbound connection ceiling, a new socket can replace an
+unhandshaked or low-work peer only when it contributes a previously absent
+IPv4 `/16` or IPv6 `/32` network group. Duplicate groups are selected first,
+same-group arrivals cannot churn incumbents, and the old task is fully reaped
+before its permit is transferred, so the configured hard bound is never
+exceeded. When the local API is enabled, `/api/v1/status`, `getnetworkinfo`,
 `getpeerinfo`, and `/metrics` report live inbound handshakes, per-peer request
 and upload accounting, admission rejection reasons, bounded disconnect
-reasons, and the current 24-hour historical-block upload usage. Prometheus
+reasons, adaptive evictions, and the current 24-hour historical-block upload usage. Prometheus
 keeps these metrics aggregate to avoid peer-address label cardinality.
 
 Each launch exclusively locks the owner-only `DATA_DIR/.rbtc.lock` before
