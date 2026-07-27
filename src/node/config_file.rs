@@ -25,7 +25,7 @@ const BOOL_KEYS: [&str; 5] = [
     "once",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 21] = [
+const VALUE_KEYS: [&str; 25] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -35,6 +35,10 @@ const VALUE_KEYS: [&str; 21] = [
     "complete_assumeutxo",
     "data_dir",
     "explorer_listen",
+    "log_dir",
+    "log_level",
+    "log_max_bytes",
+    "log_max_files",
     "minimum_chainwork",
     "mempool_max_bytes",
     "mempool_max_transactions",
@@ -333,6 +337,10 @@ fn flag_for_key(key: &str) -> &'static str {
         "data_dir" => "--data-dir",
         "dns_seed" => "--dns-seed",
         "explorer_listen" => "--explorer-listen",
+        "log_dir" => "--log-dir",
+        "log_level" => "--log-level",
+        "log_max_bytes" => "--log-max-bytes",
+        "log_max_files" => "--log-max-files",
         "minimum_chainwork" => "--minimum-chainwork",
         "mempool_max_bytes" => "--mempool-max-bytes",
         "mempool_max_transactions" => "--mempool-max-transactions",
@@ -377,6 +385,10 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--dns-seed"
             | "--dns-seeds"
             | "--explorer-listen"
+            | "--log-dir"
+            | "--log-level"
+            | "--log-max-bytes"
+            | "--log-max-files"
             | "--mempool-full-rbf"
             | "--mempool-max-bytes"
             | "--mempool-max-transactions"
@@ -421,6 +433,10 @@ fn option_group(flag: &str) -> &'static str {
         "--connect" => "connect",
         "--data-dir" => "data-dir",
         "--explorer-listen" => "explorer-listen",
+        "--log-dir" => "log-dir",
+        "--log-level" => "log-level",
+        "--log-max-bytes" => "log-max-bytes",
+        "--log-max-files" => "log-max-files",
         "--minimum-chainwork" => "minimum-chainwork",
         "--mempool-max-bytes" => "mempool-max-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",

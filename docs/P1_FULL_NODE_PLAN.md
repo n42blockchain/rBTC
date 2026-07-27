@@ -93,8 +93,12 @@ cache/freezer/resource limits appear in the secret-free startup summary.
 Embedded subsystem status plus authenticated `getblockchaininfo`,
 `getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`, `getindexinfo`,
 `verifychain`, and delayed graceful `stop` complete the status/stop portion of
-item 4. Structured logging, runtime log-level control, disk forecasting, and
-upload/index budgets stay open.
+item 4. Standalone diagnostics are now newline-delimited JSON behind a bounded
+non-blocking queue, a fixed per-second limiter, owner-only size rotation, and
+authenticated `getloginfo`/`setloglevel`; embedded hosts retain typed
+status/event receivers and do not install the process-global sink. This
+completes item 3 and the remaining runtime-control portion of item 4. Disk
+forecasting and upload/index budgets stay open.
 
 ### P1.2 — inbound P2P service
 

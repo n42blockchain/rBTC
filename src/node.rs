@@ -94,6 +94,9 @@ use rbtc::{
     },
     core_snapshot::verify_core31_snapshot,
     deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
+    diagnostics::{
+        LogConfig, LogLevel, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MIN_LOG_FILE_BYTES, MIN_LOG_FILES,
+    },
     execution_store::RedbExecutionStore,
     explorer_store::RedbExplorerIndex,
     fee_estimator::{FeeEstimatorError, FeeTrack, RedbFeeEstimator},
@@ -107,6 +110,7 @@ use rbtc::{
         TransactionRelay, connect_outbound,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
+    rbtc_info, rbtc_warn,
     rebroadcast_store::RedbRebroadcastStore,
     snapshot::{SnapshotTrustAnchor, verify_snapshot_with_trust},
     snapshot_download::{
@@ -219,6 +223,7 @@ struct Options {
     ledger_retention: LedgerRetention,
     cache: NodeCacheConfig,
     resources: NodeResourceConfig,
+    logging: NodeLogConfig,
     runtime_control: Arc<RuntimeControl>,
     observer: Option<NodeObserver>,
 }
@@ -246,6 +251,8 @@ pub struct NodeConfig {
     pub cache: NodeCacheConfig,
     /// Peer and transaction-pool resource ceilings.
     pub resources: NodeResourceConfig,
+    /// Standalone structured logging policy; embedded hosts may consume events.
+    pub logging: NodeLogConfig,
     /// Bounded local freezer retention.
     pub storage: NodeStorageConfig,
     /// Optional loopback explorer/RPC/wallet services.
@@ -269,6 +276,7 @@ impl NodeConfig {
             mempool_full_rbf: false,
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             storage: NodeStorageConfig::default(),
             api: None,
             consensus: NodeConsensusConfig::default(),
@@ -375,6 +383,7 @@ impl NodeConfig {
             },
             cache: self.cache,
             resources: self.resources,
+            logging: self.logging,
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -501,6 +510,9 @@ pub struct NodeResourceConfig {
     /// Maximum witness-serialized mempool bytes.
     pub mempool_max_bytes: usize,
 }
+
+/// Standalone structured logging policy.
+pub type NodeLogConfig = LogConfig;
 
 impl Default for NodeResourceConfig {
     fn default() -> Self {
@@ -661,6 +673,13 @@ impl NodeBuilder {
     #[must_use]
     pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
         self.config.resources = resources;
+        self
+    }
+
+    /// Sets the standalone structured logging policy.
+    #[must_use]
+    pub fn logging(mut self, logging: NodeLogConfig) -> Self {
+        self.config.logging = logging;
         self
     }
 
@@ -850,6 +869,24 @@ fn validate_storage_options(options: &Options) -> Result<(), String> {
         return Err(format!(
             "mempool byte target must be between {MAX_ADMITTED_TRANSACTION_BYTES} and {MAX_CONFIGURED_MEMPOOL_BYTES}"
         ));
+    }
+    if !(MIN_LOG_FILE_BYTES..=MAX_LOG_FILE_BYTES).contains(&options.logging.max_file_bytes) {
+        return Err(format!(
+            "log file size must be between {MIN_LOG_FILE_BYTES} and {MAX_LOG_FILE_BYTES} bytes"
+        ));
+    }
+    if !(MIN_LOG_FILES..=MAX_LOG_FILES).contains(&options.logging.max_files) {
+        return Err(format!(
+            "log file count must be between {MIN_LOG_FILES} and {MAX_LOG_FILES}"
+        ));
+    }
+    if options
+        .logging
+        .directory
+        .as_ref()
+        .is_some_and(|directory| directory.as_os_str().is_empty())
+    {
+        return Err("log directory must not be empty".to_owned());
     }
     Ok(())
 }
@@ -1670,6 +1707,8 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "getmempoolinfo",
     "getindexinfo",
     "verifychain",
+    "getloginfo",
+    "setloglevel",
     "stop",
 ];
 
@@ -1678,6 +1717,7 @@ impl LocalRpcOperator for NodeRpcOperator {
         NODE_OPERATOR_RPC_METHODS
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute(
         &self,
         method: &str,
@@ -1685,6 +1725,19 @@ impl LocalRpcOperator for NodeRpcOperator {
     ) -> Option<Result<serde_json::Value, LocalRpcOperatorError>> {
         if !NODE_OPERATOR_RPC_METHODS.contains(&method) {
             return None;
+        }
+        if method == "setloglevel" {
+            let level = rpc_one_log_level(params);
+            return Some(level.and_then(|level| {
+                if !rbtc::diagnostics::is_installed() {
+                    return Err(LocalRpcOperatorError {
+                        code: -32010,
+                        message: "Runtime logging is host managed",
+                    });
+                }
+                rbtc::diagnostics::set_level(level);
+                Ok(serde_json::json!({"level": level.as_str()}))
+            }));
         }
         if !rpc_has_no_params(params) {
             return Some(Err(LocalRpcOperatorError {
@@ -1757,6 +1810,12 @@ impl LocalRpcOperator for NodeRpcOperator {
                 })),
             }),
             "verifychain" => serde_json::Value::Bool(status_consistent(&status)),
+            "getloginfo" => serde_json::json!({
+                "level": rbtc::diagnostics::level().as_str(),
+                "dropped_records": rbtc::diagnostics::dropped_records(),
+                "write_errors": rbtc::diagnostics::write_errors(),
+                "host_managed": !rbtc::diagnostics::is_installed(),
+            }),
             "stop" => {
                 let runtime_control = Arc::clone(&self.runtime_control);
                 tokio::spawn(async move {
@@ -1772,6 +1831,26 @@ impl LocalRpcOperator for NodeRpcOperator {
 
 fn rpc_has_no_params(params: &serde_json::Value) -> bool {
     params.is_null() || params.as_array().is_some_and(Vec::is_empty)
+}
+
+fn rpc_one_log_level(params: &serde_json::Value) -> Result<LogLevel, LocalRpcOperatorError> {
+    let values = params.as_array().ok_or(LocalRpcOperatorError {
+        code: -32602,
+        message: "Invalid params",
+    })?;
+    if values.len() != 1 {
+        return Err(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        });
+    }
+    values[0]
+        .as_str()
+        .and_then(LogLevel::parse)
+        .ok_or(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        })
 }
 
 fn verification_progress(execution: u32, headers: u32) -> f64 {
@@ -2062,8 +2141,10 @@ async fn node_metrics(
         .height
         .saturating_sub(status.explorer.height);
     let utxo_total = status.utxo_hot.saturating_add(status.utxo_cold);
+    let dropped_logs = rbtc::diagnostics::dropped_records();
+    let log_write_errors = rbtc::diagnostics::write_errors();
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -2174,7 +2255,7 @@ impl ApiServer {
         if let Some(status) = background_validation {
             router = router.merge(validation_status_router(status.clone()));
         }
-        println!("embedded API listening on http://{bound}");
+        rbtc_info!("embedded API listening on http://{bound}");
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
                 .await
@@ -2407,6 +2488,7 @@ impl CliError {
 pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliError> {
     match parse_options(arguments) {
         Ok(Some(options)) => {
+            rbtc::diagnostics::install(&options.logging).map_err(CliError::runtime)?;
             // Keep signal collection on an independent runtime task. The
             // validating future performs bounded synchronous execution work;
             // if signal polling shares that same task, the OS notification can
@@ -2430,7 +2512,7 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                             &runtime_control.checkpoints_in_flight,
                         )
                         .await;
-                        eprintln!("rbtcd: shutdown signal received; closing durable stores");
+                        rbtc_warn!("rbtcd: shutdown signal received; closing durable stores");
                     }
                     signal
                 },
@@ -2440,10 +2522,11 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                         &runtime_control.checkpoints_in_flight,
                     )
                     .await;
-                    eprintln!("rbtcd: authenticated shutdown requested; closing durable stores");
+                    rbtc_warn!("rbtcd: authenticated shutdown requested; closing durable stores");
                     Ok(())
                 },
             };
+            rbtc::diagnostics::flush();
             result.map_err(CliError::runtime)
         }
         Ok(None) => {
@@ -2561,7 +2644,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 "wallet initialization failed; verify descriptors, network, database, and file permissions"
                     .to_owned()
             })?;
-            println!(
+            rbtc_info!(
                 "authenticated watch-only wallet API enabled; token file {}",
                 files.auth_token.display()
             );
@@ -2610,7 +2693,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 },
                 |wallet| Ok(wallet.audit.clone()),
             )?;
-            println!(
+            rbtc_info!(
                 "authenticated read-only JSON-RPC enabled; token file {}",
                 token_path.display()
             );
@@ -2645,7 +2728,7 @@ async fn watch_local_auth_token(path: PathBuf, token: LocalAuthToken, surface: &
         });
         match result {
             Ok(()) if !enabled => {
-                eprintln!(
+                rbtc_warn!(
                     "{surface} authentication token restored from owner-only file {}",
                     path.display()
                 );
@@ -2654,7 +2737,7 @@ async fn watch_local_auth_token(path: PathBuf, token: LocalAuthToken, surface: &
             Ok(()) => {}
             Err(error) if enabled => {
                 token.invalidate();
-                eprintln!("{surface} authentication disabled until token file is valid: {error}");
+                rbtc_warn!("{surface} authentication disabled until token file is valid: {error}");
                 enabled = false;
             }
             Err(_) => {
@@ -2714,17 +2797,17 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         return Ok(());
     }
     if options.network_execution.is_experimental() {
-        eprintln!(
+        rbtc_warn!(
             "WARNING: experimental {} block execution is enabled for validation only; \
              this build is not a production full node and must not be trusted with funds",
             options.network
         );
     }
     if options.data_dir.is_some() {
-        println!("{}", startup_configuration_summary(&options));
+        rbtc_info!("{}", startup_configuration_summary(&options));
     }
     if options.mempool_full_rbf {
-        println!("peer transaction admission full-RBF policy enabled");
+        rbtc_info!("peer transaction admission full-RBF policy enabled");
     }
     if let Some(data_dir) = &options.data_dir {
         preflight_data_dir(
@@ -2775,7 +2858,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         "none"
     };
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -2793,6 +2876,9 @@ fn startup_configuration_summary(options: &Options) -> String {
         options.cache.bulk_validation_bytes,
         options.ledger_retention.max_blocks,
         options.ledger_retention.max_bytes,
+        options.logging.level.as_str(),
+        options.logging.max_file_bytes,
+        options.logging.max_files,
         validation,
         options.validation_limits.max_blocks_per_batch,
         options.validation_limits.pause_between_batches.as_millis(),
@@ -3102,7 +3188,7 @@ async fn run_peer_pool(
             .prune_terrible(now)
             .map_err(|error| error.to_string())?;
         if pruned > 0 {
-            println!("pruned {pruned} terrible persisted peer entries before selection");
+            rbtc_info!("pruned {pruned} terrible persisted peer entries before selection");
         }
         for collision in store
             .tried_collisions()
@@ -3163,10 +3249,10 @@ async fn run_peer_pool(
         let (resolved, resolution_failures, rejected) =
             resolve_dns_candidates(options.network, &seeds, &dns_excluded, remaining).await;
         for failure in resolution_failures {
-            eprintln!("DNS seed failed: {failure}");
+            rbtc_warn!("DNS seed failed: {failure}");
         }
         if !resolved.is_empty() || rejected > 0 {
-            println!(
+            rbtc_info!(
                 "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
                 resolved.len()
             );
@@ -3251,9 +3337,10 @@ async fn run_background_assumeutxo(
     validation_options.validation_target = Some(target);
     validation_options.observer = None;
 
-    println!(
+    rbtc_info!(
         "starting active-chain service and independent genesis validation concurrently through {}:{}",
-        assumed.base.height, assumed.base.hash
+        assumed.base.height,
+        assumed.base.hash
     );
     let validation_status = status.clone();
     let validation = tokio::spawn(async move {
@@ -3414,9 +3501,12 @@ fn activate_rbtc_assumed_snapshot(
             )
         })
         .map_err(|error| error.to_string())?;
-    println!(
+    rbtc_info!(
         "activated assumed UTXO snapshot at {}:{} with {} entries/{} canonical bytes; background genesis validation remains required",
-        manifest.height, manifest.block_hash, manifest.utxo_count, manifest.records_bytes
+        manifest.height,
+        manifest.block_hash,
+        manifest.utxo_count,
+        manifest.records_bytes
     );
     Ok(())
 }
@@ -3443,9 +3533,12 @@ fn activate_core_assumed_snapshot(
     let metadata = verified
         .assume_into(&chainstate, &headers, DEFAULT_HOT_WINDOW_SECS)
         .map_err(|error| error.to_string())?;
-    println!(
+    rbtc_info!(
         "activated Bitcoin Core 31 assumed UTXO snapshot at {}:{} with {} entries and chain transaction count {}; background genesis validation remains required",
-        anchor.height, metadata.base_block_hash, metadata.coins_count, anchor.chain_tx_count
+        anchor.height,
+        metadata.base_block_hash,
+        metadata.coins_count,
+        anchor.chain_tx_count
     );
     Ok(())
 }
@@ -3531,16 +3624,19 @@ fn finalize_assumed_snapshot_with(
         .materialize_validation_deltas()
         .map_err(|error| error.to_string())?;
     if materialized > 0 {
-        println!(
+        rbtc_info!(
             "materialized {materialized} net active-chain UTXO updates before AssumeUTXO finalization"
         );
     }
     let finalized = active
         .finalize_assumed_snapshot(&validation, headers)
         .map_err(|error| error.to_string())?;
-    println!(
+    rbtc_info!(
         "independent genesis validation matched assumed UTXO snapshot at {}:{} ({} entries/{} canonical bytes); assumed-state marker cleared",
-        finalized.base.height, finalized.base.hash, finalized.utxo_count, finalized.records_bytes
+        finalized.base.height,
+        finalized.base.hash,
+        finalized.utxo_count,
+        finalized.records_bytes
     );
     Ok(())
 }
@@ -3588,7 +3684,9 @@ fn poll_background_validation(
                 }
             }
             status.set(BackgroundValidationState::Finalized);
-            println!("background genesis validation finalized while the active node remained live");
+            rbtc_info!(
+                "background genesis validation finalized while the active node remained live"
+            );
             Ok(())
         }
     }
@@ -3865,7 +3963,7 @@ fn quarantine_and_remove_validation_dir_with_sync(
     })?;
     sync_parent(parent)
         .map_err(|error| format!("sync removed validation directory parent: {error}"))?;
-    println!(
+    rbtc_info!(
         "removed completed validation directory {} after owner and target revalidation; recovery is no longer possible",
         validation_dir.display()
     );
@@ -4069,9 +4167,12 @@ async fn connect_peer(
     let remote_version = session.remote_version();
     let remote_services = remote_version.services;
     let handshake_millis = elapsed_ms(handshake_started);
-    println!(
+    rbtc_info!(
         "connected to {}: version={}, height={}, agent={}",
-        remote, remote_version.version, remote_version.start_height, remote_version.user_agent
+        remote,
+        remote_version.version,
+        remote_version.start_height,
+        remote_version.user_agent
     );
     negotiate_peer_preferences(&mut session).await?;
 
@@ -4375,12 +4476,12 @@ async fn activate_next_auxiliary_peer(
     while let Some((remote, pending)) = candidates.pop_front() {
         match activate_pending_peer(pending).await {
             Ok(connected) => {
-                println!("activated auxiliary block-download peer {remote}");
+                rbtc_info!("activated auxiliary block-download peer {remote}");
                 *session = Some(connected.session);
                 return;
             }
             Err(error) => {
-                eprintln!("auxiliary block-download peer {remote} failed activation: {error}");
+                rbtc_warn!("auxiliary block-download peer {remote} failed activation: {error}");
             }
         }
     }
@@ -4434,7 +4535,7 @@ async fn evict_excess_ready_standbys(
         connection.task.abort();
         match connection.task.await {
             Err(error) if error.is_cancelled() => {
-                println!(
+                rbtc_info!(
                     "evicted standby peer {remote} under the {maximum_automatic}-peer automatic hot-standby capacity"
                 );
                 evicted.push(remote);
@@ -4449,7 +4550,7 @@ async fn evict_excess_ready_standbys(
                         PeerRunError::transient("peer standby exited before capacity eviction")
                     }
                 };
-                eprintln!("standby peer {remote} failed during capacity eviction: {error}");
+                rbtc_warn!("standby peer {remote} failed during capacity eviction: {error}");
                 record_peer_failure(
                     peer_store,
                     remote,
@@ -4484,7 +4585,7 @@ async fn reap_finished_standbys(
             Err(error) => PeerRunError::transient(format!("peer connection task failed: {error}")),
             Ok(Ok(_)) => PeerRunError::transient("peer standby exited before activation"),
         };
-        eprintln!("standby peer {remote} failed: {error}");
+        rbtc_warn!("standby peer {remote} failed: {error}");
         record_peer_failure(
             peer_store,
             remote,
@@ -4580,7 +4681,7 @@ async fn try_peer_candidates(
                 return true;
             }
             Err(error) => {
-                eprintln!("peer {remote} failed: {error}");
+                rbtc_warn!("peer {remote} failed: {error}");
                 record_peer_failure(
                     peer_store.map(Arc::as_ref),
                     remote,
@@ -4614,7 +4715,7 @@ async fn run_connected_peer(
     let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote);
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
-        println!("activated peer {remote} after standby validation through height {height}");
+        rbtc_info!("activated peer {remote} after standby validation through height {height}");
     }
     if let Some(hash) = options.fetch_block {
         fetch_requested_block(&mut session, hash).await?;
@@ -4674,7 +4775,7 @@ async fn run_connected_peer(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove_orphans_from(orphan_source);
         if removed_orphans > 0 {
-            println!(
+            rbtc_info!(
                 "removed {removed_orphans} orphan transaction{} after peer {remote} disconnected",
                 if removed_orphans == 1 { "" } else { "s" }
             );
@@ -4688,7 +4789,7 @@ async fn run_connected_peer(
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
-        println!(
+        rbtc_info!(
             "minimum chainwork reached at height {}; full script validation remains required",
             status.height
         );
@@ -4698,7 +4799,7 @@ async fn run_connected_peer(
     let genesis = bitcoin::blockdata::constants::genesis_block(options.network).block_hash();
     request_headers(&mut session, vec![genesis]).await?;
     let headers = receive_headers(&mut session).await?;
-    println!(
+    rbtc_info!(
         "received {} headers; pass --headers-db PATH to validate, persist, and continue IBD",
         headers.len()
     );
@@ -4725,7 +4826,7 @@ async fn fetch_requested_block(
             ))
         })?
         .map_err(|error| PeerRunError::p2p(&error))?;
-    println!(
+    rbtc_info!(
         "received block {} ({} transactions); not applied: IBD chainstate integration is pending",
         block.block_hash(),
         block.txdata.len()
@@ -4804,12 +4905,12 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
     let now = match unix_time() {
         Ok(now) => now,
         Err(error) => {
-            eprintln!("peer attempt history for {remote} skipped: {error}");
+            rbtc_warn!("peer attempt history for {remote} skipped: {error}");
             return;
         }
     };
     if let Err(error) = store.record_attempt(remote, now) {
-        eprintln!("peer attempt history for {remote} failed: {error}");
+        rbtc_warn!("peer attempt history for {remote} failed: {error}");
     }
 }
 
@@ -4825,21 +4926,21 @@ fn record_peer_failure(
     let now = match unix_time() {
         Ok(now) => now,
         Err(error) => {
-            eprintln!("protocol cooldown for {remote} skipped: {error}");
+            rbtc_warn!("protocol cooldown for {remote} skipped: {error}");
             return;
         }
     };
     if let Err(error) = store.resolve_tried_collision_probe(remote, false, now) {
-        eprintln!("tried-collision failure resolution for {remote} failed: {error}");
+        rbtc_warn!("tried-collision failure resolution for {remote} failed: {error}");
     }
     if kind != PeerFailureKind::ProtocolViolation || manual {
         return;
     }
     match store.record_protocol_violation(remote, now) {
-        Ok(until) => println!(
+        Ok(until) => rbtc_info!(
             "discouraged peer {remote} after an objective protocol violation until Unix time {until}"
         ),
-        Err(error) => eprintln!("protocol cooldown for {remote} failed: {error}"),
+        Err(error) => rbtc_warn!("protocol cooldown for {remote} failed: {error}"),
     }
 }
 
@@ -4850,12 +4951,12 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr
     let now = match unix_time() {
         Ok(now) => now,
         Err(error) => {
-            eprintln!("peer session success for {remote} skipped: {error}");
+            rbtc_warn!("peer session success for {remote} skipped: {error}");
             return;
         }
     };
     if let Err(error) = store.record_session_success(remote, now) {
-        eprintln!("peer session success for {remote} failed: {error}");
+        rbtc_warn!("peer session success for {remote} failed: {error}");
     }
 }
 
@@ -4868,21 +4969,21 @@ fn record_verified_peer(
     let now = match unix_time() {
         Ok(now) => now,
         Err(error) => {
-            eprintln!("peer success history for {remote} skipped: {error}");
+            rbtc_warn!("peer success history for {remote} skipped: {error}");
             return;
         }
     };
     match store.insert_verified(remote, services, now) {
         Ok(true) => {
             if let Err(error) = store.record_handshake_latency(remote, handshake_millis) {
-                eprintln!("peer handshake latency persistence for {remote} failed: {error}");
+                rbtc_warn!("peer handshake latency persistence for {remote} failed: {error}");
             }
             if let Err(error) = store.resolve_tried_collision_probe(remote, true, now) {
-                eprintln!("tried-collision success resolution for {remote} failed: {error}");
+                rbtc_warn!("tried-collision success resolution for {remote} failed: {error}");
             }
         }
-        Ok(false) => eprintln!("verified peer {remote} was not eligible for persistence"),
-        Err(error) => eprintln!("verified peer persistence for {remote} failed: {error}"),
+        Ok(false) => rbtc_warn!("verified peer {remote} was not eligible for persistence"),
+        Err(error) => rbtc_warn!("verified peer persistence for {remote} failed: {error}"),
     }
 }
 
@@ -4899,7 +5000,7 @@ fn record_peer_block_throughput(
         return;
     };
     if let Err(error) = store.record_block_throughput(remote, bytes_per_second) {
-        eprintln!("peer block throughput persistence for {remote} failed: {error}");
+        rbtc_warn!("peer block throughput persistence for {remote} failed: {error}");
     }
 }
 
@@ -4932,21 +5033,22 @@ async fn discover_peer_addresses(
             let now = match unix_time() {
                 Ok(now) => now,
                 Err(error) => {
-                    eprintln!("peer address persistence from {source} skipped: {error}");
+                    rbtc_warn!("peer address persistence from {source} skipped: {error}");
                     return;
                 }
             };
             match store.insert_discovered(source, &addresses, now) {
-                Ok(stats) if stats.accepted > 0 => println!(
+                Ok(stats) if stats.accepted > 0 => rbtc_info!(
                     "persisted {} learned peer addresses from {source}; rejected {}",
-                    stats.accepted, stats.rejected
+                    stats.accepted,
+                    stats.rejected
                 ),
                 Ok(_) => {}
-                Err(error) => eprintln!("peer address persistence from {source} failed: {error}"),
+                Err(error) => rbtc_warn!("peer address persistence from {source} failed: {error}"),
             }
         }
-        Ok(Err(error)) => eprintln!("peer address discovery from {source} failed: {error}"),
-        Err(_) => eprintln!(
+        Ok(Err(error)) => rbtc_warn!("peer address discovery from {source} failed: {error}"),
+        Err(_) => rbtc_warn!(
             "peer address discovery from {source} timed out after {} seconds",
             PEER_DISCOVERY_TIMEOUT.as_secs()
         ),
@@ -4966,7 +5068,7 @@ async fn sync_headers(
             unix_time().map_err(PeerRunError::transient)?,
         )
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    println!(
+    rbtc_info!(
         "resuming headers-first sync from {}:{} (local-clock fallback until network-time aggregation lands)",
         dag.active_tip().height,
         dag.active_tip().hash
@@ -4991,7 +5093,7 @@ async fn sync_headers(
             .append_batch(unseen)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         dag = candidate;
-        println!(
+        rbtc_info!(
             "validated and persisted {} headers; active tip {}:{}",
             unseen.len(),
             dag.active_tip().height,
@@ -5001,7 +5103,7 @@ async fn sync_headers(
             break;
         }
     }
-    println!(
+    rbtc_info!(
         "peer returned no more headers at {}:{}",
         dag.active_tip().height,
         dag.active_tip().hash
@@ -5301,7 +5403,7 @@ fn reconcile_fee_estimator(
         match estimator.disconnect_tip(hash) {
             Ok(restored) => {
                 if restored > 0 {
-                    println!(
+                    rbtc_info!(
                         "restored {restored} fee observation{} after estimator-tip disconnection",
                         if restored == 1 { "" } else { "s" }
                     );
@@ -5311,9 +5413,10 @@ fn reconcile_fee_estimator(
                 estimator
                     .reset_tip(execution_tip.height, execution_tip.hash)
                     .map_err(|error| error.to_string())?;
-                println!(
+                rbtc_info!(
                     "reset fee-estimator history at {}:{} after a reorganization deeper than its retained journal",
-                    execution_tip.height, execution_tip.hash
+                    execution_tip.height,
+                    execution_tip.hash
                 );
                 return Ok(());
             }
@@ -5339,9 +5442,10 @@ fn reconcile_fee_estimator(
             estimator
                 .reset_tip(execution_tip.height, execution_tip.hash)
                 .map_err(|error| error.to_string())?;
-            println!(
+            rbtc_info!(
                 "initialized fee-estimator tip at {}:{} because retained blocks do not reach its prior tip",
-                execution_tip.height, execution_tip.hash
+                execution_tip.height,
+                execution_tip.hash
             );
             return Ok(());
         };
@@ -5364,7 +5468,7 @@ fn reconcile_fee_estimator(
             .connect_block(next_height, expected.hash, hash, &transaction_ids)
             .map_err(|error| error.to_string())?;
         if confirmed > 0 {
-            println!(
+            rbtc_info!(
                 "recorded {confirmed} confirmed fee observation{} at block {next_height}",
                 if confirmed == 1 { "" } else { "s" }
             );
@@ -5579,7 +5683,7 @@ async fn fetch_announced_peer_transactions(
     }
     let received = outcome.received_transactions;
     if received > 0 {
-        println!(
+        rbtc_info!(
             "downloaded {received} announced peer transaction{} for bounded admission",
             if received == 1 { "" } else { "s" }
         );
@@ -5865,7 +5969,7 @@ fn admit_pending_peer_transactions(
     }
     let expired_removed = expired_removed.max(expired_with_descendants.len());
     if expired_removed > 0 {
-        println!(
+        rbtc_info!(
             "expired {expired_removed} local mempool transaction{} or descendant{} after {} hours",
             if expired_removed == 1 { "" } else { "s" },
             if expired_removed == 1 { "" } else { "s" },
@@ -5873,24 +5977,24 @@ fn admit_pending_peer_transactions(
         );
     }
     if reconciled_removed > 0 {
-        println!(
+        rbtc_info!(
             "removed {reconciled_removed} local transactions after active-chain reconciliation"
         );
     }
     for message in accepted_messages {
-        println!("{message}");
+        rbtc_info!("{message}");
     }
     if expired_orphans > 0 {
-        println!(
+        rbtc_info!(
             "expired {expired_orphans} missing-parent transaction{} after 20 minutes",
             if expired_orphans == 1 { "" } else { "s" }
         );
     }
     for message in deferred_messages {
-        println!("{message}");
+        rbtc_info!("{message}");
     }
     for message in rejected_messages {
-        eprintln!("{message}");
+        rbtc_warn!("{message}");
     }
     Ok(PeerAdmissionProgress {
         more_orphan_work,
@@ -5981,7 +6085,7 @@ async fn sync_validating_node(
             }
         }
     };
-    println!(
+    rbtc_info!(
         "opened chainstate in {} ms",
         chainstate_open_started.elapsed().as_millis()
     );
@@ -6041,9 +6145,10 @@ async fn sync_validating_node(
         .map_err(|error| error.to_string())?;
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), ledger_retention)
         .map_err(|error| error.to_string())?;
-    println!(
+    rbtc_info!(
         "opened pruned ledger with targets max_blocks={} max_bytes={}",
-        ledger_retention.max_blocks, ledger_retention.max_bytes
+        ledger_retention.max_blocks,
+        ledger_retention.max_bytes
     );
     let explorer = api_runtime
         .map(|_| {
@@ -6085,9 +6190,10 @@ async fn sync_validating_node(
                 hash: target.block_hash,
             })
             .map_err(|error| error.to_string())?;
-        println!(
+        rbtc_info!(
             "extended completed validation target to {}:{}",
-            target.height, target.block_hash
+            target.height,
+            target.block_hash
         );
     }
     let mut disconnected_transactions = VecDeque::new();
@@ -6210,7 +6316,7 @@ async fn sync_validating_node(
                     }
                 }
                 None => {
-                    eprintln!(
+                    rbtc_warn!(
                         "retained stale block at height {} is unavailable; its transactions cannot be reconsidered",
                         tip.height
                     );
@@ -6239,9 +6345,10 @@ async fn sync_validating_node(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear_recent_confirmed_transactions();
-            println!(
+            rbtc_info!(
                 "disconnected stale execution tip; rewound to {}:{}",
-                rewound.height, rewound.hash
+                rewound.height,
+                rewound.hash
             );
         }
         if let Some(target) = validation_target {
@@ -6271,7 +6378,7 @@ async fn sync_validating_node(
         .await?;
         let startup_pruned = prune_expired_block_undos(&chainstate, &headers, &ledger)?;
         if startup_pruned > 0 {
-            println!(
+            rbtc_info!(
                 "pruned {startup_pruned} expired block undo record{} after ledger reconciliation",
                 if startup_pruned == 1 { "" } else { "s" }
             );
@@ -6409,15 +6516,16 @@ async fn sync_validating_node(
                             tip.height, tip.hash, target.height, target.block_hash
                         )));
                     }
-                    println!(
+                    rbtc_info!(
                         "independent genesis validation stopped exactly at {}:{}",
-                        tip.height, tip.hash
+                        tip.height,
+                        tip.hash
                     );
                     return Ok(());
                 }
             }
             if tip.height >= headers.active_tip().height {
-                println!("block execution caught up at height {}", tip.height);
+                rbtc_info!("block execution caught up at height {}", tip.height);
                 if let Some(estimator) = fee_estimator.as_ref() {
                     reconcile_fee_estimator(estimator, &headers, tip, &ledger)?;
                 }
@@ -6446,7 +6554,7 @@ async fn sync_validating_node(
                                 fetch_orphan_parent_transactions(session, progress.parent_requests)
                                     .await?;
                             if received > 0 {
-                                println!(
+                                rbtc_info!(
                                     "downloaded {received} missing orphan parent transaction{}",
                                     if received == 1 { "" } else { "s" }
                                 );
@@ -6469,14 +6577,14 @@ async fn sync_validating_node(
                             unix_time()?,
                         )?;
                         if relayed > 0 {
-                            println!(
+                            rbtc_info!(
                                 "republished {relayed} due peer transaction{} to hot standbys",
                                 if relayed == 1 { "" } else { "s" }
                             );
                         }
                     }
                     disconnected_transactions.clear();
-                    println!(
+                    rbtc_info!(
                         "minimum chainwork reached; full script validation remains enabled{}",
                         ibd_status
                             .active_assume_valid_height
@@ -6491,7 +6599,7 @@ async fn sync_validating_node(
                     if once {
                         return Err(PeerRunError::transient(error.to_string()));
                     }
-                    println!("remaining in IBD: {error}");
+                    rbtc_info!("remaining in IBD: {error}");
                 }
                 if once {
                     return Ok(());
@@ -6557,7 +6665,7 @@ async fn sync_validating_node(
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
-                eprintln!(
+                rbtc_warn!(
                     "auxiliary block-download peer retired after its first active-window failure; trying the next bounded candidate"
                 );
             }
@@ -6584,7 +6692,7 @@ async fn sync_validating_node(
                     status.update_validation(tip.height);
                 }
                 let remaining = target.height.saturating_sub(tip.height);
-                println!(
+                rbtc_info!(
                     "genesis validation progress: {} / {} blocks ({} remaining; batch cap {}; pause {} ms)",
                     tip.height,
                     target.height,
@@ -6661,9 +6769,10 @@ async fn reconcile_wallet(
         wallet
             .rewind_to(common)
             .map_err(|error| error.to_string())?;
-        println!(
+        rbtc_info!(
             "disconnected stale wallet tip; rewound to {}:{}",
-            common.height, common.hash
+            common.height,
+            common.hash
         );
     }
 
@@ -6741,7 +6850,7 @@ async fn reconcile_wallet(
             wallet
                 .record_scan_start_height(scan_start)
                 .map_err(|error| error.to_string())?;
-            println!(
+            rbtc_info!(
                 "wallet descriptor scan converged after {} pass(es)",
                 pass + 1
             );
@@ -6898,7 +7007,7 @@ async fn reconcile_ledger(
                 ledger
                     .commit_staged(validated_count)
                     .map_err(|error| error.to_string())?;
-                println!(
+                rbtc_info!(
                     "recovered {validated_count} validated blocks from the staged ledger segment"
                 );
             } else {
@@ -7067,9 +7176,10 @@ async fn reconcile_explorer(
         let count = explorer
             .replace_with_chainstate_baseline(execution_tip, chainstate)
             .map_err(|error| error.to_string())?;
-        println!(
+        rbtc_info!(
             "initialized snapshot-aware explorer baseline at {}:{} with {count} current UTXOs",
-            execution_tip.height, execution_tip.hash
+            execution_tip.height,
+            execution_tip.hash
         );
         publish_explorer_event(events, ExplorerEventKind::Rebased, execution_tip);
     }
@@ -7086,9 +7196,10 @@ async fn reconcile_explorer(
             let count = explorer
                 .replace_with_chainstate_baseline(execution_tip, chainstate)
                 .map_err(|error| error.to_string())?;
-            println!(
+            rbtc_info!(
                 "rebased snapshot-aware explorer at {}:{} with {count} current UTXOs after reorganization",
-                execution_tip.height, execution_tip.hash
+                execution_tip.height,
+                execution_tip.hash
             );
             publish_explorer_event(events, ExplorerEventKind::Rebased, execution_tip);
             break;
@@ -7096,9 +7207,10 @@ async fn reconcile_explorer(
         let rewound = explorer
             .disconnect_tip()
             .map_err(|error| error.to_string())?;
-        println!(
+        rbtc_info!(
             "disconnected stale explorer tip; rewound to {}:{}",
-            rewound.height, rewound.hash
+            rewound.height,
+            rewound.hash
         );
         publish_explorer_event(events, ExplorerEventKind::Disconnected, rewound);
     }
@@ -7384,7 +7496,7 @@ async fn recover_lagging_auxiliary_window(
         .zip(auxiliary_hashes)
         .filter_map(|(block, hash)| block.is_none().then_some(*hash))
         .collect::<Vec<_>>();
-    eprintln!(
+    rbtc_warn!(
         "auxiliary block window lagged the primary response by more than {} ms after delivering {received}/{} blocks; requesting only {} missing blocks from primary",
         AUXILIARY_BLOCK_RESPONSE_GRACE.as_millis(),
         auxiliary_hashes.len(),
@@ -7431,7 +7543,7 @@ async fn download_parallel_block_pair(
     );
     primary_request?;
     if let Err(error) = auxiliary_request {
-        eprintln!("auxiliary block window disabled after request failure: {error}");
+        rbtc_warn!("auxiliary block window disabled after request failure: {error}");
         let primary_blocks =
             receive_block_window(primary, primary_hashes, compact_candidates, "primary").await?;
         let auxiliary_blocks = download_block_window(
@@ -7463,7 +7575,7 @@ async fn download_parallel_block_pair(
             true,
         )),
         Some(Err(error)) => {
-            eprintln!(
+            rbtc_warn!(
                 "auxiliary block window disabled after response failure; retrying on primary: {error}"
             );
             let auxiliary_blocks = download_block_window(
@@ -7639,7 +7751,7 @@ async fn download_execute_batch(
         blocks.truncate(archive_batch_len);
         deployment_contexts.truncate(archive_batch_len);
         transaction_ids.truncate(archive_batch_len);
-        eprintln!(
+        rbtc_warn!(
             "validation batch reduced from {downloaded_len} to {archive_batch_len} blocks at the archive record-byte ceiling; carrying {} verified blocks into the next batch",
             carried.len()
         );
@@ -7977,7 +8089,7 @@ async fn download_execute_batch(
             removed
         };
         if removed_orphans > 0 {
-            println!(
+            rbtc_info!(
                 "removed {removed_orphans} orphan transaction{} included or conflicted by connected blocks",
                 if removed_orphans == 1 { "" } else { "s" }
             );
@@ -8003,7 +8115,7 @@ async fn download_execute_batch(
         .map_err(|error| error.to_string())?;
     let pruned_undos = prune_expired_block_undos(chainstate, headers, ledger)?;
     let published_at = Instant::now();
-    println!(
+    rbtc_info!(
         "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
@@ -8024,18 +8136,18 @@ async fn download_execute_batch(
         published_at.duration_since(batch_started).as_millis(),
     );
     if pruned_undos > 0 {
-        println!(
+        rbtc_info!(
             "pruned {pruned_undos} block undo record{} below the retained ledger window",
             if pruned_undos == 1 { "" } else { "s" }
         );
     }
     if execution_prefetch_count > 0 {
-        println!(
+        rbtc_info!(
             "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
         );
     }
     for migration in delta_shard_migrations {
-        println!(
+        rbtc_info!(
             "migrated hot validation delta {} from {} bytes to {} sorted shards inside a {} ms migration window",
             migration.height,
             migration.legacy_bytes,
@@ -8517,6 +8629,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut automatic_hot_standbys = None;
     let mut mempool_max_transactions = None;
     let mut mempool_max_bytes = None;
+    let mut log_level = None;
+    let mut log_dir = None;
+    let mut log_max_bytes = None;
+    let mut log_max_files = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -8860,6 +8976,46 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     value
                         .parse::<usize>()
                         .map_err(|_| format!("invalid mempool byte target: {value}"))?,
+                );
+            }
+            "--log-level" => {
+                if log_level.is_some() {
+                    return Err("--log-level cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--log-level")?;
+                log_level = Some(
+                    LogLevel::parse(&value).ok_or_else(|| format!("invalid log level: {value}"))?,
+                );
+            }
+            "--log-dir" => {
+                if log_dir.is_some() {
+                    return Err("--log-dir cannot be supplied more than once".to_owned());
+                }
+                log_dir = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--log-dir",
+                )?));
+            }
+            "--log-max-bytes" => {
+                if log_max_bytes.is_some() {
+                    return Err("--log-max-bytes cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--log-max-bytes")?;
+                log_max_bytes = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid log file size: {value}"))?,
+                );
+            }
+            "--log-max-files" => {
+                if log_max_files.is_some() {
+                    return Err("--log-max-files cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--log-max-files")?;
+                log_max_files = Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|_| format!("invalid log file count: {value}"))?,
                 );
             }
             "--chainstate-cache-bytes" => {
@@ -9511,6 +9667,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .to_owned(),
         );
     }
+    let default_logging = NodeLogConfig::default();
+    let logging_directory =
+        log_dir.or_else(|| data_dir.as_ref().map(|directory| directory.join("logs")));
     validate_runtime_options(Options {
         remotes,
         dns_seeds,
@@ -9559,6 +9718,12 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
             mempool_max_transactions: mempool_max_transactions.unwrap_or(MAX_ADMITTED_TRANSACTIONS),
             mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
+        },
+        logging: NodeLogConfig {
+            level: log_level.unwrap_or(default_logging.level),
+            directory: logging_directory,
+            max_file_bytes: log_max_bytes.unwrap_or(default_logging.max_file_bytes),
+            max_files: log_max_files.unwrap_or(default_logging.max_files),
         },
         runtime_control: Arc::new(RuntimeControl::default()),
         observer: None,
@@ -9644,7 +9809,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -9835,6 +10000,22 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            operator
+                .execute("getloginfo", &serde_json::json!([]))
+                .unwrap()
+                .unwrap()["host_managed"],
+            true
+        );
+        assert_eq!(
+            operator
+                .execute("setloglevel", &serde_json::json!(["debug"]))
+                .unwrap(),
+            Err(LocalRpcOperatorError {
+                code: -32010,
+                message: "Runtime logging is host managed",
+            })
         );
         assert_eq!(
             operator
@@ -10085,6 +10266,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         };
@@ -11950,6 +12132,10 @@ mod tests {
                 "--automatic-hot-standbys",
                 "--mempool-max-transactions",
                 "--mempool-max-bytes",
+                "--log-level",
+                "--log-dir",
+                "--log-max-bytes",
+                "--log-max-files",
                 "--cleanup-validation-dir",
                 "--prune-blocks",
                 "--prune-max-bytes",
@@ -12176,6 +12362,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_bounds_structured_log_rotation() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-log-parser",
+                "--log-level",
+                "debug",
+                "--log-dir",
+                "/tmp/rbtc-explicit-logs",
+                "--log-max-bytes",
+                "2097152",
+                "--log-max-files",
+                "3",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.logging,
+            NodeLogConfig {
+                level: LogLevel::Debug,
+                directory: Some(PathBuf::from("/tmp/rbtc-explicit-logs")),
+                max_file_bytes: 2 * 1024 * 1024,
+                max_files: 3,
+            }
+        );
+
+        let defaults = parse_options(
+            ["--data-dir", "/tmp/rbtc-default-logs"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            defaults.logging.directory,
+            Some(PathBuf::from("/tmp/rbtc-default-logs/logs"))
+        );
+
+        for arguments in [
+            vec!["--log-level", "trace"],
+            vec!["--log-max-bytes", "1048575"],
+            vec!["--log-max-bytes", "1073741825"],
+            vec!["--log-max-files", "1"],
+            vec!["--log-max-files", "21"],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn strict_network_config_is_bounded_and_cli_groups_replace_file_values() {
         let directory = TempDir::new().unwrap();
         let config_path = directory.path().join("rbtc.conf");
@@ -12188,6 +12429,9 @@ mod tests {
              automatic_hot_standbys=10\n\
              mempool_max_transactions=2048\n\
              mempool_max_bytes=314572800\n\
+             log_level=warn\n\
+             log_max_bytes=2097152\n\
+             log_max_files=3\n\
              prune_blocks=500\n\
              explorer_listen=127.0.0.1:3000\n\
              rpc_auth_token_file=/secret/token\n\
@@ -12228,6 +12472,9 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
             }
         );
+        assert_eq!(options.logging.level, LogLevel::Warn);
+        assert_eq!(options.logging.max_file_bytes, 2 * 1024 * 1024);
+        assert_eq!(options.logging.max_files, 3);
         assert_eq!(options.ledger_retention.max_blocks, 600);
         let summary = startup_configuration_summary(&options);
         assert!(summary.contains("prune_blocks=600"));
@@ -12264,6 +12511,12 @@ mod tests {
             automatic_hot_standbys: 4,
             mempool_max_transactions: 4_096,
             mempool_max_bytes: 300 * 1024 * 1024,
+        };
+        config.logging = NodeLogConfig {
+            level: LogLevel::Debug,
+            directory: Some(PathBuf::from("/tmp/rbtc-typed-logs")),
+            max_file_bytes: 2 * 1024 * 1024,
+            max_files: 3,
         };
         config.storage = NodeStorageConfig {
             prune_blocks: 576,
@@ -12304,6 +12557,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
             }
         );
+        assert_eq!(options.logging.level, LogLevel::Debug);
         assert_eq!(options.ledger_retention.max_blocks, 576);
         assert_eq!(
             options.background_assumeutxo,
@@ -13015,6 +13269,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -13085,6 +13340,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14392,6 +14648,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14451,6 +14708,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         };
@@ -14841,6 +15099,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -14934,6 +15193,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15006,6 +15266,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15094,6 +15355,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15153,6 +15415,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15208,6 +15471,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15303,6 +15567,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15364,6 +15629,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
+                logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             }),
@@ -15457,6 +15723,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15540,6 +15807,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15580,6 +15848,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15640,6 +15909,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15694,6 +15964,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15793,6 +16064,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -15948,6 +16220,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -16054,6 +16327,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -16132,6 +16406,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })
@@ -16246,6 +16521,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
+                logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             }),
@@ -16395,6 +16671,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 cache: NodeCacheConfig::default(),
                 resources: NodeResourceConfig::default(),
+                logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
             },
@@ -16514,6 +16791,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             cache: NodeCacheConfig::default(),
             resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         })

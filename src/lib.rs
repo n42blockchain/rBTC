@@ -15,6 +15,7 @@ pub mod chainstate;
 pub mod consensus;
 pub mod core_snapshot;
 pub mod deployments;
+pub mod diagnostics;
 pub mod execution_store;
 pub mod explorer_store;
 pub mod fee_estimator;
@@ -41,3 +42,59 @@ pub mod validation_owner;
 pub mod wallet;
 
 pub use utxo::{OutPointKey, Utxo, UtxoStore};
+
+/// Emits one bounded structured informational diagnostic.
+#[macro_export]
+macro_rules! rbtc_info {
+    ($($argument:tt)*) => {
+        if $crate::diagnostics::enabled($crate::diagnostics::LogLevel::Info) {
+            $crate::diagnostics::emit(
+                $crate::diagnostics::LogLevel::Info,
+                module_path!(),
+                format!($($argument)*),
+            )
+        }
+    };
+}
+
+/// Emits one bounded structured warning diagnostic.
+#[macro_export]
+macro_rules! rbtc_warn {
+    ($($argument:tt)*) => {
+        if $crate::diagnostics::enabled($crate::diagnostics::LogLevel::Warn) {
+            $crate::diagnostics::emit(
+                $crate::diagnostics::LogLevel::Warn,
+                module_path!(),
+                format!($($argument)*),
+            )
+        }
+    };
+}
+
+/// Emits one bounded structured error diagnostic.
+#[macro_export]
+macro_rules! rbtc_error {
+    ($($argument:tt)*) => {
+        if $crate::diagnostics::enabled($crate::diagnostics::LogLevel::Error) {
+            $crate::diagnostics::emit(
+                $crate::diagnostics::LogLevel::Error,
+                module_path!(),
+                format!($($argument)*),
+            )
+        }
+    };
+}
+
+/// Emits one bounded structured debug diagnostic.
+#[macro_export]
+macro_rules! rbtc_debug {
+    ($($argument:tt)*) => {
+        if $crate::diagnostics::enabled($crate::diagnostics::LogLevel::Debug) {
+            $crate::diagnostics::emit(
+                $crate::diagnostics::LogLevel::Debug,
+                module_path!(),
+                format!($($argument)*),
+            )
+        }
+    };
+}

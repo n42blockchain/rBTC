@@ -235,8 +235,10 @@ optional where appropriate, and host-runtime compatible.
   persistence, and reopen. Authenticated stable equivalents of
   `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`,
   `getindexinfo`, and `verifychain`, plus delayed graceful `stop`, are complete.
-  Add structured rate-limited rotating logs and runtime logging controls. Exact
-  response-field parity is not required.
+  Standalone JSON diagnostics now use a bounded non-blocking queue, a fixed
+  per-second limiter, owner-only size rotation, dropped/error metrics, and
+  authenticated runtime level control; embedded hosts use typed event/status
+  receivers. Exact response-field parity is not required.
 - [ ] **Explicit storage lifecycle.** Add configurable automatic/manual prune
   targets, prune/index incompatibility checks, `reindex` and
   `reindex-chainstate`, bounded offline verification/repair, schema migration

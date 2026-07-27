@@ -24,6 +24,9 @@ mempool_full_rbf=false
 automatic_hot_standbys=8
 mempool_max_transactions=64
 mempool_max_bytes=4000000
+log_level=info
+log_max_bytes=16777216
+log_max_files=5
 prune_blocks=1008
 prune_max_bytes=1073741824
 chainstate_cache_bytes=1073741824
@@ -50,6 +53,8 @@ The supported scalar keys are:
   `background_chainstate_cache_bytes`, `bulk_validation_cache_bytes`
 - `automatic_hot_standbys` (0–16), `mempool_max_transactions`
   (1–300,000), and `mempool_max_bytes` (4,000,000–1,073,741,824)
+- `log_level` (`error`, `warn`, `info`, or `debug`), `log_dir`,
+  `log_max_bytes` (1 MiB–1 GiB), and `log_max_files` (2–20)
 - Boolean `dns_seeds`, `once`, `mempool_full_rbf`,
   `cleanup_validation_dir`, and `validation_deferred_repair`
 
@@ -69,3 +74,13 @@ data directory, peer/DNS counts, active/background/bulk cache bytes, freezer
 targets, hot-standby and mempool ceilings, validation resources, and enabled API surfaces. It reports only
 booleans for RPC/wallet enablement and never prints authentication paths,
 descriptor paths, or credential contents.
+
+The standalone daemon writes newline-delimited JSON diagnostics to
+`DATA_DIR/logs/rbtc.log` by default. A 4,096-record non-blocking queue and a
+500-record-per-second limiter bound hostile log production; excess records are
+dropped and counted. Files rotate before `log_max_bytes` and retain at most
+`log_max_files`, including the active file. The log directory is owner-only and
+must not be a symlink. Authenticated `getloginfo` reports the effective level
+and dropped count; `setloglevel ["error"|"warn"|"info"|"debug"]` changes the
+level without restart. Embedded hosts do not install this process-global sink
+and instead consume the bounded typed status/event receivers.
