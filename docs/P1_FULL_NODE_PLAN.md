@@ -135,8 +135,7 @@ AssumeUTXO validator explicitly disables listening. The basic-filter schema
 was advanced because the original index omitted the genesis filter and
 therefore chained height 1 from the wrong predecessor. P1.2 remains open for
 adaptive eviction/preference, routability advertisement controls,
-inbound transaction fan-out, and recorded Core 31/btcd interoperability
-evidence.
+and recorded Core 31/btcd interoperability evidence.
 
 The observable-accounting portion is now complete. The status API and
 authenticated network/peer RPC expose the live inbound set, handshake identity,
@@ -145,7 +144,12 @@ listener admission, rejection, disconnect-reason, active-session, and rolling
 historical-upload counters. A real TCP lifecycle test proves that disconnect
 and listener cancellation cannot leave a stale peer consuming observable
 capacity. Adaptive eviction/preference, explicit routability advertisement,
-inbound transaction fan-out, and recorded Core 31/btcd interoperability remain.
+and recorded Core 31/btcd interoperability remain. Validated mempool and wallet
+relay events now also feed every accepted inbound session through the same
+bounded broadcast ring. Each session negotiates txid/wtxid inventory, applies
+the peer's latest BIP133 fee filter using policy vsize, suppresses duplicate
+announcements with a fixed-size FIFO, and drops lagged relay events instead of
+blocking consensus or peer reads.
 
 ### P1.3 — current transaction relay and policy
 

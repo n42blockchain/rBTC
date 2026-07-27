@@ -5,7 +5,7 @@
 //! published by the node-provided [`InboundDataSource`].
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -29,14 +29,14 @@ use bitcoin::{
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast},
     task::JoinSet,
-    time::timeout,
+    time::{Instant as TokioInstant, sleep_until, timeout},
 };
 
 use crate::p2p::{
     InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
-    MAX_INVENTORY_ENTRIES, P2pError, accept_inbound,
+    MAX_INVENTORY_ENTRIES, P2pError, TransactionRelay, accept_inbound,
 };
 
 const MAX_GETBLOCKS_RESULTS: usize = 500;
@@ -46,6 +46,8 @@ const RECENT_BLOCK_UPLOAD_WINDOW: u32 = 288;
 const SENDHEADERS_VERSION: u32 = 70_012;
 const FEEFILTER_VERSION: u32 = 70_013;
 const SENDCMPCT_VERSION: u32 = 70_014;
+const MAX_MONEY_SATS: i64 = 21_000_000 * 100_000_000;
+const MAX_RELAY_ANNOUNCEMENTS_PER_PEER: usize = 5_000;
 
 /// Resource ceilings for one optional inbound listener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -646,6 +648,34 @@ pub async fn run_listener_with_stats(
     source: Arc<dyn InboundDataSource>,
     stats: Arc<InboundStats>,
 ) -> Result<(), InboundError> {
+    run_listener_with_stats_and_relay(
+        listener,
+        magic,
+        local_nonce,
+        user_agent,
+        services,
+        limits,
+        source,
+        stats,
+        None,
+    )
+    .await
+}
+
+/// Runs one bounded listener with live accounting and validated transaction
+/// announcements shared across accepted peers.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_listener_with_stats_and_relay(
+    listener: TcpListener,
+    magic: bitcoin::p2p::Magic,
+    local_nonce: u64,
+    user_agent: String,
+    services: ServiceFlags,
+    limits: InboundLimits,
+    source: Arc<dyn InboundDataSource>,
+    stats: Arc<InboundStats>,
+    transaction_relay: Option<broadcast::Sender<TransactionRelay>>,
+) -> Result<(), InboundError> {
     let global = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(Mutex::new(HashMap::new()));
     let per_group = Arc::new(Mutex::new(HashMap::new()));
@@ -677,6 +707,7 @@ pub async fn run_listener_with_stats(
                 let source = Arc::clone(&source);
                 let upload = Arc::clone(&upload);
                 let user_agent = user_agent.clone();
+                let relay = transaction_relay.as_ref().map(broadcast::Sender::subscribe);
                 peers.spawn(async move {
                     let _admission = admission;
                     let result = serve_peer(
@@ -688,6 +719,7 @@ pub async fn run_listener_with_stats(
                         limits,
                         source,
                         upload,
+                        relay,
                         &account,
                     )
                     .await;
@@ -701,7 +733,7 @@ pub async fn run_listener_with_stats(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_peer(
     stream: TcpStream,
     magic: bitcoin::p2p::Magic,
@@ -711,6 +743,7 @@ async fn serve_peer(
     limits: InboundLimits,
     source: Arc<dyn InboundDataSource>,
     upload: Arc<UploadBudget>,
+    mut transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let start_height = source.start_height().map_err(InboundError::Data)?;
@@ -774,15 +807,76 @@ async fn serve_peer(
     }
     let mut request_budget = RequestBudget::new(limits.max_requests_per_minute);
     let mut requested_transactions = HashSet::new();
+    let mut remote_fee_filter_sat_kvb = 0;
+    let mut announced_transactions = HashSet::new();
+    let mut announcement_order = VecDeque::new();
+    let mut idle_deadline = TokioInstant::now() + limits.idle_timeout;
     loop {
-        let message = timeout(limits.idle_timeout, peer.receive_message())
-            .await
-            .map_err(|_| {
-                InboundError::Io(std::io::Error::new(
+        enum PeerWork {
+            Message(Result<NetworkMessage, P2pError>),
+            Relay(Result<TransactionRelay, broadcast::error::RecvError>),
+            Idle,
+        }
+        let work = tokio::select! {
+            message = peer.receive_message() => PeerWork::Message(message),
+            relay = async {
+                transaction_relay
+                    .as_mut()
+                    .expect("relay branch is guarded")
+                    .recv()
+                    .await
+            }, if transaction_relay.is_some() => PeerWork::Relay(relay),
+            () = sleep_until(idle_deadline) => PeerWork::Idle,
+        };
+        let message = match work {
+            PeerWork::Message(message) => {
+                idle_deadline = TokioInstant::now() + limits.idle_timeout;
+                message?
+            }
+            PeerWork::Relay(Ok(relay)) => {
+                if relay_meets_fee_filter(&relay, remote_fee_filter_sat_kvb) {
+                    let inventory = if peer.wtxid_relay() {
+                        Inventory::WTx(relay.transaction.compute_wtxid())
+                    } else {
+                        Inventory::Transaction(relay.transaction.compute_txid())
+                    };
+                    if remember_announcement(
+                        inventory,
+                        &mut announced_transactions,
+                        &mut announcement_order,
+                    ) {
+                        send_accounted(
+                            &mut peer,
+                            NetworkMessage::Inv(vec![inventory]),
+                            &upload,
+                            account,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                continue;
+            }
+            PeerWork::Relay(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            PeerWork::Relay(Err(broadcast::error::RecvError::Closed)) => {
+                transaction_relay = None;
+                continue;
+            }
+            PeerWork::Idle => {
+                return Err(InboundError::Io(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "inbound peer idle timeout",
-                ))
-            })??;
+                )));
+            }
+        };
+        if let NetworkMessage::FeeFilter(rate) = &message {
+            if peer.remote_version().version >= FEEFILTER_VERSION
+                && (0..=MAX_MONEY_SATS).contains(rate)
+            {
+                remote_fee_filter_sat_kvb =
+                    u64::try_from(*rate).expect("valid monetary fee filter fits u64");
+            }
+        }
         if !matches!(
             message,
             NetworkMessage::Ping(_)
@@ -806,6 +900,30 @@ async fn serve_peer(
         )
         .await?;
     }
+}
+
+fn relay_meets_fee_filter(relay: &TransactionRelay, fee_filter_sat_kvb: u64) -> bool {
+    relay.fee_sats.is_none_or(|fee_sats| {
+        let vbytes = relay.policy_vsize.max(relay.transaction.vsize());
+        u128::from(fee_sats) * 1_000 >= u128::from(fee_filter_sat_kvb) * vbytes as u128
+    })
+}
+
+fn remember_announcement(
+    inventory: Inventory,
+    announced: &mut HashSet<Inventory>,
+    order: &mut VecDeque<Inventory>,
+) -> bool {
+    if !announced.insert(inventory) {
+        return false;
+    }
+    order.push_back(inventory);
+    while order.len() > MAX_RELAY_ANNOUNCEMENTS_PER_PEER {
+        if let Some(expired) = order.pop_front() {
+            announced.remove(&expired);
+        }
+    }
+    true
 }
 
 async fn send_accounted(
@@ -1331,6 +1449,7 @@ mod tests {
     struct GenesisSource {
         block: Block,
         submitted: Mutex<Vec<Transaction>>,
+        available: Mutex<Vec<Transaction>>,
     }
 
     impl GenesisSource {
@@ -1338,6 +1457,7 @@ mod tests {
             Self {
                 block: genesis_block(Network::Regtest),
                 submitted: Mutex::new(Vec::new()),
+                available: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1363,8 +1483,20 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn transaction(&self, _inventory: Inventory) -> Result<Option<Transaction>, String> {
-            Ok(None)
+        fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
+            Ok(self
+                .available
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|transaction| match inventory {
+                    Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                        transaction.compute_txid() == txid
+                    }
+                    Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
+                    _ => false,
+                })
+                .cloned())
         }
 
         fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String> {
@@ -1473,7 +1605,54 @@ mod tests {
         assert!(matches!(budget.charge(), Err(InboundError::RequestBudget)));
     }
 
+    #[test]
+    fn relay_filter_and_per_peer_deduplication_are_exact_and_bounded() {
+        let transaction = GenesisSource::new().block.txdata[0].clone();
+        let relay = TransactionRelay {
+            transaction,
+            fee_sats: Some(999),
+            policy_vsize: 500,
+        };
+        assert!(!relay_meets_fee_filter(&relay, 2_000));
+        assert!(relay_meets_fee_filter(
+            &TransactionRelay {
+                fee_sats: Some(1_000),
+                ..relay.clone()
+            },
+            2_000
+        ));
+        assert!(relay_meets_fee_filter(
+            &TransactionRelay {
+                fee_sats: None,
+                ..relay
+            },
+            u64::MAX
+        ));
+
+        let mut announced = HashSet::new();
+        let mut order = VecDeque::new();
+        for index in 0..=MAX_RELAY_ANNOUNCEMENTS_PER_PEER {
+            let inventory = Inventory::Transaction(bitcoin::Txid::from_byte_array(
+                u32::try_from(index)
+                    .unwrap()
+                    .to_le_bytes()
+                    .repeat(8)
+                    .try_into()
+                    .unwrap(),
+            ));
+            assert!(remember_announcement(inventory, &mut announced, &mut order));
+        }
+        assert_eq!(announced.len(), MAX_RELAY_ANNOUNCEMENTS_PER_PEER);
+        assert_eq!(order.len(), MAX_RELAY_ANNOUNCEMENTS_PER_PEER);
+        assert!(!remember_announcement(
+            *order.back().unwrap(),
+            &mut announced,
+            &mut order
+        ));
+    }
+
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn listener_accepts_a_real_peer_and_serves_a_retained_witness_block() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1481,7 +1660,8 @@ mod tests {
         let service_source: Arc<dyn InboundDataSource> = source.clone();
         let hash = source.block.block_hash();
         let stats = Arc::new(InboundStats::new(1_024));
-        let task = tokio::spawn(run_listener_with_stats(
+        let (relay, _) = broadcast::channel(8);
+        let task = tokio::spawn(run_listener_with_stats_and_relay(
             listener,
             Network::Regtest.magic(),
             2,
@@ -1490,6 +1670,7 @@ mod tests {
             InboundLimits::default(),
             service_source,
             Arc::clone(&stats),
+            Some(relay.clone()),
         ));
         let mut peer = connect_outbound(
             address,
@@ -1510,6 +1691,25 @@ mod tests {
         assert_eq!(addresses.len(), 1);
         assert_eq!(addresses[0].socket, "1.2.3.4:8333".parse().unwrap());
         assert_eq!(peer.fee_filter_sat_kvb(), 2_345);
+        let mut relayed = source.block.txdata[0].clone();
+        relayed.input[0].previous_output.vout = 1;
+        source
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(relayed.clone());
+        relay
+            .send(TransactionRelay {
+                transaction: relayed.clone(),
+                fee_sats: Some(1_000),
+                policy_vsize: relayed.vsize(),
+            })
+            .unwrap();
+        peer.ping(11).await.unwrap();
+        assert_eq!(
+            peer.take_pending_transaction_inventory(),
+            vec![Inventory::WTx(relayed.compute_wtxid())]
+        );
         peer.request_blocks(&[hash]).await.unwrap();
         let block = peer.receive_requested_block(hash).await.unwrap();
         assert_eq!(block.block_hash(), hash);

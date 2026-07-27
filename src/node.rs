@@ -107,7 +107,7 @@ use rbtc::{
     ibd::IbdPolicy,
     inbound::{
         InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
-        run_listener_with_stats,
+        run_listener_with_stats_and_relay,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -3740,6 +3740,7 @@ struct InboundServer {
 }
 
 impl InboundServer {
+    #[allow(clippy::too_many_arguments)]
     async fn bind(
         address: SocketAddr,
         network: Network,
@@ -3748,6 +3749,7 @@ impl InboundServer {
         source: Arc<dyn InboundDataSource>,
         stats: Arc<InboundStats>,
         serve_compact_filters: bool,
+        transaction_relay: broadcast::Sender<TransactionRelay>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -3767,7 +3769,7 @@ impl InboundServer {
             limits.max_requests_per_minute
         );
         let task = tokio::spawn(async move {
-            run_listener_with_stats(
+            run_listener_with_stats_and_relay(
                 listener,
                 network.magic(),
                 local_nonce,
@@ -3776,6 +3778,7 @@ impl InboundServer {
                 limits,
                 source,
                 stats,
+                Some(transaction_relay),
             )
             .await
             .map_err(|error| error.to_string())
@@ -6249,6 +6252,7 @@ async fn run_peer_pool(
                     .expect("inbound source exists with listener")
                     .stats(),
                 options.indexes.basic_filter,
+                transaction_relay.clone(),
             )
             .await?,
         )
