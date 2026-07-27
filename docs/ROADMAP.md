@@ -252,7 +252,9 @@ optional where appropriate, and host-runtime compatible.
   `--prune-blocks` (288–1,008) and `--prune-max-bytes` (at least 550 MiB)
   startup targets now drive the existing crash-safe physical freezer rotation
   and sorted undo cleanup. Targets and physical-prefix progress are persisted
-  and observable. A fixed-memory, count/byte-bounded `--verify-storage` command
+  and observable. Manual height pruning now requires a read-only plan token,
+  a clean full audit, an unchanged index, a 288-block retained suffix, and a
+  restart-resumable versioned intent. A fixed-memory, count/byte-bounded `--verify-storage` command
   now verifies freezer pieces and decompressed records without opening mutable
   databases and emits a JSON dry-run repair plan; cross-store verification,
   reindex/repair execution, migration, and operator recovery workflows keep

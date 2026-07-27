@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::archive::{
@@ -22,8 +23,11 @@ const INDEX_FILE: &str = "ledger-index.json";
 const TRUNCATE_FILE: &str = "ledger-truncate";
 const STAGED_FILE: &str = "ledger-staged.rblk";
 const POLICY_FILE: &str = "ledger-policy.json";
+const PRUNE_FILE: &str = "ledger-prune.json";
 const LEDGER_POLICY_SCHEMA_VERSION: u32 = 1;
+const LEDGER_PRUNE_SCHEMA_VERSION: u32 = 1;
 const MAX_LEDGER_POLICY_BYTES: u64 = 1_024;
+const MAX_LEDGER_PRUNE_INTENT_BYTES: u64 = 256;
 const MAX_LEDGER_INDEX_BYTES: u64 = 1024 * 1024;
 const MAX_AUDIT_SLOT_NAMESPACE: u16 = 4_096;
 
@@ -89,6 +93,29 @@ pub struct LedgerAuditReport {
     pub repair_plan: Vec<String>,
 }
 
+/// Deterministic manual-prefix prune plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LedgerPrunePlan {
+    /// Requested inclusive height.
+    pub requested_through_height: u32,
+    /// Actual inclusive height covered by complete immutable segments.
+    pub effective_through_height: Option<u32>,
+    /// Oldest height that will remain retrievable.
+    pub first_retained_height: Option<u32>,
+    /// Current retained tip used to construct the plan.
+    pub tip_height: Option<u32>,
+    /// Complete archive segments removed by the plan.
+    pub segments_removed: u32,
+    /// Blocks removed by the plan.
+    pub blocks_removed: u64,
+    /// Exact compressed bytes reclaimed after physical cleanup.
+    pub bytes_reclaimed: u64,
+    /// Required retained suffix measured in blocks.
+    pub minimum_blocks_preserved: u32,
+    /// SHA-256 commitment to the current index and every plan input/result.
+    pub plan_token: String,
+}
+
 impl Default for LedgerRetention {
     fn default() -> Self {
         Self {
@@ -141,6 +168,14 @@ struct LedgerPolicy {
     slots: u16,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerPruneIntent {
+    schema_version: u32,
+    requested_through_height: u32,
+    minimum_blocks_preserved: u32,
+}
+
 impl LedgerPolicy {
     const fn current(retention: LedgerRetention) -> Self {
         Self {
@@ -180,6 +215,9 @@ enum LedgerSyncPoint {
     IndexPublish,
     PolicyFile,
     PolicyPublish,
+    PruneIntentFile,
+    PruneIntentPublish,
+    PruneIntentRemoval,
     RetiredSlotRemoval,
     TruncateIntentFile,
     TruncateIntentPublish,
@@ -220,9 +258,117 @@ impl PrunedBlockLedger {
         audit_ledger(root.as_ref(), max_segments, max_bytes)
     }
 
+    /// Creates a manual-prune plan from strict immutable metadata without
+    /// opening or recovering the ledger.
+    pub fn plan_prune_read_only(
+        root: impl AsRef<Path>,
+        requested_through_height: u32,
+        minimum_blocks_preserved: u32,
+    ) -> Result<LedgerPrunePlan, LedgerError> {
+        if minimum_blocks_preserved == 0 {
+            return Err(LedgerError::Invalid(
+                "manual prune preservation floor must be non-zero",
+            ));
+        }
+        let root = root.as_ref();
+        let root_metadata = fs::symlink_metadata(root)?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(LedgerError::Invalid(
+                "ledger prune root must be a directory",
+            ));
+        }
+        let policy_bytes =
+            read_bounded_audit_file(&root.join(POLICY_FILE), MAX_LEDGER_POLICY_BYTES)?
+                .ok_or(LedgerError::Invalid("ledger policy is missing"))?;
+        let policy: LedgerPolicy = serde_json::from_slice(&policy_bytes)?;
+        if policy.schema_version != LEDGER_POLICY_SCHEMA_VERSION {
+            return Err(LedgerError::Invalid(
+                "unsupported ledger policy schema version",
+            ));
+        }
+        let index_bytes = read_bounded_audit_file(&root.join(INDEX_FILE), MAX_LEDGER_INDEX_BYTES)?
+            .unwrap_or_else(|| serde_json::to_vec(&LedgerIndex::default()).expect("valid"));
+        let index: LedgerIndex = serde_json::from_slice(&index_bytes)?;
+        validate_read_only_plan_index(root, &index, policy.slots)?;
+        build_prune_plan(&index, requested_through_height, minimum_blocks_preserved)
+    }
+
+    /// Creates a non-mutating manual prefix-prune plan.
+    ///
+    /// Only complete immutable segments are selected, and at least
+    /// `minimum_blocks_preserved` retained-tip blocks remain. The returned
+    /// token commits to the current durable index and must be supplied to
+    /// [`Self::apply_prune_plan`].
+    pub fn plan_prune_through(
+        &self,
+        requested_through_height: u32,
+        minimum_blocks_preserved: u32,
+    ) -> Result<LedgerPrunePlan, LedgerError> {
+        if minimum_blocks_preserved == 0 {
+            return Err(LedgerError::Invalid(
+                "manual prune preservation floor must be non-zero",
+            ));
+        }
+        let _guard = self.lock();
+        self.plan_prune_through_locked(requested_through_height, minimum_blocks_preserved)
+    }
+
+    /// Applies exactly a previously returned manual prune plan.
+    ///
+    /// A stale or malformed token fails before writing an intent. Once the
+    /// intent is durable, startup resumes the same bounded complete-segment
+    /// transition until the new index and physical cleanup are both durable.
+    pub fn apply_prune_plan(
+        &self,
+        requested_through_height: u32,
+        minimum_blocks_preserved: u32,
+        plan_token: &str,
+    ) -> Result<LedgerPrunePlan, LedgerError> {
+        let _guard = self.lock();
+        let plan =
+            self.plan_prune_through_locked(requested_through_height, minimum_blocks_preserved)?;
+        if plan.plan_token != plan_token {
+            return Err(LedgerError::Invalid(
+                "manual prune plan token is stale or invalid",
+            ));
+        }
+        if plan.segments_removed == 0 {
+            return Ok(plan);
+        }
+        self.write_prune_intent(LedgerPruneIntent {
+            schema_version: LEDGER_PRUNE_SCHEMA_VERSION,
+            requested_through_height,
+            minimum_blocks_preserved,
+        })?;
+        self.apply_pruning(requested_through_height, minimum_blocks_preserved)?;
+        self.clear_prune_intent()?;
+        Ok(plan)
+    }
+
     /// Opens a ledger rooted in an application-specific directory.
     pub fn open(root: impl AsRef<Path>, retention: LedgerRetention) -> Result<Self, LedgerError> {
         Self::open_with_durability(root, retention, Arc::new(OsLedgerDurability))
+    }
+
+    /// Opens an existing ledger using its supported persisted retention policy.
+    pub fn open_persisted(root: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let root = root.as_ref();
+        let bytes = read_bounded_audit_file(&root.join(POLICY_FILE), MAX_LEDGER_POLICY_BYTES)?
+            .ok_or(LedgerError::Invalid("ledger policy is missing"))?;
+        let policy: LedgerPolicy = serde_json::from_slice(&bytes)?;
+        if policy.schema_version != LEDGER_POLICY_SCHEMA_VERSION {
+            return Err(LedgerError::Invalid(
+                "unsupported ledger policy schema version",
+            ));
+        }
+        Self::open(
+            root,
+            LedgerRetention {
+                max_blocks: policy.max_blocks,
+                max_bytes: policy.max_bytes,
+                slots: policy.slots,
+            },
+        )
     }
 
     fn open_with_durability(
@@ -244,6 +390,7 @@ impl PrunedBlockLedger {
         };
         ledger.recover_index()?;
         ledger.recover_truncation()?;
+        ledger.recover_pruning()?;
         let index = ledger.read_index()?;
         ledger.cleanup_unindexed_slots_locked(&index)?;
         // Publish the configured policy only after recovery and physical
@@ -534,6 +681,9 @@ impl PrunedBlockLedger {
     fn policy_path(&self) -> PathBuf {
         self.root.join(POLICY_FILE)
     }
+    fn prune_path(&self) -> PathBuf {
+        self.root.join(PRUNE_FILE)
+    }
     fn truncate_path(&self) -> PathBuf {
         self.root.join(TRUNCATE_FILE)
     }
@@ -717,6 +867,97 @@ impl PrunedBlockLedger {
         segments
     }
 
+    fn plan_prune_through_locked(
+        &self,
+        requested_through_height: u32,
+        minimum_blocks_preserved: u32,
+    ) -> Result<LedgerPrunePlan, LedgerError> {
+        build_prune_plan(
+            &self.read_index()?,
+            requested_through_height,
+            minimum_blocks_preserved,
+        )
+    }
+
+    fn recover_pruning(&self) -> Result<(), LedgerError> {
+        let Some(bytes) =
+            read_bounded_audit_file(&self.prune_path(), MAX_LEDGER_PRUNE_INTENT_BYTES)?
+        else {
+            return Ok(());
+        };
+        let intent: LedgerPruneIntent = serde_json::from_slice(&bytes)?;
+        if intent.schema_version != LEDGER_PRUNE_SCHEMA_VERSION {
+            return Err(LedgerError::Invalid(
+                "unsupported ledger prune intent schema version",
+            ));
+        }
+        self.apply_pruning(
+            intent.requested_through_height,
+            intent.minimum_blocks_preserved,
+        )?;
+        self.clear_prune_intent()
+    }
+
+    fn write_prune_intent(&self, intent: LedgerPruneIntent) -> Result<(), LedgerError> {
+        let temporary = self.root.join("ledger-prune.json.new");
+        match fs::symlink_metadata(&temporary) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(LedgerError::Invalid(
+                    "temporary ledger prune intent must be a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 => {
+                return Err(LedgerError::Invalid(
+                    "temporary ledger prune intent must not be hard-linked",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&serde_json::to_vec(&intent)?)?;
+        drop(file);
+        self.sync(LedgerSyncPoint::PruneIntentFile, &temporary)?;
+        fs::rename(&temporary, self.prune_path())?;
+        self.sync_directory(LedgerSyncPoint::PruneIntentPublish)
+    }
+
+    fn apply_pruning(
+        &self,
+        requested_through_height: u32,
+        minimum_blocks_preserved: u32,
+    ) -> Result<(), LedgerError> {
+        let plan =
+            self.plan_prune_through_locked(requested_through_height, minimum_blocks_preserved)?;
+        if plan.segments_removed == 0 {
+            return Ok(());
+        }
+        let mut index = self.read_index()?;
+        index
+            .segments
+            .drain(..usize::try_from(plan.segments_removed).expect("u32 fits usize"));
+        self.write_index(&index)?;
+        self.cleanup_unindexed_slots_locked(&index)?;
+        Ok(())
+    }
+
+    fn clear_prune_intent(&self) -> Result<(), LedgerError> {
+        match fs::remove_file(self.prune_path()) {
+            Ok(()) => self.sync_directory(LedgerSyncPoint::PruneIntentRemoval),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn recover_truncation(&self) -> Result<(), LedgerError> {
         let bytes = match fs::read(self.truncate_path()) {
             Ok(bytes) => bytes,
@@ -837,6 +1078,132 @@ impl PrunedBlockLedger {
             .map(Some)
             .ok_or(LedgerError::Invalid("archive block missing"))
     }
+}
+
+fn validate_read_only_plan_index(
+    root: &Path,
+    index: &LedgerIndex,
+    slots: u16,
+) -> Result<(), LedgerError> {
+    if slots == 0 || slots > MAX_AUDIT_SLOT_NAMESPACE || index.next_slot >= slots {
+        return Err(LedgerError::Invalid("ledger index bounds"));
+    }
+    let mut expected_height = None;
+    let mut used_slots = std::collections::BTreeSet::new();
+    for segment in &index.segments {
+        if segment.slot >= slots
+            || !used_slots.insert(segment.slot)
+            || expected_height.is_some_and(|height| height != segment.first_height)
+        {
+            return Err(LedgerError::Invalid("ledger index sequence"));
+        }
+        let path = root.join(format!("blk-{:04}.rblk", segment.slot));
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != segment.bytes
+        {
+            return Err(LedgerError::Invalid("archive does not match ledger index"));
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+            return Err(LedgerError::Invalid("archive must not be hard-linked"));
+        }
+        let manifest = read_archive_manifest(path)?;
+        if manifest.first_height != segment.first_height
+            || manifest.block_count != segment.block_count
+        {
+            return Err(LedgerError::Invalid("archive does not match ledger index"));
+        }
+        expected_height = Some(segment_end_exclusive(segment)?);
+    }
+    Ok(())
+}
+
+fn build_prune_plan(
+    index: &LedgerIndex,
+    requested_through_height: u32,
+    minimum_blocks_preserved: u32,
+) -> Result<LedgerPrunePlan, LedgerError> {
+    let tip_height = index
+        .segments
+        .last()
+        .map(segment_end_inclusive)
+        .transpose()?;
+    let target_through_height = tip_height
+        .and_then(|tip| tip.checked_sub(minimum_blocks_preserved))
+        .map(|maximum| requested_through_height.min(maximum));
+    let mut segments_removed = 0_usize;
+    let mut blocks_removed = 0_u64;
+    let mut bytes_reclaimed = 0_u64;
+    let mut effective_through_height = None;
+    if let Some(target) = target_through_height {
+        for segment in &index.segments {
+            let end = segment_end_inclusive(segment)?;
+            if end > target {
+                break;
+            }
+            segments_removed += 1;
+            blocks_removed = blocks_removed.saturating_add(u64::from(segment.block_count));
+            bytes_reclaimed = bytes_reclaimed.saturating_add(segment.bytes);
+            effective_through_height = Some(end);
+        }
+    }
+    let first_retained_height = index
+        .segments
+        .get(segments_removed)
+        .map(|segment| segment.first_height);
+    let segments_removed_u32 = u32::try_from(segments_removed)
+        .map_err(|_| LedgerError::Invalid("too many ledger segments"))?;
+    let plan_token = prune_plan_token(
+        index,
+        requested_through_height,
+        effective_through_height,
+        first_retained_height,
+        tip_height,
+        segments_removed_u32,
+        blocks_removed,
+        bytes_reclaimed,
+        minimum_blocks_preserved,
+    )?;
+    Ok(LedgerPrunePlan {
+        requested_through_height,
+        effective_through_height,
+        first_retained_height,
+        tip_height,
+        segments_removed: segments_removed_u32,
+        blocks_removed,
+        bytes_reclaimed,
+        minimum_blocks_preserved,
+        plan_token,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prune_plan_token(
+    index: &LedgerIndex,
+    requested_through_height: u32,
+    effective_through_height: Option<u32>,
+    first_retained_height: Option<u32>,
+    tip_height: Option<u32>,
+    segments_removed: u32,
+    blocks_removed: u64,
+    bytes_reclaimed: u64,
+    minimum_blocks_preserved: u32,
+) -> Result<String, LedgerError> {
+    let commitment = serde_json::to_vec(&(
+        "rbtc-ledger-prune-plan-v1",
+        index,
+        requested_through_height,
+        effective_through_height,
+        first_retained_height,
+        tip_height,
+        segments_removed,
+        blocks_removed,
+        bytes_reclaimed,
+        minimum_blocks_preserved,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(commitment)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1077,6 +1444,16 @@ fn audit_ledger(
             "a temporary ledger policy awaits recovery",
             "run normal startup recovery to publish or remove the temporary policy safely",
         ),
+        (
+            root.join(PRUNE_FILE),
+            "a manual prune intent awaits recovery",
+            "resume the durable manual prune intent before serving blocks",
+        ),
+        (
+            root.join("ledger-prune.json.new"),
+            "a temporary manual prune intent awaits recovery",
+            "rerun the manual prune plan before removing a temporary unpublished intent",
+        ),
     ] {
         match fs::symlink_metadata(path) {
             Ok(_) => {
@@ -1106,6 +1483,13 @@ fn read_bounded_audit_file(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "audit input is not a bounded regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audit input must not be hard-linked",
         ));
     }
     let mut bytes = Vec::new();
@@ -1540,6 +1924,144 @@ mod tests {
         assert_eq!(report.first_height, Some(10));
         assert_eq!(report.tip_height, Some(10));
         assert!(!dir.path().join(INDEX_FILE).exists());
+    }
+
+    #[test]
+    fn manual_prune_requires_matching_plan_and_keeps_the_requested_floor() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 5,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11]]).unwrap();
+        ledger.append(12, &[vec![12], vec![13]]).unwrap();
+        ledger.append(14, &[vec![14], vec![15]]).unwrap();
+        let index_before = fs::read(ledger.index_path()).unwrap();
+
+        let plan = ledger.plan_prune_through(13, 2).unwrap();
+        assert_eq!(
+            PrunedBlockLedger::plan_prune_read_only(dir.path(), 13, 2).unwrap(),
+            plan
+        );
+        assert_eq!(plan.effective_through_height, Some(13));
+        assert_eq!(plan.first_retained_height, Some(14));
+        assert_eq!(plan.tip_height, Some(15));
+        assert_eq!(plan.segments_removed, 2);
+        assert_eq!(plan.blocks_removed, 4);
+        assert_eq!(plan.plan_token.len(), 64);
+        assert_eq!(fs::read(ledger.index_path()).unwrap(), index_before);
+        assert!(matches!(
+            ledger.apply_prune_plan(13, 2, &"00".repeat(32)),
+            Err(LedgerError::Invalid(
+                "manual prune plan token is stale or invalid"
+            ))
+        ));
+        assert_eq!(fs::read(ledger.index_path()).unwrap(), index_before);
+
+        let applied = ledger.apply_prune_plan(13, 2, &plan.plan_token).unwrap();
+        assert_eq!(applied, plan);
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(14, 15)]);
+        assert!(!ledger.slot_path(0).exists());
+        assert!(!ledger.slot_path(1).exists());
+        assert!(ledger.slot_path(2).exists());
+        assert!(!ledger.prune_path().exists());
+        drop(ledger);
+
+        let reopened = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(reopened.retained_ranges().unwrap(), vec![(14, 15)]);
+    }
+
+    #[test]
+    fn manual_prune_uses_only_complete_segments_and_rejects_stale_tokens() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 5,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        ledger.append(13, &[vec![13]]).unwrap();
+
+        let crossing = ledger.plan_prune_through(11, 1).unwrap();
+        assert_eq!(crossing.segments_removed, 0);
+        assert_eq!(crossing.effective_through_height, None);
+        assert_eq!(crossing.first_retained_height, Some(10));
+        ledger.append(14, &[vec![14]]).unwrap();
+        assert!(matches!(
+            ledger.apply_prune_plan(11, 1, &crossing.plan_token),
+            Err(LedgerError::Invalid(
+                "manual prune plan token is stale or invalid"
+            ))
+        ));
+        assert_eq!(
+            ledger.retained_ranges().unwrap(),
+            vec![(10, 12), (13, 13), (14, 14)]
+        );
+    }
+
+    #[test]
+    fn manual_prune_sync_failures_reopen_to_old_or_complete_state() {
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 5,
+        };
+        for point in [
+            LedgerSyncPoint::PruneIntentFile,
+            LedgerSyncPoint::PruneIntentPublish,
+            LedgerSyncPoint::IndexFile,
+            LedgerSyncPoint::IndexPublish,
+            LedgerSyncPoint::RetiredSlotRemoval,
+            LedgerSyncPoint::PruneIntentRemoval,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let durability = Arc::new(FailOnceDurability::new(point));
+            let ledger =
+                PrunedBlockLedger::open_with_durability(dir.path(), retention, durability.clone())
+                    .unwrap();
+            ledger.append(10, &[vec![10], vec![11]]).unwrap();
+            ledger.append(12, &[vec![12], vec![13]]).unwrap();
+            ledger.append(14, &[vec![14], vec![15]]).unwrap();
+            let plan = ledger.plan_prune_through(13, 2).unwrap();
+            durability.arm();
+            assert!(matches!(
+                ledger.apply_prune_plan(13, 2, &plan.plan_token),
+                Err(LedgerError::Io(_))
+            ));
+            assert!(durability.did_fail());
+            drop(ledger);
+
+            let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+            if point == LedgerSyncPoint::PruneIntentFile {
+                assert_eq!(
+                    recovered.retained_ranges().unwrap(),
+                    vec![(10, 11), (12, 13), (14, 15)]
+                );
+            } else {
+                assert_eq!(recovered.retained_ranges().unwrap(), vec![(14, 15)]);
+                assert!(!recovered.prune_path().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn future_manual_prune_intent_is_refused_without_rewrite() {
+        let dir = TempDir::new().unwrap();
+        drop(PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap());
+        let intent_path = dir.path().join(PRUNE_FILE);
+        let future =
+            br#"{"schema_version":2,"requested_through_height":10,"minimum_blocks_preserved":1}"#;
+        fs::write(&intent_path, future).unwrap();
+        assert!(matches!(
+            PrunedBlockLedger::open(dir.path(), LedgerRetention::default()),
+            Err(LedgerError::Invalid(
+                "unsupported ledger prune intent schema version"
+            ))
+        ));
+        assert_eq!(fs::read(intent_path).unwrap(), future);
     }
 
     #[test]

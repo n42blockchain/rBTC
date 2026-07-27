@@ -1458,9 +1458,18 @@ pub enum NodeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OfflineAction {
     UtxoActivityReport,
-    RetierUtxos { hot_window_blocks: u32 },
+    RetierUtxos {
+        hot_window_blocks: u32,
+    },
     DownloadCoreSnapshot(SnapshotDownloadConfig),
-    VerifyStorage { max_segments: u32, max_bytes: u64 },
+    VerifyStorage {
+        max_segments: u32,
+        max_bytes: u64,
+    },
+    PruneStorage {
+        through_height: u32,
+        plan_token: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2862,7 +2871,7 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
             let mut logging = options.logging.clone();
             if matches!(
                 options.offline_action.as_ref(),
-                Some(OfflineAction::VerifyStorage { .. })
+                Some(OfflineAction::VerifyStorage { .. } | OfflineAction::PruneStorage { .. })
             ) {
                 // A read-only audit must not create or rotate a data-directory
                 // log merely because diagnostics were initialized.
@@ -3200,6 +3209,70 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         }
         return Ok(());
     }
+    if let Some(OfflineAction::PruneStorage {
+        through_height,
+        plan_token,
+    }) = &options.offline_action
+    {
+        let data_dir = options
+            .data_dir
+            .as_ref()
+            .expect("manual prune parser requires data directory");
+        let blocks = data_dir.join("blocks");
+        if let Some(plan_token) = plan_token {
+            let _exclusive_lock = DataDirectoryLock::acquire(data_dir, options.network)?;
+            let audit = PrunedBlockLedger::audit(
+                &blocks,
+                MAX_STORAGE_AUDIT_SEGMENTS,
+                MAX_STORAGE_AUDIT_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
+            if !audit.complete || !audit.issues.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "applied": false,
+                        "audit": audit,
+                    }))
+                    .expect("manual prune audit serialization is infallible")
+                );
+                return Err(
+                    "manual prune refused because the prerequisite freezer audit is not clean"
+                        .to_owned(),
+                );
+            }
+            let ledger =
+                PrunedBlockLedger::open_persisted(&blocks).map_err(|error| error.to_string())?;
+            let plan = ledger
+                .apply_prune_plan(*through_height, MIN_PRUNE_RETENTION_BLOCKS, plan_token)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "applied": true,
+                    "plan": plan,
+                }))
+                .expect("manual prune result serialization is infallible")
+            );
+        } else {
+            let _read_lock = DataDirectoryReadLock::acquire(data_dir)?;
+            let plan = PrunedBlockLedger::plan_prune_read_only(
+                &blocks,
+                *through_height,
+                MIN_PRUNE_RETENTION_BLOCKS,
+            )
+            .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "applied": false,
+                    "plan": plan,
+                }))
+                .expect("manual prune plan serialization is infallible")
+            );
+        }
+        return Ok(());
+    }
     if options.network_execution.is_experimental() {
         rbtc_warn!(
             "WARNING: experimental {} block execution is enabled for validation only; \
@@ -3248,7 +3321,11 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         Some(OfflineAction::RetierUtxos { hot_window_blocks }) => {
             return retier_utxos(&options, *hot_window_blocks);
         }
-        Some(OfflineAction::DownloadCoreSnapshot(_) | OfflineAction::VerifyStorage { .. })
+        Some(
+            OfflineAction::DownloadCoreSnapshot(_)
+            | OfflineAction::VerifyStorage { .. }
+            | OfflineAction::PruneStorage { .. },
+        )
         | None => {}
     }
     if let Some(validation_dir) = &options.complete_assumeutxo {
@@ -9077,6 +9154,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut verify_storage = false;
     let mut storage_audit_max_segments = None;
     let mut storage_audit_max_bytes = None;
+    let mut manual_prune_through_height = None;
+    let mut manual_prune_token = None;
     let mut snapshot_download_source = None;
     let mut snapshot_download_output = None;
     let mut snapshot_download_bytes = None;
@@ -9335,6 +9414,32 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     ));
                 }
                 storage_audit_max_bytes = Some(bytes);
+            }
+            "--prune-through-height" => {
+                if manual_prune_through_height.is_some() {
+                    return Err(
+                        "--prune-through-height cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--prune-through-height")?;
+                manual_prune_through_height = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid manual prune height: {value}"))?,
+                );
+            }
+            "--apply-prune-token" => {
+                if manual_prune_token.is_some() {
+                    return Err("--apply-prune-token cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--apply-prune-token")?;
+                if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(
+                        "manual prune plan token must be exactly 64 hexadecimal characters"
+                            .to_owned(),
+                    );
+                }
+                manual_prune_token = Some(value.to_ascii_lowercase());
             }
             "--retier-utxos-window-blocks" => {
                 if utxo_retier_window_blocks.is_some() {
@@ -9924,7 +10029,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         if data_dir.is_none() {
             return Err("--verify-storage requires --data-dir".to_owned());
         }
-        if utxo_activity_report
+        if manual_prune_through_height.is_some()
+            || manual_prune_token.is_some()
+            || utxo_activity_report
             || utxo_retier_window_blocks.is_some()
             || snapshot_download.is_some()
             || snapshot_activation
@@ -9961,6 +10068,55 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         {
             return Err(
                 "storage verification is read-only and conflicts with peer, synchronization, snapshot, validation, serving, mutation, storage-target, and file-logging modes"
+                    .to_owned(),
+            );
+        }
+    }
+    if manual_prune_token.is_some() && manual_prune_through_height.is_none() {
+        return Err("--apply-prune-token requires --prune-through-height".to_owned());
+    }
+    if manual_prune_through_height.is_some() {
+        if data_dir.is_none() {
+            return Err("--prune-through-height requires --data-dir".to_owned());
+        }
+        if verify_storage
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || snapshot_download.is_some()
+            || snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target
+            || prune_blocks.is_some()
+            || prune_max_bytes.is_some()
+            || minimum_free_bytes.is_some()
+            || active_chainstate_cache_bytes.is_some()
+            || background_chainstate_cache_bytes.is_some()
+            || bulk_validation_cache_bytes.is_some()
+            || automatic_hot_standbys.is_some()
+            || mempool_max_transactions.is_some()
+            || mempool_max_bytes.is_some()
+            || log_dir.is_some()
+            || log_max_bytes.is_some()
+            || log_max_files.is_some()
+        {
+            return Err(
+                "manual pruning is offline and conflicts with peer, synchronization, snapshot, validation, serving, other storage, and file-logging modes"
                     .to_owned(),
             );
         }
@@ -10286,7 +10442,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 max_bytes: storage_audit_max_bytes.unwrap_or(DEFAULT_STORAGE_AUDIT_MAX_BYTES),
             })
         } else {
-            None
+            manual_prune_through_height.map(|through_height| OfflineAction::PruneStorage {
+                through_height,
+                plan_token: manual_prune_token,
+            })
         },
         validation_limits,
         ledger_retention,
@@ -10399,6 +10558,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --utxo-activity-report\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-storage [--verify-storage-max-segments 1..4096] [--verify-storage-max-bytes 1048576..17179869184]\n",
+            "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
@@ -13772,6 +13932,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parses_two_phase_offline_manual_pruning() {
+        let dry_run = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-manual-prune",
+                "--prune-through-height",
+                "900000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            dry_run.offline_action,
+            Some(OfflineAction::PruneStorage {
+                through_height: 900_000,
+                plan_token: None,
+            })
+        );
+        let token = "AB".repeat(32);
+        let apply = parse_options(
+            [
+                "--network".to_owned(),
+                "bitcoin".to_owned(),
+                "--data-dir".to_owned(),
+                "/tmp/rbtc-manual-prune".to_owned(),
+                "--prune-through-height".to_owned(),
+                "900000".to_owned(),
+                "--apply-prune-token".to_owned(),
+                token,
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            apply.offline_action,
+            Some(OfflineAction::PruneStorage {
+                through_height: 900_000,
+                plan_token: Some("ab".repeat(32)),
+            })
+        );
+
+        for arguments in [
+            vec!["--network", "bitcoin", "--prune-through-height", "900000"],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-manual-prune",
+                "--apply-prune-token",
+                "abababababababababababababababababababababababababababababababab",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-manual-prune",
+                "--prune-through-height",
+                "900000",
+                "--apply-prune-token",
+                "bad",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-manual-prune",
+                "--prune-through-height",
+                "900000",
+                "--verify-storage",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn storage_audit_command_does_not_open_or_modify_node_databases() {
         let directory = TempDir::new().unwrap();
@@ -13802,6 +14043,71 @@ mod tests {
 
         assert_eq!(fs::read(marker_path).unwrap(), marker);
         assert_eq!(fs::read(index_path).unwrap(), index);
+        assert!(!directory.path().join("chainstate.redb").exists());
+        assert!(!directory.path().join("logs").exists());
+    }
+
+    #[tokio::test]
+    async fn manual_prune_command_requires_dry_run_token_and_applies_exact_plan() {
+        let directory = TempDir::new().unwrap();
+        drop(DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap());
+        let blocks_path = directory.path().join("blocks");
+        let retention = LedgerRetention {
+            max_blocks: 500,
+            max_bytes: 10_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(&blocks_path, retention).unwrap();
+        ledger.append(1, &vec![vec![1]; 150]).unwrap();
+        ledger.append(151, &vec![vec![2]; 150]).unwrap();
+        ledger.append(301, &vec![vec![3]; 150]).unwrap();
+        drop(ledger);
+        let index_path = blocks_path.join("ledger-index.json");
+        let index_before = fs::read(&index_path).unwrap();
+
+        let dry_run = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--prune-through-height".to_owned(),
+                "150".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        run_with_nonce(dry_run, 1).await.unwrap();
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        let plan =
+            PrunedBlockLedger::plan_prune_read_only(&blocks_path, 150, MIN_PRUNE_RETENTION_BLOCKS)
+                .unwrap();
+        assert_eq!(plan.effective_through_height, Some(150));
+        assert_eq!(plan.first_retained_height, Some(151));
+
+        let apply = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--prune-through-height".to_owned(),
+                "150".to_owned(),
+                "--apply-prune-token".to_owned(),
+                plan.plan_token,
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        run_with_nonce(apply, 1).await.unwrap();
+
+        let reopened = PrunedBlockLedger::open_persisted(&blocks_path).unwrap();
+        assert_eq!(
+            reopened.retained_ranges().unwrap(),
+            vec![(151, 300), (301, 450)]
+        );
         assert!(!directory.path().join("chainstate.redb").exists());
         assert!(!directory.path().join("logs").exists());
     }

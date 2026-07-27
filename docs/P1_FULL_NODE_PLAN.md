@@ -158,9 +158,11 @@ ceilings are now persisted only after recovery and physical trimming succeed.
 The strict versioned policy refuses unknown future schemas and survives
 file/directory-sync interruption without a partial state. Embedded status and
 events, authenticated blockchain status, and Prometheus expose both targets,
-the retained range, and physical-prefix progress. An explicit height-triggered
-manual prune command remains part of item 1. The freezer portion of item 3 is
-also implemented: `--verify-storage` uses fixed memory and explicit work
+the retained range, and physical-prefix progress. Item 1 is complete: manual
+height-triggered pruning is an offline two-phase plan/token operation, preserves
+at least 288 retained-tip blocks, requires a clean audit and unchanged index,
+and resumes a versioned intent after any post-publication crash. The freezer
+portion of item 3 is also implemented: `--verify-storage` uses fixed memory and explicit work
 budgets, refuses concurrent node access, never opens mutable databases, and
 returns machine-readable findings plus an ordered, non-executed repair plan.
 Cross-store offline `verifychain` remains open, as do items 2, 4, and 5.

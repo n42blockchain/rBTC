@@ -102,6 +102,23 @@ JSON dry-run repair plan, and returns failure for any issue or incomplete
 budget. It never opens chainstate, creates a database, writes a file log, or
 executes a repair.
 
+Manual freezer pruning uses a mandatory two-phase plan:
+
+```text
+rbtcd --network bitcoin --data-dir /srv/rbtc/bitcoin \
+  --prune-through-height 950000
+rbtcd --network bitcoin --data-dir /srv/rbtc/bitcoin \
+  --prune-through-height 950000 --apply-prune-token PLAN_TOKEN
+```
+
+The first command is read-only. The token commits to the durable ledger index,
+request, exact complete segments, retained range, and reclaimed bytes. The
+second command takes the exclusive lock, runs a complete freezer audit, and
+refuses a stale token before creating a versioned prune intent. It never splits
+an immutable archive and always preserves at least 288 retained-tip blocks, so
+the effective height can be below the requested height. Index publication
+precedes deletion; startup resumes a durable intent after interruption.
+
 Every persistent data directory is checked before database open and before
 each atomic validation checkpoint or live transaction-persistence cycle.
 `minimum_free_bytes` is the operator reserve (default 5 GiB). The enforced
