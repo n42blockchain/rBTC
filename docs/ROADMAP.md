@@ -226,8 +226,10 @@ optional where appropriate, and host-runtime compatible.
   TRUC behavior, replacement, standard scripts, and estimator behavior.
   Consensus and local policy must remain separate modules and separate test
   expectations.
-- [ ] **Operator configuration and diagnostics.** Add a bounded network-scoped
-  config file, explicit cache/freezer/mempool/peer limits, structured
+- [ ] **Operator configuration and diagnostics.** The library/CLI now share
+  strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
+  AssumeUTXO bounds, with subsystem status/events available to an embedded
+  host. Add a bounded network-scoped config file, structured
   rate-limited rotating logs, graceful RPC stop, runtime logging controls, and
   stable equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`,
   `getmempoolinfo`, `getindexinfo`, and `verifychain`. Exact response-field

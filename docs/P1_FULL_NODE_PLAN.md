@@ -1,6 +1,6 @@
 # P1 full-node completion plan
 
-Status date: 2026-07-26.
+Status date: 2026-07-27.
 
 This plan expands the P1 section of the production roadmap. P0 fast bootstrap,
 maximum-work/snapshot validation, data-backed UTXO tiers, and bounded freezer
@@ -57,11 +57,15 @@ cannot expose a partial checkpoint, two isolated regtest instances can run in
 one Tokio process, and the standalone CLI passes its unchanged end-to-end
 suite.
 
-Implemented on 2026-07-26: items 1–3, bounded lifecycle status/events from item
-5, a critical-task-shaped external-crate ownership test from item 6, and the
-two-instance acceptance test. Full typed configuration, subsystem events, and
-the exact sibling executor fixture remain the next ordered P1.0 work; direct
-`n42-26` linkage remains behind the licensing decision described above.
+Implemented and accepted on 2026-07-27: all six items. The public typed
+configuration covers every persistent subsystem and shares fail-fast bounds
+with the CLI adapter; typed latest-value status and bounded delta events cover
+peer, header, execution, reorg, freezer, index, trust, lifecycle, and failure
+state. External-crate tests prove two isolated instances and real regtest P2P
+observation. The exact sibling fixture uses Reth's real critical-task executor.
+Direct distribution of a combined `n42-26` binary remains behind the licensing
+decision described above; that policy gate does not reopen the technical P1.0
+work.
 
 ### P1.1 — operator lifecycle and diagnostics
 
@@ -157,7 +161,7 @@ rate limits, authorization audit coverage, cancellation, and fuzzed parsers.
 
 ## Completion accounting
 
-P1.0 is the dependency of every later phase. P1.1 and P1.4 follow, then P1.2,
+P1.0 is complete and is the dependency of every later phase. P1.1 and P1.4 follow, then P1.2,
 P1.3, P1.5, P1.6, and P1.7. A phase is checked in the main roadmap only after
 implementation, crash/restart tests, interoperability evidence, operator
 documentation, and a public-network acceptance run all exist.

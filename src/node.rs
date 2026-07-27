@@ -141,6 +141,8 @@ const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
 const MIN_PRUNE_RETENTION_BLOCKS: u32 = 288;
 const MIN_PRUNE_MAX_BYTES: u64 = 550 * 1024 * 1024;
+const MIN_CHAINSTATE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHAINSTATE_CACHE_BYTES: usize = 64 * 1024 * 1024 * 1024;
 
 const fn validation_prefetch_limit(maximum_batch_size: usize) -> usize {
     if maximum_batch_size < MAX_VALIDATION_PREFETCH_BATCH_SIZE {
@@ -194,23 +196,360 @@ struct Options {
     offline_action: Option<OfflineAction>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+    cache: NodeCacheConfig,
     runtime_control: Arc<RuntimeControl>,
+    observer: Option<NodeObserver>,
+}
+
+/// Complete typed configuration for one ordinary persistent embedded node.
+///
+/// Offline snapshot activation/download and repair commands remain separate
+/// tools. This type covers the long-running node surface, including background
+/// AssumeUTXO validation and authenticated loopback APIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeConfig {
+    /// Selected Bitcoin network.
+    pub network: Network,
+    /// Isolated durable data directory for this instance.
+    pub data_dir: PathBuf,
+    /// Ordered manually preferred outbound peers.
+    pub preferred_peers: Vec<SocketAddr>,
+    /// DNS bootstrap policy.
+    pub dns_seeds: NodeDnsSeedPolicy,
+    /// Return after reaching the current maximum-work peer tip.
+    pub once: bool,
+    /// Opt in to full-RBF mempool policy.
+    pub mempool_full_rbf: bool,
+    /// Bounded chainstate cache budgets.
+    pub cache: NodeCacheConfig,
+    /// Bounded local freezer retention.
+    pub storage: NodeStorageConfig,
+    /// Optional loopback explorer/RPC/wallet services.
+    pub api: Option<NodeApiConfig>,
+    /// Consensus and IBD policy overrides.
+    pub consensus: NodeConsensusConfig,
+    /// Optional independent genesis validation of an assumed snapshot.
+    pub assumeutxo_validation: Option<NodeAssumeUtxoValidation>,
+}
+
+impl NodeConfig {
+    /// Creates one persistent node with Core 31 network defaults.
+    #[must_use]
+    pub fn new(network: Network, data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            network,
+            data_dir: data_dir.into(),
+            preferred_peers: Vec::new(),
+            dns_seeds: NodeDnsSeedPolicy::Pinned,
+            once: false,
+            mempool_full_rbf: false,
+            cache: NodeCacheConfig::default(),
+            storage: NodeStorageConfig::default(),
+            api: None,
+            consensus: NodeConsensusConfig::default(),
+            assumeutxo_validation: None,
+        }
+    }
+
+    /// Validates every bound and cross-field dependency without opening files
+    /// or sockets.
+    pub fn validate(&self) -> Result<(), NodeConfigError> {
+        self.clone().into_options().map(drop)
+    }
+
+    fn into_options(self) -> Result<Options, NodeConfigError> {
+        let deployments = parse_deployment_config(
+            self.network,
+            true,
+            self.consensus.version_bits,
+            self.consensus.activation_heights,
+        )
+        .map_err(NodeConfigError::new)?;
+        let mut deployments = deployments;
+        if let Some(challenge) = self.consensus.signet_challenge {
+            deployments
+                .set_signet_challenge(challenge)
+                .map_err(|error| NodeConfigError::new(error.to_string()))?;
+        }
+        let ibd_policy = parse_ibd_policy(
+            self.network,
+            deployments.is_custom_signet(),
+            true,
+            self.consensus.minimum_chainwork,
+            self.consensus.assume_valid,
+        )
+        .map_err(NodeConfigError::new)?;
+        let dns_seeds = match self.dns_seeds {
+            NodeDnsSeedPolicy::Pinned if deployments.is_custom_signet() => Some(Vec::new()),
+            NodeDnsSeedPolicy::Pinned => None,
+            NodeDnsSeedPolicy::Disabled => Some(Vec::new()),
+            NodeDnsSeedPolicy::Custom(seeds) => {
+                Some(seeds.into_iter().map(NodeDnsSeed::into_internal).collect())
+            }
+        };
+        let (explorer_listen, wallet_api_files, rpc_auth_token_file) =
+            self.api.map_or((None, None, None), |api| {
+                (
+                    Some(api.listen),
+                    api.wallet.map(|wallet| WalletApiFiles {
+                        descriptors: wallet.descriptors,
+                        auth_token: wallet.auth_token,
+                    }),
+                    api.rpc_auth_token,
+                )
+            });
+        let (complete_assumeutxo, background_assumeutxo, cleanup_validation_dir, validation_limits) =
+            self.assumeutxo_validation.map_or(
+                (None, None, false, ValidationLimits::default()),
+                |validation| {
+                    let (complete, background, config) = match validation {
+                        NodeAssumeUtxoValidation::Complete(config) => (true, false, config),
+                        NodeAssumeUtxoValidation::Background(config) => (false, true, config),
+                    };
+                    let limits = ValidationLimits {
+                        max_blocks_per_batch: config.limits.max_blocks_per_batch,
+                        pause_between_batches: config.limits.pause_between_batches,
+                        quick_repair: config.limits.quick_repair,
+                    };
+                    let validation_dir = config.validation_dir;
+                    (
+                        complete.then(|| validation_dir.clone()),
+                        background.then_some(validation_dir),
+                        config.cleanup_on_success,
+                        limits,
+                    )
+                },
+            );
+        validate_runtime_options(Options {
+            remotes: self.preferred_peers,
+            dns_seeds,
+            network: self.network,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(self.data_dir),
+            once: self.once,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen,
+            wallet_api_files,
+            rpc_auth_token_file,
+            deployments,
+            ibd_policy,
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo,
+            background_assumeutxo,
+            mempool_full_rbf: self.mempool_full_rbf,
+            cleanup_validation_dir,
+            offline_action: None,
+            validation_limits,
+            ledger_retention: LedgerRetention {
+                max_blocks: self.storage.prune_blocks,
+                max_bytes: self.storage.prune_bytes,
+                ..LedgerRetention::default()
+            },
+            cache: self.cache,
+            runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
+        })
+        .map_err(NodeConfigError::new)
+    }
+}
+
+/// Invalid embedded node configuration.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("invalid node configuration: {message}")]
+pub struct NodeConfigError {
+    message: String,
+}
+
+impl NodeConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// DNS bootstrap selection for an embedded node.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NodeDnsSeedPolicy {
+    /// Use the release-pinned Core 31 seed set.
+    #[default]
+    Pinned,
+    /// Disable DNS bootstrap and use only manual or persisted peers.
+    Disabled,
+    /// Replace pinned seeds with an ordered, bounded custom set.
+    Custom(Vec<NodeDnsSeed>),
+}
+
+/// One validated DNS seed host and explicit port.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct NodeDnsSeed {
+    host: String,
+    port: u16,
+}
+
+impl NodeDnsSeed {
+    /// Validates and normalizes one DNS name or IP address.
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, NodeConfigError> {
+        let host = host.into();
+        let rendered = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let seed = parse_dns_seed(&rendered, Network::Bitcoin).map_err(NodeConfigError::new)?;
+        Ok(Self {
+            host: seed.host,
+            port: seed.port,
+        })
+    }
+
+    /// Normalized host without brackets.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Explicit P2P port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn into_internal(self) -> DnsSeed {
+        DnsSeed {
+            host: self.host,
+            port: self.port,
+        }
+    }
+}
+
+/// Bounded cache budgets for one node instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeCacheConfig {
+    /// Ordinary active-chain cache.
+    pub active_chainstate_bytes: usize,
+    /// Cache while active and genesis-validation pipelines coexist.
+    pub background_chainstate_bytes: usize,
+    /// Cache for explicit high-throughput bounded validation.
+    pub bulk_validation_bytes: usize,
+}
+
+impl Default for NodeCacheConfig {
+    fn default() -> Self {
+        Self {
+            active_chainstate_bytes: 1024 * 1024 * 1024,
+            background_chainstate_bytes: BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES,
+            bulk_validation_bytes: BULK_VALIDATION_CHAINSTATE_CACHE_BYTES,
+        }
+    }
+}
+
+/// Bounded freezer policy for one node instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeStorageConfig {
+    /// Maximum locally retrievable block window.
+    pub prune_blocks: u32,
+    /// Maximum compressed freezer bytes.
+    pub prune_bytes: u64,
+}
+
+impl Default for NodeStorageConfig {
+    fn default() -> Self {
+        Self {
+            prune_blocks: DEFAULT_RETENTION_BLOCKS,
+            prune_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+/// Optional loopback service configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeApiConfig {
+    /// Loopback listen address for explorer and authenticated subrouters.
+    pub listen: SocketAddr,
+    /// Optional owner-only bearer-token file for read-only RPC.
+    pub rpc_auth_token: Option<PathBuf>,
+    /// Optional watch-only wallet configuration.
+    pub wallet: Option<NodeWalletApiConfig>,
+}
+
+/// Watch-only wallet files for the embedded API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeWalletApiConfig {
+    /// Owner-only public descriptor configuration.
+    pub descriptors: PathBuf,
+    /// Owner-only bearer-token file.
+    pub auth_token: PathBuf,
+}
+
+/// Core-compatible consensus and IBD policy overrides.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NodeConsensusConfig {
+    /// Ordered Core-compatible `vbparams` values.
+    pub version_bits: Vec<String>,
+    /// Ordered Core-compatible buried activation overrides.
+    pub activation_heights: Vec<String>,
+    /// Exact custom BIP325 Signet challenge script.
+    pub signet_challenge: Option<Vec<u8>>,
+    /// Optional 256-bit hexadecimal minimum chainwork override.
+    pub minimum_chainwork: Option<String>,
+    /// Optional assume-valid block hash or zero.
+    pub assume_valid: Option<String>,
+}
+
+/// Bounded independent genesis-validation resources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeValidationConfig {
+    /// Blocks in one atomic validation checkpoint.
+    pub max_blocks_per_batch: usize,
+    /// Optional pause between background checkpoints.
+    pub pause_between_batches: Duration,
+    /// Allow the storage engine's bounded quick-repair path.
+    pub quick_repair: bool,
+}
+
+impl Default for NodeValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_blocks_per_batch: DEFAULT_VALIDATION_BATCH_SIZE,
+            pause_between_batches: Duration::ZERO,
+            quick_repair: true,
+        }
+    }
+}
+
+/// Shared parameters for sequential or background AssumeUTXO verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeAssumeUtxoConfig {
+    /// Isolated genesis-validation data directory.
+    pub validation_dir: PathBuf,
+    /// Bounded checkpoint resources.
+    pub limits: NodeValidationConfig,
+    /// Quarantine and remove the validation directory after finalization.
+    pub cleanup_on_success: bool,
+}
+
+/// How an embedded node independently verifies an assumed UTXO base.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeAssumeUtxoValidation {
+    /// Validate to the assumed base before serving the active node.
+    Complete(NodeAssumeUtxoConfig),
+    /// Serve base-to-tip state while genesis validation progresses separately.
+    Background(NodeAssumeUtxoConfig),
 }
 
 /// Builder for one outbound validating node owned by a host Tokio runtime.
 ///
-/// The first embedding surface deliberately covers the ordinary persistent
-/// node. Snapshot activation, wallet/RPC mounting, and background AssumeUTXO
-/// orchestration remain explicit higher-level modules instead of hidden
-/// side-effects of this builder.
+/// The typed surface covers an ordinary persistent node, optional loopback
+/// explorer/RPC/watch-only-wallet services, and independent AssumeUTXO
+/// validation. Offline snapshot installation/download and repair actions remain
+/// explicit tools rather than hidden launch side effects.
 #[derive(Clone, Debug)]
 pub struct NodeBuilder {
-    network: Network,
-    data_dir: PathBuf,
-    remotes: Vec<SocketAddr>,
-    once: bool,
-    mempool_full_rbf: bool,
-    ledger_retention: LedgerRetention,
+    config: NodeConfig,
 }
 
 impl NodeBuilder {
@@ -218,35 +557,70 @@ impl NodeBuilder {
     #[must_use]
     pub fn new(network: Network, data_dir: impl Into<PathBuf>) -> Self {
         Self {
-            network,
-            data_dir: data_dir.into(),
-            remotes: Vec::new(),
-            once: false,
-            mempool_full_rbf: false,
-            ledger_retention: LedgerRetention::default(),
+            config: NodeConfig::new(network, data_dir),
         }
+    }
+
+    /// Creates a builder from the complete typed embedded configuration.
+    #[must_use]
+    pub const fn from_config(config: NodeConfig) -> Self {
+        Self { config }
+    }
+
+    /// Returns the complete typed configuration before launch.
+    #[must_use]
+    pub const fn config(&self) -> &NodeConfig {
+        &self.config
     }
 
     /// Adds one preferred outbound peer before persisted peers and DNS seeds.
     #[must_use]
     pub fn connect(mut self, remote: SocketAddr) -> Self {
-        if !self.remotes.contains(&remote) {
-            self.remotes.push(remote);
+        if !self.config.preferred_peers.contains(&remote) {
+            self.config.preferred_peers.push(remote);
         }
+        self
+    }
+
+    /// Selects pinned, disabled, or custom DNS bootstrap.
+    #[must_use]
+    pub fn dns_seeds(mut self, policy: NodeDnsSeedPolicy) -> Self {
+        self.config.dns_seeds = policy;
         self
     }
 
     /// Returns after reaching the current peer-advertised maximum-work tip.
     #[must_use]
     pub const fn once(mut self, enabled: bool) -> Self {
-        self.once = enabled;
+        self.config.once = enabled;
         self
     }
 
     /// Enables opt-in full-RBF transaction admission policy.
     #[must_use]
     pub const fn mempool_full_rbf(mut self, enabled: bool) -> Self {
-        self.mempool_full_rbf = enabled;
+        self.config.mempool_full_rbf = enabled;
+        self
+    }
+
+    /// Sets bounded active, background, and bulk chainstate cache budgets.
+    #[must_use]
+    pub const fn cache(mut self, cache: NodeCacheConfig) -> Self {
+        self.config.cache = cache;
+        self
+    }
+
+    /// Mounts optional loopback explorer/RPC/watch-only-wallet services.
+    #[must_use]
+    pub fn api(mut self, api: NodeApiConfig) -> Self {
+        self.config.api = Some(api);
+        self
+    }
+
+    /// Configures sequential or concurrent independent snapshot verification.
+    #[must_use]
+    pub fn assumeutxo_validation(mut self, validation: NodeAssumeUtxoValidation) -> Self {
+        self.config.assumeutxo_validation = Some(validation);
         self
     }
 
@@ -256,21 +630,29 @@ impl NodeBuilder {
     /// compressed-byte target must be at least 550 MiB.
     #[must_use]
     pub const fn ledger_retention(mut self, max_blocks: u32, max_bytes: u64) -> Self {
-        self.ledger_retention.max_blocks = max_blocks;
-        self.ledger_retention.max_bytes = max_bytes;
+        self.config.storage.prune_blocks = max_blocks;
+        self.config.storage.prune_bytes = max_bytes;
         self
     }
 
     /// Starts the node as a host-owned Tokio task.
     pub fn launch(self) -> Result<NodeHandle, NodeError> {
-        let options = self.into_options()?;
+        let mut options = self.into_options()?;
         tokio::runtime::Handle::try_current().map_err(|_| NodeError::MissingRuntime)?;
         let runtime_control = Arc::clone(&options.runtime_control);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let (lifecycle, lifecycle_rx) = watch::channel(NodeLifecycle::Starting);
+        let (runtime_status, runtime_status_rx) =
+            watch::channel(NodeRuntimeStatus::starting(options.network));
         let (events, _) = broadcast::channel(NODE_EVENT_CAPACITY);
+        let observer = NodeObserver {
+            status: runtime_status.clone(),
+            events: events.clone(),
+        };
+        options.observer = Some(observer.clone());
         let task_lifecycle = lifecycle.clone();
         let task_events = events.clone();
+        let task_observer = observer;
         let task = tokio::spawn(async move {
             task_lifecycle.send_replace(NodeLifecycle::Running);
             let _ = task_events.send(NodeEvent::Started);
@@ -300,6 +682,7 @@ impl NodeBuilder {
                 Err(error) => {
                     let message = error.to_string();
                     task_lifecycle.send_replace(NodeLifecycle::Failed(message.clone()));
+                    task_observer.failed(message.clone());
                     let _ = task_events.send(NodeEvent::Failed { message });
                 }
             }
@@ -310,60 +693,150 @@ impl NodeBuilder {
             task: Some(task),
             lifecycle_sender: lifecycle,
             lifecycle: lifecycle_rx,
+            runtime_status_sender: runtime_status,
+            runtime_status: runtime_status_rx,
             events,
         })
     }
 
     fn into_options(self) -> Result<Options, NodeError> {
-        if self.data_dir.as_os_str().is_empty() {
-            return Err(NodeError::InvalidConfig(
-                "data directory must not be empty".to_owned(),
+        self.config
+            .into_options()
+            .map_err(|error| NodeError::InvalidConfig(error.message))
+    }
+}
+
+fn validate_runtime_options(options: Options) -> Result<Options, String> {
+    validate_peer_options(&options)?;
+    validate_storage_options(&options)?;
+    validate_validation_options(&options)?;
+    validate_api_options(&options)?;
+    Ok(options)
+}
+
+fn validate_peer_options(options: &Options) -> Result<(), String> {
+    if options
+        .data_dir
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
+        return Err("data directory must not be empty".to_owned());
+    }
+    if options.remotes.len() > MAX_CONFIGURED_PEERS {
+        return Err(format!(
+            "at most {MAX_CONFIGURED_PEERS} preferred peers are supported"
+        ));
+    }
+    if options.remotes.iter().collect::<HashSet<_>>().len() != options.remotes.len() {
+        return Err("preferred peers must be unique".to_owned());
+    }
+    if let Some(seeds) = &options.dns_seeds {
+        if seeds.len() > MAX_DNS_SEEDS {
+            return Err(format!("at most {MAX_DNS_SEEDS} DNS seeds are supported"));
+        }
+        if seeds.iter().collect::<HashSet<_>>().len() != seeds.len() {
+            return Err("DNS seeds must be unique".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_storage_options(options: &Options) -> Result<(), String> {
+    if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS)
+        .contains(&options.ledger_retention.max_blocks)
+    {
+        return Err(format!(
+            "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+        ));
+    }
+    if options.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
+        return Err(format!(
+            "prune byte target must be at least {MIN_PRUNE_MAX_BYTES}"
+        ));
+    }
+    for (name, bytes) in [
+        ("active chainstate", options.cache.active_chainstate_bytes),
+        (
+            "background chainstate",
+            options.cache.background_chainstate_bytes,
+        ),
+        ("bulk validation", options.cache.bulk_validation_bytes),
+    ] {
+        if !(MIN_CHAINSTATE_CACHE_BYTES..=MAX_CHAINSTATE_CACHE_BYTES).contains(&bytes) {
+            return Err(format!(
+                "{name} cache must be between {MIN_CHAINSTATE_CACHE_BYTES} and {MAX_CHAINSTATE_CACHE_BYTES} bytes"
             ));
         }
-        if self.remotes.len() > MAX_CONFIGURED_PEERS {
-            return Err(NodeError::InvalidConfig(format!(
-                "at most {MAX_CONFIGURED_PEERS} preferred peers are supported"
-            )));
-        }
-        if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS)
-            .contains(&self.ledger_retention.max_blocks)
-        {
-            return Err(NodeError::InvalidConfig(format!(
-                "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
-            )));
-        }
-        if self.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
-            return Err(NodeError::InvalidConfig(format!(
-                "prune byte target must be at least {MIN_PRUNE_MAX_BYTES}"
-            )));
-        }
-        Ok(Options {
-            remotes: self.remotes,
-            dns_seeds: None,
-            network: self.network,
-            fetch_block: None,
-            headers_db: None,
-            data_dir: Some(self.data_dir),
-            once: self.once,
-            network_execution: NetworkExecutionMode::Persistent,
-            explorer_listen: None,
-            wallet_api_files: None,
-            rpc_auth_token_file: None,
-            deployments: DeploymentConfig::for_network(self.network),
-            ibd_policy: IbdPolicy::for_network(self.network),
-            snapshot: None,
-            finalize_assumeutxo: None,
-            validation_target: None,
-            complete_assumeutxo: None,
-            background_assumeutxo: None,
-            mempool_full_rbf: self.mempool_full_rbf,
-            cleanup_validation_dir: false,
-            offline_action: None,
-            validation_limits: ValidationLimits::default(),
-            ledger_retention: self.ledger_retention,
-            runtime_control: Arc::new(RuntimeControl::default()),
-        })
     }
+    Ok(())
+}
+
+fn validate_validation_options(options: &Options) -> Result<(), String> {
+    if options.validation_limits.max_blocks_per_batch == 0
+        || options.validation_limits.max_blocks_per_batch > MAX_VALIDATION_BATCH_SIZE
+    {
+        return Err(format!(
+            "validation batch size must be between 1 and {MAX_VALIDATION_BATCH_SIZE}"
+        ));
+    }
+    if options.validation_limits.pause_between_batches
+        > Duration::from_millis(MAX_VALIDATION_PAUSE_MS)
+    {
+        return Err(format!(
+            "validation pause must be at most {MAX_VALIDATION_PAUSE_MS} milliseconds"
+        ));
+    }
+    if options.complete_assumeutxo.is_some() && options.background_assumeutxo.is_some() {
+        return Err(
+            "sequential and background AssumeUTXO validation are mutually exclusive".to_owned(),
+        );
+    }
+    if options.cleanup_validation_dir
+        && options.complete_assumeutxo.is_none()
+        && options.background_assumeutxo.is_none()
+    {
+        return Err(
+            "validation-directory cleanup requires an AssumeUTXO validation mode".to_owned(),
+        );
+    }
+    if let Some(validation_dir) = options
+        .complete_assumeutxo
+        .as_ref()
+        .or(options.background_assumeutxo.as_ref())
+    {
+        if validation_dir.as_os_str().is_empty() {
+            return Err("validation data directory must not be empty".to_owned());
+        }
+        if options.data_dir.as_ref() == Some(validation_dir) {
+            return Err(
+                "validation data directory must differ from active data directory".to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_api_options(options: &Options) -> Result<(), String> {
+    if options.complete_assumeutxo.is_some() && (options.once || options.explorer_listen.is_some())
+    {
+        return Err(
+            "sequential AssumeUTXO completion conflicts with once and API service modes".to_owned(),
+        );
+    }
+    if let Some(listen) = options.explorer_listen {
+        if !listen.ip().is_loopback() {
+            return Err("embedded APIs require a loopback listen address".to_owned());
+        }
+        if options.data_dir.is_none() {
+            return Err("embedded APIs require a data directory".to_owned());
+        }
+    } else if options.wallet_api_files.is_some() || options.rpc_auth_token_file.is_some() {
+        return Err("wallet and RPC configuration require an API listener".to_owned());
+    }
+    if options.mempool_full_rbf && options.data_dir.is_none() {
+        return Err("full-RBF policy requires a data directory".to_owned());
+    }
+    Ok(())
 }
 
 /// Host-owned handle for an embedded node task.
@@ -372,6 +845,8 @@ pub struct NodeHandle {
     task: Option<tokio::task::JoinHandle<Result<(), NodeError>>>,
     lifecycle_sender: watch::Sender<NodeLifecycle>,
     lifecycle: watch::Receiver<NodeLifecycle>,
+    runtime_status_sender: watch::Sender<NodeRuntimeStatus>,
+    runtime_status: watch::Receiver<NodeRuntimeStatus>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -383,6 +858,7 @@ impl NodeHandle {
         NodeController {
             shutdown: self.shutdown.clone(),
             lifecycle: self.lifecycle.clone(),
+            runtime_status: self.runtime_status.clone(),
             events: self.events.clone(),
         }
     }
@@ -397,6 +873,18 @@ impl NodeHandle {
     #[must_use]
     pub fn subscribe_lifecycle(&self) -> watch::Receiver<NodeLifecycle> {
         self.lifecycle.clone()
+    }
+
+    /// Returns the latest typed subsystem status.
+    #[must_use]
+    pub fn status(&self) -> NodeRuntimeStatus {
+        self.runtime_status.borrow().clone()
+    }
+
+    /// Subscribes to latest-value subsystem status changes.
+    #[must_use]
+    pub fn subscribe_status(&self) -> watch::Receiver<NodeRuntimeStatus> {
+        self.runtime_status.clone()
     }
 
     /// Subscribes to the bounded lifecycle event stream.
@@ -433,6 +921,9 @@ impl NodeHandle {
                 let message = error.to_string();
                 self.lifecycle_sender
                     .send_replace(NodeLifecycle::Failed(message.clone()));
+                let mut status = self.runtime_status.borrow().clone();
+                status.last_error = Some(message.clone());
+                self.runtime_status_sender.send_replace(status);
                 let _ = self.events.send(NodeEvent::Failed { message });
                 Err(error)
             }
@@ -445,6 +936,7 @@ impl NodeHandle {
 pub struct NodeController {
     shutdown: watch::Sender<bool>,
     lifecycle: watch::Receiver<NodeLifecycle>,
+    runtime_status: watch::Receiver<NodeRuntimeStatus>,
     events: broadcast::Sender<NodeEvent>,
 }
 
@@ -459,6 +951,18 @@ impl NodeController {
     #[must_use]
     pub fn subscribe_lifecycle(&self) -> watch::Receiver<NodeLifecycle> {
         self.lifecycle.clone()
+    }
+
+    /// Returns the latest typed subsystem status.
+    #[must_use]
+    pub fn status(&self) -> NodeRuntimeStatus {
+        self.runtime_status.borrow().clone()
+    }
+
+    /// Subscribes to latest-value subsystem status changes.
+    #[must_use]
+    pub fn subscribe_status(&self) -> watch::Receiver<NodeRuntimeStatus> {
+        self.runtime_status.clone()
     }
 
     /// Subscribes to the bounded lifecycle event stream.
@@ -512,13 +1016,145 @@ pub enum NodeLifecycle {
     Failed(String),
 }
 
-/// Bounded edge-triggered lifecycle event for host observability.
+/// Typed durable tip exposed to an embedding host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeTip {
+    /// Active height.
+    pub height: u32,
+    /// Active block hash.
+    pub hash: BlockHash,
+}
+
+/// Current freezer footprint and retrievable range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeFreezerStatus {
+    /// Immutable segments in the durable live index.
+    pub segments: u32,
+    /// Locally retrievable blocks.
+    pub blocks: u32,
+    /// Compressed bytes referenced by the live index.
+    pub bytes: u64,
+    /// Oldest retrievable height.
+    pub first_height: Option<u32>,
+    /// Newest retrievable height.
+    pub tip_height: Option<u32>,
+}
+
+/// Initial-download and snapshot trust state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeTrustStatus {
+    /// Whether active work meets the configured floor.
+    pub minimum_chainwork_reached: bool,
+    /// Active assume-valid anchor height, when known.
+    pub active_assume_valid_height: Option<u32>,
+    /// Whether every connected block still receives full script validation.
+    pub full_script_validation: bool,
+    /// Whether independent genesis replay has cleared any assumed snapshot.
+    pub independently_validated: bool,
+}
+
+/// Latest-value status for one isolated embedded node instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeRuntimeStatus {
+    /// Selected network.
+    pub network: Network,
+    /// Current active outbound peer.
+    pub active_peer: Option<SocketAddr>,
+    /// Maximum-work header tip.
+    pub header: Option<NodeTip>,
+    /// Durable executed-chain tip.
+    pub execution: Option<NodeTip>,
+    /// Optional explorer projection tip.
+    pub explorer: Option<NodeTip>,
+    /// Optional wallet projection tip.
+    pub wallet: Option<NodeTip>,
+    /// UTXOs in the recent-access tier.
+    pub utxo_hot: u64,
+    /// UTXOs in the inactive tier.
+    pub utxo_cold: u64,
+    /// Current bounded freezer footprint.
+    pub freezer: NodeFreezerStatus,
+    /// Current trust/validation state.
+    pub trust: NodeTrustStatus,
+    /// Most recent terminal task error.
+    pub last_error: Option<String>,
+}
+
+impl NodeRuntimeStatus {
+    const fn starting(network: Network) -> Self {
+        Self {
+            network,
+            active_peer: None,
+            header: None,
+            execution: None,
+            explorer: None,
+            wallet: None,
+            utxo_hot: 0,
+            utxo_cold: 0,
+            freezer: NodeFreezerStatus {
+                segments: 0,
+                blocks: 0,
+                bytes: 0,
+                first_height: None,
+                tip_height: None,
+            },
+            trust: NodeTrustStatus {
+                minimum_chainwork_reached: false,
+                active_assume_valid_height: None,
+                full_script_validation: true,
+                independently_validated: false,
+            },
+            last_error: None,
+        }
+    }
+}
+
+/// Bounded edge-triggered runtime delta for host observability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NodeEvent {
     /// The host task began polling the node runtime.
     Started,
     /// A controller requested graceful shutdown.
     ShutdownRequested,
+    /// An active outbound peer was selected.
+    PeerConnected {
+        /// Remote peer address.
+        address: SocketAddr,
+    },
+    /// The active outbound peer session ended.
+    PeerDisconnected {
+        /// Remote peer address.
+        address: SocketAddr,
+    },
+    /// Maximum-work header selection advanced or changed.
+    HeaderTipChanged {
+        /// New active header tip.
+        tip: NodeTip,
+    },
+    /// Durable block execution advanced.
+    ExecutionTipChanged {
+        /// New durable execution tip.
+        tip: NodeTip,
+    },
+    /// A stale execution branch was disconnected.
+    Reorganized {
+        /// Tip before the disconnect.
+        previous: NodeTip,
+        /// Tip immediately after the disconnect.
+        current: NodeTip,
+    },
+    /// A rebuildable projection advanced.
+    IndexTipChanged {
+        /// Stable index name (`explorer` or `wallet`).
+        index: &'static str,
+        /// New durable projection tip.
+        tip: NodeTip,
+    },
+    /// Freezer retention or physical footprint changed.
+    FreezerChanged {
+        /// New durable freezer state.
+        status: NodeFreezerStatus,
+    },
     /// The node exited successfully or completed graceful shutdown.
     Stopped,
     /// The node exited with an error.
@@ -526,6 +1162,82 @@ pub enum NodeEvent {
         /// Stable human-readable error text; no credentials are included.
         message: String,
     },
+}
+
+#[derive(Clone)]
+struct NodeObserver {
+    status: watch::Sender<NodeRuntimeStatus>,
+    events: broadcast::Sender<NodeEvent>,
+}
+
+impl NodeObserver {
+    fn peer_connected(&self, address: SocketAddr) {
+        let mut status = self.status.borrow().clone();
+        if status.active_peer != Some(address) {
+            status.active_peer = Some(address);
+            self.status.send_replace(status);
+            let _ = self.events.send(NodeEvent::PeerConnected { address });
+        }
+    }
+
+    fn peer_disconnected(&self, address: SocketAddr) {
+        let mut status = self.status.borrow().clone();
+        if status.active_peer == Some(address) {
+            status.active_peer = None;
+            self.status.send_replace(status);
+            let _ = self.events.send(NodeEvent::PeerDisconnected { address });
+        }
+    }
+
+    fn publish(&self, mut next: NodeRuntimeStatus) {
+        let previous = self.status.borrow().clone();
+        next.active_peer = previous.active_peer;
+        next.last_error = previous.last_error;
+        if previous.header != next.header {
+            if let Some(tip) = next.header {
+                let _ = self.events.send(NodeEvent::HeaderTipChanged { tip });
+            }
+        }
+        if previous.execution != next.execution {
+            if let Some(tip) = next.execution {
+                let _ = self.events.send(NodeEvent::ExecutionTipChanged { tip });
+            }
+        }
+        if previous.explorer != next.explorer {
+            if let Some(tip) = next.explorer {
+                let _ = self.events.send(NodeEvent::IndexTipChanged {
+                    index: "explorer",
+                    tip,
+                });
+            }
+        }
+        if previous.wallet != next.wallet {
+            if let Some(tip) = next.wallet {
+                let _ = self.events.send(NodeEvent::IndexTipChanged {
+                    index: "wallet",
+                    tip,
+                });
+            }
+        }
+        if previous.freezer != next.freezer {
+            let _ = self.events.send(NodeEvent::FreezerChanged {
+                status: next.freezer,
+            });
+        }
+        self.status.send_replace(next);
+    }
+
+    fn reorganized(&self, previous: NodeTip, current: NodeTip) {
+        let _ = self
+            .events
+            .send(NodeEvent::Reorganized { previous, current });
+    }
+
+    fn failed(&self, message: String) {
+        let mut status = self.status.borrow().clone();
+        status.last_error = Some(message);
+        self.status.send_replace(status);
+    }
 }
 
 /// Embedded node configuration, runtime, or task failure.
@@ -624,13 +1336,14 @@ fn active_assumeutxo_limits(configured: ValidationLimits) -> ValidationLimits {
 const fn chainstate_cache_bytes(
     network_execution: NetworkExecutionMode,
     background_pipeline: bool,
+    cache: NodeCacheConfig,
 ) -> usize {
     if background_pipeline {
-        BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES
+        cache.background_chainstate_bytes
     } else if network_execution.is_experimental() {
-        BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
+        cache.bulk_validation_bytes
     } else {
-        1024 * 1024 * 1024
+        cache.active_chainstate_bytes
     }
 }
 
@@ -1331,6 +2044,96 @@ fn collect_node_status(
         ledger_first_height: ledger.first_height,
         ledger_tip_height: ledger.tip_height,
     })
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeStatusSources<'a> {
+    network: Network,
+    ibd_policy: IbdPolicy,
+    headers: &'a HeaderDag,
+    chainstate: &'a RedbChainStore,
+    explorer: Option<&'a RedbExplorerIndex>,
+    ledger: &'a PrunedBlockLedger,
+    wallet: Option<&'a EmbeddedWallet>,
+}
+
+fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRuntimeStatus, String> {
+    let RuntimeStatusSources {
+        network,
+        ibd_policy,
+        headers,
+        chainstate,
+        explorer,
+        ledger,
+        wallet,
+    } = sources;
+    let header = headers.active_tip();
+    let execution = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let explorer = explorer
+        .map(|index| index.tip().map_err(|error| error.to_string()))
+        .transpose()?;
+    let wallet = wallet
+        .map(|wallet| wallet.chain_tip().map_err(|error| error.to_string()))
+        .transpose()?;
+    let ibd = ibd_policy
+        .status(headers)
+        .map_err(|error| error.to_string())?;
+    let utxos = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    let freezer = ledger.stats().map_err(|error| error.to_string())?;
+    let independently_validated = chainstate
+        .execution()
+        .assumed_snapshot()
+        .map_err(|error| error.to_string())?
+        .is_none();
+    Ok(NodeRuntimeStatus {
+        network,
+        active_peer: None,
+        header: Some(NodeTip {
+            height: header.height,
+            hash: header.hash,
+        }),
+        execution: Some(NodeTip {
+            height: execution.height,
+            hash: execution.hash,
+        }),
+        explorer: explorer.map(|tip| NodeTip {
+            height: tip.height,
+            hash: tip.hash,
+        }),
+        wallet: wallet.map(|tip| NodeTip {
+            height: tip.height,
+            hash: tip.hash,
+        }),
+        utxo_hot: utxos.hot,
+        utxo_cold: utxos.cold,
+        freezer: NodeFreezerStatus {
+            segments: freezer.segments,
+            blocks: freezer.blocks,
+            bytes: freezer.bytes,
+            first_height: freezer.first_height,
+            tip_height: freezer.tip_height,
+        },
+        trust: NodeTrustStatus {
+            minimum_chainwork_reached: ibd.minimum_chainwork_reached,
+            active_assume_valid_height: ibd.active_assume_valid_height,
+            full_script_validation: ibd.full_script_validation,
+            independently_validated,
+        },
+        last_error: None,
+    })
+}
+
+fn publish_runtime_status(
+    observer: Option<&NodeObserver>,
+    sources: RuntimeStatusSources<'_>,
+) -> Result<(), String> {
+    if let Some(observer) = observer {
+        observer.publish(collect_runtime_status(sources)?);
+    }
+    Ok(())
 }
 
 /// Failure returned by the thin command-line adapter.
@@ -2160,6 +2963,7 @@ async fn run_background_assumeutxo(
     validation_options.complete_assumeutxo = None;
     validation_options.background_assumeutxo = None;
     validation_options.validation_target = Some(target);
+    validation_options.observer = None;
 
     println!(
         "starting active-chain service and independent genesis validation concurrently through {}:{}",
@@ -2908,6 +3712,28 @@ struct ConnectedPeer {
     validated_header_height: Option<u32>,
 }
 
+struct ActivePeerObservation {
+    observer: Option<NodeObserver>,
+    remote: SocketAddr,
+}
+
+impl ActivePeerObservation {
+    fn new(observer: Option<NodeObserver>, remote: SocketAddr) -> Self {
+        if let Some(observer) = &observer {
+            observer.peer_connected(remote);
+        }
+        Self { observer, remote }
+    }
+}
+
+impl Drop for ActivePeerObservation {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.observer {
+            observer.peer_disconnected(self.remote);
+        }
+    }
+}
+
 struct PendingPeer {
     ready: tokio::sync::oneshot::Receiver<()>,
     ready_observed: bool,
@@ -3499,6 +4325,7 @@ async fn run_connected_peer(
         mut session,
         validated_header_height,
     } = connected;
+    let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote);
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
         println!("activated peer {remote} after standby validation through height {height}");
@@ -3532,10 +4359,12 @@ async fn run_connected_peer(
                 options.ibd_policy,
                 path.clone(),
                 &options.runtime_control,
+                options.observer.as_ref(),
                 options.once,
                 options.validation_target,
                 options.validation_limits,
                 options.ledger_retention,
+                options.cache,
                 options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
@@ -3647,6 +4476,7 @@ async fn complete_assumeutxo_validation(
         options.ibd_policy,
         validation_dir.clone(),
         &options.runtime_control,
+        options.observer.as_ref(),
         false,
         Some(ValidationTarget {
             height: assumed.base.height,
@@ -3654,6 +4484,7 @@ async fn complete_assumeutxo_validation(
         }),
         options.validation_limits,
         options.ledger_retention,
+        options.cache,
         options.mempool_full_rbf,
         None,
         None,
@@ -4780,10 +5611,12 @@ async fn sync_validating_node(
     ibd_policy: IbdPolicy,
     data_dir: PathBuf,
     runtime_control: &RuntimeControl,
+    observer: Option<&NodeObserver>,
     once: bool,
     validation_target: Option<ValidationTarget>,
     validation_limits: ValidationLimits,
     ledger_retention: LedgerRetention,
+    cache: NodeCacheConfig,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -4814,6 +5647,7 @@ async fn sync_validating_node(
         cache_size_bytes: chainstate_cache_bytes(
             network_execution,
             background_validation.is_some() || validation_scheduler.is_some(),
+            cache,
         ),
         validation_delta_journal: network_execution.is_experimental()
             || background_validation.is_some()
@@ -4962,6 +5796,18 @@ async fn sync_validating_node(
             .map(NodeStatus::new)
         })
         .transpose()?;
+    publish_runtime_status(
+        observer,
+        RuntimeStatusSources {
+            network,
+            ibd_policy,
+            headers: &headers,
+            chainstate: &chainstate,
+            explorer: explorer.as_deref(),
+            ledger: &ledger,
+            wallet,
+        },
+    )?;
     'resync: loop {
         let compact_candidates = compact_transaction_candidates(transaction_pool, wallet_runtime);
         let current_tip = execution_store.tip().map_err(|error| error.to_string())?;
@@ -5064,6 +5910,18 @@ async fn sync_validating_node(
                 DEFAULT_HOT_WINDOW_SECS,
             )
             .map_err(|error| error.to_string())?;
+            if let Some(observer) = observer {
+                observer.reorganized(
+                    NodeTip {
+                        height: tip.height,
+                        hash: tip.hash,
+                    },
+                    NodeTip {
+                        height: rewound.height,
+                        hash: rewound.hash,
+                    },
+                );
+            }
             transaction_pool
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5145,6 +6003,18 @@ async fn sync_validating_node(
                 wallet,
             )?);
         }
+        publish_runtime_status(
+            observer,
+            RuntimeStatusSources {
+                network,
+                ibd_policy,
+                headers: &headers,
+                chainstate: &chainstate,
+                explorer: explorer.as_deref(),
+                ledger: &ledger,
+                wallet,
+            },
+        )?;
         if api_server.is_none() {
             if let Some(api) = api_runtime {
                 api_server = Some(
@@ -5191,6 +6061,18 @@ async fn sync_validating_node(
                     wallet,
                 )?);
             }
+            publish_runtime_status(
+                observer,
+                RuntimeStatusSources {
+                    network,
+                    ibd_policy,
+                    headers: &headers,
+                    chainstate: &chainstate,
+                    explorer: explorer.as_deref(),
+                    ledger: &ledger,
+                    wallet,
+                },
+            )?;
             if let Some(status) = background_validation {
                 status.update_active(tip.height, headers.active_tip().height);
             }
@@ -7307,6 +8189,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     let mut validation_deferred_repair = false;
     let mut prune_blocks = None;
     let mut prune_max_bytes = None;
+    let mut active_chainstate_cache_bytes = None;
+    let mut background_chainstate_cache_bytes = None;
+    let mut bulk_validation_cache_bytes = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -7610,6 +8495,41 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 validation_pause_ms = Some(pause);
             }
             "--validation-deferred-repair" => validation_deferred_repair = true,
+            "--chainstate-cache-bytes" => {
+                if active_chainstate_cache_bytes.is_some() {
+                    return Err(
+                        "--chainstate-cache-bytes cannot be supplied more than once".to_owned()
+                    );
+                }
+                active_chainstate_cache_bytes = Some(parse_cache_bytes(
+                    &required_option_value(&mut args, "--chainstate-cache-bytes")?,
+                    "active chainstate",
+                )?);
+            }
+            "--background-chainstate-cache-bytes" => {
+                if background_chainstate_cache_bytes.is_some() {
+                    return Err(
+                        "--background-chainstate-cache-bytes cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                background_chainstate_cache_bytes = Some(parse_cache_bytes(
+                    &required_option_value(&mut args, "--background-chainstate-cache-bytes")?,
+                    "background chainstate",
+                )?);
+            }
+            "--bulk-validation-cache-bytes" => {
+                if bulk_validation_cache_bytes.is_some() {
+                    return Err(
+                        "--bulk-validation-cache-bytes cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                bulk_validation_cache_bytes = Some(parse_cache_bytes(
+                    &required_option_value(&mut args, "--bulk-validation-cache-bytes")?,
+                    "bulk validation",
+                )?);
+            }
             "--prune-blocks" => {
                 if prune_blocks.is_some() {
                     return Err("--prune-blocks cannot be supplied more than once".to_owned());
@@ -8068,6 +8988,35 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
     if mempool_full_rbf && data_dir.is_none() {
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
+    let cache_overridden = active_chainstate_cache_bytes.is_some()
+        || background_chainstate_cache_bytes.is_some()
+        || bulk_validation_cache_bytes.is_some();
+    if cache_overridden && data_dir.is_none() {
+        return Err("chainstate cache options require --data-dir".to_owned());
+    }
+    if cache_overridden
+        && (snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || snapshot_download.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some())
+    {
+        return Err(
+            "chainstate cache options apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
+                .to_owned(),
+        );
+    }
+    let default_cache = NodeCacheConfig::default();
+    let cache = NodeCacheConfig {
+        active_chainstate_bytes: active_chainstate_cache_bytes
+            .unwrap_or(default_cache.active_chainstate_bytes),
+        background_chainstate_bytes: background_chainstate_cache_bytes
+            .unwrap_or(default_cache.background_chainstate_bytes),
+        bulk_validation_bytes: bulk_validation_cache_bytes
+            .unwrap_or(default_cache.bulk_validation_bytes),
+    };
     let validation_limits = ValidationLimits {
         max_blocks_per_batch: validation_batch_size.unwrap_or(DEFAULT_VALIDATION_BATCH_SIZE),
         pause_between_batches: Duration::from_millis(validation_pause_ms.unwrap_or(0)),
@@ -8175,7 +9124,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 .to_owned(),
         );
     }
-    Ok(Some(Options {
+    validate_runtime_options(Options {
         remotes,
         dns_seeds,
         network,
@@ -8217,8 +9166,11 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
         },
         validation_limits,
         ledger_retention,
+        cache,
         runtime_control: Arc::new(RuntimeControl::default()),
-    }))
+        observer: None,
+    })
+    .map(Some)
 }
 
 fn required_option_value(
@@ -8227,6 +9179,18 @@ fn required_option_value(
 ) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("{option} requires a value"))
+}
+
+fn parse_cache_bytes(value: &str, name: &str) -> Result<usize, String> {
+    let bytes = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name} cache size: {value}"))?;
+    if !(MIN_CHAINSTATE_CACHE_BYTES..=MAX_CHAINSTATE_CACHE_BYTES).contains(&bytes) {
+        return Err(format!(
+            "{name} cache must be between {MIN_CHAINSTATE_CACHE_BYTES} and {MAX_CHAINSTATE_CACHE_BYTES} bytes"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn parse_deployment_config(
@@ -8286,7 +9250,7 @@ fn print_usage() {
             "rbtcd {}\n\nUSAGE:\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -8653,7 +9617,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         };
         let mut pending =
             spawn_peer_connections(&options, &options.remotes, 100, None, None, None, None)
@@ -10501,6 +11467,9 @@ mod tests {
                 "--cleanup-validation-dir",
                 "--prune-blocks",
                 "--prune-max-bytes",
+                "--chainstate-cache-bytes",
+                "--background-chainstate-cache-bytes",
+                "--bulk-validation-cache-bytes",
                 "--validation-batch-size",
                 "--validation-pause-ms",
                 "--snapshot-height",
@@ -10598,6 +11567,166 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_and_bounds_explicit_chainstate_cache_budgets() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-cache-parser",
+                "--chainstate-cache-bytes",
+                "268435456",
+                "--background-chainstate-cache-bytes",
+                "536870912",
+                "--bulk-validation-cache-bytes",
+                "1073741824",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.cache,
+            NodeCacheConfig {
+                active_chainstate_bytes: 256 * 1024 * 1024,
+                background_chainstate_bytes: 512 * 1024 * 1024,
+                bulk_validation_bytes: 1024 * 1024 * 1024,
+            }
+        );
+
+        for arguments in [
+            vec!["--chainstate-cache-bytes", "268435456"],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-cache-parser",
+                "--chainstate-cache-bytes",
+                "67108863",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-cache-parser",
+                "--bulk-validation-cache-bytes",
+                "68719476737",
+            ],
+            vec![
+                "--data-dir",
+                "/tmp/rbtc-cache-parser",
+                "--background-chainstate-cache-bytes",
+                "invalid",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn typed_embedded_config_maps_all_persistent_subsystems() {
+        let seed = NodeDnsSeed::new("Seed.Example.", 18_444).unwrap();
+        assert_eq!(seed.host(), "seed.example.");
+        assert_eq!(seed.port(), 18_444);
+        let mut config = NodeConfig::new(Network::Regtest, "/tmp/rbtc-typed-config");
+        config.preferred_peers = vec!["127.0.0.1:18444".parse().unwrap()];
+        config.dns_seeds = NodeDnsSeedPolicy::Custom(vec![seed]);
+        config.once = true;
+        config.mempool_full_rbf = true;
+        config.cache = NodeCacheConfig {
+            active_chainstate_bytes: 256 * 1024 * 1024,
+            background_chainstate_bytes: 512 * 1024 * 1024,
+            bulk_validation_bytes: 1024 * 1024 * 1024,
+        };
+        config.storage = NodeStorageConfig {
+            prune_blocks: 576,
+            prune_bytes: 768 * 1024 * 1024,
+        };
+        config.api = Some(NodeApiConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            rpc_auth_token: Some(PathBuf::from("/tmp/rbtc-rpc-token")),
+            wallet: Some(NodeWalletApiConfig {
+                descriptors: PathBuf::from("/tmp/rbtc-wallet-descriptors"),
+                auth_token: PathBuf::from("/tmp/rbtc-wallet-token"),
+            }),
+        });
+        config.consensus.version_bits = vec!["taproot:0:1:0".to_owned()];
+        config.consensus.activation_heights = vec!["segwit@0".to_owned()];
+        config.assumeutxo_validation =
+            Some(NodeAssumeUtxoValidation::Background(NodeAssumeUtxoConfig {
+                validation_dir: PathBuf::from("/tmp/rbtc-typed-validation"),
+                limits: NodeValidationConfig {
+                    max_blocks_per_batch: 252,
+                    pause_between_batches: Duration::from_millis(25),
+                    quick_repair: false,
+                },
+                cleanup_on_success: true,
+            }));
+
+        config.validate().unwrap();
+        let options = config.into_options().unwrap();
+        assert_eq!(options.remotes, vec!["127.0.0.1:18444".parse().unwrap()]);
+        assert_eq!(options.dns_seeds.unwrap()[0].host, "seed.example.");
+        assert!(options.mempool_full_rbf);
+        assert_eq!(options.cache.active_chainstate_bytes, 256 * 1024 * 1024);
+        assert_eq!(options.ledger_retention.max_blocks, 576);
+        assert_eq!(
+            options.background_assumeutxo,
+            Some(PathBuf::from("/tmp/rbtc-typed-validation"))
+        );
+        assert!(options.cleanup_validation_dir);
+        assert_eq!(options.validation_limits.max_blocks_per_batch, 252);
+        assert_eq!(
+            options.validation_limits.pause_between_batches,
+            Duration::from_millis(25)
+        );
+        assert!(!options.validation_limits.quick_repair);
+        assert!(options.explorer_listen.is_some());
+        assert!(options.rpc_auth_token_file.is_some());
+        assert!(options.wallet_api_files.is_some());
+    }
+
+    #[test]
+    fn typed_embedded_config_rejects_cross_field_and_budget_errors() {
+        let mut config = NodeConfig::new(Network::Regtest, "/tmp/rbtc-invalid-config");
+        config.cache.active_chainstate_bytes = MIN_CHAINSTATE_CACHE_BYTES - 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("active chainstate cache")
+        );
+
+        config.cache = NodeCacheConfig::default();
+        config.api = Some(NodeApiConfig {
+            listen: "0.0.0.0:3000".parse().unwrap(),
+            rpc_auth_token: None,
+            wallet: None,
+        });
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loopback")
+        );
+
+        config.api = None;
+        config.once = true;
+        config.assumeutxo_validation =
+            Some(NodeAssumeUtxoValidation::Complete(NodeAssumeUtxoConfig {
+                validation_dir: PathBuf::from("/tmp/rbtc-invalid-validation"),
+                limits: NodeValidationConfig::default(),
+                cleanup_on_success: false,
+            }));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sequential AssumeUTXO")
+        );
     }
 
     #[test]
@@ -11232,7 +12361,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -11299,7 +12430,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -11652,18 +12785,110 @@ mod tests {
 
     #[test]
     fn concurrent_background_pipelines_share_a_bounded_bulk_cache_budget() {
+        let cache = NodeCacheConfig::default();
         assert_eq!(
-            chainstate_cache_bytes(NetworkExecutionMode::Persistent, true),
+            chainstate_cache_bytes(NetworkExecutionMode::Persistent, true, cache),
             BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES
         );
         assert_eq!(
-            chainstate_cache_bytes(NetworkExecutionMode::ExperimentalOnce, false),
+            chainstate_cache_bytes(NetworkExecutionMode::ExperimentalOnce, false, cache),
             BULK_VALIDATION_CHAINSTATE_CACHE_BYTES
         );
         assert_eq!(
-            chainstate_cache_bytes(NetworkExecutionMode::Persistent, false),
+            chainstate_cache_bytes(NetworkExecutionMode::Persistent, false, cache),
             ChainStoreOptions::default().cache_size_bytes
         );
+    }
+
+    #[test]
+    fn embedded_observer_publishes_typed_deltas_and_bounds_slow_consumers() {
+        let (status, _) = watch::channel(NodeRuntimeStatus::starting(Network::Regtest));
+        let (events, mut receiver) = broadcast::channel(NODE_EVENT_CAPACITY);
+        let observer = NodeObserver {
+            status: status.clone(),
+            events: events.clone(),
+        };
+        let header = NodeTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([2; 32]),
+        };
+        let execution = NodeTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        let explorer = NodeTip {
+            height: 1,
+            hash: execution.hash,
+        };
+        let freezer = NodeFreezerStatus {
+            segments: 1,
+            blocks: 1,
+            bytes: 512,
+            first_height: Some(1),
+            tip_height: Some(1),
+        };
+        let next = NodeRuntimeStatus {
+            network: Network::Regtest,
+            active_peer: None,
+            header: Some(header),
+            execution: Some(execution),
+            explorer: Some(explorer),
+            wallet: None,
+            utxo_hot: 1,
+            utxo_cold: 2,
+            freezer,
+            trust: NodeTrustStatus {
+                minimum_chainwork_reached: true,
+                active_assume_valid_height: None,
+                full_script_validation: true,
+                independently_validated: true,
+            },
+            last_error: None,
+        };
+        observer.publish(next.clone());
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::HeaderTipChanged { tip: header }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::ExecutionTipChanged { tip: execution }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::IndexTipChanged {
+                index: "explorer",
+                tip: explorer,
+            }
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::FreezerChanged { status: freezer }
+        );
+        assert!(receiver.try_recv().is_err());
+        observer.publish(next);
+        assert!(receiver.try_recv().is_err());
+
+        let rewound = NodeTip {
+            height: 0,
+            hash: bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash(),
+        };
+        observer.reorganized(execution, rewound);
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            NodeEvent::Reorganized {
+                previous: execution,
+                current: rewound,
+            }
+        );
+
+        for _ in 0..=NODE_EVENT_CAPACITY {
+            let _ = events.send(NodeEvent::Started);
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Lagged(_))
+        ));
     }
 
     #[test]
@@ -12511,7 +13736,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap_err();
@@ -12567,7 +13794,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -12945,7 +14174,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13035,7 +14266,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13104,7 +14337,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13189,7 +14424,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13245,7 +14482,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13297,7 +14536,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap_err();
@@ -13389,7 +14630,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13447,7 +14690,9 @@ mod tests {
                     quick_repair: true,
                 },
                 ledger_retention: LedgerRetention::default(),
+                cache: NodeCacheConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
+                observer: None,
             }),
         )
         .await
@@ -13537,7 +14782,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13616,7 +14863,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13653,7 +14902,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -13710,7 +14961,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap_err();
@@ -13761,7 +15014,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap_err();
@@ -13857,7 +15112,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap_err();
@@ -14009,7 +15266,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -14112,7 +15371,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -14187,7 +15448,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();
@@ -14298,7 +15561,9 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                cache: NodeCacheConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
+                observer: None,
             }),
         )
         .await
@@ -14444,7 +15709,9 @@ mod tests {
                 offline_action: None,
                 validation_limits: ValidationLimits::default(),
                 ledger_retention: LedgerRetention::default(),
+                cache: NodeCacheConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
+                observer: None,
             },
             local_nonce,
         )
@@ -14560,7 +15827,9 @@ mod tests {
             offline_action: None,
             validation_limits: ValidationLimits::default(),
             ledger_retention: LedgerRetention::default(),
+            cache: NodeCacheConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
         })
         .await
         .unwrap();

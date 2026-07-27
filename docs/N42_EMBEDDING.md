@@ -1,6 +1,6 @@
 # n42-26 embedding contract
 
-Status date: 2026-07-26.
+Status date: 2026-07-27.
 
 ## Release gate
 
@@ -24,7 +24,7 @@ The intended `n42-node` assembly follows the existing
 
 ```rust,ignore
 use bitcoin::Network;
-use rbtc::node::{NodeBuilder, NodeController};
+use rbtc::node::{NodeBuilder, NodeController, NodeRuntimeStatus};
 
 let handle = NodeBuilder::new(Network::Bitcoin, bitcoin_data_dir)
     .mempool_full_rbf(false)
@@ -35,6 +35,7 @@ let handle = NodeBuilder::new(Network::Bitcoin, bitcoin_data_dir)
 // wait future into Reth's critical-task executor.
 let controller: NodeController = handle.controller();
 let mut lifecycle = controller.subscribe_lifecycle();
+let mut status = controller.subscribe_status();
 let mut events = controller.subscribe_events();
 
 task_executor.spawn_critical_task(
@@ -50,16 +51,17 @@ task_executor.spawn_critical_task(
 controller.request_shutdown();
 ```
 
-`NodeLifecycle` is a latest-value Tokio watch channel. `NodeEvent` is a
-32-entry broadcast ring: a slow consumer receives `Lagged` and must resample
-the lifecycle value instead of causing unbounded node memory. The event stream
-currently covers task lifecycle. P1.0 adds typed peer, header, execution,
-reorg, pruning, index, and failure progress without exposing mutable consensus
-internals.
+`NodeLifecycle` and `NodeRuntimeStatus` are latest-value Tokio watch channels.
+The latter exposes bounded peer count, maximum-work header tip, execution and
+index tips, freezer footprint/range, trust state, and the latest task error
+without requiring the HTTP API. `NodeEvent` is a 32-entry broadcast ring of
+lifecycle, peer, header, execution, reorg, index, freezer, and failure deltas.
+A slow consumer receives `Lagged` and must resample `status` instead of causing
+unbounded node memory. None of these views exposes mutable consensus internals.
 
 ## Integration acceptance
 
-The repository-owned external-crate test already verifies:
+The repository-owned external-crate tests verify:
 
 1. `NodeHandle::wait` can move into a critical-task-shaped executor while the
    host retains lifecycle/event observation and graceful shutdown control.
@@ -67,8 +69,13 @@ The repository-owned external-crate test already verifies:
    Tokio runtime.
 3. Each controller shuts down only its own instance and waits for that
    instance's in-flight durable checkpoint barrier.
+4. A real regtest P2P v1 handshake publishes peer, header, execution, index,
+   freezer, and trust state without enabling an HTTP listener.
 
-The final sibling acceptance fixture will live in `../n42-26` after the
-licensing decision. It must use an isolated Bitcoin data directory, forward
-host shutdown exactly once, fail the enclosing node on an unexpected rBTC task
-failure, and never reinterpret rBTC readiness as N42 consensus readiness.
+The exact sibling acceptance fixture lives at
+`../n42-26/bin/n42-node/tests/rbtc_embedding.rs`. It uses an isolated data
+directory, Reth's real `TaskExecutor::spawn_critical_task`, and retained
+controller shutdown. It is a technical integration test, not authorization to
+distribute a combined binary. Production assembly must still fail the
+enclosing node on an unexpected rBTC task failure and must never reinterpret
+rBTC readiness as N42 consensus readiness.

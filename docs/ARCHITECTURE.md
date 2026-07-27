@@ -27,12 +27,20 @@ retains a cloneable `NodeController` for checkpoint-safe shutdown. This matches
 the critical-task assembly used by `n42-26` without moving consensus or storage
 truth into the host. Each launch owns its shutdown flag and in-flight checkpoint
 barrier; an external-crate acceptance test runs two isolated regtest instances
-concurrently in one Tokio runtime and shuts them down independently. P1.0 still
-adds typed subsystem status/events and the exact sibling task-executor fixture
-before the embedding surface is complete. The current controller exposes
-latest-value `NodeLifecycle` through a Tokio watch receiver plus a 32-entry
-broadcast stream of typed lifecycle edges. Lagging observers receive an
-explicit lag error instead of growing node memory.
+concurrently in one Tokio runtime and shuts them down independently. The public
+`NodeConfig` covers ordered preferred peers, DNS policy, ordinary/background/
+bulk chainstate caches, freezer retention, mempool policy, loopback APIs,
+consensus overrides, and AssumeUTXO validation. CLI parsing and embedded hosts
+share the same bounds and cross-field validation before storage or network I/O.
+The controller exposes latest-value `NodeLifecycle` and `NodeRuntimeStatus`
+through Tokio watch receivers plus a 32-entry broadcast stream of typed
+lifecycle, peer, header, execution, reorg, index, freezer, and failure deltas.
+Lagging observers receive an explicit lag error and resample the latest status
+instead of growing node memory. The external fixture additionally drives a
+real regtest P2P handshake, while `../n42-26/bin/n42-node/tests/rbtc_embedding.rs`
+moves `NodeHandle::wait` into Reth's actual critical-task executor. This closes
+the technical P1.0 boundary without making the host the owner of Bitcoin
+consensus or storage state.
 
 The header DAG keeps a height-indexed view of the selected best-work branch, so
 active-height lookups stay constant-time while an ordinary extension appends
