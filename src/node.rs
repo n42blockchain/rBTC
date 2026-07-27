@@ -1185,6 +1185,12 @@ pub struct NodeFreezerStatus {
     pub first_height: Option<u32>,
     /// Newest retrievable height.
     pub tip_height: Option<u32>,
+    /// Configured maximum retained block count.
+    pub target_blocks: u32,
+    /// Configured maximum compressed bytes.
+    pub target_bytes: u64,
+    /// Highest height physically pruned from the active retained prefix.
+    pub pruned_through_height: Option<u32>,
 }
 
 /// Filesystem capacity and atomic-checkpoint safety forecast.
@@ -1261,6 +1267,9 @@ impl NodeRuntimeStatus {
                 bytes: 0,
                 first_height: None,
                 tip_height: None,
+                target_blocks: 0,
+                target_bytes: 0,
+                pruned_through_height: None,
             },
             disk: NodeDiskStatus {
                 total_bytes: 0,
@@ -1937,6 +1946,9 @@ struct NodeStatusProgress {
     ledger_bytes: u64,
     ledger_first_height: Option<u32>,
     ledger_tip_height: Option<u32>,
+    ledger_target_blocks: u32,
+    ledger_target_bytes: u64,
+    ledger_pruned_through_height: Option<u32>,
     disk_space: DiskSpaceSnapshot,
 }
 
@@ -2013,6 +2025,9 @@ impl LocalRpcOperator for NodeRpcOperator {
                 ),
                 "pruned": true,
                 "pruneheight": status.ledger_first_height,
+                "rbtc_prune_target_blocks": status.ledger_target_blocks,
+                "rbtc_prune_target_bytes": status.ledger_target_bytes,
+                "rbtc_pruned_through_height": status.ledger_pruned_through_height,
                 "rbtc_phase": status.phase,
                 "rbtc_independently_validated": status.trust.independently_validated,
             }),
@@ -2157,6 +2172,9 @@ struct NodeStatusResponse {
     ledger_bytes: u64,
     ledger_first_height: Option<u32>,
     ledger_tip_height: Option<u32>,
+    ledger_target_blocks: u32,
+    ledger_target_bytes: u64,
+    ledger_pruned_through_height: Option<u32>,
     disk_space: DiskSpaceSnapshot,
 }
 
@@ -2341,6 +2359,9 @@ impl NodeStatus {
             ledger_bytes: progress.ledger_bytes,
             ledger_first_height: progress.ledger_first_height,
             ledger_tip_height: progress.ledger_tip_height,
+            ledger_target_blocks: progress.ledger_target_blocks,
+            ledger_target_bytes: progress.ledger_target_bytes,
+            ledger_pruned_through_height: progress.ledger_pruned_through_height,
             disk_space: progress.disk_space,
         }
     }
@@ -2397,6 +2418,9 @@ async fn node_metrics(
     let wallet_height = status.wallet.as_ref().map_or(0, |tip| tip.height);
     let ledger_first_height = status.ledger_first_height.unwrap_or(0);
     let ledger_tip_height = status.ledger_tip_height.unwrap_or(0);
+    let ledger_pruned_through = status.ledger_pruned_through_height.unwrap_or(0);
+    let ledger_target_blocks = status.ledger_target_blocks;
+    let ledger_target_bytes = status.ledger_target_bytes;
     let execution_lag = status.header.height.saturating_sub(status.execution.height);
     let explorer_lag = status
         .execution
@@ -2411,7 +2435,7 @@ async fn node_metrics(
     let disk_reserve = status.disk_space.reserve_bytes;
     let storage_ceiling = status.disk_space.projected_storage_ceiling_bytes;
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -2591,6 +2615,7 @@ fn collect_node_status(
         .status(headers)
         .map_err(|error| error.to_string())?;
     let utxos = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    let ledger_retention = ledger.retention();
     let ledger = ledger.stats().map_err(|error| error.to_string())?;
     let independently_validated = chainstate
         .execution()
@@ -2626,6 +2651,9 @@ fn collect_node_status(
         ledger_bytes: ledger.bytes,
         ledger_first_height: ledger.first_height,
         ledger_tip_height: ledger.tip_height,
+        ledger_target_blocks: ledger_retention.max_blocks,
+        ledger_target_bytes: ledger_retention.max_bytes,
+        ledger_pruned_through_height: ledger.first_height.and_then(|height| height.checked_sub(1)),
         disk_space,
     })
 }
@@ -2668,6 +2696,7 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
         .status(headers)
         .map_err(|error| error.to_string())?;
     let utxos = chainstate.tier_stats().map_err(|error| error.to_string())?;
+    let freezer_retention = ledger.retention();
     let freezer = ledger.stats().map_err(|error| error.to_string())?;
     let independently_validated = chainstate
         .execution()
@@ -2701,6 +2730,11 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
             bytes: freezer.bytes,
             first_height: freezer.first_height,
             tip_height: freezer.tip_height,
+            target_blocks: freezer_retention.max_blocks,
+            target_bytes: freezer_retention.max_bytes,
+            pruned_through_height: freezer
+                .first_height
+                .and_then(|height| height.checked_sub(1)),
         },
         disk: NodeDiskStatus {
             total_bytes: disk_space.total_bytes,
@@ -10304,6 +10338,9 @@ mod tests {
             ledger_bytes: 0,
             ledger_first_height: None,
             ledger_tip_height: None,
+            ledger_target_blocks: 1_008,
+            ledger_target_bytes: 1024 * 1024 * 1024,
+            ledger_pruned_through_height: None,
             disk_space: DiskSpaceSnapshot {
                 total_bytes: 10_000,
                 available_bytes: 8_000,
@@ -14127,6 +14164,9 @@ mod tests {
             bytes: 512,
             first_height: Some(1),
             tip_height: Some(1),
+            target_blocks: 1_008,
+            target_bytes: 1024 * 1024 * 1024,
+            pruned_through_height: Some(0),
         };
         let disk = NodeDiskStatus {
             total_bytes: 10_000,
@@ -14228,6 +14268,9 @@ mod tests {
             ledger_bytes: 1_024,
             ledger_first_height: Some(1),
             ledger_tip_height: Some(10),
+            ledger_target_blocks: 1_008,
+            ledger_target_bytes: 1024 * 1024 * 1024,
+            ledger_pruned_through_height: Some(0),
             disk_space: DiskSpaceSnapshot {
                 total_bytes: 10_000,
                 available_bytes: 8_000,

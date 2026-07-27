@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -21,6 +21,9 @@ use crate::archive::{
 const INDEX_FILE: &str = "ledger-index.json";
 const TRUNCATE_FILE: &str = "ledger-truncate";
 const STAGED_FILE: &str = "ledger-staged.rblk";
+const POLICY_FILE: &str = "ledger-policy.json";
+const LEDGER_POLICY_SCHEMA_VERSION: u32 = 1;
+const MAX_LEDGER_POLICY_BYTES: u64 = 1_024;
 
 /// Default approximate one-week historical retention at ten-minute blocks.
 pub const DEFAULT_RETENTION_BLOCKS: u32 = 1_008;
@@ -96,6 +99,26 @@ struct LedgerIndex {
     segments: Vec<Segment>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LedgerPolicy {
+    schema_version: u32,
+    max_blocks: u32,
+    max_bytes: u64,
+    slots: u16,
+}
+
+impl LedgerPolicy {
+    const fn current(retention: LedgerRetention) -> Self {
+        Self {
+            schema_version: LEDGER_POLICY_SCHEMA_VERSION,
+            max_blocks: retention.max_blocks,
+            max_bytes: retention.max_bytes,
+            slots: retention.slots,
+        }
+    }
+}
+
 /// Checksum-verified downloaded blocks awaiting ledger publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedSegment {
@@ -122,6 +145,8 @@ enum LedgerSyncPoint {
     SlotPublish,
     IndexFile,
     IndexPublish,
+    PolicyFile,
+    PolicyPublish,
     RetiredSlotRemoval,
     TruncateIntentFile,
     TruncateIntentPublish,
@@ -169,6 +194,9 @@ impl PrunedBlockLedger {
         ledger.recover_truncation()?;
         let index = ledger.read_index()?;
         ledger.cleanup_unindexed_slots_locked(&index)?;
+        // Publish the configured policy only after recovery and physical
+        // pruning have made the on-disk ledger satisfy it.
+        ledger.persist_retention_policy()?;
         Ok(ledger)
     }
 
@@ -451,6 +479,9 @@ impl PrunedBlockLedger {
     fn index_path(&self) -> PathBuf {
         self.root.join(INDEX_FILE)
     }
+    fn policy_path(&self) -> PathBuf {
+        self.root.join(POLICY_FILE)
+    }
     fn truncate_path(&self) -> PathBuf {
         self.root.join(TRUNCATE_FILE)
     }
@@ -474,6 +505,74 @@ impl PrunedBlockLedger {
         self.sync(LedgerSyncPoint::IndexFile, &temporary)?;
         fs::rename(&temporary, self.index_path())?;
         self.sync_directory(LedgerSyncPoint::IndexPublish)
+    }
+
+    fn persist_retention_policy(&self) -> Result<(), LedgerError> {
+        let expected = LedgerPolicy::current(self.retention);
+        match fs::symlink_metadata(self.policy_path()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(LedgerError::Invalid("ledger policy must be a regular file"));
+            }
+            #[cfg(unix)]
+            Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 => {
+                return Err(LedgerError::Invalid(
+                    "ledger policy must not be hard-linked",
+                ));
+            }
+            Ok(metadata) => {
+                if metadata.len() > MAX_LEDGER_POLICY_BYTES {
+                    return Err(LedgerError::Invalid("ledger policy is oversized"));
+                }
+                let mut bytes = Vec::new();
+                File::open(self.policy_path())?
+                    .take(MAX_LEDGER_POLICY_BYTES.saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LEDGER_POLICY_BYTES {
+                    return Err(LedgerError::Invalid("ledger policy is oversized"));
+                }
+                let actual: LedgerPolicy = serde_json::from_slice(&bytes)?;
+                if actual.schema_version != LEDGER_POLICY_SCHEMA_VERSION {
+                    return Err(LedgerError::Invalid(
+                        "unsupported ledger policy schema version",
+                    ));
+                }
+                if actual == expected {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let temporary = self.root.join("ledger-policy.json.new");
+        match fs::symlink_metadata(&temporary) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(LedgerError::Invalid(
+                    "temporary ledger policy must be a regular file",
+                ));
+            }
+            #[cfg(unix)]
+            Ok(metadata) if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 => {
+                return Err(LedgerError::Invalid(
+                    "temporary ledger policy must not be hard-linked",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&serde_json::to_vec(&expected)?)?;
+        drop(file);
+        self.sync(LedgerSyncPoint::PolicyFile, &temporary)?;
+        fs::rename(&temporary, self.policy_path())?;
+        self.sync_directory(LedgerSyncPoint::PolicyPublish)
     }
 
     fn cleanup_unindexed_slots_locked(&self, index: &LedgerIndex) -> Result<u64, LedgerError> {
@@ -853,6 +952,128 @@ mod tests {
         assert!(stats.bytes > 0);
         assert_eq!(stats.first_height, Some(11));
         assert_eq!(stats.tip_height, Some(13));
+    }
+
+    #[test]
+    fn retention_policy_is_versioned_persisted_and_updated() {
+        let dir = TempDir::new().unwrap();
+        let first = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 2,
+        };
+        drop(PrunedBlockLedger::open(dir.path(), first).unwrap());
+
+        let policy_path = dir.path().join(POLICY_FILE);
+        assert_eq!(
+            serde_json::from_slice::<LedgerPolicy>(&fs::read(&policy_path).unwrap()).unwrap(),
+            LedgerPolicy::current(first)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&policy_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let updated = LedgerRetention {
+            max_blocks: 3,
+            max_bytes: 2_000_000,
+            slots: 3,
+        };
+        drop(PrunedBlockLedger::open(dir.path(), updated).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<LedgerPolicy>(&fs::read(policy_path).unwrap()).unwrap(),
+            LedgerPolicy::current(updated)
+        );
+    }
+
+    #[test]
+    fn future_retention_policy_schema_is_refused_without_rewrite() {
+        let dir = TempDir::new().unwrap();
+        let policy_path = dir.path().join(POLICY_FILE);
+        let future = br#"{"schema_version":2,"max_blocks":2,"max_bytes":1000000,"slots":2}"#;
+        fs::write(&policy_path, future).unwrap();
+
+        assert!(matches!(
+            PrunedBlockLedger::open(
+                dir.path(),
+                LedgerRetention {
+                    max_blocks: 2,
+                    max_bytes: 1_000_000,
+                    slots: 2,
+                }
+            ),
+            Err(LedgerError::Invalid(
+                "unsupported ledger policy schema version"
+            ))
+        ));
+        assert_eq!(fs::read(policy_path).unwrap(), future);
+    }
+
+    #[test]
+    fn retention_policy_sync_failures_reopen_to_a_complete_policy() {
+        let original = LedgerRetention {
+            max_blocks: 2,
+            max_bytes: 1_000_000,
+            slots: 2,
+        };
+        let updated = LedgerRetention {
+            max_blocks: 3,
+            max_bytes: 2_000_000,
+            slots: 3,
+        };
+
+        for point in [LedgerSyncPoint::PolicyFile, LedgerSyncPoint::PolicyPublish] {
+            let dir = TempDir::new().unwrap();
+            drop(PrunedBlockLedger::open(dir.path(), original).unwrap());
+            let durability = Arc::new(FailOnceDurability::new(point));
+            durability.arm();
+            assert!(matches!(
+                PrunedBlockLedger::open_with_durability(dir.path(), updated, durability.clone()),
+                Err(LedgerError::Io(_))
+            ));
+            assert!(durability.did_fail());
+
+            drop(PrunedBlockLedger::open(dir.path(), updated).unwrap());
+            assert_eq!(
+                serde_json::from_slice::<LedgerPolicy>(
+                    &fs::read(dir.path().join(POLICY_FILE)).unwrap()
+                )
+                .unwrap(),
+                LedgerPolicy::current(updated)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_policy_rejects_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        let symlink_dir = TempDir::new().unwrap();
+        let outside = symlink_dir.path().join("outside");
+        fs::write(&outside, b"unchanged").unwrap();
+        symlink(&outside, symlink_dir.path().join(POLICY_FILE)).unwrap();
+        assert!(matches!(
+            PrunedBlockLedger::open(symlink_dir.path(), LedgerRetention::default()),
+            Err(LedgerError::Invalid("ledger policy must be a regular file"))
+        ));
+        assert_eq!(fs::read(outside).unwrap(), b"unchanged");
+
+        let hardlink_dir = TempDir::new().unwrap();
+        let source = hardlink_dir.path().join("source");
+        fs::write(&source, b"unchanged").unwrap();
+        fs::hard_link(&source, hardlink_dir.path().join(POLICY_FILE)).unwrap();
+        assert!(matches!(
+            PrunedBlockLedger::open(hardlink_dir.path(), LedgerRetention::default()),
+            Err(LedgerError::Invalid(
+                "ledger policy must not be hard-linked"
+            ))
+        ));
+        assert_eq!(fs::read(source).unwrap(), b"unchanged");
     }
 
     #[test]

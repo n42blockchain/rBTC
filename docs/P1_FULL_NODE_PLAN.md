@@ -153,6 +153,14 @@ Acceptance: no command silently recreates chainstate from incomplete local
 history; every destructive transition has a dry run, crash matrix, durable
 cursor, and exact restart result.
 
+Implemented on 2026-07-27: the configured automatic/operator-selected freezer
+ceilings are now persisted only after recovery and physical trimming succeed.
+The strict versioned policy refuses unknown future schemas and survives
+file/directory-sync interruption without a partial state. Embedded status and
+events, authenticated blockchain status, and Prometheus expose both targets,
+the retained range, and physical-prefix progress. An explicit height-triggered
+manual prune command remains part of item 1; items 2–5 remain open.
+
 ### P1.5 — optional indexes
 
 Implement independently rebuildable `txindex`, spent-output index, and
