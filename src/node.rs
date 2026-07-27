@@ -1,5 +1,7 @@
 //! Embeddable node runtime and command-line adapter.
 
+mod config_file;
+
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
     fs,
@@ -2484,6 +2486,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             options.network
         );
     }
+    if options.data_dir.is_some() {
+        println!("{}", startup_configuration_summary(&options));
+    }
     if options.mempool_full_rbf {
         println!("peer transaction admission full-RBF policy enabled");
     }
@@ -2518,6 +2523,47 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         return run_background_assumeutxo(options, validation_dir, local_nonce).await;
     }
     run_peer_pool(&options, local_nonce, None, None).await
+}
+
+fn startup_configuration_summary(options: &Options) -> String {
+    let dns = match &options.dns_seeds {
+        None => "pinned".to_owned(),
+        Some(seeds) if seeds.is_empty() => "disabled".to_owned(),
+        Some(seeds) => format!("custom:{}", seeds.len()),
+    };
+    let validation = if options.background_assumeutxo.is_some() {
+        "background"
+    } else if options.complete_assumeutxo.is_some() {
+        "complete"
+    } else if options.validation_target.is_some() {
+        "bounded"
+    } else {
+        "none"
+    };
+    format!(
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} once={} full_rbf={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        options.network,
+        options
+            .data_dir
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
+        options.remotes.len(),
+        dns,
+        options.once,
+        options.mempool_full_rbf,
+        options.cache.active_chainstate_bytes,
+        options.cache.background_chainstate_bytes,
+        options.cache.bulk_validation_bytes,
+        options.ledger_retention.max_blocks,
+        options.ledger_retention.max_bytes,
+        validation,
+        options.validation_limits.max_blocks_per_batch,
+        options.validation_limits.pause_between_batches.as_millis(),
+        options.validation_limits.quick_repair,
+        options.explorer_listen.is_some(),
+        options.rpc_auth_token_file.is_some(),
+        options.wallet_api_files.is_some(),
+    )
 }
 
 fn percentage_units(part: u64, total: u64) -> u64 {
@@ -8139,6 +8185,12 @@ fn parse_dns_seed(value: &str, network: Network) -> Result<DnsSeed, String> {
 
 #[allow(clippy::too_many_lines)]
 fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
+    let arguments = config_file::merge_config_arguments(args.collect())?;
+    parse_merged_options(arguments.into_iter())
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut args = args.peekable();
     if args.peek().is_none() {
         return Ok(None);
@@ -8220,6 +8272,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                     dns_seed_values.push(seed);
                 }
             }
+            "--dns-seeds" => no_dns_seeds = false,
             "--no-dns-seeds" => no_dns_seeds = true,
             "--network" => {
                 let value = required_option_value(&mut args, "--network")?;
@@ -8246,6 +8299,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 )?));
             }
             "--once" => once = true,
+            "--no-once" => once = false,
             "--experimental-network-execution" => experimental_network_execution = true,
             "--extend-validation-target" => extend_validation_target = true,
             "--explorer-listen" => {
@@ -8389,7 +8443,9 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 )?));
             }
             "--mempool-full-rbf" => mempool_full_rbf = true,
+            "--no-mempool-full-rbf" => mempool_full_rbf = false,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
+            "--no-cleanup-validation-dir" => cleanup_validation_dir = false,
             "--utxo-activity-report" => utxo_activity_report = true,
             "--retier-utxos-window-blocks" => {
                 if utxo_retier_window_blocks.is_some() {
@@ -8495,6 +8551,7 @@ fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, 
                 validation_pause_ms = Some(pause);
             }
             "--validation-deferred-repair" => validation_deferred_repair = true,
+            "--validation-quick-repair" => validation_deferred_repair = false,
             "--chainstate-cache-bytes" => {
                 if active_chainstate_cache_bytes.is_some() {
                     return Err(
@@ -9248,6 +9305,7 @@ fn print_usage() {
     println!(
         concat!(
             "rbtcd {}\n\nUSAGE:\n",
+            "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
@@ -9262,6 +9320,8 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
+            "CONFIG:\n",
+            "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
             "PEER OPTIONS:\n",
             "  Explicit --connect peers run first. If they and persisted verified peers fail, pinned Bitcoin Core 31 DNS seeds are used. Repeat --dns-seed to replace those defaults, or pass --no-dns-seeds. A custom Signet has no default seeds; repeat --signetseednode or --connect."
         ),
@@ -11621,6 +11681,63 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn strict_network_config_is_bounded_and_cli_groups_replace_file_values() {
+        let directory = TempDir::new().unwrap();
+        let config_path = directory.path().join("rbtc.conf");
+        fs::write(
+            &config_path,
+            "network=bitcoin\n\
+             data_dir=/from-global\n\
+             connect=127.0.0.1:8333\n\
+             once=true\n\
+             prune_blocks=500\n\
+             explorer_listen=127.0.0.1:3000\n\
+             rpc_auth_token_file=/secret/token\n\
+             [testnet4]\n\
+             data_dir=/from-testnet4\n\
+             connect=127.0.0.2:48333\n\
+             prune_blocks=600\n",
+        )
+        .unwrap();
+        let options = parse_options(
+            vec![
+                "--config".to_owned(),
+                config_path.display().to_string(),
+                "--network".to_owned(),
+                "testnet4".to_owned(),
+                "--data-dir".to_owned(),
+                "/from-cli".to_owned(),
+                "--connect".to_owned(),
+                "127.0.0.3:48333".to_owned(),
+                "--no-once".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.network, Network::Testnet4);
+        assert_eq!(options.data_dir, Some(PathBuf::from("/from-cli")));
+        assert_eq!(
+            options.remotes,
+            vec!["127.0.0.3:48333".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(!options.once);
+        assert_eq!(options.ledger_retention.max_blocks, 600);
+        let summary = startup_configuration_summary(&options);
+        assert!(summary.contains("prune_blocks=600"));
+        assert!(summary.contains("api=true rpc=true wallet=false"));
+        assert!(!summary.contains("/secret/token"));
+
+        fs::write(&config_path, "network=regtest\nunknown_limit=1\n").unwrap();
+        let Err(error) =
+            parse_options(["--config".to_owned(), config_path.display().to_string()].into_iter())
+        else {
+            panic!("unknown config keys must fail");
+        };
+        assert!(error.contains("unknown config key"));
     }
 
     #[test]

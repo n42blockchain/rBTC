@@ -229,7 +229,8 @@ optional where appropriate, and host-runtime compatible.
 - [ ] **Operator configuration and diagnostics.** The library/CLI now share
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
-  host. Add a bounded network-scoped config file, structured
+  host. The strict bounded `key=value` config file now supports global/per-network
+  scopes, unknown-key rejection, and CLI override precedence. Add structured
   rate-limited rotating logs, graceful RPC stop, runtime logging controls, and
   stable equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`,
   `getmempoolinfo`, `getindexinfo`, and `verifychain`. Exact response-field

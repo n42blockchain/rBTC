@@ -42,6 +42,16 @@ rBTC is **not yet a production full node** and must not be trusted with mainnet 
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |
 
+## Operator configuration
+
+`rbtcd --config PATH` loads a strict Core/btcd-style `key=value` file with
+global and per-network sections, a 64 KiB input ceiling, unknown-key rejection,
+and deterministic CLI override precedence. Negative CLI forms such as
+`--no-once` and `--no-mempool-full-rbf` allow an explicit command line to
+override enabled file booleans. Credentials and descriptors remain in their
+owner-only files rather than entering configuration. See
+[docs/OPERATOR_CONFIG.md](docs/OPERATOR_CONFIG.md) for the schema and example.
+
 ## Local checks
 
 ```bash
