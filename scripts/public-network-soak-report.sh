@@ -89,8 +89,8 @@ printf -- '- Window: `%s` through `%s` (%s seconds)\n' \
   "$started_utc" "$ended_utc" "$duration_seconds"
 printf -- '- Commit: `%s`\n' "$commit"
 printf -- '- Binary SHA-256: `%s`\n\n' "$binary_sha256"
-printf '| Network | Samples | PIDs | Max RSS KiB | Peer endpoints | Peer groups | Tip range | Freezer slots | Max freezer bytes | Mempool bytes |\n'
-printf '| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: |\n'
+printf '| Network | Samples | PIDs | Max RSS KiB | Peer endpoints | Peer groups | Tip range | Final hash | Freezer slots | Freezer bytes | Max freezer bytes | Data KiB | Min free KiB | Mempool bytes | Restart seconds |\n'
+printf '| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: |\n'
 
 for network in bitcoin testnet4; do
   process_values=$(
@@ -157,20 +157,56 @@ for network in bitcoin testnet4; do
   freezer_values=$(
     awk -F '\t' -v network="$network" '
       NR > 1 && $2 == network {
-        if (!seen++) first_slot=$3
+        if (!seen++) {
+          first_slot=$3
+          first_bytes=$7
+        }
         last_slot=$3
+        last_bytes=$7
         if (($7 + 0) > max_bytes) max_bytes=$7 + 0
       }
-      END { printf "%s\t%s\t%d", first_slot, last_slot, max_bytes }
+      END {
+        printf "%s\t%s\t%s\t%s\t%d",
+          first_slot, last_slot, first_bytes, last_bytes, max_bytes
+      }
     ' "$metrics_dir/freezer.tsv"
   )
-  IFS=$'\t' read -r first_slot last_slot max_freezer_bytes <<<"$freezer_values"
+  IFS=$'\t' read -r first_slot last_slot first_freezer_bytes \
+    last_freezer_bytes max_freezer_bytes <<<"$freezer_values"
+
+  disk_values=$(
+    awk -F '\t' -v network="$network" '
+      NR > 1 && $2 == network {
+        if (!seen++) first_data=$3
+        last_data=$3
+        if (min_free == "" || ($4 + 0) < min_free) min_free=$4 + 0
+      }
+      END { printf "%s\t%s\t%s", first_data, last_data, min_free }
+    ' "$metrics_dir/disk.tsv"
+  )
+  IFS=$'\t' read -r first_data_kib last_data_kib min_free_kib <<<"$disk_values"
 
   mempool_bytes=$(
     awk -F '\t' -v network="$network" '
       NR > 1 && $2 == network { bytes=$3 }
       END { printf "%d", bytes }
     ' "$metrics_dir/persistent.tsv"
+  )
+  restart_seconds=$(
+    awk -F '\t' -v network="$network" '
+      $2 == network &&
+        $3 ~ /scenario=controlled-restart/ &&
+        $3 ~ /status=completed/ {
+        count=split($3, fields, " ")
+        for (field=1; field <= count; field++) {
+          if (fields[field] ~ /^duration_seconds=[0-9]+$/) {
+            sub(/^duration_seconds=/, "", fields[field])
+            duration=fields[field]
+          }
+        }
+      }
+      END { printf "%s", duration }
+    ' "$metrics_dir/events.log"
   )
 
   if [[ -z "$samples" || "$samples" == 0 ]]; then
@@ -182,14 +218,19 @@ for network in bitcoin testnet4; do
   if [[ -z "$last_height" || "$last_height" != "$last_execution" ]]; then
     failures+=("$network header/execution tips are absent or inconsistent")
   fi
+  if [[ ! "$last_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    failures+=("$network final header hash is absent or malformed")
+  fi
   if (( peer_groups < 4 )); then
     failures+=("$network observed fewer than four peer network groups")
   fi
   if [[ -z "$first_slot" || -z "$last_slot" ]]; then
     failures+=("$network has no freezer samples")
     freezer_range=unavailable
+    freezer_bytes_range=unavailable
   else
     freezer_range="${first_slot}→${last_slot}"
+    freezer_bytes_range="${first_freezer_bytes}→${last_freezer_bytes}"
     if (( last_slot <= first_slot )); then
       failures+=("$network has not yet demonstrated freezer rotation")
     fi
@@ -202,10 +243,27 @@ for network in bitcoin testnet4; do
       failures+=("$network has not yet demonstrated a natural tip advance")
     fi
   fi
+  if [[ -z "$first_data_kib" || -z "$last_data_kib" || -z "$min_free_kib" ]]; then
+    failures+=("$network has no disk-capacity samples")
+    data_range=unavailable
+    min_free_kib=unavailable
+  else
+    data_range="${first_data_kib}→${last_data_kib}"
+  fi
+  if [[ -z "$mempool_bytes" ]]; then
+    failures+=("$network has no persistent-store samples")
+    mempool_bytes=unavailable
+  fi
+  if [[ -z "$restart_seconds" ]]; then
+    failures+=("$network has no measured completed restart duration")
+    restart_seconds=unavailable
+  fi
 
-  printf '| %s | %s | %s | %s | %s | %s | `%s` | `%s` | %s | %s |\n' \
+  printf '| %s | %s | %s | %s | %s | %s | `%s` | `%s` | `%s` | `%s` | %s | `%s` | %s | %s | %s |\n' \
     "$network" "$samples" "$pid_count" "$max_rss" "$peer_count" "$peer_groups" \
-    "$tip_range" "$freezer_range" "$max_freezer_bytes" "$mempool_bytes"
+    "$tip_range" "$last_hash" "$freezer_range" "$freezer_bytes_range" \
+    "$max_freezer_bytes" "$data_range" "$min_free_kib" "$mempool_bytes" \
+    "$restart_seconds"
 done
 
 bitcoin_restarts=$(

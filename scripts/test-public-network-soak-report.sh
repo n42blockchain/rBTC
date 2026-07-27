@@ -24,6 +24,10 @@ done >>"$fixture/metrics/process.tsv"
 
 printf 'timestamp_utc\tnetwork\tdata_kib\tfilesystem_free_kib\n' \
   >"$fixture/metrics/disk.tsv"
+for network in bitcoin testnet4; do
+  printf '2026-01-01T00:00:00Z\t%s\t1000\t9000\n' "$network"
+  printf '2026-01-01T01:00:00Z\t%s\t1100\t8900\n' "$network"
+done >>"$fixture/metrics/disk.tsv"
 printf 'timestamp_utc\tnetwork\tpid\tremote_endpoint\n' \
   >"$fixture/metrics/peers.tsv"
 for network in bitcoin testnet4; do
@@ -54,8 +58,8 @@ for network in bitcoin testnet4; do
 done >>"$fixture/metrics/persistent.tsv"
 
 printf '%s\n' \
-  $'2026-01-01T01:00:00Z\tbitcoin\tscenario=controlled-restart status=completed' \
-  $'2026-01-01T01:00:00Z\ttestnet4\tscenario=controlled-restart status=completed' \
+  $'2026-01-01T01:00:00Z\tbitcoin\tscenario=controlled-restart status=completed duration_seconds=7' \
+  $'2026-01-01T01:00:00Z\ttestnet4\tscenario=controlled-restart status=completed duration_seconds=9' \
   $'2026-01-01T01:00:00Z\ttestnet4\tscenario=fault-abrupt-kill status=completed' \
   >"$fixture/metrics/events.log"
 

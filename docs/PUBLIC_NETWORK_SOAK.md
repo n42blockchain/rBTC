@@ -76,7 +76,10 @@ natural tip advance; freezer rotation; distinct pre/post-restart PIDs; one
 completed controlled restart on each network; one completed injected fault
 scenario; at least 604,800 seconds since the immutable baseline; and an
 executable baseline binary whose current SHA-256 still exactly matches the
-recorded identity.
+recorded identity. Its report retains the final hashes, peak RSS, peer
+diversity, freezer/data-directory growth, minimum free space, persistent
+mempool size, and measured restart durations rather than reducing acceptance
+to a single pass/fail bit.
 
 ## Remaining scheduled exercises
 
