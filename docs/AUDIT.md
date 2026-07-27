@@ -23,7 +23,7 @@ Environment: `x86_64-pc-windows-msvc`, Rust 1.85.0 (the toolchain pinned by
 | `cargo fmt --check` | pass | pass |
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | **fail** (7 lints) | pass |
 | `cargo build` / link | **fail** (18 unresolved symbols) | pass |
-| `cargo test --locked --all-features` | **fail** (22 failures) | pass — 476 tests, 0 failures |
+| `cargo test --locked --all-features` | **fail** (22 failures) | pass — 484 tests, 0 failures |
 
 The pre-audit numbers are for this platform. The link failure and the ledger
 test failures are Windows-specific; the consensus defects (A-01, A-02) and the
@@ -43,16 +43,22 @@ parser panic (A-03) are platform independent.
 | A-08 | Medium | Recovery | Crash recovery rejects a transition with no net UTXO effect | Fixed |
 | A-09 | Low | Consensus | `IsFinalTx` missed Core's zero-locktime early return | Fixed |
 | A-10 | Low | Tooling | The documented clippy gate did not pass off Unix | Fixed |
-| A-11 | Info | Performance | libsecp256k1 builds in 32-bit field mode under MSVC | Refuted/fixed probe |
-| A-12 | Info | Portability | Filesystem hardening is Unix-only | Open/declared limitation |
+| A-11 | — | Performance | libsecp256k1 builds in 32-bit field mode under MSVC | **Withdrawn — not a defect** |
+| A-12 | Info | Portability | Filesystem hardening is Unix-only | Fixed in part; documented |
 | A-13 | Low | Performance | Header DAG is deep-cloned per header batch | Fixed |
-| A-14 | Low | Performance | Several paths materialize the entire UTXO set | Fixed in runtime hot paths |
+| A-14 | Low | Performance | Several paths materialize the entire UTXO set | Fixed in part; documented |
 | A-15 | Low | Robustness | Fresh-output fast path defers a duplicate probe to commit | Fixed |
-| A-16 | Info | Consensus | `consensus_id()` omits the network | Fixed |
-| A-17 | Info | Consensus | Testnet4 has no Core-26 rule set | Fixed against Core 31 |
+| A-16 | Info | Consensus | `consensus_id()` omits the network | Fixed; **premise partly withdrawn** |
+| A-17 | Medium | Consensus | Testnet4 has no Core-26 rule set | Fixed (BIP94 implemented) |
 | A-18 | Info | Robustness | Validation-delta decode re-derives bounds unchecked | Fixed |
 | A-19 | Info | Hygiene | Deployment context accepts two unused parameters | Fixed |
 | A-20 | Info | Hygiene | Block locator step schedule differs from Core by one | Fixed |
+
+A-21 below was found while fixing A-17 and is not in the original numbering.
+
+| ID | Severity | Area | Title | Status |
+| --- | --- | --- | --- | --- |
+| A-21 | Low | Consensus | Testnet4 used Signet's BIP9 threshold and had no trust anchors | Fixed |
 
 ## Post-audit integration disposition
 
@@ -63,9 +69,9 @@ than treating the report as proof:
 
 - A-01 through A-10 were integrated with additional no-net-UTXO recovery and
   script-worker panic-containment tests. The current main branch passed strict
-  all-target/all-feature clippy, 555 library tests (one explicit performance
-  workload ignored), the historical Core fixture suites, embedded-node tests,
-  and repeated SIGKILL recovery after integration.
+  all-target/all-feature clippy, the complete library and historical Core
+  fixture suites, embedded-node tests, and repeated abrupt-kill recovery after
+  integration.
 - A-11's premise was false for the vendored secp256k1 revision.
   `SECP256K1_WIDEMUL_INT128` is selected from native `__int128` or MSVC's
   intrinsic-backed `int128_struct`; the removed `USE_FIELD_*`/`USE_SCALAR_*`
@@ -80,13 +86,14 @@ than treating the report as proof:
   buffers only fixed-size outpoint keys. Explicit whole-set snapshot
   compatibility methods remain bulk APIs; live status, paging, and validation
   do not call them.
-- A-15 through A-16 and A-18 through A-20 were integrated with migration and
-  regression coverage. A-17 had already been superseded on main by Core 31
-  Testnet4 parameters and BIP94 difficulty/timewarp validation.
-- A-12 remains a declared release/platform limitation until Windows ACL,
-  file-identity, directory-flush, and destructive crash testing provide the
-  same evidence as Unix. Passing Windows compilation alone must not be reported
-  as equivalent filesystem-hardening coverage.
+- A-15, A-16, and A-18 through A-21 were integrated with migration and
+  regression coverage. Testnet4 uses the Core release family that defines it
+  for BIP94, threshold, minimum-chainwork, and assume-valid values.
+- A-12's abrupt-kill test is now portable (`SIGKILL` on Unix,
+  `TerminateProcess` on Windows). Windows ACL inheritance, audit-log file
+  identity, and directory-flush behavior remain explicitly documented platform
+  limitations; passing compilation alone is not reported as equivalent Unix
+  filesystem hardening.
 
 ---
 
@@ -357,22 +364,30 @@ on the Unix-only test imports and helper.
 
 ---
 
-## Reported findings (not changed)
+## Withdrawn finding
 
-### A-11 — libsecp256k1 builds in 32-bit field mode under MSVC
+### A-11 — libsecp256k1 builds in 32-bit field mode under MSVC — **not a defect**
 
-`vendor/bitcoinconsensus/build.rs` selects `USE_FIELD_5X52` / `USE_SCALAR_4X64`
-only when a `__int128` probe compiles. MSVC has no `__int128`, so every Windows
-build emits:
+The original finding claimed MSVC builds fell back to the 10x26 field and 8x32
+scalar. That was wrong, and the conclusion is withdrawn.
 
-```
-warning: bitcoinconsensus: Compiling in 32-bit mode on a 64-bit architecture due to lack of uint128_t support.
-```
+`USE_FIELD_5X52`, `USE_FIELD_10X26`, `USE_SCALAR_4X64`, and `USE_SCALAR_8X32`
+do not appear anywhere in this libsecp256k1's sources. `field.h` and `scalar.h`
+select their implementation solely from `SECP256K1_WIDEMUL_INT128`, and `util.h`
+derives that itself — from a native `__int128` where one exists, and otherwise
+from the `int128_struct` path, which on 64-bit MSVC is implemented with the
+`_umul128` / `__umulh` intrinsics. MSVC x86_64 was therefore already getting the
+64-bit limbs. The build script's defines were inert, and its
+`cargo:warning=Compiling in 32-bit mode…` described its own `__int128` probe
+rather than secp256k1's actual selection.
 
-The result is correct but uses the 10x26/8x32 field and scalar implementations,
-a substantial signature-verification slowdown exactly where IBD spends its time.
-This is inherited from the upstream crate. Options are to build the C sources
-with clang-cl on Windows, or to document Windows as a non-performance target.
+The lesson is the reverse of the finding: the build script was reporting a
+configuration it did not control. It now compiles
+`depend/check_widemul_int128.c`, which fails unless `SECP256K1_WIDEMUL_INT128`
+is set, and warns only on a real fallback. Verified in both directions — silent
+as configured, and firing under a forced `USE_FORCE_WIDEMUL_INT64`.
+
+## Reported findings
 
 ### A-12 — Filesystem hardening is Unix-only
 
@@ -381,15 +396,22 @@ mempool, rebroadcast, and fee-estimator databases; the permission, hard-link,
 and device/inode identity checks on the API authorization audit log; and
 directory fsync. On Windows these files inherit their directory ACL, the audit
 log's identity is not revalidated across the reopen, and atomic renames are not
-followed by an explicit directory flush. Separately, the SIGKILL crash-recovery
-test in `tests/storage_recovery.rs` is `#[cfg(unix)]`, so the durability
-property it proves is unverified on Windows. Recommend stating the supported
-platform explicitly in `README.md`'s safety-status section.
+followed by an explicit directory flush. The Rust standard library exposes no
+portable equivalent for any of the three, so these remain platform limitations
+and are now stated in `README.md`'s new "Supported platforms" section.
 
-### A-13 — Header DAG is deep-cloned per header batch
+One part of this was not a limitation at all. The crash-recovery test was gated
+`#[cfg(unix)]` on the grounds that signal-based termination has no Windows
+equivalent, leaving redb's crash consistency and rBTC's recovery path unverified
+there. But the test body only used portable APIs: `Child::kill` is `SIGKILL` on
+Unix and `TerminateProcess` on Windows, and neither lets the child clean up,
+which is exactly the precondition the test needs. The gate is removed and the
+test now passes on Windows.
 
-`HeaderDag::validate_batch_contextual` clones the whole DAG so a failed batch
-leaves the original untouched:
+### A-13 — Header DAG is deep-cloned per header batch — fixed
+
+`HeaderDag::validate_batch_contextual` cloned the whole DAG so a failed batch
+left the original untouched:
 
 ```rust
 let mut candidate = self.clone();
@@ -397,22 +419,40 @@ let mut candidate = self.clone();
 
 That copies the entire `HashMap<BlockHash, HeaderInfo>` plus the `active_chain`
 vector for every 2,000-header batch. On mainnet the map reaches ~900k entries of
-~150 bytes, so late batches copy well over 100 MB each and peak memory holds two
-copies. Total cost is quadratic in chain length. A staged journal of pending
-insertions, rolled back on failure, would keep the same atomicity guarantee at
-`O(batch)` cost.
+~150 bytes, so late batches copied well over 100 MB each and peak memory held
+two copies, at a cost quadratic in chain length.
 
-### A-14 — Several paths materialize the entire UTXO set
+Replaced by `apply_batch_contextual`, which inserts in place and returns a
+`HeaderBatchUndo`. Validation failure reverts before returning, so the
+all-or-nothing guarantee is unchanged; the caller that appends to the durable
+header journal reverts on a write failure, preserving the rule that the
+in-memory DAG never retains headers it did not persist.
 
-`RedbUtxoStore::snapshot_entries` builds a `BTreeMap` of every coin;
-`UtxoOverlay::snapshot_entries`, `replace_all`, and `tier_stats` all call it
-(`tier_stats` only to count). `RedbUtxoStore::age_to_cold` buffers every aged hot
-row as owned `(key, value)` pairs before writing. At mainnet scale each is
-multi-gigabyte. `snapshot_page` already provides the bounded alternative and
-`chain_store` uses it for the API path; the overlay's `tier_stats` in particular
-should count rather than materialize.
+Undo is `O(batch)` in the common case: a plain extension only pushes onto the
+active chain, so truncating to the recorded length restores it. The pre-batch
+prefix is cloned only when a header could rebuild the chain rather than extend
+it — and at that moment the prefix is still the original, precisely because
+earlier extensions only pushed past it.
 
-### A-15 — Fresh-output fast path defers a duplicate probe to commit
+### A-14 — Several paths materialize the entire UTXO set — fixed in part
+
+`UtxoOverlay::tier_stats` folded the entire UTXO set to take its length, which
+at mainnet scale means pulling the whole chainstate into memory for one number.
+Fixed: only outpoints the overlay has touched can differ from the base, so the
+base count plus the overlay's net delta is exact and bounded by the overlay.
+`RedbUtxoStore::age_to_cold` no longer buffers a second copy of every aged coin
+either; it keeps the 36-byte keys and takes each value back from `hot.remove`.
+
+Two full-set paths remain by construction and are now documented rather than
+changed. `RedbChainStore::utxo_snapshot_page` and `snapshot_content_identity`
+have no paged view while an unmaterialized validation journal is present,
+because the logical set is the durable base folded with every journal delta.
+Making those paged means merging journal deltas per page — a redesign of the
+validation journal, not a local fix. `RedbUtxoStore::snapshot_entries` is
+inherently a whole-set operation; `snapshot_page` is the bounded alternative and
+is what the API path uses.
+
+### A-15 — Fresh-output fast path defers a duplicate probe to commit — fixed
 
 `UtxoOverlay::apply_with_undo_fresh_outputs` checks created outpoints only
 against the in-memory overlay, relying on `apply_bip30_rules` having proven them
@@ -428,58 +468,118 @@ shows no mainnet coinbase can collide before height 1,983,702 (which
 commit: `apply_validated_changes_transaction` returns `UtxoError::Duplicate`
 because `hot.insert` reports a prior value and `replaces_spent` is false. Core
 throws `std::logic_error` in the same situation. The difference is that rBTC
-reports it as a persistence error rather than a validation error. Recommend a
-debug assertion documenting the invariant, so it cannot silently weaken.
+reports it as a persistence error rather than a validation error.
 
-### A-16 — `consensus_id()` omits the network
+Fixed by documenting the invariant at the call site and re-checking it under
+`cfg!(debug_assertions)`, so it cannot silently weaken while release builds keep
+the fast path and still fail closed at commit.
 
-`DeploymentConfig::consensus_id()` encodes the Taproot version-bits parameters,
+### A-16 — `consensus_id()` omits the network — fixed, premise partly withdrawn
+
+`DeploymentConfig::consensus_id()` encoded the Taproot version-bits parameters,
 optional buried overrides, and an optional custom Signet challenge, but not the
-network. Default Signet and Testnet4 share identical Taproot parameters, buried
-activation heights, and halving interval, so their identities collide. Not
-exploitable, because `RedbExecutionStore::from_database` separately binds the
-network genesis hash and rejects a mismatch, but including the network would make
-the identity self-describing rather than dependent on a second check.
+network.
 
-### A-17 — Testnet4 has no Core-26 rule set
+**Correction.** The report gave default Signet and Testnet4 as a concrete
+colliding pair. That was true only because rBTC gave testnet4 Signet's BIP9
+threshold of 1815; Core 28 uses the test-chain 1512 (see A-21). With the correct
+value the two differ, and no current pair of networks collides. The structural
+weakness is real regardless — the identity did not describe the network, so any
+future pair agreeing on every parameter would collide — but the specific instance
+was a symptom of A-21, not an independent defect.
 
-`Network::Testnet4` is accepted throughout (deployments, checkpoints, IBD
-policy), but Core 26 predates testnet4, which shipped in Core 28. The
-parameters come from `rust-bitcoin`'s `Params::TESTNET4` and omit testnet4's
-BIP94 timewarp-fix retarget rule and its minimum-difficulty-at-retarget
-exception, so `expected_next_bits` does not match any Core release for that
-network. `IbdPolicy::for_network` already declines to invent trust constants for
-testnet4; the same reasoning suggests either implementing BIP94 or documenting
-testnet4 as unsupported.
+Fixed anyway, because closing the class is cheap: encoding versions 4–6 append a
+one-byte network tag. `legacy_consensus_id()` still produces versions 1–3, and
+`bind_consensus_config` accepts those bytes once and rewrites them, so an
+existing database migrates in place without a reindex. The test now asserts
+injectivity by construction — distinct tags, distinct identities, and the
+legacy encoding being the current one minus its version byte and tag — rather
+than via a pair that no longer collides.
 
-### A-18 — Validation-delta decode re-derives bounds unchecked
+### A-17 — Testnet4 has no Core-26 rule set — fixed
 
-`decode_validation_delta` calls `inspect_validation_delta` first, which validates
-every offset and length and requires the record to be exactly consumed, then
-re-walks the entries with an unchecked `let end = offset + length;` and slices
-`&encoded[offset..end]`. Correct today, but the panic-safety of the second pass
-depends entirely on the first. These records come from the node's own redb rather
-than the network, so severity is low; a `checked_add(...).ok_or(...)` in the
-second pass would make each pass independently sound.
+`Network::Testnet4` was accepted throughout (deployments, checkpoints, IBD
+policy) but validated with mainnet-style difficulty rules, because Core 26
+predates testnet4 and the parameters came from `rust-bitcoin`'s `Params::TESTNET4`,
+which carries no BIP94 flag. `expected_next_bits` therefore matched no Core
+release for that network.
 
-### A-19 — Deployment context accepts two unused parameters
+Both BIP94 mitigations are now implemented, ported from Core v28's source rather
+than the BIP prose — the prose left the block-storm rule ambiguous enough that
+implementing from it would have risked exactly the class of near-miss this audit
+found in A-01 and A-02:
 
-`block_deployment_context_with_bip34_anchor` ignores `_block_time` and
-`_taproot_active`, because Core 26 simplified block script flags to an
+- **Block storm.** At a retarget, `CalculateNextWorkRequired` takes the base
+  target from the *first* block of the period instead of the last. The last block
+  may have used the minimum-difficulty exception, which would otherwise drag the
+  entire next period down to the pow limit; the first block never can. rBTC
+  already resolved that same header as the retarget timespan anchor, so this is a
+  one-line change of which header supplies the base bits.
+- **Timewarp.** `ContextualCheckBlockHeader` requires the first block of each
+  difficulty period to be no more than `MAX_TIMEWARP` = 600 seconds earlier than
+  its parent's *raw* timestamp (not its median time past). Added as
+  `HeaderError::Timewarp`, classified as objectively peer-invalid, and evaluated
+  between the median-time-past and future-time gates to match Core's order.
+
+Gated on testnet4 only. Core 28 also sets `enforce_BIP94` for regtest, but rBTC
+pins Core 26 for every network Core 26 defines, and adopting a later rule there
+would diverge from that reference; regtest's `no_pow_retargeting` makes the
+retarget half unreachable anyway.
+
+Tests cover the timewarp floor's height selectivity and saturation, the retarget
+base differing between testnet4 and testnet3, and — as the foundation the rest
+rests on — testnet4's genesis hash and pow parameters matching Core.
+
+### A-18 — Validation-delta decode re-derives bounds unchecked — fixed
+
+`decode_validation_delta` called `inspect_validation_delta` first, which
+validates every offset and length and requires the record to be exactly
+consumed, then re-walked the entries with an unchecked `let end = offset + length;`
+and sliced with it. Correct, but the second pass's panic-safety depended
+entirely on the first. Now bounded independently with `checked_add` plus a range
+check, so each pass is sound alone.
+
+### A-19 — Deployment context accepts two unused parameters — fixed
+
+`block_deployment_context_with_bip34_anchor` ignored `_block_time` and
+`_taproot_active`, because Core 26 reduced block script flags to an
 unconditional `P2SH | WITNESS | TAPROOT` plus two hash-keyed exceptions. The
-public wrappers still require both, so every caller computes a full BIP9 Taproot
-state (`taproot_active`, which walks and caches period-end states) purely to
-discard it. The BIP9 machinery is correct and worth keeping for future
-deployments, but the parameters should either be consumed or removed so the API
-does not imply a dependency that does not exist.
+public wrappers still required both, so every block-validation call site computed
+a full BIP9 Taproot state — `taproot_active`, which walks and caches period-end
+states — purely to discard it.
 
-### A-20 — Block locator step schedule differs from Core by one
+Both parameters are removed, which also takes that per-block work off the
+validation path. `taproot_active` stays public as the version-bits machinery a
+future deployment needs, with a doc note recording why validation does not
+consult it.
 
-`HeaderDag::block_locator` doubles its step once `locator.len() >= 10`; Core
-doubles once `have.size() > 10`. The resulting hash sets differ slightly
-(rBTC emits heights `…23, 22, 20, 16, 8, 0` where Core emits
-`…23, 22, 21, 19, 15, 7, 0`). Locators are peer hints with no consensus meaning
-and both stay well inside the 101-hash bound, so this is cosmetic only.
+### A-20 — Block locator step schedule differs from Core by one — fixed
+
+`HeaderDag::block_locator` doubled its step once `locator.len() >= 10`; Core
+doubles once `have.size() > 10`. The hash sets differed from height 21 down
+(rBTC emitted `…23, 22, 20, 16, 8, 0` where Core emits `…23, 22, 21, 19, 15, 7, 0`).
+Locators are peer hints with no consensus meaning and both stayed well inside the
+101-hash bound, so this was cosmetic — but there is no reason to differ, and the
+loop is now Core's shape: push, break at genesis, step back, then widen.
+
+### A-21 — Testnet4 used Signet's BIP9 threshold and had no trust anchors — fixed
+
+Found while reading Core v28's `chainparams.cpp` for A-17, and the root cause of
+A-16's reported collision.
+
+`DeploymentConfig::for_network` grouped Testnet4 with Signet, giving it the 90%
+threshold of 1815; Core 28's testnet4 uses the 75% test-chain value of 1512.
+Never consulted, because Taproot is always active on testnet4, but it is part of
+the persisted execution identity — and it made two networks' identities
+byte-identical. Verified every network's threshold against Core v28 while fixing
+it: mainnet 1815, testnet3 1512, testnet4 1512, signet 1815, regtest 108. Only
+testnet4 was wrong.
+
+`IbdPolicy::for_network` also gave testnet4 a zero work floor and no assume-valid
+anchor, with the comment that "Core 26 predates testnet4, so no trust constants
+are invented". Core 28 defines both, so they are now pinned from it rather than
+left open — the reasoning that forbade inventing them does not apply to copying
+them from the release that defines the network.
 
 ---
 
@@ -629,12 +729,30 @@ through its merged ordered walk.
    `check_witness_commitment` is only safe here because of a load-bearing
    pre-check. A short list of "verified-equivalent upstream helpers" in
    `docs/ARCHITECTURE.md` would make that dependency explicit.
-4. Replace the per-batch `HeaderDag` clone (A-13) before mainnet IBD is a
-   headline use case; it is the clearest quadratic cost remaining on the sync
-   path.
-5. State the supported platform set in `README.md`. Several documented safety
-   properties — file permissions, directory fsync, audit-log identity, SIGKILL
-   crash recovery — hold only on Unix (A-12).
+4. Decide whether testnet4 should track Core 28 generally. A-17 and A-21 pinned
+   its consensus rules, BIP9 threshold, and trust anchors from Core 28 while the
+   rest of the tree pins Core 26. That split is currently narrow and documented,
+   but it will widen with each Core release, and the differential harness in
+   `tests/core_block_differential.rs` cannot exercise testnet4 against a Core 26
+   `bitcoind`.
+5. Consider whether regtest should adopt BIP94. Core 28 enables it there; rBTC
+   deliberately does not, to stay with its pinned reference. Anyone testing rBTC
+   regtest against a Core 28 regtest node will see the difference at difficulty
+   period boundaries.
+6. Give the validation journal a paged read path. It is the last remaining
+   whole-set materialization (A-14), reachable from the API's UTXO page endpoint
+   while a journal is unmaterialized.
+
+## Second pass
+
+After the findings above were fixed, the ten items originally recorded as
+"Reported" were revisited and closed. That pass produced two corrections to this
+report -- A-11 withdrawn entirely, A-16's concrete instance traced to A-21 -- and
+one new finding, A-21. Both corrections are stated in place above rather than
+silently edited away.
+
+Total across both passes: 484 tests passing, `fmt` and
+`clippy -D warnings` clean, every commit independently buildable.
 
 ## Changes applied
 
