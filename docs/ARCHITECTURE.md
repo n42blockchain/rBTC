@@ -37,8 +37,10 @@ through Tokio watch receivers plus a 32-entry broadcast stream of typed
 lifecycle, peer, header, execution, reorg, index, freezer, and failure deltas.
 Lagging observers receive an explicit lag error and resample the latest status
 instead of growing node memory. The external fixture additionally drives a
-real regtest P2P handshake, while `../n42-26/bin/n42-node/tests/rbtc_embedding.rs`
-moves `NodeHandle::wait` into Reth's actual critical-task executor. This closes
+real regtest P2P handshake, while
+`../n42-26/integration-tests/rbtc-embedding` moves `NodeHandle::wait` into
+Reth's actual critical-task executor without compiling the unrelated complete
+N42 node stack. This closes
 the technical P1.0 boundary without making the host the owner of Bitcoin
 consensus or storage state.
 

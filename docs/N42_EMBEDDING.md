@@ -73,7 +73,9 @@ The repository-owned external-crate tests verify:
    freezer, and trust state without enabling an HTTP listener.
 
 The exact sibling acceptance fixture lives at
-`../n42-26/bin/n42-node/tests/rbtc_embedding.rs`. It uses an isolated data
+`../n42-26/integration-tests/rbtc-embedding`. It is an isolated Cargo fixture
+so CI compiles rBTC and Reth's task executor without rebuilding the unrelated
+EVM, RocksDB, and full `n42-node` dependency graph. It uses an isolated data
 directory, Reth's real `TaskExecutor::spawn_critical_task`, and retained
 controller shutdown. It is a technical integration test, not authorization to
 distribute a combined binary. Production assembly must still fail the
