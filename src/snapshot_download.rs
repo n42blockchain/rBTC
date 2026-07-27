@@ -320,6 +320,8 @@ fn assemble(
     output.get_ref().sync_all()?;
     drop(output);
     fs::rename(&temporary, &config.output)?;
+    // Windows has no portable directory fsync; see `diagnostics::sync_directory`.
+    #[cfg(unix)]
     if let Some(parent) = config.output.parent() {
         File::open(parent)?.sync_all()?;
     }

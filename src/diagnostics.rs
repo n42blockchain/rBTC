@@ -472,17 +472,27 @@ fn owner_only(options: &mut OpenOptions) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    #[cfg(not(unix))]
+    {
+        let _ = options;
+    }
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restrict_directory_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn require_owner_only_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -494,20 +504,44 @@ fn require_owner_only_directory(path: &Path) -> io::Result<()> {
             ));
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restrict_file_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
+/// Makes a directory's entries durable after an atomic rename.
+///
+/// Windows cannot open a directory through `File::open` without
+/// `FILE_FLAG_BACKUP_SEMANTICS` and offers no portable directory fsync, so
+/// attempting it there fails with `ERROR_ACCESS_DENIED`. Documented no-op
+/// off Unix, matching `node::sync_directory` and the ledger's sync points.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn unix_seconds() -> u64 {

@@ -2215,7 +2215,7 @@ impl DataDirectoryLock {
                 .map_err(|error| format!("restrict data-directory lock permissions: {error}"))?;
         }
         if let Err(error) = file.try_lock_exclusive() {
-            if error.kind() == io::ErrorKind::WouldBlock {
+            if is_lock_contention(&error) {
                 let marker = read_lock_marker(&mut file);
                 return Err(format!(
                     "data directory {} is already locked{}",
@@ -2350,7 +2350,7 @@ impl DataDirectoryReadLock {
             )
         })?;
         if let Err(error) = FileExt::try_lock_shared(&file) {
-            if error.kind() == io::ErrorKind::WouldBlock {
+            if is_lock_contention(&error) {
                 return Err(format!(
                     "data directory {} is in use; stop the node before a storage audit",
                     data_dir.display()
@@ -2369,6 +2369,28 @@ impl Drop for DataDirectoryReadLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+/// Whether a failed non-blocking file lock means another holder owns it.
+///
+/// Unix reports `WouldBlock`. Windows fails `LockFileEx` with
+/// `ERROR_LOCK_VIOLATION` (33), or `ERROR_SHARING_VIOLATION` (32) when the file
+/// itself is already open exclusively; neither currently maps to a named
+/// `ErrorKind`, so both would otherwise be reported as an unexpected failure
+/// instead of ordinary contention.
+fn is_lock_contention(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        if matches!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        ) {
+            return true;
+        }
+    }
+    error.kind() == io::ErrorKind::WouldBlock
 }
 
 fn validate_data_format_manifest(
@@ -2511,8 +2533,9 @@ fn publish_data_format_manifest(
     drop(file);
     fs::rename(&temporary, &path)
         .map_err(|error| format!("publish data-format manifest: {error}"))?;
-    fs::File::open(data_dir)
-        .and_then(|directory| directory.sync_all())
+    // Windows cannot open a directory through `File::open` without
+    // `FILE_FLAG_BACKUP_SEMANTICS`; see `sync_directory`.
+    sync_directory(data_dir)
         .map_err(|error| format!("sync data-format manifest directory: {error}"))
 }
 
@@ -19911,8 +19934,15 @@ mod tests {
         let first = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
         let error = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap_err();
         assert!(error.contains("already locked"));
-        assert!(error.contains("pid="));
-        assert!(error.contains("network=regtest"));
+        // The owner detail is read from the contending handle. Unix advisory
+        // locks permit that read; Windows locks are mandatory, so the range
+        // stays unreadable and the message degrades to the contention notice
+        // alone.
+        #[cfg(unix)]
+        {
+            assert!(error.contains("pid="));
+            assert!(error.contains("network=regtest"));
+        }
         drop(first);
         DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
 
@@ -19932,13 +19962,17 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let exclusive = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
         let marker_path = directory.path().join(DATA_DIRECTORY_LOCK_FILE);
-        let marker = fs::read(&marker_path).unwrap();
         assert!(
             DataDirectoryReadLock::acquire(directory.path())
                 .unwrap_err()
                 .contains("in use")
         );
         drop(exclusive);
+        // Read the marker only after the exclusive lock is released. Unix locks
+        // are advisory, so an unrelated handle can read a locked range, but
+        // Windows locks are mandatory and such a read fails with
+        // ERROR_LOCK_VIOLATION.
+        let marker = fs::read(&marker_path).unwrap();
 
         let first = DataDirectoryReadLock::acquire(directory.path()).unwrap();
         let second = DataDirectoryReadLock::acquire(directory.path()).unwrap();

@@ -928,3 +928,89 @@ Total across both passes: 484 tests passing, `fmt` and
 
 No public API was removed or renamed. `ConsensusError::WorkerPanicked` is the
 only new public variant.
+
+---
+
+## Fourth pass — audit of the post-integration tree
+
+Performed after merging `origin/main` at `8c7451f`, which integrated the earlier
+passes and added 79 further commits (`main.rs` became `node.rs`, plus new
+`diagnostics`, `snapshot_download`, `auxiliary_index`, `index_policy`, and
+`node::config_file` modules). Everything below was found in that incoming code.
+
+**Two of my own earlier conclusions were corrected by the integration, and the
+integration was right both times.** They are recorded here rather than edited
+away.
+
+### A-23 was wrong — regtest does not enforce BIP94
+
+The second pass enabled BIP94 on regtest, citing `consensus.enforce_BIP94 = true`
+in `CRegTestParams`. That reading was wrong for the release being tracked. Core
+v31.1 has:
+
+```cpp
+consensus.enforce_BIP94 = opts.enforce_bip94;   // RegTestOptions
+bool enforce_bip94{false};                      // default
+```
+
+So regtest leaves BIP94 **off** by default; enabling it is a testing-only knob,
+not the network rule. The integrated tree keeps BIP94 testnet4-only and says so.
+A-22's separate correction — regtest's 144-block difficulty interval, which is
+observable to callers regardless — was kept, which is the right split.
+
+### A-13 remains open
+
+The integrated tree still has the cloning `validate_batch_contextual`, so the
+per-batch deep clone of the header index described under A-13 is unchanged. The
+in-place replacement was not adopted. The finding stands as written.
+
+## Regressions found in the incoming code
+
+All three are the same classes this audit already established, reappearing in
+modules written after those fixes landed. All are fixed.
+
+### A-24 — A-06 reintroduced: unconditional directory fsync in new modules
+
+`diagnostics::sync_directory`, the data-format manifest publisher in `node.rs`,
+and `snapshot_download` all called `File::open(dir)?.sync_all()` with no
+platform gate, which is `ERROR_ACCESS_DENIED` on Windows. The manifest one is on
+the startup path, so the daemon could not open a data directory at all: 30+ node
+tests failed with `sync data-format manifest directory: os error 5`. The earlier
+fixes in `ledger.rs`, `node::sync_directory`, and `snapshot.rs` had survived the
+merge; these three are new code that did not adopt the pattern.
+
+### A-25 — A-10 reintroduced: the clippy gate broken off Unix again
+
+Eight lints in `diagnostics.rs` and `auxiliary_index.rs` — `unused_variables` on
+`#[cfg(unix)]`-gated parameters and `clippy::unnecessary_wraps` on the resulting
+no-op `Result` functions. Same fix as A-10.
+
+### A-26 — Data-directory lock mishandles Windows contention
+
+New in the integration. Both lock paths classified contention as
+`ErrorKind::WouldBlock` only. Windows fails `LockFileEx` with
+`ERROR_LOCK_VIOLATION` (33), or `ERROR_SHARING_VIOLATION` (32) when the file is
+already open exclusively; neither maps to a named `ErrorKind`, so genuine
+contention was reported as an unexpected failure and the operator-facing
+"already locked" / "in use" messages never appeared. Fixed with an
+`is_lock_contention` helper covering both.
+
+A second, deeper platform difference is documented rather than changed: Unix
+advisory locks let an unrelated handle read a locked range, so the lock file's
+`pid=`/`network=` owner marker can be read back from the contending handle.
+Windows locks are mandatory, so that read fails and the message degrades to the
+contention notice without owner detail. Making the marker readable under
+contention would mean locking a byte range outside it — a change to the lock
+file format, not a local fix. The affected assertions are now Unix-gated with
+that reasoning recorded.
+
+## Verification after the merge
+
+`cargo fmt --check` clean, `cargo clippy --locked --all-targets --all-features
+-- -D warnings` clean, `cargo test --locked --all-features` 590 passing / 0
+failing on `x86_64-pc-windows-msvc`.
+
+The recurrence of A-06 and A-10 in code written after they were fixed is the
+substantive lesson of this pass: both are invisible on Unix CI. The first
+recommendation in this report — add a Windows job that links and runs the tests
+— would have caught all three regressions before they merged.

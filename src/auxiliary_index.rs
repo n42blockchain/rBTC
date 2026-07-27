@@ -476,6 +476,7 @@ fn validate_database_path(path: &Path) -> Result<(), AuxiliaryIndexError> {
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restrict_database_permissions(path: &Path) -> Result<(), AuxiliaryIndexError> {
     #[cfg(unix)]
     {
