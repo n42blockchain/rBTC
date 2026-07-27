@@ -76,9 +76,9 @@ use bitcoin::{
 use rbtc::{
     api::{
         AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
-        LocalRpcOperator, LocalRpcOperatorError, WALLET_BROADCAST_QUEUE_CAPACITY,
-        WalletBroadcastRequest, WalletBroadcastSink, explorer_events_router, explorer_router,
-        rpc_router_with_operator, wallet_router_with_sink,
+        LocalRpcOperator, LocalRpcOperatorError, MAX_RPC_BODY_BYTES,
+        WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
+        explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
     archive::bounded_archive_prefix_len,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
@@ -138,7 +138,7 @@ use rbtc::{
         dependency_packages, transaction_descendant_closure,
     },
     transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
-    utxo::{DEFAULT_HOT_WINDOW_SECS, UtxoStore},
+    utxo::{DEFAULT_HOT_WINDOW_SECS, OutPointKey, Utxo, UtxoStore},
     validation_owner::{
         MAX_VALIDATION_OWNER_BYTES, ValidationDirectoryOwner, parse_validation_directory_owner,
     },
@@ -2711,13 +2711,23 @@ struct NodeRpcOperator {
     runtime_control: Arc<RuntimeControl>,
     active_peer: Option<SocketAddr>,
     auxiliary_indexes: Arc<AuxiliaryIndexes>,
+    source: Option<Arc<SharedInboundSource>>,
 }
+
+const MAX_RPC_MEMPOOL_PAGE: usize = 1_000;
+const MAX_RPC_BLOCK_CHUNK_BYTES: usize = 24 * 1024;
 
 const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "getblockchaininfo",
     "getnetworkinfo",
     "getpeerinfo",
     "getmempoolinfo",
+    "getrawmempool",
+    "getblockheader",
+    "getblock",
+    "gettxout",
+    "rbtc.getblockchunk",
+    "rbtc.submitrawtransaction",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -2758,9 +2768,26 @@ impl LocalRpcOperator for NodeRpcOperator {
         }
         if matches!(
             method,
-            "gettxindexlocation" | "gettxspendingprevout" | "getblockfilter"
+            "gettxindexlocation"
+                | "gettxspendingprevout"
+                | "getblockfilter"
+                | "getrawmempool"
+                | "getblockheader"
+                | "getblock"
+                | "gettxout"
+                | "rbtc.getblockchunk"
+                | "rbtc.submitrawtransaction"
         ) {
-            return Some(self.execute_index_query(method, params));
+            return Some(
+                if matches!(
+                    method,
+                    "gettxindexlocation" | "gettxspendingprevout" | "getblockfilter"
+                ) {
+                    self.execute_index_query(method, params)
+                } else {
+                    self.execute_data_query(method, params)
+                },
+            );
         }
         if !rpc_has_no_params(params) {
             return Some(Err(LocalRpcOperatorError {
@@ -2819,6 +2846,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                             "addr": peer.address.to_string(),
                             "inbound": true,
                             "role": "inbound",
+                            "preferred": peer.preferred,
                             "conntime": peer.connected_seconds,
                             "version": peer.protocol_version,
                             "subver": peer.user_agent,
@@ -3022,6 +3050,247 @@ impl NodeRpcOperator {
             _ => unreachable!("index method membership checked"),
         }
     }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_data_query(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let unavailable = || LocalRpcOperatorError {
+            code: -28,
+            message: "Node data is not ready",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Node storage failure",
+        };
+        if method == "getrawmempool" {
+            let (offset, limit) = rpc_page_params(params, MAX_RPC_MEMPOOL_PAGE)?;
+            let mut txids = self
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot()
+                .into_iter()
+                .map(|transaction| transaction.compute_txid().to_string())
+                .collect::<Vec<_>>();
+            txids.sort_unstable();
+            let total = txids.len();
+            let transactions = txids
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect::<Vec<_>>();
+            let next_offset = (offset + transactions.len() < total)
+                .then_some(offset.saturating_add(transactions.len()));
+            return Ok(serde_json::json!({
+                "transactions": transactions,
+                "total": total,
+                "next_offset": next_offset,
+            }));
+        }
+        let source = self.source.as_ref().ok_or_else(unavailable)?;
+        let source = source.current().map_err(|_| unavailable())?;
+        match method {
+            "getblockheader" => {
+                let hash = rpc_one_block_hash(params)?;
+                let height = source.active_height(hash).map_err(|_| storage())?.ok_or(
+                    LocalRpcOperatorError {
+                        code: -5,
+                        message: "Block not found",
+                    },
+                )?;
+                let header = source
+                    .active_header(height)
+                    .map_err(|_| storage())?
+                    .ok_or_else(storage)?;
+                let tip = source.start_height().map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "hash": hash,
+                    "height": height,
+                    "confirmations": tip.saturating_sub(height).saturating_add(1),
+                    "version": header.version.to_consensus(),
+                    "previousblockhash": header.prev_blockhash,
+                    "merkleroot": header.merkle_root,
+                    "time": header.time,
+                    "bits": format!("{:08x}", header.bits.to_consensus()),
+                    "nonce": header.nonce,
+                    "hex": serialize(&header).to_lower_hex_string(),
+                }))
+            }
+            "getblock" => {
+                let hash = rpc_one_block_hash(params)?;
+                let height = source.active_height(hash).map_err(|_| storage())?.ok_or(
+                    LocalRpcOperatorError {
+                        code: -5,
+                        message: "Block not found",
+                    },
+                )?;
+                let raw =
+                    source
+                        .block(hash)
+                        .map_err(|_| storage())?
+                        .ok_or(LocalRpcOperatorError {
+                            code: -1,
+                            message: "Block not retained by pruned node",
+                        })?;
+                let block = deserialize::<Block>(&raw).map_err(|_| storage())?;
+                let tip = source.start_height().map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "hash": hash,
+                    "height": height,
+                    "confirmations": tip.saturating_sub(height).saturating_add(1),
+                    "size": raw.len(),
+                    "tx_count": block.txdata.len(),
+                    "previousblockhash": block.header.prev_blockhash,
+                    "merkleroot": block.header.merkle_root,
+                    "time": block.header.time,
+                }))
+            }
+            "rbtc.getblockchunk" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.is_empty() || values.len() > 2 {
+                    return Err(invalid());
+                }
+                let hash = values[0]
+                    .as_str()
+                    .and_then(|value| BlockHash::from_str(value).ok())
+                    .ok_or_else(invalid)?;
+                let offset = values
+                    .get(1)
+                    .map_or(Some(0), serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(invalid)?;
+                let raw =
+                    source
+                        .block(hash)
+                        .map_err(|_| storage())?
+                        .ok_or(LocalRpcOperatorError {
+                            code: -1,
+                            message: "Block not retained by pruned node",
+                        })?;
+                if offset > raw.len() {
+                    return Err(invalid());
+                }
+                let end = offset
+                    .saturating_add(MAX_RPC_BLOCK_CHUNK_BYTES)
+                    .min(raw.len());
+                Ok(serde_json::json!({
+                    "hash": hash,
+                    "offset": offset,
+                    "data": raw[offset..end].to_lower_hex_string(),
+                    "next_offset": (end < raw.len()).then_some(end),
+                    "total_bytes": raw.len(),
+                }))
+            }
+            "gettxout" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.len() != 2 {
+                    return Err(invalid());
+                }
+                let txid = values[0]
+                    .as_str()
+                    .and_then(|value| Txid::from_str(value).ok())
+                    .ok_or_else(invalid)?;
+                let vout = values[1]
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(invalid)?;
+                let outpoint = OutPointKey::from(OutPoint::new(txid, vout));
+                source.utxo(outpoint).map_err(|_| storage()).map(|utxo| {
+                    utxo.map_or(serde_json::Value::Null, |utxo| {
+                        serde_json::json!({
+                            "value_sats": utxo.value_sats,
+                            "height": utxo.height,
+                            "coinbase": utxo.is_coinbase,
+                            "scriptPubKey": {"hex": utxo.script_pubkey.to_lower_hex_string()},
+                        })
+                    })
+                })
+            }
+            "rbtc.submitrawtransaction" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                let raw = values
+                    .first()
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|_| values.len() == 1)
+                    .and_then(|value| Vec::<u8>::from_hex(value).ok())
+                    .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
+                    .ok_or(LocalRpcOperatorError {
+                        code: -22,
+                        message: "Transaction decode failed",
+                    })?;
+                let transaction =
+                    deserialize::<Transaction>(&raw).map_err(|_| LocalRpcOperatorError {
+                        code: -22,
+                        message: "Transaction decode failed",
+                    })?;
+                let txid = transaction.compute_txid();
+                if !source
+                    .submit_transaction(transaction)
+                    .map_err(|_| storage())?
+                {
+                    return Err(LocalRpcOperatorError {
+                        code: -32040,
+                        message: "Transaction admission queue is full",
+                    });
+                }
+                Ok(serde_json::json!({"txid": txid, "queued": true}))
+            }
+            _ => unreachable!("data method membership checked"),
+        }
+    }
+}
+
+fn rpc_one_block_hash(params: &serde_json::Value) -> Result<BlockHash, LocalRpcOperatorError> {
+    let values = params.as_array().ok_or(LocalRpcOperatorError {
+        code: -32602,
+        message: "Invalid params",
+    })?;
+    values
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| BlockHash::from_str(value).ok())
+        .filter(|_| values.len() == 1)
+        .ok_or(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        })
+}
+
+fn rpc_page_params(
+    params: &serde_json::Value,
+    maximum: usize,
+) -> Result<(usize, usize), LocalRpcOperatorError> {
+    if rpc_has_no_params(params) {
+        return Ok((0, maximum));
+    }
+    let values = params.as_array().ok_or(LocalRpcOperatorError {
+        code: -32602,
+        message: "Invalid params",
+    })?;
+    if values.len() != 2 {
+        return Err(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        });
+    }
+    let offset = values[0]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok());
+    let limit = values[1]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=maximum).contains(value));
+    offset.zip(limit).ok_or(LocalRpcOperatorError {
+        code: -32602,
+        message: "Invalid params",
+    })
 }
 
 fn rpc_has_no_params(params: &serde_json::Value) -> bool {
@@ -3646,6 +3915,10 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.fee_filter_sat_kvb()
     }
 
+    fn utxo(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
+        self.current()?.utxo(outpoint)
+    }
+
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         self.advertised_address
             .map(|address| (address, self.services))
@@ -3789,6 +4062,12 @@ impl InboundDataSource for NodeInboundSource {
             .push(transaction))
     }
 
+    fn utxo(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
+        self.chainstate
+            .get(outpoint)
+            .map_err(|error| error.to_string())
+    }
+
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
         if height > self.execution_height()? {
             return Ok(None);
@@ -3921,6 +4200,7 @@ impl ApiServer {
         runtime_control: Arc<RuntimeControl>,
         active_peer: Option<SocketAddr>,
         auxiliary_indexes: Arc<AuxiliaryIndexes>,
+        data_source: Option<Arc<SharedInboundSource>>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -3963,6 +4243,7 @@ impl ApiServer {
                 runtime_control: Arc::clone(&runtime_control),
                 active_peer,
                 auxiliary_indexes: Arc::clone(&auxiliary_indexes),
+                source: data_source.as_ref().map(Arc::clone),
             });
             router = router.merge(rpc_router_with_operator(
                 Arc::clone(&index),
@@ -6333,13 +6614,14 @@ async fn run_peer_pool(
             .collect()
     });
     let (transaction_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
-    let inbound_source = options.inbound_listen.map(|_| {
-        Arc::new(SharedInboundSource::new(
-            options.inbound_limits.max_upload_bytes_per_day,
-            options.inbound_limits.advertised_address,
-            inbound_service_flags(options.indexes.basic_filter),
-        ))
-    });
+    let inbound_source =
+        (options.inbound_listen.is_some() || options.rpc_auth_token_file.is_some()).then(|| {
+            Arc::new(SharedInboundSource::new(
+                options.inbound_limits.max_upload_bytes_per_day,
+                options.inbound_limits.advertised_address,
+                inbound_service_flags(options.indexes.basic_filter),
+            ))
+        });
     let mut inbound_server = if let (Some(address), Some(source)) =
         (options.inbound_listen, inbound_source.as_ref())
     {
@@ -8074,6 +8356,7 @@ async fn run_connected_peer(
                 options.cache,
                 options.indexes,
                 inbound_source,
+                options.inbound_listen.is_some(),
                 options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
@@ -8206,6 +8489,7 @@ async fn complete_assumeutxo_validation(
         options.cache,
         options.indexes,
         None,
+        false,
         options.mempool_full_rbf,
         None,
         None,
@@ -9359,6 +9643,7 @@ async fn sync_validating_node(
     cache: NodeCacheConfig,
     index_config: NodeIndexConfig,
     inbound_source: Option<&Arc<SharedInboundSource>>,
+    inbound_enabled: bool,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -9579,7 +9864,12 @@ async fn sync_validating_node(
                 disk_space,
             )
             .map(|progress| {
-                NodeStatus::with_inbound(progress, inbound_source.map(|source| source.stats()))
+                NodeStatus::with_inbound(
+                    progress,
+                    inbound_enabled
+                        .then(|| inbound_source.map(|source| source.stats()))
+                        .flatten(),
+                )
             })
         })
         .transpose()?;
@@ -9849,6 +10139,7 @@ async fn sync_validating_node(
                         Arc::clone(runtime_control),
                         active_peer,
                         Arc::clone(&auxiliary_indexes),
+                        inbound_source.map(Arc::clone),
                     )
                     .await?,
                 );
@@ -14405,6 +14696,60 @@ mod tests {
         })
     }
 
+    struct RpcTestSource {
+        block: Block,
+        submitted: Mutex<Vec<Transaction>>,
+    }
+
+    impl InboundDataSource for RpcTestSource {
+        fn start_height(&self) -> Result<u32, String> {
+            Ok(0)
+        }
+
+        fn active_header(&self, height: u32) -> Result<Option<Header>, String> {
+            Ok((height == 0).then_some(self.block.header))
+        }
+
+        fn active_height(&self, hash: BlockHash) -> Result<Option<u32>, String> {
+            Ok((hash == self.block.block_hash()).then_some(0))
+        }
+
+        fn block(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, String> {
+            Ok((hash == self.block.block_hash()).then(|| serialize(&self.block)))
+        }
+
+        fn mempool(&self) -> Result<Vec<Transaction>, String> {
+            Ok(Vec::new())
+        }
+
+        fn transaction(&self, _inventory: Inventory) -> Result<Option<Transaction>, String> {
+            Ok(None)
+        }
+
+        fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String> {
+            self.submitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(transaction);
+            Ok(true)
+        }
+
+        fn basic_filter(&self, _height: u32) -> Result<Option<InboundBasicFilter>, String> {
+            Ok(None)
+        }
+
+        fn utxo(&self, _outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
+            Ok(Some(Utxo {
+                value_sats: 50_000,
+                height: 0,
+                is_coinbase: true,
+                last_touched: 0,
+                creation_mtp: 0,
+                script_pubkey: vec![0x51],
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn operator_rpc_reports_bounded_status_and_requests_graceful_shutdown() {
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
@@ -14420,6 +14765,7 @@ mod tests {
                 spent_output: None,
                 basic_filter: None,
             }),
+            source: None,
         };
 
         let blockchain = operator
@@ -14504,6 +14850,73 @@ mod tests {
     }
 
     #[test]
+    fn operator_rpc_pages_chain_data_and_queues_raw_transactions() {
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let source = Arc::new(RpcTestSource {
+            block: block.clone(),
+            submitted: Mutex::new(Vec::new()),
+        });
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = source.clone();
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(hash),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(shared),
+        };
+
+        let header = operator
+            .execute("getblockheader", &serde_json::json!([hash.to_string()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(header["height"], 0);
+        assert_eq!(header["hex"].as_str().unwrap().len(), 160);
+        let summary = operator
+            .execute("getblock", &serde_json::json!([hash.to_string()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["tx_count"], 1);
+        let chunk = operator
+            .execute(
+                "rbtc.getblockchunk",
+                &serde_json::json!([hash.to_string(), 0]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk["total_bytes"], serialize(&block).len());
+        let txid = block.txdata[0].compute_txid();
+        let utxo = operator
+            .execute("gettxout", &serde_json::json!([txid.to_string(), 0]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(utxo["value_sats"], 50_000);
+        let submitted = operator
+            .execute(
+                "rbtc.submitrawtransaction",
+                &serde_json::json!([serialize(&block.txdata[0]).to_lower_hex_string()]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(submitted["queued"], true);
+        assert_eq!(
+            source
+                .submitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn operator_rpc_serves_enabled_optional_indexes_with_bounded_queries() {
         let directory = TempDir::new().unwrap();
         let txindex = Arc::new(
@@ -14549,6 +14962,7 @@ mod tests {
                 spent_output: Some(spent),
                 basic_filter: Some(filters),
             }),
+            source: None,
         };
         let txid = block.txdata[0].compute_txid();
         let location = operator
@@ -20714,6 +21128,7 @@ mod tests {
                 spent_output: None,
                 basic_filter: None,
             }),
+            None,
         )
         .await
         .unwrap();

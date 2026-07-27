@@ -35,9 +35,12 @@ use tokio::{
     time::{Instant as TokioInstant, sleep_until, timeout},
 };
 
-use crate::p2p::{
-    InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
-    MAX_INVENTORY_ENTRIES, P2pError, TransactionRelay, accept_inbound,
+use crate::{
+    p2p::{
+        InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
+        MAX_INVENTORY_ENTRIES, P2pError, TransactionRelay, accept_inbound,
+    },
+    utxo::{OutPointKey, Utxo},
 };
 
 const MAX_GETBLOCKS_RESULTS: usize = 500;
@@ -490,6 +493,10 @@ pub trait InboundDataSource: Send + Sync + 'static {
     /// Current local minimum mempool fee in satoshis per 1,000 virtual bytes.
     fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
         Ok(0)
+    }
+    /// Active-chain UTXO lookup for authenticated local control surfaces.
+    fn utxo(&self, _outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
+        Ok(None)
     }
 }
 

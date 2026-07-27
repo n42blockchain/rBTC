@@ -274,6 +274,13 @@ retrieval, UTXO scans, wait-for-tip, peer controls, prune/index status, and
 stable error codes. Expensive scans are offline jobs or cursor-paged bounded
 tasks rather than synchronous RPC handlers.
 
+Raw transactions now enter the bounded ordinary validation queue; mempool
+IDs, raw retained blocks, explorer UTXOs, and address UTXOs use bounded pages,
+while headers, block metadata, exact chainstate outpoints, peer/prune/index
+status, and lifecycle controls have stable errors. SSE tip events provide the
+existing wait primitive. Administrative peer add/remove and a general
+chainstate scan job remain follow-ups.
+
 Acceptance: the documented API has request/response byte caps, concurrency and
 rate limits, authorization audit coverage, cancellation, and fuzzed parsers.
 

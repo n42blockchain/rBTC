@@ -297,10 +297,12 @@ optional where appropriate, and host-runtime compatible.
   routable advertisement, and address-family isolation are complete. Native
   onion/I2P address persistence and discovery remain. Automatic port mapping
   is not required.
-- [ ] **Operational API breadth.** Add raw transaction submission, mempool
-  inspection, UTXO scans/proofs, block/header retrieval modes, wait-for-tip
-  primitives, peer controls, and stable error codes. Prefer a small documented
-  surface over nominal Core RPC parity.
+- [ ] **Operational API breadth.** Authenticated raw submission, cursor-paged
+  mempool and retained raw-block reads, header/block metadata, exact
+  chainstate outpoints, SSE tip waits, peer/prune/index status, lifecycle
+  control, and stable errors are complete. Administrative peer mutation and a
+  general offline/cursor chainstate scan remain. Prefer this bounded surface
+  over nominal Core RPC parity.
 
 ## P2 — role-specific extensions
 
