@@ -2,7 +2,11 @@
 
 use std::collections::BTreeSet;
 
-use bitcoin::{Script, Sequence, Transaction, Witness, WitnessVersion, script::Instruction};
+use bitcoin::{
+    Script, Sequence, Transaction, Witness, WitnessVersion,
+    opcodes::all::{OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY},
+    script::Instruction,
+};
 use thiserror::Error;
 
 use crate::{
@@ -17,6 +21,8 @@ pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_FFFF;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
+/// Keys charged for an `OP_CHECKMULTISIG` whose key count is not a known push.
+const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 
 /// A successful transaction application and its reorg data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,6 +138,9 @@ impl ChainstateError {
                 error,
                 UtxoError::Duplicate(_) | UtxoError::Missing(_) | UtxoError::DuplicateSpend(_)
             ),
+            // A local worker fault is not evidence against the peer that
+            // supplied the block.
+            Self::Script(ConsensusError::WorkerPanicked) => false,
             Self::Script(_)
             | Self::ValueOverflow
             | Self::Inflation
@@ -397,7 +406,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
                 });
             }
         }
-        if csv_active && transaction.version.0 >= 2 {
+        if csv_active && enforces_bip68(transaction) {
             check_sequence_lock(input.sequence, outpoint, &utxo, height, creation_mtp)?;
         }
         input_value = input_value
@@ -429,16 +438,70 @@ fn prepare_transaction_with_context<S: UtxoStore>(
     })
 }
 
+/// Counts signature operations exactly like Bitcoin Core's `CScript::GetSigOpCount`.
+///
+/// `accurate` selects Core's `fAccurate` mode, which charges an
+/// `OP_CHECKMULTISIG` only for the key count immediately pushed by a preceding
+/// `OP_1`..`OP_16`.
+///
+/// This deliberately does not use `rust-bitcoin`'s `Script::count_sigops`.
+/// That implementation only clears its multisig key hint on data pushes, while
+/// Core reassigns `lastOpcode` after *every* opcode, including the signature
+/// operations themselves. Scripts such as
+/// `OP_2 OP_CHECKSIG OP_CHECKMULTISIG` therefore cost 21 in Core but only 3
+/// upstream, which would let rBTC accept a block above the consensus
+/// `MAX_BLOCK_SIGOPS_COST` that Core rejects.
+pub(crate) fn count_script_sigops(script: &Script, accurate: bool) -> usize {
+    let mut sigops = 0_usize;
+    // Mirrors Core's `lastOpcode`, reduced to the only property it is read for:
+    // whether the previous opcode was an `OP_1`..`OP_16` key-count push.
+    let mut previous_pushnum = None;
+    for instruction in script.instructions() {
+        let Ok(instruction) = instruction else {
+            // Core's `GetOp` failure breaks out and keeps the running total.
+            break;
+        };
+        match instruction {
+            // Data pushes use opcodes below `OP_1`, so they can never supply a
+            // key count.
+            Instruction::PushBytes(_) => previous_pushnum = None,
+            Instruction::Op(opcode) => {
+                match opcode {
+                    OP_CHECKSIG | OP_CHECKSIGVERIFY => sigops = sigops.saturating_add(1),
+                    OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                        let keys = match (accurate, previous_pushnum) {
+                            (true, Some(keys)) => usize::from(keys),
+                            _ => MAX_PUBKEYS_PER_MULTISIG,
+                        };
+                        sigops = sigops.saturating_add(keys);
+                    }
+                    _ => {}
+                }
+                previous_pushnum = decode_pushnum(opcode);
+            }
+        }
+    }
+    sigops
+}
+
+/// Returns the key count encoded by `OP_1`..`OP_16`, matching Core's `DecodeOP_N`.
+const fn decode_pushnum(opcode: bitcoin::Opcode) -> Option<u8> {
+    match opcode.to_u8() {
+        byte @ 0x51..=0x60 => Some(byte - 0x50),
+        _ => None,
+    }
+}
+
 fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
     let sigops = transaction
         .input
         .iter()
-        .map(|input| input.script_sig.count_sigops_legacy())
+        .map(|input| count_script_sigops(&input.script_sig, false))
         .chain(
             transaction
                 .output
                 .iter()
-                .map(|output| output.script_pubkey.count_sigops_legacy()),
+                .map(|output| count_script_sigops(&output.script_pubkey, false)),
         )
         .sum::<usize>();
     u64::try_from(sigops).expect("transaction sigops fit u64") * 4
@@ -464,7 +527,9 @@ fn transaction_sigop_cost(transaction: &Transaction, prevouts: &[Utxo], flags: u
 }
 
 fn p2sh_sigops(script_sig: &Script) -> usize {
-    last_push(script_sig).map_or(0, |redeem| Script::from_bytes(&redeem).count_sigops())
+    last_push(script_sig).map_or(0, |redeem| {
+        count_script_sigops(Script::from_bytes(&redeem), true)
+    })
 }
 
 fn last_push(script: &Script) -> Option<Vec<u8>> {
@@ -500,15 +565,20 @@ fn witness_program_sigops(program: &Script, witness: &Witness) -> usize {
     }
     match program.as_bytes().get(1).copied() {
         Some(20) => 1,
-        Some(32) => witness
-            .last()
-            .map_or(0, |script| Script::from_bytes(script).count_sigops()),
+        Some(32) => witness.last().map_or(0, |script| {
+            count_script_sigops(Script::from_bytes(script), true)
+        }),
         _ => 0,
     }
 }
 
 fn transaction_is_final(transaction: &Transaction, height: u32, lock_time_context: u32) -> bool {
     let lock_time = transaction.lock_time.to_consensus_u32();
+    // Core's `IsFinalTx` returns early for an absent lock time. Without this the
+    // comparison below would fall through to the sequence check at height zero.
+    if lock_time == 0 {
+        return true;
+    }
     let comparison = if transaction.lock_time.is_block_height() {
         height
     } else {
@@ -519,6 +589,16 @@ fn transaction_is_final(transaction: &Transaction, height: u32, lock_time_contex
             .input
             .iter()
             .all(|input| input.sequence == Sequence::MAX)
+}
+
+/// Whether BIP68 relative locks apply to this transaction's version.
+///
+/// Core's `CalculateSequenceLocks` casts the signed version field to `uint32_t`
+/// before comparing with 2, so every version whose high bit is set also
+/// enforces BIP68. Comparing the signed value directly would skip the rule for
+/// exactly those versions and accept transactions Core rejects.
+pub(crate) fn enforces_bip68(transaction: &Transaction) -> bool {
+    u32::from_ne_bytes(transaction.version.0.to_ne_bytes()) >= 2
 }
 
 pub(crate) fn check_sequence_lock(
@@ -809,6 +889,79 @@ mod tests {
         );
         assert!(!transaction_is_final(&transaction, 1, 500_000_000));
         assert!(transaction_is_final(&transaction, 1, 500_000_001));
+    }
+
+    #[test]
+    fn accurate_sigop_count_tracks_the_previous_opcode_like_core() {
+        // Core's `GetSigOpCount` reassigns `lastOpcode` after every opcode, so a
+        // key-count push consumed by an intervening signature operation no
+        // longer applies to a following OP_CHECKMULTISIG. rust-bitcoin's
+        // `Script::count_sigops` keeps the stale hint and reports 3 and 4 here.
+        let after_checksig = Builder::new()
+            .push_int(2)
+            .push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&after_checksig, true), 21);
+        assert_eq!(count_script_sigops(&after_checksig, false), 21);
+
+        let repeated_multisig = Builder::new()
+            .push_int(2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&repeated_multisig, true), 22);
+        assert_eq!(count_script_sigops(&repeated_multisig, false), 40);
+
+        // A single pushed key count is still charged accurately, and a data push
+        // never supplies one.
+        let accurate = Builder::new()
+            .push_int(2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&accurate, true), 2);
+        assert_eq!(count_script_sigops(&accurate, false), 20);
+        let data_push = Builder::new()
+            .push_slice([2_u8])
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        assert_eq!(count_script_sigops(&data_push, true), 20);
+
+        // Core's `GetOp` failure keeps the running total instead of discarding it.
+        let truncated = ScriptBuf::from_bytes(vec![OP_CHECKSIG.to_u8(), 0x4c]);
+        assert_eq!(count_script_sigops(&truncated, true), 1);
+    }
+
+    #[test]
+    fn bip68_enforcement_follows_core_unsigned_version_comparison() {
+        let mut transaction = spend(
+            OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+            Sequence::from_height(6),
+            LockTime::ZERO,
+        );
+        transaction.version = Version(1);
+        assert!(!enforces_bip68(&transaction));
+        transaction.version = Version(2);
+        assert!(enforces_bip68(&transaction));
+        // Core casts the version to `uint32_t`, so every negative signed value
+        // compares above 2 and still enforces relative locks.
+        transaction.version = Version(-1);
+        assert!(enforces_bip68(&transaction));
+        transaction.version = Version(i32::MIN);
+        assert!(enforces_bip68(&transaction));
+    }
+
+    #[test]
+    fn negative_version_transactions_still_honor_relative_locks() {
+        let (_dir, store) = store();
+        let outpoint = OutPoint::new(Txid::from_byte_array([4; 32]), 0);
+        insert_unspent(&store, outpoint, 100, 1_000);
+        let mut locked = spend(outpoint, Sequence::from_height(6), LockTime::ZERO);
+        locked.version = Version(-1);
+        assert!(matches!(
+            apply_transaction_with_context(&store, &locked, 104, 0, 2_000, 2_000, 0, true),
+            Err(ChainstateError::RelativeHeightLock { .. })
+        ));
     }
 
     #[test]

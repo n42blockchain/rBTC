@@ -17,7 +17,9 @@ use rand::Rng;
 use thiserror::Error;
 
 use crate::{
-    chainstate::{ChainstateError, apply_transaction_with_context, check_sequence_lock},
+    chainstate::{
+        ChainstateError, apply_transaction_with_context, check_sequence_lock, enforces_bip68,
+    },
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
         TransactionPolicyError, validate_standard_inputs, validate_standard_transaction,
@@ -1854,7 +1856,7 @@ fn apply_to_overlay<S: UtxoStore>(
         context.script_flags,
         context.csv_active,
     )?;
-    if !context.csv_active && transaction.version.0 >= 2 {
+    if !context.csv_active && enforces_bip68(transaction) {
         for (input, utxo) in transaction.input.iter().zip(&prevouts) {
             check_sequence_lock(
                 input.sequence,

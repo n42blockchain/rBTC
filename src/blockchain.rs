@@ -140,17 +140,25 @@ fn script_validation_worker(queue: &ScriptValidationQueue) {
             }
             work.pop_front().expect("non-empty script queue")
         };
-        let failure = work.jobs.into_iter().find_map(|job| {
-            verify_serialized_transaction_scripts_with_flags(
-                &job.raw_transaction,
-                job.input_count,
-                &job.prevouts,
-                job.script_flags,
-            )
-            .err()
-            .map(|error| (job.block_order, job.index, error))
-        });
-        let _ = work.result.send(failure);
+        let ScriptValidationWork { jobs, result } = work;
+        // The submitting batch keeps its own live sender, so a dropped result
+        // channel never disconnects the receiver. An unwinding job would
+        // therefore block `DeferredScriptBatch::finish` forever; report the
+        // failure instead so the candidate block is rejected.
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            jobs.into_iter().find_map(|job| {
+                verify_serialized_transaction_scripts_with_flags(
+                    &job.raw_transaction,
+                    job.input_count,
+                    &job.prevouts,
+                    job.script_flags,
+                )
+                .err()
+                .map(|error| (job.block_order, job.index, error))
+            })
+        }))
+        .unwrap_or(Some((0, 0, ConsensusError::WorkerPanicked)));
+        let _ = result.send(failure);
     }
 }
 

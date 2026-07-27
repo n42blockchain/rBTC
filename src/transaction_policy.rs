@@ -6,6 +6,8 @@ use bitcoin::{
 };
 use thiserror::Error;
 
+use crate::chainstate::count_script_sigops;
+
 /// Core 26's minimum non-witness transaction size used by standardness policy.
 pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 /// Core's maximum standard scriptSig size.
@@ -238,7 +240,7 @@ pub fn validate_standard_inputs(
             .then(|| pushed_redeem_script(&input.script_sig, index))
             .transpose()?;
         if let Some(redeem_script) = &redeem_script {
-            let sigops = redeem_script.count_sigops();
+            let sigops = count_script_sigops(redeem_script, true);
             if sigops > MAX_STANDARD_P2SH_SIGOPS {
                 return Err(TransactionPolicyError::P2shSigops {
                     index,

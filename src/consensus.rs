@@ -29,6 +29,12 @@ pub enum ConsensusError {
         #[source]
         source: bitcoinconsensus::Error,
     },
+    /// A script-validation worker unwound instead of returning a verdict.
+    ///
+    /// Block validation fails closed rather than waiting for a result that can
+    /// never arrive.
+    #[error("script validation worker panicked")]
+    WorkerPanicked,
     /// Bitcoin Core's consensus script engine rejected an input.
     #[error("script validation failed for input {input}: {source}")]
     Script {
