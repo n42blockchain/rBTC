@@ -148,6 +148,56 @@ pub struct HeaderDag {
     active_chain: Vec<BlockHash>,
 }
 
+/// An atomically staged header batch.
+///
+/// Dropping without [`Self::commit`] removes every inserted header and restores
+/// the previous active tip. The ordinary active-chain extension path therefore
+/// retains only `O(batch)` hashes instead of cloning the complete DAG.
+pub struct StagedHeaderBatch<'a> {
+    dag: &'a mut HeaderDag,
+    accepted: Vec<HeaderInfo>,
+    inserted: Vec<BlockHash>,
+    original_active_tip: BlockHash,
+    original_active_len: usize,
+    rebuilt_active_chain: bool,
+    committed: bool,
+}
+
+impl StagedHeaderBatch<'_> {
+    /// Makes the staged headers visible permanently and returns their metadata.
+    #[must_use]
+    pub fn commit(mut self) -> Vec<HeaderInfo> {
+        self.committed = true;
+        std::mem::take(&mut self.accepted)
+    }
+
+    fn rollback(&mut self) {
+        for hash in self.inserted.drain(..).rev() {
+            self.dag.headers.remove(&hash);
+        }
+        let original = self
+            .dag
+            .headers
+            .get(&self.original_active_tip)
+            .copied()
+            .expect("staged batch retains the original active tip");
+        if self.rebuilt_active_chain {
+            self.dag.rebuild_active_chain(original);
+        } else {
+            self.dag.active_chain.truncate(self.original_active_len);
+            self.dag.active_tip = self.original_active_tip;
+        }
+    }
+}
+
+impl Drop for StagedHeaderBatch<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
+}
+
 impl HeaderDag {
     /// Starts a DAG at the selected network's consensus genesis header.
     #[must_use]
@@ -256,6 +306,40 @@ impl HeaderDag {
             accepted.push(candidate.insert_contextual(*header, adjusted_time)?);
         }
         Ok((candidate, accepted))
+    }
+
+    /// Contextually validates and stages a contiguous header batch in place.
+    ///
+    /// The returned guard rolls the batch back unless the caller commits it,
+    /// allowing persistence to complete between validation and publication.
+    /// Successful active-chain extensions use `O(batch)` additional memory.
+    /// A failed batch that crossed onto a stronger side chain rebuilds the
+    /// former active-chain vector while rolling back; that rare path preserves
+    /// atomicity without imposing a full-DAG copy on every successful batch.
+    pub fn stage_batch_contextual(
+        &mut self,
+        headers: &[Header],
+        adjusted_time: u32,
+    ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        let original_active_tip = self.active_tip;
+        let original_active_len = self.active_chain.len();
+        let mut staged = StagedHeaderBatch {
+            dag: self,
+            accepted: Vec::with_capacity(headers.len()),
+            inserted: Vec::with_capacity(headers.len()),
+            original_active_tip,
+            original_active_len,
+            rebuilt_active_chain: false,
+            committed: false,
+        };
+        for header in headers {
+            let rebuilds_active_chain = staged.dag.insertion_rebuilds_active_chain(header);
+            let info = staged.dag.insert_contextual(*header, adjusted_time)?;
+            staged.rebuilt_active_chain |= rebuilds_active_chain;
+            staged.inserted.push(info.hash);
+            staged.accepted.push(info);
+        }
+        Ok(staged)
     }
 
     /// Finds any known header, including side-chain headers.
@@ -477,6 +561,10 @@ impl HeaderDag {
             return;
         }
 
+        self.rebuild_active_chain(info);
+    }
+
+    fn rebuild_active_chain(&mut self, info: HeaderInfo) {
         let chain_len = usize::try_from(info.height)
             .expect("header height fits usize")
             .checked_add(1)
@@ -497,6 +585,19 @@ impl HeaderDag {
         }
         self.active_tip = info.hash;
         self.active_chain = active_chain;
+    }
+
+    fn insertion_rebuilds_active_chain(&self, header: &Header) -> bool {
+        let Some(parent) = self.headers.get(&header.prev_blockhash).copied() else {
+            return false;
+        };
+        let Some(height) = parent.height.checked_add(1) else {
+            return false;
+        };
+        let chainwork = parent.chainwork + header.target().to_work();
+        chainwork > self.active_tip().chainwork
+            && !(parent.hash == self.active_tip
+                && usize::try_from(height).ok() == Some(self.active_chain.len()))
     }
 
     fn ancestor_at_height(&self, mut current: HeaderInfo, height: u32) -> Option<HeaderInfo> {
@@ -963,6 +1064,44 @@ mod tests {
             Err(HeaderError::Duplicate(_))
         ));
         assert_eq!(dag.active_tip().hash, child.block_hash());
+    }
+
+    #[test]
+    fn staged_batches_commit_extensions_and_roll_back_a_stronger_side_chain() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let first = mine_child(genesis.hash, genesis.header.time + 1);
+        let second = mine_child(first.block_hash(), first.time + 1);
+        let accepted = dag
+            .stage_batch_contextual(&[first, second], second.time)
+            .unwrap()
+            .commit();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(dag.active_tip().hash, second.block_hash());
+
+        let fork_first = mine_child(genesis.hash, genesis.header.time + 10);
+        let fork_second = mine_child(fork_first.block_hash(), fork_first.time + 1);
+        let fork_third = mine_child(fork_second.block_hash(), fork_second.time + 1);
+        let fork_hashes = [
+            fork_first.block_hash(),
+            fork_second.block_hash(),
+            fork_third.block_hash(),
+        ];
+        {
+            let _uncommitted = dag
+                .stage_batch_contextual(&[fork_first, fork_second, fork_third], fork_third.time)
+                .unwrap();
+        }
+        assert_eq!(dag.active_tip().hash, second.block_hash());
+        assert_eq!(dag.active_tip().height, 2);
+        assert!(fork_hashes.iter().all(|hash| dag.get(hash).is_none()));
+
+        let third = mine_child(second.block_hash(), second.time + 1);
+        let _ = dag
+            .stage_batch_contextual(&[third], third.time)
+            .unwrap()
+            .commit();
+        assert_eq!(dag.active_tip().hash, third.block_hash());
     }
 
     #[test]

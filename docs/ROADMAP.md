@@ -37,7 +37,8 @@ Primary references:
 
 - [x] Header PoW, contextual time/difficulty, cumulative-work fork choice,
   checkpoints, minimum-chainwork policy, durable header replay, and active-chain
-  reorganization.
+  reorganization. Successful header responses use an `O(batch)` rollback guard
+  rather than cloning the complete DAG before every durable append.
 - [x] Full contextual block and transaction validation: historical BIP30/BIP16
   exceptions, buried deployments, BIP68/113, SegWit, Taproot, Signet, subsidy,
   coinbase maturity, weight, Merkle/witness commitments, sigops, and script

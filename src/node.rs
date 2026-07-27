@@ -5344,13 +5344,13 @@ fn prepare_reindex_headers(
                     .header
             })
             .collect::<Vec<_>>();
-        let (candidate, _) = current
-            .validate_batch_contextual(&batch, unix_time()?)
+        let staged = current
+            .stage_batch_contextual(&batch, unix_time()?)
             .map_err(|error| error.to_string())?;
         store
             .append_batch(&batch)
             .map_err(|error| error.to_string())?;
-        current = candidate;
+        let _ = staged.commit();
         next = end;
     }
     if current.active_tip().hash != source.active_tip().hash {
@@ -7349,13 +7349,13 @@ async fn maintain_standby(
                     let unseen = unseen_header_suffix(dag, &headers)
                         .map_err(|error| PeerRunError::header(&error))?;
                     if !unseen.is_empty() {
-                        let (candidate, _) = dag
-                            .validate_batch_contextual(
+                        let staged = dag
+                            .stage_batch_contextual(
                                 unseen,
                                 unix_time().map_err(PeerRunError::transient)?,
                             )
                             .map_err(|error| PeerRunError::header(&error))?;
-                        *dag = candidate;
+                        let _ = staged.commit();
                     }
                     connected.validated_header_height = Some(dag.active_tip().height);
                 }
@@ -8206,13 +8206,13 @@ async fn sync_headers(
         if unseen.is_empty() {
             break;
         }
-        let (candidate, _) = dag
-            .validate_batch_contextual(unseen, unix_time().map_err(PeerRunError::transient)?)
+        let staged = dag
+            .stage_batch_contextual(unseen, unix_time().map_err(PeerRunError::transient)?)
             .map_err(|error| PeerRunError::header(&error))?;
         store
             .append_batch(unseen)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
-        dag = candidate;
+        let _ = staged.commit();
         rbtc_info!(
             "validated and persisted {} headers; active tip {}:{}",
             unseen.len(),
