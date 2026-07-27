@@ -18,11 +18,14 @@ const LIST_KEYS: [&str; 5] = [
     "testactivationheight",
     "vbparams",
 ];
-const BOOL_KEYS: [&str; 5] = [
+const BOOL_KEYS: [&str; 8] = [
+    "block_filter_index",
     "cleanup_validation_dir",
     "dns_seeds",
     "mempool_full_rbf",
     "once",
+    "spent_output_index",
+    "txindex",
     "validation_deferred_repair",
 ];
 const VALUE_KEYS: [&str; 26] = [
@@ -289,6 +292,8 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
     if BOOL_KEYS.contains(&entry.key.as_str()) {
         let enabled = parse_bool(entry)?;
         let flag = match (entry.key.as_str(), enabled) {
+            ("block_filter_index", true) => "--block-filter-index",
+            ("block_filter_index", false) => "--no-block-filter-index",
             ("cleanup_validation_dir", true) => "--cleanup-validation-dir",
             ("cleanup_validation_dir", false) => "--no-cleanup-validation-dir",
             ("dns_seeds", true) => "--dns-seeds",
@@ -297,6 +302,10 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
             ("mempool_full_rbf", false) => "--no-mempool-full-rbf",
             ("once", true) => "--once",
             ("once", false) => "--no-once",
+            ("spent_output_index", true) => "--spent-output-index",
+            ("spent_output_index", false) => "--no-spent-output-index",
+            ("txindex", true) => "--txindex",
+            ("txindex", false) => "--no-txindex",
             ("validation_deferred_repair", true) => "--validation-deferred-repair",
             ("validation_deferred_repair", false) => "--validation-quick-repair",
             _ => unreachable!("known boolean config key"),
@@ -378,6 +387,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--automatic-hot-standbys"
             | "--background-assumeutxo"
             | "--background-chainstate-cache-bytes"
+            | "--block-filter-index"
             | "--bulk-validation-cache-bytes"
             | "--chainstate-cache-bytes"
             | "--cleanup-validation-dir"
@@ -398,16 +408,21 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--minimum-chainwork"
             | "--network"
             | "--no-cleanup-validation-dir"
+            | "--no-block-filter-index"
             | "--no-dns-seeds"
             | "--no-mempool-full-rbf"
             | "--no-once"
+            | "--no-spent-output-index"
+            | "--no-txindex"
             | "--once"
             | "--prune-blocks"
             | "--prune-max-bytes"
             | "--rpc-auth-token-file"
+            | "--spent-output-index"
             | "--signetchallenge"
             | "--signetseednode"
             | "--testactivationheight"
+            | "--txindex"
             | "--validation-batch-size"
             | "--validation-deferred-repair"
             | "--validation-pause-ms"
@@ -424,9 +439,12 @@ fn option_group(flag: &str) -> &'static str {
         "--assume-valid" | "--assumevalid" => "assumevalid",
         "--automatic-hot-standbys" => "automatic-hot-standbys",
         "--cleanup-validation-dir" | "--no-cleanup-validation-dir" => "cleanup-validation-dir",
+        "--block-filter-index" | "--no-block-filter-index" => "block-filter-index",
         "--dns-seed" | "--dns-seeds" | "--no-dns-seeds" | "--signetseednode" => "dns-seeds",
         "--mempool-full-rbf" | "--no-mempool-full-rbf" => "mempool-full-rbf",
         "--no-once" | "--once" => "once",
+        "--spent-output-index" | "--no-spent-output-index" => "spent-output-index",
+        "--txindex" | "--no-txindex" => "txindex",
         "--validation-deferred-repair" | "--validation-quick-repair" => "validation-repair",
         "--background-assumeutxo" => "background-assumeutxo",
         "--background-chainstate-cache-bytes" => "background-chainstate-cache-bytes",
@@ -476,6 +494,9 @@ mod tests {
              connect=127.0.0.1:8333\n\
              prune_blocks=600\n\
              once=true\n\
+             txindex=true\n\
+             spent_output_index=true\n\
+             block_filter_index=true\n\
              [bitcoin]\n\
              data_dir=/bitcoin\n\
              connect=127.0.0.2:8333\n\
@@ -494,6 +515,17 @@ mod tests {
             entry.flag == "--connect" && entry.value.as_deref() == Some("127.0.0.1:8333")
         }));
         assert!(selected.iter().any(|entry| entry.flag == "--once"));
+        assert!(selected.iter().any(|entry| entry.flag == "--txindex"));
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--spent-output-index")
+        );
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--block-filter-index")
+        );
     }
 
     #[test]

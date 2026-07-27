@@ -711,6 +711,32 @@ an index is caught up, its self-contained records and rollback data survive
 old block-file deletion. The policy module has no chainstate mutation API, so
 index disable/removal/rebuild cannot become a consensus transition.
 
+The optional projections are physically separate network- and kind-bound redb
+files. `txindex` maps txid to active height/hash/position and stores the
+previous row in its block undo so historical BIP30 replacement is reversible.
+The spent-output index maps a serialized outpoint to its active spender. The
+basic-filter index feeds each executed block and the exact spent-prevout
+scripts from chainstate undo into rust-bitcoin's BIP158 constructor, then
+persists the filter, filter hash, chained BIP157 header, and block-hash lookup.
+Each validation window is one transaction per index: records are sorted by
+key, the new tip and every rollback row commit together, and an invalid later
+block aborts the whole window. After the authoritative chainstate commit, the
+independent explorer and optional-index transactions run concurrently with the
+wallet projection; all workers are joined successfully before events or the
+freezer publication barrier advance. The stores can therefore lag chainstate
+only across a process failure; startup rewinds non-active tips and replays the
+missing suffix. A tx index can obtain old active blocks from a full-history peer.
+Spent-output and filter reconstruction additionally requires retained
+execution undo and fails closed with an explicit full reindex instruction when
+that information has crossed the prune floor. Freezer publication waits for
+every enabled tip, rollback rows below the retained floor are deleted in a
+sorted transaction, and both automatic and manual pruning use the same gate.
+Disk preflight adds one maximum serialized block per configured batch and per
+enabled index as conservative copy-on-write headroom, while reporting current
+index bytes separately. Embedded status/events and authenticated
+`getindexinfo`, `gettxindexlocation`, `gettxspendingprevout`, and
+`getblockfilter` expose the independent tips and bounded queries.
+
 IBD first writes each downloaded batch to a checksum-protected staging archive. Blocks become visible in the retained ledger only after their UTXO transitions have reached the durable execution tip. On restart the daemon truncates archive data above the recovered active execution tip, publishes only the active validated prefix of a staged batch, and backfills a missing retained suffix from a full-history witness peer. This coordinates the separate redb chainstate and file ring without claiming an atomic transaction across storage engines.
 
 The v1 transport rejects payload declarations above Bitcoin Core 26's 4,000,000-byte protocol maximum before allocating the payload. Handshake user agents are limited to 256 UTF-8 bytes for both local and remote versions, outbound `getheaders` locators are capped at Core's 101 hashes, and `addr`/`addrv2` responses are capped at 1,000 entries. Request/response waits count every raw frame, including answered keepalive pings, against a 32-message budget; this prevents a ping stream from bypassing the bounded state machine. A repeated `version` after handshake is a terminal protocol error. With protocol version 70016 peers the handshake sends BIP339 `wtxidrelay` followed by BIP155 `sendaddrv2` before `verack`, matching Core's ordering; older peers receive only `verack`. The address-discovery primitive requests `getaddr`, converts legacy and BIP155 IPv4/IPv6 entries, ignores unsupported families and zero ports, and deduplicates socket addresses. The validating daemon stores only full-history+witness entries in a network-bound `peers.redb`; public networks reject non-routable and reserved IP space, while regtest permits local testing addresses. Core-inspired timestamp normalization applies a two-hour learned-address penalty and a 30-day horizon. A 64-entry source-group ceiling and 4,096-entry global ceiling bound one peer's influence and disk use. The store atomically generates a 256-bit random bucket key when created or when an old database first reopens; wrong-length metadata fails closed. Domain-separated SHA-256 maps learned address/source groups among 1,024 new buckets and successful address keys/groups among 256 tried buckets, with 64 entries per bucket. A learned record can persist up to eight distinct source-group references; each additional reference is admitted with probability `1 / 2^n`, maps independently, is schema-bounded, and defaults to none for legacy rows. A verified full-service handshake bypasses a saturated new-source quota, becomes tried, and frees all prior new references. Address-pool updates physically discard stale or newly invalid records; capacity eviction retains unfailed peers that completed synchronization sessions, then handshake-only successes, known lower successful-handshake latency, higher completed block-response throughput, and fresher records while enforcing each table's keyed bucket ceiling. Startup candidate selection applies the same persistent reputation, latency, and throughput ordering, round-robins buckets within each target IPv4 `/16` or IPv6 `/32` group, and takes one target group before taking a second. This remains a keyed bounded foundation rather than every Core addrman selection and terrible-entry rule. The daemon generates one cryptographically random self-connection nonce for the process run and reuses it across its fallback connections, rather than assigning a different identity to each peer attempt.

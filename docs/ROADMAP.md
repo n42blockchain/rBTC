@@ -275,9 +275,17 @@ optional where appropriate, and host-runtime compatible.
   schema, migrates legacy absence only after successful preflight, and refuses
   future rollback before mutable database open. Backup/restore, rollback, and
   disaster decisions are published in `docs/DISASTER_RECOVERY.md`.
-- [ ] **Optional indexes commonly used by node clients.** Add independently
-  rebuildable `txindex`, spent-output index, and BIP157/158 compact-filter index
-  with explicit disk cost, sync state, prune compatibility, and peer serving.
+- [x] **Optional indexes commonly used by node clients.** Independently
+  rebuildable `--txindex`, `--spent-output-index`, and
+  `--block-filter-index` stores now have network/kind/schema identities,
+  atomic sorted batch writes, durable tips, bounded rollback retention,
+  active-chain rewind/catch-up, BIP30 restoration, exact executed-prevout
+  BIP158 construction and BIP157 header chaining. They participate in
+  automatic/manual prune gates, both explicit full reindex paths, conservative
+  checkpoint disk headroom, root schema inventory, typed host status/events,
+  `getindexinfo`, and bounded authenticated lookup RPCs. Serving those filters
+  on inbound BIP157 P2P messages belongs to the inbound-peer service item
+  below, because an outbound-only node has no peer request surface.
 - [ ] **Network privacy and reachability controls.** Add proxy/`onlynet`,
   Tor/I2P outbound support, bind/whitebind equivalents, and address-network
   isolation tests. Automatic port mapping is not required.

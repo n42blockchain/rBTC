@@ -21,6 +21,9 @@ data_dir=/var/lib/rbtc/bitcoin
 dns_seeds=true
 once=false
 mempool_full_rbf=false
+txindex=false
+spent_output_index=false
+block_filter_index=false
 automatic_hot_standbys=8
 mempool_max_transactions=64
 mempool_max_bytes=4000000
@@ -57,7 +60,8 @@ The supported scalar keys are:
   (1–300,000), and `mempool_max_bytes` (4,000,000–1,073,741,824)
 - `log_level` (`error`, `warn`, `info`, or `debug`), `log_dir`,
   `log_max_bytes` (1 MiB–1 GiB), and `log_max_files` (2–20)
-- Boolean `dns_seeds`, `once`, `mempool_full_rbf`,
+- Boolean `dns_seeds`, `once`, `mempool_full_rbf`, `txindex`,
+  `spent_output_index`, `block_filter_index`,
   `cleanup_validation_dir`, and `validation_deferred_repair`
 
 The repeatable keys are `connect`, `dns_seed`, `signetseednode`, `vbparams`,

@@ -66,7 +66,7 @@ impl Drop for InFlightCheckpoint<'_> {
 }
 
 use bitcoin::{
-    Block, BlockHash, Network, Transaction,
+    Block, BlockHash, Network, OutPoint, Transaction, Txid,
     block::Header,
     consensus::{deserialize, serialize},
     hashes::Hash,
@@ -81,6 +81,7 @@ use rbtc::{
         rpc_router_with_operator, wallet_router_with_sink,
     },
     archive::bounded_archive_prefix_len,
+    auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
         BlockDeploymentContext, BlockExecutionError,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
@@ -205,7 +206,7 @@ const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
-const DATA_FORMAT_SCHEMA_VERSION: u32 = 1;
+const DATA_FORMAT_SCHEMA_VERSION: u32 = 2;
 const MAX_DATA_FORMAT_MANIFEST_BYTES: u64 = 4 * 1024;
 const NODE_EVENT_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
@@ -251,10 +252,81 @@ struct Options {
     ledger_retention: LedgerRetention,
     minimum_free_bytes: u64,
     cache: NodeCacheConfig,
+    indexes: NodeIndexConfig,
     resources: NodeResourceConfig,
     logging: NodeLogConfig,
     runtime_control: Arc<RuntimeControl>,
     observer: Option<NodeObserver>,
+}
+
+struct AuxiliaryIndexes {
+    transaction: Option<Arc<RedbAuxiliaryIndex>>,
+    spent_output: Option<Arc<RedbAuxiliaryIndex>>,
+    basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
+}
+
+impl AuxiliaryIndexes {
+    fn open(
+        data_dir: &std::path::Path,
+        network: Network,
+        config: NodeIndexConfig,
+    ) -> Result<Self, String> {
+        let open = |enabled: bool, name: &str, kind| {
+            enabled
+                .then(|| RedbAuxiliaryIndex::open(data_dir.join(name), network, kind).map(Arc::new))
+                .transpose()
+                .map_err(|error| error.to_string())
+        };
+        Ok(Self {
+            transaction: open(
+                config.transaction,
+                "txindex.redb",
+                AuxiliaryIndexKind::Transaction,
+            )?,
+            spent_output: open(
+                config.spent_output,
+                "spent-output-index.redb",
+                AuxiliaryIndexKind::SpentOutput,
+            )?,
+            basic_filter: open(
+                config.basic_filter,
+                "basic-filter-index.redb",
+                AuxiliaryIndexKind::BasicFilter,
+            )?,
+        })
+    }
+
+    fn enabled(&self) -> impl Iterator<Item = (AuxiliaryIndexKind, &RedbAuxiliaryIndex)> {
+        [
+            (AuxiliaryIndexKind::Transaction, self.transaction.as_deref()),
+            (
+                AuxiliaryIndexKind::SpentOutput,
+                self.spent_output.as_deref(),
+            ),
+            (
+                AuxiliaryIndexKind::BasicFilter,
+                self.basic_filter.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(kind, index)| index.map(|index| (kind, index)))
+    }
+}
+
+const fn auxiliary_policy_kind(kind: AuxiliaryIndexKind) -> IndexKind {
+    match kind {
+        AuxiliaryIndexKind::Transaction => IndexKind::Transaction,
+        AuxiliaryIndexKind::SpentOutput => IndexKind::SpentOutput,
+        AuxiliaryIndexKind::BasicFilter => IndexKind::BasicFilter,
+    }
+}
+
+const fn auxiliary_index_label(kind: AuxiliaryIndexKind) -> &'static str {
+    match kind {
+        AuxiliaryIndexKind::Transaction => "transaction",
+        AuxiliaryIndexKind::SpentOutput => "spent-output",
+        AuxiliaryIndexKind::BasicFilter => "basic-filter",
+    }
 }
 
 /// Complete typed configuration for one ordinary persistent embedded node.
@@ -278,6 +350,8 @@ pub struct NodeConfig {
     pub mempool_full_rbf: bool,
     /// Bounded chainstate cache budgets.
     pub cache: NodeCacheConfig,
+    /// Independently persisted optional indexes.
+    pub indexes: NodeIndexConfig,
     /// Peer and transaction-pool resource ceilings.
     pub resources: NodeResourceConfig,
     /// Standalone structured logging policy; embedded hosts may consume events.
@@ -304,6 +378,7 @@ impl NodeConfig {
             once: false,
             mempool_full_rbf: false,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             storage: NodeStorageConfig::default(),
@@ -412,6 +487,7 @@ impl NodeConfig {
             },
             minimum_free_bytes: self.storage.minimum_free_bytes,
             cache: self.cache,
+            indexes: self.indexes,
             resources: self.resources,
             logging: self.logging,
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -521,6 +597,17 @@ pub struct NodeStorageConfig {
     pub prune_bytes: u64,
     /// Free bytes preserved beyond one worst-case atomic checkpoint.
     pub minimum_free_bytes: u64,
+}
+
+/// Independently persisted optional active-chain indexes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeIndexConfig {
+    /// Transaction ID to active block position (`-txindex` in Bitcoin Core).
+    pub transaction: bool,
+    /// Outpoint to active-chain spending transaction.
+    pub spent_output: bool,
+    /// BIP157/158 basic compact filters and filter headers.
+    pub basic_filter: bool,
 }
 
 impl Default for NodeStorageConfig {
@@ -702,6 +789,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Enables independently rebuildable transaction, spent-output, or basic-filter indexes.
+    #[must_use]
+    pub const fn indexes(mut self, indexes: NodeIndexConfig) -> Self {
+        self.config.indexes = indexes;
+        self
+    }
+
     /// Sets bounded hot-standby and transaction-pool resources.
     #[must_use]
     pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
@@ -834,7 +928,43 @@ fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_storage_options(&options)?;
     validate_validation_options(&options)?;
     validate_api_options(&options)?;
+    validate_index_options(&options)?;
     Ok(options)
+}
+
+fn validate_index_options(options: &Options) -> Result<(), String> {
+    let enabled =
+        options.indexes.transaction || options.indexes.spent_output || options.indexes.basic_filter;
+    if !enabled {
+        return Ok(());
+    }
+    if options.data_dir.is_none() {
+        return Err("optional indexes require a data directory".to_owned());
+    }
+    if options.snapshot.is_some() || options.finalize_assumeutxo.is_some() {
+        return Err(
+            "optional indexes cannot be created during snapshot installation or finalization"
+                .to_owned(),
+        );
+    }
+    if options.complete_assumeutxo.is_some() || options.background_assumeutxo.is_some() {
+        return Err(
+            "optional indexes require an independently executed chainstate; finish AssumeUTXO validation first or use --reindex-chainstate with the desired indexes"
+                .to_owned(),
+        );
+    }
+    if options.offline_action.as_ref().is_some_and(|action| {
+        !matches!(
+            action,
+            OfflineAction::ReindexFromFreezer { .. } | OfflineAction::ReindexChainstate { .. }
+        )
+    }) {
+        return Err(
+            "optional indexes conflict with this read-only or storage-maintenance action"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_peer_options(options: &Options) -> Result<(), String> {
@@ -1224,8 +1354,12 @@ pub struct NodeDiskStatus {
     pub required_bytes: u64,
     /// Operator-selected reserve included in the required threshold.
     pub reserve_bytes: u64,
-    /// Bounded freezer, mempool, and rotating-log storage ceiling.
+    /// Bounded freezer/mempool/log ceiling plus current optional-index bytes.
     pub projected_storage_ceiling_bytes: u64,
+    /// Current bytes occupied by enabled optional index databases.
+    pub optional_index_bytes: u64,
+    /// Worst-case optional-index copy-on-write headroom for one configured batch.
+    pub optional_index_checkpoint_headroom_bytes: u64,
 }
 
 /// Initial-download and snapshot trust state.
@@ -1256,6 +1390,12 @@ pub struct NodeRuntimeStatus {
     pub explorer: Option<NodeTip>,
     /// Optional wallet projection tip.
     pub wallet: Option<NodeTip>,
+    /// Optional transaction index tip.
+    pub transaction_index: Option<NodeTip>,
+    /// Optional spent-output index tip.
+    pub spent_output_index: Option<NodeTip>,
+    /// Optional BIP157/158 basic-filter index tip.
+    pub basic_filter_index: Option<NodeTip>,
     /// UTXOs in the recent-access tier.
     pub utxo_hot: u64,
     /// UTXOs in the inactive tier.
@@ -1279,6 +1419,9 @@ impl NodeRuntimeStatus {
             execution: None,
             explorer: None,
             wallet: None,
+            transaction_index: None,
+            spent_output_index: None,
+            basic_filter_index: None,
             utxo_hot: 0,
             utxo_cold: 0,
             freezer: NodeFreezerStatus {
@@ -1297,6 +1440,8 @@ impl NodeRuntimeStatus {
                 required_bytes: 0,
                 reserve_bytes: 0,
                 projected_storage_ceiling_bytes: 0,
+                optional_index_bytes: 0,
+                optional_index_checkpoint_headroom_bytes: 0,
             },
             trust: NodeTrustStatus {
                 minimum_chainwork_reached: false,
@@ -1422,6 +1567,29 @@ impl NodeObserver {
                     index: "wallet",
                     tip,
                 });
+            }
+        }
+        for (changed, index, tip) in [
+            (
+                previous.transaction_index != next.transaction_index,
+                "txindex",
+                next.transaction_index,
+            ),
+            (
+                previous.spent_output_index != next.spent_output_index,
+                "spent-output",
+                next.spent_output_index,
+            ),
+            (
+                previous.basic_filter_index != next.basic_filter_index,
+                "basic-filter",
+                next.basic_filter_index,
+            ),
+        ] {
+            if changed {
+                if let Some(tip) = tip {
+                    let _ = self.events.send(NodeEvent::IndexTipChanged { index, tip });
+                }
             }
         }
         if previous.freezer != next.freezer {
@@ -1725,6 +1893,8 @@ struct DiskSpaceSnapshot {
     required_bytes: u64,
     reserve_bytes: u64,
     projected_storage_ceiling_bytes: u64,
+    optional_index_bytes: u64,
+    optional_index_checkpoint_headroom_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1733,6 +1903,7 @@ struct DiskSpaceMonitor {
     required_bytes: u64,
     reserve_bytes: u64,
     projected_storage_ceiling_bytes: u64,
+    optional_index_checkpoint_headroom_bytes: u64,
 }
 
 impl DiskSpaceMonitor {
@@ -1742,11 +1913,20 @@ impl DiskSpaceMonitor {
             .saturating_mul(MAX_SERIALIZED_BLOCK_BYTES)
             .saturating_mul(2);
         let mempool_bytes = u64::try_from(options.resources.mempool_max_bytes).unwrap_or(u64::MAX);
+        let enabled_indexes = u64::from(options.indexes.transaction)
+            + u64::from(options.indexes.spent_output)
+            + u64::from(options.indexes.basic_filter);
+        let optional_index_checkpoint_headroom_bytes =
+            u64::try_from(options.validation_limits.max_blocks_per_batch)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(MAX_SERIALIZED_BLOCK_BYTES)
+                .saturating_mul(enabled_indexes);
         let required_bytes = options
             .minimum_free_bytes
             .saturating_add(checkpoint_bytes)
             .saturating_add(mempool_bytes)
             .saturating_add(options.logging.max_file_bytes)
+            .saturating_add(optional_index_checkpoint_headroom_bytes)
             .saturating_add(DATABASE_COMMIT_HEADROOM_BYTES);
         let log_ceiling = options
             .logging
@@ -1762,10 +1942,36 @@ impl DiskSpaceMonitor {
             required_bytes,
             reserve_bytes: options.minimum_free_bytes,
             projected_storage_ceiling_bytes,
+            optional_index_checkpoint_headroom_bytes,
         }
     }
 
     fn check(&self) -> Result<DiskSpaceSnapshot, PeerRunError> {
+        let mut optional_index_bytes = 0_u64;
+        for name in [
+            "txindex.redb",
+            "spent-output-index.redb",
+            "basic-filter-index.redb",
+        ] {
+            match fs::symlink_metadata(self.data_dir.join(name)) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    optional_index_bytes = optional_index_bytes.saturating_add(metadata.len());
+                }
+                Ok(_) => {
+                    return Err(PeerRunError::local(format!(
+                        "optional index path {} must be a regular non-symlink file",
+                        self.data_dir.join(name).display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(PeerRunError::local(format!(
+                        "inspect optional index path {}: {error}",
+                        self.data_dir.join(name).display()
+                    )));
+                }
+            }
+        }
         let available_bytes = fs2::available_space(&self.data_dir).map_err(|error| {
             PeerRunError::local(format!(
                 "read available disk space for {}: {error}",
@@ -1783,7 +1989,11 @@ impl DiskSpaceMonitor {
             available_bytes,
             required_bytes: self.required_bytes,
             reserve_bytes: self.reserve_bytes,
-            projected_storage_ceiling_bytes: self.projected_storage_ceiling_bytes,
+            projected_storage_ceiling_bytes: self
+                .projected_storage_ceiling_bytes
+                .saturating_add(optional_index_bytes),
+            optional_index_bytes,
+            optional_index_checkpoint_headroom_bytes: self.optional_index_checkpoint_headroom_bytes,
         };
         if available_bytes < self.required_bytes {
             return Err(PeerRunError::local(format!(
@@ -1903,6 +2113,16 @@ struct DataStoreSchemaVersions {
     explorer: u32,
     wallet: u32,
     rebroadcast: u32,
+    #[serde(default = "data_store_schema_v1")]
+    transaction_index: u32,
+    #[serde(default = "data_store_schema_v1")]
+    spent_output_index: u32,
+    #[serde(default = "data_store_schema_v1")]
+    basic_filter_index: u32,
+}
+
+const fn data_store_schema_v1() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1930,6 +2150,9 @@ impl DataFormatManifest {
                 explorer: 1,
                 wallet: 1,
                 rebroadcast: 1,
+                transaction_index: 1,
+                spent_output_index: 1,
+                basic_filter_index: 1,
             },
         }
     }
@@ -2027,8 +2250,19 @@ fn validate_data_format_manifest(
     }
     let actual: DataFormatManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode data-format manifest: {error}"))?;
+    if actual.schema_version == 1 && actual.minimum_reader_version == 1 {
+        let mut legacy = DataFormatManifest::current(network);
+        legacy.schema_version = 1;
+        legacy.minimum_reader_version = 1;
+        if actual == legacy {
+            return Ok(true);
+        }
+        return Err(format!(
+            "data-format manifest does not match the {network} legacy schema inventory"
+        ));
+    }
     if actual.schema_version != DATA_FORMAT_SCHEMA_VERSION
-        || actual.minimum_reader_version > DATA_FORMAT_SCHEMA_VERSION
+        || actual.minimum_reader_version != DATA_FORMAT_SCHEMA_VERSION
     {
         return Err(format!(
             "unsupported data-format schema version {} (minimum reader {})",
@@ -2050,7 +2284,8 @@ fn publish_data_format_manifest(
 ) -> Result<(), String> {
     let path = data_dir.join(DATA_FORMAT_MANIFEST_FILE);
     match fs::symlink_metadata(&path) {
-        Ok(_) => return validate_data_format_manifest(data_dir, network).map(drop),
+        Ok(_) if !validate_data_format_manifest(data_dir, network)? => return Ok(()),
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
@@ -2260,6 +2495,9 @@ struct NodeStatusProgress {
     execution: NodeTipResponse,
     explorer: NodeTipResponse,
     wallet: Option<NodeTipResponse>,
+    transaction_index: Option<NodeTipResponse>,
+    spent_output_index: Option<NodeTipResponse>,
+    basic_filter_index: Option<NodeTipResponse>,
     minimum_chainwork_reached: bool,
     active_assume_valid_height: Option<u32>,
     full_script_validation: bool,
@@ -2288,6 +2526,7 @@ struct NodeRpcOperator {
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
     runtime_control: Arc<RuntimeControl>,
     active_peer: Option<SocketAddr>,
+    auxiliary_indexes: Arc<AuxiliaryIndexes>,
 }
 
 const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
@@ -2296,6 +2535,9 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "getpeerinfo",
     "getmempoolinfo",
     "getindexinfo",
+    "gettxindexlocation",
+    "gettxspendingprevout",
+    "getblockfilter",
     "verifychain",
     "getloginfo",
     "getdiskinfo",
@@ -2329,6 +2571,12 @@ impl LocalRpcOperator for NodeRpcOperator {
                 rbtc::diagnostics::set_level(level);
                 Ok(serde_json::json!({"level": level.as_str()}))
             }));
+        }
+        if matches!(
+            method,
+            "gettxindexlocation" | "gettxspendingprevout" | "getblockfilter"
+        ) {
+            return Some(self.execute_index_query(method, params));
         }
         if !rpc_has_no_params(params) {
             return Some(Err(LocalRpcOperatorError {
@@ -2402,6 +2650,18 @@ impl LocalRpcOperator for NodeRpcOperator {
                     "synced": *wallet == status.execution,
                     "best_block_height": wallet.height,
                 })),
+                "txindex": status.transaction_index.as_ref().map(|tip| serde_json::json!({
+                    "synced": *tip == status.execution,
+                    "best_block_height": tip.height,
+                })),
+                "spent_output": status.spent_output_index.as_ref().map(|tip| serde_json::json!({
+                    "synced": *tip == status.execution,
+                    "best_block_height": tip.height,
+                })),
+                "basic_filter": status.basic_filter_index.as_ref().map(|tip| serde_json::json!({
+                    "synced": *tip == status.execution,
+                    "best_block_height": tip.height,
+                })),
             }),
             "verifychain" => serde_json::Value::Bool(status_consistent(&status)),
             "getloginfo" => serde_json::json!({
@@ -2422,6 +2682,140 @@ impl LocalRpcOperator for NodeRpcOperator {
             }
             _ => unreachable!("method membership checked above"),
         }))
+    }
+}
+
+impl NodeRpcOperator {
+    #[allow(clippy::too_many_lines)]
+    fn execute_index_query(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let unavailable = || LocalRpcOperatorError {
+            code: -1,
+            message: "Index is not enabled",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Index storage failure",
+        };
+        match method {
+            "gettxindexlocation" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                let txid = values
+                    .first()
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| Txid::from_str(value).ok())
+                    .filter(|_| values.len() == 1)
+                    .ok_or_else(invalid)?;
+                let index = self
+                    .auxiliary_indexes
+                    .transaction
+                    .as_deref()
+                    .ok_or_else(unavailable)?;
+                index
+                    .transaction(txid)
+                    .map_err(|_| storage())
+                    .map(|location| {
+                        location.map_or(serde_json::Value::Null, |location| {
+                            serde_json::json!({
+                                "txid": txid.to_string(),
+                                "blockhash": location.block_hash.to_string(),
+                                "blockheight": location.height,
+                                "position": location.position,
+                            })
+                        })
+                    })
+            }
+            "gettxspendingprevout" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                let requests = values
+                    .first()
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|_| values.len() == 1)
+                    .ok_or_else(invalid)?;
+                if requests.len() > 1_000 {
+                    return Err(invalid());
+                }
+                let index = self
+                    .auxiliary_indexes
+                    .spent_output
+                    .as_deref()
+                    .ok_or_else(unavailable)?;
+                requests
+                    .iter()
+                    .map(|request| {
+                        let txid = request
+                            .get("txid")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|value| Txid::from_str(value).ok())
+                            .ok_or_else(invalid)?;
+                        let vout = request
+                            .get("vout")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok())
+                            .ok_or_else(invalid)?;
+                        let outpoint = OutPoint::new(txid, vout);
+                        let location = index.spender(outpoint).map_err(|_| storage())?;
+                        Ok(location.map_or_else(
+                            || serde_json::json!({"txid": txid, "vout": vout}),
+                            |location| {
+                                serde_json::json!({
+                                    "txid": txid,
+                                    "vout": vout,
+                                    "spendingtxid": location.spending_txid,
+                                    "input_index": location.input_index,
+                                    "blockhash": location.block_hash,
+                                    "blockheight": location.height,
+                                })
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(serde_json::Value::Array)
+            }
+            "getblockfilter" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                if !(values.len() == 1
+                    || (values.len() == 2 && values[1].as_str() == Some("basic")))
+                {
+                    return Err(invalid());
+                }
+                let hash = values
+                    .first()
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| BlockHash::from_str(value).ok())
+                    .ok_or_else(invalid)?;
+                let index = self
+                    .auxiliary_indexes
+                    .basic_filter
+                    .as_deref()
+                    .ok_or_else(unavailable)?;
+                index
+                    .basic_filter_by_hash(hash)
+                    .map_err(|_| storage())?
+                    .map_or_else(
+                        || {
+                            Err(LocalRpcOperatorError {
+                                code: -5,
+                                message: "Block filter not found",
+                            })
+                        },
+                        |record| {
+                            Ok(serde_json::json!({
+                                "filter": record.filter.to_lower_hex_string(),
+                                "header": record.filter_header.to_string(),
+                            }))
+                        },
+                    )
+            }
+            _ => unreachable!("index method membership checked"),
+        }
     }
 }
 
@@ -2469,6 +2863,17 @@ fn status_consistent(status: &NodeStatusResponse) -> bool {
                 && (wallet.height != status.execution.height
                     || wallet.hash == status.execution.hash)
         })
+        && [
+            status.transaction_index.as_ref(),
+            status.spent_output_index.as_ref(),
+            status.basic_filter_index.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|tip| {
+            tip.height <= status.execution.height
+                && (tip.height != status.execution.height || tip.hash == status.execution.hash)
+        })
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -2489,6 +2894,9 @@ struct NodeStatusResponse {
     execution: NodeTipResponse,
     explorer: NodeTipResponse,
     wallet: Option<NodeTipResponse>,
+    transaction_index: Option<NodeTipResponse>,
+    spent_output_index: Option<NodeTipResponse>,
+    basic_filter_index: Option<NodeTipResponse>,
     trust: NodeTrustResponse,
     utxo_hot: u64,
     utxo_cold: u64,
@@ -2643,11 +3051,20 @@ impl NodeStatus {
             .wallet
             .as_ref()
             .is_none_or(|wallet| *wallet == progress.execution);
+        let auxiliary_caught_up = [
+            progress.transaction_index.as_ref(),
+            progress.spent_output_index.as_ref(),
+            progress.basic_filter_index.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|tip| *tip == progress.execution);
         let disk_safe = progress.disk_space.available_bytes >= progress.disk_space.required_bytes;
         let ready = progress.minimum_chainwork_reached
             && chain_caught_up
             && explorer_caught_up
             && wallet_caught_up
+            && auxiliary_caught_up
             && disk_safe;
         let phase = if !disk_safe {
             "low_disk"
@@ -2655,7 +3072,7 @@ impl NodeStatus {
             "ibd"
         } else if !chain_caught_up {
             "syncing_blocks"
-        } else if !explorer_caught_up || !wallet_caught_up {
+        } else if !explorer_caught_up || !wallet_caught_up || !auxiliary_caught_up {
             "reconciling"
         } else if progress.independently_validated {
             "ready"
@@ -2671,6 +3088,9 @@ impl NodeStatus {
             execution: progress.execution,
             explorer: progress.explorer,
             wallet: progress.wallet,
+            transaction_index: progress.transaction_index,
+            spent_output_index: progress.spent_output_index,
+            basic_filter_index: progress.basic_filter_index,
             trust: NodeTrustResponse {
                 minimum_chainwork_reached: progress.minimum_chainwork_reached,
                 active_assume_valid_height: progress.active_assume_valid_height,
@@ -2741,6 +3161,18 @@ async fn node_metrics(
     let independently_validated = u8::from(status.trust.independently_validated);
     let wallet_enabled = u8::from(status.wallet.is_some());
     let wallet_height = status.wallet.as_ref().map_or(0, |tip| tip.height);
+    let transaction_index_height = status
+        .transaction_index
+        .as_ref()
+        .map_or(0, |tip| tip.height);
+    let spent_output_index_height = status
+        .spent_output_index
+        .as_ref()
+        .map_or(0, |tip| tip.height);
+    let basic_filter_index_height = status
+        .basic_filter_index
+        .as_ref()
+        .map_or(0, |tip| tip.height);
     let ledger_first_height = status.ledger_first_height.unwrap_or(0);
     let ledger_tip_height = status.ledger_tip_height.unwrap_or(0);
     let ledger_pruned_through = status.ledger_pruned_through_height.unwrap_or(0);
@@ -2759,8 +3191,10 @@ async fn node_metrics(
     let disk_required = status.disk_space.required_bytes;
     let disk_reserve = status.disk_space.reserve_bytes;
     let storage_ceiling = status.disk_space.projected_storage_ceiling_bytes;
+    let optional_index_bytes = status.disk_space.optional_index_bytes;
+    let optional_index_headroom = status.disk_space.optional_index_checkpoint_headroom_bytes;
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"txindex\"}} {transaction_index_height}\nrbtc_tip_height{{kind=\"spent_output\"}} {spent_output_index_height}\nrbtc_tip_height{{kind=\"basic_filter\"}} {basic_filter_index_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\nrbtc_disk_bytes{{kind=\"optional_indexes\"}} {optional_index_bytes}\nrbtc_disk_bytes{{kind=\"optional_index_checkpoint_headroom\"}} {optional_index_headroom}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -2818,6 +3252,7 @@ impl ApiServer {
         transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
         runtime_control: Arc<RuntimeControl>,
         active_peer: Option<SocketAddr>,
+        auxiliary_indexes: Arc<AuxiliaryIndexes>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -2859,6 +3294,7 @@ impl ApiServer {
                 transaction_pool: Arc::clone(&transaction_pool),
                 runtime_control: Arc::clone(&runtime_control),
                 active_peer,
+                auxiliary_indexes: Arc::clone(&auxiliary_indexes),
             });
             router = router.merge(rpc_router_with_operator(
                 Arc::clone(&index),
@@ -2925,6 +3361,7 @@ fn collect_node_status(
     explorer: &RedbExplorerIndex,
     ledger: &PrunedBlockLedger,
     wallet: Option<&EmbeddedWallet>,
+    auxiliary_indexes: &AuxiliaryIndexes,
     disk_space: DiskSpaceSnapshot,
 ) -> Result<NodeStatusProgress, String> {
     let header = headers.active_tip();
@@ -2936,6 +3373,14 @@ fn collect_node_status(
     let wallet = wallet
         .map(|wallet| wallet.chain_tip().map_err(|error| error.to_string()))
         .transpose()?;
+    let auxiliary_tip = |index: Option<&RedbAuxiliaryIndex>| {
+        index
+            .map(|index| index.tip().map_err(|error| error.to_string()))
+            .transpose()
+    };
+    let transaction_index = auxiliary_tip(auxiliary_indexes.transaction.as_deref())?;
+    let spent_output_index = auxiliary_tip(auxiliary_indexes.spent_output.as_deref())?;
+    let basic_filter_index = auxiliary_tip(auxiliary_indexes.basic_filter.as_deref())?;
     let ibd = ibd_policy
         .status(headers)
         .map_err(|error| error.to_string())?;
@@ -2962,6 +3407,18 @@ fn collect_node_status(
             hash: explorer.hash.to_string(),
         },
         wallet: wallet.map(|tip| NodeTipResponse {
+            height: tip.height,
+            hash: tip.hash.to_string(),
+        }),
+        transaction_index: transaction_index.map(|tip| NodeTipResponse {
+            height: tip.height,
+            hash: tip.hash.to_string(),
+        }),
+        spent_output_index: spent_output_index.map(|tip| NodeTipResponse {
+            height: tip.height,
+            hash: tip.hash.to_string(),
+        }),
+        basic_filter_index: basic_filter_index.map(|tip| NodeTipResponse {
             height: tip.height,
             hash: tip.hash.to_string(),
         }),
@@ -2992,9 +3449,11 @@ struct RuntimeStatusSources<'a> {
     explorer: Option<&'a RedbExplorerIndex>,
     ledger: &'a PrunedBlockLedger,
     wallet: Option<&'a EmbeddedWallet>,
+    auxiliary_indexes: &'a AuxiliaryIndexes,
     disk_space: DiskSpaceSnapshot,
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRuntimeStatus, String> {
     let RuntimeStatusSources {
         network,
@@ -3004,6 +3463,7 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
         explorer,
         ledger,
         wallet,
+        auxiliary_indexes,
         disk_space,
     } = sources;
     let header = headers.active_tip();
@@ -3017,6 +3477,14 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
     let wallet = wallet
         .map(|wallet| wallet.chain_tip().map_err(|error| error.to_string()))
         .transpose()?;
+    let auxiliary_tip = |index: Option<&RedbAuxiliaryIndex>| {
+        index
+            .map(|index| index.tip().map_err(|error| error.to_string()))
+            .transpose()
+    };
+    let transaction_index = auxiliary_tip(auxiliary_indexes.transaction.as_deref())?;
+    let spent_output_index = auxiliary_tip(auxiliary_indexes.spent_output.as_deref())?;
+    let basic_filter_index = auxiliary_tip(auxiliary_indexes.basic_filter.as_deref())?;
     let ibd = ibd_policy
         .status(headers)
         .map_err(|error| error.to_string())?;
@@ -3047,6 +3515,18 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
             height: tip.height,
             hash: tip.hash,
         }),
+        transaction_index: transaction_index.map(|tip| NodeTip {
+            height: tip.height,
+            hash: tip.hash,
+        }),
+        spent_output_index: spent_output_index.map(|tip| NodeTip {
+            height: tip.height,
+            hash: tip.hash,
+        }),
+        basic_filter_index: basic_filter_index.map(|tip| NodeTip {
+            height: tip.height,
+            hash: tip.hash,
+        }),
         utxo_hot: utxos.hot,
         utxo_cold: utxos.cold,
         freezer: NodeFreezerStatus {
@@ -3067,6 +3547,9 @@ fn collect_runtime_status(sources: RuntimeStatusSources<'_>) -> Result<NodeRunti
             required_bytes: disk_space.required_bytes,
             reserve_bytes: disk_space.reserve_bytes,
             projected_storage_ceiling_bytes: disk_space.projected_storage_ceiling_bytes,
+            optional_index_bytes: disk_space.optional_index_bytes,
+            optional_index_checkpoint_headroom_bytes: disk_space
+                .optional_index_checkpoint_headroom_bytes,
         },
         trust: NodeTrustStatus {
             minimum_chainwork_reached: ibd.minimum_chainwork_reached,
@@ -3719,11 +4202,19 @@ fn reindex_from_complete_freezer(
         .map_err(|error| error.to_string())?;
     let output_ledger = PrunedBlockLedger::open(output.join("blocks"), options.ledger_retention)
         .map_err(|error| error.to_string())?;
+    let auxiliary_indexes = AuxiliaryIndexes::open(&output, options.network, options.indexes)?;
     recover_local_reindex_staging(
         &options.deployments,
         &output_headers,
         &chainstate,
         &output_ledger,
+    )?;
+    recover_local_reindex_indexes(
+        options,
+        &output_headers,
+        &chainstate,
+        &source_ledger,
+        &auxiliary_indexes,
     )?;
     if validate_data_format_manifest(&output, options.network)? {
         publish_data_format_manifest(&output, options.network)?;
@@ -3737,12 +4228,21 @@ fn reindex_from_complete_freezer(
         &chainstate,
         &source_ledger,
         &output_ledger,
+        &auxiliary_indexes,
     )?;
-    finish_local_reindex(options, &output, target, &output_headers, &chainstate)?;
+    finish_local_reindex(
+        options,
+        &output,
+        target,
+        &output_headers,
+        &chainstate,
+        Some(&auxiliary_indexes),
+    )?;
     print_freezer_reindex_report(options, source, &output, target, initial_height, started);
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_local_reindex_batches(
     options: &Options,
     output: &std::path::Path,
@@ -3751,6 +4251,7 @@ fn run_local_reindex_batches(
     chainstate: &RedbChainStore,
     source_ledger: &PrunedBlockLedger,
     output_ledger: &PrunedBlockLedger,
+    auxiliary_indexes: &AuxiliaryIndexes,
 ) -> Result<u32, String> {
     let initial_height = chainstate
         .execution()
@@ -3780,7 +4281,14 @@ fn run_local_reindex_batches(
         let batch = source_ledger
             .read_block_batch(first_height, max_blocks, DEFAULT_VERIFY_CHAIN_BLOCK_BYTES)
             .map_err(|error| error.to_string())?;
-        execute_local_reindex_batch(options, headers, chainstate, output_ledger, &batch)?;
+        execute_local_reindex_batch(
+            options,
+            headers,
+            chainstate,
+            output_ledger,
+            auxiliary_indexes,
+            &batch,
+        )?;
         let current = chainstate
             .execution()
             .tip()
@@ -3798,12 +4306,106 @@ fn run_local_reindex_batches(
     }
 }
 
+fn recover_local_reindex_indexes(
+    options: &Options,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    source_ledger: &PrunedBlockLedger,
+    indexes: &AuxiliaryIndexes,
+) -> Result<(), String> {
+    let execution_tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    for (kind, index) in indexes.enabled() {
+        let label = auxiliary_index_label(kind);
+        loop {
+            let tip = index.tip().map_err(|error| error.to_string())?;
+            if tip.height <= execution_tip.height
+                && headers
+                    .active_header_at(tip.height)
+                    .is_some_and(|header| header.hash == tip.hash)
+            {
+                break;
+            }
+            index.disconnect_tip().map_err(|error| error.to_string())?;
+        }
+        loop {
+            let tip = index.tip().map_err(|error| error.to_string())?;
+            if tip.height >= execution_tip.height {
+                break;
+            }
+            let first_height = tip
+                .height
+                .checked_add(1)
+                .ok_or_else(|| format!("{label} index height overflow"))?;
+            let count = (execution_tip.height - tip.height).min(
+                u32::try_from(options.validation_limits.max_blocks_per_batch)
+                    .expect("validation batch bound fits u32"),
+            );
+            let raw = source_ledger
+                .read_block_batch(first_height, count, DEFAULT_VERIFY_CHAIN_BLOCK_BYTES)
+                .map_err(|error| error.to_string())?;
+            let blocks = raw
+                .blocks
+                .iter()
+                .map(|bytes| deserialize::<Block>(bytes).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected = (0..blocks.len())
+                .map(|offset| {
+                    let height = first_height
+                        .checked_add(u32::try_from(offset).expect("index batch fits u32"))
+                        .ok_or_else(|| format!("{label} index height overflow"))?;
+                    headers
+                        .active_header_at(height)
+                        .ok_or_else(|| format!("missing active header at height {height}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let mut block_undos = Vec::with_capacity(blocks.len());
+            for (expected, block) in expected.iter().zip(&blocks) {
+                validate_archive_block(
+                    &options.deployments,
+                    headers,
+                    expected.height,
+                    expected.hash,
+                    block,
+                )?;
+                block_undos.push(if kind == AuxiliaryIndexKind::Transaction {
+                    Vec::new()
+                } else {
+                    chainstate
+                        .undos()
+                        .get(expected.hash)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!(
+                                "cannot resume {label} index at height {} because its execution undo was pruned; restart the explicit reindex with an empty output directory",
+                                expected.height
+                            )
+                        })?
+                });
+            }
+            let batch = expected
+                .iter()
+                .zip(&blocks)
+                .zip(&block_undos)
+                .map(|((expected, block), undos)| (expected.height, block, undos.as_slice()))
+                .collect::<Vec<_>>();
+            index
+                .connect_batch(&batch)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn finish_local_reindex(
     options: &Options,
     output: &std::path::Path,
     target: rbtc::execution_store::ExecutionTip,
     headers: &HeaderDag,
     chainstate: &RedbChainStore,
+    open_indexes: Option<&AuxiliaryIndexes>,
 ) -> Result<(), String> {
     let check = verify_freezer_cross_store(
         output,
@@ -3818,6 +4420,26 @@ fn finish_local_reindex(
             "rebuilt output failed final cross-store verification: {}",
             check.issues.join("; ")
         ));
+    }
+    let owned_indexes = open_indexes
+        .is_none()
+        .then(|| AuxiliaryIndexes::open(output, options.network, options.indexes))
+        .transpose()?;
+    let indexes = open_indexes
+        .or(owned_indexes.as_ref())
+        .expect("one index set");
+    for (kind, index) in indexes.enabled() {
+        let tip = index.tip().map_err(|error| error.to_string())?;
+        if tip != target {
+            return Err(format!(
+                "rebuilt {} index stopped at {}:{}, expected {}:{}; output was not promoted",
+                auxiliary_index_label(kind),
+                tip.height,
+                tip.hash,
+                target.height,
+                target.hash
+            ));
+        }
     }
     if target.height > 0 {
         chainstate
@@ -3923,7 +4545,7 @@ async fn reindex_chainstate_from_peers(
         },
     )
     .map_err(|error| error.to_string())?;
-    finish_local_reindex(options, &output, target, &output_headers, &chainstate)?;
+    finish_local_reindex(options, &output, target, &output_headers, &chainstate, None)?;
     let report = PeerReindexReport {
         schema_version: 1,
         network: options.network.to_string(),
@@ -4222,6 +4844,7 @@ fn execute_local_reindex_batch(
     headers: &HeaderDag,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
+    auxiliary_indexes: &AuxiliaryIndexes,
     batch: &LedgerBlockBatch,
 ) -> Result<(), String> {
     let current = chainstate
@@ -4274,7 +4897,7 @@ fn execute_local_reindex_batch(
     });
     stage_result.map_err(|error| error.to_string())?;
     let prefetched = prefetch_result.map_err(|error| error.to_string())?;
-    connect_prevalidated_active_blocks_with_txids_and_utxos(
+    let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
         chainstate,
         headers,
         &blocks,
@@ -4285,10 +4908,36 @@ fn execute_local_reindex_batch(
         &deployment_contexts,
     )
     .map_err(|error| error.to_string())?;
+    let index_batch = expected
+        .iter()
+        .zip(&blocks)
+        .zip(&applied_blocks)
+        .map(|((expected, block), applied)| {
+            (expected.height, block, applied.transaction_undos.as_slice())
+        })
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        auxiliary_indexes
+            .enabled()
+            .map(|(_, index)| {
+                scope.spawn(|| {
+                    index
+                        .connect_batch(&index_batch)
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .try_for_each(|job| {
+                job.join()
+                    .expect("local optional-index worker must not panic")
+            })
+    })?;
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("reindex batch bound fits u32"))
         .map_err(|error| error.to_string())?;
     prune_expired_block_undos(chainstate, headers, ledger)?;
+    prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     Ok(())
 }
 
@@ -4361,6 +5010,36 @@ fn validate_manual_prune_indexes(
         .map_err(|error| {
             format!(
                 "manual prune would strand the enabled wallet index at height {best_height}: {error:?}"
+            )
+        })?;
+    }
+    for (file, kind) in [
+        ("txindex.redb", AuxiliaryIndexKind::Transaction),
+        ("spent-output-index.redb", AuxiliaryIndexKind::SpentOutput),
+        ("basic-filter-index.redb", AuxiliaryIndexKind::BasicFilter),
+    ] {
+        let path = data_dir.join(file);
+        if !path.exists() {
+            continue;
+        }
+        let index =
+            RedbAuxiliaryIndex::open(path, network, kind).map_err(|error| error.to_string())?;
+        let tip = index.tip().map_err(|error| error.to_string())?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: auxiliary_policy_kind(kind),
+                best_height: tip.height,
+                required_from_height: 1,
+                utxo_baseline_height: None,
+            },
+            first_retained_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            format!(
+                "manual prune would strand the {} index at height {}: {error:?}",
+                auxiliary_index_label(kind),
+                tip.height
             )
         })?;
     }
@@ -4652,7 +5331,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         "none"
     };
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -4663,6 +5342,9 @@ fn startup_configuration_summary(options: &Options) -> String {
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
+        options.indexes.transaction,
+        options.indexes.spent_output,
+        options.indexes.basic_filter,
         options.resources.mempool_max_transactions,
         options.resources.mempool_max_bytes,
         options.cache.active_chainstate_bytes,
@@ -6555,6 +7237,7 @@ async fn run_connected_peer(
                 options.ledger_retention,
                 disk_monitor,
                 options.cache,
+                options.indexes,
                 options.mempool_full_rbf,
                 api_runtime,
                 background_validation,
@@ -6677,6 +7360,7 @@ async fn complete_assumeutxo_validation(
         options.ledger_retention,
         DiskSpaceMonitor::for_options(options, validation_dir.clone()),
         options.cache,
+        options.indexes,
         options.mempool_full_rbf,
         None,
         None,
@@ -7823,6 +8507,7 @@ async fn sync_validating_node(
     ledger_retention: LedgerRetention,
     disk_monitor: DiskSpaceMonitor,
     cache: NodeCacheConfig,
+    index_config: NodeIndexConfig,
     mempool_full_rbf: bool,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -7970,6 +8655,9 @@ async fn sync_validating_node(
                 .map_err(|error| error.to_string())
         })
         .transpose()?;
+    let auxiliary_indexes = Arc::new(
+        AuxiliaryIndexes::open(&data_dir, network, index_config).map_err(PeerRunError::local)?,
+    );
     let explorer_events = explorer
         .as_ref()
         .map(|explorer| {
@@ -8022,6 +8710,7 @@ async fn sync_validating_node(
                     .expect("API runtime has an explorer index"),
                 &ledger,
                 wallet,
+                &auxiliary_indexes,
                 disk_space,
             )
             .map(NodeStatus::new)
@@ -8037,6 +8726,7 @@ async fn sync_validating_node(
             explorer: explorer.as_deref(),
             ledger: &ledger,
             wallet,
+            auxiliary_indexes: &auxiliary_indexes,
             disk_space,
         },
     )?;
@@ -8193,6 +8883,7 @@ async fn sync_validating_node(
         )
         .await?;
         let startup_pruned = prune_expired_block_undos(&chainstate, &headers, &ledger)?;
+        prune_expired_auxiliary_index_undos(&auxiliary_indexes, &ledger)?;
         if startup_pruned > 0 {
             rbtc_info!(
                 "pruned {startup_pruned} expired block undo record{} after ledger reconciliation",
@@ -8212,6 +8903,16 @@ async fn sync_validating_node(
             )
             .await?;
         }
+        reconcile_auxiliary_indexes(
+            session,
+            deployment_config,
+            &headers,
+            &chainstate,
+            &ledger,
+            &auxiliary_indexes,
+            &compact_candidates,
+        )
+        .await?;
         if let Some(wallet) = wallet_runtime {
             reconcile_wallet(
                 session,
@@ -8237,6 +8938,7 @@ async fn sync_validating_node(
                     .expect("node status has an explorer index"),
                 &ledger,
                 wallet,
+                &auxiliary_indexes,
                 disk_space,
             )?);
         }
@@ -8250,6 +8952,7 @@ async fn sync_validating_node(
                 explorer: explorer.as_deref(),
                 ledger: &ledger,
                 wallet,
+                auxiliary_indexes: &auxiliary_indexes,
                 disk_space,
             },
         )?;
@@ -8278,6 +8981,7 @@ async fn sync_validating_node(
                         Arc::clone(transaction_pool),
                         Arc::clone(runtime_control),
                         active_peer,
+                        Arc::clone(&auxiliary_indexes),
                     )
                     .await?,
                 );
@@ -8301,6 +9005,7 @@ async fn sync_validating_node(
                         .expect("node status has an explorer index"),
                     &ledger,
                     wallet,
+                    &auxiliary_indexes,
                     disk_space,
                 )?);
             }
@@ -8314,6 +9019,7 @@ async fn sync_validating_node(
                     explorer: explorer.as_deref(),
                     ledger: &ledger,
                     wallet,
+                    auxiliary_indexes: &auxiliary_indexes,
                     disk_space,
                 },
             )?;
@@ -8476,6 +9182,7 @@ async fn sync_validating_node(
                 explorer.as_deref(),
                 explorer_events.as_ref(),
                 wallet,
+                &auxiliary_indexes,
                 &compact_candidates,
                 transaction_pool,
                 validation_target.map(|target| target.height),
@@ -8865,6 +9572,28 @@ fn prune_expired_block_undos(
         .map_err(|error| error.to_string())
 }
 
+fn prune_expired_auxiliary_index_undos(
+    indexes: &AuxiliaryIndexes,
+    ledger: &PrunedBlockLedger,
+) -> Result<u64, String> {
+    let Some(retain_from_height) = ledger
+        .stats()
+        .map_err(|error| error.to_string())?
+        .first_height
+    else {
+        return Ok(0);
+    };
+    let mut removed = 0_u64;
+    for (_, index) in indexes.enabled() {
+        removed = removed.saturating_add(
+            index
+                .prune_undos_before(retain_from_height)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(removed)
+}
+
 async fn backfill_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
@@ -9144,6 +9873,165 @@ async fn reconcile_explorer(
             );
         }
     }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn reconcile_auxiliary_indexes(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    deployment_config: &DeploymentConfig,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    ledger: &PrunedBlockLedger,
+    indexes: &AuxiliaryIndexes,
+    compact_candidates: &[Transaction],
+) -> Result<(), String> {
+    let execution_tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?;
+    let retained = ledger.stats().map_err(|error| error.to_string())?;
+    for (kind, index) in indexes.enabled() {
+        let label = auxiliary_index_label(kind);
+        let initial_tip = index.tip().map_err(|error| error.to_string())?;
+        validate_index_activation(
+            IndexBuildState {
+                kind: auxiliary_policy_kind(kind),
+                best_height: initial_tip.height,
+                required_from_height: 1,
+                utxo_baseline_height: None,
+            },
+            IndexHistoryAvailability {
+                local_first_height: retained.first_height,
+                authenticated_peer_history: true,
+            },
+            execution_tip.height,
+        )
+        .map_err(|error| format!("{label} index activation refusal: {error:?}"))?;
+
+        loop {
+            let tip = index.tip().map_err(|error| error.to_string())?;
+            if tip.height <= execution_tip.height
+                && headers
+                    .active_header_at(tip.height)
+                    .is_some_and(|header| header.hash == tip.hash)
+            {
+                break;
+            }
+            let parent = index.disconnect_tip().map_err(|error| error.to_string())?;
+            rbtc_info!(
+                "disconnected stale {label} index tip; rewound to {}:{}",
+                parent.height,
+                parent.hash
+            );
+        }
+
+        loop {
+            let tip = index.tip().map_err(|error| error.to_string())?;
+            if tip.height >= execution_tip.height {
+                break;
+            }
+            let next_height = tip
+                .height
+                .checked_add(1)
+                .ok_or_else(|| format!("{label} index height overflow"))?;
+            let batch_len = usize::try_from(execution_tip.height - tip.height)
+                .unwrap_or(usize::MAX)
+                .min(MAX_BLOCKS_IN_FLIGHT);
+            let expected = (0..batch_len)
+                .map(|offset| {
+                    let height = next_height
+                        .checked_add(u32::try_from(offset).expect("index batch fits u32"))
+                        .ok_or_else(|| format!("{label} index height overflow"))?;
+                    headers
+                        .active_header_at(height)
+                        .ok_or_else(|| format!("missing active header at height {height}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let mut blocks = Vec::with_capacity(batch_len);
+            let mut all_local = true;
+            for header in &expected {
+                let Some(bytes) = ledger
+                    .read_block(header.height)
+                    .map_err(|error| error.to_string())?
+                else {
+                    all_local = false;
+                    break;
+                };
+                blocks.push(deserialize(&bytes).map_err(|error| {
+                    format!(
+                        "decode retained block for {label} index at height {}: {error}",
+                        header.height
+                    )
+                })?);
+            }
+            if !all_local {
+                let hashes = expected
+                    .iter()
+                    .map(|header| header.hash)
+                    .collect::<Vec<_>>();
+                timeout(PEER_TIMEOUT, session.request_blocks(&hashes))
+                    .await
+                    .map_err(|_| {
+                        format!("{label} index backfill getdata timed out for {batch_len} blocks")
+                    })?
+                    .map_err(|error| error.to_string())?;
+                blocks = timeout(
+                    PEER_TIMEOUT,
+                    session.receive_requested_blocks_with_candidates(&hashes, compact_candidates),
+                )
+                .await
+                .map_err(|_| {
+                    format!("{label} index backfill response timed out for {batch_len} blocks")
+                })?
+                .map_err(|error| error.to_string())?;
+            }
+            let mut block_undos = Vec::with_capacity(blocks.len());
+            for (expected, block) in expected.iter().zip(&blocks) {
+                validate_archive_block(
+                    deployment_config,
+                    headers,
+                    expected.height,
+                    expected.hash,
+                    block,
+                )?;
+                let transaction_undos = if kind == AuxiliaryIndexKind::Transaction {
+                    Vec::new()
+                } else {
+                    chainstate
+                        .undos()
+                        .get(expected.hash)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!(
+                                "{label} index requires spent-prevout undo at height {}; the pruned history cannot reconstruct it from blocks or a UTXO baseline—run --reindex-chainstate into a new directory with this index enabled",
+                                expected.height
+                            )
+                        })?
+                };
+                block_undos.push(transaction_undos);
+            }
+            let batch = expected
+                .iter()
+                .zip(&blocks)
+                .zip(&block_undos)
+                .map(|((expected, block), undos)| (expected.height, block, undos.as_slice()))
+                .collect::<Vec<_>>();
+            index
+                .connect_batch(&batch)
+                .map_err(|error| error.to_string())?;
+            tokio::task::yield_now().await;
+        }
+        let tip = index.tip().map_err(|error| error.to_string())?;
+        if tip != initial_tip {
+            rbtc_info!(
+                "{label} index caught up from height {} to {}:{}",
+                initial_tip.height,
+                tip.height,
+                tip.hash
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn request_block_window(
@@ -9465,6 +10353,7 @@ async fn download_execute_batch(
     explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
+    auxiliary_indexes: &AuxiliaryIndexes,
     compact_candidates: &[Transaction],
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     maximum_height: Option<u32>,
@@ -9940,6 +10829,7 @@ async fn download_execute_batch(
         explorer,
         explorer_events,
         wallet,
+        auxiliary_indexes,
         &expected,
         &blocks,
         &applied_blocks,
@@ -9951,11 +10841,12 @@ async fn download_execute_batch(
     let last = expected
         .last()
         .expect("non-empty block batch has a last header");
-    validate_live_indexes_before_prune(explorer, wallet, last.height)?;
+    validate_live_indexes_before_prune(explorer, wallet, auxiliary_indexes, last.height)?;
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
     let pruned_undos = prune_expired_block_undos(chainstate, headers, ledger)?;
+    let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
         "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
@@ -9983,6 +10874,12 @@ async fn download_execute_batch(
             if pruned_undos == 1 { "" } else { "s" }
         );
     }
+    if pruned_index_undos > 0 {
+        rbtc_info!(
+            "pruned {pruned_index_undos} optional-index rollback record{} below the retained ledger window",
+            if pruned_index_undos == 1 { "" } else { "s" }
+        );
+    }
     if execution_prefetch_count > 0 {
         rbtc_info!(
             "execution-overlapped prefetch retained {execution_prefetch_count} fully received blocks for the next batch"
@@ -10006,6 +10903,7 @@ async fn download_execute_batch(
 fn validate_live_indexes_before_prune(
     explorer: Option<&RedbExplorerIndex>,
     wallet: Option<&EmbeddedWallet>,
+    auxiliary_indexes: &AuxiliaryIndexes,
     execution_height: u32,
 ) -> Result<(), PeerRunError> {
     if let Some(explorer) = explorer {
@@ -10048,6 +10946,26 @@ fn validate_live_indexes_before_prune(
         .map_err(|error| {
             PeerRunError::local(format!(
                 "refusing freezer publication past wallet height {}: {error:?}",
+                tip.height
+            ))
+        })?;
+    }
+    for (kind, index) in auxiliary_indexes.enabled() {
+        let tip = index.tip().map_err(|error| error.to_string())?;
+        validate_prune_boundary(
+            IndexBuildState {
+                kind: auxiliary_policy_kind(kind),
+                best_height: tip.height,
+                required_from_height: 1,
+                utxo_baseline_height: None,
+            },
+            execution_height,
+            execution_height,
+        )
+        .map_err(|error| {
+            PeerRunError::local(format!(
+                "refusing freezer publication past {} index height {}: {error:?}",
+                auxiliary_index_label(kind),
                 tip.height
             ))
         })?;
@@ -10181,6 +11099,7 @@ fn index_validated_blocks(
     explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
     wallet: Option<&EmbeddedWallet>,
+    auxiliary_indexes: &AuxiliaryIndexes,
     expected: &[HeaderInfo],
     blocks: &[Block],
     applied_blocks: &[AppliedBlock],
@@ -10188,23 +11107,59 @@ fn index_validated_blocks(
     if expected.len() != blocks.len() || blocks.len() != applied_blocks.len() {
         return Err("validated projection batch lengths differ".to_owned());
     }
-    if let Some(explorer) = explorer {
-        let explorer_batch = expected
-            .iter()
-            .zip(blocks)
-            .zip(applied_blocks)
-            .map(|((expected, block), applied)| (expected.height, block, applied))
+    let explorer_batch = expected
+        .iter()
+        .zip(blocks)
+        .zip(applied_blocks)
+        .map(|((expected, block), applied)| (expected.height, block, applied))
+        .collect::<Vec<_>>();
+    let auxiliary_batch = expected
+        .iter()
+        .zip(blocks)
+        .zip(applied_blocks)
+        .map(|((expected, block), applied)| {
+            (expected.height, block, applied.transaction_undos.as_slice())
+        })
+        .collect::<Vec<_>>();
+    std::thread::scope(|scope| {
+        let explorer_job = explorer.map(|explorer| {
+            scope.spawn(|| {
+                explorer
+                    .connect_batch(&explorer_batch)
+                    .map_err(|error| error.to_string())
+            })
+        });
+        let auxiliary_jobs = auxiliary_indexes
+            .enabled()
+            .map(|(_, index)| {
+                scope.spawn(|| {
+                    index
+                        .connect_batch(&auxiliary_batch)
+                        .map_err(|error| error.to_string())
+                })
+            })
             .collect::<Vec<_>>();
-        explorer
-            .connect_batch(&explorer_batch)
-            .map_err(|error| error.to_string())?;
-    }
-    for ((expected, block), applied) in expected.iter().zip(blocks).zip(applied_blocks) {
-        if let Some(wallet) = wallet {
-            wallet
-                .apply_validated_block(block, expected.height)
-                .map_err(|error| error.to_string())?;
+        let wallet_result = if let Some(wallet) = wallet {
+            expected
+                .iter()
+                .zip(blocks)
+                .try_for_each(|(expected, block)| {
+                    wallet
+                        .apply_validated_block(block, expected.height)
+                        .map_err(|error| error.to_string())
+                })
+        } else {
+            Ok(())
+        };
+        if let Some(job) = explorer_job {
+            job.join().expect("explorer index worker must not panic")?;
         }
+        for job in auxiliary_jobs {
+            job.join().expect("optional index worker must not panic")?;
+        }
+        wallet_result
+    })?;
+    for (expected, applied) in expected.iter().zip(applied_blocks) {
         publish_explorer_event(
             explorer_events,
             ExplorerEventKind::Connected,
@@ -10505,6 +11460,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = false;
+    let mut transaction_index = false;
+    let mut spent_output_index = false;
+    let mut basic_filter_index = false;
     let mut cleanup_validation_dir = false;
     let mut utxo_activity_report = false;
     let mut utxo_retier_window_blocks = None;
@@ -10738,6 +11696,12 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             }
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--no-mempool-full-rbf" => mempool_full_rbf = false,
+            "--txindex" => transaction_index = true,
+            "--no-txindex" => transaction_index = false,
+            "--spent-output-index" => spent_output_index = true,
+            "--no-spent-output-index" => spent_output_index = false,
+            "--block-filter-index" => basic_filter_index = true,
+            "--no-block-filter-index" => basic_filter_index = false,
             "--cleanup-validation-dir" => cleanup_validation_dir = true,
             "--no-cleanup-validation-dir" => cleanup_validation_dir = false,
             "--utxo-activity-report" => utxo_activity_report = true,
@@ -11790,6 +12754,25 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     if mempool_full_rbf && data_dir.is_none() {
         return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
+    let indexes_enabled = transaction_index || spent_output_index || basic_filter_index;
+    if indexes_enabled && data_dir.is_none() {
+        return Err("optional indexes require --data-dir".to_owned());
+    }
+    if indexes_enabled
+        && (snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || verify_storage
+            || snapshot_download.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some())
+    {
+        return Err(
+            "optional indexes apply to validating-node execution and conflict with offline, snapshot-install, fetch, and headers-only modes"
+                .to_owned(),
+        );
+    }
     let resource_overridden = automatic_hot_standbys.is_some()
         || mempool_max_transactions.is_some()
         || mempool_max_bytes.is_some();
@@ -12011,6 +12994,11 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         ledger_retention,
         minimum_free_bytes,
         cache,
+        indexes: NodeIndexConfig {
+            transaction: transaction_index,
+            spent_output: spent_output_index,
+            basic_filter: basic_filter_index,
+        },
         resources: NodeResourceConfig {
             automatic_hot_standbys: automatic_hot_standbys
                 .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
@@ -12107,7 +13095,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -12119,8 +13107,8 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --retier-utxos-window-blocks BLOCKS\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-storage [--verify-storage-max-segments 1..4096] [--verify-storage-max-bytes 1048576..17179869184]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-chain [--verify-chain-depth 1..1008] [--verify-chain-max-block-bytes 1048576..4294967296]\n",
-            "  rbtcd --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-from-freezer OUTPUT [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-chainstate OUTPUT [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
+            "  rbtcd --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-from-freezer OUTPUT [--txindex] [--spent-output-index] [--block-filter-index] [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-chainstate OUTPUT [--txindex] [--spent-output-index] [--block-filter-index] [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
@@ -12243,6 +13231,9 @@ mod tests {
             execution: tip.clone(),
             explorer: tip.clone(),
             wallet: Some(tip),
+            transaction_index: None,
+            spent_output_index: None,
+            basic_filter_index: None,
             minimum_chainwork_reached: true,
             active_assume_valid_height: None,
             full_script_validation: true,
@@ -12263,6 +13254,8 @@ mod tests {
                 required_bytes: 2_000,
                 reserve_bytes: 1_000,
                 projected_storage_ceiling_bytes: 3_000,
+                optional_index_bytes: 0,
+                optional_index_checkpoint_headroom_bytes: 0,
             },
         })
     }
@@ -12277,6 +13270,11 @@ mod tests {
             transaction_pool,
             runtime_control: Arc::clone(&runtime_control),
             active_peer: Some("127.0.0.1:18444".parse().unwrap()),
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
         };
 
         let blockchain = operator
@@ -12358,6 +13356,88 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
             .expect("RPC stop notifies the outer runtime after returning a response");
+    }
+
+    #[test]
+    fn operator_rpc_serves_enabled_optional_indexes_with_bounded_queries() {
+        let directory = TempDir::new().unwrap();
+        let txindex = Arc::new(
+            RedbAuxiliaryIndex::open(
+                directory.path().join("tx.redb"),
+                Network::Regtest,
+                AuxiliaryIndexKind::Transaction,
+            )
+            .unwrap(),
+        );
+        let spent = Arc::new(
+            RedbAuxiliaryIndex::open(
+                directory.path().join("spent.redb"),
+                Network::Regtest,
+                AuxiliaryIndexKind::SpentOutput,
+            )
+            .unwrap(),
+        );
+        let filters = Arc::new(
+            RedbAuxiliaryIndex::open(
+                directory.path().join("filters.redb"),
+                Network::Regtest,
+                AuxiliaryIndexKind::BasicFilter,
+            )
+            .unwrap(),
+        );
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let block = regtest_block_at_height(
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(1),
+            1,
+        );
+        txindex.connect_block(1, &block, &[]).unwrap();
+        spent.connect_block(1, &block, &[]).unwrap();
+        filters.connect_block(1, &block, &[]).unwrap();
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(genesis.block_hash()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: Some(txindex),
+                spent_output: Some(spent),
+                basic_filter: Some(filters),
+            }),
+        };
+        let txid = block.txdata[0].compute_txid();
+        let location = operator
+            .execute("gettxindexlocation", &serde_json::json!([txid.to_string()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(location["blockheight"], 1);
+        let filter = operator
+            .execute(
+                "getblockfilter",
+                &serde_json::json!([block.block_hash().to_string(), "basic"]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            filter["filter"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(filter["header"].as_str().unwrap().len(), 64);
+        let unspent = operator
+            .execute(
+                "gettxspendingprevout",
+                &serde_json::json!([[{"txid": txid.to_string(), "vout": 0}]]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(unspent[0].get("spendingtxid").is_none());
+        assert!(
+            operator
+                .execute("gettxspendingprevout", &serde_json::json!([vec![0; 1_001]]))
+                .unwrap()
+                .is_err()
+        );
     }
 
     async fn assert_node_observability(address: SocketAddr) {
@@ -12587,6 +13667,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -14451,6 +15532,9 @@ mod tests {
                 "--complete-assumeutxo",
                 "--background-assumeutxo",
                 "--mempool-full-rbf",
+                "--txindex",
+                "--spent-output-index",
+                "--block-filter-index",
                 "--automatic-hot-standbys",
                 "--mempool-max-transactions",
                 "--mempool-max-bytes",
@@ -14577,6 +15661,51 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_independent_optional_indexes_and_explicit_disables() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-index-parser",
+                "--txindex",
+                "--spent-output-index",
+                "--block-filter-index",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.indexes,
+            NodeIndexConfig {
+                transaction: true,
+                spent_output: true,
+                basic_filter: true,
+            }
+        );
+        let disabled = parse_options(
+            [
+                "--data-dir",
+                "/tmp/rbtc-index-parser",
+                "--txindex",
+                "--no-txindex",
+                "--spent-output-index",
+                "--no-spent-output-index",
+                "--block-filter-index",
+                "--no-block-filter-index",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disabled.indexes, NodeIndexConfig::default());
+        assert!(parse_options(["--txindex"].into_iter().map(str::to_owned)).is_err());
     }
 
     #[test]
@@ -15908,6 +17037,9 @@ mod tests {
                 output.display().to_string(),
                 "--validation-batch-size".to_owned(),
                 "1".to_owned(),
+                "--txindex".to_owned(),
+                "--spent-output-index".to_owned(),
+                "--block-filter-index".to_owned(),
             ]
             .into_iter(),
         )
@@ -15936,6 +17068,33 @@ mod tests {
             rebuilt_ledger.retained_ranges().unwrap(),
             vec![(1, 1), (2, 2)]
         );
+        for (file, kind) in [
+            ("txindex.redb", AuxiliaryIndexKind::Transaction),
+            ("spent-output-index.redb", AuxiliaryIndexKind::SpentOutput),
+            ("basic-filter-index.redb", AuxiliaryIndexKind::BasicFilter),
+        ] {
+            let index =
+                RedbAuxiliaryIndex::open(output.join(file), Network::Regtest, kind).unwrap();
+            assert_eq!(index.tip().unwrap().height, 2);
+            if kind == AuxiliaryIndexKind::Transaction {
+                assert_eq!(
+                    index
+                        .transaction(first.txdata[0].compute_txid())
+                        .unwrap()
+                        .unwrap()
+                        .height,
+                    1
+                );
+            }
+            if kind == AuxiliaryIndexKind::BasicFilter {
+                assert!(
+                    index
+                        .basic_filter_by_hash(second.block_hash())
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -16306,6 +17465,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -16378,6 +17538,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -16750,6 +17911,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn embedded_observer_publishes_typed_deltas_and_bounds_slow_consumers() {
         let (status, _) = watch::channel(NodeRuntimeStatus::starting(Network::Regtest));
         let (events, mut receiver) = broadcast::channel(NODE_EVENT_CAPACITY);
@@ -16785,6 +17947,8 @@ mod tests {
             required_bytes: 2_000,
             reserve_bytes: 1_000,
             projected_storage_ceiling_bytes: 3_000,
+            optional_index_bytes: 0,
+            optional_index_checkpoint_headroom_bytes: 0,
         };
         let next = NodeRuntimeStatus {
             network: Network::Regtest,
@@ -16793,6 +17957,9 @@ mod tests {
             execution: Some(execution),
             explorer: Some(explorer),
             wallet: None,
+            transaction_index: None,
+            spent_output_index: None,
+            basic_filter_index: None,
             utxo_hot: 1,
             utxo_cold: 2,
             freezer,
@@ -16868,6 +18035,9 @@ mod tests {
             execution: tip.clone(),
             explorer: tip.clone(),
             wallet: Some(tip.clone()),
+            transaction_index: None,
+            spent_output_index: None,
+            basic_filter_index: None,
             minimum_chainwork_reached: true,
             active_assume_valid_height: None,
             full_script_validation: true,
@@ -16888,6 +18058,8 @@ mod tests {
                 required_bytes: 2_000,
                 reserve_bytes: 1_000,
                 projected_storage_ceiling_bytes: 3_000,
+                optional_index_bytes: 0,
+                optional_index_checkpoint_headroom_bytes: 0,
             },
         };
         let status = NodeStatus::new(progress.clone());
@@ -16905,6 +18077,10 @@ mod tests {
 
         progress.explorer = progress.execution.clone();
         progress.wallet = Some(progress.execution.clone());
+        progress.transaction_index = Some(tip);
+        status.update(progress.clone());
+        assert_eq!(status.response().phase, "reconciling");
+        progress.transaction_index = Some(progress.execution.clone());
         progress.independently_validated = false;
         status.update(progress.clone());
         assert!(status.response().ready);
@@ -16930,6 +18106,7 @@ mod tests {
             required_bytes: 1,
             reserve_bytes: 1,
             projected_storage_ceiling_bytes: 1,
+            optional_index_checkpoint_headroom_bytes: 0,
         }
         .check()
         .unwrap();
@@ -16940,6 +18117,7 @@ mod tests {
             required_bytes: u64::MAX,
             reserve_bytes: u64::MAX,
             projected_storage_ceiling_bytes: 1,
+            optional_index_checkpoint_headroom_bytes: 0,
         }
         .check()
         .unwrap_err();
@@ -17009,9 +18187,37 @@ mod tests {
             );
         }
 
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "minimum_reader_version": 1,
+            "network": "regtest",
+            "stores": {
+                "headers": 1,
+                "chainstate": 1,
+                "freezer": 1,
+                "peers": 1,
+                "mempool": 1,
+                "fee_estimates": 1,
+                "explorer": 1,
+                "wallet": 1,
+                "rebroadcast": 1,
+            }
+        }))
+        .unwrap();
+        fs::write(&path, legacy).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["schema_version"],
+            2
+        );
+
         let future = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
-            "minimum_reader_version": 2,
+            "schema_version": 3,
+            "minimum_reader_version": 3,
             "network": "regtest",
             "stores": {
                 "headers": 1,
@@ -17886,6 +19092,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -17948,6 +19155,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18097,6 +19305,11 @@ mod tests {
             Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             Arc::new(RuntimeControl::default()),
             Some("127.0.0.1:18444".parse().unwrap()),
+            Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
         )
         .await
         .unwrap();
@@ -18340,6 +19553,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18435,6 +19649,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18509,6 +19724,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18599,6 +19815,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18660,6 +19877,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18717,6 +19935,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18814,6 +20033,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -18877,6 +20097,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
+                indexes: NodeIndexConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -18972,6 +20193,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19057,6 +20279,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19099,6 +20322,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19161,6 +20385,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19217,6 +20442,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19319,6 +20545,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19476,6 +20703,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19584,6 +20812,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19664,6 +20893,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19780,6 +21010,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
+                indexes: NodeIndexConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -19931,6 +21162,7 @@ mod tests {
                 ledger_retention: LedgerRetention::default(),
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
+                indexes: NodeIndexConfig::default(),
                 resources: NodeResourceConfig::default(),
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
@@ -20052,6 +21284,7 @@ mod tests {
             ledger_retention: LedgerRetention::default(),
             minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
             cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
             resources: NodeResourceConfig::default(),
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),

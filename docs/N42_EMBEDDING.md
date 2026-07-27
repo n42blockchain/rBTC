@@ -24,10 +24,15 @@ The intended `n42-node` assembly follows the existing
 
 ```rust,ignore
 use bitcoin::Network;
-use rbtc::node::{NodeBuilder, NodeController, NodeRuntimeStatus};
+use rbtc::node::{NodeBuilder, NodeController, NodeIndexConfig, NodeRuntimeStatus};
 
 let handle = NodeBuilder::new(Network::Bitcoin, bitcoin_data_dir)
     .mempool_full_rbf(false)
+    .indexes(NodeIndexConfig {
+        transaction: true,
+        spent_output: false,
+        basic_filter: true,
+    })
     .ledger_retention(1_008, 1024 * 1024 * 1024)
     .launch()?;
 
