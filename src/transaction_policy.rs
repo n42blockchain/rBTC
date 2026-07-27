@@ -12,10 +12,10 @@ use crate::chainstate::count_script_sigops;
 pub const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 /// Core's maximum standard scriptSig size.
 pub const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
-/// Maximum standard OP_RETURN script size, including the opcode.
-pub const MAX_STANDARD_OP_RETURN_SIZE: usize = 83;
-/// Default minimum relay fee used by the local wallet admission path.
-pub const DEFAULT_MIN_RELAY_FEE_SAT_VB: u64 = 1;
+/// Core 31's aggregate standard data-carrier script-byte ceiling.
+pub const MAX_STANDARD_OP_RETURN_SIZE: usize = 100_000;
+/// Core 31's default minimum relay fee in satoshis per 1,000 virtual bytes.
+pub const DEFAULT_MIN_RELAY_FEE_SAT_KVB: u64 = 100;
 /// Maximum accurate sigops in a standard P2SH redeem script.
 pub const MAX_STANDARD_P2SH_SIGOPS: usize = 15;
 /// Maximum witness script bytes in a standard P2WSH spend.
@@ -37,7 +37,7 @@ pub enum TransactionPolicyError {
     /// Coinbase transactions never enter a mempool.
     #[error("coinbase transaction is not relayable")]
     Coinbase,
-    /// Core 26 relays only versions 1 and 2 by default.
+    /// Core 31 relays transaction versions 1 through 3 by default.
     #[error("transaction version is non-standard")]
     Version,
     /// The non-witness encoding is too small to relay.
@@ -55,9 +55,6 @@ pub enum TransactionPolicyError {
     /// An output script is not one of Core's standard templates.
     #[error("output {0} script is non-standard")]
     OutputScript(usize),
-    /// More than one data-carrier output is present.
-    #[error("transaction contains more than one OP_RETURN output")]
-    MultipleOpReturn,
     /// A data-carrier script exceeds Core's default standard size.
     #[error("output {0} OP_RETURN script exceeds the standard size")]
     OpReturnSize(usize),
@@ -149,10 +146,22 @@ pub fn validate_standard_transaction(
     transaction: &Transaction,
     fee_sats: u64,
 ) -> Result<(), TransactionPolicyError> {
+    validate_standard_transaction_at_rate(transaction, fee_sats, DEFAULT_MIN_RELAY_FEE_SAT_KVB)
+}
+
+/// Applies context-free standardness with an explicit relay fee floor.
+///
+/// A zero rate is reserved for the bounded one-parent-one-child package path,
+/// where the child pays the aggregate package relay fee.
+pub(crate) fn validate_standard_transaction_at_rate(
+    transaction: &Transaction,
+    fee_sats: u64,
+    minimum_relay_fee_sat_kvb: u64,
+) -> Result<(), TransactionPolicyError> {
     if transaction.is_coinbase() {
         return Err(TransactionPolicyError::Coinbase);
     }
-    if !transaction.version.is_standard() {
+    if !(1..=3).contains(&transaction.version.0) {
         return Err(TransactionPolicyError::Version);
     }
     if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
@@ -169,20 +178,18 @@ pub fn validate_standard_transaction(
             return Err(TransactionPolicyError::ScriptSigNotPushOnly(index));
         }
     }
-    let mut op_return = false;
+    let mut op_return_bytes = 0_usize;
+    let mut ephemeral_dust = false;
     for (index, output) in transaction.output.iter().enumerate() {
         let script = &output.script_pubkey;
         if script.is_op_return() {
             if !Script::from_bytes(&script.as_bytes()[1..]).is_push_only() {
                 return Err(TransactionPolicyError::OutputScript(index));
             }
-            if op_return {
-                return Err(TransactionPolicyError::MultipleOpReturn);
-            }
-            if script.len() > MAX_STANDARD_OP_RETURN_SIZE {
+            op_return_bytes = op_return_bytes.saturating_add(script.len());
+            if op_return_bytes > MAX_STANDARD_OP_RETURN_SIZE {
                 return Err(TransactionPolicyError::OpReturnSize(index));
             }
-            op_return = true;
             continue;
         }
         if !(script.is_p2pk()
@@ -197,16 +204,21 @@ pub fn validate_standard_transaction(
         }
         let minimum = script.minimal_non_dust().to_sat();
         if output.value.to_sat() < minimum {
-            return Err(TransactionPolicyError::Dust {
-                index,
-                value_sats: output.value.to_sat(),
-                minimum_sats: minimum,
-            });
+            if minimum_relay_fee_sat_kvb != 0 || fee_sats != 0 || ephemeral_dust {
+                return Err(TransactionPolicyError::Dust {
+                    index,
+                    value_sats: output.value.to_sat(),
+                    minimum_sats: minimum,
+                });
+            }
+            ephemeral_dust = true;
         }
     }
     let minimum_fee = u64::try_from(transaction.vsize())
         .unwrap_or(u64::MAX)
-        .saturating_mul(DEFAULT_MIN_RELAY_FEE_SAT_VB);
+        .saturating_mul(minimum_relay_fee_sat_kvb)
+        .saturating_add(999)
+        / 1_000;
     if fee_sats < minimum_fee {
         return Err(TransactionPolicyError::FeeRate {
             fee_sats,
@@ -462,6 +474,8 @@ mod tests {
     fn rejects_version_size_weight_and_scriptsig_policy() {
         let mut transaction = standard_transaction();
         transaction.version = Version(3);
+        assert_eq!(validate_standard_transaction(&transaction, 1_000), Ok(()));
+        transaction.version = Version(4);
         assert_eq!(
             validate_standard_transaction(&transaction, 1_000),
             Err(TransactionPolicyError::Version)
@@ -499,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonstandard_dust_and_multiple_data_outputs() {
+    fn accepts_multiple_bounded_data_outputs_but_rejects_nonstandard_dust() {
         let mut transaction = standard_transaction();
         transaction.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x61; 24]);
         assert_eq!(
@@ -528,10 +542,7 @@ mod tests {
                 script_pubkey: data,
             },
         ];
-        assert_eq!(
-            validate_standard_transaction(&transaction, 1_000),
-            Err(TransactionPolicyError::MultipleOpReturn)
-        );
+        assert_eq!(validate_standard_transaction(&transaction, 1_000), Ok(()));
 
         let mut transaction = standard_transaction();
         transaction.output[0] = TxOut {
@@ -576,7 +587,10 @@ mod tests {
     #[test]
     fn rejects_fee_below_rounded_vsize_floor() {
         let transaction = standard_transaction();
-        let minimum = u64::try_from(transaction.vsize()).unwrap();
+        let minimum = u64::try_from(transaction.vsize())
+            .unwrap()
+            .saturating_mul(DEFAULT_MIN_RELAY_FEE_SAT_KVB)
+            .div_ceil(1_000);
         assert_eq!(
             validate_standard_transaction(&transaction, minimum - 1),
             Err(TransactionPolicyError::FeeRate {

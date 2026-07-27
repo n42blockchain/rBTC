@@ -9,13 +9,14 @@ use bitcoin::{
     BlockHash, Transaction,
     bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId},
     consensus::{deserialize, encode::Error as EncodeError, serialize},
+    hashes::{Hash, sha256d},
     p2p::{
         Address, Magic, ServiceFlags,
         address::{AddrV2, AddrV2Message},
         message::{MAX_INV_SIZE, NetworkMessage, RawNetworkMessage},
         message_blockdata::{GetHeadersMessage, Inventory},
         message_compact_blocks::{GetBlockTxn, SendCmpct},
-        message_network::VersionMessage,
+        message_network::{Reject, VersionMessage},
     },
 };
 use std::{
@@ -2280,7 +2281,43 @@ pub fn encode_v1(magic: Magic, payload: NetworkMessage) -> Vec<u8> {
 
 /// Parses and checks the magic, command, length, and checksum of a v1 P2P envelope.
 pub fn decode_v1(bytes: &[u8]) -> Result<RawNetworkMessage, EncodeError> {
-    deserialize(bytes)
+    match deserialize(bytes) {
+        Ok(message) => Ok(message),
+        Err(error) => {
+            // BIP61 permits `reject` messages about non-transaction commands
+            // (notably `version`) to omit the trailing 32-byte object hash.
+            // rust-bitcoin's legacy Reject type always expects that hash, so
+            // recover this obsolete, informational message after independently
+            // checking its envelope checksum.
+            if bytes.len() >= V1_HEADER_LEN
+                && &bytes[4..16] == b"reject\0\0\0\0\0\0"
+                && reject_checksum_is_valid(bytes)
+            {
+                let magic = Magic::from_bytes(bytes[..4].try_into().expect("length checked"));
+                let mut payload = bytes[V1_HEADER_LEN..].to_vec();
+                payload.extend_from_slice(&[0_u8; 32]);
+                if let Ok(reject) = deserialize::<Reject>(&payload) {
+                    return Ok(RawNetworkMessage::new(
+                        magic,
+                        NetworkMessage::Reject(reject),
+                    ));
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn reject_checksum_is_valid(bytes: &[u8]) -> bool {
+    let declared = u32::from_le_bytes(bytes[16..20].try_into().expect("length checked"));
+    let Ok(declared) = usize::try_from(declared) else {
+        return false;
+    };
+    if bytes.len() != V1_HEADER_LEN.saturating_add(declared) {
+        return false;
+    }
+    let digest = sha256d::Hash::hash(&bytes[V1_HEADER_LEN..]).to_byte_array();
+    bytes[20..24] == digest[..4]
 }
 
 #[cfg(test)]
@@ -2350,6 +2387,33 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn bip61_reject_without_object_hash_is_checksum_checked_and_ignored() {
+        // btcd legitimately omits the object hash when rejecting `version`.
+        // rust-bitcoin's Reject decoder requires it unconditionally.
+        let payload = b"\x07version\x40\x21required services 0x1 not offered".to_vec();
+        let checksum = sha256d::Hash::hash(&payload).to_byte_array();
+        let mut message = Vec::with_capacity(V1_HEADER_LEN + payload.len());
+        message.extend_from_slice(&Magic::REGTEST.to_bytes());
+        message.extend_from_slice(b"reject\0\0\0\0\0\0");
+        message.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        message.extend_from_slice(&checksum[..4]);
+        message.extend_from_slice(&payload);
+        let decoded = decode_v1(&message).unwrap();
+        assert_eq!(decoded.magic(), &Magic::REGTEST);
+        assert!(matches!(
+            decoded.into_payload(),
+            NetworkMessage::Reject(reject)
+                if reject.message == "version"
+                    && reject.reason == "required services 0x1 not offered"
+                    && reject.hash == sha256d::Hash::all_zeros()
+        ));
+
+        let mut corrupted = message;
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(decode_v1(&corrupted).is_err());
     }
 
     #[test]

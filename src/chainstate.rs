@@ -492,8 +492,9 @@ const fn decode_pushnum(opcode: bitcoin::Opcode) -> Option<u8> {
     }
 }
 
-fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
-    let sigops = transaction
+/// Counts context-free legacy sigops for transaction relay policy.
+pub(crate) fn transaction_legacy_sigops(transaction: &Transaction) -> usize {
+    transaction
         .input
         .iter()
         .map(|input| count_script_sigops(&input.script_sig, false))
@@ -503,8 +504,11 @@ fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
                 .iter()
                 .map(|output| count_script_sigops(&output.script_pubkey, false)),
         )
-        .sum::<usize>();
-    u64::try_from(sigops).expect("transaction sigops fit u64") * 4
+        .sum()
+}
+
+fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
+    u64::try_from(transaction_legacy_sigops(transaction)).expect("transaction sigops fit u64") * 4
 }
 
 fn transaction_sigop_cost(transaction: &Transaction, prevouts: &[Utxo], flags: u32) -> u64 {

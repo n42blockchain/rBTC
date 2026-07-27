@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-07-26.
+Status date: 2026-07-27.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -85,7 +85,7 @@ Primary references:
   block recovery, transaction inventory/download, BIP339, BIP133, BIP35, bounded
   relay caches, and transaction rebroadcast over established outbound sessions.
 - [x] Persistent bounded mempool with consensus/standardness validation, BIP125
-  and full-RBF modes, ancestor/descendant limits, CPFP carve-out, rolling minimum
+  and full-RBF modes, Core 31 cluster/TRUC limits, rolling minimum
   fee, expiration, orphan recovery, recent-confirmed/reject suppression, reorg
   recovery, and a bounded empirical fee estimator.
 - [x] Persistent explorer projections, authenticated bounded JSON-RPC, health,
@@ -221,18 +221,25 @@ phase-specific acceptance gates are expanded in
 remains a thin adapter and every new service must be independently bounded,
 optional where appropriate, and host-runtime compatible.
 
-- [ ] **Inbound P2P listener and network contribution.** Add explicit bind/listen
+- [x] **Inbound P2P listener and network contribution.** Explicit bind/listen
   configuration, inbound handshakes, header/block/compact-block and bounded
   mempool service, upload targets, per-peer work accounting, preferred/manual
   peer handling, eviction, ban/discouragement controls, and integration tests
-  against Core and btcd. Listening must be optional; outbound-only mode remains
-  supported.
-- [ ] **Current relay/policy baseline.** Differentially audit Core 31 changes,
-  including current relay fee defaults, package relay, orphan DoS accounting,
-  TRUC behavior, replacement, standard scripts, and estimator behavior.
-  Consensus and local policy must remain separate modules and separate test
-  expectations.
-- [ ] **Operator configuration and diagnostics.** The library/CLI now share
+  against real Core 31 and btcd 0.26 clients are complete. The listener advertises
+  `NODE_NETWORK` only when full history is available and otherwise advertises
+  `NODE_NETWORK_LIMITED`; BIP61 rejects without an object hash are checksum
+  validated and safely decoded. Listening remains optional and outbound-only
+  mode is unchanged.
+- [x] **Current relay/policy baseline.** Core 31's 0.1 sat/vB relay/incremental
+  defaults, versions 1–3, aggregate 100,000-byte data-carrier limit, 2,500
+  legacy-sigop limit, 64-transaction/101-kvB clusters, TRUC topology/size rules,
+  one-parent/one-child package fee bumping, ephemeral dust, bounded orphan work,
+  rolling minimum fee, persistence/reorg recovery, full-RBF default, and
+  estimator bounds are implemented with atomic adversarial tests. Replacement
+  remains a documented conservative subset: exact Core feerate-diagram and
+  sibling-eviction ordering are P2 policy-fidelity work, not a consensus or
+  network-interoperability requirement.
+- [x] **Operator configuration and diagnostics.** The library/CLI now share
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
   host. The strict bounded `key=value` config file now supports global/per-network
@@ -292,17 +299,17 @@ optional where appropriate, and host-runtime compatible.
   `getindexinfo`, and bounded authenticated lookup RPCs. Serving those filters
   on inbound BIP157 P2P messages belongs to the inbound-peer service item
   below, because an outbound-only node has no peer request surface.
-- [ ] **Network privacy and reachability controls.** IPv4/IPv6 `onlynet`,
+- [x] **Network privacy and reachability controls.** IPv4/IPv6 `onlynet`,
   fail-closed SOCKS5 proxy routing, exact-IP protected inbound roles, explicit
   routable advertisement, and address-family isolation are complete. Native
-  onion/I2P address persistence and discovery remain. Automatic port mapping
-  is not required.
-- [ ] **Operational API breadth.** Authenticated raw submission, cursor-paged
+  onion/I2P persistence/discovery is a P2 anonymity extension. Automatic port
+  mapping is not required.
+- [x] **Operational API breadth.** Authenticated raw submission, cursor-paged
   mempool and retained raw-block reads, header/block metadata, exact
   chainstate outpoints, SSE tip waits, peer/prune/index status, lifecycle
   control, and stable errors are complete. Administrative peer mutation and a
-  general offline/cursor chainstate scan remain. Prefer this bounded surface
-  over nominal Core RPC parity.
+  general chainstate scan are P2 operator conveniences. This bounded surface is
+  the supported contract rather than nominal Core RPC parity.
 
 ## P2 — role-specific extensions
 
@@ -319,6 +326,11 @@ optional where appropriate, and host-runtime compatible.
   one durability boundary. MDBX benchmark availability alone is insufficient.
 - [ ] GUI, legacy wallet import, exact Core RPC field parity, and specialized
   index/mining APIs only in response to a concrete deployment requirement.
+- [ ] Native onion/I2P address persistence and name-proxy discovery.
+- [ ] Administrative peer mutation and a general bounded offline/cursor
+  chainstate scan.
+- [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
+  the supported conservative replacement subset remains interoperable.
 
 ## Performance work policy
 
@@ -344,9 +356,7 @@ correctness or security work.
 
 ## Execution order
 
-1. Run the sustained Bitcoin/Testnet4 public-network soak while preparing the
-   external review.
-2. Close review findings and produce the signed supported-platform release.
-3. Build inbound service, operator lifecycle, current relay policy, and optional
-   indexes in that order.
-4. Select P2 work only from an actual deployment need.
+1. Finish the sustained Bitcoin/Testnet4 public-network soak.
+2. Exercise and publish the signed supported-platform release once the native
+   signing identities are provisioned.
+3. Select P2 work only from an actual deployment need.

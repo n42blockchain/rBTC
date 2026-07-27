@@ -19,10 +19,11 @@ use thiserror::Error;
 use crate::{
     chainstate::{
         ChainstateError, apply_transaction_with_context, check_sequence_lock, enforces_bip68,
+        transaction_legacy_sigops,
     },
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
-        TransactionPolicyError, validate_standard_inputs, validate_standard_transaction,
+        TransactionPolicyError, validate_standard_inputs, validate_standard_transaction_at_rate,
     },
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -56,9 +57,20 @@ pub const ORPHAN_EXPIRY_SECS: u32 = 20 * 60;
 /// Core's twelve-hour rolling mempool minimum-fee half-life.
 pub const ROLLING_FEE_HALFLIFE_SECS: u32 = 12 * 60 * 60;
 const SATOSHIS_PER_KVB: u64 = 1_000;
+const DEFAULT_MIN_RELAY_FEE_SAT_KVB: u64 = 100;
 const DEFAULT_BYTES_PER_SIGOP: usize = 20;
 /// Core 26's per-transaction standard sigop cost ceiling.
 pub const MAX_STANDARD_TRANSACTION_SIGOP_COST: u64 = 16_000;
+/// Core 31's context-free legacy sigop ceiling per standard transaction.
+pub const MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS: usize = 2_500;
+/// Transaction version reserved by Core's topology-restricted relay policy.
+pub const TRUC_VERSION: i32 = 3;
+/// Maximum virtual size of a version-3 transaction.
+pub const MAX_TRUC_VBYTES: usize = 10_000;
+/// Maximum virtual size of a version-3 transaction with an unconfirmed parent.
+pub const MAX_TRUC_CHILD_VBYTES: usize = 1_000;
+/// Maximum ancestor and descendant count, including the transaction, for TRUC.
+pub const MAX_TRUC_CONNECTED_TRANSACTIONS: usize = 2;
 /// Core 26 standard-script flags expressible through the public consensus ABI.
 pub const PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS: u32 =
     bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
@@ -68,20 +80,14 @@ pub const MAX_PACKAGE_TRANSACTIONS: usize = 25;
 pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 /// Core-like maximum aggregate virtual size accepted for one package.
 pub const MAX_PACKAGE_VBYTES: usize = 101_000;
-/// Core default maximum ancestors, including the transaction itself.
-pub const MAX_ANCESTOR_TRANSACTIONS: usize = 25;
-/// Core default maximum aggregate ancestor virtual size.
-pub const MAX_ANCESTOR_VBYTES: usize = 101_000;
-/// Core default maximum descendants, including the transaction itself.
-pub const MAX_DESCENDANT_TRANSACTIONS: usize = 25;
-/// Core default maximum aggregate descendant virtual size.
-pub const MAX_DESCENDANT_VBYTES: usize = 101_000;
-/// Core's single-transaction CPFP descendant-size carve-out.
-pub const EXTRA_DESCENDANT_TRANSACTION_VBYTES: usize = 10_000;
+/// Core 31's maximum number of transactions in one mempool cluster.
+pub const MAX_MEMPOOL_CLUSTER_TRANSACTIONS: usize = 64;
+/// Core 31's maximum aggregate virtual size of one mempool cluster.
+pub const MAX_MEMPOOL_CLUSTER_VBYTES: usize = 101_000;
 /// Maximum original transactions and descendants replaced in one admission.
 pub const MAX_REPLACEMENT_EVICTIONS: usize = 100;
-/// Additional relay fee charged for every replacement virtual byte.
-pub const INCREMENTAL_RELAY_FEE_SAT_VB: u64 = 1;
+/// Core 31's incremental relay fee in satoshis per 1,000 virtual bytes.
+pub const INCREMENTAL_RELAY_FEE_SAT_KVB: u64 = 100;
 
 const MAX_NON_RBF_SEQUENCE: u32 = 0xffff_fffe;
 
@@ -159,44 +165,24 @@ pub enum TransactionAdmissionError {
     /// Capacity cannot be recovered without evicting the new package or one of its ancestors.
     #[error("transaction package cannot fit without evicting a required ancestor")]
     PackageCapacity,
-    /// A transaction would exceed the bounded ancestor count.
-    #[error("transaction {txid} has {count} ancestors; limit is {limit}")]
-    TooManyAncestors {
-        /// Transaction whose ancestor set is over the limit.
+    /// A dependency-connected mempool cluster exceeds its transaction bound.
+    #[error("transaction {txid} belongs to a cluster of {count} transactions; limit is {limit}")]
+    TooManyClusterTransactions {
+        /// Newly admitted transaction in the cluster.
         txid: Txid,
-        /// Ancestors including the transaction itself.
+        /// Cluster transaction count.
         count: usize,
-        /// Hard ancestor-count limit.
+        /// Cluster count limit.
         limit: usize,
     },
-    /// A transaction would exceed the bounded aggregate ancestor size.
-    #[error("transaction {txid} ancestor virtual size {vbytes} exceeds limit {limit}")]
-    AncestorsTooLarge {
-        /// Transaction whose ancestor set is over the limit.
+    /// A dependency-connected mempool cluster exceeds its virtual-size bound.
+    #[error("transaction {txid} belongs to a {vbytes}-vbyte cluster; limit is {limit}")]
+    ClusterTooLarge {
+        /// Newly admitted transaction in the cluster.
         txid: Txid,
-        /// Aggregate ancestor virtual size.
+        /// Aggregate cluster virtual size.
         vbytes: usize,
-        /// Hard aggregate ancestor virtual-size limit.
-        limit: usize,
-    },
-    /// An ancestor would exceed the bounded descendant count.
-    #[error("transaction {txid} has {count} descendants; limit is {limit}")]
-    TooManyDescendants {
-        /// Transaction whose descendant set is over the limit.
-        txid: Txid,
-        /// Descendants including the transaction itself.
-        count: usize,
-        /// Hard descendant-count limit.
-        limit: usize,
-    },
-    /// An ancestor would exceed the bounded aggregate descendant size.
-    #[error("transaction {txid} descendant virtual size {vbytes} exceeds limit {limit}")]
-    DescendantsTooLarge {
-        /// Transaction whose descendant set is over the limit.
-        txid: Txid,
-        /// Aggregate descendant virtual size.
-        vbytes: usize,
-        /// Hard aggregate descendant virtual-size limit.
+        /// Cluster virtual-size limit.
         limit: usize,
     },
     /// A directly conflicting transaction did not opt in, including through an ancestor.
@@ -268,6 +254,82 @@ pub enum TransactionAdmissionError {
         cost: u64,
         /// Standard policy ceiling.
         limit: u64,
+    },
+    /// A transaction exceeds Core 31's context-free legacy sigop ceiling.
+    #[error("transaction has {count} legacy sigops; standard limit is {limit}")]
+    TooManyLegacySigops {
+        /// Legacy sigops counted without P2SH or witness expansion.
+        count: usize,
+        /// Standard legacy-sigop limit.
+        limit: usize,
+    },
+    /// A version-3 transaction is connected to a non-version-3 transaction.
+    #[error(
+        "TRUC transaction {txid} is connected to transaction {connected} with version {version}"
+    )]
+    TrucVersionMix {
+        /// Version-3 transaction.
+        txid: Txid,
+        /// Connected transaction with an incompatible version.
+        connected: Txid,
+        /// Incompatible transaction version.
+        version: i32,
+    },
+    /// A version-3 transaction exceeds its standalone virtual-size ceiling.
+    #[error("TRUC transaction {txid} virtual size {vbytes} exceeds limit {limit}")]
+    TrucTooLarge {
+        /// Version-3 transaction.
+        txid: Txid,
+        /// Policy virtual size.
+        vbytes: usize,
+        /// TRUC transaction limit.
+        limit: usize,
+    },
+    /// A version-3 child exceeds its smaller virtual-size ceiling.
+    #[error("TRUC child {txid} virtual size {vbytes} exceeds limit {limit}")]
+    TrucChildTooLarge {
+        /// Version-3 child.
+        txid: Txid,
+        /// Policy virtual size.
+        vbytes: usize,
+        /// TRUC child limit.
+        limit: usize,
+    },
+    /// A version-3 transaction exceeds the one-parent/one-child topology.
+    #[error("TRUC transaction {txid} has {count} {direction}; limit is {limit}")]
+    TrucTopology {
+        /// Version-3 transaction.
+        txid: Txid,
+        /// Either `ancestors` or `descendants`.
+        direction: &'static str,
+        /// Connected count including the transaction.
+        count: usize,
+        /// TRUC topology limit.
+        limit: usize,
+    },
+    /// An ephemeral-dust transaction paid a non-zero fee.
+    #[error("ephemeral-dust transaction {txid} pays non-zero fee {fee_sats}")]
+    EphemeralDustFee {
+        /// Transaction containing dust.
+        txid: Txid,
+        /// Exact transaction fee.
+        fee_sats: u64,
+    },
+    /// More than one child spends outputs from an ephemeral-dust parent.
+    #[error("ephemeral-dust transaction {txid} has {count} children; limit is one")]
+    EphemeralDustChildren {
+        /// Parent transaction containing dust.
+        txid: Txid,
+        /// Direct child count.
+        count: usize,
+    },
+    /// The sole child failed to spend every dust output of its parent.
+    #[error("child {child} does not spend ephemeral-dust output {outpoint}")]
+    MissingEphemeralDustSpend {
+        /// Child transaction.
+        child: Txid,
+        /// Dust output that remains unspent.
+        outpoint: OutPoint,
     },
 }
 
@@ -490,7 +552,8 @@ impl TransactionAdmissionPool {
         if self.rolling_minimum_fee_sat_kvb == 0 || !self.rolling_fee_decay_enabled {
             self.rolling_minimum_fee_sat_kvb
         } else {
-            self.rolling_minimum_fee_sat_kvb.max(SATOSHIS_PER_KVB)
+            self.rolling_minimum_fee_sat_kvb
+                .max(DEFAULT_MIN_RELAY_FEE_SAT_KVB)
         }
     }
 
@@ -1126,7 +1189,6 @@ impl TransactionAdmissionPool {
         transactions: Vec<Transaction>,
         context: TransactionAdmissionContext,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
-        let allow_cpfp_carveout = transactions.len() == 1;
         let (already_present, package) = self.collect_new_package(transactions)?;
         if package.is_empty() {
             return Ok(PackageAdmissionOutcome {
@@ -1144,7 +1206,12 @@ impl TransactionAdmissionPool {
 
         let overlay = AdmissionUtxoOverlay::new(store);
         for entry in &self.entries {
-            let _ = apply_to_overlay(&overlay, &entry.transaction, context)?;
+            let _ = apply_to_overlay(
+                &overlay,
+                &entry.transaction,
+                context,
+                DEFAULT_MIN_RELAY_FEE_SAT_KVB,
+            )?;
         }
         let (accepted, replacement_fee_sats, replacement_vbytes) =
             self.append_ordered_package(&overlay, ordered, context, use_package_feerate)?;
@@ -1154,7 +1221,9 @@ impl TransactionAdmissionPool {
                 limit: MAX_PACKAGE_VBYTES,
             });
         }
-        self.validate_topology_limits(&accepted, allow_cpfp_carveout)?;
+        self.validate_cluster_limits(&accepted)?;
+        self.validate_truc_policy(&accepted)?;
+        self.validate_ephemeral_dust(&accepted)?;
         validate_replacement_fees(
             replacement_fee_sats,
             replacement.conflicts_fee_sats,
@@ -1325,7 +1394,7 @@ impl TransactionAdmissionPool {
         });
         let rolling_rate = self
             .effective_rolling_minimum_fee_sat_kvb()
-            .max(SATOSHIS_PER_KVB);
+            .max(DEFAULT_MIN_RELAY_FEE_SAT_KVB);
         for transaction in ordered {
             if let Some(conflict) = transaction
                 .input
@@ -1336,12 +1405,13 @@ impl TransactionAdmissionPool {
                 return Err(TransactionPolicyError::Conflict(conflict).into());
             }
             let txid = transaction.compute_txid();
-            let applied = apply_to_overlay(overlay, &transaction, context)?;
-            let individual_rate = if use_package_feerate {
-                SATOSHIS_PER_KVB
+            let policy_rate = if use_package_feerate {
+                0
             } else {
-                rolling_rate
+                DEFAULT_MIN_RELAY_FEE_SAT_KVB
             };
+            let applied = apply_to_overlay(overlay, &transaction, context, policy_rate)?;
+            let individual_rate = if use_package_feerate { 0 } else { rolling_rate };
             let minimum_sats = fee_for_rate(individual_rate, applied.policy_vsize);
             if applied.fee_sats < minimum_sats {
                 return Err(TransactionAdmissionError::RollingMinimumFee {
@@ -1455,7 +1525,7 @@ impl TransactionAdmissionPool {
                     / u128::try_from(removed_vbytes).unwrap_or(u128::MAX),
             )
             .unwrap_or(u64::MAX)
-            .saturating_add(SATOSHIS_PER_KVB);
+            .saturating_add(INCREMENTAL_RELAY_FEE_SAT_KVB);
             if removed_rate > self.rolling_minimum_fee_sat_kvb {
                 self.rolling_minimum_fee_sat_kvb = removed_rate;
                 self.rolling_fee_decay_enabled = false;
@@ -1494,7 +1564,7 @@ impl TransactionAdmissionPool {
             / 2_f64.powf(elapsed / half_life))
         .round() as u64;
         self.rolling_fee_last_update = now;
-        if self.rolling_minimum_fee_sat_kvb < SATOSHIS_PER_KVB / 2 {
+        if self.rolling_minimum_fee_sat_kvb < DEFAULT_MIN_RELAY_FEE_SAT_KVB / 2 {
             self.rolling_minimum_fee_sat_kvb = 0;
         }
     }
@@ -1563,63 +1633,248 @@ impl TransactionAdmissionPool {
             })
     }
 
-    fn validate_topology_limits(
-        &self,
-        accepted: &[Txid],
-        allow_cpfp_carveout: bool,
-    ) -> Result<(), TransactionAdmissionError> {
-        let mut affected_ancestors = BTreeSet::new();
-        let mut cpfp_carveout_parent = None;
+    fn cluster_closure(&self, txid: Txid) -> BTreeSet<Txid> {
+        let pool_txids = self
+            .entries
+            .iter()
+            .map(|entry| entry.transaction.compute_txid())
+            .collect::<BTreeSet<_>>();
+        let mut cluster = BTreeSet::new();
+        let mut pending = vec![txid];
+        while let Some(candidate) = pending.pop() {
+            if !cluster.insert(candidate) {
+                continue;
+            }
+            if let Some(transaction) = self
+                .entries
+                .iter()
+                .find(|entry| entry.transaction.compute_txid() == candidate)
+                .map(|entry| &entry.transaction)
+            {
+                pending.extend(
+                    transaction
+                        .input
+                        .iter()
+                        .map(|input| input.previous_output.txid)
+                        .filter(|parent| pool_txids.contains(parent)),
+                );
+            }
+            pending.extend(
+                self.entries
+                    .iter()
+                    .filter(|entry| {
+                        entry
+                            .transaction
+                            .input
+                            .iter()
+                            .any(|input| input.previous_output.txid == candidate)
+                    })
+                    .map(|entry| entry.transaction.compute_txid()),
+            );
+        }
+        cluster
+    }
+
+    fn validate_cluster_limits(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
+        let mut validated = BTreeSet::new();
         for txid in accepted {
-            let ancestors = self.ancestor_closure(*txid);
-            if ancestors.len() > MAX_ANCESTOR_TRANSACTIONS {
-                return Err(TransactionAdmissionError::TooManyAncestors {
+            if validated.contains(txid) {
+                continue;
+            }
+            let cluster = self.cluster_closure(*txid);
+            if cluster.len() > MAX_MEMPOOL_CLUSTER_TRANSACTIONS {
+                return Err(TransactionAdmissionError::TooManyClusterTransactions {
                     txid: *txid,
-                    count: ancestors.len(),
-                    limit: MAX_ANCESTOR_TRANSACTIONS,
+                    count: cluster.len(),
+                    limit: MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
                 });
             }
-            let vbytes = self.closure_vbytes(&ancestors);
-            if vbytes > MAX_ANCESTOR_VBYTES {
-                return Err(TransactionAdmissionError::AncestorsTooLarge {
+            let vbytes = self.closure_vbytes(&cluster);
+            if vbytes > MAX_MEMPOOL_CLUSTER_VBYTES {
+                return Err(TransactionAdmissionError::ClusterTooLarge {
                     txid: *txid,
                     vbytes,
-                    limit: MAX_ANCESTOR_VBYTES,
+                    limit: MAX_MEMPOOL_CLUSTER_VBYTES,
                 });
             }
-            if allow_cpfp_carveout && accepted.len() == 1 && ancestors.len() == 2 {
-                let policy_vsize = self
-                    .entries
-                    .iter()
-                    .find(|entry| entry.transaction.compute_txid() == *txid)
-                    .map_or(usize::MAX, |entry| entry.policy_vsize);
-                if policy_vsize <= EXTRA_DESCENDANT_TRANSACTION_VBYTES {
-                    cpfp_carveout_parent =
-                        ancestors.iter().copied().find(|ancestor| ancestor != txid);
+            validated.extend(cluster);
+        }
+        Ok(())
+    }
+
+    fn validate_truc_policy(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
+        let versions = self
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.transaction.compute_txid(),
+                    (entry.transaction.version.0, entry.policy_vsize),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for txid in accepted {
+            let Some(&(version, policy_vsize)) = versions.get(txid) else {
+                continue;
+            };
+            let parents = self
+                .entries
+                .iter()
+                .find(|entry| entry.transaction.compute_txid() == *txid)
+                .into_iter()
+                .flat_map(|entry| &entry.transaction.input)
+                .map(|input| input.previous_output.txid)
+                .filter(|parent| versions.contains_key(parent))
+                .collect::<BTreeSet<_>>();
+            if version != TRUC_VERSION {
+                if let Some(parent) = parents.iter().find(|parent| {
+                    versions
+                        .get(*parent)
+                        .is_some_and(|(v, _)| *v == TRUC_VERSION)
+                }) {
+                    return Err(TransactionAdmissionError::TrucVersionMix {
+                        txid: *parent,
+                        connected: *txid,
+                        version,
+                    });
+                }
+                continue;
+            }
+            if policy_vsize > MAX_TRUC_VBYTES {
+                return Err(TransactionAdmissionError::TrucTooLarge {
+                    txid: *txid,
+                    vbytes: policy_vsize,
+                    limit: MAX_TRUC_VBYTES,
+                });
+            }
+            if let Some(parent) = parents.iter().find(|parent| {
+                versions
+                    .get(*parent)
+                    .is_some_and(|(v, _)| *v != TRUC_VERSION)
+            }) {
+                return Err(TransactionAdmissionError::TrucVersionMix {
+                    txid: *txid,
+                    connected: *parent,
+                    version: versions[parent].0,
+                });
+            }
+            let ancestors = self.ancestor_closure(*txid);
+            if ancestors.len() > MAX_TRUC_CONNECTED_TRANSACTIONS {
+                return Err(TransactionAdmissionError::TrucTopology {
+                    txid: *txid,
+                    direction: "ancestors",
+                    count: ancestors.len(),
+                    limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
+                });
+            }
+            let descendants = self.descendant_closure(*txid);
+            if descendants.len() > MAX_TRUC_CONNECTED_TRANSACTIONS {
+                return Err(TransactionAdmissionError::TrucTopology {
+                    txid: *txid,
+                    direction: "descendants",
+                    count: descendants.len(),
+                    limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
+                });
+            }
+            if !parents.is_empty() && policy_vsize > MAX_TRUC_CHILD_VBYTES {
+                return Err(TransactionAdmissionError::TrucChildTooLarge {
+                    txid: *txid,
+                    vbytes: policy_vsize,
+                    limit: MAX_TRUC_CHILD_VBYTES,
+                });
+            }
+            for connected in ancestors.iter().chain(descendants.iter()) {
+                if let Some(&(connected_version, _)) = versions.get(connected) {
+                    if connected_version != TRUC_VERSION {
+                        return Err(TransactionAdmissionError::TrucVersionMix {
+                            txid: *txid,
+                            connected: *connected,
+                            version: connected_version,
+                        });
+                    }
                 }
             }
-            affected_ancestors.extend(ancestors);
         }
-        for txid in affected_ancestors {
-            let descendants = self.descendant_closure(txid);
-            let uses_carveout = cpfp_carveout_parent == Some(txid);
-            let count_limit = MAX_DESCENDANT_TRANSACTIONS + usize::from(uses_carveout);
-            if descendants.len() > count_limit {
-                return Err(TransactionAdmissionError::TooManyDescendants {
+        Ok(())
+    }
+
+    fn validate_ephemeral_dust(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
+        let mut relevant = accepted.iter().copied().collect::<BTreeSet<_>>();
+        let pool_txids = self
+            .entries
+            .iter()
+            .map(|entry| entry.transaction.compute_txid())
+            .collect::<BTreeSet<_>>();
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| accepted.contains(&entry.transaction.compute_txid()))
+        {
+            relevant.extend(
+                entry
+                    .transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.txid)
+                    .filter(|parent| pool_txids.contains(parent)),
+            );
+        }
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| relevant.contains(&entry.transaction.compute_txid()))
+        {
+            let txid = entry.transaction.compute_txid();
+            let dust = entry
+                .transaction
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| {
+                    !output.script_pubkey.is_op_return()
+                        && output.value.to_sat() < output.script_pubkey.minimal_non_dust().to_sat()
+                })
+                .map(|(vout, _)| OutPoint::new(txid, u32::try_from(vout).unwrap_or(u32::MAX)))
+                .collect::<BTreeSet<_>>();
+            if dust.is_empty() {
+                continue;
+            }
+            if entry.fee_sats != 0 {
+                return Err(TransactionAdmissionError::EphemeralDustFee {
                     txid,
-                    count: descendants.len(),
-                    limit: count_limit,
+                    fee_sats: entry.fee_sats,
                 });
             }
-            let vbytes = self.closure_vbytes(&descendants);
-            let vbytes_limit = MAX_DESCENDANT_VBYTES
-                + usize::from(uses_carveout) * EXTRA_DESCENDANT_TRANSACTION_VBYTES;
-            if vbytes > vbytes_limit {
-                return Err(TransactionAdmissionError::DescendantsTooLarge {
+            let children = self
+                .entries
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .transaction
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output.txid == txid)
+                })
+                .collect::<Vec<_>>();
+            if children.len() > 1 {
+                return Err(TransactionAdmissionError::EphemeralDustChildren {
                     txid,
-                    vbytes,
-                    limit: vbytes_limit,
+                    count: children.len(),
                 });
+            }
+            if let Some(child) = children.first() {
+                let spent = child
+                    .transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output)
+                    .collect::<BTreeSet<_>>();
+                if let Some(outpoint) = dust.iter().find(|outpoint| !spent.contains(outpoint)) {
+                    return Err(TransactionAdmissionError::MissingEphemeralDustSpend {
+                        child: child.transaction.compute_txid(),
+                        outpoint: *outpoint,
+                    });
+                }
             }
         }
         Ok(())
@@ -1705,9 +1960,7 @@ fn validate_replacement_fees(
         });
     }
     let additional_fee_sats = replacement_fee_sats - conflicts_fee_sats;
-    let required_fee_sats = u64::try_from(replacement_vbytes)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(INCREMENTAL_RELAY_FEE_SAT_VB);
+    let required_fee_sats = fee_for_rate(INCREMENTAL_RELAY_FEE_SAT_KVB, replacement_vbytes);
     if additional_fee_sats < required_fee_sats {
         return Err(TransactionAdmissionError::InsufficientReplacementRelayFee {
             additional_fee_sats,
@@ -1803,7 +2056,7 @@ fn is_child_with_parents(transactions: &[Transaction]) -> bool {
 }
 
 fn is_child_with_parents_tree(transactions: &[Transaction]) -> bool {
-    if !is_child_with_parents(transactions) {
+    if transactions.len() != 2 || !is_child_with_parents(transactions) {
         return false;
     }
     let (_, parents) = transactions
@@ -1830,7 +2083,15 @@ fn apply_to_overlay<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
     context: TransactionAdmissionContext,
+    minimum_relay_fee_sat_kvb: u64,
 ) -> Result<AppliedAdmission, TransactionAdmissionError> {
+    let legacy_sigops = transaction_legacy_sigops(transaction);
+    if legacy_sigops > MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS {
+        return Err(TransactionAdmissionError::TooManyLegacySigops {
+            count: legacy_sigops,
+            limit: MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS,
+        });
+    }
     let prevouts = transaction
         .input
         .iter()
@@ -1872,7 +2133,7 @@ fn apply_to_overlay<S: UtxoStore>(
         .input_value_sats
         .checked_sub(applied.output_value_sats)
         .expect("consensus validation rejects transaction inflation");
-    validate_standard_transaction(transaction, fee_sats)?;
+    validate_standard_transaction_at_rate(transaction, fee_sats, minimum_relay_fee_sat_kvb)?;
     validate_standard_inputs(transaction, &prevout_scripts)?;
     if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
         != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
@@ -2626,7 +2887,7 @@ mod tests {
             .into_script();
         utxo.script_pubkey = ScriptBuf::new_p2wsh(&witness_script.wscript_hash()).into_bytes();
         transaction.input[0].witness = Witness::from_slice(&[witness_script.as_bytes()]);
-        transaction.output[0].value = Amount::from_sat(99_800);
+        transaction.output[0].value = Amount::from_sat(99_980);
         store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
         let mut pool = TransactionAdmissionPool::default();
 
@@ -2634,11 +2895,30 @@ mod tests {
         assert!(matches!(
             pool.admit(&store, transaction, context()),
             Err(TransactionAdmissionError::RollingMinimumFee {
-                fee_sats: 200,
-                minimum_sats: 500,
+                fee_sats: 20,
+                minimum_sats: 50,
             })
         ));
         assert!(store.get(OutPointKey::from(outpoint)).unwrap().is_some());
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn legacy_sigop_limit_is_enforced_before_script_classification() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut transaction) = spend(89);
+        transaction.output[0].script_pubkey =
+            ScriptBuf::from_bytes(vec![opcodes::all::OP_CHECKSIG.to_u8(); 2_501]);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+
+        assert!(matches!(
+            pool.admit(&store, transaction, context()),
+            Err(TransactionAdmissionError::TooManyLegacySigops {
+                count: 2_501,
+                limit: MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS,
+            })
+        ));
         assert!(pool.is_empty());
     }
 
@@ -2757,192 +3037,78 @@ mod tests {
     }
 
     #[test]
-    fn ancestor_and_descendant_count_limits_reject_atomically_at_twenty_six() {
+    fn cluster_count_limit_rejects_atomically_at_sixty_five() {
         let (_directory, store) = store();
-        let (chain_outpoint, chain_utxo, chain_parent) = spend(69);
+        let (chain_outpoint, mut chain_utxo, mut previous) = spend(69);
+        chain_utxo.value_sats = 1_000_000;
+        previous.output[0].value = Amount::from_sat(990_000);
         store
             .apply(&[], &[(chain_outpoint.into(), chain_utxo)])
             .unwrap();
-        let mut chain = vec![chain_parent.clone()];
-        let mut previous = chain_parent;
-        for index in 1..MAX_ANCESTOR_TRANSACTIONS {
-            let next = child(&previous, 90_000 - u64::try_from(index).unwrap() * 1_000);
-            chain.push(next.clone());
+        let mut chain_pool = TransactionAdmissionPool::default();
+        chain_pool
+            .admit(&store, previous.clone(), context())
+            .unwrap();
+        for index in 1..MAX_MEMPOOL_CLUSTER_TRANSACTIONS {
+            let next = child(&previous, 990_000 - u64::try_from(index).unwrap() * 1_000);
+            chain_pool.admit(&store, next.clone(), context()).unwrap();
             previous = next;
         }
-        let mut chain_pool = TransactionAdmissionPool::default();
-        chain_pool.admit_package(&store, chain, context()).unwrap();
         let before = chain_pool.snapshot();
-        let twenty_sixth = child(&previous, 65_000);
-        let twenty_sixth_txid = twenty_sixth.compute_txid();
+        let sixty_fifth = child(&previous, 925_000);
+        let sixty_fifth_txid = sixty_fifth.compute_txid();
         assert!(matches!(
-            chain_pool.admit(&store, twenty_sixth, context()),
-            Err(TransactionAdmissionError::TooManyAncestors {
+            chain_pool.admit(&store, sixty_fifth, context()),
+            Err(TransactionAdmissionError::TooManyClusterTransactions {
                 txid,
-                count: 26,
-                limit: MAX_ANCESTOR_TRANSACTIONS,
-            }) if txid == twenty_sixth_txid
+                count: 65,
+                limit: MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
+            }) if txid == sixty_fifth_txid
         ));
         assert_eq!(chain_pool.snapshot(), before);
+    }
 
-        let (fanout_outpoint, fanout_utxo, mut fanout_parent) = spend(70);
-        store
-            .apply(&[], &[(fanout_outpoint.into(), fanout_utxo)])
-            .unwrap();
-        let output = fanout_parent.output[0].clone();
-        fanout_parent.output = (0..=MAX_DESCENDANT_TRANSACTIONS)
-            .map(|_| TxOut {
-                value: Amount::from_sat(3_000),
-                script_pubkey: output.script_pubkey.clone(),
-            })
-            .collect();
-        let parent_txid = fanout_parent.compute_txid();
-        let mut fanout = vec![fanout_parent.clone()];
-        for vout in 0..u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap() {
-            fanout.push(child_at(&fanout_parent, vout, 2_000));
+    #[test]
+    fn cluster_virtual_size_limit_rejects_atomically() {
+        fn pad(transaction: &mut Transaction) {
+            let mut script = vec![opcodes::all::OP_RETURN.to_u8()];
+            script.extend(vec![opcodes::OP_0.to_u8(); 19_000]);
+            transaction.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(script),
+            });
         }
-        let mut fanout_pool = TransactionAdmissionPool::default();
-        fanout_pool
-            .admit_package(&store, fanout, context())
-            .unwrap();
-        let before = fanout_pool.snapshot();
-        let last = child_at(
-            &fanout_parent,
-            u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap(),
-            2_000,
-        );
-        let mut multi_package_pool = fanout_pool.clone();
-        assert!(matches!(
-            multi_package_pool.admit_package(
-                &store,
-                vec![last.clone(), fanout_parent.clone()],
-                context(),
-            ),
-            Err(TransactionAdmissionError::TooManyDescendants {
-                txid,
-                count: 26,
-                limit: MAX_DESCENDANT_TRANSACTIONS,
-            }) if txid == parent_txid
-        ));
-        assert_eq!(multi_package_pool.snapshot(), before);
 
-        fanout_pool.admit(&store, last, context()).unwrap();
-        assert_eq!(fanout_pool.len(), MAX_DESCENDANT_TRANSACTIONS + 1);
-        let before = fanout_pool.snapshot();
-        let twenty_seventh = child_at(
-            &fanout_parent,
-            u32::try_from(MAX_DESCENDANT_TRANSACTIONS).unwrap(),
-            2_000,
-        );
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut transaction) = spend(210);
+        utxo.value_sats = 1_000_000;
+        transaction.output[0].value = Amount::from_sat(990_000);
+        pad(&mut transaction);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::with_capacity(100, 16 * 1024 * 1024);
+        pool.admit(&store, transaction.clone(), context()).unwrap();
+        for index in 1..5 {
+            let mut next = child(
+                &transaction,
+                990_000 - u64::try_from(index).unwrap() * 10_000,
+            );
+            pad(&mut next);
+            pool.admit(&store, next.clone(), context()).unwrap();
+            transaction = next;
+        }
+        let cluster = pool.cluster_closure(transaction.compute_txid());
+        assert!(pool.closure_vbytes(&cluster) <= MAX_MEMPOOL_CLUSTER_VBYTES);
+        let before = pool.snapshot();
+        let mut candidate = child(&transaction, 930_000);
+        pad(&mut candidate);
         assert!(matches!(
-            fanout_pool.admit(&store, twenty_seventh, context()),
-            Err(TransactionAdmissionError::TooManyDescendants {
-                txid,
-                count: 27,
-                limit: 26,
-            }) if txid == parent_txid
-        ));
-        assert_eq!(fanout_pool.snapshot(), before);
-    }
-
-    #[test]
-    fn ancestor_and_descendant_virtual_size_limits_are_distinct() {
-        let (_directory, _store) = store();
-        let (_, _, mut large_parent) = spend(67);
-        large_parent.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 60_000]);
-        let mut large_child = child(&large_parent, 80_000);
-        large_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 60_000]);
-        assert!(large_parent.vsize() < MAX_ANCESTOR_VBYTES);
-        assert!(large_child.vsize() < MAX_ANCESTOR_VBYTES);
-        let child_txid = large_child.compute_txid();
-        let ancestor_pool = unchecked_pool(vec![large_parent.clone(), large_child.clone()]);
-        assert!(matches!(
-            ancestor_pool.validate_topology_limits(&[child_txid], false),
-            Err(TransactionAdmissionError::AncestorsTooLarge {
-                txid,
-                vbytes,
-                limit: MAX_ANCESTOR_VBYTES,
-            }) if txid == child_txid && vbytes > MAX_ANCESTOR_VBYTES
-        ));
-
-        let (_, _, parent) = spend(68);
-        let mut first = child_at(&parent, 0, 80_000);
-        first.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 60_000]);
-        let mut second = child_at(&parent, 1, 79_000);
-        second.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 60_000]);
-        let parent_txid = parent.compute_txid();
-        let second_txid = second.compute_txid();
-        let descendant_pool = unchecked_pool(vec![parent, first, second]);
-        assert!(matches!(
-            descendant_pool.validate_topology_limits(&[second_txid], false),
-            Err(TransactionAdmissionError::DescendantsTooLarge {
-                txid,
-                vbytes,
-                limit: MAX_DESCENDANT_VBYTES,
-            }) if txid == parent_txid && vbytes > MAX_DESCENDANT_VBYTES
-        ));
-    }
-
-    #[test]
-    fn cpfp_carveout_extends_descendant_size_by_ten_thousand_vbytes() {
-        let (_, _, mut parent) = spend(96);
-        let output = parent.output[0].clone();
-        parent.output = vec![output.clone(), output];
-        let mut existing_child = child_at(&parent, 0, 80_000);
-        existing_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 100_600]);
-        let mut carveout_child = child_at(&parent, 1, 70_000);
-        carveout_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0; 5_000]);
-        let parent_txid = parent.compute_txid();
-        let child_txid = carveout_child.compute_txid();
-        let pool = unchecked_pool(vec![parent, existing_child, carveout_child]);
-        let descendants = pool.descendant_closure(parent_txid);
-        let descendant_vbytes = pool.closure_vbytes(&descendants);
-        assert!(descendant_vbytes > MAX_DESCENDANT_VBYTES);
-        assert!(descendant_vbytes <= MAX_DESCENDANT_VBYTES + EXTRA_DESCENDANT_TRANSACTION_VBYTES);
-
-        assert!(matches!(
-            pool.validate_topology_limits(&[child_txid], false),
-            Err(TransactionAdmissionError::DescendantsTooLarge {
-                txid,
-                limit: MAX_DESCENDANT_VBYTES,
+            pool.admit(&store, candidate, context()),
+            Err(TransactionAdmissionError::ClusterTooLarge {
+                limit: MAX_MEMPOOL_CLUSTER_VBYTES,
                 ..
-            }) if txid == parent_txid
+            })
         ));
-        assert!(pool.validate_topology_limits(&[child_txid], true).is_ok());
-    }
-
-    #[test]
-    fn cpfp_carveout_rejects_a_child_above_ten_thousand_vbytes() {
-        let (_, _, mut parent) = spend(97);
-        let output = parent.output[0].clone();
-        parent.output = (0..MAX_DESCENDANT_TRANSACTIONS)
-            .map(|_| output.clone())
-            .collect();
-        let mut entries = vec![parent.clone()];
-        for vout in 0..u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap() {
-            entries.push(child_at(&parent, vout, 80_000));
-        }
-        let mut oversized = child_at(
-            &parent,
-            u32::try_from(MAX_DESCENDANT_TRANSACTIONS - 1).unwrap(),
-            79_000,
-        );
-        oversized.output[0].script_pubkey =
-            ScriptBuf::from_bytes(vec![0; EXTRA_DESCENDANT_TRANSACTION_VBYTES + 1_000]);
-        let parent_txid = parent.compute_txid();
-        let oversized_txid = oversized.compute_txid();
-        assert!(oversized.vsize() > EXTRA_DESCENDANT_TRANSACTION_VBYTES);
-        entries.push(oversized);
-        let pool = unchecked_pool(entries);
-
-        assert!(matches!(
-            pool.validate_topology_limits(&[oversized_txid], true),
-            Err(TransactionAdmissionError::TooManyDescendants {
-                txid,
-                count: 26,
-                limit: MAX_DESCENDANT_TRANSACTIONS,
-            }) if txid == parent_txid
-        ));
+        assert_eq!(pool.snapshot(), before);
     }
 
     #[test]
@@ -3225,10 +3391,8 @@ mod tests {
             entries.push(descendant.clone());
             previous = descendant;
         }
-        let last_txid = previous.compute_txid();
         let mut pool = unchecked_pool(entries);
         assert_eq!(pool.len(), 25);
-        assert!(pool.validate_topology_limits(&[last_txid], false).is_ok());
         let unique_evictions = roots
             .iter()
             .flat_map(|root| pool.descendant_closure(root.compute_txid()))
@@ -3366,12 +3530,11 @@ mod tests {
     }
 
     #[test]
-    fn package_feerate_never_bypasses_individual_minimum_relay() {
+    fn one_parent_one_child_package_may_bump_a_below_minimum_parent() {
         let (_directory, store) = store();
         let (outpoint, utxo, mut parent) = spend(99);
         store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
-        let parent_minimum = u64::try_from(parent.vsize()).unwrap();
-        parent.output[0].value = Amount::from_sat(100_000 - (parent_minimum - 1));
+        parent.output[0].value = Amount::from_sat(100_000);
         let child = child(
             &parent,
             parent.output[0].value.to_sat().saturating_sub(10_000),
@@ -3381,17 +3544,134 @@ mod tests {
             ..TransactionAdmissionPool::default()
         };
 
+        let outcome = pool
+            .admit_package(&store, vec![child, parent], context())
+            .unwrap();
+        assert_eq!(outcome.accepted.len(), 2);
+        assert_eq!(pool.len(), 2);
+        assert!(store.get(outpoint.into()).unwrap().is_some());
+    }
+
+    #[test]
+    fn ephemeral_dust_requires_zero_fee_one_output_and_a_complete_sweep() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(211);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let script_pubkey = parent.output[0].script_pubkey.clone();
+        parent.output[0].value = Amount::from_sat(99_999);
+        parent.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: script_pubkey.clone(),
+        });
+
+        let incomplete_child = child(&parent, 90_000);
+        let mut pool = TransactionAdmissionPool::default();
         assert!(matches!(
-            pool.admit_package(&store, vec![child, parent], context()),
-            Err(TransactionAdmissionError::Policy(
-                TransactionPolicyError::FeeRate {
-                    fee_sats,
-                    minimum_sats,
-                }
-            )) if fee_sats + 1 == minimum_sats && minimum_sats == parent_minimum
+            pool.admit_package(&store, vec![incomplete_child, parent.clone()], context()),
+            Err(TransactionAdmissionError::MissingEphemeralDustSpend { .. })
         ));
         assert!(pool.is_empty());
-        assert!(store.get(outpoint.into()).unwrap().is_some());
+
+        let mut complete_child = child(&parent, 90_000);
+        let mut dust_input = complete_child.input[0].clone();
+        dust_input.previous_output.vout = 1;
+        complete_child.input.push(dust_input);
+        pool.admit_package(
+            &store,
+            vec![complete_child.clone(), parent.clone()],
+            context(),
+        )
+        .unwrap();
+        assert_eq!(pool.len(), 2);
+
+        let mut fee_parent = parent.clone();
+        fee_parent.output[0].value = Amount::from_sat(99_998);
+        let fee_child = child(&fee_parent, 90_000);
+        let mut rejected = TransactionAdmissionPool::default();
+        assert!(matches!(
+            rejected.admit_package(&store, vec![fee_child, fee_parent], context()),
+            Err(TransactionAdmissionError::Policy(
+                TransactionPolicyError::Dust { .. }
+            ))
+        ));
+
+        let mut multiple_dust_parent = parent;
+        multiple_dust_parent.output[0].value = Amount::from_sat(99_998);
+        multiple_dust_parent.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey,
+        });
+        let multiple_dust_child = child(&multiple_dust_parent, 90_000);
+        assert!(matches!(
+            rejected.admit_package(
+                &store,
+                vec![multiple_dust_child, multiple_dust_parent],
+                context()
+            ),
+            Err(TransactionAdmissionError::Policy(
+                TransactionPolicyError::Dust { .. }
+            ))
+        ));
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn truc_enforces_version_pairing_child_size_and_one_child_topology() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(209);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut version_three_child = child(&parent, 80_000);
+        version_three_child.version = Version(TRUC_VERSION);
+        let mut pool = TransactionAdmissionPool::default();
+        assert!(matches!(
+            pool.admit_package(&store, vec![version_three_child, parent.clone()], context()),
+            Err(TransactionAdmissionError::TrucVersionMix { version: 2, .. })
+        ));
+        assert!(pool.is_empty());
+
+        parent.version = Version(TRUC_VERSION);
+        let mut oversized_child = child(&parent, 80_000);
+        oversized_child.version = Version(TRUC_VERSION);
+        let mut data_script = vec![opcodes::all::OP_RETURN.to_u8()];
+        data_script.extend(vec![opcodes::OP_0.to_u8(); 5_000]);
+        oversized_child.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(data_script),
+        });
+        assert!(oversized_child.vsize() > MAX_TRUC_CHILD_VBYTES);
+        assert!(matches!(
+            pool.admit_package(&store, vec![oversized_child, parent.clone()], context()),
+            Err(TransactionAdmissionError::TrucChildTooLarge {
+                limit: MAX_TRUC_CHILD_VBYTES,
+                ..
+            })
+        ));
+        assert!(pool.is_empty());
+
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+        ];
+        let mut first = child_at(&parent, 0, 40_000);
+        first.version = Version(TRUC_VERSION);
+        let mut second = child_at(&parent, 1, 40_000);
+        second.version = Version(TRUC_VERSION);
+        assert!(matches!(
+            pool.admit_package(&store, vec![first, second, parent], context()),
+            Err(TransactionAdmissionError::TrucTopology {
+                direction: "descendants",
+                count: 3,
+                limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
+                ..
+            })
+        ));
+        assert!(pool.is_empty());
     }
 
     #[test]
@@ -4180,7 +4460,7 @@ mod tests {
             4_000
         );
         pool.rolling_minimum_fee_sat_kvb = 600;
-        assert_eq!(pool.rolling_minimum_fee_sat_kvb(11_001), SATOSHIS_PER_KVB);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(11_001), 600);
     }
 
     #[test]
@@ -4249,53 +4529,6 @@ mod tests {
                 child_transaction.compute_txid(),
                 grandchild.compute_txid()
             ])
-        );
-    }
-
-    #[test]
-    fn topology_rejection_precedes_capacity_eviction_without_mutation() {
-        let (_directory, store) = store();
-        let (outpoint, mut utxo, mut transaction) = spend(71);
-        utxo.value_sats = 10_000_000;
-        transaction.output[0].value = Amount::from_sat(9_999_000);
-        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
-        let mut pool = TransactionAdmissionPool::default();
-        pool.admit(&store, transaction.clone(), context()).unwrap();
-
-        let mut value = 9_998_000;
-        for _ in 1..MAX_ANCESTOR_TRANSACTIONS {
-            transaction = child(&transaction, value);
-            pool.admit(&store, transaction.clone(), context()).unwrap();
-            value -= 1_000;
-        }
-        for index in
-            100..100 + u8::try_from(MAX_ADMITTED_TRANSACTIONS - MAX_ANCESTOR_TRANSACTIONS).unwrap()
-        {
-            let (outpoint, utxo, unrelated) = spend(index);
-            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
-            pool.admit(&store, unrelated, context()).unwrap();
-        }
-        assert_eq!(pool.len(), MAX_ADMITTED_TRANSACTIONS);
-        let before = pool
-            .snapshot()
-            .iter()
-            .map(Transaction::compute_wtxid)
-            .collect::<Vec<_>>();
-        let candidate = child(&transaction, value);
-        assert!(matches!(
-            pool.admit(&store, candidate, context()),
-            Err(TransactionAdmissionError::TooManyAncestors {
-                count: 26,
-                limit: MAX_ANCESTOR_TRANSACTIONS,
-                ..
-            })
-        ));
-        assert_eq!(
-            pool.snapshot()
-                .iter()
-                .map(Transaction::compute_wtxid)
-                .collect::<Vec<_>>(),
-            before
         );
     }
 

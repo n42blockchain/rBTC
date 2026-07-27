@@ -385,7 +385,7 @@ impl NodeConfig {
             preferred_peers: Vec::new(),
             dns_seeds: NodeDnsSeedPolicy::Pinned,
             once: false,
-            mempool_full_rbf: false,
+            mempool_full_rbf: true,
             cache: NodeCacheConfig::default(),
             indexes: NodeIndexConfig::default(),
             inbound: None,
@@ -1290,9 +1290,6 @@ fn validate_api_options(options: &Options) -> Result<(), String> {
         }
     } else if options.wallet_api_files.is_some() || options.rpc_auth_token_file.is_some() {
         return Err("wallet and RPC configuration require an API listener".to_owned());
-    }
-    if options.mempool_full_rbf && options.data_dir.is_none() {
-        return Err("full-RBF policy requires a data directory".to_owned());
     }
     Ok(())
 }
@@ -3685,6 +3682,10 @@ async fn node_metrics(
         .inbound
         .as_ref()
         .map_or(0, |value| value.accepted_total);
+    let inbound_handshakes = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.handshakes_total);
     let inbound_rejected_capacity = status
         .inbound
         .as_ref()
@@ -3734,7 +3735,7 @@ async fn node_metrics(
         .as_ref()
         .map_or(0, |value| value.historical_upload_target_bytes);
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"txindex\"}} {transaction_index_height}\nrbtc_tip_height{{kind=\"spent_output\"}} {spent_output_index_height}\nrbtc_tip_height{{kind=\"basic_filter\"}} {basic_filter_index_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\nrbtc_disk_bytes{{kind=\"optional_indexes\"}} {optional_index_bytes}\nrbtc_disk_bytes{{kind=\"optional_index_checkpoint_headroom\"}} {optional_index_headroom}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_inbound_connections Currently admitted inbound peer sessions.\n# TYPE rbtc_inbound_connections gauge\nrbtc_inbound_connections {inbound_active}\n# HELP rbtc_inbound_sessions_total Inbound session admission and completion counters.\n# TYPE rbtc_inbound_sessions_total counter\nrbtc_inbound_sessions_total{{result=\"accepted\"}} {inbound_accepted}\nrbtc_inbound_sessions_total{{result=\"rejected_capacity\"}} {inbound_rejected_capacity}\nrbtc_inbound_sessions_total{{result=\"rejected_source\"}} {inbound_rejected_source}\nrbtc_inbound_sessions_total{{result=\"completed\"}} {inbound_completed}\nrbtc_inbound_sessions_total{{result=\"evicted\"}} {inbound_evicted}\n# HELP rbtc_inbound_disconnects_total Classified inbound disconnect counters.\n# TYPE rbtc_inbound_disconnects_total counter\nrbtc_inbound_disconnects_total{{reason=\"request_budget\"}} {inbound_request_budget_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"request_bound\"}} {inbound_request_bound_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"upload_target\"}} {inbound_upload_target_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"protocol\"}} {inbound_protocol_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"io\"}} {inbound_io_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"local_data\"}} {inbound_data_disconnects}\n# HELP rbtc_inbound_historical_upload_bytes Historical block upload in the current rolling window and its target.\n# TYPE rbtc_inbound_historical_upload_bytes gauge\nrbtc_inbound_historical_upload_bytes{{kind=\"used_24h\"}} {inbound_historical_upload}\nrbtc_inbound_historical_upload_bytes{{kind=\"target\"}} {inbound_historical_target}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"txindex\"}} {transaction_index_height}\nrbtc_tip_height{{kind=\"spent_output\"}} {spent_output_index_height}\nrbtc_tip_height{{kind=\"basic_filter\"}} {basic_filter_index_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\nrbtc_disk_bytes{{kind=\"optional_indexes\"}} {optional_index_bytes}\nrbtc_disk_bytes{{kind=\"optional_index_checkpoint_headroom\"}} {optional_index_headroom}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_inbound_connections Currently admitted inbound peer sessions.\n# TYPE rbtc_inbound_connections gauge\nrbtc_inbound_connections {inbound_active}\n# HELP rbtc_inbound_sessions_total Inbound session admission and completion counters.\n# TYPE rbtc_inbound_sessions_total counter\nrbtc_inbound_sessions_total{{result=\"accepted\"}} {inbound_accepted}\nrbtc_inbound_sessions_total{{result=\"handshaken\"}} {inbound_handshakes}\nrbtc_inbound_sessions_total{{result=\"rejected_capacity\"}} {inbound_rejected_capacity}\nrbtc_inbound_sessions_total{{result=\"rejected_source\"}} {inbound_rejected_source}\nrbtc_inbound_sessions_total{{result=\"completed\"}} {inbound_completed}\nrbtc_inbound_sessions_total{{result=\"evicted\"}} {inbound_evicted}\n# HELP rbtc_inbound_disconnects_total Classified inbound disconnect counters.\n# TYPE rbtc_inbound_disconnects_total counter\nrbtc_inbound_disconnects_total{{reason=\"request_budget\"}} {inbound_request_budget_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"request_bound\"}} {inbound_request_bound_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"upload_target\"}} {inbound_upload_target_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"protocol\"}} {inbound_protocol_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"io\"}} {inbound_io_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"local_data\"}} {inbound_data_disconnects}\n# HELP rbtc_inbound_historical_upload_bytes Historical block upload in the current rolling window and its target.\n# TYPE rbtc_inbound_historical_upload_bytes gauge\nrbtc_inbound_historical_upload_bytes{{kind=\"used_24h\"}} {inbound_historical_upload}\nrbtc_inbound_historical_upload_bytes{{kind=\"target\"}} {inbound_historical_target}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -12743,7 +12744,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut validation_block_hash = None;
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
-    let mut mempool_full_rbf = false;
+    let mut mempool_full_rbf = true;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -13850,7 +13851,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -13892,7 +13892,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -13934,7 +13933,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || experimental_network_execution
             || extend_validation_target
@@ -13966,7 +13964,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || headers_db.is_some()
             || once
             || explorer_listen.is_some()
-            || mempool_full_rbf
             || cleanup_validation_dir
             || experimental_network_execution
             || extend_validation_target
@@ -14014,7 +14011,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -14057,7 +14053,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -14088,7 +14083,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -14119,7 +14113,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || !remotes.is_empty()
             || !dns_seed_values.is_empty()
             || no_dns_seeds
-            || mempool_full_rbf
             || cleanup_validation_dir
             || validation_batch_size.is_some()
             || validation_pause_ms.is_some()
@@ -14155,9 +14148,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "storage targets apply to validating-node execution and conflict with offline, snapshot, fetch, and headers-only modes"
                 .to_owned(),
         );
-    }
-    if mempool_full_rbf && data_dir.is_none() {
-        return Err("--mempool-full-rbf requires --data-dir".to_owned());
     }
     let indexes_enabled = transaction_index || spent_output_index || basic_filter_index;
     if indexes_enabled && data_dir.is_none() {
@@ -17952,7 +17942,7 @@ mod tests {
         assert!(options.fetch_block.is_none());
         assert!(options.headers_db.is_none());
         assert!(options.data_dir.is_none());
-        assert!(!options.mempool_full_rbf);
+        assert!(options.mempool_full_rbf);
         assert!(!options.once);
         assert_eq!(options.network_execution, NetworkExecutionMode::Persistent);
         assert!(options.explorer_listen.is_none());
@@ -17965,7 +17955,7 @@ mod tests {
         assert!(options.snapshot.is_none());
         assert!(!completed_validating_session(&options));
 
-        assert_eq!(
+        assert!(
             parse_options(
                 [
                     "--connect",
@@ -17977,9 +17967,9 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned),
             )
-            .err()
-            .unwrap(),
-            "--mempool-full-rbf requires --data-dir"
+            .unwrap()
+            .unwrap()
+            .mempool_full_rbf
         );
         let full_rbf = parse_options(
             [

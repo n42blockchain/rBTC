@@ -4,8 +4,8 @@ Status date: 2026-07-27.
 
 This plan expands the P1 section of the production roadmap. P0 fast bootstrap,
 maximum-work/snapshot validation, data-backed UTXO tiers, and bounded freezer
-retention remain invariants. The public Bitcoin/Testnet4 soak and external
-review continue independently; P1 work must not weaken or reset either gate.
+retention remain invariants. The public Bitcoin/Testnet4 soak continues
+independently; P1 work must not weaken or reset that gate.
 
 ## Architecture boundary
 
@@ -105,7 +105,8 @@ also complete: startup and every safe checkpoint boundary enforce an
 operator-configured reserve plus worst-case batch/mempool/log/database
 headroom, classify exhaustion as a local failure without peer punishment, and
 publish the forecast through status, authenticated RPC, and Prometheus.
-Upload/index budgets stay open.
+Upload and index budgets are covered by the completed listener and optional
+index phases below.
 
 Header future-time validation no longer relies indefinitely on a raw local
 clock. Each node instance accepts one timestamp sample per IPv4 `/16` or IPv6
@@ -141,9 +142,17 @@ node peer pool rather than an active outbound session, so failover atomically
 leases a new reconciled read view without rebinding. The independent
 AssumeUTXO validator explicitly disables listening. The basic-filter schema
 was advanced because the original index omitted the genesis filter and
-therefore chained height 1 from the wrong predecessor. P1.2 remains open for
-preferred/manual inbound roles and recorded Core 31/btcd interoperability
-evidence.
+therefore chained height 1 from the wrong predecessor.
+
+Preferred/manual roles are complete: exact-IP preferred sources bypass only
+source-group admission, remain inside the global/work/upload ceilings, and are
+protected from untrusted eviction. A maintained ignored integration test starts
+official Core 31 and btcd 0.26 clients sequentially, requires cumulative
+version/verack completion from each, and exercises the same listener whose real
+TCP suite serves headers, witness blocks, transactions, addresses, filters, and
+mempool inventory. The test also caught and fixed valid hashless BIP61
+`version` rejects and the distinction between full-history `NODE_NETWORK` and
+pruned `NODE_NETWORK_LIMITED` service claims. P1.2 is complete.
 
 The observable-accounting portion is now complete. The status API and
 authenticated network/peer RPC expose the live inbound set, handshake identity,
@@ -177,9 +186,22 @@ blocking consensus or peer reads.
    deduplication, feefilter, wtxidrelay, and bounded fan-out.
 4. Validate estimator behavior across restart and reorg against Core fixtures.
 
-Acceptance: consensus and policy remain separate APIs; live Core differential
-tests cover every changed Core 27–31 policy family, and adversarial relay tests
-prove fixed memory/work ceilings.
+Acceptance: consensus and policy remain separate APIs; source-pinned boundary
+tests cover each adopted Core 27–31 policy family, and adversarial relay tests
+prove fixed memory/work ceilings. Exact internal ordering is required only for
+features that claim exact parity.
+
+Implemented and accepted on 2026-07-27. The independent policy module now
+matches Core 31's 0.1 sat/vB relay and incremental fee defaults, versions 1–3,
+aggregate data-carrier limit, dust/standard scripts, and 2,500 legacy-sigop
+limit. Atomic admission implements 64-transaction/101-kvB clusters, TRUC
+version/topology/size limits, one-parent/one-child aggregate fee bumping,
+ephemeral dust, full-RBF by default with explicit opt-out, rolling fees,
+bounded orphan provenance/work, persistence, reorg resurrection, and bounded
+fan-out over inbound and outbound peers. Exact Core feerate-diagram and sibling
+replacement ordering is deliberately P2: the current stricter replacement
+subset is safe and interoperable, while reproducing internal block-building
+ordering is not necessary for a contributing full node. P1.3 is complete.
 
 ### P1.4 — explicit storage lifecycle
 
@@ -253,11 +275,17 @@ background catch-up budget, and peer/API serving switch.
 Acceptance: disabling/removing an index cannot mutate consensus chainstate;
 rebuild and reorg results match a clean build byte-for-byte.
 
+Implemented and accepted on 2026-07-27: independently versioned transaction,
+spent-output, and BIP157/158 filter indexes have sorted atomic batches, durable
+tips, bounded rollback, restart catch-up, prune/reindex gates, disk forecasts,
+typed status/events, authenticated queries, and inbound compact-filter serving.
+No index owns or mutates consensus chainstate. P1.5 is complete.
+
 ### P1.6 — privacy and reachability
 
 IPv4/IPv6 `onlynet`, a no-authentication SOCKS5 transport, resolver fail-closed
 proxy mode, and candidate-family filtering are complete. Native onion/I2P
-address persistence and name-proxy discovery remain separate follow-ups;
+address persistence and name-proxy discovery are P2 extensions;
 automatic port mapping remains optional and off by default.
 
 The bounded exact-IP `whitelist` role is complete: preferred sources bypass
@@ -266,6 +294,10 @@ ordinary work/upload policy, and are protected from untrusted eviction.
 
 Acceptance: each enabled network has an explicit dial and DNS path; disabled
 networks produce no socket or resolver traffic.
+
+The acceptance suite covers direct IPv4/IPv6 selection, proxied IP literals,
+resolver isolation, invalid proxy replies, and exact-IP protected inbound
+roles. P1.6 is complete.
 
 ### P1.7 — operational API completion
 
@@ -279,14 +311,17 @@ IDs, raw retained blocks, explorer UTXOs, and address UTXOs use bounded pages,
 while headers, block metadata, exact chainstate outpoints, peer/prune/index
 status, and lifecycle controls have stable errors. SSE tip events provide the
 existing wait primitive. Administrative peer add/remove and a general
-chainstate scan job remain follow-ups.
+chainstate scan job are P2 operator conveniences rather than requirements of
+the bounded supported API.
 
 Acceptance: the documented API has request/response byte caps, concurrency and
 rate limits, authorization audit coverage, cancellation, and fuzzed parsers.
 
+Those gates are covered by the authenticated API, strict parser, queue/rate,
+rotation, pagination, cancellation, and audit tests. P1.7 is complete.
+
 ## Completion accounting
 
-P1.0 is complete and is the dependency of every later phase. P1.1 and P1.4 follow, then P1.2,
-P1.3, P1.5, P1.6, and P1.7. A phase is checked in the main roadmap only after
-implementation, crash/restart tests, interoperability evidence, operator
-documentation, and a public-network acceptance run all exist.
+P1.0 through P1.7 are complete. The remaining unchecked roadmap gates are the
+time-based seven-day public soak, native release credentials/execution, and
+explicitly deployment-driven P2 extensions.

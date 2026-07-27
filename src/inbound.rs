@@ -131,6 +131,8 @@ pub struct InboundPeerStats {
 pub struct InboundStatsSnapshot {
     /// Configured listener has accepted this many sockets.
     pub accepted_total: u64,
+    /// Sessions which completed the bounded version/verack handshake.
+    pub handshakes_total: u64,
     /// Sockets rejected because the process-wide connection ceiling was full.
     pub rejected_capacity_total: u64,
     /// Sockets rejected by the per-IP or per-network-group ceiling.
@@ -179,6 +181,7 @@ struct LiveInboundPeer {
 struct InboundStatsState {
     next_id: u64,
     accepted_total: u64,
+    handshakes_total: u64,
     rejected_capacity_total: u64,
     rejected_source_total: u64,
     completed_total: u64,
@@ -199,6 +202,7 @@ impl Default for InboundStatsState {
         Self {
             next_id: 0,
             accepted_total: 0,
+            handshakes_total: 0,
             rejected_capacity_total: 0,
             rejected_source_total: 0,
             completed_total: 0,
@@ -262,6 +266,7 @@ impl InboundStats {
         peers.sort_unstable_by_key(|peer| peer.address);
         InboundStatsSnapshot {
             accepted_total: state.accepted_total,
+            handshakes_total: state.handshakes_total,
             rejected_capacity_total: state.rejected_capacity_total,
             rejected_source_total: state.rejected_source_total,
             completed_total: state.completed_total,
@@ -375,6 +380,13 @@ impl InboundPeerAccount {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .peers
+            .get(&self.id)
+            .is_some_and(|peer| !peer.handshake_complete)
+        {
+            state.handshakes_total = state.handshakes_total.saturating_add(1);
+        }
         if let Some(peer) = state.peers.get_mut(&self.id) {
             peer.handshake_complete = true;
             peer.protocol_version = Some(version);
@@ -2047,5 +2059,89 @@ mod tests {
         assert_eq!(stats.snapshot().completed_total, 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires RBTC_BITCOIND and RBTC_BTCD executable paths"]
+    async fn core31_and_btcd_complete_real_inbound_handshakes() {
+        let bitcoind = std::env::var_os("RBTC_BITCOIND").expect("RBTC_BITCOIND is required");
+        let btcd = std::env::var_os("RBTC_BTCD").expect("RBTC_BTCD is required");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source: Arc<dyn InboundDataSource> = Arc::new(GenesisSource::new());
+        let stats = Arc::new(InboundStats::new(1024 * 1024));
+        let task = tokio::spawn(run_listener_with_stats(
+            listener,
+            Network::Regtest.magic(),
+            2,
+            "/rbtcd:interop/".to_owned(),
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            InboundLimits {
+                idle_timeout: Duration::from_secs(30),
+                ..InboundLimits::default()
+            },
+            source,
+            Arc::clone(&stats),
+        ));
+
+        let core_dir = tempfile::tempdir().unwrap();
+        let mut core = std::process::Command::new(bitcoind)
+            .args([
+                "-regtest",
+                "-server=0",
+                "-listen=0",
+                "-dnsseed=0",
+                "-discover=0",
+                "-v2transport=0",
+                "-printtoconsole=0",
+                &format!("-datadir={}", core_dir.path().display()),
+                &format!("-connect={address}"),
+            ])
+            .spawn()
+            .unwrap();
+        let mut core_ready = false;
+        for _ in 0..10_000 {
+            if stats.snapshot().handshakes_total >= 1 {
+                core_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = core.kill();
+        let _ = core.wait();
+
+        let btcd_dir = tempfile::tempdir().unwrap();
+        let mut btcd = std::process::Command::new(btcd)
+            .args([
+                "--regtest",
+                "--nolisten",
+                "--norpc",
+                "--nodnsseed",
+                "--nostalldetect",
+                &format!("--datadir={}", btcd_dir.path().display()),
+                &format!("--logdir={}", btcd_dir.path().display()),
+                &format!("--connect={address}"),
+            ])
+            .spawn()
+            .unwrap();
+
+        let mut btcd_ready = false;
+        for _ in 0..10_000 {
+            if stats.snapshot().handshakes_total >= 2 {
+                btcd_ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = btcd.kill();
+        let _ = btcd.wait();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            core_ready && btcd_ready,
+            "missing external handshake: core={core_ready}, btcd={btcd_ready}, stats={:?}",
+            stats.snapshot()
+        );
     }
 }
