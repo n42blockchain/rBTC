@@ -102,3 +102,10 @@ bench = false
 
 [workspace]
 members = ["."]
+
+# `fuzz/` is its own workspace, so patches declared by the repository root do
+# not propagate here. Fuzz targets must exercise the same audited interpreter
+# ABI and crash-hardened storage implementation as the production crate.
+[patch.crates-io]
+bitcoinconsensus = { path = "../vendor/bitcoinconsensus" }
+redb = { path = "../vendor/redb" }

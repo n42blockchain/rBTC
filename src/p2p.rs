@@ -73,6 +73,11 @@ const MAX_MONEY_SATS: i64 = 21_000_000 * 100_000_000;
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_session_id() -> u64 {
+    // Rust 1.99 renamed this operation to `try_update`; retain `fetch_update`
+    // while the crate's supported Rust 1.85 baseline does not provide the new
+    // spelling. The pinned nightly fuzz job still treats every other warning
+    // as an error.
+    #[allow(deprecated)]
     NEXT_SESSION_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .expect("process-local peer session ID space exhausted")

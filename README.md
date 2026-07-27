@@ -113,6 +113,11 @@ chainstate, ledger, and explorer path and retains a separate JSON report.
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character
 hash names remain local and are ignored rather than accumulated in commits.
+Because `fuzz/` is an independent Cargo workspace, it explicitly patches
+`bitcoinconsensus` and `redb` to the same reviewed vendored trees as the root
+workspace. CI checks its lock file before running every target under the dated
+`nightly-2026-07-13` toolchain; a local override must likewise name an exact
+dated nightly through `RBTC_FUZZ_TOOLCHAIN`.
 
 The optional live differential gate requires the matching `bitcoin-cli` beside a Bitcoin Core 31.0 `bitcoind` and rejects another daemon version. It submits the same mined regtest blocks to Core and through rBTC's production header-DAG/block-connection path, including atomic rejection checks for the persisted tip, undo record, and candidate UTXO. The dependency and Core 27–31 change classification is documented in [docs/CORE31_COMPATIBILITY.md](docs/CORE31_COMPATIBILITY.md).
 

@@ -216,7 +216,12 @@ The pinned Core 26 `bitcoinconsensus` source adds a narrow transaction-level
 ABI used by those jobs. It decodes the serialized transaction once, constructs
 `PrecomputedTransactionData` once, then verifies every input against the same
 immutable spent-output vector; the returned failure still identifies the exact
-input. The former public one-input ABI repeated transaction decoding and common
+input. The independent `fuzz/` workspace repeats the root workspace's
+`bitcoinconsensus` and `redb` path patches explicitly; Cargo patches do not
+propagate across workspace roots. Its committed lock file, dated nightly check,
+Clippy gate, and ASan regressions therefore exercise these exact reviewed
+implementations rather than similarly versioned crates.io packages. The former
+public one-input ABI repeated transaction decoding and common
 signature-hash precomputation for every input. A hot release A/B on the same
 five authenticated activation blocks (8,997 transactions and 23,331 inputs)
 fell from 1.47 to 0.44 seconds, a 3.34× execution speedup. The complete pinned
