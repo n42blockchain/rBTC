@@ -26,6 +26,14 @@ and records its own progress in `logs/exercise-supervisor.log`. It executes the
 Bitcoin graceful restart first and the Testnet4 abrupt-kill recovery second;
 the evidence monitor remains independent and running throughout.
 
+The seven-day finalizer is independently scheduled for
+`2026-08-02T22:19:44Z` with frozen helper
+`state/public-network-soak-report-start`, SHA-256
+`d1a0af7d2f73fc5226af6c62a2ac43e66cabb10bee423f0e088babb5109499bc`.
+It writes `public-network-soak-report.md` only on full acceptance; a failed run
+retains an explicitly incomplete report and records the failure in
+`logs/finalizer-supervisor.log`.
+
 At `2026-07-27T12:18Z`, both nodes had remained alive for about 14 hours.
 Bitcoin was at height 959840 and Testnet4 at 145944, with execution equal to the
 maximum-work header tip. The monitor observed six current Bitcoin peer network
