@@ -87,6 +87,310 @@ pub struct InboundBasicFilter {
     pub filter_header: FilterHeader,
 }
 
+/// One currently admitted inbound peer and its bounded resource accounting.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct InboundPeerStats {
+    /// Remote socket address.
+    pub address: SocketAddr,
+    /// Seconds since the TCP socket was admitted.
+    pub connected_seconds: u64,
+    /// Whether the version/verack handshake completed.
+    pub handshake_complete: bool,
+    /// Negotiated peer protocol version, after the handshake.
+    pub protocol_version: Option<u32>,
+    /// Bounded peer user agent, after the handshake.
+    pub user_agent: Option<String>,
+    /// Counted non-keepalive requests received from this peer.
+    pub requests: u64,
+    /// Consensus payload bytes admitted to this peer's socket write path.
+    pub uploaded_bytes: u64,
+    /// Historical block payload bytes charged to the rolling upload target.
+    pub historical_upload_bytes: u64,
+}
+
+/// Process-lifetime inbound service counters plus the live peer set.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct InboundStatsSnapshot {
+    /// Configured listener has accepted this many sockets.
+    pub accepted_total: u64,
+    /// Sockets rejected because the process-wide connection ceiling was full.
+    pub rejected_capacity_total: u64,
+    /// Sockets rejected by the per-IP or per-network-group ceiling.
+    pub rejected_source_total: u64,
+    /// Sessions which completed or failed after admission.
+    pub completed_total: u64,
+    /// Sessions closed because their request-work budget was exhausted.
+    pub request_budget_disconnects: u64,
+    /// Sessions closed because the historical upload target was exhausted.
+    pub upload_target_disconnects: u64,
+    /// Sessions closed by protocol/framing failures.
+    pub protocol_disconnects: u64,
+    /// Sessions closed by structurally bounded but excessive requests.
+    pub request_bound_disconnects: u64,
+    /// Sessions closed by socket I/O or idle timeout.
+    pub io_disconnects: u64,
+    /// Sessions closed by local authenticated-data failures.
+    pub data_disconnects: u64,
+    /// Currently admitted sessions, including handshakes.
+    pub active: u64,
+    /// Historical block bytes charged in the current rolling 24-hour window.
+    pub historical_upload_bytes_24h: u64,
+    /// Configured rolling historical upload target; zero means unlimited.
+    pub historical_upload_target_bytes: u64,
+    /// Live per-peer accounting sorted by remote address.
+    pub peers: Vec<InboundPeerStats>,
+}
+
+#[derive(Debug)]
+struct LiveInboundPeer {
+    address: SocketAddr,
+    connected: Instant,
+    handshake_complete: bool,
+    protocol_version: Option<u32>,
+    user_agent: Option<String>,
+    requests: u64,
+    uploaded_bytes: u64,
+    historical_upload_bytes: u64,
+}
+
+#[derive(Debug)]
+struct InboundStatsState {
+    next_id: u64,
+    accepted_total: u64,
+    rejected_capacity_total: u64,
+    rejected_source_total: u64,
+    completed_total: u64,
+    request_budget_disconnects: u64,
+    upload_target_disconnects: u64,
+    protocol_disconnects: u64,
+    request_bound_disconnects: u64,
+    io_disconnects: u64,
+    data_disconnects: u64,
+    historical_window_started: Instant,
+    historical_upload_bytes_24h: u64,
+    peers: HashMap<u64, LiveInboundPeer>,
+}
+
+impl Default for InboundStatsState {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            accepted_total: 0,
+            rejected_capacity_total: 0,
+            rejected_source_total: 0,
+            completed_total: 0,
+            request_budget_disconnects: 0,
+            upload_target_disconnects: 0,
+            protocol_disconnects: 0,
+            request_bound_disconnects: 0,
+            io_disconnects: 0,
+            data_disconnects: 0,
+            historical_window_started: Instant::now(),
+            historical_upload_bytes_24h: 0,
+            peers: HashMap::new(),
+        }
+    }
+}
+
+/// Shared, read-only-observable accounting for one inbound listener.
+#[derive(Debug)]
+pub struct InboundStats {
+    historical_upload_target_bytes: u64,
+    state: Mutex<InboundStatsState>,
+}
+
+impl InboundStats {
+    /// Creates empty listener accounting for one configured upload target.
+    #[must_use]
+    pub fn new(historical_upload_target_bytes: u64) -> Self {
+        Self {
+            historical_upload_target_bytes,
+            state: Mutex::new(InboundStatsState::default()),
+        }
+    }
+
+    /// Returns a consistent point-in-time snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> InboundStatsSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.historical_window_started.elapsed() >= Duration::from_secs(24 * 60 * 60) {
+            state.historical_window_started = Instant::now();
+            state.historical_upload_bytes_24h = 0;
+        }
+        let mut peers = state
+            .peers
+            .values()
+            .map(|peer| InboundPeerStats {
+                address: peer.address,
+                connected_seconds: peer.connected.elapsed().as_secs(),
+                handshake_complete: peer.handshake_complete,
+                protocol_version: peer.protocol_version,
+                user_agent: peer.user_agent.clone(),
+                requests: peer.requests,
+                uploaded_bytes: peer.uploaded_bytes,
+                historical_upload_bytes: peer.historical_upload_bytes,
+            })
+            .collect::<Vec<_>>();
+        peers.sort_unstable_by_key(|peer| peer.address);
+        InboundStatsSnapshot {
+            accepted_total: state.accepted_total,
+            rejected_capacity_total: state.rejected_capacity_total,
+            rejected_source_total: state.rejected_source_total,
+            completed_total: state.completed_total,
+            request_budget_disconnects: state.request_budget_disconnects,
+            upload_target_disconnects: state.upload_target_disconnects,
+            protocol_disconnects: state.protocol_disconnects,
+            request_bound_disconnects: state.request_bound_disconnects,
+            io_disconnects: state.io_disconnects,
+            data_disconnects: state.data_disconnects,
+            active: u64::try_from(peers.len()).unwrap_or(u64::MAX),
+            historical_upload_bytes_24h: state.historical_upload_bytes_24h,
+            historical_upload_target_bytes: self.historical_upload_target_bytes,
+            peers,
+        }
+    }
+
+    fn reject_capacity(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rejected_capacity_total = state.rejected_capacity_total.saturating_add(1);
+    }
+
+    fn reject_source(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.rejected_source_total = state.rejected_source_total.saturating_add(1);
+    }
+
+    fn accept(self: &Arc<Self>, address: SocketAddr) -> InboundPeerAccount {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.accepted_total = state.accepted_total.saturating_add(1);
+        state.peers.insert(
+            id,
+            LiveInboundPeer {
+                address,
+                connected: Instant::now(),
+                handshake_complete: false,
+                protocol_version: None,
+                user_agent: None,
+                requests: 0,
+                uploaded_bytes: 0,
+                historical_upload_bytes: 0,
+            },
+        );
+        InboundPeerAccount {
+            id,
+            stats: Arc::clone(self),
+        }
+    }
+}
+
+struct InboundPeerAccount {
+    id: u64,
+    stats: Arc<InboundStats>,
+}
+
+impl InboundPeerAccount {
+    fn handshake(&self, version: u32, user_agent: String) {
+        let mut state = self
+            .stats
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = state.peers.get_mut(&self.id) {
+            peer.handshake_complete = true;
+            peer.protocol_version = Some(version);
+            peer.user_agent = Some(user_agent);
+        }
+    }
+
+    fn request(&self) {
+        let mut state = self
+            .stats
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = state.peers.get_mut(&self.id) {
+            peer.requests = peer.requests.saturating_add(1);
+        }
+    }
+
+    fn upload(&self, bytes: usize, historical_block: bool) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mut state = self
+            .stats
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(peer) = state.peers.get_mut(&self.id) {
+            peer.uploaded_bytes = peer.uploaded_bytes.saturating_add(bytes);
+            if historical_block {
+                peer.historical_upload_bytes = peer.historical_upload_bytes.saturating_add(bytes);
+            }
+        }
+        if historical_block {
+            if state.historical_window_started.elapsed() >= Duration::from_secs(24 * 60 * 60) {
+                state.historical_window_started = Instant::now();
+                state.historical_upload_bytes_24h = 0;
+            }
+            state.historical_upload_bytes_24h =
+                state.historical_upload_bytes_24h.saturating_add(bytes);
+        }
+    }
+
+    fn finish(&self, error: Option<&InboundError>) {
+        let mut state = self
+            .stats
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.peers.remove(&self.id).is_none() {
+            return;
+        }
+        state.completed_total = state.completed_total.saturating_add(1);
+        match error {
+            Some(InboundError::RequestBudget) => {
+                state.request_budget_disconnects =
+                    state.request_budget_disconnects.saturating_add(1);
+            }
+            Some(InboundError::UploadTarget) => {
+                state.upload_target_disconnects = state.upload_target_disconnects.saturating_add(1);
+            }
+            Some(InboundError::Protocol(_)) => {
+                state.protocol_disconnects = state.protocol_disconnects.saturating_add(1);
+            }
+            Some(InboundError::RequestBound(_)) => {
+                state.request_bound_disconnects = state.request_bound_disconnects.saturating_add(1);
+            }
+            Some(InboundError::Io(_)) => {
+                state.io_disconnects = state.io_disconnects.saturating_add(1);
+            }
+            Some(InboundError::Data(_)) => {
+                state.data_disconnects = state.data_disconnects.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for InboundPeerAccount {
+    fn drop(&mut self) {
+        self.finish(None);
+    }
+}
+
 /// Read-only active-chain data exposed to inbound peers.
 ///
 /// Implementations must return only maximum-work active-chain data already
@@ -317,6 +621,31 @@ pub async fn run_listener(
     limits: InboundLimits,
     source: Arc<dyn InboundDataSource>,
 ) -> Result<(), InboundError> {
+    run_listener_with_stats(
+        listener,
+        magic,
+        local_nonce,
+        user_agent,
+        services,
+        limits,
+        source,
+        Arc::new(InboundStats::new(limits.max_upload_bytes_per_day)),
+    )
+    .await
+}
+
+/// Runs one bounded listener while publishing live, process-lifetime accounting.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_listener_with_stats(
+    listener: TcpListener,
+    magic: bitcoin::p2p::Magic,
+    local_nonce: u64,
+    user_agent: String,
+    services: ServiceFlags,
+    limits: InboundLimits,
+    source: Arc<dyn InboundDataSource>,
+    stats: Arc<InboundStats>,
+) -> Result<(), InboundError> {
     let global = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(Mutex::new(HashMap::new()));
     let per_group = Arc::new(Mutex::new(HashMap::new()));
@@ -327,6 +656,7 @@ pub async fn run_listener(
             accepted = listener.accept() => {
                 let (stream, remote) = accepted?;
                 let Ok(global_permit) = Arc::clone(&global).try_acquire_owned() else {
+                    stats.reject_capacity();
                     drop(stream);
                     continue;
                 };
@@ -339,15 +669,17 @@ pub async fn run_listener(
                         global_permit,
                     )
                 else {
+                    stats.reject_source();
                     drop(stream);
                     continue;
                 };
+                let account = stats.accept(remote);
                 let source = Arc::clone(&source);
                 let upload = Arc::clone(&upload);
                 let user_agent = user_agent.clone();
                 peers.spawn(async move {
                     let _admission = admission;
-                    let _ = serve_peer(
+                    let result = serve_peer(
                         stream,
                         magic,
                         local_nonce,
@@ -356,8 +688,10 @@ pub async fn run_listener(
                         limits,
                         source,
                         upload,
+                        &account,
                     )
                     .await;
+                    account.finish(result.as_ref().err());
                 });
             }
             completed = peers.join_next(), if !peers.is_empty() => {
@@ -377,6 +711,7 @@ async fn serve_peer(
     limits: InboundLimits,
     source: Arc<dyn InboundDataSource>,
     upload: Arc<UploadBudget>,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let start_height = source.start_height().map_err(InboundError::Data)?;
     let start_height = i32::try_from(start_height).unwrap_or(i32::MAX);
@@ -398,8 +733,19 @@ async fn serve_peer(
             "inbound handshake timed out",
         ))
     })??;
+    account.handshake(
+        peer.remote_version().version,
+        peer.remote_version().user_agent.clone(),
+    );
     if peer.remote_version().version >= SENDHEADERS_VERSION {
-        send_accounted(&mut peer, NetworkMessage::SendHeaders, &upload, false).await?;
+        send_accounted(
+            &mut peer,
+            NetworkMessage::SendHeaders,
+            &upload,
+            account,
+            false,
+        )
+        .await?;
     }
     if peer.remote_version().version >= SENDCMPCT_VERSION {
         send_accounted(
@@ -409,6 +755,7 @@ async fn serve_peer(
                 version: 2,
             }),
             &upload,
+            account,
             false,
         )
         .await?;
@@ -420,6 +767,7 @@ async fn serve_peer(
             &mut peer,
             NetworkMessage::FeeFilter(fee_filter),
             &upload,
+            account,
             false,
         )
         .await?;
@@ -446,12 +794,14 @@ async fn serve_peer(
                 | NetworkMessage::FeeFilter(_)
         ) {
             request_budget.charge()?;
+            account.request();
         }
         route_message(
             &mut peer,
             message,
             source.as_ref(),
             &upload,
+            account,
             &mut requested_transactions,
         )
         .await?;
@@ -462,9 +812,12 @@ async fn send_accounted(
     peer: &mut InboundPeerSession<TcpStream>,
     message: NetworkMessage,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
     historical_block: bool,
 ) -> Result<(), InboundError> {
-    upload.charge(serialize(&message).len(), historical_block)?;
+    let bytes = serialize(&message).len();
+    upload.charge(bytes, historical_block)?;
+    account.upload(bytes, historical_block);
     peer.send_message(message).await?;
     Ok(())
 }
@@ -475,11 +828,12 @@ async fn route_message(
     message: NetworkMessage,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
     requested_transactions: &mut HashSet<Inventory>,
 ) -> Result<(), InboundError> {
     match message {
         NetworkMessage::Ping(nonce) => {
-            send_accounted(peer, NetworkMessage::Pong(nonce), upload, false).await
+            send_accounted(peer, NetworkMessage::Pong(nonce), upload, account, false).await
         }
         NetworkMessage::GetHeaders(request) => {
             let headers = headers_after_locator(
@@ -488,7 +842,14 @@ async fn route_message(
                 request.stop_hash,
                 MAX_HEADERS_PER_RESPONSE,
             )?;
-            send_accounted(peer, NetworkMessage::Headers(headers), upload, false).await
+            send_accounted(
+                peer,
+                NetworkMessage::Headers(headers),
+                upload,
+                account,
+                false,
+            )
+            .await
         }
         NetworkMessage::GetBlocks(request) => {
             let headers = headers_after_locator(
@@ -501,10 +862,12 @@ async fn route_message(
                 .into_iter()
                 .map(|header| Inventory::Block(header.block_hash()))
                 .collect();
-            send_accounted(peer, NetworkMessage::Inv(inventory), upload, false).await
+            send_accounted(peer, NetworkMessage::Inv(inventory), upload, account, false).await
         }
-        NetworkMessage::GetAddr => serve_addresses(peer, source, upload).await,
-        NetworkMessage::GetData(requests) => serve_getdata(peer, requests, source, upload).await,
+        NetworkMessage::GetAddr => serve_addresses(peer, source, upload, account).await,
+        NetworkMessage::GetData(requests) => {
+            serve_getdata(peer, requests, source, upload, account).await
+        }
         NetworkMessage::Inv(inventory) => {
             let mut requests = Vec::new();
             for entry in inventory {
@@ -528,7 +891,14 @@ async fn route_message(
             if requests.is_empty() {
                 Ok(())
             } else {
-                send_accounted(peer, NetworkMessage::GetData(requests), upload, false).await
+                send_accounted(
+                    peer,
+                    NetworkMessage::GetData(requests),
+                    upload,
+                    account,
+                    false,
+                )
+                .await
             }
         }
         NetworkMessage::Tx(transaction) => {
@@ -553,7 +923,7 @@ async fn route_message(
             }
             Ok(())
         }
-        NetworkMessage::MemPool => serve_mempool(peer, source, upload).await,
+        NetworkMessage::MemPool => serve_mempool(peer, source, upload, account).await,
         NetworkMessage::GetBlockTxn(request) => {
             let hash = request.txs_request.block_hash;
             let Some(raw) = source.block(hash).map_err(InboundError::Data)? else {
@@ -561,6 +931,7 @@ async fn route_message(
                     peer,
                     NetworkMessage::NotFound(vec![Inventory::CompactBlock(hash)]),
                     upload,
+                    account,
                     false,
                 )
                 .await;
@@ -590,16 +961,19 @@ async fn route_message(
                     },
                 }),
                 upload,
+                account,
                 !is_recent_block(source, hash)?,
             )
             .await
         }
-        NetworkMessage::GetCFilters(request) => serve_filters(peer, request, source, upload).await,
+        NetworkMessage::GetCFilters(request) => {
+            serve_filters(peer, request, source, upload, account).await
+        }
         NetworkMessage::GetCFHeaders(request) => {
-            serve_filter_headers(peer, request, source, upload).await
+            serve_filter_headers(peer, request, source, upload, account).await
         }
         NetworkMessage::GetCFCheckpt(request) => {
-            serve_filter_checkpoints(peer, request, source, upload).await
+            serve_filter_checkpoints(peer, request, source, upload, account).await
         }
         NetworkMessage::Version(_) => Err(InboundError::Protocol(P2pError::PostHandshakeVersion)),
         _ => Ok(()),
@@ -610,6 +984,7 @@ async fn serve_addresses(
     peer: &mut InboundPeerSession<TcpStream>,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -626,7 +1001,14 @@ async fn serve_addresses(
         .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
         .map(|address| (now, Address::new(&address, services)))
         .collect();
-    send_accounted(peer, NetworkMessage::Addr(addresses), upload, false).await
+    send_accounted(
+        peer,
+        NetworkMessage::Addr(addresses),
+        upload,
+        account,
+        false,
+    )
+    .await
 }
 
 fn headers_after_locator(
@@ -665,6 +1047,7 @@ async fn serve_getdata(
     requests: Vec<Inventory>,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let mut block_requests = 0usize;
     let mut transaction_requests = 0usize;
@@ -684,6 +1067,7 @@ async fn serve_getdata(
                         peer,
                         NetworkMessage::Block(block),
                         upload,
+                        account,
                         !is_recent_block(source, hash)?,
                     )
                     .await?;
@@ -710,6 +1094,7 @@ async fn serve_getdata(
                             compact_block: compact,
                         }),
                         upload,
+                        account,
                         !is_recent_block(source, hash)?,
                     )
                     .await?;
@@ -725,7 +1110,14 @@ async fn serve_getdata(
                 if let Some(transaction) =
                     source.transaction(request).map_err(InboundError::Data)?
                 {
-                    send_accounted(peer, NetworkMessage::Tx(transaction), upload, false).await?;
+                    send_accounted(
+                        peer,
+                        NetworkMessage::Tx(transaction),
+                        upload,
+                        account,
+                        false,
+                    )
+                    .await?;
                 } else {
                     not_found.push(request);
                 }
@@ -734,7 +1126,14 @@ async fn serve_getdata(
         }
     }
     if !not_found.is_empty() {
-        send_accounted(peer, NetworkMessage::NotFound(not_found), upload, false).await?;
+        send_accounted(
+            peer,
+            NetworkMessage::NotFound(not_found),
+            upload,
+            account,
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -743,6 +1142,7 @@ async fn serve_mempool(
     peer: &mut InboundPeerSession<TcpStream>,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let mut transactions = source.mempool().map_err(InboundError::Data)?;
     transactions.truncate(MAX_INVENTORY_ENTRIES);
@@ -756,7 +1156,7 @@ async fn serve_mempool(
             }
         })
         .collect();
-    send_accounted(peer, NetworkMessage::Inv(inventory), upload, false).await
+    send_accounted(peer, NetworkMessage::Inv(inventory), upload, account, false).await
 }
 
 fn requested_filter_range(
@@ -788,6 +1188,7 @@ async fn serve_filters(
     request: bitcoin::p2p::message_filter::GetCFilters,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let range = requested_filter_range(
         source,
@@ -810,6 +1211,7 @@ async fn serve_filters(
                 filter: filter.filter,
             }),
             upload,
+            account,
             false,
         )
         .await?;
@@ -822,6 +1224,7 @@ async fn serve_filter_headers(
     request: bitcoin::p2p::message_filter::GetCFHeaders,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     let range = requested_filter_range(
         source,
@@ -859,6 +1262,7 @@ async fn serve_filter_headers(
             filter_hashes,
         }),
         upload,
+        account,
         false,
     )
     .await
@@ -869,6 +1273,7 @@ async fn serve_filter_checkpoints(
     request: bitcoin::p2p::message_filter::GetCFCheckpt,
     source: &dyn InboundDataSource,
     upload: &UploadBudget,
+    account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
     if request.filter_type != BASIC_FILTER_TYPE {
         return Err(InboundError::RequestBound(
@@ -903,6 +1308,7 @@ async fn serve_filter_checkpoints(
             filter_headers,
         }),
         upload,
+        account,
         false,
     )
     .await
@@ -1074,7 +1480,8 @@ mod tests {
         let source = Arc::new(GenesisSource::new());
         let service_source: Arc<dyn InboundDataSource> = source.clone();
         let hash = source.block.block_hash();
-        let task = tokio::spawn(run_listener(
+        let stats = Arc::new(InboundStats::new(1_024));
+        let task = tokio::spawn(run_listener_with_stats(
             listener,
             Network::Regtest.magic(),
             2,
@@ -1082,6 +1489,7 @@ mod tests {
             ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
             InboundLimits::default(),
             service_source,
+            Arc::clone(&stats),
         ));
         let mut peer = connect_outbound(
             address,
@@ -1105,6 +1513,12 @@ mod tests {
         peer.request_blocks(&[hash]).await.unwrap();
         let block = peer.receive_requested_block(hash).await.unwrap();
         assert_eq!(block.block_hash(), hash);
+        let observed = stats.snapshot();
+        assert_eq!(observed.active, 1);
+        assert_eq!(observed.accepted_total, 1);
+        assert!(observed.peers[0].handshake_complete);
+        assert!(observed.peers[0].requests >= 2);
+        assert!(observed.peers[0].uploaded_bytes > 0);
         let mut transaction = source.block.txdata[0].clone();
         transaction.input[0].previous_output = OutPoint {
             txid: bitcoin::Txid::all_zeros(),
@@ -1143,6 +1557,18 @@ mod tests {
                 .as_slice(),
             &[transaction]
         );
+        drop(peer);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if stats.snapshot().active == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats.snapshot().completed_total, 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }

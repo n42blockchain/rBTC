@@ -105,7 +105,10 @@ use rbtc::{
     header_store::RedbHeaderStore,
     headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
-    inbound::{InboundBasicFilter, InboundDataSource, InboundLimits, run_listener},
+    inbound::{
+        InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
+        run_listener_with_stats,
+    },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
         validate_prune_boundary,
@@ -2625,6 +2628,7 @@ struct NodeStatusProgress {
 struct NodeStatus {
     started: Instant,
     progress: Arc<Mutex<NodeStatusProgress>>,
+    inbound: Option<Arc<InboundStats>>,
 }
 
 struct NodeRpcOperator {
@@ -2691,6 +2695,7 @@ impl LocalRpcOperator for NodeRpcOperator {
             }));
         }
         let status = self.status.response();
+        let inbound_connections = status.inbound.as_ref().map_or(0, |inbound| inbound.active);
         Some(Ok(match method {
             "getblockchaininfo" => serde_json::json!({
                 "chain": status.network,
@@ -2714,24 +2719,44 @@ impl LocalRpcOperator for NodeRpcOperator {
                 "version": env!("CARGO_PKG_VERSION"),
                 "subversion": USER_AGENT,
                 "networkactive": true,
-                "connections": usize::from(self.active_peer.is_some()),
-                "connections_in": 0,
+                "connections": inbound_connections.saturating_add(
+                    u64::try_from(usize::from(self.active_peer.is_some())).unwrap_or(u64::MAX)
+                ),
+                "connections_in": inbound_connections,
                 "connections_out": usize::from(self.active_peer.is_some()),
+                "rbtc_inbound": status.inbound,
                 "networks": [{
                     "name": status.network,
                     "reachable": self.active_peer.is_some(),
                 }],
             }),
-            "getpeerinfo" => self.active_peer.map_or_else(
-                || serde_json::json!([]),
-                |address| {
-                    serde_json::json!([{
+            "getpeerinfo" => {
+                let mut peers = Vec::new();
+                if let Some(address) = self.active_peer {
+                    peers.push(serde_json::json!({
                         "addr": address.to_string(),
                         "inbound": false,
                         "role": "active",
-                    }])
-                },
-            ),
+                    }));
+                }
+                if let Some(inbound) = status.inbound {
+                    peers.extend(inbound.peers.into_iter().map(|peer| {
+                        serde_json::json!({
+                            "addr": peer.address.to_string(),
+                            "inbound": true,
+                            "role": "inbound",
+                            "conntime": peer.connected_seconds,
+                            "version": peer.protocol_version,
+                            "subver": peer.user_agent,
+                            "handshake_complete": peer.handshake_complete,
+                            "requests": peer.requests,
+                            "bytessent": peer.uploaded_bytes,
+                            "historicalbytessent": peer.historical_upload_bytes,
+                        })
+                    }));
+                }
+                serde_json::Value::Array(peers)
+            }
             "getmempoolinfo" => {
                 let pool = self
                     .transaction_pool
@@ -3014,6 +3039,7 @@ struct NodeStatusResponse {
     ledger_target_blocks: u32,
     ledger_target_bytes: u64,
     ledger_pruned_through_height: Option<u32>,
+    inbound: Option<InboundStatsSnapshot>,
     disk_space: DiskSpaceSnapshot,
 }
 
@@ -3134,10 +3160,20 @@ impl BackgroundValidationStatus {
 }
 
 impl NodeStatus {
+    #[cfg(test)]
     fn new(progress: NodeStatusProgress) -> Self {
         Self {
             started: Instant::now(),
             progress: Arc::new(Mutex::new(progress)),
+            inbound: None,
+        }
+    }
+
+    fn with_inbound(progress: NodeStatusProgress, inbound: Option<Arc<InboundStats>>) -> Self {
+        Self {
+            started: Instant::now(),
+            progress: Arc::new(Mutex::new(progress)),
+            inbound,
         }
     }
 
@@ -3213,6 +3249,7 @@ impl NodeStatus {
             ledger_target_blocks: progress.ledger_target_blocks,
             ledger_target_bytes: progress.ledger_target_bytes,
             ledger_pruned_through_height: progress.ledger_pruned_through_height,
+            inbound: self.inbound.as_ref().map(|stats| stats.snapshot()),
             disk_space: progress.disk_space,
         }
     }
@@ -3258,6 +3295,7 @@ async fn node_ready(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn node_metrics(
     axum::extract::State(status): axum::extract::State<NodeStatus>,
 ) -> ([(axum::http::HeaderName, &'static str); 2], String) {
@@ -3299,8 +3337,57 @@ async fn node_metrics(
     let storage_ceiling = status.disk_space.projected_storage_ceiling_bytes;
     let optional_index_bytes = status.disk_space.optional_index_bytes;
     let optional_index_headroom = status.disk_space.optional_index_checkpoint_headroom_bytes;
+    let inbound_active = status.inbound.as_ref().map_or(0, |value| value.active);
+    let inbound_accepted = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.accepted_total);
+    let inbound_rejected_capacity = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.rejected_capacity_total);
+    let inbound_rejected_source = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.rejected_source_total);
+    let inbound_completed = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.completed_total);
+    let inbound_request_budget_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.request_budget_disconnects);
+    let inbound_upload_target_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.upload_target_disconnects);
+    let inbound_protocol_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.protocol_disconnects);
+    let inbound_request_bound_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.request_bound_disconnects);
+    let inbound_io_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.io_disconnects);
+    let inbound_data_disconnects = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.data_disconnects);
+    let inbound_historical_upload = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.historical_upload_bytes_24h);
+    let inbound_historical_target = status
+        .inbound
+        .as_ref()
+        .map_or(0, |value| value.historical_upload_target_bytes);
     let body = format!(
-        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"txindex\"}} {transaction_index_height}\nrbtc_tip_height{{kind=\"spent_output\"}} {spent_output_index_height}\nrbtc_tip_height{{kind=\"basic_filter\"}} {basic_filter_index_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\nrbtc_disk_bytes{{kind=\"optional_indexes\"}} {optional_index_bytes}\nrbtc_disk_bytes{{kind=\"optional_index_checkpoint_headroom\"}} {optional_index_headroom}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
+        "# HELP rbtc_node_info Static network and current synchronization phase.\n# TYPE rbtc_node_info gauge\nrbtc_node_info{{network=\"{}\",phase=\"{}\"}} 1\n# HELP rbtc_ready Whether every serving projection is caught up and minimum chainwork is reached.\n# TYPE rbtc_ready gauge\nrbtc_ready {ready}\n# HELP rbtc_tip_height Durable heights by subsystem.\n# TYPE rbtc_tip_height gauge\nrbtc_tip_height{{kind=\"header\"}} {}\nrbtc_tip_height{{kind=\"execution\"}} {}\nrbtc_tip_height{{kind=\"explorer\"}} {}\nrbtc_tip_height{{kind=\"wallet\"}} {wallet_height}\nrbtc_tip_height{{kind=\"txindex\"}} {transaction_index_height}\nrbtc_tip_height{{kind=\"spent_output\"}} {spent_output_index_height}\nrbtc_tip_height{{kind=\"basic_filter\"}} {basic_filter_index_height}\nrbtc_tip_height{{kind=\"ledger\"}} {ledger_tip_height}\n# HELP rbtc_tip_lag_blocks Current block lag by subsystem.\n# TYPE rbtc_tip_lag_blocks gauge\nrbtc_tip_lag_blocks{{kind=\"execution\"}} {execution_lag}\nrbtc_tip_lag_blocks{{kind=\"explorer\"}} {explorer_lag}\n# HELP rbtc_utxos Current UTXO entries by tier.\n# TYPE rbtc_utxos gauge\nrbtc_utxos{{tier=\"hot\"}} {}\nrbtc_utxos{{tier=\"cold\"}} {}\nrbtc_utxos{{tier=\"total\"}} {utxo_total}\n# HELP rbtc_ledger_segments Retained immutable ledger segments.\n# TYPE rbtc_ledger_segments gauge\nrbtc_ledger_segments {}\n# HELP rbtc_ledger_blocks Retained pruned-ledger blocks.\n# TYPE rbtc_ledger_blocks gauge\nrbtc_ledger_blocks {}\n# HELP rbtc_ledger_bytes Retained compressed ledger bytes.\n# TYPE rbtc_ledger_bytes gauge\nrbtc_ledger_bytes {}\n# HELP rbtc_ledger_first_height Oldest retained block height, or zero for an empty ledger.\n# TYPE rbtc_ledger_first_height gauge\nrbtc_ledger_first_height {ledger_first_height}\n# HELP rbtc_ledger_pruned_through_height Highest physically pruned active-prefix height, or zero when none.\n# TYPE rbtc_ledger_pruned_through_height gauge\nrbtc_ledger_pruned_through_height {ledger_pruned_through}\n# HELP rbtc_ledger_retention_target Configured freezer retention ceilings.\n# TYPE rbtc_ledger_retention_target gauge\nrbtc_ledger_retention_target{{kind=\"blocks\"}} {ledger_target_blocks}\nrbtc_ledger_retention_target{{kind=\"bytes\"}} {ledger_target_bytes}\n# HELP rbtc_disk_bytes Filesystem capacity and checkpoint safety thresholds.\n# TYPE rbtc_disk_bytes gauge\nrbtc_disk_bytes{{kind=\"total\"}} {disk_total}\nrbtc_disk_bytes{{kind=\"available\"}} {disk_available}\nrbtc_disk_bytes{{kind=\"required\"}} {disk_required}\nrbtc_disk_bytes{{kind=\"reserve\"}} {disk_reserve}\nrbtc_disk_bytes{{kind=\"bounded_storage_ceiling\"}} {storage_ceiling}\nrbtc_disk_bytes{{kind=\"optional_indexes\"}} {optional_index_bytes}\nrbtc_disk_bytes{{kind=\"optional_index_checkpoint_headroom\"}} {optional_index_headroom}\n# HELP rbtc_minimum_chainwork_reached Whether the configured IBD work floor is reached.\n# TYPE rbtc_minimum_chainwork_reached gauge\nrbtc_minimum_chainwork_reached {minimum_chainwork}\n# HELP rbtc_independently_validated Whether chainstate no longer depends on an assumed snapshot.\n# TYPE rbtc_independently_validated gauge\nrbtc_independently_validated {independently_validated}\n# HELP rbtc_wallet_enabled Whether the serving node has an embedded wallet.\n# TYPE rbtc_wallet_enabled gauge\nrbtc_wallet_enabled {wallet_enabled}\n# HELP rbtc_log_dropped_records Total structured diagnostics dropped by rate or queue bounds.\n# TYPE rbtc_log_dropped_records counter\nrbtc_log_dropped_records {dropped_logs}\n# HELP rbtc_log_write_errors Total structured-log destination failures.\n# TYPE rbtc_log_write_errors counter\nrbtc_log_write_errors {log_write_errors}\n# HELP rbtc_inbound_connections Currently admitted inbound peer sessions.\n# TYPE rbtc_inbound_connections gauge\nrbtc_inbound_connections {inbound_active}\n# HELP rbtc_inbound_sessions_total Inbound session admission and completion counters.\n# TYPE rbtc_inbound_sessions_total counter\nrbtc_inbound_sessions_total{{result=\"accepted\"}} {inbound_accepted}\nrbtc_inbound_sessions_total{{result=\"rejected_capacity\"}} {inbound_rejected_capacity}\nrbtc_inbound_sessions_total{{result=\"rejected_source\"}} {inbound_rejected_source}\nrbtc_inbound_sessions_total{{result=\"completed\"}} {inbound_completed}\n# HELP rbtc_inbound_disconnects_total Classified inbound disconnect counters.\n# TYPE rbtc_inbound_disconnects_total counter\nrbtc_inbound_disconnects_total{{reason=\"request_budget\"}} {inbound_request_budget_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"request_bound\"}} {inbound_request_bound_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"upload_target\"}} {inbound_upload_target_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"protocol\"}} {inbound_protocol_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"io\"}} {inbound_io_disconnects}\nrbtc_inbound_disconnects_total{{reason=\"local_data\"}} {inbound_data_disconnects}\n# HELP rbtc_inbound_historical_upload_bytes Historical block upload in the current rolling window and its target.\n# TYPE rbtc_inbound_historical_upload_bytes gauge\nrbtc_inbound_historical_upload_bytes{{kind=\"used_24h\"}} {inbound_historical_upload}\nrbtc_inbound_historical_upload_bytes{{kind=\"target\"}} {inbound_historical_target}\n# HELP rbtc_session_uptime_seconds Current peer-serving session uptime.\n# TYPE rbtc_session_uptime_seconds gauge\nrbtc_session_uptime_seconds {}\n",
         status.network,
         status.phase,
         status.header.height,
@@ -3353,13 +3440,25 @@ struct NodeInboundSource {
     basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
 }
 
-#[derive(Default)]
 struct SharedInboundSource {
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
+    stats: Arc<InboundStats>,
 }
 
 impl SharedInboundSource {
+    fn new(max_upload_bytes_per_day: u64) -> Self {
+        Self {
+            current: RwLock::new(None),
+            peer_store: RwLock::new(None),
+            stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
+        }
+    }
+
+    fn stats(&self) -> Arc<InboundStats> {
+        Arc::clone(&self.stats)
+    }
+
     fn current(&self) -> Result<Arc<dyn InboundDataSource>, String> {
         self.current
             .read()
@@ -3647,6 +3746,7 @@ impl InboundServer {
         local_nonce: u64,
         limits: InboundLimits,
         source: Arc<dyn InboundDataSource>,
+        stats: Arc<InboundStats>,
         serve_compact_filters: bool,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
@@ -3667,7 +3767,7 @@ impl InboundServer {
             limits.max_requests_per_minute
         );
         let task = tokio::spawn(async move {
-            run_listener(
+            run_listener_with_stats(
                 listener,
                 network.magic(),
                 local_nonce,
@@ -3675,6 +3775,7 @@ impl InboundServer {
                 services,
                 limits,
                 source,
+                stats,
             )
             .await
             .map_err(|error| error.to_string())
@@ -6125,9 +6226,11 @@ async fn run_peer_pool(
             .collect()
     });
     let (transaction_relay, _) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
-    let inbound_source = options
-        .inbound_listen
-        .map(|_| Arc::new(SharedInboundSource::default()));
+    let inbound_source = options.inbound_listen.map(|_| {
+        Arc::new(SharedInboundSource::new(
+            options.inbound_limits.max_upload_bytes_per_day,
+        ))
+    });
     let mut inbound_server = if let (Some(address), Some(source)) =
         (options.inbound_listen, inbound_source.as_ref())
     {
@@ -6139,6 +6242,10 @@ async fn run_peer_pool(
                 local_nonce,
                 options.inbound_limits,
                 source,
+                inbound_source
+                    .as_ref()
+                    .expect("inbound source exists with listener")
+                    .stats(),
                 options.indexes.basic_filter,
             )
             .await?,
@@ -9242,7 +9349,9 @@ async fn sync_validating_node(
                 &auxiliary_indexes,
                 disk_space,
             )
-            .map(NodeStatus::new)
+            .map(|progress| {
+                NodeStatus::with_inbound(progress, inbound_source.map(|source| source.stats()))
+            })
         })
         .transpose()?;
     publish_runtime_status(

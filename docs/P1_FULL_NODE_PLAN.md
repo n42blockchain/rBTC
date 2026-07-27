@@ -135,8 +135,17 @@ AssumeUTXO validator explicitly disables listening. The basic-filter schema
 was advanced because the original index omitted the genesis filter and
 therefore chained height 1 from the wrong predecessor. P1.2 remains open for
 adaptive eviction/preference, routability advertisement controls,
-observable per-peer accounting, inbound transaction fan-out, and recorded
-Core 31/btcd interoperability evidence.
+inbound transaction fan-out, and recorded Core 31/btcd interoperability
+evidence.
+
+The observable-accounting portion is now complete. The status API and
+authenticated network/peer RPC expose the live inbound set, handshake identity,
+request work, and per-peer upload; Prometheus exposes bounded-cardinality
+listener admission, rejection, disconnect-reason, active-session, and rolling
+historical-upload counters. A real TCP lifecycle test proves that disconnect
+and listener cancellation cannot leave a stale peer consuming observable
+capacity. Adaptive eviction/preference, explicit routability advertisement,
+inbound transaction fan-out, and recorded Core 31/btcd interoperability remain.
 
 ### P1.3 — current transaction relay and policy
 
