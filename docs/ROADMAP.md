@@ -202,11 +202,16 @@ Primary references:
   operator-controlled keys on the declared Linux/macOS/Windows platform matrix,
   verify byte-identical artifacts and provenance from a clean checkout, publish
   the SBOM, upgrade/rollback notes, data-format compatibility, and
-  disaster-recovery procedure. The local `n42appv2` Android/Apple signing inventory, required
-  native identities, common manifest signature, and expanded
-  Linux/macOS/Windows matrix are recorded in
-  [RELEASE_SIGNING.md](RELEASE_SIGNING.md); a Developer ID Application identity
-  and Windows Authenticode identity still need provisioning.
+  disaster-recovery procedure. The workflow now fails closed on missing or
+  wrong-team credentials; applies and verifies Developer ID/notarization and
+  Authenticode/RFC3161 signatures; produces a strict root-data-schema-v3
+  manifest, CycloneDX SBOM, per-artifact provenance, and offline
+  repository/organization-bound Sigstore manifest bundle; and publishes only
+  after the complete draft is assembled. The local `n42appv2` Android/Apple
+  signing inventory and exact protected-environment contract are recorded in
+  [RELEASE_SIGNING.md](RELEASE_SIGNING.md). A Developer ID Application identity,
+  Windows Authenticode identity, release-immutability setting, and real tagged
+  clean-host run remain external execution gates.
 
 These are the only blockers to the first production **outbound-only,
 watch-only/external-signer validating-node** claim. Inbound service, an internal

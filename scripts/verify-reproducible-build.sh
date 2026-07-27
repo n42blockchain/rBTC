@@ -21,8 +21,8 @@ export CARGO_INCREMENTAL=0
 export SOURCE_DATE_EPOCH="$source_date_epoch"
 export RUSTFLAGS="-C strip=symbols -C debuginfo=0"
 
-cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release --all-features --target-dir "$build_root/first"
-cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release --all-features --target-dir "$build_root/second"
+cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release --target-dir "$build_root/first"
+cargo build --manifest-path "$repo_root/Cargo.toml" --locked --release --target-dir "$build_root/second"
 
 first="$build_root/first/release/rbtcd"
 second="$build_root/second/release/rbtcd"

@@ -86,3 +86,18 @@ controller shutdown. It is a technical integration test, not authorization to
 distribute a combined binary. Production assembly must still fail the
 enclosing node on an unexpected rBTC task failure and must never reinterpret
 rBTC readiness as N42 consensus readiness.
+
+The current sibling Reth 2.3 task crate declares Rust 1.95, while rBTC itself
+continues to build with its lower 1.85 MSRV. The fixture therefore declares and
+tests the host boundary explicitly:
+
+```bash
+cargo +1.95.0 test \
+  --manifest-path ../n42-26/integration-tests/rbtc-embedding/Cargo.toml \
+  --locked
+```
+
+On 2026-07-27 this exact locked test compiled current rBTC, current
+`reth-tasks`, and the isolated host crate and passed 1/1. Running the fixture
+under rBTC's 1.85 override is intentionally rejected rather than silently
+selecting a different Reth revision.

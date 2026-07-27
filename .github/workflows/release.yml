@@ -1,4 +1,4 @@
-name: Release hard gates
+name: Signed release hard gates
 
 on:
   workflow_dispatch:
@@ -10,11 +10,19 @@ permissions:
   contents: read
   id-token: write
   attestations: write
-  artifact-metadata: write
+
+env:
+  REQUIRED_APPLE_TEAM_ID: CFRXH38L48
 
 jobs:
-  reproducible-linux:
-    runs-on: ubuntu-latest
+  signing-preflight:
+    runs-on: ubuntu-24.04
+    environment: release-signing
+    outputs:
+      release_ref: ${{ steps.metadata.outputs.release_ref }}
+      source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
+      rustc_version: ${{ steps.metadata.outputs.rustc_version }}
+      publish: ${{ steps.metadata.outputs.publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -22,61 +30,173 @@ jobs:
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
           toolchain: 1.85.0
+      - name: Fail closed unless every native signing identity is provisioned
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        shell: bash
+        run: |
+          required=(
+            MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD
+            MACOS_SIGNING_IDENTITY APPLE_API_KEY_P8 APPLE_API_KEY_ID
+            APPLE_API_ISSUER_ID APPLE_TEAM_ID WINDOWS_CERTIFICATE_PFX
+            WINDOWS_CERTIFICATE_PASSWORD WINDOWS_CERTIFICATE_SUBJECT
+            WINDOWS_TIMESTAMP_URL
+          )
+          for name in "${required[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "required release secret is absent: $name" >&2
+              exit 1
+            fi
+          done
+          if [[ "$APPLE_TEAM_ID" != "$REQUIRED_APPLE_TEAM_ID" ]]; then
+            echo "Apple team does not match the n42appv2 release team" >&2
+            exit 1
+          fi
+          if [[ "$MACOS_SIGNING_IDENTITY" != Developer\ ID\ Application:* ]]; then
+            echo "macOS identity must be a Developer ID Application identity" >&2
+            exit 1
+          fi
+          case "$WINDOWS_TIMESTAMP_URL" in
+            https://*) ;;
+            *)
+              echo "Windows RFC3161 timestamp URL must use HTTPS" >&2
+              exit 1
+              ;;
+          esac
+      - name: Resolve immutable release metadata
+        id: metadata
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release_ref="${GITHUB_REF#refs/tags/}"
+            [[ "$release_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+              echo "release tag is not semantic: $release_ref" >&2
+              exit 1
+            }
+            git tag --points-at "$GITHUB_SHA" | grep -Fx "$release_ref" >/dev/null
+            publish=true
+          else
+            release_ref="manual-${GITHUB_SHA:0:12}"
+            publish=false
+          fi
+          {
+            echo "release_ref=$release_ref"
+            echo "source_date_epoch=$(git show -s --format=%ct "$GITHUB_SHA")"
+            echo "rustc_version=$(rustc -V)"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+      - name: Validate canonical manifest tooling
+        run: scripts/test-release-manifest.sh
+
+  reproducible-linux:
+    needs: signing-preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-cyclonedx@0.5.9
       - run: scripts/verify-reproducible-build.sh
-      - name: Assemble release evidence
+      - name: Assemble Linux release and SBOM
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
+        shell: bash
         run: |
           mkdir -p dist
           cp target/release/rbtcd dist/rbtcd-x86_64-unknown-linux-gnu
-          SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" cargo cyclonedx --all-features --format json --spec-version 1.5 --override-filename rbtc.cdx
+          cargo cyclonedx --format json --spec-version 1.5 \
+            --override-filename rbtc.cdx
           mv rbtc.cdx.json dist/
           cd dist
-          sha256sum rbtcd-x86_64-unknown-linux-gnu rbtc.cdx.json > SHA256SUMS
-      - name: Attest release provenance
+          sha256sum rbtcd-x86_64-unknown-linux-gnu rbtc.cdx.json > \
+            rbtcd-x86_64-unknown-linux-gnu.sha256
+      - name: Attest Linux provenance
+        id: provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
-          subject-path: |
-            dist/rbtcd-x86_64-unknown-linux-gnu
-            dist/SHA256SUMS
+          subject-path: dist/rbtcd-x86_64-unknown-linux-gnu
+      - name: Retain Linux provenance bundle
+        shell: bash
+        run: cp "${{ steps.provenance.outputs.bundle-path }}" \
+          dist/rbtcd-x86_64-unknown-linux-gnu.provenance.sigstore.json
       - name: Attest release SBOM
+        id: sbom
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/rbtcd-x86_64-unknown-linux-gnu
           sbom-path: dist/rbtc.cdx.json
+      - name: Retain SBOM attestation bundle
+        shell: bash
+        run: cp "${{ steps.sbom.outputs.bundle-path }}" \
+          dist/rbtc.sbom.sigstore.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rbtc-linux-release-evidence
+          name: rbtc-x86_64-unknown-linux-gnu-release
           path: dist/
           if-no-files-found: error
 
-  native-platform-matrix:
-    name: native ${{ matrix.target }}
+  native-linux-arm64:
+    needs: signing-preflight
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
+          targets: aarch64-unknown-linux-gnu
+      - name: Test native library and embedding boundary
+        run: cargo test --locked --lib --test embedded_node_api
+      - name: Build native release artifact
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
+        run: cargo build --locked --release
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/rbtcd dist/rbtcd-aarch64-unknown-linux-gnu
+          cd dist
+          sha256sum rbtcd-aarch64-unknown-linux-gnu > \
+            rbtcd-aarch64-unknown-linux-gnu.sha256
+      - name: Attest native provenance
+        id: provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/rbtcd-aarch64-unknown-linux-gnu
+      - name: Retain provenance bundle
+        shell: bash
+        run: cp "${{ steps.provenance.outputs.bundle-path }}" \
+          dist/rbtcd-aarch64-unknown-linux-gnu.provenance.sigstore.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rbtc-aarch64-unknown-linux-gnu-release
+          path: dist/
+          if-no-files-found: error
+
+  signed-macos:
+    needs: signing-preflight
+    environment: release-signing
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            executable: rbtcd
-            artifact: rbtcd-x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            executable: rbtcd
-            artifact: rbtcd-aarch64-unknown-linux-gnu
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            executable: rbtcd
-            artifact: rbtcd-x86_64-apple-darwin
           - runner: macos-15
             target: aarch64-apple-darwin
-            executable: rbtcd
-            artifact: rbtcd-aarch64-apple-darwin
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            executable: rbtcd.exe
-            artifact: rbtcd-x86_64-pc-windows-msvc.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -86,29 +206,259 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Test native library and embedding boundary
         run: cargo test --locked --lib --test embedded_node_api
-      - name: Build locked release artifact
+      - name: Build native release artifact
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
         run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Stage Unix artifact and checksum
-        if: runner.os != 'Windows'
+      - name: Sign, notarize, and verify
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         shell: bash
         run: |
+          set -euo pipefail
+          artifact="rbtcd-${{ matrix.target }}"
+          keychain="$RUNNER_TEMP/rbtc-release.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          certificate="$RUNNER_TEMP/rbtc-release.p12"
+          api_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$certificate" "$api_key"
+          }
+          trap cleanup EXIT
+
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${{ matrix.artifact }}"
-          shasum -a 256 "dist/${{ matrix.artifact }}" > "dist/${{ matrix.artifact }}.sha256"
-      - name: Stage Windows artifact and checksum
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${{ matrix.artifact }}"
-          $digest = (Get-FileHash "dist/${{ matrix.artifact }}" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$digest  ${{ matrix.artifact }}" | Set-Content -NoNewline "dist/${{ matrix.artifact }}.sha256"
-      - name: Attest native artifact provenance
+          cp "target/${{ matrix.target }}/release/rbtcd" "dist/$artifact"
+          printf '%s' "$MACOS_CERTIFICATE_P12" |
+            openssl base64 -d -A -out "$certificate"
+          printf '%s' "$APPLE_API_KEY_P8" >"$api_key"
+          chmod 600 "$certificate" "$api_key"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          security find-certificate -c "$MACOS_SIGNING_IDENTITY" -p "$keychain" |
+            openssl x509 -noout -subject -nameopt RFC2253 |
+            grep -F "OU=$REQUIRED_APPLE_TEAM_ID" >/dev/null
+          codesign --force --options runtime --timestamp \
+            --keychain "$keychain" --sign "$MACOS_SIGNING_IDENTITY" \
+            "dist/$artifact"
+          codesign --verify --deep --strict --verbose=2 "dist/$artifact"
+          codesign -d --verbose=4 "dist/$artifact" 2>&1 |
+            grep -F "TeamIdentifier=$REQUIRED_APPLE_TEAM_ID" >/dev/null
+
+          ditto -c -k --keepParent "dist/$artifact" "dist/$artifact.zip"
+          xcrun notarytool submit "dist/$artifact.zip" --key "$api_key" \
+            --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            --wait --output-format json >"$RUNNER_TEMP/notary-submit.json"
+          python3 - "$RUNNER_TEMP/notary-submit.json" <<'PY'
+          import json
+          import sys
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          if result.get("status") != "Accepted" or not result.get("id"):
+              raise SystemExit(f"notarization was not accepted: {result}")
+          print(result["id"])
+          PY
+          submission_id="$(python3 -c \
+            'import json,sys; print(json.load(open(sys.argv[1]))[\"id\"])' \
+            "$RUNNER_TEMP/notary-submit.json")"
+          xcrun notarytool log "$submission_id" --key "$api_key" \
+            --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" \
+            "dist/$artifact.notary.json"
+          spctl --assess --type execute --verbose=4 "dist/$artifact"
+
+          cd dist
+          shasum -a 256 "$artifact" "$artifact.zip" "$artifact.notary.json" \
+            >"$artifact.sha256"
+      - name: Attest signed and notarized macOS artifact
+        id: provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
-          subject-path: dist/${{ matrix.artifact }}
+          subject-path: |
+            dist/rbtcd-${{ matrix.target }}
+            dist/rbtcd-${{ matrix.target }}.zip
+            dist/rbtcd-${{ matrix.target }}.notary.json
+      - name: Retain provenance bundle
+        shell: bash
+        run: cp "${{ steps.provenance.outputs.bundle-path }}" \
+          "dist/rbtcd-${{ matrix.target }}.provenance.sigstore.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rbtc-${{ matrix.target }}-release-evidence
+          name: rbtc-${{ matrix.target }}-release
           path: dist/
           if-no-files-found: error
+
+  signed-windows:
+    needs: signing-preflight
+    environment: release-signing
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        with:
+          toolchain: 1.85.0
+          targets: x86_64-pc-windows-msvc
+      - name: Test native library and embedding boundary
+        run: cargo test --locked --lib --test embedded_node_api
+      - name: Build native release artifact
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
+        run: cargo build --locked --release
+      - name: Authenticode sign, timestamp, and verify
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_SUBJECT: ${{ secrets.WINDOWS_CERTIFICATE_SUBJECT }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $artifact = "rbtcd-x86_64-pc-windows-msvc.exe"
+          $certificate = Join-Path $env:RUNNER_TEMP "rbtc-release.pfx"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/release/rbtcd.exe" "dist/$artifact"
+          try {
+            [IO.File]::WriteAllBytes(
+              $certificate,
+              [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX)
+            )
+            $flags = [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+            $pfx = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $certificate,
+              $env:WINDOWS_CERTIFICATE_PASSWORD,
+              $flags
+            )
+            if ($pfx.Subject -notlike "*$($env:WINDOWS_CERTIFICATE_SUBJECT)*") {
+              throw "Windows certificate subject does not match the approved N42 release identity"
+            }
+            if (-not $pfx.HasPrivateKey) {
+              throw "Windows release certificate does not contain a private key"
+            }
+            $signtool = Get-ChildItem `
+              "${env:ProgramFiles(x86)}\\Windows Kits\\10\\bin\\*\\x64\\signtool.exe" |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if (-not $signtool) {
+              throw "SignTool was not found in the Windows SDK"
+            }
+            & $signtool.FullName sign /fd SHA256 /td SHA256 `
+              /tr $env:WINDOWS_TIMESTAMP_URL /f $certificate `
+              /p $env:WINDOWS_CERTIFICATE_PASSWORD /d "rBTC" "dist/$artifact"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signing failed with exit code $LASTEXITCODE"
+            }
+            & $signtool.FullName verify /pa /all /v "dist/$artifact"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode verification failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $certificate
+          }
+          $digest = (Get-FileHash "dist/$artifact" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $artifact" | Set-Content -NoNewline "dist/$artifact.sha256"
+      - name: Attest signed Windows provenance
+        id: provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/rbtcd-x86_64-pc-windows-msvc.exe
+      - name: Retain provenance bundle
+        shell: pwsh
+        run: Copy-Item "${{ steps.provenance.outputs.bundle-path }}" `
+          "dist/rbtcd-x86_64-pc-windows-msvc.provenance.sigstore.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rbtc-x86_64-pc-windows-msvc-release
+          path: dist/
+          if-no-files-found: error
+
+  canonical-release:
+    needs:
+      - signing-preflight
+      - reproducible-linux
+      - native-linux-arm64
+      - signed-macos
+      - signed-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: rbtc-*-release
+          path: dist
+          merge-multiple: true
+      - name: Generate and independently verify canonical release manifest
+        shell: bash
+        run: |
+          scripts/generate-release-manifest.sh \
+            dist dist/RELEASE-MANIFEST.tsv \
+            "${{ needs.signing-preflight.outputs.release_ref }}" \
+            "$GITHUB_SHA" \
+            "${{ needs.signing-preflight.outputs.rustc_version }}" \
+            "${{ needs.signing-preflight.outputs.source_date_epoch }}"
+          scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
+      - name: Sign common release identity with GitHub/Sigstore OIDC
+        id: manifest_attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/RELEASE-MANIFEST.tsv
+      - name: Retain offline-verifiable manifest signature bundle
+        shell: bash
+        run: |
+          cp "${{ steps.manifest_attestation.outputs.bundle-path }}" \
+            dist/RELEASE-MANIFEST.sigstore.json
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' |
+            sort -z |
+            xargs -0 sha256sum >SHA256SUMS
+      - name: Verify assembled release after signing
+        run: scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rbtc-${{ needs.signing-preflight.outputs.release_ref }}
+          path: dist/
+          if-no-files-found: error
+
+  publish-draft-then-freeze:
+    if: needs.signing-preflight.outputs.publish == 'true'
+    needs:
+      - signing-preflight
+      - canonical-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: rbtc-${{ needs.signing-preflight.outputs.release_ref }}
+          path: dist
+      - name: Create or resume draft, upload all assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REF: ${{ needs.signing-preflight.outputs.release_ref }}
+        shell: bash
+        run: |
+          existing="$(gh release view "$RELEASE_REF" --json isDraft \
+            --jq .isDraft 2>/dev/null || true)"
+          if [[ -z "$existing" ]]; then
+            gh release create "$RELEASE_REF" --verify-tag --draft \
+              --title "rBTC $RELEASE_REF" --generate-notes
+          elif [[ "$existing" != true ]]; then
+            echo "refusing to overwrite an already published release" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_REF" dist/* --clobber
+          gh release edit "$RELEASE_REF" --draft=false
