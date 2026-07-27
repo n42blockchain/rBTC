@@ -209,6 +209,8 @@ const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
 const MIN_PARALLEL_STRUCTURE_BLOCKS_PER_WORKER: usize = 64;
 const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
+/// Unlocked sidecar describing who holds the lock, readable under contention.
+const DATA_DIRECTORY_LOCK_OWNER_FILE: &str = ".rbtc.lock.owner";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
 const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
@@ -2169,6 +2171,7 @@ impl DiskSpaceMonitor {
 #[derive(Debug)]
 struct DataDirectoryLock {
     file: fs::File,
+    owner_marker: PathBuf,
 }
 
 impl DataDirectoryLock {
@@ -2216,7 +2219,7 @@ impl DataDirectoryLock {
         }
         if let Err(error) = file.try_lock_exclusive() {
             if is_lock_contention(&error) {
-                let marker = read_lock_marker(&mut file);
+                let marker = read_owner_marker(data_dir, &mut file);
                 return Err(format!(
                     "data directory {} is already locked{}",
                     data_dir.display(),
@@ -2244,12 +2247,21 @@ impl DataDirectoryLock {
                     path.display()
                 )
             })?;
-        Ok(Self { file })
+        // The in-file marker above stays for compatibility with releases that
+        // only look there, but a contending process cannot read it on Windows:
+        // its locks are mandatory, so the locked range is unreadable through
+        // another handle. Publish the same text to an unlocked sidecar, which
+        // both platforms can read. The lock itself is still a whole-file lock on
+        // the same path, so a mixed-version pair still excludes correctly.
+        let owner_marker = owner_marker_path(data_dir);
+        write_owner_marker(&owner_marker, &marker);
+        Ok(Self { file, owner_marker })
     }
 }
 
 impl Drop for DataDirectoryLock {
     fn drop(&mut self) {
+        let _ = fs::remove_file(&self.owner_marker);
         let _ = FileExt::unlock(&self.file);
     }
 }
@@ -2537,6 +2549,43 @@ fn publish_data_format_manifest(
     // `FILE_FLAG_BACKUP_SEMANTICS`; see `sync_directory`.
     sync_directory(data_dir)
         .map_err(|error| format!("sync data-format manifest directory: {error}"))
+}
+
+/// Path of the unlocked sidecar carrying the lock's owner description.
+fn owner_marker_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(DATA_DIRECTORY_LOCK_OWNER_FILE)
+}
+
+/// Publishes the owner description where a contending process can read it.
+///
+/// Best-effort: the marker is diagnostic, so a write failure must not stop a
+/// node that already holds the lock.
+fn write_owner_marker(path: &std::path::Path, marker: &str) {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(path) {
+        let _ = file.write_all(marker.as_bytes());
+        let _ = file.sync_data();
+    }
+}
+
+/// Reads the owner description of a lock held by another process.
+///
+/// Prefers the unlocked sidecar, which is readable on every platform, and falls
+/// back to the in-file marker so a lock taken by a release that only wrote there
+/// is still attributed on Unix.
+fn read_owner_marker(data_dir: &std::path::Path, file: &mut fs::File) -> Option<String> {
+    if let Ok(mut sidecar) = fs::File::open(owner_marker_path(data_dir)) {
+        if let Some(marker) = read_lock_marker(&mut sidecar) {
+            return Some(marker);
+        }
+    }
+    read_lock_marker(file)
 }
 
 fn read_lock_marker(file: &mut fs::File) -> Option<String> {
@@ -5687,6 +5736,7 @@ fn reject_unowned_reindex_entries(output: &std::path::Path) -> Result<(), String
     let allowed = [
         VALIDATION_OWNER_FILE,
         DATA_DIRECTORY_LOCK_FILE,
+        DATA_DIRECTORY_LOCK_OWNER_FILE,
         DATA_FORMAT_MANIFEST_FILE,
         "headers.redb",
         "chainstate.redb",
@@ -7419,6 +7469,7 @@ fn cleanup_completed_validation_dir(
             Some(
                 VALIDATION_OWNER_FILE
                     | DATA_DIRECTORY_LOCK_FILE
+                    | DATA_DIRECTORY_LOCK_OWNER_FILE
                     | "chainstate.redb"
                     | "headers.redb"
                     | "peers.redb"
@@ -19942,15 +19993,10 @@ mod tests {
         let first = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
         let error = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap_err();
         assert!(error.contains("already locked"));
-        // The owner detail is read from the contending handle. Unix advisory
-        // locks permit that read; Windows locks are mandatory, so the range
-        // stays unreadable and the message degrades to the contention notice
-        // alone.
-        #[cfg(unix)]
-        {
-            assert!(error.contains("pid="));
-            assert!(error.contains("network=regtest"));
-        }
+        // Owner detail now comes from an unlocked sidecar, so it is reported on
+        // every platform rather than only where locks are advisory.
+        assert!(error.contains("pid="));
+        assert!(error.contains("network=regtest"));
         drop(first);
         DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
 
@@ -19963,6 +20009,48 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o077, 0);
         }
+    }
+
+    #[test]
+    fn lock_owner_sidecar_is_readable_under_contention_and_removed_on_release() {
+        let directory = TempDir::new().unwrap();
+        let sidecar = directory.path().join(DATA_DIRECTORY_LOCK_OWNER_FILE);
+        assert!(!sidecar.exists());
+
+        let held = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        // Readable through an unrelated handle while the lock is held. This is
+        // what fails on Windows if the marker lives inside the locked file.
+        let published = fs::read_to_string(&sidecar).unwrap();
+        assert!(published.contains("pid="));
+        assert!(published.contains("network=regtest"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&sidecar).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+
+        // A read-only audit must not disturb it.
+        assert!(DataDirectoryReadLock::acquire(directory.path()).is_err());
+        assert_eq!(fs::read_to_string(&sidecar).unwrap(), published);
+
+        drop(held);
+        assert!(
+            !sidecar.exists(),
+            "releasing the lock must not leave a stale owner marker"
+        );
+
+        // A lock taken by a release that only wrote the in-file marker is still
+        // attributed, so the sidecar is an addition rather than a requirement.
+        let legacy = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        fs::remove_file(&sidecar).unwrap();
+        let error = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap_err();
+        assert!(error.contains("already locked"));
+        #[cfg(unix)]
+        assert!(error.contains("pid="));
+        drop(legacy);
     }
 
     #[test]

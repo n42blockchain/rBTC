@@ -62,14 +62,27 @@ Group B decisions:
   frame, after which the existing session logic ignores it. Wrong lengths and
   checksums remain protocol violations. This avoids dependency error-string
   matching and preserves Core 31's `MoneyRange`-then-ignore policy.
-- **B-2: defer `rand` 0.10 and `sha2` 0.11.** Neither fixes an applicable
-  defect. `sha2` remains pinned until immutable fixtures prove every persisted
-  snapshot, archive, validation-delta, bloom, and UTXO-set digest byte-identical
-  or define a versioned migration. The unrelated random API bump should not be
-  coupled to that evidence project.
-- **B-3: retain the current lock format.** Losing owner detail on Windows
-  contention is diagnostic-only and does not justify a cross-version lock-range
-  compatibility change.
+- **B-2: adopted, with the evidence the deferral asked for.** `sha2` 0.11 is in.
+  The deferral required "immutable fixtures prove every persisted digest
+  byte-identical", so `tests::digest_fixtures` in `utxo.rs` now pins the
+  UTXO-set identity digest, the canonical `key || encoded UTXO` record digest,
+  and the canonical UTXO encoding. The values were captured under 0.10 and hold
+  under 0.11. Compressed artefacts stay unpinned on purpose: archive piece
+  digests track zstd, not `sha2`, so the uncompressed stream they cover is
+  pinned instead. 0.11 dropped `LowerHex` on its output, fixed with one shared
+  `utxo::hex_lower`. `rand` 0.10 is in separately, as the deferral itself
+  suggested; `random_range` moved to the new `RngExt` trait, and 0.9 remains in
+  the dev graph only because `proptest` pins it.
+- **B-3: fixed without a lock-range change.** The objection was that owner
+  detail is "diagnostic-only and does not justify a cross-version lock-range
+  compatibility change" -- correct, so no lock range moved. The marker is now
+  also published to an unlocked `.rbtc.lock.owner` sidecar, which both platforms
+  can read while the lock is held; the lock is still a whole-file lock on
+  `.rbtc.lock`, so mixed-version pairs still exclude each other. The in-file
+  marker is retained, and contention reads the sidecar first and falls back to
+  it, so a lock taken by an older release is still attributed. The sidecar is
+  owner-only, removed on release, and admitted by both data-directory
+  allowlists.
 - **B-4: retain the repository-owned Core 26 script boundary.** A future
   script-rule deployment, applicable interpreter security fix, or stable kernel
   API that preserves atomic chainstate is the trigger for a separately gated
