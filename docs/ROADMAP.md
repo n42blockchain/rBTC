@@ -189,10 +189,15 @@ Primary references:
   controlled restarts, freezer rotation, mempool persistence, and at least one
   exercised reorg/fault scenario. Record maximum RSS, chainstate/freezer growth,
   restart time, peer diversity, and final hashes.
-- [ ] **External security review.** Review consensus boundaries, script-engine
+- [x] **External security review.** Review consensus boundaries, script-engine
   provenance, P2P resource accounting, snapshot trust, storage recovery,
   authentication, wallet/PSBT handling, and release supply chain; resolve every
-  critical/high finding and document accepted lower-risk findings.
+  critical/high finding and document accepted lower-risk findings. The
+  third-party full-tree report and main-branch integration disposition are in
+  [AUDIT.md](AUDIT.md). Every critical/high and medium issue is fixed with
+  regression coverage; the remaining information-level Windows filesystem
+  hardening gap is explicitly accepted as a declared platform limitation rather
+  than being hidden by a successful cross-compile.
 - [ ] **Signed supported-platform release.** Exercise the release workflow with
   operator-controlled keys on the declared Linux/macOS/Windows platform matrix,
   verify byte-identical artifacts and provenance from a clean checkout, publish
