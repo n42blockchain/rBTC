@@ -794,6 +794,27 @@ is expected O(1) and a maximum batch is expected O(50,000), not O(3.2 million).
 Regression coverage exercises aliasing, replacement, byte accounting, and the
 64-entry eviction boundary.
 
+### Post-audit fuzz-workspace assurance closure
+
+A final clean-tree supply-chain replay exposed an independent test-assurance
+gap outside the auditor's code patches. Cargo patches apply at a workspace
+root, and `fuzz/` is deliberately its own workspace, so it had not inherited
+the repository root's vendored `bitcoinconsensus` and `redb` patches. Its stale
+lock file still named the crates.io implementations; after current root
+dependencies were resolved, a locked build failed because the public
+`bitcoinconsensus` crate does not contain rBTC's reviewed Taproot spent-output
+and transaction-batch ABI. Consequently the fuzz workflow could not be treated
+as evidence that the production interpreter/storage implementations were under
+test.
+
+The fuzz manifest now repeats both path patches explicitly, its lock file names
+the path packages and current root dependency closure, and CI performs a locked
+check plus warning-denying Clippy before running targets. The regression script
+uses the exact dated nightly installed by CI instead of the moving `+nightly`
+alias. A local locked check, Clippy run, RustSec/cargo-deny pass, and all twelve
+ASan seed-corpus targets completed against the corrected graph. This was a
+build/test-provenance issue, not a change to runtime consensus behavior.
+
 ## Recommendations
 
 1. Add a Windows job to `.github/workflows` that runs `cargo test --locked --all-features`.
