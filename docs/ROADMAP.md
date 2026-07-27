@@ -188,7 +188,12 @@ Primary references:
   at least seven consecutive days across natural tip updates, peer churn,
   controlled restarts, freezer rotation, mempool persistence, and at least one
   exercised reorg/fault scenario. Record maximum RSS, chainstate/freezer growth,
-  restart time, peer diversity, and final hashes.
+  restart time, peer diversity, and final hashes. The immutable-baseline run
+  started at `2026-07-26T22:19:44Z`; its PID-switching monitor now records
+  process, peer-group, tip/hash, freezer, persistent-store, and disk evidence,
+  and its fail-closed report enforces the seven-day, both-network restart, and
+  fault-injection gates. Current evidence and the remaining scheduled exercises
+  are in [PUBLIC_NETWORK_SOAK.md](PUBLIC_NETWORK_SOAK.md).
 - [x] **External security review.** Review consensus boundaries, script-engine
   provenance, P2P resource accounting, snapshot trust, storage recovery,
   authentication, wallet/PSBT handling, and release supply chain; resolve every
