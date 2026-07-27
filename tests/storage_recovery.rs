@@ -1,7 +1,10 @@
 //! Process-level crash and damaged-file recovery checks for unified chainstate.
 
+use std::fs;
+// Only the SIGKILL recovery test below re-executes this binary, and signal-based
+// termination has no Windows equivalent.
+#[cfg(unix)]
 use std::{
-    fs,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -53,6 +56,7 @@ fn open_chainstate(path: impl AsRef<std::path::Path>, quick_repair: bool) -> Red
     .unwrap()
 }
 
+#[cfg(unix)]
 fn assert_consistent(store: &RedbChainStore) {
     let tip = store.execution().tip().unwrap();
     if tip.height == 0 {

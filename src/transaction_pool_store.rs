@@ -956,12 +956,21 @@ fn validate_file_before_open(path: &Path) -> Result<(), TransactionPoolStoreErro
     Ok(())
 }
 
+/// Restricts a freshly created database file to the owning user.
+///
+/// Windows has no portable equivalent of the Unix mode bits, so this is a
+/// documented no-op there and the file inherits its directory's ACL.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn restrict_file_permissions(path: &Path) -> Result<(), TransactionPoolStoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|error| TransactionPoolStoreError::File(error.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
     Ok(())
 }

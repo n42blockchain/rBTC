@@ -258,7 +258,20 @@ struct OsLedgerDurability;
 
 impl LedgerDurability for OsLedgerDurability {
     fn sync(&self, _point: LedgerSyncPoint, path: &Path) -> io::Result<()> {
-        File::open(path)?.sync_all()
+        #[cfg(unix)]
+        {
+            File::open(path)?.sync_all()
+        }
+        // Windows cannot open a directory through `File::open` without
+        // `FILE_FLAG_BACKUP_SEMANTICS`, and offers no portable directory fsync.
+        // Attempting it fails every archive publication with
+        // `ERROR_ACCESS_DENIED`, so the sync point is a documented no-op there,
+        // matching `sync_directory` on the snapshot and audit-log paths.
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(())
+        }
     }
 }
 

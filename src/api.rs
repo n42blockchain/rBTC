@@ -512,7 +512,10 @@ fn sync_wallet_audit_parent(path: &FsPath) -> Result<(), String> {
         })
 }
 
+/// Windows offers no portable directory fsync, so a fresh audit log's directory
+/// entry is not explicitly durable there.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_wallet_audit_parent(_: &FsPath) -> Result<(), String> {
     Ok(())
 }
@@ -568,7 +571,10 @@ fn validate_wallet_audit_identity(
     Ok(())
 }
 
+/// Windows metadata exposes no stable device/inode pair, so the audit log's
+/// identity is not re-checked across the reopen there.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn validate_wallet_audit_identity(
     _: &FsPath,
     _: &std::fs::Metadata,

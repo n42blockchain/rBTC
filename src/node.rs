@@ -6915,6 +6915,11 @@ fn quarantine_and_remove_validation_dir_with_sync(
     Ok(())
 }
 
+/// Makes a directory's entries durable after an atomic rename.
+///
+/// Windows has no portable directory fsync, so this is a documented no-op
+/// there: a rename is ordered but its directory entry is not explicitly flushed.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn sync_directory(path: &std::path::Path) -> io::Result<()> {
     #[cfg(unix)]
     {
