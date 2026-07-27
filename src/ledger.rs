@@ -106,6 +106,17 @@ pub struct LedgerBlockHashReport {
     pub hashes: Vec<(u32, bitcoin::BlockHash)>,
 }
 
+/// Contiguous consensus block bytes loaded with one decode per archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerBlockBatch {
+    /// Height of the first returned block.
+    pub first_height: u32,
+    /// Exact canonical record bytes retained in this batch.
+    pub record_bytes: u64,
+    /// Consensus-serialized blocks in ascending height order.
+    pub blocks: Vec<Vec<u8>>,
+}
+
 /// Deterministic manual-prefix prune plan.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LedgerPrunePlan {
@@ -748,6 +759,87 @@ impl PrunedBlockLedger {
             last_height,
             verified_record_bytes,
             hashes,
+        })
+    }
+
+    /// Reads a bounded contiguous batch while decoding each overlapping
+    /// archive no more than once.
+    pub fn read_block_batch(
+        &self,
+        first_height: u32,
+        max_blocks: u32,
+        max_record_bytes: u64,
+    ) -> Result<LedgerBlockBatch, LedgerError> {
+        if max_blocks == 0
+            || max_blocks > u32::from(MAX_AUDIT_SLOT_NAMESPACE)
+            || max_record_bytes == 0
+        {
+            return Err(LedgerError::Invalid("invalid retained block batch bound"));
+        }
+        let _guard = self.lock();
+        let index = self.read_index()?;
+        let mut next_height = first_height;
+        let mut record_bytes = 0_u64;
+        let mut blocks = Vec::with_capacity(usize::try_from(max_blocks).expect("u32 fits usize"));
+        for segment in &index.segments {
+            let segment_end = segment_end_inclusive(segment)?;
+            if segment_end < next_height {
+                continue;
+            }
+            if segment.first_height > next_height {
+                break;
+            }
+            let (manifest, segment_blocks) = read_archive(self.slot_path(segment.slot))?;
+            if manifest.first_height != segment.first_height
+                || manifest.block_count != segment.block_count
+            {
+                return Err(LedgerError::Invalid("archive does not match ledger index"));
+            }
+            let offset = usize::try_from(next_height - segment.first_height)
+                .expect("archive offset fits usize");
+            for block in segment_blocks.into_iter().skip(offset) {
+                let next_record_bytes = record_bytes
+                    .checked_add(4)
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(u64::try_from(block.len()).expect("block length fits u64"))
+                    })
+                    .ok_or(LedgerError::Invalid("retained block batch byte overflow"))?;
+                if next_record_bytes > max_record_bytes {
+                    if blocks.is_empty() {
+                        return Err(LedgerError::Invalid(
+                            "retained block batch byte budget was exhausted",
+                        ));
+                    }
+                    return Ok(LedgerBlockBatch {
+                        first_height,
+                        record_bytes,
+                        blocks,
+                    });
+                }
+                record_bytes = next_record_bytes;
+                blocks.push(block);
+                next_height = next_height
+                    .checked_add(1)
+                    .ok_or(LedgerError::Invalid("height overflow"))?;
+                if blocks.len() == usize::try_from(max_blocks).expect("u32 fits usize") {
+                    return Ok(LedgerBlockBatch {
+                        first_height,
+                        record_bytes,
+                        blocks,
+                    });
+                }
+            }
+        }
+        if blocks.is_empty() {
+            return Err(LedgerError::Invalid(
+                "requested retained block batch is unavailable",
+            ));
+        }
+        Ok(LedgerBlockBatch {
+            first_height,
+            record_bytes,
+            blocks,
         })
     }
 
@@ -2457,6 +2549,32 @@ mod tests {
                 "requested retained block range is incomplete"
             ))
         ));
+    }
+
+    #[test]
+    fn reads_bounded_contiguous_batches_across_archive_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 10_000_000,
+            slots: 10,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.append(10, &[vec![1], vec![2]]).unwrap();
+        ledger.append(12, &[vec![3], vec![4]]).unwrap();
+        let batch = ledger.read_block_batch(11, 3, 100).unwrap();
+        assert_eq!(batch.first_height, 11);
+        assert_eq!(batch.blocks, vec![vec![2], vec![3], vec![4]]);
+        assert_eq!(batch.record_bytes, 15);
+        let byte_limited = ledger.read_block_batch(10, 4, 10).unwrap();
+        assert_eq!(byte_limited.blocks, vec![vec![1], vec![2]]);
+        assert!(matches!(
+            ledger.read_block_batch(10, 1, 4),
+            Err(LedgerError::Invalid(
+                "retained block batch byte budget was exhausted"
+            ))
+        ));
+        assert!(ledger.read_block_batch(9, 1, 100).is_err());
     }
 
     #[test]

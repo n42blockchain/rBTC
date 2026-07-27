@@ -383,6 +383,44 @@ impl RedbExecutionStore {
         Ok(())
     }
 
+    /// Removes a completed temporary validation ceiling before promoting a
+    /// separately rebuilt chainstate into an ordinary live node directory.
+    ///
+    /// Both the stored target and durable execution tip must exactly equal the
+    /// caller's expected identity. A partial or differently targeted rebuild
+    /// therefore cannot be promoted by clearing its safety boundary.
+    pub fn clear_completed_validation_target(
+        &self,
+        expected: ExecutionTip,
+    ) -> Result<(), ExecutionStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            let stored = meta
+                .get(VALIDATION_TARGET_KEY)?
+                .map(|value| decode_tip(value.value()))
+                .transpose()?
+                .ok_or(ExecutionStoreError::ValidationTargetExtensionUnbound)?;
+            let tip = meta
+                .get(TIP_KEY)?
+                .map(|value| decode_tip(value.value()))
+                .transpose()?
+                .ok_or(ExecutionStoreError::Malformed("missing execution tip"))?;
+            if stored != expected || tip != expected {
+                return Err(ExecutionStoreError::ValidationTargetMismatch {
+                    stored_height: stored.height,
+                    stored_hash: stored.hash,
+                    requested_height: expected.height,
+                    requested_hash: expected.hash,
+                });
+            }
+            meta.remove(VALIDATION_TARGET_KEY)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Binds this execution database to a canonical consensus configuration.
     ///
     /// A fresh database accepts the first selected configuration. Once bound it
@@ -834,8 +872,22 @@ mod tests {
         store.advance(first.hash, second).unwrap();
         drop(store);
 
-        let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
+        let reopened = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
         assert_eq!(reopened.validation_target().unwrap(), Some(second));
+        assert!(matches!(
+            reopened.clear_completed_validation_target(first),
+            Err(ExecutionStoreError::ValidationTargetMismatch { .. })
+        ));
+        reopened.clear_completed_validation_target(second).unwrap();
+        assert_eq!(reopened.validation_target().unwrap(), None);
+        drop(reopened);
+        assert_eq!(
+            RedbExecutionStore::open(path, Network::Regtest)
+                .unwrap()
+                .validation_target()
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

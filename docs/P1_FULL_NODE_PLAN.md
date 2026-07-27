@@ -170,7 +170,13 @@ replays the header graph and correlates the maximum-work active chain,
 execution tip, complete freezer audit, and a bounded retained block/undo
 suffix. Its one-pass-per-archive decoder uses one block-sized buffer, reports
 redb's recovery-capable open semantics, refuses missing stores, and emits no
-semantic repair. Item 3 is complete; items 2 and 5 remain.
+semantic repair. The local half of item 2 is complete:
+`--reindex-from-freezer OUTPUT` requires clean block coverage from height 1 to
+the fully replayed maximum-work header tip, ignores the source chainstate, and
+rebuilds a separately owned output with batched archive reads, parallel
+structure validation, overlapped staging/UTXO prefetch, sorted commits,
+crash-resume, and verified promotion. Authenticated-peer
+`reindex-chainstate` and item 5 remain.
 
 Item 4 is complete. Every persistent subsystem has an
 explicit version in the strict network-bound data-format inventory. A missing

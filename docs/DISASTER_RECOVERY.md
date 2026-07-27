@@ -79,7 +79,9 @@ is durable; a crash before publication remains the old readable generation.
   The reduced index is durable before physical deletion, so restart exposes
   either the old complete prefix or the planned retained suffix.
 - **Chainstate corruption with complete local history:** preserve the failed
-  directory for analysis and rebuild into a separate directory. Do not overwrite
+  directory for analysis and run `--reindex-from-freezer OUTPUT`. The command
+  refuses incomplete or dirty history, never opens the failed source
+  chainstate, and promotes only a separately verified output. Do not overwrite
   the only copy during diagnosis.
 - **Chainstate corruption with a pruned freezer:** local reindex is impossible.
   Revalidate from genesis using authenticated full-history peers into a fresh

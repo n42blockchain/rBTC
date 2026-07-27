@@ -129,6 +129,33 @@ empty-store initialization. A clean JSON report proves the checked
 maximum-work-header/execution/freezer/undo relationships, not that pruned
 history is locally available for reindex.
 
+To rebuild a damaged chainstate when the stopped source still has complete
+block history, use a different output directory:
+
+```text
+rbtcd --network NETWORK --data-dir SOURCE \
+  --reindex-from-freezer OUTPUT \
+  --validation-batch-size 64 \
+  --bulk-validation-cache-bytes 8589934592
+```
+
+The command requires a versioned source whose clean freezer range is exactly
+height 1 through the fully validated maximum-work header tip. It deliberately
+does not open or trust `SOURCE/chainstate.redb`. `OUTPUT` must be empty or an
+exact resumable output previously owned by this command, and must not alias,
+contain, or sit inside `SOURCE`. Each aggregate archive range is loaded once;
+block structure checks are parallel, freezer staging overlaps UTXO prefetch,
+and full consensus/script execution writes sorted atomic chainstate batches.
+`--validation-batch-size` is 1–1,008, `--validation-pause-ms` can deliberately
+throttle checkpoints, `--validation-deferred-repair` trades faster bulk writes
+for a potentially slower unclean-restart repair, and the prune/cache/free-space
+options retain their normal hard bounds. A durable owner marker prevents an
+incomplete output from starting as a live node. On restart the command
+truncates unexecuted staging and resumes from its durable execution tip. It
+removes the marker only after exact target completion and bounded cross-store
+verification; switching service to `OUTPUT` remains an explicit operator
+action.
+
 Manual freezer pruning uses a mandatory two-phase plan:
 
 ```text

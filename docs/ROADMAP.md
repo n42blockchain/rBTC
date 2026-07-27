@@ -260,7 +260,12 @@ optional where appropriate, and host-runtime compatible.
   fully replays stored headers and checks maximum-work header/execution/freezer/
   retained-block/undo consistency with bounded one-pass archive decoding,
   refusing missing stores and making redb recovery semantics explicit.
-  Reindex/repair execution and prune/index policy keep this broader item open.
+  `--reindex-from-freezer OUTPUT` now rebuilds into a non-aliasing owned
+  directory only when a clean source covers height 1 through the replayed
+  maximum-work tip; it ignores source chainstate, batches archive reads,
+  overlaps staging and UTXO prefetch, resumes crashes, and promotes only after
+  exact-target cross-store verification. Authenticated-peer reindex and
+  prune/index policy keep this broader item open.
   The strict network-bound root manifest now inventories every subsystem
   schema, migrates legacy absence only after successful preflight, and refuses
   future rollback before mutable database open. Backup/restore, rollback, and
