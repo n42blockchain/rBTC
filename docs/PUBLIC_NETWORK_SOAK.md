@@ -18,14 +18,13 @@ Testnet4 nodes run from separate data directories and PID files. Updating a PID
 file after a restart preserves one metrics timeline; it does not reset the
 baseline clock.
 
-At `2026-07-27T12:08Z`, both nodes had remained alive for about 13.8 hours.
-Bitcoin was at height 959839 and Testnet4 at 145938, with execution equal to the
+At `2026-07-27T12:18Z`, both nodes had remained alive for about 14 hours.
+Bitcoin was at height 959840 and Testnet4 at 145944, with execution equal to the
 maximum-work header tip. The monitor observed six current Bitcoin peer network
 groups and nine Testnet4 groups. Peak RSS so far was 7,216,176 KiB and 749,328
 KiB respectively. Both persistent mempool stores were non-empty (2,379,776 and
-2,121,728 bytes). The upgraded detailed sample already observed Bitcoin freezer
-publication advance from slot 212 to 213; Testnet4 needs a later natural block
-before its first measured rotation.
+2,121,728 bytes). The detailed samples observed Bitcoin freezer publication
+advance from slot 212 to 214 and Testnet4 from 320 to 323.
 
 These are progress observations, not a completed gate.
 
@@ -45,6 +44,14 @@ These are progress observations, not a completed gate.
 The monitor accepts either a numeric PID or a strict regular PID file. A missing
 or exited process is recorded without terminating the collector, so a short
 controlled restart remains visible instead of splitting the soak timeline.
+
+`scripts/public-network-soak-exercise.sh` performs a bounded recovery exercise.
+It refuses to signal a PID unless the baseline is at least one day old, the
+recorded immutable binary still hashes correctly, the process command names
+`rbtcd` and the exact data directory, and the latest measured header/execution
+tips agree. It atomically switches the PID file, waits for the replacement to
+reach a consistent tip no lower than the pre-exercise tip, and records timings,
+hashes, persistent-store sizes, and success or failure in the event stream.
 
 `scripts/public-network-soak-report.sh` is a fail-closed finalizer. Its normal
 seven-day invocation is:
@@ -75,15 +82,25 @@ recorded identity.
 
 After at least one full day of ordinary operation:
 
-1. Record both tips and persistent-store sizes, gracefully stop Bitcoin, reopen
-   the same directory with `state/rbtcd-soak-start`, update `state/bitcoin.pid`,
-   measure time to equal header/execution tips, and append a
-   `scenario=controlled-restart status=completed` event.
-2. Inject an abrupt Testnet4 process termination, leave the collector running,
-   reopen the same directory with the immutable binary, update
-   `state/testnet4.pid`, require storage recovery and tip equality, and append
-   both `scenario=controlled-restart status=completed` and
-   `scenario=fault-abrupt-kill status=completed` evidence.
+1. Gracefully restart Bitcoin with:
+
+   ```bash
+   scripts/public-network-soak-exercise.sh \
+     /Users/jieliu/Documents/n42/rBTC-public-soak-20260726 bitcoin \
+     /Users/jieliu/Documents/n42/rBTC-mainnet-assumeutxo-20260725 graceful
+   ```
+
+2. Inject an abrupt Testnet4 termination and verify recovery with:
+
+   ```bash
+   scripts/public-network-soak-exercise.sh \
+     /Users/jieliu/Documents/n42/rBTC-public-soak-20260726 testnet4 \
+     /Users/jieliu/Documents/n42/rBTC-testnet4-full-20260725 abrupt
+   ```
+
+   The helper records both the controlled-restart and fault-abrupt-kill
+   completion evidence only after the replacement reaches matching
+   header/execution tips.
 3. Continue through the seven-day boundary. Then retain final hashes, peak RSS,
    data/freezer deltas, peer diversity, restart times, ordinary peer failures,
    and the generated fail-closed report.
