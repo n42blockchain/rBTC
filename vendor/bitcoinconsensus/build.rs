@@ -3,20 +3,13 @@ extern crate cc;
 use std::env;
 
 fn main() {
-    // Check whether we can use 64-bit compilation
-    let use_64bit_compilation = if env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap() == "64" {
-        let check = cc::Build::new()
+    let sixty_four_bit_target = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap() == "64";
+    let native_int128 = sixty_four_bit_target
+        && cc::Build::new()
             .file("depend/check_uint128_t.c")
             .cargo_metadata(false)
             .try_compile("check_uint128_t")
             .is_ok();
-        if !check {
-            println!("cargo:warning=Compiling in 32-bit mode on a 64-bit architecture due to lack of uint128_t support.");
-        }
-        check
-    } else {
-        false
-    };
     let target = env::var("TARGET").expect("TARGET was not set");
     let is_big_endian = env::var("CARGO_CFG_TARGET_ENDIAN").expect("No endian is set") == "big";
     let mut base_config = cc::Build::new();
@@ -61,13 +54,27 @@ fn main() {
             secp_config.define("WORDS_BIGENDIAN", "1");
         }
 
-        if use_64bit_compilation {
-            secp_config
-                .define("USE_FIELD_5X52", "1")
-                .define("USE_SCALAR_4X64", "1")
-                .define("HAVE___INT128", "1");
-        } else {
-            secp_config.define("USE_FIELD_10X26", "1").define("USE_SCALAR_8X32", "1");
+        // This libsecp256k1 no longer reads USE_FIELD_*/USE_SCALAR_* at all; the
+        // field (5x52 vs 10x26) and scalar (4x64 vs 8x32) implementations are
+        // both selected by SECP256K1_WIDEMUL_INT128, which `util.h` derives on
+        // its own. It picks the 64-bit limbs from a native __int128 where one
+        // exists and otherwise from the `int128_struct` intrinsic path on
+        // 64-bit MSVC, so the only thing worth doing here is asserting that a
+        // 64-bit target really did get them.
+        if native_int128 {
+            secp_config.define("HAVE___INT128", "1");
+        }
+        if sixty_four_bit_target
+            && secp_config
+                .clone()
+                .file("depend/check_widemul_int128.c")
+                .cargo_metadata(false)
+                .try_compile("check_widemul_int128")
+                .is_err()
+        {
+            println!(
+                "cargo:warning=libsecp256k1 fell back to 32-bit limb arithmetic on a 64-bit target; signature verification will be substantially slower."
+            );
         }
 
         secp_config.compile("libsecp256k1.a");
