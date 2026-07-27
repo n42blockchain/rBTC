@@ -50,7 +50,7 @@ rBTC is **not yet a production release** and must not be trusted with mainnet fu
 
 ### Supported platforms
 
-Unix is the primary target. Consensus, storage atomicity, and abrupt-kill crash recovery are verified on every platform, but three hardening measures rely on APIs the Rust standard library exposes only on Unix, and are documented no-ops elsewhere:
+Unix is the primary target, but CI links and runs the full test suite on `windows-latest` as well, because several defect classes are structurally invisible on Unix — directory `fsync`, `#[cfg(unix)]`-gated no-ops, and file-lock error classification have each regressed at least once. Consensus, storage atomicity, and abrupt-kill crash recovery are verified on every platform, but three hardening measures rely on APIs the Rust standard library exposes only on Unix, and are documented no-ops elsewhere:
 
 - The mempool, rebroadcast, and fee-estimator databases are created `0600` on Unix. On Windows they inherit their directory's ACL, so the data directory itself must restrict access.
 - Directory `fsync` after an atomic rename — used by snapshot publication, block-archive slot rotation, and the authorization audit log — has no portable Windows equivalent. Renames remain ordered, but the directory entry is not explicitly flushed.

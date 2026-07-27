@@ -872,9 +872,12 @@ build/test-provenance issue, not a change to runtime consensus behavior.
 
 ## Recommendations
 
-1. Add a Windows job to `.github/workflows` that runs `cargo test --locked --all-features`.
-   Every one of A-04, A-05, A-06, and A-10 would have been caught by a job that
-   links and runs tests on `x86_64-pc-windows-msvc`.
+1. ~~Add a Windows job to `.github/workflows`~~ — **done**. The `windows` job in
+   `ci.yml` runs `cargo clippy -D warnings` and `cargo test --locked --all-features`
+   on `windows-latest`. Every one of A-04, A-05, A-06, A-10, A-24, A-25, and A-26
+   would have been caught by it. It must link and run the tests, not merely
+   `cargo check`: A-04 and A-05 were link failures, and A-06, A-24 and A-26 only
+   appear at runtime.
 2. Extend `tests/core_consensus_vectors.rs` with Core's sigop-counting vectors.
    A-01 lived in a consensus-critical helper that the existing Core vector suite
    did not exercise.
