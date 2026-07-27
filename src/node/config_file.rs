@@ -11,13 +11,14 @@ use std::{
 use bitcoin::Network;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024;
-const LIST_KEYS: [&str; 6] = [
+const LIST_KEYS: [&str; 7] = [
     "connect",
     "dns_seed",
     "signetseednode",
     "testactivationheight",
     "vbparams",
     "whitelist",
+    "onlynet",
 ];
 const BOOL_KEYS: [&str; 9] = [
     "block_filter_index",
@@ -30,7 +31,7 @@ const BOOL_KEYS: [&str; 9] = [
     "txindex",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 32] = [
+const VALUE_KEYS: [&str; 33] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -57,6 +58,7 @@ const VALUE_KEYS: [&str; 32] = [
     "network",
     "prune_blocks",
     "prune_max_bytes",
+    "proxy",
     "rpc_auth_token_file",
     "signetchallenge",
     "validation_batch_size",
@@ -377,8 +379,10 @@ fn flag_for_key(key: &str) -> &'static str {
         "max_upload_bytes_per_day" => "--max-upload-bytes-per-day",
         "minimum_free_bytes" => "--minimum-free-bytes",
         "network" => "--network",
+        "onlynet" => "--onlynet",
         "prune_blocks" => "--prune-blocks",
         "prune_max_bytes" => "--prune-max-bytes",
+        "proxy" => "--proxy",
         "rpc_auth_token_file" => "--rpc-auth-token-file",
         "signetchallenge" => "--signetchallenge",
         "signetseednode" => "--signetseednode",
@@ -446,6 +450,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--once"
             | "--prune-blocks"
             | "--prune-max-bytes"
+            | "--proxy"
             | "--rpc-auth-token-file"
             | "--spent-output-index"
             | "--signetchallenge"
@@ -457,6 +462,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--validation-pause-ms"
             | "--validation-quick-repair"
             | "--vbparams"
+            | "--onlynet"
             | "--wallet-auth-token-file"
             | "--wallet-descriptors"
             | "--whitelist"
@@ -496,12 +502,14 @@ fn option_group(flag: &str) -> &'static str {
         "--network" => "network",
         "--prune-blocks" => "prune-blocks",
         "--prune-max-bytes" => "prune-max-bytes",
+        "--proxy" => "proxy",
         "--rpc-auth-token-file" => "rpc-auth-token-file",
         "--signetchallenge" => "signetchallenge",
         "--testactivationheight" => "testactivationheight",
         "--validation-batch-size" => "validation-batch-size",
         "--validation-pause-ms" => "validation-pause-ms",
         "--vbparams" => "vbparams",
+        "--onlynet" => "onlynet",
         "--wallet-auth-token-file" => "wallet-auth-token-file",
         "--wallet-descriptors" => "wallet-descriptors",
         "--whitelist" => "whitelist",

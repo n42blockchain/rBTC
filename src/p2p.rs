@@ -2124,6 +2124,84 @@ pub async fn connect_outbound(
 ) -> Result<PeerSession<TcpStream>, P2pError> {
     validate_user_agent(&user_agent)?;
     let stream = TcpStream::connect(remote).await?;
+    complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+}
+
+/// Opens an outbound connection through a no-authentication SOCKS5 proxy and
+/// completes the ordinary Bitcoin v1 handshake.
+///
+/// The destination is encoded as an IP literal, so this operation performs no
+/// local DNS lookup. Proxy authentication is deliberately unsupported: node
+/// configuration and logs never need to retain proxy credentials.
+pub async fn connect_outbound_via_socks5(
+    proxy: SocketAddr,
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+) -> Result<PeerSession<TcpStream>, P2pError> {
+    validate_user_agent(&user_agent)?;
+    let mut stream = TcpStream::connect(proxy).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0_u8; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting != [5, 0] {
+        return Err(P2pError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SOCKS5 proxy rejected no-authentication method",
+        )));
+    }
+    let mut request = Vec::with_capacity(22);
+    request.extend_from_slice(&[5, 1, 0]);
+    match remote.ip() {
+        IpAddr::V4(ip) => {
+            request.push(1);
+            request.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            request.push(4);
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&remote.port().to_be_bytes());
+    stream.write_all(&request).await?;
+    let mut response = [0_u8; 4];
+    stream.read_exact(&mut response).await?;
+    if response[0] != 5 || response[1] != 0 || response[2] != 0 {
+        return Err(P2pError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("SOCKS5 proxy connect failed with reply {}", response[1]),
+        )));
+    }
+    let address_bytes = match response[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await?;
+            usize::from(length[0])
+        }
+        _ => {
+            return Err(P2pError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SOCKS5 proxy returned an invalid address type",
+            )));
+        }
+    };
+    let mut ignored = vec![0_u8; address_bytes + 2];
+    stream.read_exact(&mut ignored).await?;
+    complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+}
+
+async fn complete_outbound_handshake(
+    stream: TcpStream,
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+) -> Result<PeerSession<TcpStream>, P2pError> {
     let local_address = stream.local_addr()?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4712,5 +4790,77 @@ mod tests {
             block_hash
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connection_uses_ip_literal_and_completes_handshake() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_listener.local_addr().unwrap();
+        let target_server = tokio::spawn(async move {
+            let (stream, _) = target_listener.accept().await.unwrap();
+            let mut transport = V1Transport::new(stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Version(_)
+            ));
+            transport
+                .write_message(NetworkMessage::Version(version(77)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Verack
+            ));
+            transport
+                .write_message(NetworkMessage::Verack)
+                .await
+                .unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = proxy_listener.local_addr().unwrap();
+        let proxy_server = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            client.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0_u8; 10];
+            client.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 1]);
+            assert_eq!(
+                &request[4..8],
+                &target
+                    .ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap()
+                    .octets()
+            );
+            assert_eq!(u16::from_be_bytes([request[8], request[9]]), target.port());
+            let mut upstream = TcpStream::connect(target).await.unwrap();
+            client
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .unwrap();
+        });
+
+        let client = connect_outbound_via_socks5(
+            proxy,
+            target,
+            Network::Regtest.magic(),
+            76,
+            "/rbtcd:socks-test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.remote_version().nonce, 77);
+        drop(client);
+        target_server.await.unwrap();
+        proxy_server.await.unwrap();
     }
 }

@@ -255,10 +255,10 @@ rebuild and reorg results match a clean build byte-for-byte.
 
 ### P1.6 — privacy and reachability
 
-Add proxy/`onlynet`, Tor and I2P outbound transports, DNS isolation, bind
-equivalents, address-network filtering, and tests preventing
-cross-network leaks. Automatic port mapping remains optional and off by
-default.
+IPv4/IPv6 `onlynet`, a no-authentication SOCKS5 transport, resolver fail-closed
+proxy mode, and candidate-family filtering are complete. Native onion/I2P
+address persistence and name-proxy discovery remain separate follow-ups;
+automatic port mapping remains optional and off by default.
 
 The bounded exact-IP `whitelist` role is complete: preferred sources bypass
 only source-group admission, remain subject to the global hard ceiling and

@@ -292,9 +292,11 @@ optional where appropriate, and host-runtime compatible.
   `getindexinfo`, and bounded authenticated lookup RPCs. Serving those filters
   on inbound BIP157 P2P messages belongs to the inbound-peer service item
   below, because an outbound-only node has no peer request surface.
-- [ ] **Network privacy and reachability controls.** Add proxy/`onlynet`,
-  Tor/I2P outbound support, bind/whitebind equivalents, and address-network
-  isolation tests. Automatic port mapping is not required.
+- [ ] **Network privacy and reachability controls.** IPv4/IPv6 `onlynet`,
+  fail-closed SOCKS5 proxy routing, exact-IP protected inbound roles, explicit
+  routable advertisement, and address-family isolation are complete. Native
+  onion/I2P address persistence and discovery remain. Automatic port mapping
+  is not required.
 - [ ] **Operational API breadth.** Add raw transaction submission, mempool
   inspection, UTXO scans/proofs, block/header retrieval modes, wait-for-tip
   primitives, peer controls, and stable error codes. Prefer a small documented
