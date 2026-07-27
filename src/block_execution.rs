@@ -161,7 +161,24 @@ impl BlockExecutionError {
 enum PendingUtxoState {
     Before,
     After,
+    /// The transition has no observable UTXO effect, so the current chainstate
+    /// satisfies both its pre- and post-state.
+    ///
+    /// A block whose only outputs are provably unspendable and which spends
+    /// nothing produces an empty transition, and recovery must accept it from
+    /// either side instead of declaring the chainstate inconsistent.
+    Either,
     Mixed,
+}
+
+impl PendingUtxoState {
+    const fn matches_before(self) -> bool {
+        matches!(self, Self::Before | Self::Either)
+    }
+
+    const fn matches_after(self) -> bool {
+        matches!(self, Self::After | Self::Either)
+    }
 }
 
 fn pending_utxo_state<S: UtxoStore>(
@@ -190,7 +207,8 @@ fn pending_utxo_state<S: UtxoStore>(
         matches_after &= current.as_ref() == after.get(&outpoint);
     }
     Ok(match (matches_before, matches_after) {
-        (true, _) => PendingUtxoState::Before,
+        (true, true) => PendingUtxoState::Either,
+        (true, false) => PendingUtxoState::Before,
         (false, true) => PendingUtxoState::After,
         (false, false) => PendingUtxoState::Mixed,
     })
@@ -216,7 +234,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
     match pending.kind {
         TransitionKind::Connect if execution_tip == pending.parent => {
             match state {
-                PendingUtxoState::Before => {}
+                PendingUtxoState::Before | PendingUtxoState::Either => {}
                 PendingUtxoState::After => {
                     chainstate.undo(&pending.undo, now, hot_window_secs)?;
                 }
@@ -229,7 +247,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
             Ok(true)
         }
         TransitionKind::Connect if execution_tip == pending.next => {
-            if state != PendingUtxoState::After {
+            if !state.matches_after() {
                 return Err(BlockExecutionError::InconsistentTransition);
             }
             if undo_store.get(pending.next.hash)?.is_none() {
@@ -243,7 +261,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
                 PendingUtxoState::After => {
                     chainstate.undo(&pending.undo, now, hot_window_secs)?;
                 }
-                PendingUtxoState::Before => {}
+                PendingUtxoState::Before | PendingUtxoState::Either => {}
                 PendingUtxoState::Mixed => {
                     return Err(BlockExecutionError::InconsistentTransition);
                 }
@@ -254,7 +272,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
             Ok(true)
         }
         TransitionKind::Disconnect if execution_tip == pending.parent => {
-            if state != PendingUtxoState::Before {
+            if !state.matches_before() {
                 return Err(BlockExecutionError::InconsistentTransition);
             }
             undo_store.remove(pending.next.hash)?;
