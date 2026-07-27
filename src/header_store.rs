@@ -94,7 +94,8 @@ impl RedbHeaderStore {
 
     /// Persists a validated header batch in one redb write transaction.
     ///
-    /// The caller should first use [`HeaderDag::validate_batch_contextual`].
+    /// The caller should first use [`HeaderDag::stage_batch_contextual`] and
+    /// commit the returned guard only after this durable append succeeds.
     /// A duplicate or malformed header aborts the complete batch, leaving the
     /// durable prefix unchanged.
     pub fn append_batch(&self, batch: &[Header]) -> Result<(), HeaderStoreError> {

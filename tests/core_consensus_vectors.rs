@@ -3,15 +3,17 @@
 use std::{collections::HashMap, str::FromStr};
 
 use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+    Amount, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
     absolute::LockTime,
     consensus::deserialize,
     hex::FromHex,
     opcodes::{Opcode, all::*},
-    script::{Builder, PushBytesBuf},
+    script::{Builder, Instruction, PushBytesBuf},
     transaction::Version,
 };
-use rbtc::{consensus::verify_transaction_scripts_with_flags, utxo::Utxo};
+use rbtc::{
+    chainstate::count_script_sigops, consensus::verify_transaction_scripts_with_flags, utxo::Utxo,
+};
 use serde_json::Value;
 
 const VALID_VECTORS: &str = include_str!("data/bitcoin-core-26/tx_valid.json");
@@ -104,6 +106,42 @@ fn vector_rows(json: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Independent transcription of Core v26.0
+/// `CScript::GetSigOpCount(bool)` (`src/script/script.cpp`, lines 156-178).
+///
+/// The important distinction from rust-bitcoin 0.32 is that Core replaces
+/// `lastOpcode` after every opcode. A key-count push therefore cannot survive
+/// an intervening CHECKSIG or CHECKMULTISIG.
+fn core_26_script_sigops(script: &Script, accurate: bool) -> usize {
+    let mut sigops = 0_usize;
+    let mut previous_pushnum = None;
+    for instruction in script.instructions() {
+        let Ok(instruction) = instruction else {
+            break;
+        };
+        match instruction {
+            Instruction::PushBytes(_) => previous_pushnum = None,
+            Instruction::Op(opcode) => {
+                match opcode {
+                    OP_CHECKSIG | OP_CHECKSIGVERIFY => sigops += 1,
+                    OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                        sigops += match (accurate, previous_pushnum) {
+                            (true, Some(keys)) => usize::from(keys),
+                            _ => 20,
+                        };
+                    }
+                    _ => {}
+                }
+                previous_pushnum = match opcode.to_u8() {
+                    byte @ 0x51..=0x60 => Some(byte - 0x50),
+                    _ => None,
+                };
+            }
+        }
+    }
+    sigops
 }
 
 fn transaction_and_prevouts(row: &[Value]) -> (Transaction, Vec<Utxo>) {
@@ -328,4 +366,54 @@ fn core_26_public_consensus_script_corpus_matches() {
     assert_eq!(rejected, 82);
     assert_eq!(policy_only, 977);
     assert_eq!(witness_cases, 62);
+}
+
+#[test]
+fn core_26_script_corpus_and_algorithm_edges_pin_sigop_counting() {
+    let rows = serde_json::from_str::<Vec<Value>>(SCRIPT_VECTORS).expect("vendored Core scripts");
+    let mut scripts = 0_usize;
+    for row in &rows {
+        let Some(row) = row.as_array() else {
+            continue;
+        };
+        if row.len() == 1 {
+            continue;
+        }
+        let offset = usize::from(row.first().is_some_and(Value::is_array));
+        for assembly in [&row[offset], &row[offset + 1]] {
+            let script = parse_core_asm(
+                assembly
+                    .as_str()
+                    .expect("Core script vector assembly string"),
+            );
+            for accurate in [false, true] {
+                assert_eq!(
+                    count_script_sigops(&script, accurate),
+                    core_26_script_sigops(&script, accurate),
+                    "Core script vector sigop mismatch for accurate={accurate}: {assembly}",
+                );
+            }
+            scripts += 1;
+        }
+    }
+    assert_eq!(scripts, 2_414);
+
+    // The public Core corpus does not contain the stale-pushnum sequence that
+    // exposed A-01. These two source-derived sentinels exercise the exact
+    // `lastOpcode = opcode` rule above and make a mutation back to
+    // rust-bitcoin's `Script::count_sigops` fail this external suite.
+    let after_checksig = Builder::new()
+        .push_int(2)
+        .push_opcode(OP_CHECKSIG)
+        .push_opcode(OP_CHECKMULTISIG)
+        .into_script();
+    let repeated_multisig = Builder::new()
+        .push_int(2)
+        .push_opcode(OP_CHECKMULTISIG)
+        .push_opcode(OP_CHECKMULTISIG)
+        .into_script();
+    assert_eq!(core_26_script_sigops(&after_checksig, true), 21);
+    assert_eq!(count_script_sigops(&after_checksig, true), 21);
+    assert_eq!(core_26_script_sigops(&repeated_multisig, true), 22);
+    assert_eq!(count_script_sigops(&repeated_multisig, true), 22);
 }

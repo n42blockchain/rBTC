@@ -843,11 +843,34 @@ the Testnet3 minimum-difficulty walk-back has an
 repeated information-level `getdata` scan description is historical on main;
 the bounded relay hash index described above has already removed it.
 
-The auditor still excludes line-by-line review of peer management, API wiring,
-CLI/shutdown sequencing, and the policy behaviour of `rebroadcast_store.rs`
-and `undo_store.rs`. Existing tests and soak evidence cover those paths but are
-not mislabeled as completion of that remaining audit scope. No code delta from
+At that checkpoint the auditor still excluded line-by-line review of peer
+management, API wiring, CLI/shutdown sequencing, and the policy behaviour of
+`rebroadcast_store.rs` and `undo_store.rs`. The next audit commit closed the
+peer-management, shutdown, and rebroadcast portions; API/CLI wiring and
+`undo_store.rs` remain explicitly lower-depth areas. No code delta from
 `5147e11` required integration.
+
+### Disposition of the shutdown, peer-classification, and retention review (`3c6b79f`)
+
+The final pre-integration depth pass found no new defect. Shutdown is safe
+because every redb durability boundary is synchronous: dropping the node run
+future at a signal cannot split a transaction, and the existing write-ahead
+protocols reconcile termination between related commits. The intentionally
+pending `checkpoint_shutdown` future forces the signal branch to win at a
+committed checkpoint boundary rather than racing a prefetched batch.
+
+Peer error classification preserves the anti-eclipse distinction. I/O,
+timeouts, missing blocks, and caller-side request errors are transient;
+objective bounded-wire violations are discouragement candidates. In
+particular, `Message(EncodeError::Io(_))` is classified before the general
+`Message(_)` arm, so truncation is not confused with a malformed payload.
+Unclassified errors default to transient.
+
+Rebroadcast capacity eviction also retains the useful entries in the intended
+order: expired and confirmed entries leave first, then non-canonical entries,
+then the oldest canonical unconfirmed entry. The audit commit was not directly
+cherry-picked because its document base conflicts with the post-integration
+report; these conclusions were replayed against the merged tree instead.
 
 ### Post-audit fuzz-workspace assurance closure
 
@@ -1017,3 +1040,53 @@ The recurrence of A-06 and A-10 in code written after they were fixed is the
 substantive lesson of this pass: both are invisible on Unix CI. The first
 recommendation in this report — add a Windows job that links and runs the tests
 — would have caught all three regressions before they merged.
+
+## Dependency follow-up
+
+The audit of `bitcoin` 0.32.8 → 0.32.102 (`68352cb`) found the consensus
+helpers relied on by this tree byte-equivalent across the update:
+`count_sigops_internal`, witness-commitment checking, compact-target
+calculation, network parameters, script push/witness helpers, and transaction
+version representation. `bdk_wallet` also accepts the update.
+
+The one observed behavior change was BIP133 parsing. Version 0.32.102 rejects an
+out-of-range `feefilter` while decoding, whereas Core 31 decodes the signed
+integer and applies it only when `MoneyRange` holds. Merging the dependency
+unchanged would therefore turn an ignored advisory value into peer
+misbehaviour.
+
+The adopted update preserves Core's policy without matching a dependency error
+string: after ordinary decoding fails, rBTC recovers only an exact
+`feefilter` command with an eight-byte payload, valid declared length, and valid
+checksum, and only when the decoded value is outside `MoneyRange`. The existing
+session layer then ignores it. Any malformed length, checksum, or other command
+continues to fail as a protocol violation. Both the end-to-end BIP133 behavior
+and the malformed-frame distinction have dedicated regression tests.
+
+The breaking `rand` 0.10 and `sha2` 0.11 updates remain deferred. In particular,
+`sha2` participates in persisted consensus-supporting identities; an update
+requires byte-stability fixtures for every stored digest or an explicit
+versioned migration, not an opportunistic dependency refresh.
+
+## Follow-up depth pass
+
+The lower-depth areas named in the work order were subsequently reviewed:
+`diagnostics`, `snapshot_download`, `auxiliary_index`, `index_policy`,
+`node::config_file`, `undo_store`, and the API/CLI wiring. Three
+non-consensus defects were found and fixed:
+
+- A full 16-address explicit/persisted candidate wave prevented DNS resolution,
+  so an all-stale peer database could terminate a public node without consulting
+  its configured bootstrap source. Candidate caps now apply per independently
+  bounded wave, with prior attempts and discouraged addresses excluded.
+- `validate_index_activation` accepted an authenticated UTXO baseline below the
+  execution tip as if it covered the complete missing history. Only an exact-tip
+  baseline now short-circuits history requirements; older baselines still need a
+  retained suffix or authenticated peer history.
+- CLI/config precedence mapped several inbound fields to the same fallback
+  `unknown` group. Overriding one could silently suppress configured listen,
+  peer-cap, upload-quota, and request-rate fields. Each now has a distinct group.
+
+Regression tests reproduce all three former states. No further correctness,
+durability, authentication, or unbounded-resource defect was found in the named
+modules. The Group C platform and operational limitations remain accepted.

@@ -2284,6 +2284,14 @@ pub fn decode_v1(bytes: &[u8]) -> Result<RawNetworkMessage, EncodeError> {
     match deserialize(bytes) {
         Ok(message) => Ok(message),
         Err(error) => {
+            // rust-bitcoin 0.32.102 rejects out-of-MoneyRange `feefilter`
+            // payloads during decoding. Core 31's `ProcessMessage` instead
+            // decodes the signed integer and ignores it unless MoneyRange
+            // holds. Recover only an exact, checksum-valid eight-byte frame;
+            // malformed lengths and checksums remain protocol violations.
+            if let Some(message) = decode_out_of_range_feefilter(bytes) {
+                return Ok(message);
+            }
             // BIP61 permits `reject` messages about non-transaction commands
             // (notably `version`) to omit the trailing 32-byte object hash.
             // rust-bitcoin's legacy Reject type always expects that hash, so
@@ -2306,6 +2314,30 @@ pub fn decode_v1(bytes: &[u8]) -> Result<RawNetworkMessage, EncodeError> {
             Err(error)
         }
     }
+}
+
+fn decode_out_of_range_feefilter(bytes: &[u8]) -> Option<RawNetworkMessage> {
+    const FEEFILTER_FRAME_LEN: usize = V1_HEADER_LEN + size_of::<i64>();
+    if bytes.len() != FEEFILTER_FRAME_LEN
+        || &bytes[4..16] != b"feefilter\0\0\0"
+        || u32::from_le_bytes(bytes[16..20].try_into().ok()?) != 8
+    {
+        return None;
+    }
+    let payload = &bytes[V1_HEADER_LEN..];
+    let digest = sha256d::Hash::hash(payload).to_byte_array();
+    if bytes[20..24] != digest[..4] {
+        return None;
+    }
+    let rate = i64::from_le_bytes(payload.try_into().ok()?);
+    if (0..=MAX_MONEY_SATS).contains(&rate) {
+        return None;
+    }
+    let magic = Magic::from_bytes(bytes[..4].try_into().ok()?);
+    Some(RawNetworkMessage::new(
+        magic,
+        NetworkMessage::FeeFilter(rate),
+    ))
 }
 
 fn reject_checksum_is_valid(bytes: &[u8]) -> bool {
@@ -2387,6 +2419,26 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn out_of_range_feefilter_is_ignored_without_weakening_frame_validation() {
+        let message = encode_v1(
+            Magic::REGTEST,
+            NetworkMessage::FeeFilter(MAX_MONEY_SATS + 1),
+        );
+        assert!(matches!(
+            decode_v1(&message).unwrap().into_payload(),
+            NetworkMessage::FeeFilter(rate) if rate == MAX_MONEY_SATS + 1
+        ));
+
+        let mut bad_checksum = message.clone();
+        bad_checksum[20] ^= 1;
+        assert!(decode_v1(&bad_checksum).is_err());
+
+        let mut bad_length = message;
+        bad_length[16..20].copy_from_slice(&7_u32.to_le_bytes());
+        assert!(decode_v1(&bad_length).is_err());
     }
 
     #[test]

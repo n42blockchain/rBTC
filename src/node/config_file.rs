@@ -491,10 +491,15 @@ fn option_group(flag: &str) -> &'static str {
         "--data-dir" => "data-dir",
         "--explorer-listen" => "explorer-listen",
         "--external-address" => "external-address",
+        "--inbound-requests-per-minute" => "inbound-requests-per-minute",
+        "--listen" | "--no-listen" => "listen",
         "--log-dir" => "log-dir",
         "--log-level" => "log-level",
         "--log-max-bytes" => "log-max-bytes",
         "--log-max-files" => "log-max-files",
+        "--max-inbound-peers" => "max-inbound-peers",
+        "--max-inbound-peers-per-ip" => "max-inbound-peers-per-ip",
+        "--max-upload-bytes-per-day" => "max-upload-bytes-per-day",
         "--minimum-chainwork" => "minimum-chainwork",
         "--mempool-max-bytes" => "mempool-max-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",
@@ -599,5 +604,46 @@ mod tests {
             symlink(&target, &link).unwrap();
             assert!(parse_config_file(&link).is_err());
         }
+    }
+
+    #[test]
+    fn cli_inbound_override_keeps_unrelated_config_limits() {
+        let directory = TempDir::new().unwrap();
+        let config = directory.path().join("rbtc.conf");
+        fs::write(
+            &config,
+            "inbound_listen=127.0.0.1:18444\n\
+             max_inbound_peers=12\n\
+             max_inbound_peers_per_ip=3\n\
+             max_upload_bytes_per_day=1000000\n\
+             inbound_requests_per_minute=120\n",
+        )
+        .unwrap();
+        let merged = merge_config_arguments(vec![
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--inbound-requests-per-minute".to_owned(),
+            "240".to_owned(),
+        ])
+        .unwrap();
+        for retained in [
+            "--listen",
+            "--max-inbound-peers",
+            "--max-inbound-peers-per-ip",
+            "--max-upload-bytes-per-day",
+        ] {
+            assert!(
+                merged.iter().any(|argument| argument == retained),
+                "{retained} was incorrectly suppressed by another inbound override"
+            );
+        }
+        assert_eq!(
+            merged
+                .windows(2)
+                .filter(|pair| pair[0] == "--inbound-requests-per-minute")
+                .count(),
+            1
+        );
+        assert!(merged.ends_with(&["--inbound-requests-per-minute".to_owned(), "240".to_owned()]));
     }
 }

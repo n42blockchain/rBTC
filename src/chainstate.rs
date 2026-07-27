@@ -451,7 +451,7 @@ fn prepare_transaction_with_context<S: UtxoStore>(
 /// `OP_2 OP_CHECKSIG OP_CHECKMULTISIG` therefore cost 21 in Core but only 3
 /// upstream, which would let rBTC accept a block above the consensus
 /// `MAX_BLOCK_SIGOPS_COST` that Core rejects.
-pub(crate) fn count_script_sigops(script: &Script, accurate: bool) -> usize {
+pub fn count_script_sigops(script: &Script, accurate: bool) -> usize {
     let mut sigops = 0_usize;
     // Mirrors Core's `lastOpcode`, reduced to the only property it is read for:
     // whether the previous opcode was an `OP_1`..`OP_16` key-count push.
@@ -511,7 +511,12 @@ fn legacy_sigop_cost(transaction: &Transaction) -> u64 {
     u64::try_from(transaction_legacy_sigops(transaction)).expect("transaction sigops fit u64") * 4
 }
 
-fn transaction_sigop_cost(transaction: &Transaction, prevouts: &[Utxo], flags: u32) -> u64 {
+/// Returns Core-compatible consensus sigop cost for one transaction.
+///
+/// `prevouts` must be in input order. The caller supplies the script flags
+/// active for the candidate block so P2SH and witness costs activate at the
+/// same boundaries as Bitcoin Core.
+pub fn transaction_sigop_cost(transaction: &Transaction, prevouts: &[Utxo], flags: u32) -> u64 {
     let mut cost = legacy_sigop_cost(transaction);
     for (input, prevout) in transaction.input.iter().zip(prevouts) {
         let script_pubkey = Script::from_bytes(&prevout.script_pubkey);

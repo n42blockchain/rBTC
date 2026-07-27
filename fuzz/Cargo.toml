@@ -10,7 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 axum = "=0.8.9"
-bitcoin = "=0.32.8"
+bitcoin = "=0.32.102"
 libfuzzer-sys = "=0.4.13"
 rbtc = { path = "..", version = "=0.1.0" }
 tokio = { version = "=1.53.1", features = ["rt"] }

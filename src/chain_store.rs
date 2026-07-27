@@ -1,7 +1,7 @@
 //! Unified durable storage for active-chain state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
@@ -893,6 +893,38 @@ fn validation_delta_lookup(
     Ok(None)
 }
 
+/// Returns the next sorted delta keys after an exclusive cursor without
+/// decoding or allocating their UTXO values.
+fn validation_delta_key_page(
+    encoded: &[u8],
+    after: Option<OutPointKey>,
+    limit: usize,
+) -> Result<(u64, Vec<OutPointKey>), UtxoError> {
+    let (utxo_count, count, _) = validation_delta_header(encoded)?;
+    if limit == 0 {
+        return Ok((utxo_count, Vec::new()));
+    }
+    let mut left = 0_usize;
+    let mut right = count;
+    if let Some(after) = after {
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let (candidate, ..) = validation_delta_index_entry(encoded, middle)?;
+            if candidate <= after {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+    }
+    let end = left.saturating_add(limit).min(count);
+    let mut keys = Vec::with_capacity(end.saturating_sub(left));
+    for index in left..end {
+        keys.push(validation_delta_index_entry(encoded, index)?.0);
+    }
+    Ok((utxo_count, keys))
+}
+
 fn decode_validation_delta(encoded: &[u8]) -> Result<(u64, ValidationDeltaUpdates), UtxoError> {
     let (utxo_count, count, _) = inspect_validation_delta(encoded, None)?;
     let mut updates = Vec::with_capacity(count);
@@ -1511,26 +1543,127 @@ impl RedbChainStore {
         Ok(count)
     }
 
+    fn validation_journal_candidate_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<OutPointKey>, UtxoError> {
+        let journal = self
+            .validation_journal
+            .as_ref()
+            .expect("caller checked validation journal")
+            .lock()
+            .expect("validation journal lock not poisoned");
+        let transaction = self.db.begin_read()?;
+        let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
+        let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+        let mut candidates = BTreeSet::new();
+        let mut retain_smallest = |outpoint| {
+            candidates.insert(outpoint);
+            if candidates.len() > limit {
+                candidates.pop_last();
+            }
+        };
+        for (outpoint, _) in self.utxos.snapshot_page(after, limit)? {
+            retain_smallest(outpoint);
+        }
+        for row in &journal.rows {
+            let encoded = deltas
+                .get(row.height)?
+                .ok_or(UtxoError::Malformed("missing validation delta row"))?;
+            match validation_delta_record_header(encoded.value())? {
+                ValidationDeltaRecordHeader::Legacy { .. } => {
+                    let (_, keys) = validation_delta_key_page(encoded.value(), after, limit)?;
+                    for outpoint in keys {
+                        retain_smallest(outpoint);
+                    }
+                }
+                ValidationDeltaRecordHeader::Sharded(header) => {
+                    let first_shard = after.map_or(0, |cursor| {
+                        usize::from(validation_delta_shard(cursor, header.shard_count))
+                    });
+                    let mut retained = 0_usize;
+                    for shard in first_shard..header.shard_count {
+                        if retained == limit {
+                            break;
+                        }
+                        let shard = u8::try_from(shard).expect("validation shard count fits u8");
+                        if !validation_shard_is_populated(header, shard) {
+                            continue;
+                        }
+                        let key = validation_delta_shard_key(row.height, shard);
+                        let encoded_shard = delta_shards
+                            .get(key.as_slice())?
+                            .ok_or(UtxoError::Malformed("missing validation delta shard"))?;
+                        let (utxo_count, keys) = validation_delta_key_page(
+                            encoded_shard.value(),
+                            after,
+                            limit - retained,
+                        )?;
+                        if utxo_count != header.utxo_count
+                            || keys.iter().any(|outpoint| {
+                                validation_delta_shard(*outpoint, header.shard_count) != shard
+                            })
+                        {
+                            return Err(UtxoError::Malformed(
+                                "validation delta shard content mismatch",
+                            ));
+                        }
+                        retained += keys.len();
+                        for outpoint in keys {
+                            retain_smallest(outpoint);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(candidates.into_iter().collect())
+    }
+
     /// Returns one sorted, cursor-based page from the complete hot/cold UTXO set.
     ///
-    /// A store carrying an unmaterialized validation journal has no paged view:
-    /// its logical set is the durable base folded with every journal delta, so
-    /// this falls back to materializing that fold. Callers on a validation store
-    /// should prefer [`Self::materialize_validation_deltas`] first.
+    /// A validation-journal page merges the durable base and sorted delta
+    /// indexes in bounded windows. Removed candidates are skipped and replaced
+    /// until the requested logical page is full; `after` remains an exclusive
+    /// cursor over the folded set.
     pub fn utxo_snapshot_page(
         &self,
         after: Option<OutPointKey>,
         limit: usize,
     ) -> Result<Vec<(OutPointKey, Utxo)>, UtxoError> {
-        if self.validation_journal.is_some() {
-            return Ok(self
-                .snapshot_entries()?
-                .into_iter()
-                .filter(|(outpoint, _)| after.is_none_or(|after| *outpoint > after))
-                .take(limit)
-                .collect());
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-        self.utxos.snapshot_page(after, limit)
+        if self.validation_journal.is_none() {
+            return self.utxos.snapshot_page(after, limit);
+        }
+
+        // Validation-journal writers take this guard before changing either
+        // durable rows or the in-memory row inventory. Holding it across the
+        // bounded merge gives every candidate and overlay lookup one logical
+        // snapshot even though each uses its own redb read transaction.
+        let _guard = self.lock();
+        let mut page = Vec::with_capacity(limit);
+        let mut cursor = after;
+        while page.len() < limit {
+            // A floor amortizes pages containing many deleted candidates while
+            // keeping memory independent of the UTXO-set and journal sizes.
+            let scan_limit = limit.saturating_sub(page.len()).max(256);
+            let candidates = self.validation_journal_candidate_page(cursor, scan_limit)?;
+            if candidates.is_empty() {
+                break;
+            }
+            for (outpoint, utxo) in self.get_many(&candidates)? {
+                cursor = Some(outpoint);
+                if let Some(utxo) = utxo {
+                    page.push((outpoint, utxo));
+                    if page.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(page)
     }
 
     /// Reclassifies one bounded, durable UTXO page by block-age.
@@ -3795,6 +3928,97 @@ mod tests {
             identity_from_sorted_entries(expected.into_iter())
                 .unwrap()
                 .2
+        );
+    }
+
+    #[test]
+    fn validation_journal_pages_merge_removals_replacements_and_new_keys() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let base_options = ChainStoreOptions {
+            retain_block_undo: false,
+            ..ChainStoreOptions::default()
+        };
+        let store =
+            RedbChainStore::open_with_options(&path, Network::Regtest, base_options).unwrap();
+        store
+            .apply(
+                &[],
+                &[
+                    (key(1), coin(1)),
+                    (key(4), coin(4)),
+                    (key(7), coin(7)),
+                    (key(10), coin(10)),
+                ],
+            )
+            .unwrap();
+        let genesis = store.execution().tip().unwrap();
+        drop(store);
+
+        let store = RedbChainStore::open_with_options(
+            &path,
+            Network::Regtest,
+            ChainStoreOptions {
+                validation_delta_journal: true,
+                ..base_options
+            },
+        )
+        .unwrap();
+        let first = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([92; 32]),
+        };
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next: first,
+                spent: vec![key(1), key(4)],
+                created: vec![
+                    (key(2), coin(2)),
+                    (key(4), coin(40)),
+                    (key(6), coin(6)),
+                    (key(9), coin(9)),
+                ],
+                transaction_undos: Vec::new(),
+            }])
+            .unwrap();
+        store
+            .commit_connect_batch(&[ConnectTransition {
+                expected_parent: first.hash,
+                next: ExecutionTip {
+                    height: 2,
+                    hash: BlockHash::from_byte_array([93; 32]),
+                },
+                spent: vec![key(6)],
+                created: vec![(key(5), coin(5))],
+                transaction_undos: Vec::new(),
+            }])
+            .unwrap();
+
+        let expected = vec![
+            (key(2), coin(2)),
+            (key(4), coin(40)),
+            (key(5), coin(5)),
+            (key(7), coin(7)),
+            (key(9), coin(9)),
+            (key(10), coin(10)),
+        ];
+        assert!(store.utxo_snapshot_page(None, 0).unwrap().is_empty());
+        let first_page = store.utxo_snapshot_page(None, 2).unwrap();
+        let second_page = store
+            .utxo_snapshot_page(first_page.last().map(|(outpoint, _)| *outpoint), 2)
+            .unwrap();
+        let third_page = store
+            .utxo_snapshot_page(second_page.last().map(|(outpoint, _)| *outpoint), 2)
+            .unwrap();
+        let end = store
+            .utxo_snapshot_page(third_page.last().map(|(outpoint, _)| *outpoint), 2)
+            .unwrap();
+        assert_eq!([first_page, second_page, third_page].concat(), expected);
+        assert!(end.is_empty());
+        assert_eq!(
+            store.utxo_snapshot_page(Some(key(1)), 3).unwrap(),
+            expected[..3]
         );
     }
 

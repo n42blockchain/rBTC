@@ -90,7 +90,10 @@ pub fn validate_index_activation(
         if base > execution_height {
             return Err(IndexPolicyError::BaselineAheadOfExecution);
         }
-        if base >= state.required_from_height.saturating_sub(1) {
+        // A current-UTXO projection can replace unavailable history only when
+        // it is anchored at this exact execution tip. An older baseline still
+        // needs the intervening local suffix or an authenticated history peer.
+        if base == execution_height && base >= state.required_from_height.saturating_sub(1) {
             return Ok(());
         }
     }
@@ -165,6 +168,25 @@ mod tests {
             ..transaction
         };
         assert!(validate_index_activation(explorer, history, 1_000).is_ok());
+        let stale_explorer = IndexBuildState {
+            utxo_baseline_height: Some(500),
+            ..explorer
+        };
+        assert_eq!(
+            validate_index_activation(stale_explorer, history, 1_000),
+            Err(IndexPolicyError::MissingBuildHistory)
+        );
+        assert!(
+            validate_index_activation(
+                stale_explorer,
+                IndexHistoryAvailability {
+                    authenticated_peer_history: true,
+                    ..history
+                },
+                1_000
+            )
+            .is_ok()
+        );
         assert_eq!(
             validate_index_activation(
                 IndexBuildState {

@@ -6716,7 +6716,7 @@ async fn run_peer_pool(
         }
     }
     let mut attempted = remotes.iter().copied().collect::<HashSet<_>>();
-    let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS);
+    let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS * 2);
     if try_peer_candidates(
         options,
         &remotes,
@@ -6740,8 +6740,14 @@ async fn run_peer_pool(
     }
 
     let seeds = selected_dns_seeds(options);
-    if !seeds.is_empty() && attempted.len() < MAX_CONFIGURED_PEERS {
-        let remaining = MAX_CONFIGURED_PEERS - attempted.len();
+    if !seeds.is_empty() {
+        // The configured-peer cap bounds each connection wave, not the
+        // lifetime candidate set. A full persisted wave may consist entirely
+        // of stale addresses; still resolve one fresh, independently bounded
+        // DNS wave rather than exiting without consulting the bootstrap
+        // source. `attempted` remains excluded so no address is retried in the
+        // same run.
+        let remaining = MAX_CONFIGURED_PEERS;
         let mut dns_excluded = attempted.clone();
         if let Some(store) = &peer_store {
             for discouraged in store
@@ -15827,9 +15833,11 @@ mod tests {
     fn repeated_known_header_prefix_is_a_noop_but_not_an_infix() {
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
         let child = mine_regtest_child(genesis.block_hash(), genesis.time + 1);
-        let (dag, _) = HeaderDag::new(Network::Regtest)
-            .validate_batch_contextual(&[child], child.time)
-            .unwrap();
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let _ = dag
+            .stage_batch_contextual(&[child], child.time)
+            .unwrap()
+            .commit();
         let grandchild = mine_regtest_child(child.block_hash(), child.time + 1);
 
         assert!(unseen_header_suffix(&dag, &[child]).unwrap().is_empty());
@@ -22079,12 +22087,15 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn daemon_falls_back_to_dns_and_reuses_the_verified_peer_without_dns() {
+    async fn daemon_falls_back_to_dns_after_a_full_stale_wave_and_reuses_the_peer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dns_remote = listener.local_addr().unwrap();
-        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let failed_explicit = failed_listener.local_addr().unwrap();
-        drop(failed_listener);
+        let mut failed_explicit = Vec::with_capacity(MAX_CONFIGURED_PEERS);
+        for _ in 0..MAX_CONFIGURED_PEERS {
+            let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            failed_explicit.push(failed_listener.local_addr().unwrap());
+            drop(failed_listener);
+        }
 
         let server = tokio::spawn(async move {
             for nonce in [31, 32] {
@@ -22112,7 +22123,7 @@ mod tests {
 
         let directory = TempDir::new().unwrap();
         run(Options {
-            remotes: vec![failed_explicit],
+            remotes: failed_explicit,
             dns_seeds: Some(vec![DnsSeed {
                 host: dns_remote.ip().to_string(),
                 port: dns_remote.port(),

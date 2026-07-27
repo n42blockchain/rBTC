@@ -9,7 +9,7 @@ use std::{
 use bitcoin::{Block, Network, Txid, consensus::deserialize, hex::FromHex};
 use rbtc::{
     blockchain::{BlockError, apply_block_with_deployments},
-    chainstate::{COINBASE_MATURITY, ChainstateError},
+    chainstate::{COINBASE_MATURITY, ChainstateError, transaction_sigop_cost},
     deployments::block_deployment_context,
     utxo::{OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -56,6 +56,7 @@ struct ActivationCase {
     utxos: &'static [u8],
     expected_utxos: usize,
     expected_coinbase_origins: usize,
+    expected_sigop_cost: u64,
 }
 
 fn cases() -> [ActivationCase; 5] {
@@ -69,6 +70,7 @@ fn cases() -> [ActivationCase; 5] {
             utxos: BIP65_UTXOS,
             expected_utxos: 1_576,
             expected_coinbase_origins: 5,
+            expected_sigop_cost: 9_516,
         },
         ActivationCase {
             name: "CSV",
@@ -79,6 +81,7 @@ fn cases() -> [ActivationCase; 5] {
             utxos: CSV_UTXOS,
             expected_utxos: 4_398,
             expected_coinbase_origins: 0,
+            expected_sigop_cost: 20_432,
         },
         ActivationCase {
             name: "SegWit",
@@ -89,6 +92,7 @@ fn cases() -> [ActivationCase; 5] {
             utxos: SEGWIT_UTXOS,
             expected_utxos: 4_897,
             expected_coinbase_origins: 2,
+            expected_sigop_cost: 18_403,
         },
         ActivationCase {
             name: "Taproot",
@@ -99,6 +103,7 @@ fn cases() -> [ActivationCase; 5] {
             utxos: TAPROOT_UTXOS,
             expected_utxos: 6_303,
             expected_coinbase_origins: 1,
+            expected_sigop_cost: 13_143,
         },
         ActivationCase {
             name: "Taproot exception",
@@ -109,6 +114,7 @@ fn cases() -> [ActivationCase; 5] {
             utxos: TAPROOT_EXCEPTION_UTXOS,
             expected_utxos: 6_157,
             expected_coinbase_origins: 0,
+            expected_sigop_cost: 16_213,
         },
     ]
 }
@@ -359,6 +365,53 @@ fn execute(
     )
 }
 
+fn block_sigop_cost(
+    case: &ActivationCase,
+    block: &Block,
+    external: &BTreeMap<OutPointKey, Utxo>,
+) -> u64 {
+    let deployments = block_deployment_context(Network::Bitcoin, case.height, block.block_hash());
+    let mut available = external.clone();
+    let mut total = 0_u64;
+    for transaction in &block.txdata {
+        let prevouts = if transaction.is_coinbase() {
+            Vec::new()
+        } else {
+            transaction
+                .input
+                .iter()
+                .map(|input| {
+                    available
+                        .remove(&OutPointKey::from(input.previous_output))
+                        .expect("complete authenticated historical UTXO view")
+                })
+                .collect::<Vec<_>>()
+        };
+        total = total
+            .checked_add(transaction_sigop_cost(
+                transaction,
+                &prevouts,
+                deployments.script_flags,
+            ))
+            .expect("historical block sigop cost fits u64");
+        let txid = transaction.compute_txid();
+        for (vout, output) in transaction.output.iter().enumerate() {
+            available.insert(
+                bitcoin::OutPoint::new(txid, u32::try_from(vout).expect("vout fits u32")).into(),
+                Utxo {
+                    value_sats: output.value.to_sat(),
+                    height: case.height,
+                    is_coinbase: transaction.is_coinbase(),
+                    last_touched: u64::from(block.header.time),
+                    creation_mtp: case.parent_mtp,
+                    script_pubkey: output.script_pubkey.as_bytes().to_vec(),
+                },
+            );
+        }
+    }
+    total
+}
+
 fn execute_with_script_flags(
     case: &ActivationCase,
     block: &Block,
@@ -393,6 +446,12 @@ fn complete_mainnet_activation_blocks_execute_and_undo_from_external_utxos() {
         external_utxo_count += before.len();
         assert_complete_external_view(&case, &block, &before);
         assert_exact_origin_metadata(&case, &before);
+        assert_eq!(
+            block_sigop_cost(&case, &block, &before),
+            case.expected_sigop_cost,
+            "{} Core-compatible block sigop cost",
+            case.name
+        );
         let store = MemoryUtxoStore::from_entries(before.clone());
         let applied = execute(&case, &block, &store).unwrap_or_else(|error| {
             panic!("{} activation block execution failed: {error}", case.name)

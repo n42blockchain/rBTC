@@ -304,24 +304,6 @@ impl HeaderDag {
         locator
     }
 
-    /// Contextually validates a contiguous received header batch atomically.
-    ///
-    /// If any header fails, this DAG remains unchanged. Persistence callers
-    /// should commit the same raw batch before replacing their in-memory DAG,
-    /// giving crash recovery a replayable prefix only.
-    pub fn validate_batch_contextual(
-        &self,
-        headers: &[Header],
-        adjusted_time: u32,
-    ) -> Result<(Self, Vec<HeaderInfo>), HeaderError> {
-        let mut candidate = self.clone();
-        let mut accepted = Vec::with_capacity(headers.len());
-        for header in headers {
-            accepted.push(candidate.insert_contextual(*header, adjusted_time)?);
-        }
-        Ok((candidate, accepted))
-    }
-
     /// Contextually validates and stages a contiguous header batch in place.
     ///
     /// The returned guard rolls the batch back unless the caller commits it,
@@ -1088,19 +1070,23 @@ mod tests {
         let mut dag = HeaderDag::new(Network::Regtest);
         let genesis = dag.active_tip();
         let child = mine_child(genesis.hash, genesis.header.time + 1);
-        let (candidate, accepted) = dag.validate_batch_contextual(&[child], child.time).unwrap();
+        let accepted = dag
+            .stage_batch_contextual(&[child], child.time)
+            .unwrap()
+            .commit();
         assert_eq!(accepted[0].height, 1);
-        assert_eq!(dag.active_tip().height, 0);
-        dag = candidate;
+        assert_eq!(dag.active_tip().height, 1);
 
         let locator = dag.block_locator();
         assert_eq!(locator[0], child.block_hash());
         assert_eq!(*locator.last().unwrap(), genesis.hash);
+        let grandchild = mine_child(child.block_hash(), child.time + 1);
         assert!(matches!(
-            dag.validate_batch_contextual(&[child, child], child.time),
+            dag.stage_batch_contextual(&[grandchild, grandchild], grandchild.time),
             Err(HeaderError::Duplicate(_))
         ));
         assert_eq!(dag.active_tip().hash, child.block_hash());
+        assert!(dag.get(&grandchild.block_hash()).is_none());
     }
 
     #[test]

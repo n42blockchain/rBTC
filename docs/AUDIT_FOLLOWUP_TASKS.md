@@ -25,6 +25,81 @@ Bitcoin Core source that justifies the behaviour, with the release tag. rBTC
 pins the Core 26 script interpreter but tracks Core 31.1's consensus *rules* —
 see [docs/CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
 
+## Resolution status
+
+Revalidated and executed on 2026-07-27:
+
+- **A-13 completed, with a corrected premise.** The merged production paths
+  already used the `StagedHeaderBatch` in-place/RAII implementation. The stale
+  cloning API survived only in tests. It has been removed; tests now stage and
+  commit, and failed batches prove that both the tip and index roll back.
+  Persistence keeps the guard uncommitted until the header journal append
+  succeeds, while non-persisting validation commits immediately.
+- **A-14 completed, with a corrected partial premise.** The journal's existing
+  sorted fixed-width delta indexes are sufficient: pages now merge bounded base
+  and per-row key windows, batch-resolve overlays, skip removals, and continue
+  until the logical page is full. No format migration is needed.
+  `snapshot_content_identity` had already been changed to a bounded visitor in
+  the merged tree.
+- **A-27 completed.** The external suite now checks 2,414 scripts from Core
+  v26's script corpus against an independent transcription of
+  `CScript::GetSigOpCount`, pins five authenticated historical block costs, and
+  includes the stale-pushnum edge absent from the public corpus. Temporarily
+  restoring rust-bitcoin's counter made the suite fail (`3 != 21`).
+- **A-28 stopped because its required premise is unavailable.** Stock Core 31
+  has no testnet4 retarget-interval override. `submitheader` checks proof of
+  work before the contextual BIP94 boundary rule, and testnet4's real
+  `0x1d00ffff` proof of work makes a synthetic 2,016-header boundary infeasible.
+  `-testactivationheight` does not change PoW parameters, and
+  `getblocktemplate` cannot synthesize a historical boundary. A test that only
+  calls rBTC, or whose mutated header fails merely with `high-hash`, would not
+  be differential evidence and was deliberately not added.
+
+Group B decisions:
+
+- **B-1: match Core and adopt `bitcoin` 0.32.102.** The compatibility decoder
+  accepts only an exactly eight-byte, checksum-valid out-of-range `feefilter`
+  frame, after which the existing session logic ignores it. Wrong lengths and
+  checksums remain protocol violations. This avoids dependency error-string
+  matching and preserves Core 31's `MoneyRange`-then-ignore policy.
+- **B-2: defer `rand` 0.10 and `sha2` 0.11.** Neither fixes an applicable
+  defect. `sha2` remains pinned until immutable fixtures prove every persisted
+  snapshot, archive, validation-delta, bloom, and UTXO-set digest byte-identical
+  or define a versioned migration. The unrelated random API bump should not be
+  coupled to that evidence project.
+- **B-3: retain the current lock format.** Losing owner detail on Windows
+  contention is diagnostic-only and does not justify a cross-version lock-range
+  compatibility change.
+- **B-4: retain the repository-owned Core 26 script boundary.** A future
+  script-rule deployment, applicable interpreter security fix, or stable kernel
+  API that preserves atomic chainstate is the trigger for a separately gated
+  `libbitcoinkernel` migration; see
+  [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
+
+The lower-depth Group D pass was also completed. It found and fixed three
+non-consensus issues:
+
+- **A-29: a full stale persisted-peer wave suppressed DNS bootstrap.**
+  `MAX_CONFIGURED_PEERS` now bounds each connection wave rather than the
+  lifetime candidate set. After up to 16 explicit/persisted failures the node
+  still resolves one independently bounded, de-duplicated DNS wave. A daemon
+  test fills the complete first wave with unreachable addresses and proves the
+  fresh DNS peer is reached and later reused.
+- **A-30: an old UTXO index baseline was treated as current.** Only a baseline
+  at the exact execution tip may replace missing history. An older baseline
+  now still requires a retained suffix or authenticated history peer.
+- **A-31: unrelated CLI inbound overrides suppressed config limits.** Missing
+  option-group mappings caused `listen`, connection caps, upload quota, and
+  request rate to share the fallback `unknown` group. Every field now has a
+  distinct group, and a file/CLI merge regression proves overriding request
+  rate retains the other configured limits.
+
+The systematic pass over `diagnostics`, `snapshot_download`,
+`auxiliary_index`, `index_policy`, `node::config_file`, `undo_store`, and the
+API/CLI wiring found no further correctness, durability, authentication, or
+unbounded-resource defect. The accepted platform limitations in Group C remain
+unchanged.
+
 ---
 
 ## Group A — ready to implement, no decision needed
