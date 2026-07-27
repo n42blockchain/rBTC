@@ -4,7 +4,7 @@ mod config_file;
 
 use fs2::FileExt;
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Seek, Write},
     net::{IpAddr, SocketAddr},
@@ -6215,6 +6215,7 @@ async fn run_peer_pool(
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), String> {
+    let network_time = Arc::new(NetworkTime::default());
     let api_runtime = prepare_api_runtime(options)?;
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::with_capacity(
         options.resources.mempool_max_transactions,
@@ -6324,6 +6325,7 @@ async fn run_peer_pool(
         &mut inbound_server,
         &manual_remotes,
         &mut failures,
+        &network_time,
     )
     .await?
     {
@@ -6369,6 +6371,7 @@ async fn run_peer_pool(
             &mut inbound_server,
             &manual_remotes,
             &mut failures,
+            &network_time,
         )
         .await?
         {
@@ -7298,7 +7301,31 @@ async fn connect_peer(
     })
 }
 
+#[cfg(test)]
 async fn maintain_standby(
+    connected: ConnectedPeer,
+    activate: tokio::sync::oneshot::Receiver<()>,
+    keepalive_interval: Duration,
+    ping_nonce: u64,
+    transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
+    header_dag: Option<HeaderDag>,
+    transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
+) -> Result<ConnectedPeer, PeerRunError> {
+    maintain_standby_with_time(
+        connected,
+        activate,
+        keepalive_interval,
+        ping_nonce,
+        transaction_relay,
+        header_dag,
+        transaction_pool,
+        &NetworkTime::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintain_standby_with_time(
     mut connected: ConnectedPeer,
     mut activate: tokio::sync::oneshot::Receiver<()>,
     keepalive_interval: Duration,
@@ -7306,6 +7333,7 @@ async fn maintain_standby(
     mut transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
     mut header_dag: Option<HeaderDag>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
+    network_time: &NetworkTime,
 ) -> Result<ConnectedPeer, PeerRunError> {
     enum StandbyAction {
         Activate,
@@ -7360,7 +7388,8 @@ async fn maintain_standby(
                         let staged = dag
                             .stage_batch_contextual(
                                 unseen,
-                                unix_time().map_err(PeerRunError::transient)?,
+                                network_time
+                                    .adjusted_time(unix_time().map_err(PeerRunError::transient)?),
                             )
                             .map_err(|error| PeerRunError::header(&error))?;
                         let _ = staged.commit();
@@ -7439,6 +7468,7 @@ async fn connect_and_maintain_standby(
     header_dag: Option<HeaderDag>,
     mempool_relay_source: Option<MempoolRelaySource>,
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
+    network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer(
         deployments,
@@ -7448,6 +7478,18 @@ async fn connect_and_maintain_standby(
         peer_store,
     )
     .await?;
+    let local_time = unix_time().map_err(PeerRunError::transient)?;
+    let observed = network_time.observe(
+        remote.ip(),
+        connected.session.remote_version().timestamp,
+        local_time,
+    );
+    rbtc_info!(
+        "network-time sample from {remote}: samples={} offset_seconds={} usable={}",
+        observed.samples,
+        observed.offset_seconds,
+        observed.usable
+    );
     if let Some(source) = mempool_relay_source {
         connected.session.set_mempool_relay_source(source);
     }
@@ -7458,7 +7500,7 @@ async fn connect_and_maintain_standby(
     let mut source_guard = transaction_pool
         .as_ref()
         .map(|pool| TransactionRequestSourceGuard::new(orphan_source, Arc::clone(pool)));
-    let result = maintain_standby(
+    let result = maintain_standby_with_time(
         connected,
         activate,
         STANDBY_KEEPALIVE_INTERVAL,
@@ -7466,6 +7508,7 @@ async fn connect_and_maintain_standby(
         transaction_relay,
         header_dag,
         transaction_pool.as_ref(),
+        network_time.as_ref(),
     )
     .await;
     if result.is_ok() {
@@ -7497,6 +7540,7 @@ fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_peer_connections(
     options: &Options,
     remotes: &[SocketAddr],
@@ -7505,6 +7549,7 @@ fn spawn_peer_connections(
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
     mempool_relay_source: Option<&MempoolRelaySource>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
+    network_time: &Arc<NetworkTime>,
 ) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
@@ -7525,6 +7570,7 @@ fn spawn_peer_connections(
             let transaction_pool = require_full_services
                 .then(|| transaction_pool.cloned())
                 .flatten();
+            let network_time = Arc::clone(network_time);
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote,
@@ -7537,6 +7583,7 @@ fn spawn_peer_connections(
                 header_dag,
                 mempool_relay_source,
                 transaction_pool,
+                network_time,
             ));
             (
                 remote,
@@ -7719,6 +7766,7 @@ async fn try_peer_candidates(
     inbound_server: &mut Option<InboundServer>,
     manual_remotes: &HashSet<SocketAddr>,
     failures: &mut Vec<String>,
+    network_time: &Arc<NetworkTime>,
 ) -> Result<bool, String> {
     let mut pending = match spawn_peer_connections(
         options,
@@ -7728,6 +7776,7 @@ async fn try_peer_candidates(
         Some(transaction_relay),
         Some(mempool_relay_source),
         Some(transaction_pool),
+        network_time,
     ) {
         Ok(pending) => pending,
         Err(error) => {
@@ -7757,6 +7806,7 @@ async fn try_peer_candidates(
                     transaction_pool,
                     transaction_relay,
                     inbound_source,
+                    network_time,
                 ));
                 let mut standby_reaper = tokio::time::interval(STANDBY_REAP_INTERVAL);
                 loop {
@@ -7827,6 +7877,7 @@ async fn run_connected_peer(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     inbound_source: Option<&Arc<SharedInboundSource>>,
+    network_time: &NetworkTime,
 ) -> Result<(), PeerRunError> {
     let ConnectedPeer {
         remote,
@@ -7855,6 +7906,7 @@ async fn run_connected_peer(
                 validation_dir.clone(),
                 transaction_pool,
                 transaction_relay,
+                network_time,
             )
             .await
         } else {
@@ -7884,6 +7936,7 @@ async fn run_connected_peer(
                 validation_scheduler,
                 transaction_pool,
                 transaction_relay,
+                network_time,
             )
             .await
         };
@@ -7909,7 +7962,13 @@ async fn run_connected_peer(
     }
 
     if let Some(path) = &options.headers_db {
-        let headers = sync_headers(&mut session, &options.deployments, path.clone()).await?;
+        let headers = sync_headers(
+            &mut session,
+            &options.deployments,
+            path.clone(),
+            network_time,
+        )
+        .await?;
         let status = options
             .ibd_policy
             .ensure_minimum_chainwork(&headers)
@@ -7965,6 +8024,7 @@ async fn complete_assumeutxo_validation(
     validation_dir: PathBuf,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
+    network_time: &NetworkTime,
 ) -> Result<(), PeerRunError> {
     let active_dir = options
         .data_dir
@@ -8008,6 +8068,7 @@ async fn complete_assumeutxo_validation(
         None,
         transaction_pool,
         transaction_relay,
+        network_time,
     )
     .await?;
     finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
@@ -8187,6 +8248,7 @@ async fn sync_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployments: &DeploymentConfig,
     path: PathBuf,
+    network_time: &NetworkTime,
 ) -> Result<HeaderDag, PeerRunError> {
     let store =
         RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
@@ -8196,10 +8258,14 @@ async fn sync_headers(
             unix_time().map_err(PeerRunError::transient)?,
         )
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let time = network_time.snapshot();
     rbtc_info!(
-        "resuming headers-first sync from {}:{} (local-clock fallback until network-time aggregation lands)",
+        "resuming headers-first sync from {}:{} (network_time_samples={} offset_seconds={} usable={})",
         dag.active_tip().height,
-        dag.active_tip().hash
+        dag.active_tip().hash,
+        time.samples,
+        time.offset_seconds,
+        time.usable
     );
 
     loop {
@@ -8215,7 +8281,10 @@ async fn sync_headers(
             break;
         }
         let staged = dag
-            .stage_batch_contextual(unseen, unix_time().map_err(PeerRunError::transient)?)
+            .stage_batch_contextual(
+                unseen,
+                network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?),
+            )
             .map_err(|error| PeerRunError::header(&error))?;
         store
             .append_batch(unseen)
@@ -9152,6 +9221,7 @@ async fn sync_validating_node(
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
+    network_time: &NetworkTime,
 ) -> Result<(), PeerRunError> {
     if network_execution.is_experimental() {
         if !supports_experimental_block_execution(network) || !once {
@@ -9314,7 +9384,13 @@ async fn sync_validating_node(
     let mut api_server: Option<ApiServer> = None;
     let mut inbound_source_lease: Option<SharedInboundSourceLease> = None;
     let inbound_transactions = Arc::new(Mutex::new(InboundTransactionQueue::default()));
-    let mut headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+    let mut headers = sync_headers(
+        session,
+        deployment_config,
+        headers_path.clone(),
+        network_time,
+    )
+    .await?;
     let inbound_headers = Arc::new(RwLock::new(headers.clone()));
     if network_execution.extends_validation_target() {
         let target = validation_target.expect("parser requires an explicit extension target");
@@ -9819,7 +9895,13 @@ async fn sync_validating_node(
                         .map_err(|_| PeerRunError::transient("peer ping timed out"))?
                         .map_err(|error| PeerRunError::p2p(&error))?;
                 }
-                headers = sync_headers(session, deployment_config, headers_path.clone()).await?;
+                headers = sync_headers(
+                    session,
+                    deployment_config,
+                    headers_path.clone(),
+                    network_time,
+                )
+                .await?;
                 *inbound_headers
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.clone();
@@ -11875,6 +11957,108 @@ fn unix_time() -> Result<u32, String> {
         .as_secs();
     u32::try_from(seconds)
         .map_err(|_| "system clock does not fit Bitcoin timestamp range".to_owned())
+}
+
+const MIN_NETWORK_TIME_SAMPLES: usize = 5;
+const MAX_NETWORK_TIME_SAMPLES: usize = 200;
+const MAX_NETWORK_TIME_ADJUSTMENT_SECS: i64 = 70 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TimeNetworkGroup {
+    Ipv4([u8; 2]),
+    Ipv6([u8; 4]),
+}
+
+fn time_network_group(ip: IpAddr) -> TimeNetworkGroup {
+    match ip {
+        IpAddr::V4(ip) => TimeNetworkGroup::Ipv4([ip.octets()[0], ip.octets()[1]]),
+        IpAddr::V6(ip) => {
+            if let Some(ip) = ip.to_ipv4_mapped() {
+                return TimeNetworkGroup::Ipv4([ip.octets()[0], ip.octets()[1]]);
+            }
+            let octets = ip.octets();
+            TimeNetworkGroup::Ipv6([octets[0], octets[1], octets[2], octets[3]])
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NetworkTimeState {
+    offsets: HashMap<TimeNetworkGroup, i64>,
+    offset_seconds: i64,
+    usable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NetworkTimeSnapshot {
+    samples: usize,
+    offset_seconds: i64,
+    usable: bool,
+}
+
+#[derive(Debug, Default)]
+struct NetworkTime {
+    state: Mutex<NetworkTimeState>,
+}
+
+impl NetworkTime {
+    fn observe(&self, remote: IpAddr, peer_time: i64, local_time: u32) -> NetworkTimeSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let group = time_network_group(remote);
+        if state.offsets.len() < MAX_NETWORK_TIME_SAMPLES {
+            state
+                .offsets
+                .entry(group)
+                .or_insert_with(|| peer_time.saturating_sub(i64::from(local_time)));
+        }
+        if state.offsets.len() >= MIN_NETWORK_TIME_SAMPLES {
+            let mut offsets = state.offsets.values().copied().collect::<Vec<_>>();
+            offsets.sort_unstable();
+            let median = offsets[offsets.len() / 2];
+            state.offset_seconds = if median.unsigned_abs()
+                <= u64::try_from(MAX_NETWORK_TIME_ADJUSTMENT_SECS)
+                    .expect("positive adjustment bound fits u64")
+            {
+                state.usable = true;
+                median
+            } else {
+                state.usable = false;
+                0
+            };
+        }
+        NetworkTimeSnapshot {
+            samples: state.offsets.len(),
+            offset_seconds: state.offset_seconds,
+            usable: state.usable,
+        }
+    }
+
+    fn adjusted_time(&self, local_time: u32) -> u32 {
+        let offset = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .offset_seconds;
+        let adjusted = i64::from(local_time)
+            .saturating_add(offset)
+            .clamp(0, i64::from(u32::MAX));
+        u32::try_from(adjusted).expect("clamped network time fits u32")
+    }
+
+    fn snapshot(&self) -> NetworkTimeSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        NetworkTimeSnapshot {
+            samples: state.offsets.len(),
+            offset_seconds: state.offset_seconds,
+            usable: state.usable,
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u32 {
@@ -14313,6 +14497,51 @@ mod tests {
         (peer, local_version)
     }
 
+    #[test]
+    fn network_time_uses_diverse_median_and_rejects_extreme_adjustment() {
+        let clock = NetworkTime::default();
+        let local = 1_000_000;
+        for (address, offset) in [
+            ("10.1.0.1", 100_i64),
+            ("11.1.0.1", 120),
+            ("12.1.0.1", 80),
+            ("13.1.0.1", 110),
+            ("14.1.0.1", 90),
+        ] {
+            clock.observe(address.parse().unwrap(), i64::from(local) + offset, local);
+        }
+        assert_eq!(
+            clock.snapshot(),
+            NetworkTimeSnapshot {
+                samples: 5,
+                offset_seconds: 100,
+                usable: true,
+            }
+        );
+        assert_eq!(clock.adjusted_time(local), local + 100);
+        clock.observe("10.1.2.3".parse().unwrap(), i64::from(local) + 3_000, local);
+        assert_eq!(clock.snapshot().samples, 5);
+        assert_eq!(clock.snapshot().offset_seconds, 100);
+
+        let extreme = NetworkTime::default();
+        for first_octet in 20..25 {
+            extreme.observe(
+                format!("{first_octet}.1.0.1").parse().unwrap(),
+                i64::from(local) + MAX_NETWORK_TIME_ADJUSTMENT_SECS + 1,
+                local,
+            );
+        }
+        assert_eq!(
+            extreme.snapshot(),
+            NetworkTimeSnapshot {
+                samples: 5,
+                offset_seconds: 0,
+                usable: false,
+            }
+        );
+        assert_eq!(extreme.adjusted_time(local), local);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_checkpoint_returns_control_after_synchronous_work() {
         let requested = Arc::new(AtomicBool::new(false));
@@ -14426,9 +14655,17 @@ mod tests {
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
         };
-        let mut pending =
-            spawn_peer_connections(&options, &options.remotes, 100, None, None, None, None)
-                .unwrap();
+        let mut pending = spawn_peer_connections(
+            &options,
+            &options.remotes,
+            100,
+            None,
+            None,
+            None,
+            None,
+            &Arc::new(NetworkTime::default()),
+        )
+        .unwrap();
         timeout(Duration::from_secs(2), ready_received)
             .await
             .expect("later candidate should handshake while first candidate is stalled")
@@ -14697,6 +14934,7 @@ mod tests {
             None,
             Some(source),
             None,
+            Arc::new(NetworkTime::default()),
         ));
         timeout(Duration::from_secs(2), ready)
             .await

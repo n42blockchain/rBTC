@@ -107,6 +107,14 @@ headroom, classify exhaustion as a local failure without peer punishment, and
 publish the forecast through status, authenticated RPC, and Prometheus.
 Upload/index budgets stay open.
 
+Header future-time validation no longer relies indefinitely on a raw local
+clock. Each node instance accepts one timestamp sample per IPv4 `/16` or IPv6
+`/32`, caps the sample set at 200, requires five diverse full-service
+handshakes, and uses the median only within the 70-minute Bitcoin adjustment
+bound. Insufficient or extreme samples fail safely to local time; active and
+standby header validation share the same adjusted clock without process-global
+state.
+
 ### P1.2 — inbound P2P service
 
 1. Add optional `bind`/`listen`, routability advertisement, connection limits,
