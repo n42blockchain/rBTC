@@ -51,7 +51,7 @@ const MAX_MONEY_SATS: i64 = 21_000_000 * 100_000_000;
 const MAX_RELAY_ANNOUNCEMENTS_PER_PEER: usize = 5_000;
 
 /// Resource ceilings for one optional inbound listener.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundLimits {
     /// Maximum concurrently established or handshaking inbound sockets.
     pub max_connections: usize,
@@ -65,6 +65,12 @@ pub struct InboundLimits {
     pub idle_timeout: Duration,
     /// Explicit publicly reachable address; never inferred from a bind socket.
     pub advertised_address: Option<SocketAddr>,
+    /// Exact source IPs granted a protected inbound role.
+    ///
+    /// Preferred peers still consume the global hard connection ceiling and
+    /// every ordinary request/upload bound, but may exceed the per-source
+    /// ceiling and cannot be displaced by an untrusted connection.
+    pub preferred_peer_ips: Vec<IpAddr>,
 }
 
 impl Default for InboundLimits {
@@ -76,6 +82,7 @@ impl Default for InboundLimits {
             max_requests_per_minute: 1_200,
             idle_timeout: Duration::from_secs(20 * 60),
             advertised_address: None,
+            preferred_peer_ips: Vec::new(),
         }
     }
 }
@@ -98,6 +105,8 @@ pub struct InboundBasicFilter {
 pub struct InboundPeerStats {
     /// Remote socket address.
     pub address: SocketAddr,
+    /// Whether this source has the explicitly configured protected role.
+    pub preferred: bool,
     /// Seconds since the TCP socket was admitted.
     pub connected_seconds: u64,
     /// Whether the version/verack handshake completed.
@@ -153,6 +162,7 @@ pub struct InboundStatsSnapshot {
 struct LiveInboundPeer {
     address: SocketAddr,
     group: NetworkGroup,
+    preferred: bool,
     connected: Instant,
     handshake_complete: bool,
     protocol_version: Option<u32>,
@@ -236,6 +246,7 @@ impl InboundStats {
             .values()
             .map(|peer| InboundPeerStats {
                 address: peer.address,
+                preferred: peer.preferred,
                 connected_seconds: peer.connected.elapsed().as_secs(),
                 handshake_complete: peer.handshake_complete,
                 protocol_version: peer.protocol_version,
@@ -281,7 +292,7 @@ impl InboundStats {
         state.rejected_source_total = state.rejected_source_total.saturating_add(1);
     }
 
-    fn accept(self: &Arc<Self>, address: SocketAddr) -> InboundPeerAccount {
+    fn accept(self: &Arc<Self>, address: SocketAddr, preferred: bool) -> InboundPeerAccount {
         let mut state = self
             .state
             .lock()
@@ -294,6 +305,7 @@ impl InboundStats {
             LiveInboundPeer {
                 address,
                 group: network_group(address.ip()),
+                preferred,
                 connected: Instant::now(),
                 handshake_complete: false,
                 protocol_version: None,
@@ -309,16 +321,17 @@ impl InboundStats {
         }
     }
 
-    fn eviction_candidate(&self, incoming: SocketAddr) -> Option<u64> {
+    fn eviction_candidate(&self, incoming: SocketAddr, incoming_preferred: bool) -> Option<u64> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let incoming_group = network_group(incoming.ip());
-        if state
-            .peers
-            .values()
-            .any(|peer| peer.group == incoming_group)
+        if !incoming_preferred
+            && state
+                .peers
+                .values()
+                .any(|peer| peer.group == incoming_group)
         {
             return None;
         }
@@ -330,8 +343,10 @@ impl InboundStats {
             .peers
             .iter()
             .filter(|(_, peer)| {
-                !peer.handshake_complete
-                    || group_counts.get(&peer.group).copied().unwrap_or_default() > 1
+                !peer.preferred
+                    && (incoming_preferred
+                        || !peer.handshake_complete
+                        || group_counts.get(&peer.group).copied().unwrap_or_default() > 1)
             })
             .min_by_key(|(_, peer)| {
                 (
@@ -636,6 +651,7 @@ impl Drop for IpAdmission {
 fn admit_ip(
     remote: SocketAddr,
     limit: usize,
+    preferred: bool,
     ip_counts: &Arc<Mutex<HashMap<IpAddr, usize>>>,
     group_counts: &Arc<Mutex<HashMap<NetworkGroup, usize>>>,
     global: OwnedSemaphorePermit,
@@ -648,8 +664,9 @@ fn admit_ip(
     let mut groups = group_counts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if ips.get(&ip).copied().unwrap_or_default() >= limit
-        || groups.get(&group).copied().unwrap_or_default() >= limit
+    if !preferred
+        && (ips.get(&ip).copied().unwrap_or_default() >= limit
+            || groups.get(&group).copied().unwrap_or_default() >= limit)
     {
         return None;
     }
@@ -692,11 +709,12 @@ async fn acquire_global_slot(
     cancellations: &mut HashMap<u64, tokio::sync::oneshot::Sender<()>>,
     stats: &InboundStats,
     remote: SocketAddr,
+    preferred: bool,
 ) -> Option<OwnedSemaphorePermit> {
     if let Ok(permit) = Arc::clone(global).try_acquire_owned() {
         return Some(permit);
     }
-    let candidate = stats.eviction_candidate(remote)?;
+    let candidate = stats.eviction_candidate(remote, preferred)?;
     let cancel = cancellations.remove(&candidate)?;
     let _ = cancel.send(());
     loop {
@@ -726,6 +744,7 @@ pub async fn run_listener(
     limits: InboundLimits,
     source: Arc<dyn InboundDataSource>,
 ) -> Result<(), InboundError> {
+    let upload_target = limits.max_upload_bytes_per_day;
     run_listener_with_stats(
         listener,
         magic,
@@ -734,7 +753,7 @@ pub async fn run_listener(
         services,
         limits,
         source,
-        Arc::new(InboundStats::new(limits.max_upload_bytes_per_day)),
+        Arc::new(InboundStats::new(upload_target)),
     )
     .await
 }
@@ -789,7 +808,8 @@ pub async fn run_listener_with_stats_and_relay(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, remote) = accepted?;
-                if source_at_limit(
+                let preferred = limits.preferred_peer_ips.contains(&remote.ip());
+                if !preferred && source_at_limit(
                     remote,
                     limits.max_connections_per_ip,
                     &per_ip,
@@ -805,6 +825,7 @@ pub async fn run_listener_with_stats_and_relay(
                     &mut cancellations,
                     stats.as_ref(),
                     remote,
+                    preferred,
                 ).await else {
                     stats.reject_capacity();
                     drop(stream);
@@ -814,6 +835,7 @@ pub async fn run_listener_with_stats_and_relay(
                     admit_ip(
                         remote,
                         limits.max_connections_per_ip,
+                        preferred,
                         &per_ip,
                         &per_group,
                         global_permit,
@@ -823,11 +845,12 @@ pub async fn run_listener_with_stats_and_relay(
                     drop(stream);
                     continue;
                 };
-                let account = stats.accept(remote);
+                let account = stats.accept(remote, preferred);
                 let source = Arc::clone(&source);
                 let upload = Arc::clone(&upload);
                 let user_agent = user_agent.clone();
                 let relay = transaction_relay.as_ref().map(broadcast::Sender::subscribe);
+                let peer_limits = limits.clone();
                 let id = account.id;
                 let (cancel, cancelled) = tokio::sync::oneshot::channel();
                 peers.spawn(async move {
@@ -839,7 +862,7 @@ pub async fn run_listener_with_stats_and_relay(
                             local_nonce,
                             user_agent,
                             services,
-                            limits,
+                            peer_limits,
                             source,
                             upload,
                             relay,
@@ -1700,6 +1723,7 @@ mod tests {
         let first = admit_ip(
             remote,
             1,
+            false,
             &ip_counts,
             &group_counts,
             Arc::clone(&semaphore).try_acquire_owned().unwrap(),
@@ -1709,6 +1733,7 @@ mod tests {
             admit_ip(
                 remote,
                 1,
+                false,
                 &ip_counts,
                 &group_counts,
                 Arc::clone(&semaphore).try_acquire_owned().unwrap()
@@ -1721,6 +1746,7 @@ mod tests {
             admit_ip(
                 "127.0.0.2:18444".parse().unwrap(),
                 1,
+                false,
                 &ip_counts,
                 &group_counts,
                 Arc::clone(&semaphore).try_acquire_owned().unwrap()
@@ -1730,6 +1756,7 @@ mod tests {
         let other_group = admit_ip(
             "126.1.0.2:18444".parse().unwrap(),
             1,
+            false,
             &ip_counts,
             &group_counts,
             Arc::clone(&semaphore).try_acquire_owned().unwrap(),
@@ -1764,21 +1791,21 @@ mod tests {
     #[test]
     fn adaptive_eviction_improves_network_diversity_without_churn() {
         let stats = Arc::new(InboundStats::new(0));
-        let useful = stats.accept("10.1.0.1:8333".parse().unwrap());
+        let useful = stats.accept("10.1.0.1:8333".parse().unwrap(), false);
         useful.handshake(70_016, "/useful/".to_owned());
         useful.request();
         useful.upload(1_000, false);
-        let duplicate = stats.accept("10.1.1.1:8333".parse().unwrap());
+        let duplicate = stats.accept("10.1.1.1:8333".parse().unwrap(), false);
         duplicate.handshake(70_016, "/duplicate/".to_owned());
-        let unique = stats.accept("11.1.0.1:8333".parse().unwrap());
+        let unique = stats.accept("11.1.0.1:8333".parse().unwrap(), false);
         unique.handshake(70_016, "/unique/".to_owned());
 
         assert_eq!(
-            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap()),
+            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap(), false),
             Some(duplicate.id)
         );
         assert_eq!(
-            stats.eviction_candidate("10.1.2.1:8333".parse().unwrap()),
+            stats.eviction_candidate("10.1.2.1:8333".parse().unwrap(), false),
             None
         );
         duplicate.finish(Some(&InboundError::Evicted));
@@ -1786,9 +1813,59 @@ mod tests {
         assert_eq!(snapshot.evicted_total, 1);
         assert_eq!(snapshot.active, 2);
         assert_eq!(
-            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap()),
+            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap(), false),
             None
         );
+    }
+
+    #[test]
+    fn preferred_admission_bypasses_only_the_source_ceiling() {
+        let ip_counts = Arc::new(Mutex::new(HashMap::new()));
+        let group_counts = Arc::new(Mutex::new(HashMap::new()));
+        let semaphore = Arc::new(Semaphore::new(2));
+        let remote = "127.0.0.1:18444".parse().unwrap();
+        let ordinary = admit_ip(
+            remote,
+            1,
+            false,
+            &ip_counts,
+            &group_counts,
+            Arc::clone(&semaphore).try_acquire_owned().unwrap(),
+        )
+        .unwrap();
+        let preferred = admit_ip(
+            remote,
+            1,
+            true,
+            &ip_counts,
+            &group_counts,
+            Arc::clone(&semaphore).try_acquire_owned().unwrap(),
+        )
+        .unwrap();
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
+        drop((ordinary, preferred));
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[test]
+    fn preferred_inbound_can_replace_but_cannot_be_replaced() {
+        let stats = Arc::new(InboundStats::new(0));
+        let ordinary = stats.accept("10.1.0.1:8333".parse().unwrap(), false);
+        ordinary.handshake(70_016, "/ordinary/".to_owned());
+        let protected = stats.accept("11.1.0.1:8333".parse().unwrap(), true);
+        protected.handshake(70_016, "/protected/".to_owned());
+
+        assert_eq!(
+            stats.eviction_candidate("10.1.1.1:8333".parse().unwrap(), true),
+            Some(ordinary.id)
+        );
+        ordinary.finish(Some(&InboundError::Evicted));
+        assert_eq!(
+            stats.eviction_candidate("12.1.0.1:8333".parse().unwrap(), false),
+            None
+        );
+        let snapshot = stats.snapshot();
+        assert!(snapshot.peers[0].preferred);
     }
 
     #[test]

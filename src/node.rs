@@ -625,7 +625,7 @@ pub struct NodeIndexConfig {
 }
 
 /// Optional inbound P2P listener and resource policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeInboundConfig {
     /// Explicit socket address to bind. No listener is opened when absent.
     pub listen: SocketAddr,
@@ -639,10 +639,12 @@ pub struct NodeInboundConfig {
     pub max_upload_bytes_per_day: u64,
     /// Maximum non-keepalive requests accepted per peer per minute.
     pub max_requests_per_minute: u32,
+    /// Exact source IPs with a protected inbound role.
+    pub preferred_peer_ips: Vec<IpAddr>,
 }
 
 impl NodeInboundConfig {
-    const fn limits(self) -> InboundLimits {
+    fn limits(self) -> InboundLimits {
         InboundLimits {
             max_connections: self.max_connections,
             max_connections_per_ip: self.max_connections_per_ip,
@@ -650,6 +652,7 @@ impl NodeInboundConfig {
             max_requests_per_minute: self.max_requests_per_minute,
             idle_timeout: Duration::from_secs(20 * 60),
             advertised_address: self.advertise,
+            preferred_peer_ips: self.preferred_peer_ips,
         }
     }
 }
@@ -842,7 +845,7 @@ impl NodeBuilder {
 
     /// Enables a bounded inbound Bitcoin P2P listener.
     #[must_use]
-    pub const fn inbound(mut self, inbound: NodeInboundConfig) -> Self {
+    pub fn inbound(mut self, inbound: NodeInboundConfig) -> Self {
         self.config.inbound = Some(inbound);
         self
     }
@@ -1009,7 +1012,7 @@ fn validate_inbound_options(options: &Options) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    let limits = options.inbound_limits;
+    let limits = &options.inbound_limits;
     if !(1..=256).contains(&limits.max_connections) {
         return Err("maximum inbound peers must be between 1 and 256".to_owned());
     }
@@ -1029,6 +1032,11 @@ fn validate_inbound_options(options: &Options) -> Result<(), String> {
     }
     if !(60..=100_000).contains(&limits.max_requests_per_minute) {
         return Err("inbound requests per minute must be between 60 and 100000".to_owned());
+    }
+    if limits.preferred_peer_ips.len() > MAX_CONFIGURED_PEERS {
+        return Err(format!(
+            "too many preferred inbound IPs; limit is {MAX_CONFIGURED_PEERS}"
+        ));
     }
     Ok(())
 }
@@ -6284,7 +6292,7 @@ async fn run_peer_pool(
                 address,
                 options.network,
                 local_nonce,
-                options.inbound_limits,
+                options.inbound_limits.clone(),
                 source,
                 inbound_source
                     .as_ref()
@@ -12359,6 +12367,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut basic_filter_index = false;
     let mut inbound_listen = None;
     let mut inbound_advertise = None;
+    let mut preferred_inbound_ips = Vec::new();
     let mut no_inbound_listen = false;
     let mut max_inbound_peers = None;
     let mut max_inbound_peers_per_ip = None;
@@ -12629,6 +12638,20 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("invalid external address: {value}"))?,
                 );
+            }
+            "--whitelist" => {
+                let value = required_option_value(&mut args, "--whitelist")?;
+                let ip = value
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("invalid preferred inbound IP: {value}"))?;
+                if !preferred_inbound_ips.contains(&ip) {
+                    if preferred_inbound_ips.len() == MAX_CONFIGURED_PEERS {
+                        return Err(format!(
+                            "too many unique --whitelist IPs; limit is {MAX_CONFIGURED_PEERS}"
+                        ));
+                    }
+                    preferred_inbound_ips.push(ip);
+                }
             }
             "--max-inbound-peers" => {
                 if max_inbound_peers.is_some() {
@@ -13998,6 +14021,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(default_inbound.max_requests_per_minute),
             idle_timeout: default_inbound.idle_timeout,
             advertised_address: inbound_advertise,
+            preferred_peer_ips: preferred_inbound_ips,
         },
         resources: NodeResourceConfig {
             automatic_hot_standbys: automatic_hot_standbys
@@ -14095,7 +14119,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -16777,6 +16801,10 @@ mod tests {
                 "127.0.0.1:18444",
                 "--external-address",
                 "127.0.0.1:18444",
+                "--whitelist",
+                "127.0.0.2",
+                "--whitelist",
+                "127.0.0.2",
                 "--max-inbound-peers",
                 "12",
                 "--max-inbound-peers-per-ip",
@@ -16803,9 +16831,14 @@ mod tests {
             options.inbound_limits.advertised_address,
             Some("127.0.0.1:18444".parse().unwrap())
         );
+        assert_eq!(
+            options.inbound_limits.preferred_peer_ips,
+            vec!["127.0.0.2".parse::<IpAddr>().unwrap()]
+        );
 
         for arguments in [
             vec!["--external-address", "1.2.3.4:8333"],
+            vec!["--whitelist", "127.0.0.0/8"],
             vec![
                 "--network",
                 "bitcoin",

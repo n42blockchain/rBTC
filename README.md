@@ -437,6 +437,7 @@ Enable inbound serving only with an explicit address:
 rbtcd --network bitcoin --data-dir /srv/rbtc/bitcoin \
   --listen 0.0.0.0:8333 \
   --external-address YOUR_PUBLIC_IP:8333 \
+  --whitelist 203.0.113.9 \
   --max-inbound-peers 32 \
   --max-inbound-peers-per-ip 4 \
   --max-upload-bytes-per-day 1073741824 \
@@ -445,6 +446,7 @@ rbtcd --network bitcoin --data-dir /srv/rbtc/bitcoin \
 
 The same keys are available in the strict config file as `inbound_listen`,
 `external_address`,
+repeatable `whitelist`,
 `max_inbound_peers`, `max_inbound_peers_per_ip`,
 `max_upload_bytes_per_day`, and `inbound_requests_per_minute`;
 `listen=false` preserves outbound-only mode. A zero daily upload target means
@@ -454,6 +456,9 @@ The external address is optional, must be explicitly routable for the selected
 network, and is never inferred from a wildcard bind. When configured it is
 announced once to each outbound peer and returned first in bounded inbound
 `getaddr` samples with the node's exact service flags.
+Each exact `whitelist=IP` source has a protected inbound role: it may bypass
+only the per-IP/network-group ceiling, still consumes the global hard ceiling
+and every request/upload budget, and cannot be evicted by an ordinary peer.
 The listener remains bound across active outbound-peer failover, but refuses
 new handshakes while no reconciled execution view is installed.
 At the hard inbound connection ceiling, a new socket can replace an

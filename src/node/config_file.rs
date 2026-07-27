@@ -11,12 +11,13 @@ use std::{
 use bitcoin::Network;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024;
-const LIST_KEYS: [&str; 5] = [
+const LIST_KEYS: [&str; 6] = [
     "connect",
     "dns_seed",
     "signetseednode",
     "testactivationheight",
     "vbparams",
+    "whitelist",
 ];
 const BOOL_KEYS: [&str; 9] = [
     "block_filter_index",
@@ -387,6 +388,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "vbparams" => "--vbparams",
         "wallet_auth_token_file" => "--wallet-auth-token-file",
         "wallet_descriptors" => "--wallet-descriptors",
+        "whitelist" => "--whitelist",
         _ => unreachable!("known value or list config key"),
     }
 }
@@ -457,6 +459,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--vbparams"
             | "--wallet-auth-token-file"
             | "--wallet-descriptors"
+            | "--whitelist"
     )
     .then_some(group)
 }
@@ -501,6 +504,7 @@ fn option_group(flag: &str) -> &'static str {
         "--vbparams" => "vbparams",
         "--wallet-auth-token-file" => "wallet-auth-token-file",
         "--wallet-descriptors" => "wallet-descriptors",
+        "--whitelist" => "whitelist",
         _ => "unknown",
     }
 }

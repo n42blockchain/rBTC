@@ -255,10 +255,14 @@ rebuild and reorg results match a clean build byte-for-byte.
 
 ### P1.6 — privacy and reachability
 
-Add proxy/`onlynet`, Tor and I2P outbound transports, DNS isolation, bind and
-whitebind equivalents, address-network filtering, and tests preventing
+Add proxy/`onlynet`, Tor and I2P outbound transports, DNS isolation, bind
+equivalents, address-network filtering, and tests preventing
 cross-network leaks. Automatic port mapping remains optional and off by
 default.
+
+The bounded exact-IP `whitelist` role is complete: preferred sources bypass
+only source-group admission, remain subject to the global hard ceiling and
+ordinary work/upload policy, and are protected from untrusted eviction.
 
 Acceptance: each enabled network has an explicit dial and DNS path; disabled
 networks produce no socket or resolver traffic.
