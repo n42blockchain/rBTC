@@ -175,8 +175,11 @@ semantic repair. The local half of item 2 is complete:
 the fully replayed maximum-work header tip, ignores the source chainstate, and
 rebuilds a separately owned output with batched archive reads, parallel
 structure validation, overlapped staging/UTXO prefetch, sorted commits,
-crash-resume, and verified promotion. Authenticated-peer
-`reindex-chainstate` and item 5 remain.
+crash-resume, and verified promotion. The authenticated-peer half is also
+complete: `--reindex-chainstate OUTPUT` pins the fully replayed maximum-work
+source header tip, reacquires witness blocks through bounded full-history
+peers, applies the normal dual-window and full consensus/script pipeline, and
+promotes only an exact verified target. Item 2 is complete; item 5 remains.
 
 Item 4 is complete. Every persistent subsystem has an
 explicit version in the strict network-bound data-format inventory. A missing

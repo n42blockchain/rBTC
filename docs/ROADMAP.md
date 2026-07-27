@@ -264,8 +264,11 @@ optional where appropriate, and host-runtime compatible.
   directory only when a clean source covers height 1 through the replayed
   maximum-work tip; it ignores source chainstate, batches archive reads,
   overlaps staging and UTXO prefetch, resumes crashes, and promotes only after
-  exact-target cross-store verification. Authenticated-peer reindex and
-  prune/index policy keep this broader item open.
+  exact-target cross-store verification. `--reindex-chainstate OUTPUT` covers
+  incomplete local history by pinning the replayed maximum-work header tip and
+  reacquiring witness blocks through bounded full-history peers under complete
+  consensus/script validation. Prune/index policy keeps this broader item
+  open.
   The strict network-bound root manifest now inventories every subsystem
   schema, migrates legacy absence only after successful preflight, and refuses
   future rollback before mutable database open. Backup/restore, rollback, and

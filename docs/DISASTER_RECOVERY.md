@@ -84,10 +84,11 @@ is durable; a crash before publication remains the old readable generation.
   chainstate, and promotes only a separately verified output. Do not overwrite
   the only copy during diagnosis.
 - **Chainstate corruption with a pruned freezer:** local reindex is impossible.
-  Revalidate from genesis using authenticated full-history peers into a fresh
-  directory, or activate a release-pinned Bitcoin AssumeUTXO snapshot and
-  complete independent background validation. A transport checksum alone does
-  not authenticate UTXO state.
+  Run `--reindex-chainstate OUTPUT` to pin the fully replayed maximum-work
+  source header tip and revalidate from genesis using full-history peers into
+  a fresh directory, or activate a release-pinned Bitcoin AssumeUTXO snapshot
+  and complete independent background validation. A transport checksum alone
+  does not authenticate UTXO state.
 - **Header corruption:** reacquire and fully validate headers/PoW/fork work in a
   fresh directory before accepting any snapshot base or block stream.
 - **Lost wallet projection:** restore public descriptors and replay from the

@@ -1484,6 +1484,9 @@ enum OfflineAction {
     ReindexFromFreezer {
         output: PathBuf,
     },
+    ReindexChainstate {
+        output: PathBuf,
+    },
     PruneStorage {
         through_height: u32,
         plan_token: Option<String>,
@@ -1543,6 +1546,20 @@ struct FreezerReindexReport {
     elapsed_seconds: u64,
     independently_validated: bool,
     source_freezer_complete: bool,
+    promoted: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PeerReindexReport {
+    schema_version: u32,
+    network: String,
+    source: String,
+    output: String,
+    target_height: u32,
+    target_hash: String,
+    elapsed_seconds: u64,
+    headers_authenticated_by_work: bool,
+    blocks_authenticated_by_consensus: bool,
     promoted: bool,
 }
 
@@ -3112,6 +3129,7 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
                     OfflineAction::VerifyStorage { .. }
                         | OfflineAction::VerifyChain { .. }
                         | OfflineAction::ReindexFromFreezer { .. }
+                        | OfflineAction::ReindexChainstate { .. }
                         | OfflineAction::PruneStorage { .. },
                 )
             ) {
@@ -3518,6 +3536,9 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     if let Some(OfflineAction::ReindexFromFreezer { output }) = &options.offline_action {
         return reindex_from_complete_freezer(&options, output);
     }
+    if let Some(OfflineAction::ReindexChainstate { output }) = &options.offline_action {
+        return reindex_chainstate_from_peers(&options, output, local_nonce).await;
+    }
     if matches!(
         options.offline_action.as_ref(),
         Some(OfflineAction::VerifyChain { .. })
@@ -3599,6 +3620,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             OfflineAction::DownloadCoreSnapshot(_)
             | OfflineAction::VerifyStorage { .. }
             | OfflineAction::ReindexFromFreezer { .. }
+            | OfflineAction::ReindexChainstate { .. }
             | OfflineAction::PruneStorage { .. },
         )
         | None => {}
@@ -3828,35 +3850,156 @@ fn print_freezer_reindex_report(
     );
 }
 
-fn require_existing_reindex_source(
+async fn reindex_chainstate_from_peers(
+    options: &Options,
+    output: &std::path::Path,
+    local_nonce: u64,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let source = options
+        .data_dir
+        .as_ref()
+        .expect("peer reindex parser requires source data directory");
+    require_existing_reindex_header_source(source, options.network)?;
+    let _source_lock = DataDirectoryLock::acquire(source, options.network)?;
+    let source_headers = RedbHeaderStore::open(source.join("headers.redb"))
+        .map_err(|error| error.to_string())?
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    options
+        .ibd_policy
+        .ensure_minimum_chainwork(&source_headers)
+        .map_err(|error| error.to_string())?;
+    let active_tip = source_headers.active_tip();
+    let target = rbtc::execution_store::ExecutionTip {
+        height: active_tip.height,
+        hash: active_tip.hash,
+    };
+    let (output, _output_lock) = prepare_reindex_output(source, output, options.network, target)?;
+    prepare_reindex_headers(&output, &source_headers, &options.deployments)?;
+    if validate_data_format_manifest(&output, options.network)? {
+        publish_data_format_manifest(&output, options.network)?;
+    }
+
+    let mut validation_options = options.clone();
+    validation_options.data_dir = Some(output.clone());
+    validation_options.once = false;
+    validation_options.network_execution = NetworkExecutionMode::Persistent;
+    validation_options.explorer_listen = None;
+    validation_options.wallet_api_files = None;
+    validation_options.rpc_auth_token_file = None;
+    validation_options.validation_target = (target.height > 0).then_some(ValidationTarget {
+        height: target.height,
+        block_hash: target.hash,
+    });
+    validation_options.offline_action = None;
+    validation_options.cache.active_chainstate_bytes = options.cache.bulk_validation_bytes;
+    validation_options.observer = None;
+    if target.height > 0 {
+        run_peer_pool(&validation_options, local_nonce, None, None).await?;
+    } else {
+        initialize_empty_reindex_output(&validation_options, &output)?;
+    }
+
+    let output_headers = RedbHeaderStore::open(output.join("headers.redb"))
+        .map_err(|error| error.to_string())?
+        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+        .map_err(|error| error.to_string())?;
+    let chainstate = RedbChainStore::open_with_options(
+        output.join("chainstate.redb"),
+        options.network,
+        ChainStoreOptions {
+            quick_repair: options.validation_limits.quick_repair,
+            cache_size_bytes: options.cache.bulk_validation_bytes,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    finish_local_reindex(options, &output, target, &output_headers, &chainstate)?;
+    let report = PeerReindexReport {
+        schema_version: 1,
+        network: options.network.to_string(),
+        source: source.display().to_string(),
+        output: output.display().to_string(),
+        target_height: target.height,
+        target_hash: target.hash.to_string(),
+        elapsed_seconds: started.elapsed().as_secs(),
+        headers_authenticated_by_work: true,
+        blocks_authenticated_by_consensus: true,
+        promoted: true,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .expect("peer reindex report serialization is infallible")
+    );
+    Ok(())
+}
+
+fn initialize_empty_reindex_output(
+    options: &Options,
+    output: &std::path::Path,
+) -> Result<(), String> {
+    let chainstate = RedbChainStore::open_with_options(
+        output.join("chainstate.redb"),
+        options.network,
+        ChainStoreOptions {
+            quick_repair: options.validation_limits.quick_repair,
+            cache_size_bytes: options.cache.bulk_validation_bytes,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    chainstate
+        .execution()
+        .bind_consensus_config(
+            &options.deployments.consensus_id(),
+            &DeploymentConfig::for_network(options.network).consensus_id(),
+        )
+        .map_err(|error| error.to_string())?;
+    PrunedBlockLedger::open(output.join("blocks"), options.ledger_retention)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn require_existing_reindex_header_source(
     source: &std::path::Path,
     network: Network,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         format!(
-            "freezer reindex requires existing source {}: {error}",
+            "peer reindex requires an existing source {}: {error}",
             source.display()
         )
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("freezer reindex source must be a directory, not a symlink".to_owned());
+        return Err("peer reindex source must be a directory, not a symlink".to_owned());
     }
-    for required in ["headers.redb", "blocks"] {
-        let path = source.join(required);
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("freezer reindex requires {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink()
-            || (required == "headers.redb" && !metadata.is_file())
-            || (required == "blocks" && !metadata.is_dir())
-        {
-            return Err(format!(
-                "freezer reindex source {} has the wrong type",
-                path.display()
-            ));
-        }
+    let headers = source.join("headers.redb");
+    let metadata = fs::symlink_metadata(&headers)
+        .map_err(|error| format!("peer reindex requires {}: {error}", headers.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("peer reindex source headers must be a regular file".to_owned());
     }
     if validate_data_format_manifest(source, network)? {
-        return Err("freezer reindex requires an existing data-format manifest".to_owned());
+        return Err("peer reindex requires an existing data-format manifest".to_owned());
+    }
+    Ok(())
+}
+
+fn require_existing_reindex_source(
+    source: &std::path::Path,
+    network: Network,
+) -> Result<(), String> {
+    require_existing_reindex_header_source(source, network)?;
+    let blocks = source.join("blocks");
+    let metadata = fs::symlink_metadata(&blocks)
+        .map_err(|error| format!("freezer reindex requires {}: {error}", blocks.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "freezer reindex source {} has the wrong type",
+            blocks.display()
+        ));
     }
     Ok(())
 }
@@ -3942,6 +4085,7 @@ fn reject_unowned_reindex_entries(output: &std::path::Path) -> Result<(), String
         DATA_FORMAT_MANIFEST_FILE,
         "headers.redb",
         "chainstate.redb",
+        "peers.redb",
         "blocks",
     ];
     for entry in fs::read_dir(output)
@@ -10228,6 +10372,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut verify_chain_depth = None;
     let mut verify_chain_block_bytes = None;
     let mut reindex_from_freezer = None;
+    let mut reindex_chainstate = None;
     let mut manual_prune_through_height = None;
     let mut manual_prune_token = None;
     let mut snapshot_download_source = None;
@@ -10497,6 +10642,15 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 reindex_from_freezer = Some(PathBuf::from(required_option_value(
                     &mut args,
                     "--reindex-from-freezer",
+                )?));
+            }
+            "--reindex-chainstate" => {
+                if reindex_chainstate.is_some() {
+                    return Err("--reindex-chainstate cannot be supplied more than once".to_owned());
+                }
+                reindex_chainstate = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--reindex-chainstate",
                 )?));
             }
             "--verify-storage-max-segments" => {
@@ -11102,6 +11256,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         && complete_assumeutxo.is_none()
         && background_assumeutxo.is_none()
         && reindex_from_freezer.is_none()
+        && reindex_chainstate.is_none()
     {
         return Err(
             "validation resource limits require bounded or automatic AssumeUTXO validation"
@@ -11157,6 +11312,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         + usize::from(verify_storage)
         + usize::from(verify_chain)
         + usize::from(reindex_from_freezer.is_some())
+        + usize::from(reindex_chainstate.is_some())
         + usize::from(manual_prune_through_height.is_some());
     if offline_action_count > 1 {
         return Err("offline maintenance actions cannot be combined".to_owned());
@@ -11281,6 +11437,44 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         {
             return Err(
                 "freezer reindex is exclusively offline and conflicts with peer, synchronization, snapshot, serving, unrelated resource, and file-logging modes"
+                    .to_owned(),
+            );
+        }
+    }
+    if reindex_chainstate.is_some() {
+        if data_dir.is_none() {
+            return Err("--reindex-chainstate requires --data-dir".to_owned());
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || mempool_full_rbf
+            || cleanup_validation_dir
+            || experimental_network_execution
+            || extend_validation_target
+            || active_chainstate_cache_bytes.is_some()
+            || background_chainstate_cache_bytes.is_some()
+            || automatic_hot_standbys.is_some()
+            || mempool_max_transactions.is_some()
+            || mempool_max_bytes.is_some()
+        {
+            return Err(
+                "peer chainstate reindex conflicts with snapshot, explicit validation, serving, mempool, and unrelated resource modes"
+                    .to_owned(),
+            );
+        }
+        let has_peer_bootstrap = !remotes.is_empty()
+            || (!no_dns_seeds
+                && (!dns_seed_values.is_empty() || !pinned_dns_seed_hosts(network).is_empty()));
+        if !has_peer_bootstrap {
+            return Err(
+                "--reindex-chainstate requires --connect or an enabled DNS bootstrap source"
                     .to_owned(),
             );
         }
@@ -11662,6 +11856,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             })
         } else if let Some(output) = reindex_from_freezer {
             Some(OfflineAction::ReindexFromFreezer { output })
+        } else if let Some(output) = reindex_chainstate {
+            Some(OfflineAction::ReindexChainstate { output })
         } else {
             manual_prune_through_height.map(|through_height| OfflineAction::PruneStorage {
                 through_height,
@@ -11781,6 +11977,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-storage [--verify-storage-max-segments 1..4096] [--verify-storage-max-bytes 1048576..17179869184]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --verify-chain [--verify-chain-depth 1..1008] [--verify-chain-max-block-bytes 1048576..4294967296]\n",
             "  rbtcd --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-from-freezer OUTPUT [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-chainstate OUTPUT [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
@@ -15281,6 +15478,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_separate_authenticated_peer_reindex() {
+        let options = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-peer-reindex-source",
+                "--reindex-chainstate",
+                "/tmp/rbtc-peer-reindex-output",
+                "--connect",
+                "127.0.0.1:18444",
+                "--validation-batch-size",
+                "64",
+                "--bulk-validation-cache-bytes",
+                "8589934592",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.offline_action,
+            Some(OfflineAction::ReindexChainstate {
+                output: PathBuf::from("/tmp/rbtc-peer-reindex-output"),
+            })
+        );
+        assert_eq!(options.validation_limits.max_blocks_per_batch, 64);
+        assert_eq!(options.cache.bulk_validation_bytes, 8_589_934_592);
+        for arguments in [
+            vec![
+                "--network",
+                "regtest",
+                "--reindex-chainstate",
+                "/tmp/output",
+                "--connect",
+                "127.0.0.1:18444",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/source",
+                "--reindex-chainstate",
+                "/tmp/output",
+                "--no-dns-seeds",
+            ],
+            vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/source",
+                "--reindex-chainstate",
+                "/tmp/output",
+                "--connect",
+                "127.0.0.1:18444",
+                "--once",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_two_phase_offline_manual_pruning() {
         let dry_run = parse_options(
             [
@@ -15531,6 +15792,105 @@ mod tests {
         assert_eq!(
             rebuilt_ledger.retained_ranges().unwrap(),
             vec![(1, 1), (2, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_peer_reindex_builds_and_promotes_to_header_target() {
+        let source = TempDir::new().unwrap();
+        let output_parent = TempDir::new().unwrap();
+        let output = output_parent.path().join("rebuilt");
+        drop(DataDirectoryLock::acquire(source.path(), Network::Regtest).unwrap());
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let first = regtest_block_at_height(
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(1),
+            1,
+        );
+        let second =
+            regtest_block_at_height(first.block_hash(), first.header.time.saturating_add(1), 2);
+        let headers = RedbHeaderStore::open(source.path().join("headers.redb")).unwrap();
+        headers
+            .append_batch(&[first.header, second.header])
+            .unwrap();
+        drop(headers);
+        publish_data_format_manifest(source.path(), Network::Regtest).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(81)).await;
+            respond_to_getaddr(&mut peer).await;
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetHeaders(request) => {
+                    assert_eq!(request.locator_hashes.first(), Some(&second_hash));
+                    peer.write_message(NetworkMessage::Headers(Vec::new()))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected peer-reindex getheaders, got {message:?}"),
+            }
+            match peer.read_message().await.unwrap().into_payload() {
+                NetworkMessage::GetData(inventory) => {
+                    assert_eq!(
+                        inventory,
+                        vec![
+                            bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(first_hash),
+                            bitcoin::p2p::message_blockdata::Inventory::WitnessBlock(second_hash),
+                        ]
+                    );
+                    peer.write_message(NetworkMessage::Block(first))
+                        .await
+                        .unwrap();
+                    peer.write_message(NetworkMessage::Block(second))
+                        .await
+                        .unwrap();
+                }
+                message => panic!("expected peer-reindex block request, got {message:?}"),
+            }
+        });
+        let options = parse_options(
+            [
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                source.path().display().to_string(),
+                "--reindex-chainstate".to_owned(),
+                output.display().to_string(),
+                "--connect".to_owned(),
+                remote.to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        run_with_nonce(options, 79).await.unwrap();
+        server.await.unwrap();
+
+        let rebuilt =
+            RedbChainStore::open(output.join("chainstate.redb"), Network::Regtest).unwrap();
+        assert_eq!(
+            rebuilt.execution().tip().unwrap(),
+            rbtc::execution_store::ExecutionTip {
+                height: 2,
+                hash: second_hash,
+            }
+        );
+        assert_eq!(rebuilt.execution().validation_target().unwrap(), None);
+        assert_eq!(rebuilt.tier_stats().unwrap().hot, 2);
+        assert!(rebuilt.undos().get(first_hash).unwrap().is_some());
+        assert!(rebuilt.undos().get(second_hash).unwrap().is_some());
+        drop(rebuilt);
+        assert!(!output.join(VALIDATION_OWNER_FILE).exists());
+        assert!(!validate_data_format_manifest(&output, Network::Regtest).unwrap());
+        assert_eq!(
+            PrunedBlockLedger::open_persisted(output.join("blocks"))
+                .unwrap()
+                .retained_ranges()
+                .unwrap(),
+            vec![(1, 2)]
         );
     }
 

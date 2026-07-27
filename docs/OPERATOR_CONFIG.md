@@ -156,6 +156,33 @@ removes the marker only after exact target completion and bounded cross-store
 verification; switching service to `OUTPUT` remains an explicit operator
 action.
 
+If complete local history is unavailable but the source headers are intact,
+pin their current maximum-work tip and reacquire every required block from
+full-history peers:
+
+```text
+rbtcd --network NETWORK --data-dir SOURCE \
+  --reindex-chainstate OUTPUT \
+  --connect FULL_HISTORY_PEER \
+  --validation-batch-size 64 \
+  --bulk-validation-cache-bytes 8589934592
+```
+
+Explicit peers, configured seeds, or the pinned network seeds bootstrap the
+bounded peer pool. The source must have a valid root manifest and a fully
+replayable header database that meets minimum chainwork; its chainstate and
+freezer are not opened. The selected maximum-work tip becomes an immutable
+height/hash execution ceiling in `OUTPUT`. Required witness blocks remain
+authenticated by their PoW-selected header hashes and by complete contextual
+Bitcoin consensus/script execution—not by a transport digest, MPT, or
+independent UTXO claim. Existing dual-peer block windows overlap network
+receive, parallel structure validation, freezer staging, and sorted UTXO
+prefetch/commit. The same owner-marker, directory isolation, resource bounds,
+disk reserve, crash resume, final verification, and explicit switch-over rules
+as local freezer reindex apply. If a stronger chain no longer contains the
+pinned target during the run, the command fails closed; rerun against an
+updated, independently validated source header directory.
+
 Manual freezer pruning uses a mandatory two-phase plan:
 
 ```text
