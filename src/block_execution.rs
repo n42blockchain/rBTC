@@ -973,6 +973,21 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
+            // The caller's contract is that every created outpoint was already
+            // proved absent under its enclosing consensus rules, which is what
+            // lets this path skip the durable probe that `apply_with_undo`
+            // performs. `apply_bip30_rules` only performs that proof when BIP30
+            // is enforced or an exception applies, so above the BIP34 anchor the
+            // guarantee rests on txid uniqueness alone. Re-check it in debug
+            // builds so the invariant cannot silently weaken; a release build
+            // still fails closed at commit, where
+            // `apply_validated_changes_transaction` rejects the collision.
+            if cfg!(debug_assertions) && !seen_spent.contains(outpoint) {
+                assert!(
+                    self.load(&mut state, *outpoint)?.is_none(),
+                    "fresh-output fast path was given an outpoint that already exists: {outpoint}"
+                );
+            }
         }
         for outpoint in spent {
             state.current.insert(*outpoint, None);
@@ -1042,12 +1057,34 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         Ok(())
     }
 
+    /// Counts the overlay's population without materializing the UTXO set.
+    ///
+    /// Only outpoints this overlay has touched can differ from the base, so the
+    /// base count plus the overlay's net delta is exact. Materializing instead
+    /// would pull the whole chainstate into memory for a single number.
     fn tier_stats(&self) -> Result<TierStats, UtxoError> {
-        Ok(TierStats {
-            hot: u64::try_from(self.snapshot_entries()?.len())
-                .map_err(|_| UtxoError::Malformed("overlay entry count"))?,
-            cold: 0,
-        })
+        let base = self.base.tier_stats()?;
+        let total = base
+            .hot
+            .checked_add(base.cold)
+            .ok_or(UtxoError::Malformed("base entry count"))?;
+        let state = self.state.lock().expect("overlay lock not poisoned");
+        let mut delta = 0_i64;
+        for (outpoint, current) in &state.current {
+            let present_before = match state.original.get(outpoint) {
+                Some(original) => original.is_some(),
+                // Reached only for an outpoint written straight into `current`
+                // without a recorded pre-image; bounded by the overlay size.
+                None => self.base.get(*outpoint)?.is_some(),
+            };
+            delta += i64::from(current.is_some()) - i64::from(present_before);
+        }
+        let hot = i64::try_from(total)
+            .ok()
+            .and_then(|total| total.checked_add(delta))
+            .and_then(|total| u64::try_from(total).ok())
+            .ok_or(UtxoError::Malformed("overlay entry count"))?;
+        Ok(TierStats { hot, cold: 0 })
     }
 }
 
@@ -1394,13 +1431,7 @@ mod tests {
     }
 
     fn deployments(height: u32) -> BlockDeploymentContext {
-        block_deployment_context(
-            Network::Regtest,
-            height,
-            BlockHash::all_zeros(),
-            u32::MAX,
-            true,
-        )
+        block_deployment_context(Network::Regtest, height, BlockHash::all_zeros())
     }
 
     #[test]
@@ -1907,13 +1938,7 @@ mod tests {
                 .unwrap();
         let mut headers = HeaderDag::new(Network::Signet);
         headers.insert_contextual(block.header, u32::MAX).unwrap();
-        let context = block_deployment_context(
-            Network::Signet,
-            1,
-            block.block_hash(),
-            block.header.time,
-            false,
-        );
+        let context = block_deployment_context(Network::Signet, 1, block.block_hash());
         assert!(context.signet_challenge.is_some());
 
         let mut damaged = block.clone();
@@ -1960,13 +1985,7 @@ mod tests {
                 .unwrap();
         let mut headers = HeaderDag::new(Network::Signet);
         headers.insert_contextual(block.header, u32::MAX).unwrap();
-        let mut context = block_deployment_context(
-            Network::Signet,
-            1,
-            block.block_hash(),
-            block.header.time,
-            true,
-        );
+        let mut context = block_deployment_context(Network::Signet, 1, block.block_hash());
         context.signet_challenge = Some(Arc::from([0x00]));
 
         assert!(matches!(

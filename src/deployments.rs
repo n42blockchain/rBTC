@@ -29,6 +29,13 @@ const NEVER_ACTIVE: i64 = -2;
 const CONFIG_ENCODING_VERSION: u8 = 1;
 const BURIED_CONFIG_ENCODING_VERSION: u8 = 2;
 const CUSTOM_SIGNET_CONFIG_ENCODING_VERSION: u8 = 3;
+// Versions 1-3 above describe the same parameters without a network tag, so two
+// networks that happen to share every deployment value produce identical bytes.
+// Versions 4-6 append the network and are what `consensus_id` emits now; the
+// older encodings are still accepted once, for in-place migration.
+const NETWORK_BOUND_CONFIG_ENCODING_VERSION: u8 = 4;
+const NETWORK_BOUND_BURIED_CONFIG_ENCODING_VERSION: u8 = 5;
+const NETWORK_BOUND_CUSTOM_SIGNET_CONFIG_ENCODING_VERSION: u8 = 6;
 const BITCOIN_HALVING_INTERVAL: u32 = 210_000;
 const REGTEST_HALVING_INTERVAL: u32 = 150;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
@@ -290,8 +297,34 @@ impl DeploymentConfig {
     }
 
     /// Canonical bytes that bind persisted execution state to these settings.
+    ///
+    /// The network is part of the identity: Testnet4 and default Signet
+    /// otherwise agree on every deployment value, halving interval, and buried
+    /// activation height, so their identities would be byte-identical.
     #[must_use]
     pub fn consensus_id(&self) -> Vec<u8> {
+        let mut encoded = self.legacy_consensus_id();
+        if let Some(version) = encoded.first_mut() {
+            *version = match *version {
+                BURIED_CONFIG_ENCODING_VERSION => NETWORK_BOUND_BURIED_CONFIG_ENCODING_VERSION,
+                CUSTOM_SIGNET_CONFIG_ENCODING_VERSION => {
+                    NETWORK_BOUND_CUSTOM_SIGNET_CONFIG_ENCODING_VERSION
+                }
+                _ => NETWORK_BOUND_CONFIG_ENCODING_VERSION,
+            };
+        }
+        encoded.push(network_tag(self.network));
+        encoded
+    }
+
+    /// The pre-network-binding identity, accepted once so an existing execution
+    /// database can migrate to [`Self::consensus_id`] without a reindex.
+    ///
+    /// Relying on this is safe because the execution store separately binds the
+    /// network's genesis hash and refuses a mismatch, so the collision this
+    /// encoding permits was never reachable in practice.
+    #[must_use]
+    pub fn legacy_consensus_id(&self) -> Vec<u8> {
         let mut encoded = vec![0_u8; 29];
         encoded[0] = CONFIG_ENCODING_VERSION;
         encoded[1..5].copy_from_slice(&self.taproot.period.to_le_bytes());
@@ -339,20 +372,21 @@ impl DeploymentConfig {
 }
 
 /// Derives block and script consensus flags for one candidate.
+///
+/// Core 26 reduced block script flags to an unconditional
+/// `P2SH | WITNESS | TAPROOT` plus two hash-keyed exceptions, so neither the
+/// candidate's timestamp nor Taproot's BIP9 state is an input here. See
+/// [`taproot_active`] for the deployment state itself.
 #[must_use]
 pub fn block_deployment_context(
     network: Network,
     height: u32,
     block_hash: BlockHash,
-    block_time: u32,
-    taproot_active: bool,
 ) -> BlockDeploymentContext {
     block_deployment_context_with_config(
         &DeploymentConfig::for_network(network),
         height,
         block_hash,
-        block_time,
-        taproot_active,
     )
 }
 
@@ -362,17 +396,8 @@ pub fn block_deployment_context_with_config(
     config: &DeploymentConfig,
     height: u32,
     block_hash: BlockHash,
-    block_time: u32,
-    taproot_active: bool,
 ) -> BlockDeploymentContext {
-    block_deployment_context_with_bip34_anchor(
-        config,
-        height,
-        block_hash,
-        block_time,
-        taproot_active,
-        false,
-    )
+    block_deployment_context_with_bip34_anchor(config, height, block_hash, false)
 }
 
 /// Derives candidate flags using the active header chain for Core's BIP30 optimization.
@@ -381,8 +406,6 @@ pub fn block_deployment_context_for_headers(
     headers: &HeaderDag,
     height: u32,
     block_hash: BlockHash,
-    block_time: u32,
-    taproot_active: bool,
 ) -> Result<BlockDeploymentContext, DeploymentConfigError> {
     if headers.network() != config.network {
         return Err(DeploymentConfigError::NetworkMismatch);
@@ -396,8 +419,6 @@ pub fn block_deployment_context_for_headers(
         config,
         height,
         block_hash,
-        block_time,
-        taproot_active,
         bip34_anchor_matches,
     ))
 }
@@ -406,8 +427,6 @@ fn block_deployment_context_with_bip34_anchor(
     config: &DeploymentConfig,
     height: u32,
     block_hash: BlockHash,
-    _block_time: u32,
-    _taproot_active: bool,
     bip34_anchor_matches: bool,
 ) -> BlockDeploymentContext {
     let network = config.network;
@@ -447,6 +466,17 @@ fn block_deployment_context_with_bip34_anchor(
     }
 }
 
+/// Stable one-byte discriminant binding an execution identity to its network.
+const fn network_tag(network: Network) -> u8 {
+    match network {
+        Network::Bitcoin => 1,
+        Network::Testnet => 2,
+        Network::Testnet4 => 3,
+        Network::Signet => 4,
+        Network::Regtest => 5,
+    }
+}
+
 const fn halving_interval(network: Network) -> u32 {
     match network {
         Network::Regtest => REGTEST_HALVING_INTERVAL,
@@ -466,6 +496,11 @@ pub fn taproot_always_active(network: Network) -> bool {
 ///
 /// Mainnet and legacy testnet use the Core 26 deployment parameters. Newer
 /// test networks and default regtest configure Taproot as always active.
+///
+/// Block validation does not consult this: Core 26 enables `SCRIPT_VERIFY_TAPROOT`
+/// unconditionally outside its two script-flag exception blocks. It is retained
+/// as the version-bits machinery that a future deployment needs, and for
+/// reporting a deployment's status.
 pub fn taproot_active(
     headers: &HeaderDag,
     candidate_height: u32,
@@ -771,13 +806,7 @@ mod tests {
 
     #[test]
     fn regtest_activates_default_core_rules_at_block_one() {
-        let context = block_deployment_context(
-            Network::Regtest,
-            1,
-            BlockHash::all_zeros(),
-            1_333_238_399,
-            taproot_always_active(Network::Regtest),
-        );
+        let context = block_deployment_context(Network::Regtest, 1, BlockHash::all_zeros());
         assert!(context.bip34_active);
         assert!(context.csv_active);
         assert!(context.segwit_active);
@@ -795,7 +824,7 @@ mod tests {
     fn only_signet_selects_bip325_block_validation() {
         let hash = BlockHash::all_zeros();
         assert!(
-            block_deployment_context(Network::Signet, 1, hash, 0, false)
+            block_deployment_context(Network::Signet, 1, hash)
                 .signet_challenge
                 .is_some()
         );
@@ -806,7 +835,7 @@ mod tests {
             Network::Regtest,
         ] {
             assert!(
-                block_deployment_context(network, 1, hash, 0, false)
+                block_deployment_context(network, 1, hash)
                     .signet_challenge
                     .is_none()
             );
@@ -835,10 +864,9 @@ mod tests {
         assert_ne!(config.consensus_id(), default_id);
         assert_eq!(
             config.consensus_id()[0],
-            CUSTOM_SIGNET_CONFIG_ENCODING_VERSION
+            NETWORK_BOUND_CUSTOM_SIGNET_CONFIG_ENCODING_VERSION
         );
-        let context =
-            block_deployment_context_with_config(&config, 1, BlockHash::all_zeros(), 0, true);
+        let context = block_deployment_context_with_config(&config, 1, BlockHash::all_zeros());
         assert_eq!(
             context.signet_challenge.as_deref(),
             Some(challenge.as_slice())
@@ -857,12 +885,45 @@ mod tests {
     }
 
     #[test]
+    fn execution_identity_distinguishes_networks_that_share_every_parameter() {
+        // Testnet4 and default Signet agree on the Taproot version-bits
+        // parameters, the buried activation heights, and the halving interval,
+        // so the pre-network encoding gave them identical identities.
+        let testnet4 = DeploymentConfig::for_network(Network::Testnet4);
+        let signet = DeploymentConfig::for_network(Network::Signet);
+        assert_eq!(testnet4.legacy_consensus_id(), signet.legacy_consensus_id());
+        assert_ne!(testnet4.consensus_id(), signet.consensus_id());
+
+        // Every network is distinct, and the superseded encoding is a strict
+        // prefix of the current one so migration is unambiguous.
+        let ids = [
+            Network::Bitcoin,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Signet,
+            Network::Regtest,
+        ]
+        .map(|network| DeploymentConfig::for_network(network).consensus_id());
+        for (index, id) in ids.iter().enumerate() {
+            assert!(!ids[..index].contains(id), "duplicate identity at {index}");
+        }
+        for network in [Network::Bitcoin, Network::Regtest, Network::Signet] {
+            let config = DeploymentConfig::for_network(network);
+            let legacy = config.legacy_consensus_id();
+            let current = config.consensus_id();
+            assert_eq!(current.len(), legacy.len() + 1);
+            assert_eq!(current[1..legacy.len()], legacy[1..]);
+            assert_eq!(*current.last().expect("network tag"), network_tag(network));
+        }
+    }
+
+    #[test]
     fn network_subsidy_halving_intervals_match_core() {
         let hash = BlockHash::all_zeros();
-        let regtest_before = block_deployment_context(Network::Regtest, 149, hash, 0, true);
-        let regtest_after = block_deployment_context(Network::Regtest, 150, hash, 0, true);
-        let mainnet_early = block_deployment_context(Network::Bitcoin, 150, hash, 0, false);
-        let mainnet_after = block_deployment_context(Network::Bitcoin, 210_000, hash, 0, false);
+        let regtest_before = block_deployment_context(Network::Regtest, 149, hash);
+        let regtest_after = block_deployment_context(Network::Regtest, 150, hash);
+        let mainnet_early = block_deployment_context(Network::Bitcoin, 150, hash);
+        let mainnet_after = block_deployment_context(Network::Bitcoin, 210_000, hash);
         assert_eq!(regtest_before.subsidy_sats, 50 * 100_000_000);
         assert_eq!(regtest_after.subsidy_sats, 25 * 100_000_000);
         assert_eq!(mainnet_early.subsidy_sats, 50 * 100_000_000);
@@ -871,34 +932,16 @@ mod tests {
 
     #[test]
     fn mainnet_csv_and_segwit_boundaries_match_pinned_core() {
-        let before = block_deployment_context(
-            Network::Bitcoin,
-            419_327,
-            BlockHash::all_zeros(),
-            u32::MAX,
-            false,
-        );
+        let before = block_deployment_context(Network::Bitcoin, 419_327, BlockHash::all_zeros());
         assert!(!before.csv_active);
-        let csv = block_deployment_context(
-            Network::Bitcoin,
-            419_328,
-            BlockHash::all_zeros(),
-            u32::MAX,
-            false,
-        );
+        let csv = block_deployment_context(Network::Bitcoin, 419_328, BlockHash::all_zeros());
         assert!(csv.csv_active);
         assert!(!csv.segwit_active);
         assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_P2SH, 0);
         assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
         assert_ne!(csv.script_flags & bitcoinconsensus::VERIFY_TAPROOT, 0);
         assert_eq!(csv.script_flags & bitcoinconsensus::VERIFY_NULLDUMMY, 0);
-        let segwit = block_deployment_context(
-            Network::Bitcoin,
-            481_824,
-            BlockHash::all_zeros(),
-            u32::MAX,
-            false,
-        );
+        let segwit = block_deployment_context(Network::Bitcoin, 481_824, BlockHash::all_zeros());
         assert!(segwit.segwit_active);
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_WITNESS, 0);
         assert_ne!(segwit.script_flags & bitcoinconsensus::VERIFY_NULLDUMMY, 0);
@@ -932,22 +975,14 @@ mod tests {
         ));
 
         let config = DeploymentConfig::for_network(Network::Bitcoin);
-        let optimized = block_deployment_context_with_bip34_anchor(
-            &config,
-            227_932,
-            ordinary,
-            u32::MAX,
-            false,
-            true,
-        );
+        let optimized =
+            block_deployment_context_with_bip34_anchor(&config, 227_932, ordinary, true);
         assert!(!optimized.bip30_enforced);
         assert!(!optimized.bip30_overwrite);
         let exception = block_deployment_context_with_bip34_anchor(
             &config,
             91_842,
             parse_hash("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"),
-            u32::MAX,
-            false,
             false,
         );
         assert!(!exception.bip30_enforced);
@@ -1166,8 +1201,11 @@ mod tests {
     fn parses_core_compatible_regtest_vbparams_and_special_states() {
         let headers = HeaderDag::new(Network::Regtest);
         let mut config = DeploymentConfig::for_network(Network::Regtest);
-        assert_eq!(config.consensus_id().len(), 29);
-        assert_eq!(config.consensus_id()[0], CONFIG_ENCODING_VERSION);
+        assert_eq!(config.consensus_id().len(), 30);
+        assert_eq!(
+            config.consensus_id()[0],
+            NETWORK_BOUND_CONFIG_ENCODING_VERSION
+        );
         config.apply_vbparams("taproot:-2:0").unwrap();
         assert!(!taproot_active(&headers, 1, &config).unwrap());
 
@@ -1179,7 +1217,7 @@ mod tests {
             config.consensus_id(),
             DeploymentConfig::for_network(Network::Regtest).consensus_id()
         );
-        assert_eq!(config.consensus_id().len(), 29);
+        assert_eq!(config.consensus_id().len(), 30);
     }
 
     #[test]
@@ -1188,9 +1226,8 @@ mod tests {
         for value in ["bip34@10", "dersig@11", "cltv@12", "csv@13", "segwit@14"] {
             config.apply_test_activation_height(value).unwrap();
         }
-        let context = |height| {
-            block_deployment_context_with_config(&config, height, BlockHash::all_zeros(), 0, false)
-        };
+        let context =
+            |height| block_deployment_context_with_config(&config, height, BlockHash::all_zeros());
         assert!(!context(9).bip34_active);
         assert!(context(10).bip34_active);
         assert_eq!(config.minimum_block_version(9), 1);
@@ -1225,8 +1262,11 @@ mod tests {
             context(14).script_flags & bitcoinconsensus::VERIFY_WITNESS,
             0
         );
-        assert_eq!(config.consensus_id().len(), 49);
-        assert_eq!(config.consensus_id()[0], BURIED_CONFIG_ENCODING_VERSION);
+        assert_eq!(config.consensus_id().len(), 50);
+        assert_eq!(
+            config.consensus_id()[0],
+            NETWORK_BOUND_BURIED_CONFIG_ENCODING_VERSION
+        );
         let original_id = config.consensus_id();
         config.apply_test_activation_height("bip34@11").unwrap();
         assert_ne!(config.consensus_id(), original_id);
@@ -1238,8 +1278,7 @@ mod tests {
         config.apply_test_activation_height("bip34@10").unwrap();
         config.apply_test_activation_height("bip34@20").unwrap();
         assert!(
-            !block_deployment_context_with_config(&config, 19, BlockHash::all_zeros(), 0, false,)
-                .bip34_active
+            !block_deployment_context_with_config(&config, 19, BlockHash::all_zeros()).bip34_active
         );
         assert_eq!(
             config.apply_test_activation_height("bip66@10"),
@@ -1343,9 +1382,7 @@ mod tests {
                 &DeploymentConfig::for_network(Network::Bitcoin),
                 &headers,
                 1,
-                BlockHash::all_zeros(),
-                0,
-                false,
+                BlockHash::all_zeros()
             ),
             Err(DeploymentConfigError::NetworkMismatch)
         );

@@ -427,12 +427,17 @@ impl RedbExecutionStore {
     /// cannot be changed in place, even at genesis, because an interrupted block
     /// transition may already exist in the other stores. Databases created
     /// before this metadata existed can migrate only to `legacy_default`.
+    ///
+    /// `legacy_selected` is the same configuration under a superseded encoding.
+    /// A database still holding those bytes is rewritten to `selected` in place,
+    /// which lets the identity format gain fields without forcing a reindex.
     pub fn bind_consensus_config(
         &self,
         selected: &[u8],
+        legacy_selected: &[u8],
         legacy_default: &[u8],
     ) -> Result<(), ExecutionStoreError> {
-        if selected.is_empty() || legacy_default.is_empty() {
+        if selected.is_empty() || legacy_selected.is_empty() || legacy_default.is_empty() {
             return Err(ExecutionStoreError::Malformed(
                 "empty consensus configuration",
             ));
@@ -451,7 +456,7 @@ impl RedbExecutionStore {
                 .map(|value| value.value().to_vec());
             let compatible = stored.as_deref().map_or_else(
                 || (self.new_database && tip.height == 0) || selected == legacy_default,
-                |stored| stored == selected,
+                |stored| stored == selected || stored == legacy_selected,
             );
             if !compatible {
                 return Err(ExecutionStoreError::ConsensusConfigMismatch { height: tip.height });
@@ -895,7 +900,9 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("execution.redb");
         let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
-        store.bind_consensus_config(b"default", b"default").unwrap();
+        store
+            .bind_consensus_config(b"default", b"default", b"default")
+            .unwrap();
         let genesis = store.tip().unwrap();
         let child = ExecutionTip {
             height: 1,
@@ -916,17 +923,17 @@ mod tests {
 
         let reopened = RedbExecutionStore::open(path, Network::Regtest).unwrap();
         reopened
-            .bind_consensus_config(b"default", b"default")
+            .bind_consensus_config(b"default", b"default", b"default")
             .unwrap();
         assert!(matches!(
-            reopened.bind_consensus_config(b"custom", b"default"),
+            reopened.bind_consensus_config(b"custom", b"custom", b"default"),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
         ));
         assert_eq!(reopened.tip().unwrap(), child);
         reopened.rewind(child, genesis).unwrap();
         assert_eq!(reopened.tip().unwrap(), genesis);
         assert!(matches!(
-            reopened.bind_consensus_config(b"custom", b"default"),
+            reopened.bind_consensus_config(b"custom", b"custom", b"default"),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
         ));
     }
@@ -947,10 +954,12 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            store.bind_consensus_config(b"custom", b"default"),
+            store.bind_consensus_config(b"custom", b"custom", b"default"),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
         ));
-        store.bind_consensus_config(b"default", b"default").unwrap();
+        store
+            .bind_consensus_config(b"default", b"default", b"default")
+            .unwrap();
     }
 
     #[test]
@@ -958,14 +967,57 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("execution.redb");
         let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
-        store.bind_consensus_config(b"custom", b"default").unwrap();
+        store
+            .bind_consensus_config(b"custom", b"custom", b"default")
+            .unwrap();
         drop(store);
 
         let store = RedbExecutionStore::open(path, Network::Regtest).unwrap();
-        store.bind_consensus_config(b"custom", b"default").unwrap();
+        store
+            .bind_consensus_config(b"custom", b"custom", b"default")
+            .unwrap();
         assert!(matches!(
-            store.bind_consensus_config(b"other", b"default"),
+            store.bind_consensus_config(b"other", b"other", b"default"),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
+        ));
+    }
+
+    #[test]
+    fn a_superseded_identity_encoding_migrates_in_place() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("execution.redb");
+        let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
+        store
+            .bind_consensus_config(b"legacy", b"legacy", b"legacy")
+            .unwrap();
+        store
+            .advance(
+                store.tip().unwrap().hash,
+                ExecutionTip {
+                    height: 1,
+                    hash: BlockHash::from_byte_array([1; 32]),
+                },
+            )
+            .unwrap();
+
+        // A store still holding the superseded bytes above genesis is accepted
+        // and rewritten, so the new identity binds without a reindex.
+        store
+            .bind_consensus_config(b"current", b"legacy", b"unused-default")
+            .unwrap();
+        assert_eq!(
+            store.consensus_config().unwrap().as_deref(),
+            Some(&b"current"[..])
+        );
+        // Once migrated, the superseded encoding is no longer a valid identity.
+        assert!(matches!(
+            store.bind_consensus_config(b"legacy", b"legacy", b"unused-default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
+        ));
+        // An unrelated identity is still rejected.
+        assert!(matches!(
+            store.bind_consensus_config(b"other", b"other-legacy", b"unused-default"),
+            Err(ExecutionStoreError::ConsensusConfigMismatch { height: 1 })
         ));
     }
 
@@ -978,18 +1030,30 @@ mod tests {
         selected.apply_test_activation_height("bip34@10").unwrap();
         let store = RedbExecutionStore::open(&path, Network::Regtest).unwrap();
         store
-            .bind_consensus_config(&selected.consensus_id(), &defaults.consensus_id())
+            .bind_consensus_config(
+                &selected.consensus_id(),
+                &selected.legacy_consensus_id(),
+                &defaults.consensus_id(),
+            )
             .unwrap();
         drop(store);
 
         let store = RedbExecutionStore::open(path, Network::Regtest).unwrap();
         store
-            .bind_consensus_config(&selected.consensus_id(), &defaults.consensus_id())
+            .bind_consensus_config(
+                &selected.consensus_id(),
+                &selected.legacy_consensus_id(),
+                &defaults.consensus_id(),
+            )
             .unwrap();
         let mut changed = defaults.clone();
         changed.apply_test_activation_height("bip34@11").unwrap();
         assert!(matches!(
-            store.bind_consensus_config(&changed.consensus_id(), &defaults.consensus_id()),
+            store.bind_consensus_config(
+                &changed.consensus_id(),
+                &changed.legacy_consensus_id(),
+                &defaults.consensus_id(),
+            ),
             Err(ExecutionStoreError::ConsensusConfigMismatch { height: 0 })
         ));
     }

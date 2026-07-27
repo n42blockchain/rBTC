@@ -898,7 +898,13 @@ fn decode_validation_delta(encoded: &[u8]) -> Result<(u64, ValidationDeltaUpdate
     let mut updates = Vec::with_capacity(count);
     for index in 0..count {
         let (outpoint, state, offset, length) = validation_delta_index_entry(encoded, index)?;
-        let end = offset + length;
+        // `inspect_validation_delta` above already proved every offset/length
+        // pair in range, but re-derive the bound here so this pass is sound on
+        // its own rather than only in combination with the first one.
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= encoded.len())
+            .ok_or(UtxoError::Malformed("truncated validation delta UTXO"))?;
         let utxo = (state & 1 != 0)
             .then(|| Utxo::decode(&encoded[offset..end]))
             .transpose()?;
@@ -1506,6 +1512,11 @@ impl RedbChainStore {
     }
 
     /// Returns one sorted, cursor-based page from the complete hot/cold UTXO set.
+    ///
+    /// A store carrying an unmaterialized validation journal has no paged view:
+    /// its logical set is the durable base folded with every journal delta, so
+    /// this falls back to materializing that fold. Callers on a validation store
+    /// should prefer [`Self::materialize_validation_deltas`] first.
     pub fn utxo_snapshot_page(
         &self,
         after: Option<OutPointKey>,
@@ -2931,11 +2942,11 @@ mod tests {
         .unwrap();
         active
             .execution()
-            .bind_consensus_config(b"rules", b"rules")
+            .bind_consensus_config(b"rules", b"rules", b"rules")
             .unwrap();
         validation
             .execution()
-            .bind_consensus_config(b"rules", b"rules")
+            .bind_consensus_config(b"rules", b"rules", b"rules")
             .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();
@@ -3015,11 +3026,11 @@ mod tests {
                 .unwrap();
         active
             .execution()
-            .bind_consensus_config(b"rules", b"rules")
+            .bind_consensus_config(b"rules", b"rules", b"rules")
             .unwrap();
         validation
             .execution()
-            .bind_consensus_config(b"rules", b"rules")
+            .bind_consensus_config(b"rules", b"rules", b"rules")
             .unwrap();
         let mut headers = HeaderDag::new(Network::Regtest);
         let genesis = headers.active_tip();

@@ -55,13 +55,7 @@ fn validate_decoded_fixture(block: Block, height: u32, expected_hash: &str) -> B
         .header
         .validate_pow(block.header.target())
         .expect("historical block satisfies its claimed proof of work");
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        height,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, height, block.block_hash());
     validate_block_structure_with_deployments(
         &block,
         height,
@@ -88,13 +82,7 @@ fn core_bip30_repeat_blocks_are_pinned_and_select_the_exception() {
         ),
     ] {
         let block = validate_fixture(encoded, height, expected_hash);
-        let context = block_deployment_context(
-            Network::Bitcoin,
-            height,
-            block.block_hash(),
-            block.header.time,
-            false,
-        );
+        let context = block_deployment_context(Network::Bitcoin, height, block.block_hash());
         assert!(!context.bip30_enforced);
     }
 }
@@ -106,13 +94,7 @@ fn core_bip16_exception_block_uses_no_base_script_flags() {
         170_060,
         "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
     );
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        170_060,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, 170_060, block.block_hash());
     assert_eq!(context.script_flags, bitcoinconsensus::VERIFY_NONE);
     assert!(context.bip30_enforced);
 }
@@ -138,13 +120,7 @@ fn real_bip34_activation_block_enforces_coinbase_height() {
         block.block_hash().to_string(),
         "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
     );
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        227_931,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, 227_931, block.block_hash());
     assert!(context.bip34_active);
     validate_block_structure_with_deployments(
         &block,
@@ -168,13 +144,7 @@ fn real_bip66_activation_block_selects_der_signatures_and_version_three() {
         363_725,
         "00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931",
     );
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        363_725,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, 363_725, block.block_hash());
     assert_ne!(context.script_flags & bitcoinconsensus::VERIFY_DERSIG, 0);
     assert_eq!(block.header.version.to_consensus(), 3);
 }
@@ -186,13 +156,7 @@ fn real_bip65_activation_block_selects_cltv_and_version_four() {
         388_381,
         "000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0",
     );
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        388_381,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, 388_381, block.block_hash());
     assert_ne!(
         context.script_flags & bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY,
         0
@@ -208,13 +172,7 @@ fn real_csv_activation_block_selects_sequence_locks_without_segwit() {
         419_328,
         "000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5",
     );
-    let context = block_deployment_context(
-        Network::Bitcoin,
-        419_328,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let context = block_deployment_context(Network::Bitcoin, 419_328, block.block_hash());
     assert!(context.csv_active);
     assert!(!context.segwit_active);
     assert_ne!(

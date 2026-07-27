@@ -214,30 +214,29 @@ impl HeaderDag {
 
     /// Builds a standard newest-to-oldest block locator for `getheaders`.
     ///
-    /// The first ten entries walk one header at a time; thereafter the step
-    /// doubles until genesis. This retains recent reorg precision while
-    /// bounding the locator to the protocol's expected small size.
+    /// This reproduces Core's `GetLocator` step schedule exactly: eleven entries
+    /// one header apart, then a doubling step down to genesis. The doubling
+    /// starts once more than ten entries are present, so a `u32` height yields
+    /// at most ~42 hashes, well inside the protocol's 101-hash bound.
     #[must_use]
     pub fn block_locator(&self) -> Vec<BlockHash> {
         let mut locator = Vec::new();
         let mut height = self.active_tip().height;
         let mut step = 1_u32;
-        while height > 0 {
+        loop {
             locator.push(
                 self.active_header_at(height)
-                    .expect("active chain contains its tip height")
+                    .expect("active chain contains every height up to its tip")
                     .hash,
             );
+            if height == 0 {
+                break;
+            }
             height = height.saturating_sub(step);
-            if locator.len() >= 10 {
+            if locator.len() > 10 {
                 step = step.saturating_mul(2);
             }
         }
-        locator.push(
-            self.active_header_at(0)
-                .expect("active chain contains genesis")
-                .hash,
-        );
         locator
     }
 
@@ -975,8 +974,10 @@ mod tests {
             dag.insert(child).unwrap();
         }
 
+        // Core's `GetLocator` doubles its step only once more than ten entries
+        // are present, so heights 22 and 21 are both one apart.
         let locator = dag.block_locator();
-        let expected_heights = [32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 20, 16, 8, 0];
+        let expected_heights = [32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 19, 15, 7, 0];
         assert_eq!(locator.len(), expected_heights.len());
         for (hash, height) in locator.iter().zip(expected_heights) {
             assert_eq!(

@@ -926,14 +926,15 @@ impl UtxoStore for RedbUtxoStore {
         let cutoff = now.saturating_sub(hot_window_secs);
         let transaction = self.db.begin_write()?;
         let moved = {
+            // Buffer only the 36-byte keys. Carrying each record's value through
+            // as well would hold a second copy of every aged coin in memory,
+            // and the value is available again from `hot.remove` below.
             let hot = transaction.open_table(HOT_TABLE)?;
-            let rows = hot
+            let keys = hot
                 .iter()?
                 .filter_map(|row| match row {
                     Ok((key, value)) => match Utxo::decode(value.value()) {
-                        Ok(utxo) if utxo.last_touched < cutoff => {
-                            Some(Ok((key.value().to_vec(), value.value().to_vec())))
-                        }
+                        Ok(utxo) if utxo.last_touched < cutoff => Some(Ok(key.value().to_vec())),
                         Ok(_) => None,
                         Err(error) => Some(Err(error)),
                     },
@@ -943,11 +944,18 @@ impl UtxoStore for RedbUtxoStore {
             drop(hot);
             let mut hot = transaction.open_table(HOT_TABLE)?;
             let mut cold = transaction.open_table(COLD_TABLE)?;
-            for (key, value) in &rows {
-                hot.remove(key.as_slice())?;
+            let mut moved = 0_u64;
+            for key in &keys {
+                let Some(value) = hot
+                    .remove(key.as_slice())?
+                    .map(|value| value.value().to_vec())
+                else {
+                    continue;
+                };
                 cold.insert(key.as_slice(), value.as_slice())?;
+                moved += 1;
             }
-            u64::try_from(rows.len()).expect("usize fits u64")
+            moved
         };
         transaction.commit()?;
         Ok(moved)

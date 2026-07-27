@@ -95,7 +95,7 @@ use rbtc::{
         ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
     },
     core_snapshot::verify_core31_snapshot,
-    deployments::{DeploymentConfig, block_deployment_context_for_headers, taproot_active},
+    deployments::{DeploymentConfig, block_deployment_context_for_headers},
     diagnostics::{
         LogConfig, LogLevel, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MIN_LOG_FILE_BYTES, MIN_LOG_FILES,
     },
@@ -4758,6 +4758,7 @@ fn reindex_from_complete_freezer(
         .execution()
         .bind_consensus_config(
             &options.deployments.consensus_id(),
+            &options.deployments.legacy_consensus_id(),
             &DeploymentConfig::for_network(options.network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
@@ -5153,6 +5154,7 @@ fn initialize_empty_reindex_output(
         .execution()
         .bind_consensus_config(
             &options.deployments.consensus_id(),
+            &options.deployments.legacy_consensus_id(),
             &DeploymentConfig::for_network(options.network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
@@ -6706,6 +6708,7 @@ fn finalize_assumed_snapshot_with(
         .execution()
         .bind_consensus_config(
             &deployments.consensus_id(),
+            &deployments.legacy_consensus_id(),
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
@@ -7163,6 +7166,7 @@ fn preflight_data_dir(
         .execution()
         .bind_consensus_config(
             &deployments.consensus_id(),
+            &deployments.legacy_consensus_id(),
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())
@@ -8613,15 +8617,11 @@ fn transaction_admission_context(
     let parent_mtp = headers
         .median_time_past(tip.hash)
         .ok_or_else(|| "transaction admission parent MTP is unavailable".to_owned())?;
-    let taproot_active =
-        taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?;
     let deployments = block_deployment_context_for_headers(
         deployment_config,
         headers,
         height,
         BlockHash::all_zeros(),
-        parent_mtp,
-        taproot_active,
     )
     .map_err(|error| error.to_string())?;
     Ok(TransactionAdmissionContext {
@@ -9224,6 +9224,7 @@ async fn sync_validating_node(
     execution_store
         .bind_consensus_config(
             &deployment_config.consensus_id(),
+            &deployment_config.legacy_consensus_id(),
             &DeploymentConfig::for_network(network).consensus_id(),
         )
         .map_err(|error| error.to_string())?;
@@ -10345,15 +10346,9 @@ fn validate_archive_block(
             "archive block {actual} does not match active block {expected_hash} at height {height}"
         ));
     }
-    let deployments = block_deployment_context_for_headers(
-        deployment_config,
-        headers,
-        height,
-        expected_hash,
-        block.header.time,
-        taproot_active(headers, height, deployment_config).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let deployments =
+        block_deployment_context_for_headers(deployment_config, headers, height, expected_hash)
+            .map_err(|error| error.to_string())?;
     validate_block_structure_with_deployments(
         block,
         height,
@@ -11657,17 +11652,9 @@ fn validate_downloaded_block(
             "downloaded block {actual} does not match active block {expected_hash} at height {height}"
         )));
     }
-    let taproot = taproot_active(headers, height, deployment_config)
-        .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    let deployments = block_deployment_context_for_headers(
-        deployment_config,
-        headers,
-        height,
-        expected_hash,
-        block.header.time,
-        taproot,
-    )
-    .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let deployments =
+        block_deployment_context_for_headers(deployment_config, headers, height, expected_hash)
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
     let transaction_ids = validate_block_structure_with_deployments_and_txids(
         block,
         height,
@@ -17079,7 +17066,7 @@ mod tests {
             served.deployments,
             DeploymentConfig::for_network(Network::Regtest)
         );
-        assert_eq!(served.deployments.consensus_id().len(), 49);
+        assert_eq!(served.deployments.consensus_id().len(), 50);
         assert!(completed_validating_session(&served));
         assert!(
             parse_options(
@@ -18319,6 +18306,7 @@ mod tests {
             .execution()
             .bind_consensus_config(
                 &DeploymentConfig::for_network(Network::Regtest).consensus_id(),
+                &DeploymentConfig::for_network(Network::Regtest).legacy_consensus_id(),
                 &DeploymentConfig::for_network(Network::Regtest).consensus_id(),
             )
             .unwrap();

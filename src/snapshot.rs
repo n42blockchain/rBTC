@@ -1172,13 +1172,7 @@ mod tests {
         let second_info = headers
             .insert_contextual(second.header, second.header.time)
             .unwrap();
-        let context = block_deployment_context(
-            Network::Regtest,
-            2,
-            second_info.hash,
-            second.header.time,
-            true,
-        );
+        let context = block_deployment_context(Network::Regtest, 2, second_info.hash);
         connect_active_block(&chainstate, &headers, &second, 101, 60, &context).unwrap();
         drop(chainstate);
 

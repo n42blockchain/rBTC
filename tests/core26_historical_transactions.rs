@@ -155,8 +155,6 @@ fn context(materialized: &MaterializedFixture) -> rbtc::block_execution::BlockDe
         Network::Bitcoin,
         materialized.fixture.height,
         materialized.header.block_hash(),
-        materialized.header.time,
-        true,
     )
 }
 

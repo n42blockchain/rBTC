@@ -342,13 +342,7 @@ fn execute(
     block: &Block,
     store: &MemoryUtxoStore,
 ) -> Result<rbtc::blockchain::AppliedBlock, BlockError> {
-    let deployments = block_deployment_context(
-        Network::Bitcoin,
-        case.height,
-        block.block_hash(),
-        block.header.time,
-        true,
-    );
+    let deployments = block_deployment_context(Network::Bitcoin, case.height, block.block_hash());
     apply_block_with_deployments(
         store,
         block,
@@ -371,13 +365,7 @@ fn execute_with_script_flags(
     store: &MemoryUtxoStore,
     script_flags: u32,
 ) -> Result<rbtc::blockchain::AppliedBlock, BlockError> {
-    let deployments = block_deployment_context(
-        Network::Bitcoin,
-        case.height,
-        block.block_hash(),
-        block.header.time,
-        true,
-    );
+    let deployments = block_deployment_context(Network::Bitcoin, case.height, block.block_hash());
     apply_block_with_deployments(
         store,
         block,
@@ -546,13 +534,7 @@ fn taproot_exception_is_required_for_the_real_pre_activation_anyone_can_spend() 
         .unwrap();
     let block = block(&case);
     let before = utxos(&case, &block);
-    let deployments = block_deployment_context(
-        Network::Bitcoin,
-        case.height,
-        block.block_hash(),
-        block.header.time,
-        false,
-    );
+    let deployments = block_deployment_context(Network::Bitcoin, case.height, block.block_hash());
     assert_eq!(
         deployments.script_flags & bitcoinconsensus::VERIFY_TAPROOT,
         0

@@ -52,8 +52,7 @@ fn mainnet_buried_activation_anchors_select_the_expected_rules() {
         ),
     ];
     for (height, block_hash, bip34, csv, segwit) in cases {
-        let context =
-            block_deployment_context(Network::Bitcoin, height, hash(block_hash), 0, false);
+        let context = block_deployment_context(Network::Bitcoin, height, hash(block_hash));
         assert_eq!(context.bip34_active, bip34, "height {height}");
         assert_eq!(context.csv_active, csv, "height {height}");
         assert_eq!(context.segwit_active, segwit, "height {height}");
@@ -100,8 +99,7 @@ fn testnet_buried_activation_anchors_select_the_expected_rules() {
         ),
     ];
     for (height, block_hash, bip34, csv, segwit) in cases {
-        let context =
-            block_deployment_context(Network::Testnet, height, hash(block_hash), 0, false);
+        let context = block_deployment_context(Network::Testnet, height, hash(block_hash));
         assert_eq!(context.bip34_active, bip34, "height {height}");
         assert_eq!(context.csv_active, csv, "height {height}");
         assert_eq!(context.segwit_active, segwit, "height {height}");
@@ -114,8 +112,6 @@ fn historical_script_and_bip30_exception_hashes_are_exact() {
         Network::Bitcoin,
         170_060,
         hash("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
-        0,
-        false,
     );
     assert_eq!(mainnet_p2sh.script_flags, bitcoinconsensus::VERIFY_NONE);
 
@@ -123,8 +119,6 @@ fn historical_script_and_bip30_exception_hashes_are_exact() {
         Network::Bitcoin,
         709_632,
         hash("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"),
-        0,
-        true,
     );
     assert_eq!(
         mainnet_taproot.script_flags,
@@ -140,8 +134,6 @@ fn historical_script_and_bip30_exception_hashes_are_exact() {
         Network::Testnet,
         0,
         hash("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"),
-        0,
-        false,
     );
     assert_eq!(testnet_p2sh.script_flags, bitcoinconsensus::VERIFY_NONE);
 
@@ -156,8 +148,7 @@ fn historical_script_and_bip30_exception_hashes_are_exact() {
         ),
     ] {
         assert!(
-            !block_deployment_context(Network::Bitcoin, height, hash(block_hash), 0, false,)
-                .bip30_enforced
+            !block_deployment_context(Network::Bitcoin, height, hash(block_hash)).bip30_enforced
         );
     }
 }
