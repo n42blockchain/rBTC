@@ -43,16 +43,50 @@ parser panic (A-03) are platform independent.
 | A-08 | Medium | Recovery | Crash recovery rejects a transition with no net UTXO effect | Fixed |
 | A-09 | Low | Consensus | `IsFinalTx` missed Core's zero-locktime early return | Fixed |
 | A-10 | Low | Tooling | The documented clippy gate did not pass off Unix | Fixed |
-| A-11 | Info | Performance | libsecp256k1 builds in 32-bit field mode under MSVC | Reported |
-| A-12 | Info | Portability | Filesystem hardening is Unix-only | Reported |
-| A-13 | Low | Performance | Header DAG is deep-cloned per header batch | Reported |
-| A-14 | Low | Performance | Several paths materialize the entire UTXO set | Reported |
-| A-15 | Low | Robustness | Fresh-output fast path defers a duplicate probe to commit | Reported |
-| A-16 | Info | Consensus | `consensus_id()` omits the network | Reported |
-| A-17 | Info | Consensus | Testnet4 has no Core-26 rule set | Reported |
-| A-18 | Info | Robustness | Validation-delta decode re-derives bounds unchecked | Reported |
-| A-19 | Info | Hygiene | Deployment context accepts two unused parameters | Reported |
-| A-20 | Info | Hygiene | Block locator step schedule differs from Core by one | Reported |
+| A-11 | Info | Performance | libsecp256k1 builds in 32-bit field mode under MSVC | Refuted/fixed probe |
+| A-12 | Info | Portability | Filesystem hardening is Unix-only | Open/declared limitation |
+| A-13 | Low | Performance | Header DAG is deep-cloned per header batch | Fixed |
+| A-14 | Low | Performance | Several paths materialize the entire UTXO set | Fixed in runtime hot paths |
+| A-15 | Low | Robustness | Fresh-output fast path defers a duplicate probe to commit | Fixed |
+| A-16 | Info | Consensus | `consensus_id()` omits the network | Fixed |
+| A-17 | Info | Consensus | Testnet4 has no Core-26 rule set | Fixed against Core 31 |
+| A-18 | Info | Robustness | Validation-delta decode re-derives bounds unchecked | Fixed |
+| A-19 | Info | Hygiene | Deployment context accepts two unused parameters | Fixed |
+| A-20 | Info | Hygiene | Block locator step schedule differs from Core by one | Fixed |
+
+## Post-audit integration disposition
+
+The detailed finding text below records what was observed at audited revision
+`3d36e87`; this section and the status table record the later main-branch
+disposition. The actual fixes were reviewed and integrated by commit rather
+than treating the report as proof:
+
+- A-01 through A-10 were integrated with additional no-net-UTXO recovery and
+  script-worker panic-containment tests. The current main branch passed strict
+  all-target/all-feature clippy, 555 library tests (one explicit performance
+  workload ignored), the historical Core fixture suites, embedded-node tests,
+  and repeated SIGKILL recovery after integration.
+- A-11's premise was false for the vendored secp256k1 revision.
+  `SECP256K1_WIDEMUL_INT128` is selected from native `__int128` or MSVC's
+  intrinsic-backed `int128_struct`; the removed `USE_FIELD_*`/`USE_SCALAR_*`
+  defines were unused. The build now compiles a direct selection assertion and
+  does not compile the complete secp source a second time for that probe.
+- A-13 is closed in the live synchronizer, standby validator, and freezer
+  reindex path by an in-place `O(batch)` guard. Persistence occurs before
+  commit; validation/persistence failure rolls back inserted hashes, and only
+  the rare stronger-side-chain rollback rebuilds the former active vector.
+- A-14 is closed for runtime counting and aging: both validation and admission
+  overlays compute a bounded net population delta, and hot-to-cold aging
+  buffers only fixed-size outpoint keys. Explicit whole-set snapshot
+  compatibility methods remain bulk APIs; live status, paging, and validation
+  do not call them.
+- A-15 through A-16 and A-18 through A-20 were integrated with migration and
+  regression coverage. A-17 had already been superseded on main by Core 31
+  Testnet4 parameters and BIP94 difficulty/timewarp validation.
+- A-12 remains a declared release/platform limitation until Windows ACL,
+  file-identity, directory-flush, and destructive crash testing provide the
+  same evidence as Unix. Passing Windows compilation alone must not be reported
+  as equivalent filesystem-hardening coverage.
 
 ---
 

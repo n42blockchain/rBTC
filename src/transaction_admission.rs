@@ -2039,11 +2039,26 @@ impl<S: UtxoStore> UtxoStore for AdmissionUtxoOverlay<'_, S> {
     }
 
     fn tier_stats(&self) -> Result<TierStats, UtxoError> {
-        Ok(TierStats {
-            hot: u64::try_from(self.snapshot_entries()?.len())
-                .map_err(|_| UtxoError::Malformed("admission overlay entry count"))?,
-            cold: 0,
-        })
+        let base = self.base.tier_stats()?;
+        let total = base
+            .hot
+            .checked_add(base.cold)
+            .ok_or(UtxoError::Malformed("base entry count"))?;
+        let current = self
+            .current
+            .lock()
+            .expect("admission overlay lock not poisoned");
+        let mut delta = 0_i64;
+        for (outpoint, value) in current.iter() {
+            let present_before = self.base.get(*outpoint)?.is_some();
+            delta += i64::from(value.is_some()) - i64::from(present_before);
+        }
+        let hot = i64::try_from(total)
+            .ok()
+            .and_then(|total| total.checked_add(delta))
+            .and_then(|total| u64::try_from(total).ok())
+            .ok_or(UtxoError::Malformed("admission overlay entry count"))?;
+        Ok(TierStats { hot, cold: 0 })
     }
 }
 
@@ -2175,6 +2190,31 @@ mod tests {
             }],
         };
         (outpoint, utxo, transaction)
+    }
+
+    #[test]
+    fn admission_overlay_counts_only_its_bounded_net_delta() {
+        let (_directory, store) = store();
+        let (first, first_utxo, _) = spend(1);
+        let (second, second_utxo, _) = spend(2);
+        store
+            .apply(
+                &[],
+                &[
+                    (first.into(), first_utxo.clone()),
+                    (second.into(), second_utxo.clone()),
+                ],
+            )
+            .unwrap();
+        let overlay = AdmissionUtxoOverlay::new(&store);
+        let third = OutPointKey::from(OutPoint::new(Txid::from_byte_array([3; 32]), 0));
+        overlay
+            .apply(&[first.into()], &[(third, first_utxo)])
+            .unwrap();
+        assert_eq!(overlay.tier_stats().unwrap().hot, 2);
+        let fourth = OutPointKey::from(OutPoint::new(Txid::from_byte_array([4; 32]), 0));
+        overlay.apply(&[], &[(fourth, second_utxo)]).unwrap();
+        assert_eq!(overlay.tier_stats().unwrap().hot, 3);
     }
 
     fn child(parent: &Transaction, value_sats: u64) -> Transaction {
