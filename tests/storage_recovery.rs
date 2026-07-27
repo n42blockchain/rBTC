@@ -1,10 +1,7 @@
 //! Process-level crash and damaged-file recovery checks for unified chainstate.
 
-use std::fs;
-// Only the SIGKILL recovery test below re-executes this binary, and signal-based
-// termination has no Windows equivalent.
-#[cfg(unix)]
 use std::{
+    fs,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -56,7 +53,6 @@ fn open_chainstate(path: impl AsRef<std::path::Path>, quick_repair: bool) -> Red
     .unwrap()
 }
 
-#[cfg(unix)]
 fn assert_consistent(store: &RedbChainStore) {
     let tip = store.execution().tip().unwrap();
     if tip.height == 0 {
@@ -74,7 +70,7 @@ fn assert_consistent(store: &RedbChainStore) {
 }
 
 #[test]
-#[ignore = "subprocess helper, invoked only by repeated_sigkill_recovers_an_atomic_state"]
+#[ignore = "subprocess helper, invoked only by repeated_abrupt_kill_recovers_an_atomic_state"]
 fn crash_writer_child() {
     let Ok(database) = std::env::var("RBTC_CRASH_DB") else {
         return;
@@ -110,9 +106,13 @@ fn crash_writer_child() {
     }
 }
 
-#[cfg(unix)]
+/// Kills a writing child mid-transaction and checks the store reopens atomic.
+///
+/// `Child::kill` gives the process no chance to clean up on either platform --
+/// `SIGKILL` on Unix, `TerminateProcess` on Windows -- so the durability
+/// property this proves is verified everywhere rather than on Unix alone.
 #[test]
-fn repeated_sigkill_recovers_an_atomic_state() {
+fn repeated_abrupt_kill_recovers_an_atomic_state() {
     let executable = std::env::current_exe().unwrap();
 
     for quick_repair in [true, false] {
