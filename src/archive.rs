@@ -174,7 +174,7 @@ pub fn encode_archive(
         block_count: u32::try_from(blocks.len())
             .map_err(|_| ArchiveError::Invalid("too many blocks"))?,
         records_bytes,
-        records_sha256: format!("{:x}", records_hash.finalize()),
+        records_sha256: crate::utxo::hex_lower(&records_hash.finalize()),
         piece_size: PIECE_SIZE,
         piece_sha256: compressed.chunks(PIECE_SIZE).map(hash_hex).collect(),
     };
@@ -358,7 +358,7 @@ pub(crate) fn verify_archive_block_hashes_streaming(
     if manifest.format_version == FORMAT_VERSION && records_bytes != manifest.records_bytes {
         return Err(ArchiveError::Invalid("records length"));
     }
-    if format!("{:x}", digest.finalize()) != manifest.records_sha256 {
+    if crate::utxo::hex_lower(&digest.finalize()) != manifest.records_sha256 {
         return Err(ArchiveError::Invalid("records checksum"));
     }
     Ok((manifest, hashes, records_bytes))
@@ -462,7 +462,7 @@ fn verify_record_stream(
     if manifest.format_version == FORMAT_VERSION && records_bytes != manifest.records_bytes {
         return Err(ArchiveError::Invalid("records length"));
     }
-    if format!("{:x}", digest.finalize()) != manifest.records_sha256 {
+    if crate::utxo::hex_lower(&digest.finalize()) != manifest.records_sha256 {
         return Err(ArchiveError::Invalid("records checksum"));
     }
     Ok(())
@@ -619,7 +619,7 @@ fn validate_manifest(manifest: &ArchiveManifest) -> Result<u64, ArchiveError> {
 }
 
 fn hash_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::utxo::hex_lower(&Sha256::digest(bytes))
 }
 
 /// Decodes a lowercase 64-character hexadecimal SHA-256 digest.

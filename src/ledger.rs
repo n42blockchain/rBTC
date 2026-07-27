@@ -1401,7 +1401,7 @@ fn prune_plan_token(
         bytes_reclaimed,
         minimum_blocks_preserved,
     ))?;
-    Ok(format!("{:x}", Sha256::digest(commitment)))
+    Ok(crate::utxo::hex_lower(&Sha256::digest(commitment)))
 }
 
 #[allow(clippy::too_many_lines)]

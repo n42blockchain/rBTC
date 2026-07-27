@@ -291,7 +291,7 @@ impl VerifiedSnapshot {
         }
         if count != self.manifest.utxo_count
             || records_bytes != self.manifest.records_bytes
-            || format!("{:x}", records.finalize()) != self.manifest.records_sha256
+            || crate::utxo::hex_lower(&records.finalize()) != self.manifest.records_sha256
         {
             return Err(SnapshotError::Invalid(
                 "snapshot changed after verification",
@@ -534,7 +534,7 @@ fn verify_entries<R: Read>(
             return Err(SnapshotError::Invalid("records exceed manifest bounds"));
         }
     }
-    if format!("{:x}", records.finalize()) != manifest.records_sha256 {
+    if crate::utxo::hex_lower(&records.finalize()) != manifest.records_sha256 {
         return Err(SnapshotError::Invalid("records checksum"));
     }
     if count != manifest.utxo_count {
@@ -747,7 +747,7 @@ fn encode_entries(entries: &BTreeMap<OutPointKey, Utxo>) -> Result<Vec<u8>, Snap
 }
 
 fn hex_hash(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::utxo::hex_lower(&Sha256::digest(bytes))
 }
 
 /// Decodes a 64-character hexadecimal SHA-256 digest from an untrusted manifest.

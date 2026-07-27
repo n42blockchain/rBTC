@@ -14,6 +14,28 @@ use thiserror::Error;
 
 /// The number of seconds in the default hot window (60 days).
 pub const DEFAULT_HOT_WINDOW_SECS: u64 = 60 * 24 * 60 * 60;
+/// Pinned digest of the fixture UTXO's set-identity contribution.
+///
+/// See `tests::digest_fixtures` for why these are immutable.
+#[cfg(test)]
+const DIGEST_UTXO_SET_IDENTITY: [u8; 32] = [
+    0x1d, 0x4d, 0xa7, 0x51, 0x1b, 0x27, 0x5a, 0x79, 0x2b, 0x9d, 0x1d, 0x30, 0x14, 0x61, 0xc8, 0x18,
+    0xad, 0x37, 0x2a, 0x8f, 0xdf, 0xf7, 0x0b, 0xb8, 0xb2, 0x73, 0xa9, 0xba, 0x4c, 0x6f, 0x17, 0x4c,
+];
+/// Pinned digest of one canonical `key || encoded UTXO` record.
+#[cfg(test)]
+const DIGEST_CANONICAL_RECORD_STREAM: [u8; 32] = [
+    0x87, 0x8b, 0x38, 0x8f, 0x11, 0x49, 0xc3, 0xd5, 0xc9, 0x2b, 0x81, 0xe2, 0x13, 0x36, 0x64, 0x7b,
+    0x8e, 0x26, 0xbe, 0xbb, 0x4f, 0xed, 0xef, 0xe8, 0x9d, 0x2c, 0x1c, 0xf2, 0x6f, 0x73, 0x34, 0x8e,
+];
+/// Pinned canonical encoding of the fixture UTXO.
+#[cfg(test)]
+const ENCODED_FIXTURE_UTXO: &[u8] = &[
+    0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x0d, 0x0c, 0x0b, 0x0a, 0x01, 0xef, 0xbe, 0xad,
+    0xde, 0xef, 0xbe, 0xad, 0xde, 0x44, 0x33, 0x22, 0x11, 0x04, 0x00, 0x00, 0x00, 0x51, 0x21, 0xff,
+    0x00,
+];
+
 const HOT_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxo_hot");
 const COLD_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("utxo_cold");
 const RETIER_PROGRESS_TABLE: TableDefinition<u8, &[u8]> =
@@ -1103,6 +1125,22 @@ where
     ))
 }
 
+/// Renders a digest as lowercase hex.
+///
+/// `sha2` 0.11 returns a `hybrid_array::Array`, which does not implement
+/// `LowerHex`, so `format!("{:x}", ..)` on a digest no longer compiles. The
+/// bytes are unchanged, so the rendered string is identical to what earlier
+/// releases wrote; `tests::digest_fixtures` pins that.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 pub(crate) fn update_utxo_set_digest(digest: &mut Sha256, key: &[u8], utxo: &Utxo) {
     digest.update(key);
     digest.update(utxo.value_sats.to_le_bytes());
@@ -1508,5 +1546,92 @@ mod tests {
         assert_eq!(rows[8_192].1, Some(coin(30)));
         assert_eq!(rows[8_193], rows[0]);
         assert!(rows[1].1.is_none());
+    }
+
+    /// Immutable fixtures pinning every persisted digest construction.
+    ///
+    /// These exist so a `sha2`/`digest` major bump, or a refactor of what bytes
+    /// are fed into a digest, cannot silently change a value that is already on
+    /// disk. SHA-256 itself is a fixed function, so any change here means the
+    /// *input* construction moved -- which is a storage format break.
+    ///
+    /// Compressed artefacts are deliberately excluded: archive piece digests are
+    /// taken over zstd output, so they track the compressor rather than `sha2`.
+    /// The uncompressed record stream each piece set covers is pinned instead.
+    mod digest_fixtures {
+        use super::*;
+
+        fn fixture_utxo() -> Utxo {
+            Utxo {
+                value_sats: 0x0123_4567_89ab_cdef,
+                height: 0x0a0b_0c0d,
+                is_coinbase: true,
+                // Excluded from the UTXO-set digest on purpose; a change here
+                // must not move the digest.
+                last_touched: 0xdead_beef_dead_beef,
+                creation_mtp: 0x1122_3344,
+                script_pubkey: vec![0x51, 0x21, 0xff, 0x00],
+            }
+        }
+
+        fn fixture_key() -> OutPointKey {
+            let mut bytes = [0_u8; 36];
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::try_from(index).expect("index fits u8");
+            }
+            OutPointKey::from_bytes(&bytes).expect("fixed key length")
+        }
+
+        #[test]
+        fn utxo_set_identity_digest_is_pinned() {
+            let mut digest = Sha256::new();
+            update_utxo_set_digest(&mut digest, fixture_key().as_bytes(), &fixture_utxo());
+            let pinned: [u8; 32] = digest.finalize().into();
+            assert_eq!(
+                pinned, DIGEST_UTXO_SET_IDENTITY,
+                "UTXO-set identity digest changed; persisted snapshots would not verify"
+            );
+        }
+
+        #[test]
+        fn utxo_set_identity_digest_excludes_local_touch_time() {
+            let mut first = Sha256::new();
+            update_utxo_set_digest(&mut first, fixture_key().as_bytes(), &fixture_utxo());
+            let mut second = Sha256::new();
+            let aged = Utxo {
+                last_touched: 0,
+                ..fixture_utxo()
+            };
+            update_utxo_set_digest(&mut second, fixture_key().as_bytes(), &aged);
+            assert_eq!(
+                <[u8; 32]>::from(first.finalize()),
+                <[u8; 32]>::from(second.finalize())
+            );
+        }
+
+        #[test]
+        fn canonical_record_stream_digest_is_pinned() {
+            // The 36-byte key followed by the canonical UTXO encoding is the
+            // snapshot and archive record format.
+            let key = fixture_key();
+            let encoded = fixture_utxo().encode().expect("fixture encodes");
+            let mut digest = Sha256::new();
+            digest.update(key.as_bytes());
+            digest.update(&encoded);
+            let pinned: [u8; 32] = digest.finalize().into();
+            assert_eq!(
+                pinned, DIGEST_CANONICAL_RECORD_STREAM,
+                "canonical record digest changed; persisted snapshots and archives would not verify"
+            );
+        }
+
+        #[test]
+        fn canonical_utxo_encoding_is_pinned() {
+            assert_eq!(
+                fixture_utxo().encode().expect("fixture encodes"),
+                ENCODED_FIXTURE_UTXO,
+                "canonical UTXO encoding changed; every persisted digest moves with it"
+            );
+        }
     }
 }

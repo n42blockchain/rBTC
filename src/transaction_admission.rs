@@ -13,7 +13,7 @@ use bitcoin::{
     BlockHash, OutPoint, ScriptBuf, Transaction, Txid, Wtxid, consensus::encode::serialize,
     hashes::sha256d,
 };
-use rand::Rng;
+use rand::RngExt;
 use thiserror::Error;
 
 use crate::{
