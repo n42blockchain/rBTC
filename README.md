@@ -91,7 +91,7 @@ cargo deny check
 scripts/verify-reproducible-build.sh
 scripts/public-network-sync-smoke.sh
 RBTC_FUZZ_RUNS=10000 scripts/run-fuzz-regression.sh
-cargo +nightly miri test --lib merkle_proof::tests::verifies_left_and_right_transaction_positions
+cargo +nightly-2026-07-13 miri test --lib merkle_proof::tests::verifies_left_and_right_transaction_positions
 RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind cargo test --release --test core_block_differential -- --ignored --nocapture
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
 ```
