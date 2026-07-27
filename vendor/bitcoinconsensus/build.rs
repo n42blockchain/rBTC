@@ -27,6 +27,11 @@ fn main() {
 
     if target.contains("windows") {
         base_config.define("WIN32", "1");
+        // libsecp256k1 is linked statically here. Without this define its
+        // public headers declare every entry point `__declspec(dllimport)`,
+        // so MSVC emits unresolvable `__imp_secp256k1_*` references from the
+        // C++ consensus sources.
+        base_config.define("SECP256K1_STATIC", "1");
     }
 
     let mut secp_config = base_config.clone();
@@ -42,6 +47,10 @@ fn main() {
             .define("ECMULT_GEN_PREC_BITS", "4")
             .define("ENABLE_MODULE_SCHNORRSIG", "1")
             .define("ENABLE_MODULE_EXTRAKEYS", "1")
+            // `pubkey.cpp` compiles `EllSwiftPubKey::Decode`, which references
+            // `secp256k1_ellswift_decode`. Without this module the symbol is
+            // never emitted and the final link fails.
+            .define("ENABLE_MODULE_ELLSWIFT", "1")
             // Technically libconsensus doesn't require the recovery feautre, but `pubkey.cpp` does.
             .define("ENABLE_MODULE_RECOVERY", "1")
             .file("depend/bitcoin/src/secp256k1/src/precomputed_ecmult_gen.c")
