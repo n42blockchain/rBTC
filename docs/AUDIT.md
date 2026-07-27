@@ -86,12 +86,13 @@ than treating the report as proof:
 | `1b887c5` | `ee3ac1a` | 144-block regtest interval retained; incorrect unconditional BIP94 portion rejected |
 | `7095993` | reviewed disposition below | Review-only; no valid code delta was missing |
 | `da76a5c` | `77b8aae` plus disposition below | Review accepted; information-level relay scan replaced by bounded hash index |
+| `5147e11` | reviewed disposition below | Review accepted; no new defect, header-replay operational notes retained |
 
 This manifest is the current rolling main-branch audit integration checkpoint.
 It deliberately does not create merge ancestry to
 `audit/consensus-and-portability-fixes`: doing so would mark the rejected
 default-regtest BIP94 change as integrated and make future containment checks
-lie. Every accepted code delta through `da76a5c` is present on `main` under the
+lie. Every accepted code delta through `5147e11` is present on `main` under the
 commits above. Later auditor pushes remain subject to the same commit-by-commit
 review, verification, and integration before the final audit closure.
 
@@ -818,6 +819,35 @@ replacement, and eviction rebuild at most 128 index rows, while request lookup
 is expected O(1) and a maximum batch is expected O(50,000), not O(3.2 million).
 Regression coverage exercises aliasing, replacement, byte accounting, and the
 64-entry eviction boundary.
+
+### Disposition of the driver and persistence review (`5147e11`)
+
+This documentation-only audit commit completed the depth pass over the IBD
+checkpoint driver, fee estimator, header journal, and transaction-pool
+persistence. Its conclusions were rechecked against current main. The IBD
+driver now lives in `node.rs`, but retains the reviewed ordering: a staged
+archive is not published before its checkpoint, prefetched UTXOs are matched
+element-by-element to independently derived outpoints, and the commit
+transaction again requires each removal to exist and each insertion not to
+collide. `TrackedFee` construction and every persisted decode path reject a
+zero or oversized policy vsize before rate division. Header-journal replay
+revalidates each stored header contextually. Relay-attempt and admission-time
+maps are decoded within fixed bounds and cross-checked against the active
+transaction set.
+
+Two header replay observations are retained as operational, not correctness,
+findings: moving the local clock backwards by more than the future-time
+allowance can make a previously accepted journal fail closed on restart, and
+the Testnet3 minimum-difficulty walk-back has an
+`O(headers × difficulty_interval)` worst case during full replay. The commit's
+repeated information-level `getdata` scan description is historical on main;
+the bounded relay hash index described above has already removed it.
+
+The auditor still excludes line-by-line review of peer management, API wiring,
+CLI/shutdown sequencing, and the policy behaviour of `rebroadcast_store.rs`
+and `undo_store.rs`. Existing tests and soak evidence cover those paths but are
+not mislabeled as completion of that remaining audit scope. No code delta from
+`5147e11` required integration.
 
 ### Post-audit fuzz-workspace assurance closure
 
