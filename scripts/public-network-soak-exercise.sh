@@ -43,7 +43,14 @@ metrics_dir="$soak_dir/metrics"
 baseline="$state_dir/baseline.txt"
 binary="$state_dir/rbtcd-soak-start"
 pid_file="$state_dir/$network.pid"
-log_file="$soak_dir/logs/$network.log"
+legacy_log="$soak_dir/logs/$network.log"
+structured_log="$soak_dir/logs/$network/rbtc.log"
+log_file=$legacy_log
+log_layout=legacy
+if [[ -f "$structured_log" && ! -L "$structured_log" ]]; then
+  log_file=$structured_log
+  log_layout=structured
+fi
 events="$metrics_dir/events.log"
 tip_metrics="$metrics_dir/tips.tsv"
 persistent_metrics="$metrics_dir/persistent.tsv"
@@ -172,8 +179,13 @@ while kill -0 "$old_pid" 2>/dev/null; do
 done
 
 first_new_log_line=$(( $(wc -l <"$log_file") + 1 ))
-nohup "$binary" --network "$network" --data-dir "$data_dir" \
-  >>"$log_file" 2>&1 </dev/null &
+if [[ "$log_layout" == structured ]]; then
+  nohup "$binary" --network "$network" --data-dir "$data_dir" \
+    --log-dir "$soak_dir/logs/$network" >/dev/null 2>&1 </dev/null &
+else
+  nohup "$binary" --network "$network" --data-dir "$data_dir" \
+    >>"$log_file" 2>&1 </dev/null &
+fi
 new_pid=$!
 printf '%s\n' "$new_pid" >"$pid_temp"
 mv -f "$pid_temp" "$pid_file"
@@ -190,14 +202,25 @@ while true; do
     exit 1
   fi
   new_log=$(tail -n +"$first_new_log_line" "$log_file")
-  header_after=$(
-    sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' \
-      <<<"$new_log" | tail -n 1
-  )
-  execution_after=$(
-    sed -n 's/^block execution caught up at height \([0-9][0-9]*\)$/\1/p' \
-      <<<"$new_log" | tail -n 1
-  )
+  if [[ "$log_layout" == structured ]]; then
+    header_after=$(
+      sed -n 's/^.*"message":"peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)".*$/\1\t\2/p' \
+        <<<"$new_log" | tail -n 1
+    )
+    execution_after=$(
+      sed -n 's/^.*"message":"block execution caught up at height \([0-9][0-9]*\)".*$/\1/p' \
+        <<<"$new_log" | tail -n 1
+    )
+  else
+    header_after=$(
+      sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' \
+        <<<"$new_log" | tail -n 1
+    )
+    execution_after=$(
+      sed -n 's/^block execution caught up at height \([0-9][0-9]*\)$/\1/p' \
+        <<<"$new_log" | tail -n 1
+    )
+  fi
   if [[ -n "$header_after" && -n "$execution_after" ]]; then
     IFS=$'\t' read -r height_after hash_after <<<"$header_after"
     if [[ "$height_after" == "$execution_after" ]] \

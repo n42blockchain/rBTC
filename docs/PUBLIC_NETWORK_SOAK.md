@@ -4,16 +4,29 @@ Status date: 2026-07-28.
 
 ## Replacement acceptance run
 
-The current release-gate run started at `2026-07-28T09:21:19Z` and cannot
-satisfy the seven-day duration before `2026-08-04T09:21:19Z`. Evidence is under
+The current release-gate run started at `2026-07-28T11:12:36Z` and cannot
+satisfy the seven-day duration before `2026-08-04T11:12:36Z`. Evidence is under
 `/Users/jieliu/Documents/n42/rBTC-public-soak-20260728`. It pins commit
 `83bd350ff2b80d1a31308c380247ac07ae8f7c05`, immutable release binary SHA-256
 `d5c0fe4c36c3e1aaa7b59b1006f6a69f14ebceb53526ce071e627577fd3fec5b`,
 and monitor SHA-256
 `2041212a80b6d029b2c975d01f9a106839deea476e5849ef72d3539b8c16c24f`.
+The structured-log-aware recovery helper has SHA-256
+`bf86ce86c8365018434ad53fe7399e1d620fb59af2e29d00bf557b4ae4ffefe8`;
+the final report helper has SHA-256
+`d1a0af7d2f73fc5226af6c62a2ac43e66cabb10bee423f0e088babb5109499bc`.
 The Bitcoin and Testnet4 processes use separate structured-log directories;
 the frozen monitor accepts those JSONL rotating logs as well as the legacy
 plain-text layout.
+
+The formal clock starts at the first sample where both frozen processes were
+live and each network's header and execution tips agreed: Bitcoin height
+`959963`, hash
+`00000000000000000002345fb3f43fc1992a11cbf52abe0e5f61ffcf2d107530`;
+Testnet4 height `146078`, hash
+`0000000000014e26d056a6aae29324761b159858050a88fc536b2fb51c4a9962`.
+Startup samples collected while Bitcoin completed a redb checksum repair are
+retained in `prelive-repair-metrics` but excluded from the acceptance window.
 
 This replacement includes the public-soak finding from commit `83bd350`: a
 long-running daemon no longer exits after one persisted-plus-DNS peer wave is
@@ -22,8 +35,8 @@ five minutes and remains immediately responsive to authenticated or signal
 shutdown. `--once` retains deterministic failure/exit behavior.
 
 The one-day recovery exercises are scheduled for
-`2026-07-29T09:21:19Z`; the fail-closed seven-day finalizer is scheduled for
-`2026-08-04T09:21:19Z`.
+`2026-07-29T11:12:36Z`; the fail-closed seven-day finalizer is scheduled for
+`2026-08-04T11:12:36Z`.
 
 ## Invalidated predecessor run
 
