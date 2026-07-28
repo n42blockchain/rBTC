@@ -629,16 +629,22 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    use tempfile::NamedTempFile;
+
+    fn metadata_bytes(network: Network, base: BlockHash, coins_count: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&network.magic().to_bytes());
+        bytes.extend_from_slice(base.as_byte_array());
+        bytes.extend_from_slice(&coins_count.to_le_bytes());
+        bytes
+    }
 
     #[test]
     fn parses_core_v2_metadata() {
         let base = BlockHash::from_byte_array([7_u8; 32]);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(SNAPSHOT_MAGIC);
-        bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&Network::Testnet4.magic().to_bytes());
-        bytes.extend_from_slice(base.as_byte_array());
-        bytes.extend_from_slice(&42_u64.to_le_bytes());
+        let bytes = metadata_bytes(Network::Testnet4, base, 42);
         assert_eq!(
             read_metadata(&mut Cursor::new(bytes)).unwrap(),
             CoreSnapshotMetadata {
@@ -647,6 +653,54 @@ mod tests {
                 coins_count: 42,
             }
         );
+    }
+
+    #[test]
+    fn verification_helpers_bind_network_and_core31_anchor_identity() {
+        use std::io::Write as _;
+
+        let anchor = core31_assumeutxo_anchors(Network::Bitcoin)[0];
+        let base = anchor.block_hash.parse::<BlockHash>().unwrap();
+        let metadata = CoreSnapshotMetadata {
+            network: Network::Bitcoin,
+            base_block_hash: base,
+            coins_count: 1,
+        };
+        assert_eq!(find_anchor(metadata).unwrap(), anchor);
+        assert!(matches!(
+            find_anchor(CoreSnapshotMetadata {
+                base_block_hash: BlockHash::all_zeros(),
+                ..metadata
+            }),
+            Err(CoreSnapshotError::UnsupportedBase)
+        ));
+        assert!(matches!(
+            validate_anchor(&HeaderDag::new(Network::Regtest), metadata, anchor),
+            Err(CoreSnapshotError::NetworkMismatch)
+        ));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&metadata_bytes(Network::Bitcoin, base, 1))
+            .unwrap();
+        file.flush().unwrap();
+        assert!(matches!(
+            open_snapshot(file.path(), Network::Testnet4),
+            Err(CoreSnapshotError::NetworkMismatch)
+        ));
+
+        let verified = VerifiedCore31Snapshot {
+            path: file.path().to_owned(),
+            metadata,
+            anchor,
+            content: SnapshotContentIdentity {
+                records_sha256: [0; 32],
+                utxo_count: 1,
+                records_bytes: 1,
+            },
+            import_time: 1,
+        };
+        assert_eq!(verified.metadata(), metadata);
+        assert_eq!(verified.anchor(), anchor);
     }
 
     #[test]
@@ -734,5 +788,87 @@ mod tests {
         let p2sh = decompress_script(&mut Cursor::new([vec![1], vec![4_u8; 20]].concat())).unwrap();
         assert_eq!(&p2sh[..2], &[0xa9, 20]);
         assert_eq!(p2sh.last(), Some(&0x87));
+    }
+
+    #[test]
+    fn compact_size_varint_amount_and_script_boundaries_are_strict() {
+        assert_eq!(read_compact_size(&mut Cursor::new([252])).unwrap(), 252);
+        assert_eq!(
+            read_compact_size(&mut Cursor::new([253, 253, 0])).unwrap(),
+            253
+        );
+        assert_eq!(
+            read_compact_size(&mut Cursor::new([254, 0, 0, 1, 0])).unwrap(),
+            0x1_0000
+        );
+        assert!(matches!(
+            read_compact_size(&mut Cursor::new([255, 0, 0, 0, 0, 1, 0, 0, 0])),
+            Err(CoreSnapshotError::Invalid(_))
+        ));
+
+        assert_eq!(read_core_varint(&mut Cursor::new([0])).unwrap(), 0);
+        assert_eq!(read_core_varint(&mut Cursor::new([0x80, 0])).unwrap(), 128);
+        assert!(read_core_varint(&mut Cursor::new([0xff; 16])).is_err());
+        assert_eq!(decompress_amount(0), Some(0));
+        assert_eq!(decompress_amount(1), Some(1));
+        assert_eq!(decompress_amount(10), Some(1_000_000_000));
+        assert_eq!(decompress_amount(u64::MAX), None);
+
+        let compressed_key = PublicKey::from_slice(&[
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ])
+        .unwrap();
+        for tag in [2_u8, 3] {
+            let mut encoded = vec![tag];
+            encoded.extend_from_slice(&compressed_key.serialize()[1..]);
+            assert_eq!(
+                decompress_script(&mut Cursor::new(encoded)).unwrap().len(),
+                35
+            );
+        }
+        for tag in [4_u8, 5] {
+            let mut encoded = vec![tag];
+            encoded.extend_from_slice(&compressed_key.serialize()[1..]);
+            assert_eq!(
+                decompress_script(&mut Cursor::new(encoded)).unwrap().len(),
+                67
+            );
+        }
+        assert_eq!(
+            decompress_script(&mut Cursor::new([8, 0x51, 0xac]))
+                .unwrap()
+                .as_slice(),
+            [0x51, 0xac]
+        );
+    }
+
+    #[test]
+    fn metadata_and_coin_reader_reject_structural_corruption() {
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(SNAPSHOT_MAGIC);
+        metadata.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        metadata.extend_from_slice(&Network::Regtest.magic().to_bytes());
+        metadata.extend_from_slice(&[0_u8; 32]);
+        metadata.extend_from_slice(&0_u64.to_le_bytes());
+        assert!(matches!(
+            read_metadata(&mut Cursor::new(metadata)),
+            Err(CoreSnapshotError::Invalid("empty UTXO set"))
+        ));
+
+        let headers = HeaderDag::new(Network::Regtest);
+        let cases = [
+            [[1_u8; 32].as_slice(), &[0]].concat(),
+            [[1_u8; 32].as_slice(), &[2]].concat(),
+            [[1_u8; 32].as_slice(), &[1, 255, 0, 0, 0, 0, 1, 0, 0, 0]].concat(),
+        ];
+        for encoded in cases {
+            assert!(
+                CoreCoinReader::new(Cursor::new(encoded), 1, 0, &headers, 1)
+                    .next_coin()
+                    .is_err()
+            );
+        }
     }
 }

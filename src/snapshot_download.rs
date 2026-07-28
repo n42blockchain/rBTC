@@ -460,4 +460,133 @@ mod tests {
         );
         assert!(!config.output.with_extension("rbtc-assembling").exists());
     }
+
+    #[test]
+    fn completed_ranges_resume_through_the_full_parallel_publish_path() {
+        let directory = TempDir::new().unwrap();
+        let config = SnapshotDownloadConfig {
+            source: "https://example.com/snapshot".to_owned(),
+            output: directory.path().join("snapshot.dat"),
+            expected_bytes: 7,
+            workers: 8,
+            chunk_bytes: 3,
+        };
+        let (state, manifest) = prepare_state(&config).unwrap();
+        assert_eq!(chunk_bounds(&manifest, 0), (0, 2));
+        assert_eq!(chunk_bounds(&manifest, 2), (6, 6));
+        fs::write(state.join("chunk-000000.part"), b"abc").unwrap();
+        fs::write(state.join("chunk-000001.part"), b"def").unwrap();
+        fs::write(state.join("chunk-000002.part"), b"g").unwrap();
+
+        let report = download_snapshot(&config).unwrap();
+        assert_eq!(report.bytes, 7);
+        assert_eq!(report.chunks, 3);
+        assert_eq!(fs::read(&config.output).unwrap(), b"abcdefg");
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn failed_https_range_is_bounded_and_preserves_resume_state() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let directory = TempDir::new().unwrap();
+        let config = SnapshotDownloadConfig {
+            source: format!("https://{address}/snapshot"),
+            output: directory.path().join("snapshot.dat"),
+            expected_bytes: 1,
+            workers: 1,
+            chunk_bytes: 1,
+        };
+        let (state, manifest) = prepare_state(&config).unwrap();
+        assert!(matches!(
+            download_chunk(&state, &manifest, 0),
+            Err(SnapshotDownloadError::Range { index: 0, .. } | SnapshotDownloadError::Io(_))
+        ));
+        assert!(state.join("manifest.json").is_file());
+        assert!(!config.output.exists());
+    }
+
+    #[test]
+    fn validation_rejects_every_bounded_resource_violation() {
+        let directory = TempDir::new().unwrap();
+        let base = SnapshotDownloadConfig {
+            source: "https://example.com/snapshot".to_owned(),
+            output: directory.path().join("snapshot.dat"),
+            expected_bytes: 1,
+            workers: 1,
+            chunk_bytes: 1,
+        };
+        for invalid in [
+            SnapshotDownloadConfig {
+                expected_bytes: 0,
+                ..base.clone()
+            },
+            SnapshotDownloadConfig {
+                expected_bytes: MAX_SNAPSHOT_DOWNLOAD_BYTES + 1,
+                ..base.clone()
+            },
+            SnapshotDownloadConfig {
+                workers: 0,
+                ..base.clone()
+            },
+            SnapshotDownloadConfig {
+                workers: MAX_SNAPSHOT_DOWNLOAD_WORKERS + 1,
+                ..base.clone()
+            },
+            SnapshotDownloadConfig {
+                chunk_bytes: 0,
+                ..base.clone()
+            },
+            SnapshotDownloadConfig {
+                chunk_bytes: MAX_SNAPSHOT_DOWNLOAD_BYTES + 1,
+                ..base.clone()
+            },
+        ] {
+            assert!(matches!(
+                validate(&invalid),
+                Err(SnapshotDownloadError::Invalid(_))
+            ));
+        }
+        fs::write(&base.output, b"occupied").unwrap();
+        assert!(matches!(
+            validate(&base),
+            Err(SnapshotDownloadError::Invalid(
+                "final output already exists"
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_state_and_completed_chunks_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let config = SnapshotDownloadConfig {
+            source: "https://example.com/snapshot".to_owned(),
+            output: directory.path().join("snapshot.dat"),
+            expected_bytes: 1,
+            workers: 1,
+            chunk_bytes: 1,
+        };
+        let state = state_directory(&config.output).unwrap();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &state).unwrap();
+        assert!(matches!(
+            prepare_state(&config),
+            Err(SnapshotDownloadError::Invalid(_))
+        ));
+        fs::remove_file(&state).unwrap();
+
+        let (state, manifest) = prepare_state(&config).unwrap();
+        let outside_file = directory.path().join("outside.part");
+        fs::write(&outside_file, b"x").unwrap();
+        symlink(&outside_file, state.join("chunk-000000.part")).unwrap();
+        assert!(matches!(
+            download_chunk(&state, &manifest, 0),
+            Err(SnapshotDownloadError::Invalid(_))
+        ));
+    }
 }

@@ -588,6 +588,58 @@ mod tests {
     }
 
     #[test]
+    fn rotating_writer_rejects_unsafe_paths_and_secures_new_directories() {
+        let root = TempDir::new().unwrap();
+        let created = root.path().join("nested").join("logs");
+        let mut writer = RotatingFile::open(&created, 120, 2).unwrap();
+        writer.write_line(b"{\"message\":\"safe\"}\n").unwrap();
+        writer.flush().unwrap();
+        assert!(created.join("rbtc.log").is_file());
+
+        let file_destination = root.path().join("not-a-directory");
+        File::create(&file_destination).unwrap();
+        assert_eq!(
+            RotatingFile::open(&file_destination, 120, 2)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let non_regular = root.path().join("non-regular");
+        fs::create_dir(&non_regular).unwrap();
+        restrict_directory_permissions(&non_regular).unwrap();
+        fs::create_dir(non_regular.join("rbtc.log")).unwrap();
+        assert_eq!(
+            RotatingFile::open(&non_regular, 120, 2)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let shared = root.path().join("shared");
+            fs::create_dir(&shared).unwrap();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                RotatingFile::open(&shared, 120, 2).err().unwrap().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+
+            let link = root.path().join("linked");
+            std::os::unix::fs::symlink(&created, &link).unwrap();
+            assert_eq!(
+                RotatingFile::open(&link, 120, 2).err().unwrap().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
     fn log_levels_are_strict_and_stable() {
         for (text, level) in [
             ("error", LogLevel::Error),
@@ -608,5 +660,58 @@ mod tests {
         let truncated = truncate_message(message);
         assert!(truncated.len() <= MAX_LOG_MESSAGE_BYTES);
         assert!(truncated.chars().all(|character| character == '界'));
+    }
+
+    #[test]
+    fn process_logger_installs_filters_flushes_and_reconfigures() {
+        const CHILD_ENV: &str = "RBTC_DIAGNOSTICS_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "diagnostics::tests::process_logger_installs_filters_flushes_and_reconfigures",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        assert!(
+            install(&LogConfig {
+                max_file_bytes: MIN_LOG_FILE_BYTES - 1,
+                ..LogConfig::default()
+            })
+            .unwrap_err()
+            .contains("log file size")
+        );
+        assert!(
+            install(&LogConfig {
+                max_files: MIN_LOG_FILES - 1,
+                ..LogConfig::default()
+            })
+            .unwrap_err()
+            .contains("log file count")
+        );
+
+        install(&LogConfig::default()).unwrap();
+        assert!(is_installed());
+        assert_eq!(level(), LogLevel::Info);
+        assert!(enabled(LogLevel::Error));
+        assert!(!enabled(LogLevel::Debug));
+        emit(LogLevel::Debug, "diagnostics-test", "filtered".to_owned());
+        emit(LogLevel::Info, "diagnostics-test", "accepted".to_owned());
+        flush();
+
+        install(&LogConfig {
+            level: LogLevel::Debug,
+            ..LogConfig::default()
+        })
+        .unwrap();
+        assert_eq!(level(), LogLevel::Debug);
+        assert!(enabled(LogLevel::Debug));
+        assert_eq!(write_errors(), 0);
     }
 }

@@ -22938,10 +22938,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "run explicitly with cargo test --release --bin rbtcd tests::reproducible_end_to_end_ibd_workload -- --ignored --exact --nocapture"]
     #[allow(clippy::too_many_lines)]
     async fn reproducible_end_to_end_ibd_workload() {
-        const DEFAULT_BLOCKS: u32 = 100;
+        // Keep a small production-path workload in every test/coverage run.
+        // The benchmark workflow supplies its larger requested size explicitly.
+        const DEFAULT_BLOCKS: u32 = 10;
         const MAX_BLOCKS: u32 = 1_000;
 
         let block_count = std::env::var("RBTC_BENCH_IBD_BLOCKS").map_or(DEFAULT_BLOCKS, |value| {
