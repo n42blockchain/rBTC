@@ -1,9 +1,12 @@
-# Audit follow-up work order
+# Audit follow-up disposition and retained work order
 
-Open items remaining after the four audit passes recorded in
-[docs/AUDIT.md](AUDIT.md). Verified against the tree at merge commit `41fa2cf`
-(`origin/main` `8c7451f` plus the Windows regression fixes); every "current
-state" below was re-checked in code, not carried over from the report.
+Disposition of the items raised after the four audit passes recorded in
+[docs/AUDIT.md](AUDIT.md). The resolution status below records the integrated
+result; the original Group A–D work order is retained afterward as audit
+evidence, not as a list of still-open implementation tasks. The original
+premises were verified against merge commit `41fa2cf` (`origin/main` `8c7451f`
+plus the Windows regression fixes); every "current state" was re-checked in
+code, not carried over from the report.
 
 **Acceptance criteria for every task in this document**, unless a task says
 otherwise:

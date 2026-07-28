@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-07-27.
+Status date: 2026-07-28.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -188,12 +188,18 @@ Primary references:
   at least seven consecutive days across natural tip updates, peer churn,
   controlled restarts, freezer rotation, mempool persistence, and at least one
   exercised reorg/fault scenario. Record maximum RSS, chainstate/freezer growth,
-  restart time, peer diversity, and final hashes. The immutable-baseline run
-  started at `2026-07-26T22:19:44Z`; its PID-switching monitor now records
+  restart time, peer diversity, and final hashes. The predecessor
+  immutable-baseline run started at `2026-07-26T22:19:44Z`; its PID-switching
+  monitor recorded
   process, peer-group, tip/hash, freezer, persistent-store, and disk evidence,
   and its fail-closed report enforces the seven-day, both-network restart, and
-  fault-injection gates. Current evidence and the remaining scheduled exercises
-  are in [PUBLIC_NETWORK_SOAK.md](PUBLIC_NETWORK_SOAK.md).
+  fault-injection gates. The first run was invalidated after an unplanned
+  peer-exhaustion exit exposed and drove the daemon retry fix. Its evidence is
+  retained rather than relabelled as a pass. The replacement immutable-baseline
+  run's formal live window started at `2026-07-28T11:12:36Z`; its one-day
+  recovery exercises are scheduled for `2026-07-29T11:12:36Z` and it cannot
+  satisfy the seven-day gate before `2026-08-04T11:12:36Z`. Current evidence is
+  in [PUBLIC_NETWORK_SOAK.md](PUBLIC_NETWORK_SOAK.md).
 - [x] **External security review.** Review consensus boundaries, script-engine
   provenance, P2P resource accounting, snapshot trust, storage recovery,
   authentication, wallet/PSBT handling, and release supply chain; resolve every
