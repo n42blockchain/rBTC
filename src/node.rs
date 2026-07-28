@@ -203,6 +203,9 @@ const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
 const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
+const PEER_CANDIDATE_EXHAUSTED_PREFIX: &str = "peer candidates exhausted: ";
+const PEER_RETRY_INITIAL_SECONDS: u64 = 5;
+const PEER_RETRY_MAX_SECONDS: u64 = 5 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
@@ -6685,7 +6688,70 @@ fn retier_utxos(options: &Options, hot_window_blocks: u32) -> Result<(), String>
 }
 
 #[allow(clippy::too_many_lines)]
+fn is_peer_candidate_exhaustion(error: &str) -> bool {
+    error.starts_with(PEER_CANDIDATE_EXHAUSTED_PREFIX)
+}
+
+fn peer_retry_seconds(attempt: u32, nonce: u64) -> u64 {
+    let exponent = attempt.min(6);
+    let base = PEER_RETRY_INITIAL_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(PEER_RETRY_MAX_SECONDS);
+    let jitter_bound = (base / 4).max(1);
+    let jitter = nonce.rotate_left(attempt % 64) % (jitter_bound + 1);
+    base.saturating_add(jitter).min(PEER_RETRY_MAX_SECONDS)
+}
+
+#[cfg(not(test))]
+fn peer_retry_delay(attempt: u32, nonce: u64) -> Duration {
+    Duration::from_secs(peer_retry_seconds(attempt, nonce))
+}
+
+#[cfg(test)]
+fn peer_retry_delay(attempt: u32, nonce: u64) -> Duration {
+    Duration::from_millis(peer_retry_seconds(attempt, nonce))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_pool(
+    options: &Options,
+    local_nonce: u64,
+    background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
+) -> Result<(), String> {
+    let mut retry_attempt = 0_u32;
+    loop {
+        match run_peer_pool_session(
+            options,
+            local_nonce,
+            background_validation,
+            validation_scheduler,
+        )
+        .await
+        {
+            Err(error)
+                if !options.once
+                    && options.fetch_block.is_none()
+                    && is_peer_candidate_exhaustion(&error) =>
+            {
+                let delay = peer_retry_delay(retry_attempt, local_nonce);
+                retry_attempt = retry_attempt.saturating_add(1);
+                rbtc_warn!(
+                    "{error}; daemon will resolve and retry peer candidates in {} seconds",
+                    delay.as_secs()
+                );
+                tokio::select! {
+                    () = options.runtime_control.shutdown_requested() => return Ok(()),
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_peer_pool_session(
     options: &Options,
     local_nonce: u64,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -6872,13 +6938,12 @@ async fn run_peer_pool(
         }
     }
     if attempted.is_empty() {
-        return Err(
-            "no peer candidates available; provide --connect, enable/configure DNS seeds, or retain a verified peer database"
-                .to_owned(),
-        );
+        return Err(format!(
+            "{PEER_CANDIDATE_EXHAUSTED_PREFIX}no peer candidates available; provide --connect, enable/configure DNS seeds, or retain a verified peer database"
+        ));
     }
     Err(format!(
-        "all {} peer candidates failed: {}",
+        "{PEER_CANDIDATE_EXHAUSTED_PREFIX}all {} peer candidates failed: {}",
         failures.len(),
         failures.join("; ")
     ))
@@ -15313,6 +15378,78 @@ mod tests {
         .expect("shutdown barrier clears after the checkpoint drops");
         assert!(InFlightCheckpoint::try_enter(&requested, &in_flight).is_none());
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
+    fn peer_retry_test_options(once: bool, runtime_control: Arc<RuntimeControl>) -> Options {
+        Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: None,
+            once,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: None,
+            mempool_full_rbf: false,
+            cleanup_validation_dir: false,
+            offline_action: None,
+            validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
+            cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
+            resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
+            runtime_control,
+            observer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_retries_exhausted_peer_waves_but_once_mode_reports_them() {
+        for attempt in 0..32 {
+            let seconds = peer_retry_seconds(attempt, 0x5a5a_a5a5_1234_5678);
+            assert!((PEER_RETRY_INITIAL_SECONDS..=PEER_RETRY_MAX_SECONDS).contains(&seconds));
+        }
+        assert_eq!(
+            peer_retry_seconds(31, 0x5a5a_a5a5_1234_5678),
+            PEER_RETRY_MAX_SECONDS
+        );
+
+        let runtime_control = Arc::new(RuntimeControl::default());
+        let daemon_options = peer_retry_test_options(false, Arc::clone(&runtime_control));
+        let daemon =
+            tokio::spawn(async move { run_peer_pool(&daemon_options, 1, None, None).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !daemon.is_finished(),
+            "a long-running node must not exit on temporary peer exhaustion"
+        );
+        runtime_control.request_shutdown();
+        timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("retry backoff must remain responsive to shutdown")
+            .unwrap()
+            .unwrap();
+
+        let once_options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        let error = run_peer_pool(&once_options, 1, None, None)
+            .await
+            .unwrap_err();
+        assert!(is_peer_candidate_exhaustion(&error));
+        assert!(error.contains("no peer candidates available"));
     }
 
     #[tokio::test]
