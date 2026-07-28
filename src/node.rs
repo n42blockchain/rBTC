@@ -211,6 +211,8 @@ const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 /// Unlocked sidecar describing who holds the lock, readable under contention.
 const DATA_DIRECTORY_LOCK_OWNER_FILE: &str = ".rbtc.lock.owner";
+/// Create-new staging file used to publish the owner sidecar without following links.
+const DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE: &str = ".rbtc.lock.owner.tmp";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
 const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
@@ -2559,18 +2561,40 @@ fn owner_marker_path(data_dir: &std::path::Path) -> PathBuf {
 /// Publishes the owner description where a contending process can read it.
 ///
 /// Best-effort: the marker is diagnostic, so a write failure must not stop a
-/// node that already holds the lock.
+/// node that already holds the lock. The bytes are first written through a
+/// create-new handle and then renamed into place. This prevents a stale or
+/// attacker-controlled sidecar symlink/hardlink from redirecting the truncate
+/// into another file.
 fn write_owner_marker(path: &std::path::Path, marker: &str) {
+    let Some(data_dir) = path.parent() else {
+        return;
+    };
+    let temporary = data_dir.join(DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE);
+    // `remove_file` removes a link itself rather than its target. A fixed
+    // staging name is sufficient because the exclusive data-directory lock
+    // serializes every legitimate publisher.
+    let _ = fs::remove_file(&temporary);
     let mut options = fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    if let Ok(mut file) = options.open(path) {
-        let _ = file.write_all(marker.as_bytes());
-        let _ = file.sync_data();
+    let published = (|| -> io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(marker.as_bytes())?;
+        file.sync_data()?;
+        drop(file);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary, path)
+    })();
+    if published.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
 }
 
@@ -20220,6 +20244,34 @@ mod tests {
                 .unwrap_err()
                 .contains("exactly one hard link")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_owner_sidecar_replaces_links_without_touching_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let outside = directory.path().join("outside-owner-target");
+        let sidecar = directory.path().join(DATA_DIRECTORY_LOCK_OWNER_FILE);
+        fs::write(&outside, "must remain intact").unwrap();
+
+        symlink(&outside, &sidecar).unwrap();
+        let held = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "must remain intact");
+        assert!(
+            !fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(held);
+
+        fs::hard_link(&outside, &sidecar).unwrap();
+        let held = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "must remain intact");
+        assert_eq!(fs::metadata(&outside).unwrap().len(), 18);
+        drop(held);
     }
 
     #[tokio::test]

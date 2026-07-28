@@ -66,10 +66,11 @@ Group B decisions:
   The deferral required "immutable fixtures prove every persisted digest
   byte-identical", so `tests::digest_fixtures` in `utxo.rs` now pins the
   UTXO-set identity digest, the canonical `key || encoded UTXO` record digest,
-  and the canonical UTXO encoding. The values were captured under 0.10 and hold
-  under 0.11. Compressed artefacts stay unpinned on purpose: archive piece
-  digests track zstd, not `sha2`, so the uncompressed stream they cover is
-  pinned instead. 0.11 dropped `LowerHex` on its output, fixed with one shared
+  the canonical UTXO encoding, and the exact persisted validation-bloom record
+  including its checksum. The values were captured under 0.10 and hold under
+  0.11. Compressed artefacts stay unpinned on purpose: archive piece digests
+  track zstd, not `sha2`, so the uncompressed stream they cover is pinned
+  instead. 0.11 dropped `LowerHex` on its output, fixed with one shared
   `utxo::hex_lower`. `rand` 0.10 is in separately, as the deferral itself
   suggested; `random_range` moved to the new `RngExt` trait, and 0.9 remains in
   the dev graph only because `proptest` pins it.
@@ -81,8 +82,9 @@ Group B decisions:
   `.rbtc.lock`, so mixed-version pairs still exclude each other. The in-file
   marker is retained, and contention reads the sidecar first and falls back to
   it, so a lock taken by an older release is still attributed. The sidecar is
-  owner-only, removed on release, and admitted by both data-directory
-  allowlists.
+  owner-only, published through a create-new staging file plus rename so
+  pre-positioned links cannot redirect a truncate, removed on release, and
+  admitted by both data-directory allowlists.
 - **B-4: retain the repository-owned Core 26 script boundary.** A future
   script-rule deployment, applicable interpreter security fix, or stable kernel
   API that preserves atomic chainstate is the trigger for a separately gated
