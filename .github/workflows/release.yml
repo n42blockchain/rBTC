@@ -142,7 +142,7 @@ jobs:
         shell: bash
         run: cp "${{ steps.sbom.outputs.bundle-path }}" \
           dist/rbtc.sbom.sigstore.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rbtc-x86_64-unknown-linux-gnu-release
           path: dist/
@@ -180,7 +180,7 @@ jobs:
         shell: bash
         run: cp "${{ steps.provenance.outputs.bundle-path }}" \
           dist/rbtcd-aarch64-unknown-linux-gnu.provenance.sigstore.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rbtc-aarch64-unknown-linux-gnu-release
           path: dist/
@@ -293,7 +293,7 @@ jobs:
         shell: bash
         run: cp "${{ steps.provenance.outputs.bundle-path }}" \
           "dist/rbtcd-${{ matrix.target }}.provenance.sigstore.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rbtc-${{ matrix.target }}-release
           path: dist/
@@ -376,7 +376,7 @@ jobs:
         shell: pwsh
         run: Copy-Item "${{ steps.provenance.outputs.bundle-path }}" `
           "dist/rbtcd-x86_64-pc-windows-msvc.provenance.sigstore.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rbtc-x86_64-pc-windows-msvc-release
           path: dist/
@@ -423,7 +423,7 @@ jobs:
             xargs -0 sha256sum >SHA256SUMS
       - name: Verify assembled release after signing
         run: scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: rbtc-${{ needs.signing-preflight.outputs.release_ref }}
           path: dist/
