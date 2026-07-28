@@ -298,6 +298,33 @@ differential-verification plan before any code moves.
 
 ---
 
+## Group A addition — found while closing out
+
+### A-32 · `active_node_and_genesis_validator_run_concurrently_and_finalize` is load-sensitive
+
+**Severity: Low (intermittent CI failure).**
+**File: `src/node.rs`, the 15-second `timeout(..)` around the concurrent `run(..)`.**
+
+The test fails with `Elapsed(())` and the message "concurrent validation must not
+wait for sequential peer startup" when the full suite runs, and passes 3/3 when
+run alone. Confirmed pre-existing, not caused by the Group B changes: the same
+test fails on `47c7034` with none of them applied, and passes in isolation there
+too. It is a wall-clock budget competing with the rest of the suite for CPU, not
+a logic fault.
+
+This matters more now than before, because the `windows` CI job added for the
+earlier findings runs the full suite on a shared runner that is slower than a
+developer machine. A 15-second budget that already loses on a local full-suite
+run will make that job intermittently red, which trains people to ignore it --
+the opposite of why it was added.
+
+Required: make the assertion independent of wall-clock scheduling, or give it a
+budget that a loaded shared runner can meet. Prefer the former: the property
+under test is that concurrent validation does not *serialize behind* peer
+startup, which can be asserted from observed ordering rather than from elapsed
+time. Do not simply raise the constant without saying why the new value is
+defensible.
+
 ## Group C — accepted limitations, do not "fix"
 
 Listed so they are not re-reported as defects. Change these only if the stated
