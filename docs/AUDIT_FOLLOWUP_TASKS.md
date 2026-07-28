@@ -54,6 +54,11 @@ Revalidated and executed on 2026-07-27:
   `getblocktemplate` cannot synthesize a historical boundary. A test that only
   calls rBTC, or whose mutated header fails merely with `high-hash`, would not
   be differential evidence and was deliberately not added.
+- **A-32 completed.** The test now receives an explicit event after both peer
+  connections have been accepted but before either handshake is served. That
+  event, rather than elapsed wall time, proves peer startup is concurrent. A
+  separate 60-second timeout remains only as a loaded-runner liveness bound for
+  deadlock detection; it no longer encodes the concurrency property.
 
 Group B decisions:
 
@@ -324,6 +329,11 @@ under test is that concurrent validation does not *serialize behind* peer
 startup, which can be asserted from observed ordering rather than from elapsed
 time. Do not simply raise the constant without saying why the new value is
 defensible.
+
+**Resolved:** the server sends a one-shot event only after accepting both
+connections and before serving either handshake. The test asserts that event
+first, then independently waits for node completion. The 60-second watchdog is
+only a deadlock/liveness ceiling for loaded shared runners.
 
 ## Group C — accepted limitations, do not "fix"
 

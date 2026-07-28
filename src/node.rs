@@ -22051,11 +22051,13 @@ mod tests {
         let remote = listener.local_addr().unwrap();
         let first_for_server = first.clone();
         let second_for_server = second.clone();
+        let (concurrency_observed, concurrency_confirmed) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             // Both outbound connections must be established before either
             // handshake is serviced, proving this mode is not sequential.
             let (first_stream, _) = listener.accept().await.unwrap();
             let (second_stream, _) = listener.accept().await.unwrap();
+            concurrency_observed.send(()).unwrap();
             let first_peer = serve_concurrent_assumeutxo_peer(
                 first_stream,
                 70,
@@ -22070,50 +22072,53 @@ mod tests {
             );
             tokio::join!(first_peer, second_peer);
         });
-        timeout(
-            Duration::from_secs(15),
-            run(Options {
-                remotes: vec![remote],
-                dns_seeds: Some(Vec::new()),
-                network: Network::Regtest,
-                fetch_block: None,
-                headers_db: None,
-                data_dir: Some(active_dir.clone()),
-                once: true,
-                network_execution: NetworkExecutionMode::Persistent,
-                explorer_listen: None,
-                wallet_api_files: None,
-                rpc_auth_token_file: None,
-                deployments: DeploymentConfig::for_network(Network::Regtest),
-                ibd_policy: IbdPolicy::for_network(Network::Regtest),
-                snapshot: None,
-                finalize_assumeutxo: None,
-                validation_target: None,
-                complete_assumeutxo: None,
-                background_assumeutxo: Some(validation_dir.clone()),
-                mempool_full_rbf: false,
-                cleanup_validation_dir: true,
-                offline_action: None,
-                validation_limits: ValidationLimits {
-                    max_blocks_per_batch: 1,
-                    pause_between_batches: Duration::ZERO,
-                    quick_repair: true,
-                },
-                ledger_retention: LedgerRetention::default(),
-                minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
-                cache: NodeCacheConfig::default(),
-                indexes: NodeIndexConfig::default(),
-                inbound_listen: None,
-                inbound_limits: InboundLimits::default(),
-                resources: NodeResourceConfig::default(),
-                logging: NodeLogConfig::default(),
-                runtime_control: Arc::new(RuntimeControl::default()),
-                observer: None,
-            }),
-        )
-        .await
-        .expect("concurrent validation must not wait for sequential peer startup")
-        .unwrap();
+        let node = tokio::spawn(run(Options {
+            remotes: vec![remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(active_dir.clone()),
+            once: true,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: Some(validation_dir.clone()),
+            mempool_full_rbf: false,
+            cleanup_validation_dir: true,
+            offline_action: None,
+            validation_limits: ValidationLimits {
+                max_blocks_per_batch: 1,
+                pause_between_batches: Duration::ZERO,
+                quick_repair: true,
+            },
+            ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
+            cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
+            resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
+        }));
+        timeout(Duration::from_secs(60), concurrency_confirmed)
+            .await
+            .expect("node did not establish both peer connections within the liveness budget")
+            .expect("peer server stopped before observing both connections");
+        timeout(Duration::from_secs(60), node)
+            .await
+            .expect("concurrent node run exceeded the loaded-runner liveness budget")
+            .unwrap()
+            .unwrap();
         server.await.unwrap();
 
         let active =
