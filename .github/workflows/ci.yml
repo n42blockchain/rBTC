@@ -24,6 +24,7 @@ jobs:
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: bash -n scripts/*.sh
       - run: scripts/test-release-manifest.sh
+      - run: scripts/test-public-network-soak-monitor.sh
       - run: scripts/test-public-network-soak-report.sh
       - run: scripts/test-public-network-soak-exercise.sh
       - run: scripts/enrich-historical-utxos.py --self-test

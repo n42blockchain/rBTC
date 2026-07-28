@@ -1,8 +1,31 @@
 # Public-network soak
 
-Status date: 2026-07-27.
+Status date: 2026-07-28.
 
-## Active acceptance run
+## Replacement acceptance run
+
+The current release-gate run started at `2026-07-28T09:21:19Z` and cannot
+satisfy the seven-day duration before `2026-08-04T09:21:19Z`. Evidence is under
+`/Users/jieliu/Documents/n42/rBTC-public-soak-20260728`. It pins commit
+`83bd350ff2b80d1a31308c380247ac07ae8f7c05`, immutable release binary SHA-256
+`d5c0fe4c36c3e1aaa7b59b1006f6a69f14ebceb53526ce071e627577fd3fec5b`,
+and monitor SHA-256
+`2041212a80b6d029b2c975d01f9a106839deea476e5849ef72d3539b8c16c24f`.
+The Bitcoin and Testnet4 processes use separate structured-log directories;
+the frozen monitor accepts those JSONL rotating logs as well as the legacy
+plain-text layout.
+
+This replacement includes the public-soak finding from commit `83bd350`: a
+long-running daemon no longer exits after one persisted-plus-DNS peer wave is
+exhausted. It retries with jittered exponential backoff from five seconds to
+five minutes and remains immediately responsive to authenticated or signal
+shutdown. `--once` retains deterministic failure/exit behavior.
+
+The one-day recovery exercises are scheduled for
+`2026-07-29T09:21:19Z`; the fail-closed seven-day finalizer is scheduled for
+`2026-08-04T09:21:19Z`.
+
+## Invalidated predecessor run
 
 The release-gate run started at `2026-07-26T22:19:44Z` and cannot satisfy the
 seven-day duration before `2026-08-02T22:19:44Z`. It uses the immutable copied
@@ -11,6 +34,16 @@ binary `state/rbtcd-soak-start`, commit
 `78a5c5768bbe77d496b5e05492664156632f09dc0e4e78ab2dadf5e708175a61`.
 Replacing `target/release/rbtcd` during later development therefore does not
 change the program under test.
+
+At `2026-07-28T06:30:13Z`, both predecessor processes exited after their
+current peer candidates were exhausted. The monitor remained alive, so later
+tip rows were durable-state observations rather than live-node evidence.
+Recovery preserved both data directories and demonstrated that the stores
+reopened and caught up, including a Testnet4 reorganization, but the roughly
+2.5-hour unplanned outage invalidates this run as a continuous acceptance
+soak. Its events now explicitly record
+`scenario=unplanned-peer-exhaustion status=failed`; the evidence is retained
+as the reproducer for commit `83bd350`, not relabeled as a pass.
 
 Host evidence is under
 `/Users/jieliu/Documents/n42/rBTC-public-soak-20260726`. The Bitcoin and

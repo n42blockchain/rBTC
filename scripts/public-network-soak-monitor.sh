@@ -129,10 +129,10 @@ sample_peers() {
   local pid_source=$3
   local pid endpoint
   if ! pid=$(resolve_pid "$pid_source") || ! kill -0 "$pid" 2>/dev/null; then
-    return
+    return 0
   fi
   if ! command -v lsof >/dev/null 2>&1; then
-    return
+    return 0
   fi
   while IFS= read -r endpoint; do
     [[ -n "$endpoint" ]] || continue
@@ -156,20 +156,43 @@ sample_peers() {
 sample_tip() {
   local timestamp=$1
   local network=$2
-  local log_file="$output_dir/logs/$network.log"
+  local legacy_log="$output_dir/logs/$network.log"
+  local structured_log="$output_dir/logs/$network/rbtc.log"
+  local log_file
   local header execution height hash
-  [[ -f "$log_file" && ! -L "$log_file" ]] || return
-  header=$(
-    tail -n 2000 "$log_file" |
-      sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' |
-      tail -n 1
-  )
-  execution=$(
-    tail -n 2000 "$log_file" |
-      sed -n 's/^block execution caught up at height \([0-9][0-9]*\)$/\1/p' |
-      tail -n 1
-  )
-  [[ -n "$header" && -n "$execution" ]] || return
+  if [[ -f "$structured_log" && ! -L "$structured_log" ]]; then
+    log_file=$structured_log
+  else
+    log_file=$legacy_log
+  fi
+  [[ -f "$log_file" && ! -L "$log_file" ]] || return 0
+  if [[ "$log_file" == "$structured_log" ]]; then
+    command -v jq >/dev/null 2>&1 || return 0
+    header=$(
+      tail -n 2000 "$log_file" |
+        jq -rR 'fromjson? | .message // empty' |
+        sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' |
+        tail -n 1
+    )
+    execution=$(
+      tail -n 2000 "$log_file" |
+        jq -rR 'fromjson? | .message // empty' |
+        sed -n 's/^block execution caught up at height \([0-9][0-9]*\)$/\1/p' |
+        tail -n 1
+    )
+  else
+    header=$(
+      tail -n 2000 "$log_file" |
+        sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' |
+        tail -n 1
+    )
+    execution=$(
+      tail -n 2000 "$log_file" |
+        sed -n 's/^block execution caught up at height \([0-9][0-9]*\)$/\1/p' |
+        tail -n 1
+    )
+  fi
+  [[ -n "$header" && -n "$execution" ]] || return 0
   IFS=$'\t' read -r height hash <<<"$header"
   printf '%s\t%s\t%s\t%s\t%s\n' \
     "$timestamp" "$network" "$height" "$hash" "$execution" >>"$tip_metrics"
@@ -181,8 +204,8 @@ sample_freezer() {
   local data_dir=$3
   local index="$data_dir/blocks/ledger-index.json"
   local values
-  [[ -f "$index" && ! -L "$index" ]] || return
-  command -v jq >/dev/null 2>&1 || return
+  [[ -f "$index" && ! -L "$index" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
   if ! values=$(
     jq -er '
       (.segments | length) as $count |
@@ -197,7 +220,7 @@ sample_freezer() {
       ] | @tsv
     ' "$index" 2>/dev/null
   ); then
-    return
+    return 0
   fi
   printf '%s\t%s\t%s\n' "$timestamp" "$network" "$values" >>"$freezer_metrics"
 }
