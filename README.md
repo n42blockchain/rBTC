@@ -84,6 +84,9 @@ peer. Installation, signed-artifact verification, and first-start checks are in
 [docs/INSTALLATION.md](docs/INSTALLATION.md). Product release status is
 summarized in [docs/PRODUCT_MATURITY.md](docs/PRODUCT_MATURITY.md), and private
 vulnerability reporting is defined in [SECURITY.md](SECURITY.md).
+The measured storage, traffic, UTXO-tier, maximum-work, and AssumeUTXO
+requirements for a future mobile validating mode are assessed in
+[docs/MOBILE_FULL_NODE_FEASIBILITY.md](docs/MOBILE_FULL_NODE_FEASIBILITY.md).
 
 ## Local checks
 
