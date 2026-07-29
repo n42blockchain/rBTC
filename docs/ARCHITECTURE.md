@@ -572,6 +572,29 @@ fully validated chainstate in 173 ms, executed three new blocks through
 `000000000074ec24258d33c6e340032db208128adde0f7841c83fdbbeb3e25ea`,
 and exited in 6.16 seconds.
 
+A retained Core snapshot can additionally serve direct point lookups without
+being expanded into redb. Offline
+`--build-core-snapshot-index SNAPSHOT --snapshot-index-output FILE` streams the
+file once under the same canonical-form rules as the activation loader,
+re-derives Core's exact UTXO-set commitment against the compiled release
+identity, and atomically publishes a sidecar container: a BBhash minimal
+perfect hash function over every outpoint (written in safe Rust over keyed
+SipHash-2-4 from the vendored `bitcoin_hashes`, expected three to four bits
+per key at gamma 2) plus a bit-packed table holding each coin's byte offset and the
+backward distance to its txid group header. Field widths are derived from the
+actual maxima, so a mainnet-scale table costs roughly seven bytes per coin.
+The container binds the snapshot's network, base block hash and height, coin
+count, exact length, and full SHA-256, and is sealed by a trailing SHA-256
+that open verifies before use; the snapshot header identity and length are
+rechecked at open and the full content digest can be re-verified on demand.
+Lookups resolve one slot, read the 32-byte txid at the group header and the
+coin's CompactSize vout from the file, and only then decompress that single
+coin's amount and script template, so results are exact — a foreign outpoint
+that the minimal perfect hash function maps to an arbitrary slot is rejected
+by the byte comparison, never answered probabilistically. Coins keep Core's
+compressed representation on disk; nothing is imported, and the index never
+substitutes for activation's trust checks.
+
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,
 credential-free HTTPS URL plus an exact expected length and a new output file.

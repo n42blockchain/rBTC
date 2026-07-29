@@ -95,6 +95,7 @@ use rbtc::{
         ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
     },
     core_snapshot::verify_core31_snapshot,
+    core_snapshot_index::build_core_snapshot_index,
     deployments::{DeploymentConfig, block_deployment_context_for_headers},
     diagnostics::{
         LogConfig, LogLevel, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MIN_LOG_FILE_BYTES, MIN_LOG_FILES,
@@ -1805,6 +1806,10 @@ enum OfflineAction {
         hot_window_blocks: u32,
     },
     DownloadCoreSnapshot(SnapshotDownloadConfig),
+    BuildCoreSnapshotIndex {
+        snapshot: PathBuf,
+        output: PathBuf,
+    },
     VerifyStorage {
         max_segments: u32,
         max_bytes: u64,
@@ -4954,6 +4959,23 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         );
         return Ok(());
     }
+    if let Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output }) =
+        &options.offline_action
+    {
+        let report =
+            build_core_snapshot_index(snapshot, output).map_err(|error| error.to_string())?;
+        println!(
+            "built snapshot access index {}: coins={} snapshot_bytes={} snapshot_sha256={} index_bytes={} mphf_levels={} mphf_bits={}; the retained snapshot file stays the authoritative compressed data source",
+            output.display(),
+            report.coins,
+            report.snapshot_bytes,
+            report.snapshot_sha256.to_lower_hex_string(),
+            report.index_bytes,
+            report.mphf_levels,
+            report.mphf_bits,
+        );
+        return Ok(());
+    }
     if let Some(OfflineAction::VerifyStorage {
         max_segments,
         max_bytes,
@@ -5131,6 +5153,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         }) => return verify_chain_offline(&options, *depth, *max_block_bytes),
         Some(
             OfflineAction::DownloadCoreSnapshot(_)
+            | OfflineAction::BuildCoreSnapshotIndex { .. }
             | OfflineAction::VerifyStorage { .. }
             | OfflineAction::ReindexFromFreezer { .. }
             | OfflineAction::ReindexChainstate { .. }
@@ -12853,6 +12876,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_download_output = None;
     let mut snapshot_download_bytes = None;
     let mut snapshot_download_workers = None;
+    let mut snapshot_index_source = None;
+    let mut snapshot_index_output = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -13376,6 +13401,28 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     ));
                 }
             }
+            "--build-core-snapshot-index" => {
+                if snapshot_index_source.is_some() {
+                    return Err(
+                        "--build-core-snapshot-index cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_index_source = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--build-core-snapshot-index",
+                )?));
+            }
+            "--snapshot-index-output" => {
+                if snapshot_index_output.is_some() {
+                    return Err(
+                        "--snapshot-index-output cannot be supplied more than once".to_owned()
+                    );
+                }
+                snapshot_index_output = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-index-output",
+                )?));
+            }
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -13885,6 +13932,16 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             );
         }
     };
+    let snapshot_index_build = match (snapshot_index_source, snapshot_index_output) {
+        (None, None) => None,
+        (Some(snapshot), Some(output)) => Some((snapshot, output)),
+        _ => {
+            return Err(
+                "--build-core-snapshot-index and --snapshot-index-output must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
     if !verify_storage
         && (storage_audit_max_segments.is_some() || storage_audit_max_bytes.is_some())
     {
@@ -13902,6 +13959,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let offline_action_count = usize::from(utxo_activity_report)
         + usize::from(utxo_retier_window_blocks.is_some())
         + usize::from(snapshot_download.is_some())
+        + usize::from(snapshot_index_build.is_some())
         + usize::from(verify_storage)
         + usize::from(verify_chain)
         + usize::from(reindex_from_freezer.is_some())
@@ -14145,6 +14203,35 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .to_owned(),
         );
     }
+    if snapshot_index_build.is_some()
+        && (utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || verify_storage
+            || data_dir.is_some()
+            || snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target)
+    {
+        return Err(
+            "snapshot index building is offline and conflicts with data-dir, peer, synchronization, activation, validation, serving, wallet, and policy modes"
+                .to_owned(),
+        );
+    }
     if utxo_activity_report {
         if data_dir.is_none() {
             return Err("--utxo-activity-report requires --data-dir".to_owned());
@@ -14221,6 +14308,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14240,6 +14328,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14261,6 +14350,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14282,6 +14372,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14453,6 +14544,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             Some(OfflineAction::RetierUtxos { hot_window_blocks })
         } else if let Some(config) = snapshot_download {
             Some(OfflineAction::DownloadCoreSnapshot(config))
+        } else if let Some((snapshot, output)) = snapshot_index_build {
+            Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output })
         } else if verify_storage {
             Some(OfflineAction::VerifyStorage {
                 max_segments: storage_audit_max_segments
@@ -14617,6 +14710,7 @@ fn print_usage() {
             "  rbtcd [PEER OPTIONS] --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-chainstate OUTPUT [--txindex] [--spent-output-index] [--block-filter-index] [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
+            "  rbtcd --build-core-snapshot-index CORE_DUMPTXOUTSET_FILE --snapshot-index-output FILE\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
             "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
@@ -19247,6 +19341,61 @@ mod tests {
                 "850142614",
                 "--data-dir",
                 "/tmp/rbtc",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_only_offline_core_snapshot_index_builds() {
+        let options = parse_options(
+            [
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            options.offline_action,
+            Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output })
+                if snapshot == PathBuf::from("/srv/snapshots/utxo-935000.dat")
+                    && output == PathBuf::from("/srv/snapshots/utxo-935000.rbtcidx")
+        ));
+        for arguments in [
+            vec!["--build-core-snapshot-index", "/srv/snapshots/utxo.dat"],
+            vec!["--snapshot-index-output", "/srv/snapshots/utxo.rbtcidx"],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--data-dir",
+                "/tmp/rbtc",
+            ],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--once",
+            ],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--download-core-assumeutxo",
+                "https://example.com/utxo.dat",
+                "--snapshot-download-output",
+                "/tmp/utxo.dat",
+                "--snapshot-download-bytes",
+                "850142614",
             ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());

@@ -32,12 +32,12 @@ use crate::{
 
 const SNAPSHOT_MAGIC: &[u8; 5] = b"utxo\xff";
 const SNAPSHOT_VERSION: u16 = 2;
-const METADATA_BYTES: usize = 5 + 2 + 4 + 32 + 8;
+pub(crate) const METADATA_BYTES: usize = 5 + 2 + 4 + 32 + 8;
 const MAX_COMPACT_SIZE: u64 = 0x0200_0000;
 const MAX_SCRIPT_BYTES: u64 = 10_000;
 // Each output contributes at least 9 non-witness bytes, or 36 weight units.
 // Transaction overhead makes this a conservative per-txid upper bound.
-const MAX_COINS_PER_TXID: u64 = 4_000_000 / 36;
+pub(crate) const MAX_COINS_PER_TXID: u64 = 4_000_000 / 36;
 
 /// Failures while parsing or authenticating a Bitcoin Core UTXO snapshot.
 #[derive(Debug, Error)]
@@ -221,7 +221,9 @@ fn open_snapshot(
     Ok((reader, metadata))
 }
 
-fn read_metadata(reader: &mut impl Read) -> Result<CoreSnapshotMetadata, CoreSnapshotError> {
+pub(crate) fn read_metadata(
+    reader: &mut impl Read,
+) -> Result<CoreSnapshotMetadata, CoreSnapshotError> {
     let mut header = [0_u8; METADATA_BYTES];
     reader.read_exact(&mut header)?;
     if &header[..5] != SNAPSHOT_MAGIC {
@@ -245,7 +247,7 @@ fn read_metadata(reader: &mut impl Read) -> Result<CoreSnapshotMetadata, CoreSna
     })
 }
 
-fn network_for_magic(magic: Magic) -> Option<Network> {
+pub(crate) fn network_for_magic(magic: Magic) -> Option<Network> {
     [
         Network::Bitcoin,
         Network::Testnet,
@@ -257,7 +259,7 @@ fn network_for_magic(magic: Magic) -> Option<Network> {
     .find(|network| network.magic() == magic)
 }
 
-fn find_anchor(
+pub(crate) fn find_anchor(
     metadata: CoreSnapshotMetadata,
 ) -> Result<Core31AssumeUtxoAnchor, CoreSnapshotError> {
     core31_assumeutxo_anchors(metadata.network)
@@ -459,7 +461,7 @@ impl<R: Read> Iterator for CoreCoinReader<'_, R> {
     }
 }
 
-fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
+pub(crate) fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     let first = read_byte(reader)?;
     let value = match first {
         0..=252 => u64::from(first),
@@ -497,7 +499,7 @@ fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     Ok(value)
 }
 
-fn read_core_varint(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
+pub(crate) fn read_core_varint(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     let mut value = 0_u64;
     loop {
         let byte = read_byte(reader)?;
@@ -520,7 +522,7 @@ fn read_byte(reader: &mut impl Read) -> Result<u8, CoreSnapshotError> {
     Ok(byte[0])
 }
 
-fn decompress_amount(mut value: u64) -> Option<u64> {
+pub(crate) fn decompress_amount(mut value: u64) -> Option<u64> {
     if value == 0 {
         return Some(0);
     }
@@ -541,7 +543,7 @@ fn decompress_amount(mut value: u64) -> Option<u64> {
     Some(amount)
 }
 
-fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotError> {
+pub(crate) fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotError> {
     let size = read_core_varint(reader)?;
     match size {
         0 => {
@@ -601,7 +603,11 @@ fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotErro
     }
 }
 
-fn update_core_utxo_hash(engine: &mut sha256::HashEngine, key: OutPointKey, utxo: &Utxo) {
+pub(crate) fn update_core_utxo_hash(
+    engine: &mut sha256::HashEngine,
+    key: OutPointKey,
+    utxo: &Utxo,
+) {
     engine.input(key.as_bytes());
     engine.input(&((utxo.height << 1) + u32::from(u8::from(utxo.is_coinbase))).to_le_bytes());
     engine.input(&utxo.value_sats.to_le_bytes());

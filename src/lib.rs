@@ -15,6 +15,7 @@ pub mod chain_store;
 pub mod chainstate;
 pub mod consensus;
 pub mod core_snapshot;
+pub mod core_snapshot_index;
 pub mod deployments;
 pub mod diagnostics;
 pub mod execution_store;
@@ -29,6 +30,7 @@ pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod merkle_proof;
+pub mod mphf;
 pub mod node;
 pub mod p2p;
 pub mod peer_store;
