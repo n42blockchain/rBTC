@@ -218,7 +218,10 @@ Primary references:
   Authenticode/RFC3161 signatures; produces a strict root-data-schema-v3
   manifest, CycloneDX SBOM, per-artifact provenance, and offline
   repository/organization-bound Sigstore manifest bundle; and publishes only
-  after the complete draft is assembled. The local `n42appv2` Android/Apple
+  after the complete draft is assembled. Tag, Cargo package, CLI/P2P/RPC, and
+  manifest versions are bound; every native release job runs the complete
+  all-feature suite and executes the built artifact before signing. The local
+  `n42appv2` Android/Apple
   signing inventory and exact protected-environment contract are recorded in
   [RELEASE_SIGNING.md](RELEASE_SIGNING.md). A Developer ID Application identity,
   Windows Authenticode identity, release-immutability setting, and real tagged

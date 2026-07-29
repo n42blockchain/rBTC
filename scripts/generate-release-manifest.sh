@@ -2,18 +2,19 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 DIST_DIR OUTPUT TAG COMMIT RUSTC SOURCE_DATE_EPOCH" >&2
+    echo "usage: $0 DIST_DIR OUTPUT TAG VERSION COMMIT RUSTC SOURCE_DATE_EPOCH" >&2
     exit 2
 }
 
-[[ $# -eq 6 ]] || usage
+[[ $# -eq 7 ]] || usage
 
 dist_dir=$1
 output=$2
 release_tag=$3
-commit=$4
-rustc_version=$5
-source_date_epoch=$6
+package_version=$4
+commit=$5
+rustc_version=$6
+source_date_epoch=$7
 
 [[ -d "$dist_dir" ]] || {
     echo "release directory does not exist: $dist_dir" >&2
@@ -27,8 +28,16 @@ source_date_epoch=$6
     echo "SOURCE_DATE_EPOCH must be an unsigned integer" >&2
     exit 1
 }
+[[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+    echo "package version must be semantic version text" >&2
+    exit 1
+}
+if [[ "$release_tag" == v* && "$release_tag" != "v$package_version" ]]; then
+    echo "release tag $release_tag does not match package version $package_version" >&2
+    exit 1
+fi
 
-for value in "$release_tag" "$rustc_version"; do
+for value in "$release_tag" "$package_version" "$rustc_version"; do
     [[ "$value" != *$'\t'* && "$value" != *$'\n'* && -n "$value" ]] || {
         echo "manifest metadata must be non-empty single-line text without tabs" >&2
         exit 1
@@ -65,8 +74,9 @@ tmp_output=$(mktemp "${TMPDIR:-/tmp}/rbtc-release-manifest.XXXXXX")
 trap 'rm -f "$tmp_output"' EXIT
 
 {
-    printf 'rbtc-release-manifest-v1\n'
+    printf 'rbtc-release-manifest-v2\n'
     printf 'tag\t%s\n' "$release_tag"
+    printf 'version\t%s\n' "$package_version"
     printf 'commit\t%s\n' "$commit"
     printf 'rustc\t%s\n' "$rustc_version"
     printf 'source_date_epoch\t%s\n' "$source_date_epoch"

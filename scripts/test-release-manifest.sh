@@ -22,7 +22,7 @@ for asset in "${assets[@]}"; do
 done
 
 "$repo_root/scripts/generate-release-manifest.sh" \
-    "$fixture" "$fixture/RELEASE-MANIFEST.tsv" v0.0.0-test \
+    "$fixture" "$fixture/RELEASE-MANIFEST.tsv" v0.0.0-test 0.0.0-test \
     0123456789abcdef0123456789abcdef01234567 \
     "rustc 1.85.0 (fixture)" 1
 "$repo_root/scripts/verify-release-manifest.sh" \
@@ -32,6 +32,14 @@ printf 'tampered\n' >>"$fixture/rbtc.cdx.json"
 if "$repo_root/scripts/verify-release-manifest.sh" \
     "$fixture/RELEASE-MANIFEST.tsv" "$fixture" >/dev/null 2>&1; then
     echo "tampered release asset was accepted" >&2
+    exit 1
+fi
+
+if "$repo_root/scripts/generate-release-manifest.sh" \
+    "$fixture" "$fixture/mismatched.tsv" v9.9.9 0.0.0 \
+    0123456789abcdef0123456789abcdef01234567 \
+    "rustc 1.85.0 (fixture)" 1 >/dev/null 2>&1; then
+    echo "release tag/package version mismatch was accepted" >&2
     exit 1
 fi
 

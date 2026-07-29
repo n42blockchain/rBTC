@@ -165,7 +165,7 @@ const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_millis(20);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
-const USER_AGENT: &str = "/rbtcd:0.1.0/";
+const USER_AGENT: &str = concat!("/rbtcd:", env!("CARGO_PKG_VERSION"), "/");
 const MAX_CONFIGURED_PEERS: usize = 16;
 const DEFAULT_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 16;
@@ -4656,8 +4656,31 @@ impl CliError {
 /// should use [`NodeBuilder`] so shutdown and task ownership remain under the
 /// host application's control.
 pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliError> {
-    match parse_options(arguments) {
+    let mut arguments = arguments.collect::<Vec<_>>();
+    if matches!(
+        arguments.as_slice(),
+        [argument] if argument == "--version" || argument == "-V"
+    ) {
+        print_version();
+        return Ok(());
+    }
+    let check_config_count = arguments
+        .iter()
+        .filter(|argument| argument.as_str() == "--check-config")
+        .count();
+    if check_config_count > 1 {
+        print_usage();
+        return Err(CliError::parse(
+            "--check-config cannot be supplied more than once".to_owned(),
+        ));
+    }
+    arguments.retain(|argument| argument != "--check-config");
+    match parse_options(arguments.into_iter()) {
         Ok(Some(options)) => {
+            if check_config_count == 1 {
+                println!("{}", startup_configuration_summary(&options));
+                return Ok(());
+            }
             let mut logging = options.logging.clone();
             if matches!(
                 options.offline_action.as_ref(),
@@ -4716,7 +4739,13 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
         }
         Ok(None) => {
             print_usage();
-            Ok(())
+            if check_config_count == 1 {
+                Err(CliError::parse(
+                    "--check-config requires a configuration file or launch arguments".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         Err(error) => {
             print_usage();
@@ -14687,6 +14716,8 @@ fn print_usage() {
     println!(
         concat!(
             "rbtcd {}\n\nUSAGE:\n",
+            "  rbtcd --version\n",
+            "  rbtcd --check-config --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
@@ -14714,6 +14745,10 @@ fn print_usage() {
         ),
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn print_version() {
+    println!("rbtcd {}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -14754,6 +14789,36 @@ mod tests {
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
+
+    #[tokio::test]
+    async fn cli_version_and_config_check_are_side_effect_free() {
+        assert_eq!(
+            USER_AGENT,
+            concat!("/rbtcd:", env!("CARGO_PKG_VERSION"), "/")
+        );
+        run_cli(["--version".to_owned()].into_iter()).await.unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let data_dir = directory.path().join("not-created");
+        run_cli(
+            [
+                "--check-config".to_owned(),
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                data_dir.display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .await
+        .unwrap();
+        assert!(!data_dir.exists());
+
+        let error = run_cli(["--check-config".to_owned()].into_iter())
+            .await
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
 
     #[test]
     fn block_throughput_uses_completed_transfer_deltas_and_saturates() {
@@ -17363,6 +17428,8 @@ mod tests {
         let known = prop::sample::select(
             [
                 "--help",
+                "--version",
+                "--check-config",
                 "--connect",
                 "--dns-seed",
                 "--no-dns-seeds",

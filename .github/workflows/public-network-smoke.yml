@@ -19,8 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
-        with:
-          toolchain: 1.85.0
       - run: scripts/public-network-sync-smoke.sh
 
   mainnet-checkpoint:
@@ -31,6 +29,4 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
-        with:
-          toolchain: 1.85.0
       - run: scripts/public-network-sync-smoke.sh

@@ -20,6 +20,7 @@ jobs:
     environment: release-signing
     outputs:
       release_ref: ${{ steps.metadata.outputs.release_ref }}
+      package_version: ${{ steps.metadata.outputs.package_version }}
       source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
       rustc_version: ${{ steps.metadata.outputs.rustc_version }}
       publish: ${{ steps.metadata.outputs.publish }}
@@ -28,8 +29,6 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
-        with:
-          toolchain: 1.85.0
       - name: Fail closed unless every native signing identity is provisioned
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -77,12 +76,20 @@ jobs:
         id: metadata
         shell: bash
         run: |
+          package_version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              python3 -c 'import json,sys; packages=[p for p in json.load(sys.stdin)["packages"] if p["name"] == "rbtc"]; assert len(packages) == 1; print(packages[0]["version"])'
+          )"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             release_ref="${GITHUB_REF#refs/tags/}"
-            [[ "$release_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
+            [[ "$release_ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
               echo "release tag is not semantic: $release_ref" >&2
               exit 1
             }
+            if [[ "$release_ref" != "v$package_version" ]]; then
+              echo "release tag $release_ref does not match Cargo package version $package_version" >&2
+              exit 1
+            fi
             git tag --points-at "$GITHUB_SHA" | grep -Fx "$release_ref" >/dev/null
             publish=true
           else
@@ -91,6 +98,7 @@ jobs:
           fi
           {
             echo "release_ref=$release_ref"
+            echo "package_version=$package_version"
             echo "source_date_epoch=$(git show -s --format=%ct "$GITHUB_SHA")"
             echo "rustc_version=$(rustc -V)"
             echo "publish=$publish"
@@ -104,11 +112,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
-        with:
-          toolchain: 1.85.0
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-cyclonedx@0.5.9
+      - name: Test complete native feature set
+        run: cargo test --locked --all-features
       - run: scripts/verify-reproducible-build.sh
       - name: Assemble Linux release and SBOM
         env:
@@ -117,6 +125,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/rbtcd dist/rbtcd-x86_64-unknown-linux-gnu
+          scripts/verify-release-binary.sh \
+            dist/rbtcd-x86_64-unknown-linux-gnu \
+            "${{ needs.signing-preflight.outputs.package_version }}"
           cargo cyclonedx --format json --spec-version 1.5 \
             --override-filename rbtc.cdx
           mv rbtc.cdx.json dist/
@@ -155,10 +166,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
-          toolchain: 1.85.0
           targets: aarch64-unknown-linux-gnu
-      - name: Test native library and embedding boundary
-        run: cargo test --locked --lib --test embedded_node_api
+      - name: Test complete native feature set
+        run: cargo test --locked --all-features
       - name: Build native release artifact
         env:
           SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
@@ -168,6 +178,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/rbtcd dist/rbtcd-aarch64-unknown-linux-gnu
+          scripts/verify-release-binary.sh \
+            dist/rbtcd-aarch64-unknown-linux-gnu \
+            "${{ needs.signing-preflight.outputs.package_version }}"
           cd dist
           sha256sum rbtcd-aarch64-unknown-linux-gnu > \
             rbtcd-aarch64-unknown-linux-gnu.sha256
@@ -202,14 +215,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
-          toolchain: 1.85.0
           targets: ${{ matrix.target }}
-      - name: Test native library and embedding boundary
-        run: cargo test --locked --lib --test embedded_node_api
+      - name: Test complete native feature set
+        run: cargo test --locked --all-features
       - name: Build native release artifact
         env:
           SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
         run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Smoke-test native release artifact
+        shell: bash
+        run: |
+          scripts/verify-release-binary.sh \
+            "target/${{ matrix.target }}/release/rbtcd" \
+            "${{ needs.signing-preflight.outputs.package_version }}"
       - name: Sign, notarize, and verify
         env:
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -307,14 +325,26 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
-          toolchain: 1.85.0
           targets: x86_64-pc-windows-msvc
-      - name: Test native library and embedding boundary
-        run: cargo test --locked --lib --test embedded_node_api
+      - name: Locate libclang for bindgen
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (Test-Path (Join-Path $llvm 'libclang.dll')) {
+            "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+      - name: Test complete native feature set
+        run: cargo test --locked --all-features
       - name: Build native release artifact
         env:
           SOURCE_DATE_EPOCH: ${{ needs.signing-preflight.outputs.source_date_epoch }}
         run: cargo build --locked --release
+      - name: Smoke-test native release artifact
+        shell: bash
+        run: |
+          scripts/verify-release-binary.sh \
+            target/release/rbtcd.exe \
+            "${{ needs.signing-preflight.outputs.package_version }}"
       - name: Authenticode sign, timestamp, and verify
         env:
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
@@ -403,6 +433,7 @@ jobs:
           scripts/generate-release-manifest.sh \
             dist dist/RELEASE-MANIFEST.tsv \
             "${{ needs.signing-preflight.outputs.release_ref }}" \
+            "${{ needs.signing-preflight.outputs.package_version }}" \
             "$GITHUB_SHA" \
             "${{ needs.signing-preflight.outputs.rustc_version }}" \
             "${{ needs.signing-preflight.outputs.source_date_epoch }}"

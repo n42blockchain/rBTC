@@ -78,6 +78,12 @@ and deterministic CLI override precedence. Negative CLI forms such as
 override enabled file booleans. Credentials and descriptors remain in their
 owner-only files rather than entering configuration. See
 [docs/OPERATOR_CONFIG.md](docs/OPERATOR_CONFIG.md) for the schema and example.
+Use `rbtcd --check-config --config PATH` to validate and print the complete
+secret-free effective configuration without creating storage or connecting a
+peer. Installation, signed-artifact verification, and first-start checks are in
+[docs/INSTALLATION.md](docs/INSTALLATION.md). Product release status is
+summarized in [docs/PRODUCT_MATURITY.md](docs/PRODUCT_MATURITY.md), and private
+vulnerability reporting is defined in [SECURITY.md](SECURITY.md).
 
 ## Local checks
 
@@ -88,6 +94,9 @@ cargo test --locked --all-features
 cargo llvm-cov --locked --all-features --fail-under-lines 90
 cargo audit --deny warnings
 cargo deny check
+cargo build --locked --release
+target/release/rbtcd --version
+target/release/rbtcd --help
 scripts/verify-reproducible-build.sh
 scripts/public-network-sync-smoke.sh
 RBTC_FUZZ_RUNS=10000 scripts/run-fuzz-regression.sh
