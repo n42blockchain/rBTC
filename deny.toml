@@ -12,11 +12,16 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "GPL-3.0-only",
+    "ISC",
     "MIT",
     "MITNFA",
+    "MPL-2.0",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.8
+exceptions = [
+    { allow = ["NCSA"], crate = "libfuzzer-sys@0.4.13" },
+]
 
 [bans]
 multiple-versions = "warn"
