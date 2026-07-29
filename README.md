@@ -546,6 +546,58 @@ every post-base block normally. The historical validator independently rebuilds
 the base UTXO set, and only an exact identity match clears the assumed marker.
 No MPT or new consensus commitment is introduced.
 
+For read-mostly tooling, `CoreSnapshotIndex::build` can create an independent
+BBHash MPHF sidecar for `utxo-935000.dat`. The original Core file is not
+rewritten: one MPHF slot points to each txid group, so all outputs from a
+transaction continue to reuse the single stored txid and Core's amount/script
+compression. `CoreSnapshotIndex::open` binds the sidecar to the snapshot
+metadata, length, and full-file SHA-256, and `get` verifies the txid and vout in
+the source group before returning a UTXO. The sidecar also records the exact
+grouped-key byte count, exposed in total and as average bytes per UTXO. Full
+activation must still use
+`verify_core31_snapshot`; the sidecar is an access accelerator, not a new trust
+anchor. The source modification time is cached with nanosecond precision:
+opening an unchanged file does not hash it again. A changed timestamp triggers
+one full SHA-256 pass; an unchanged digest refreshes the cached timestamp
+atomically, while a changed digest rejects the sidecar.
+
+The Core 31 mainnet height-935,000 snapshot and generated v3 MPHF sidecar were
+measured on 2026-07-29:
+
+| Artifact/metric | Measured value |
+| --- | ---: |
+| Core snapshot bytes | 9,387,990,306 |
+| Core snapshot UTXOs | 164,241,311 |
+| Core snapshot bytes/UTXO | 57.159738 |
+| Distinct txid groups | 113,879,165 |
+| Grouped outpoint-key bytes | 3,944,314,134 |
+| Grouped key bytes/UTXO | 24.015360 |
+| BBHash sidecar bytes | 957,969,566 |
+| Sidecar/source ratio | 10.2042% |
+
+The source snapshot SHA-256 was
+`e572ddbe456d254f05fb004cebe225bdb3656074b66f0e9b1c7fa83e1301d486`.
+The sidecar keeps eight-byte group offsets plus the MPHF bitmaps; values,
+compressed scripts, and grouped txids remain exclusively in the original Core
+snapshot.
+
+An experimental full-copy comparison also migrated the caught-up mainnet redb
+UTXO set into MDBX in sorted 20,000-row pages. The verified 2026-07-29 report
+contained 166,328,068 records:
+
+| Metric | redb | MDBX |
+| --- | ---: | ---: |
+| Storage bytes | 73,023,500,288 | 17,448,321,024 |
+| Bytes/UTXO | 439.033 | 104.903 |
+| MDBX/redb size | 100% | 23.8941% |
+
+The migration took 640.013 seconds, approximately 259,882 rows/second, and
+recounted the source and destination to the same record total. This is a
+static full-copy result, not yet a claim about long-running write
+amplification. `scripts/eval-mdbx-full-copy-day.sh` and
+`scripts/summary-mdbx-full-copy-day.sh` provide the separate 24-hour size/RSS
+measurement path.
+
 An experimental validation directory remains bound to its original hard
 ceiling during ordinary restarts. Once that exact target has completed,
 `--extend-validation-target` may raise it to a higher authenticated height/hash
