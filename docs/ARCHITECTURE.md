@@ -761,15 +761,33 @@ usage) having resumed from an already-advanced state, while redb covered
 a cold base. Different block ranges and different starting states make the
 raw 361 vs 175 blocks/min figures unusable as an engine verdict.
 
-Normalising by maintenance I/O per block does compare, and it is the sharpest
-result of the whole exercise. redb avoided rebases by compacting 72 times,
-each rewriting the surviving data: roughly 314 GiB written to free 100.7 GiB,
-about **12.7 MiB per block**. MDBX's two rebases wrote roughly 21 GiB — two
-snapshots plus indexes — about **1.1 MiB per block**. redb bought "no
-rebases" at a bit over **eleven times the maintenance write amplification**.
-That is the real trade between these engines at a comfortable budget: MDBX
-does a small number of large, planned rewrites, while redb does continuous
-incremental ones that add up to far more total I/O.
+Normalising by maintenance I/O per block does compare. redb avoided rebases
+by compacting 72 times, each rewriting the surviving data: roughly 314 GiB
+written to free 100.7 GiB, about **12.7 MiB per block**, against MDBX's two
+rebases at roughly 21 GiB — about **1.1 MiB per block**.
+
+Most of that gap turned out to be a tuning defect on the redb side rather
+than a property of the engine. The overlay's working set settles near
+4.4 GiB, and the compaction trigger sat at 50% of the 10 GiB budget — 5 GiB,
+barely above it. Each pass therefore rewrote the whole ~4.4 GiB survivor to
+reclaim about 1 GiB, and the file re-crossed the trigger almost immediately.
+A percentage-of-budget threshold cannot prevent that on its own: once the
+file is above it, every batch qualifies regardless of how little was freed
+last time. Compaction now additionally requires the file to have grown half
+again over its size after the previous compaction, which ties the decision to
+how much garbage has actually re-accumulated and adapts to any budget and
+working set. Replaying the run's observed sizes under that rule gives an
+estimated 9 compactions and 38 GiB — about **1.5 MiB per block**, close to
+MDBX's 1.1.
+
+Raising the threshold instead was considered and rejected on the same replay:
+at 75% the trigger would never have fired, since the overlay peaked at
+6.61 GiB (66%), so compaction would stop entirely and the file would drift
+into the 85% rebase threshold — trading ~4 GiB rewrites for ~10.6 GiB ones.
+The threshold stays at 50% and the growth gate does the work.
+
+The residual difference is structural and remains the real trade: MDBX does a
+small number of large planned rewrites, redb a larger number of smaller ones.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat

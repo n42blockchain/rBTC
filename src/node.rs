@@ -1815,10 +1815,57 @@ pub enum NodeError {
 const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
-/// Compaction runs well below the rebase threshold: reclaiming space freed by
-/// spends is far cheaper than folding the overlay into a whole new snapshot,
-/// so it is worth trying first and often.
+/// Compaction runs below the rebase threshold, since reclaiming space in
+/// place is far cheaper than folding the overlay into a whole new snapshot: a
+/// compaction rewrites the ~4 GiB survivor, a rebase writes a fresh ~10.6 GiB
+/// snapshot and index.
+///
+/// Kept at 50% deliberately. Raising it looks attractive — a measured mainnet
+/// run at this threshold compacted 72 times, rewriting 314 GiB — but replaying
+/// that run's sizes shows a 75% trigger would never have fired at all, because
+/// the overlay peaked at 6.61 GiB (66%). Compaction would simply stop, and the
+/// file would drift up into the 85% rebase threshold instead, trading ~4 GiB
+/// rewrites for ~10.6 GiB ones. The thrashing is fixed by
+/// [`SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT`] instead, which cuts the same
+/// run to an estimated 9 compactions and 38 GiB without disabling the
+/// mechanism.
 const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
+
+/// Growth over the last post-compaction size required before compacting
+/// again, as a percentage of that size.
+///
+/// The percentage-of-budget threshold alone cannot prevent thrashing: once
+/// the file sits above it, every batch qualifies, however little was freed
+/// last time. Requiring the file to have grown by half again since the last
+/// compaction ties the decision to how much garbage has actually
+/// accumulated, which is what makes the rewrite worth its cost, and adapts
+/// to any budget and working set rather than assuming one.
+const SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT: u64 = 50;
+
+/// Decides whether compacting the overlay now is worth the rewrite it costs.
+///
+/// `used_bytes`/`capacity_bytes` describe the file now, `compact_percent` is
+/// the configured trigger, and `last_compacted_bytes` is the size right after
+/// the previous compaction, if there was one.
+#[cfg(feature = "mdbx")]
+fn overlay_compaction_is_worthwhile(
+    used_bytes: u64,
+    capacity_bytes: u64,
+    compact_percent: u8,
+    last_compacted_bytes: Option<u64>,
+) -> bool {
+    if capacity_bytes == 0 {
+        return false;
+    }
+    let used_percent = used_bytes.saturating_mul(100) / capacity_bytes;
+    if used_percent < u64::from(compact_percent) {
+        return false;
+    }
+    last_compacted_bytes.is_none_or(|bytes| {
+        used_bytes.saturating_sub(bytes)
+            >= bytes.saturating_mul(SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT) / 100
+    })
+}
 
 /// Storage engine backing a snapshot-overlay catch-up run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9125,13 +9172,14 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
     let mut auxiliary_session = None;
     let mut prefetched_blocks = PrefetchedBlocks::default();
-    // Size at which compaction last ran and released nothing. During
-    // catch-up the overlay is dominated by live data — coins the chain just
-    // created, plus undo records still inside the retention window — rather
-    // than by reclaimable garbage, so compaction routinely finds nothing to
-    // release. Without this, every batch past the threshold would re-run it
-    // at the same size and log a meaningless result.
-    let mut fruitless_compaction_bytes: Option<u64> = None;
+    // File size immediately after the last compaction, whatever it released.
+    // Compaction rewrites every surviving byte, so repeating it before
+    // meaningful garbage has re-accumulated costs far more than it returns —
+    // and during catch-up the overlay is mostly live data (coins the chain
+    // just created, plus undo still inside the retention window), so garbage
+    // accumulates slowly. Gating on growth since this point covers both the
+    // fruitless case and the merely uneconomical one.
+    let mut last_compacted_bytes: Option<u64> = None;
     loop {
         loop {
             let tip = chainstate
@@ -9170,8 +9218,12 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         let mut usage = chainstate
             .overlay_capacity()
             .map_err(PeerRunError::transient)?;
-        let worth_compacting = usage.used_percent() >= overlay.compact_percent
-            && fruitless_compaction_bytes.is_none_or(|bytes| usage.used_bytes > bytes);
+        let worth_compacting = overlay_compaction_is_worthwhile(
+            usage.used_bytes,
+            usage.capacity_bytes,
+            overlay.compact_percent,
+            last_compacted_bytes,
+        );
         if worth_compacting {
             if let Some(compaction) = chainstate
                 .overlay_compact()
@@ -9186,7 +9238,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
                     compaction.after_bytes,
                     released,
                 );
-                fruitless_compaction_bytes = (released == 0).then_some(compaction.after_bytes);
+                last_compacted_bytes = Some(compaction.after_bytes);
                 usage = chainstate
                     .overlay_capacity()
                     .map_err(PeerRunError::transient)?;
@@ -9209,7 +9261,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
                 report.folded_overlay,
                 report.dropped_tombstones,
             );
-            fruitless_compaction_bytes = None;
+            last_compacted_bytes = None;
         }
         download_execute_batch(
             session,
@@ -20016,6 +20068,65 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    /// Regression test built from a measured mainnet run: with a 10 GiB
+    /// budget the overlay's working set settled near 4.4 GiB, so a 50%
+    /// trigger sat only ~0.6 GiB above it and compaction re-fired on nearly
+    /// every batch — 72 compactions rewriting 314 GiB to reclaim 100 GiB.
+    /// The trigger now sits at 75% and, more importantly, will not repeat
+    /// until the file has grown half again over its last compacted size.
+    #[test]
+    #[cfg(feature = "mdbx")]
+    fn overlay_compaction_waits_for_real_growth_before_repeating() {
+        const BUDGET: u64 = 10 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let percent = DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT;
+
+        // Below the 50% trigger: never worth it, whatever the history.
+        assert!(!overlay_compaction_is_worthwhile(
+            4 * GIB,
+            BUDGET,
+            percent,
+            None
+        ));
+        assert!(!overlay_compaction_is_worthwhile(
+            4 * GIB,
+            BUDGET,
+            percent,
+            Some(3 * GIB)
+        ));
+
+        // Above the trigger with no prior compaction: run it.
+        assert!(overlay_compaction_is_worthwhile(
+            5 * GIB,
+            BUDGET,
+            percent,
+            None
+        ));
+
+        // The exact thrashing case that motivated this, in the measured
+        // numbers: compaction left ~4.5 GiB, the file crept back just over
+        // the 5 GiB trigger, and rewriting all 4.5 GiB again is not worth
+        // the ~0.6 GiB it would reclaim.
+        assert!(!overlay_compaction_is_worthwhile(
+            5 * GIB + GIB / 8,
+            BUDGET,
+            percent,
+            Some(4 * GIB + GIB / 2)
+        ));
+
+        // Genuine re-accumulation — half again over the last compacted size
+        // — does justify another pass.
+        assert!(overlay_compaction_is_worthwhile(
+            7 * GIB,
+            BUDGET,
+            percent,
+            Some(4 * GIB + GIB / 2)
+        ));
+
+        // Degenerate inputs stay false rather than dividing by zero.
+        assert!(!overlay_compaction_is_worthwhile(GIB, 0, percent, None));
     }
 
     #[test]
