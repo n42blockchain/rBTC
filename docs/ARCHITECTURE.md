@@ -745,16 +745,35 @@ across 395 batches, 212 compaction attempts, and 24 rebases:
   often needs a retention policy for superseded bases, or the disk saved on
   the overlay is lost many times over beside it.
 
-The two completed runs are **not** a controlled engine comparison, and should
-not be read as one: MDBX completed at a 10 GiB budget (55 minutes, 2 rebases)
-while redb completed at 3 GiB (3.64 hours, 24 rebases), so the gap conflates
-engine and budget. The MDBX 3 GiB attempt never finished, because it hit the
-`last_pgno` defect fixed above. A matched-budget run on both engines is the
-measurement still owed.
+redb was then run again at a 10 GiB budget, which changes the picture
+completely: it reached the tip in 2.40 hours over 25,299 blocks with **zero
+rebases**, ending at 57% of budget with the original 935,000 base still in
+place. The overlay's steady-state working set is the same in both runs — the
+file settles around 4 GiB regardless of what it is told — so the 3 GiB budget
+was simply below what this workload needs, and the 24 rebases it forced were
+the consequence of that, not of the engine. Set the budget above the working
+set and the same engine never rebases at all.
 
-What the data does support, independent of budget, is the enforcement point:
+Comparing the two 10 GiB runs is closer to controlled but still not clean:
+MDBX covered 940,376→960,205 (19,829 blocks, 55 minutes, 2 rebases, 42% final
+usage) having resumed from an already-advanced state, while redb covered
+935,000→960,299 (25,299 blocks, 144 minutes, 0 rebases, 57% final usage) from
+a cold base. Different block ranges and different starting states make the
+raw 361 vs 175 blocks/min figures unusable as an engine verdict.
+
+Normalising by maintenance I/O per block does compare, and it is the sharpest
+result of the whole exercise. redb avoided rebases by compacting 72 times,
+each rewriting the surviving data: roughly 314 GiB written to free 100.7 GiB,
+about **12.7 MiB per block**. MDBX's two rebases wrote roughly 21 GiB — two
+snapshots plus indexes — about **1.1 MiB per block**. redb bought "no
+rebases" at a bit over **eleven times the maintenance write amplification**.
+That is the real trade between these engines at a comfortable budget: MDBX
+does a small number of large, planned rewrites, while redb does continuous
+incremental ones that add up to far more total I/O.
+
+Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
-a third above the number it was given. Per-batch execution (64 blocks) held steady at
+a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
 6–12 seconds including download, structure validation, staging, consensus
 execution, and publish. `capacity()` reports `last_pgno`-based usage — the
 figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical
