@@ -712,6 +712,30 @@ clean run from height 935,000 to the live tip: two rebases (at 947,032 and
 scale together), reaching height 960,205 with the overlay at 42% of its
 10 GiB budget and exiting 0.
 
+A latest-code cold rerun on 2026-07-30 used the same 164,241,311-coin
+`utxo-935000.dat` (9,387,990,306 bytes) and its 1,155,791,488-byte index. It
+validated 25,313 blocks in 396 batches and exited 0 at height 960,313. Process
+wall time from the first daemon log record was 90.29 minutes; the interval
+from the start of the first execution batch through the final commit was
+83.07 minutes (305 blocks/min). Batch totals averaged 10.83 seconds, with a
+3.00-second minimum and a 55.32-second cold-first-batch maximum. Ten transient
+peer warnings were recovered through failover and no error was logged.
+
+The rerun rebased at 947,224 after 12,224 blocks and at 958,296 after another
+11,072 blocks. Each rebase paused block progress for about 4.61 minutes:
+
+| Rebase height | Coins | Snapshot bytes | Index bytes | Folded overlay | Dropped tombstones |
+|---:|---:|---:|---:|---:|---:|
+| 947,224 | 165,489,673 | 9,456,185,634 | 1,164,575,992 | 8,416,963 | 7,168,601 |
+| 958,296 | 166,103,491 | 9,485,481,367 | 1,168,896,520 | 7,253,120 | 6,639,302 |
+
+The two measured rebase pauses totaled 9.22 minutes, 11% of execution wall
+time. The final 2,017-block overlay occupied 2,080,374,784 logical bytes
+(2,063,597,568 allocated bytes), reported as 19% of the hard 10 GiB ceiling.
+The active compressed base plus MPHF index was 10,654,377,887 bytes. Benchmark
+directories retain prior rebase generations for audit, so their aggregate
+disk usage is not the active working-set size.
+
 The redb engine was then measured over a complete run on the same snapshot,
 with a 3 GiB budget and compaction enabled at 50%. It reached the same tip
 960,220 and exited 0, taking 3.64 hours for 25,220 blocks (115 blocks/min)
@@ -822,6 +846,17 @@ Two cautions about these numbers. MDBX scaled best across the two sizes
 comparison at all: the redb entry drives the full `RedbChainStore`, committing
 tip and undo alongside the UTXO mutation, while the MDBX and SQLite entries
 drive a bare UTXO store. Only the lookup column compares like with like.
+
+The latest cold-base MDBX rerun makes the same-budget comparison closer:
+MDBX covered 935,000→960,313 in 90.29 process minutes (83.07 execution
+minutes), with two rebases and 19% final usage; redb covered
+935,000→960,299 in 144 minutes, with zero rebases and 57% final usage. Their
+raw process rates are about 280 and 176 blocks/min respectively, but network
+peers, filesystem cache state, and block workload still prevent treating that
+ratio as an isolated engine microbenchmark. The MDBX rerun wrote
+21,275,139,513 bytes of snapshot-plus-index rebase output, about 0.80 MiB per
+validated block, making redb's measured 12.7 MiB/block maintenance rate about
+sixteen times larger on these same-budget runs.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
