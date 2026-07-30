@@ -737,6 +737,13 @@ across 395 batches, 212 compaction attempts, and 24 rebases:
   rebase streams and re-indexes a ~9.4 GB snapshot, rebase frequency — not
   per-block execution speed — is what sets end-to-end catch-up time at a
   small budget.
+- **Retained bases cost far more disk than the budget saves.** Each rebase
+  publishes a new snapshot and index and, by design, leaves the previous one
+  in place as evidence. Twenty-four rebases therefore accumulated about
+  248 GB of retained bases — roughly 10.6 GB apiece — to hold an overlay
+  budget of 3 GiB. Any deployment running at a budget small enough to rebase
+  often needs a retention policy for superseded bases, or the disk saved on
+  the overlay is lost many times over beside it.
 
 The two completed runs are **not** a controlled engine comparison, and should
 not be read as one: MDBX completed at a 10 GiB budget (55 minutes, 2 rebases)
