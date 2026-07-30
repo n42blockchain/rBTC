@@ -713,34 +713,44 @@ scale together), reaching height 960,205 with the overlay at 42% of its
 10 GiB budget and exiting 0.
 
 The redb engine was then measured on the same snapshot and the same 3 GiB
-budget, with compaction enabled at 50%. Two results stand out, and they point
-in opposite directions:
+budget, with compaction enabled at 50%. Over the first 42 compaction attempts
+and three rebases:
 
-- **Active compaction reclaimed nothing during catch-up.** Across 15 attempts
-  spanning three distinct file sizes (1.61, 2.36, and 3.23 GB), every single
-  one released zero bytes. This is not a defect: compaction returns space
-  freed by deletion, and a catch-up overlay is dominated by *live* data —
-  coins the chain has just created, plus per-block undo still inside the
-  retention window — with very little garbage to collect. The attempts are
-  cheap (redb detects there is nothing to move and returns without rewriting
-  the file; batch-to-batch time was indistinguishable from batches with no
-  compaction), but they are also useless, so the driver now backs off after a
-  fruitless attempt until the file has actually grown. Compaction *is*
-  effective where deletion is bulk: the rebase, which clears every table,
-  took the file from 3.23 GB to 1.18 GB in place — the reclamation MDBX can
-  only get by recreating its environment file.
-- **redb's coarse file growth defeats a policy-enforced budget.** The
-  overlay went from 1.61 GB straight to 3.23 GB in a single step, overshooting
-  the 3 GiB budget before any check could see it, and reached its first
-  rebase after only 704 blocks versus MDBX's 2,240 at the same budget. With
-  no geometry ceiling to refuse the oversized commit, a measured-after-the-fact
-  budget cannot hold a limit that the engine can cross by a full doubling.
+- **Compaction is usually a no-op, but occasionally frees a large amount.**
+  Forty of the forty-two attempts released zero bytes. That is inherent to
+  the workload rather than a defect: compaction returns space freed by
+  deletion, and a catch-up overlay is dominated by *live* data — coins the
+  chain has just created, plus per-block undo still inside the retention
+  window. The no-op attempts are cheap, since redb detects there is nothing
+  to move without rewriting the file (batch-to-batch time was
+  indistinguishable from batches that skipped compaction), but they are
+  useless, so the driver backs off after a fruitless attempt until the file
+  grows again. The two that did fire were worth having: one took 2.22 GB down
+  to 0.27 GB and another 4.27 GB down to 3.15 GB, releasing 1.95 GB and
+  1.12 GB. Bulk deletion is what makes compaction pay, so it earns its place
+  around the rebase boundary rather than between ordinary batches — and that
+  in-place reclamation is exactly what `libmdbx-rs` 0.6.6 offers no API for,
+  forcing the MDBX rebase to recreate its environment file instead.
+- **A policy-enforced budget cannot hold the line.** redb grows its file in
+  coarse steps — the overlay went from 1.61 GB straight to 3.23 GB in one
+  commit — and peaked at 3.98 GiB against a 3.00 GiB budget, 33% over. With
+  no geometry ceiling to refuse the oversized commit, measuring after the
+  fact cannot bound a file the engine can grow by a full doubling between
+  checks. MDBX's `MDBX_MAP_FULL` refuses that commit outright, which is the
+  behaviour a hard budget actually needs.
 
-For a hard, small budget this makes MDBX the better fit despite lacking
-in-place compaction: an engine-enforced ceiling is what actually bounds the
-file, and compaction turns out not to help during the workload the bound
-exists for. redb's compaction earns its place at the rebase boundary, not
-between batches. Per-batch execution (64 blocks) held steady at
+Rebase frequency did **not** separate the engines as cleanly as the first
+data point suggested. redb's intervals were 704, 2,112, and 1,024 blocks
+(mean ≈ 1,280) against MDBX's single 2,240-block sample at the same budget.
+The 704-block figure is a cold-start artifact — a small fresh file crosses
+the threshold on its first doubling — and with few samples on either side and
+high variance on the redb side, the honest reading is that redb rebases
+somewhat more often, not several times more often.
+
+For a hard, small budget MDBX therefore remains the better fit despite
+lacking in-place compaction: an engine-enforced ceiling is what actually
+bounds the file, and compaction does not help during the steady part of the
+workload the bound exists for. Per-batch execution (64 blocks) held steady at
 6–12 seconds including download, structure validation, staging, consensus
 execution, and publish. `capacity()` reports `last_pgno`-based usage — the
 figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical
