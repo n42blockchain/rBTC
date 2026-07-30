@@ -1806,7 +1806,13 @@ pub enum NodeError {
     ControlChannelClosed,
 }
 
-const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// Measured default: the overlay's steady-state working set during
+/// mainnet catch-up settles near 4 GiB — coins created above the base plus
+/// per-block undo inside the retention window — independent of what the
+/// budget is set to. A 3 GiB budget sits below that and forced a rebase
+/// roughly every 1,000 blocks, spending more wall clock rebasing than
+/// executing; 10 GiB completed the same catch-up without rebasing at all.
+const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
 /// Compaction runs well below the rebase threshold: reclaiming space freed by

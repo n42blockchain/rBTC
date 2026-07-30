@@ -643,7 +643,7 @@ overlay store, including stale-tip disconnection back to the active chain
 and block-undo pruning below the retained-ledger floor. Between batches it
 checks the capacity high-water mark and rebases onto
 `utxo-<height>.dat`/`.rbtcidx` beside the current snapshot when the
-configured threshold (default 85% of the default 3 GiB ceiling) is reached.
+configured threshold (default 85% of the default 10 GiB ceiling) is reached.
 The mode is deliberately bounded: it requires `--once` and `--data-dir`,
 conflicts with explorer, wallet, index, and other snapshot or offline modes,
 executes to the header tip observed after the initial synchronization, and
@@ -687,7 +687,7 @@ rbtcd --network bitcoin --data-dir DATA --once \
   --snapshot-overlay-capacity-bytes 10737418240
 ```
 
-A first attempt at the default 3 GiB ceiling reached height 960,203 after
+A first attempt at a 3 GiB ceiling (the default at the time) reached height 960,203 after
 one rebase (at 937,240, 2,240 blocks of live-2024-era Ordinals/Runes-congested
 mainnet growth) and then repeatedly hit `MDBX_MAP_FULL`: `last_pgno` — the
 copy-on-write B-tree's high-water mark, and the only thing the geometry
