@@ -649,6 +649,55 @@ conflicts with explorer, wallet, index, and other snapshot or offline modes,
 executes to the header tip observed after the initial synchronization, and
 exits; a binary built without the `mdbx` feature refuses it at startup.
 
+On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
+164,241,311 coins) was downloaded from a third-party community mirror
+(`bitcoin-snapshots.jaonoctus.dev`, `files-vps02.jaonoctus.dev/utxo-935000.dat`)
+and indexed offline:
+
+```
+rbtcd --build-core-snapshot-index utxo-935000.dat --snapshot-index-output utxo-935000.rbtcidx
+```
+
+That authenticated the file against the compiled 935,000 mainnet identity in
+2m18s and published a 1,155,791,488-byte index (19 BBhash levels, 3.30 bits
+per key). Catch-up then ran to the header tip observed at connect time:
+
+```
+rbtcd --network bitcoin --data-dir DATA --once \
+  --snapshot-overlay-catchup utxo-935000.dat --snapshot-overlay-index utxo-935000.rbtcidx \
+  --snapshot-overlay-capacity-bytes 10737418240
+```
+
+A first attempt at the default 3 GiB ceiling reached height 960,203 after
+one rebase (at 937,240, 2,240 blocks of live-2024-era Ordinals/Runes-congested
+mainnet growth) and then repeatedly hit `MDBX_MAP_FULL`: `last_pgno` — the
+copy-on-write B-tree's high-water mark, and the only thing the geometry
+ceiling actually checks — never shrinks after `clear_table`, so reusing the
+same environment file after a rebase eventually loses the whole budget
+regardless of logical content. That soak also surfaced a genuine one-coin
+`compress_script` defect (a height-707,034 P2PK output using SEC1's rare
+hybrid uncompressed tag 0x06/0x07, which `libsecp256k1` parses as a valid
+point but Core's `CompressScript` never compresses; compressing it anyway
+made decompression's `serialize_uncompressed` silently normalize the tag to
+0x04, breaking the re-verified UTXO-set commitment) and a missing
+`ledger.discard_staged()` reconciliation step that let a chainstate-commit
+failure leave a staged ledger segment blocking every retry. All three are
+fixed: `compress_script` now requires the exact standard tag, `rebase_into`
+recreates the environment file instead of clearing its tables in place, and
+the driver discards a leftover staged segment before its main loop.
+
+With those fixes and a 10 GiB ceiling, the same snapshot and index drove a
+clean run from height 935,000 to the live tip: two rebases (at 947,032 and
+956,056, roughly 9,000–9,700 blocks apart — proportionally longer than the
+3 GiB ceiling's single 2,240-block interval, confirming budget and interval
+scale together), reaching height 960,205 with the overlay at 42% of its
+10 GiB budget and exiting 0. Per-batch execution (64 blocks) held steady at
+6–12 seconds including download, structure validation, staging, consensus
+execution, and publish. `capacity()` reports `last_pgno`-based usage — the
+figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical
+bytes" figure, which the same soak found could stay low immediately after a
+rebase while the environment was already unable to grow further.
+
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,
 credential-free HTTPS URL plus an exact expected length and a new output file.

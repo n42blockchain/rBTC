@@ -8892,13 +8892,21 @@ async fn sync_snapshot_overlay_node(
     .await?;
 
     let database_dir = data_dir.join("overlay-mdbx");
-    let identity =
-        match SnapshotOverlayChainstate::stored_identity(&database_dir, overlay.capacity_bytes)
-            .map_err(|error| PeerRunError::transient(error.to_string()))?
-        {
-            Some(identity) => identity,
-            None => compiled_overlay_identity(&overlay.snapshot, options.network)?,
-        };
+    let stored_identity =
+        SnapshotOverlayChainstate::stored_identity(&database_dir, overlay.capacity_bytes)
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let (identity, snapshot_path, index_path) = match stored_identity {
+        None => (
+            compiled_overlay_identity(&overlay.snapshot, options.network)?,
+            overlay.snapshot.clone(),
+            overlay.index.clone(),
+        ),
+        Some(identity) => {
+            let (snapshot_path, index_path) =
+                overlay_base_paths_for_height(&overlay.snapshot, identity.height);
+            (identity, snapshot_path, index_path)
+        }
+    };
     if headers
         .active_header_at(identity.height)
         .is_none_or(|header| header.hash != identity.block_hash)
@@ -8912,8 +8920,8 @@ async fn sync_snapshot_overlay_node(
     let mut chainstate = SnapshotOverlayChainstate::open(
         SnapshotOverlayConfig {
             database_dir,
-            snapshot_path: overlay.snapshot.clone(),
-            index_path: overlay.index.clone(),
+            snapshot_path,
+            index_path,
             capacity_bytes: overlay.capacity_bytes,
             import_time,
             mtp_by_height,
@@ -8935,6 +8943,25 @@ async fn sync_snapshot_overlay_node(
 
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    // A prior attempt may have staged a downloaded batch and then failed
+    // before committing it (for example, the chainstate transaction hitting
+    // the hard capacity ceiling) — `download_execute_batch` always stages
+    // fresh for the next batch and does not expect a pre-existing staged
+    // segment, so leaving one in place fails every subsequent attempt at the
+    // same height with "staged segment already exists" instead of
+    // recovering. The redb-backed driver reconciles this against its own
+    // chainstate tip and can resume already-validated staged blocks via
+    // `commit_staged`; this driver takes the simpler always-discard path and
+    // re-downloads, which is a bounded, one-batch bandwidth cost.
+    if ledger
+        .staged()
+        .map_err(|error| PeerRunError::transient(error.to_string()))?
+        .is_some()
+    {
+        ledger
+            .discard_staged()
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    }
     let auxiliary_indexes = AuxiliaryIndexes::open(
         &data_dir,
         options.network,
@@ -8985,13 +9012,8 @@ async fn sync_snapshot_overlay_node(
                 .needs_rebase(overlay.rebase_percent)
                 .map_err(|error| PeerRunError::transient(error.to_string()))?
         {
-            let directory = overlay
-                .snapshot
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default();
-            let new_snapshot = directory.join(format!("utxo-{}.dat", tip.height));
-            let new_index = directory.join(format!("utxo-{}.rbtcidx", tip.height));
+            let (new_snapshot, new_index) =
+                overlay_base_paths_for_height(&overlay.snapshot, tip.height);
             let extension = creation_mtp_range(&headers, base_height + 1, tip.height)?;
             let report = chainstate
                 .rebase_into(&new_snapshot, &new_index, &extension)
@@ -9043,6 +9065,29 @@ async fn sync_snapshot_overlay_node(
         usage.capacity_bytes,
     );
     Ok(())
+}
+
+/// Derives the base snapshot/index paths for `height` beside `cli_snapshot`.
+///
+/// A fresh environment opens the operator-supplied files directly (handled
+/// by the caller). Once a rebase has moved the base past them, this
+/// driver's own rebase step is the only writer of new base files, and it
+/// always names them `utxo-<height>.dat`/`.rbtcidx` beside the original
+/// snapshot — reusing that convention here is what lets a restart find the
+/// current base without persisting a file path anywhere.
+#[cfg(feature = "mdbx")]
+fn overlay_base_paths_for_height(
+    cli_snapshot: &std::path::Path,
+    height: u32,
+) -> (PathBuf, PathBuf) {
+    let directory = cli_snapshot
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    (
+        directory.join(format!("utxo-{height}.dat")),
+        directory.join(format!("utxo-{height}.rbtcidx")),
+    )
 }
 
 /// Resolves the compiled Core 31 identity for an operator-supplied snapshot.
@@ -19746,6 +19791,24 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    #[test]
+    #[cfg(feature = "mdbx")]
+    fn overlay_base_paths_follow_the_rebase_naming_convention() {
+        // A fresh environment must resolve to the operator's own file names,
+        // whatever they are — this function is only consulted for the
+        // resumed (post-rebase) case in the driver, but must still agree
+        // with rebase_into's own naming so a resumed run finds what an
+        // earlier rebase actually wrote.
+        let cli_snapshot = PathBuf::from("/srv/snapshots/utxo-935000.dat");
+        let (snapshot, index) = overlay_base_paths_for_height(&cli_snapshot, 937_304);
+        assert_eq!(snapshot, PathBuf::from("/srv/snapshots/utxo-937304.dat"));
+        assert_eq!(index, PathBuf::from("/srv/snapshots/utxo-937304.rbtcidx"));
+        assert_ne!(
+            snapshot, cli_snapshot,
+            "a rebased base must not resolve back to the original CLI-supplied file"
+        );
     }
 
     #[test]

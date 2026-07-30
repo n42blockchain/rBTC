@@ -153,7 +153,10 @@ pub struct SnapshotOverlayConfig {
 
 /// Snapshot-backed chainstate with one bounded MDBX overlay environment.
 pub struct SnapshotOverlayChainstate {
-    db: Database<NoWriteMap>,
+    /// `None` only transiently inside `rebase_into`, while the environment
+    /// file is being recreated.
+    db: Option<Database<NoWriteMap>>,
+    database_dir: PathBuf,
     base: CoreSnapshotUtxoIndex,
     identity: SnapshotBaseIdentity,
     mtp_by_height: Vec<u32>,
@@ -180,21 +183,7 @@ impl SnapshotOverlayChainstate {
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
         let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
-        fs::create_dir_all(&config.database_dir)?;
-        let capacity = isize::try_from(config.capacity_bytes)
-            .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
-        let db = Database::open_with_options(
-            &config.database_dir,
-            DatabaseOptions {
-                max_tables: Some(4),
-                mode: Mode::ReadWrite(ReadWriteOptions {
-                    sync_mode: SyncMode::Durable,
-                    max_size: Some(capacity),
-                    ..ReadWriteOptions::default()
-                }),
-                ..DatabaseOptions::default()
-            },
-        )?;
+        let db = open_environment(&config.database_dir, config.capacity_bytes)?;
         let identity = {
             let transaction = db.begin_rw_txn()?;
             for name in [OVERLAY, TOMBSTONE, UNDO, META] {
@@ -263,7 +252,8 @@ impl SnapshotOverlayChainstate {
             ));
         }
         Ok(Self {
-            db,
+            db: Some(db),
+            database_dir: config.database_dir,
             base,
             identity,
             mtp_by_height: config.mtp_by_height,
@@ -291,20 +281,7 @@ impl SnapshotOverlayChainstate {
         if !database_dir.join("mdbx.dat").exists() {
             return Ok(None);
         }
-        let capacity = isize::try_from(capacity_bytes)
-            .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
-        let db: Database<NoWriteMap> = Database::open_with_options(
-            database_dir,
-            DatabaseOptions {
-                max_tables: Some(4),
-                mode: Mode::ReadWrite(ReadWriteOptions {
-                    sync_mode: SyncMode::Durable,
-                    max_size: Some(capacity),
-                    ..ReadWriteOptions::default()
-                }),
-                ..DatabaseOptions::default()
-            },
-        )?;
+        let db = open_environment(database_dir, capacity_bytes)?;
         let transaction = db.begin_rw_txn()?;
         transaction.create_table(Some(META), TableFlags::empty())?;
         let meta = transaction.open_table(Some(META))?;
@@ -312,6 +289,12 @@ impl SnapshotOverlayChainstate {
             .get::<Vec<u8>>(&meta, META_IDENTITY)?
             .map(|stored| decode_identity(&stored))
             .transpose()
+    }
+
+    fn db(&self) -> &Database<NoWriteMap> {
+        self.db
+            .as_ref()
+            .expect("environment handle is only absent transiently during rebase")
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -332,10 +315,21 @@ impl SnapshotOverlayChainstate {
     ///
     /// Fails on MDBX environment errors.
     pub fn capacity(&self) -> Result<OverlayCapacity, SnapshotOverlayError> {
-        let info = self.db.info()?;
-        let page_size = u64::from(self.db.stat()?.page_size());
+        let info = self.db().info()?;
+        let page_size = u64::from(self.db().stat()?.page_size());
         let last_page = u64::try_from(info.last_pgno())
             .map_err(|_| SnapshotOverlayError::Invalid("page number overflows"))?;
+        // `MDBX_MAP_FULL` fires when `last_pgno` — the file's high-water
+        // mark, i.e. the highest page number the copy-on-write B-tree has
+        // ever committed — would need to grow past the geometry ceiling.
+        // That trigger ignores the freelist entirely: MVCC retention and
+        // page-split patterns mean a write can still need a page beyond
+        // `last_pgno` even while a large fraction of allocated pages are
+        // logically free and reusable. So `last_pgno` alone, not a
+        // freelist-adjusted "pages actually in use" figure, is what predicts
+        // the real ceiling — and it never decreases after `clear_table`,
+        // which is exactly why `rebase_into` recreates the environment file
+        // instead of reusing this one indefinitely.
         Ok(OverlayCapacity {
             used_bytes: (last_page + 1).saturating_mul(page_size),
             capacity_bytes: self.capacity_bytes,
@@ -537,7 +531,7 @@ impl SnapshotOverlayChainstate {
 
     fn commit_transitions(&self, transitions: &[ConnectTransition]) -> Result<(), ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
@@ -605,7 +599,7 @@ impl SnapshotOverlayChainstate {
         }
         // `&mut self` already excludes every other reader and writer, and the
         // read transaction below pins one MVCC view for the whole merge.
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let meta = transaction.open_table(Some(META))?;
         let tip = Self::read_tip(&transaction, &meta)?;
         let expected_extension = tip
@@ -636,7 +630,12 @@ impl SnapshotOverlayChainstate {
         }
 
         // Stream-merge the old snapshot (minus tombstones) with the overlay
-        // into a temporary file, hashing Core's commitment as we go.
+        // into a temporary file, hashing Core's commitment as we go. Every
+        // file this function creates is tracked here and removed on any
+        // early return, so a failed rebase — including a re-verification
+        // mismatch after publication — never leaves an orphan blocking a
+        // retry at the same target height.
+        let mut cleanup = RemoveFilesOnDrop::default();
         let temporary = new_snapshot_path.with_file_name({
             let mut name = new_snapshot_path
                 .file_name()
@@ -645,6 +644,7 @@ impl SnapshotOverlayChainstate {
             name.push(".tmp");
             name
         });
+        cleanup.track(temporary.clone());
         let mut writer = std::io::BufWriter::new(File::create(&temporary)?);
         let mut header = Vec::with_capacity(51);
         header.extend_from_slice(b"utxo\xff");
@@ -736,6 +736,7 @@ impl SnapshotOverlayChainstate {
         drop(writer);
         drop(transaction);
         fs::rename(&temporary, new_snapshot_path)?;
+        cleanup.replace(new_snapshot_path.to_owned());
         // Windows has no portable directory fsync; see `diagnostics::sync_directory`.
         #[cfg(unix)]
         if let Some(parent) = new_snapshot_path.parent() {
@@ -751,27 +752,77 @@ impl SnapshotOverlayChainstate {
         // commitment, so a compression asymmetry cannot survive publication.
         let report =
             build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
+        cleanup.track(new_index_path.to_owned());
         let new_base = CoreSnapshotUtxoIndex::open(new_index_path, new_snapshot_path)?;
 
-        let transaction = self.db.begin_rw_txn()?;
-        for name in [OVERLAY, TOMBSTONE, UNDO] {
-            let table = transaction.open_table(Some(name))?;
-            transaction.clear_table(&table)?;
+        // `clear_table` alone is not enough: MDBX's copy-on-write B-tree
+        // reclaims freed pages onto a freelist for reuse, but `last_pgno` —
+        // the file's high-water mark, and the only thing `MDBX_MAP_FULL`
+        // actually checks against the geometry ceiling — never shrinks, even
+        // to near zero logical content. Reusing this environment file
+        // indefinitely would eventually let `last_pgno` reach the ceiling
+        // regardless of how little data remains, permanently losing the
+        // budget a rebase is meant to reclaim. The environment file must
+        // therefore be recreated from scratch.
+        //
+        // Rebuilding at a fresh sibling directory first, and only replacing
+        // the canonical directory once that build is fully committed and
+        // closed, means no step ever renames or deletes a directory while
+        // this process still holds an open handle into it — a live MDBX
+        // memory mapping can otherwise make that unreliable on Windows.
+        let identity_bytes = encode_identity(&identity, &new_base)?;
+        let fresh_dir = self.database_dir.with_file_name({
+            let mut name = self
+                .database_dir
+                .file_name()
+                .ok_or(SnapshotOverlayError::Invalid("overlay directory name"))?
+                .to_owned();
+            name.push(".rebasing");
+            name
+        });
+        if fresh_dir.exists() {
+            fs::remove_dir_all(&fresh_dir)?;
         }
-        let meta = transaction.open_table(Some(META))?;
-        transaction.put(
-            &meta,
-            META_IDENTITY,
-            encode_identity(&identity, &new_base)?,
-            WriteFlags::empty(),
-        )?;
-        transaction.commit()?;
+        {
+            let fresh_db = open_environment(&fresh_dir, self.capacity_bytes)?;
+            let transaction = fresh_db.begin_rw_txn()?;
+            for name in [OVERLAY, TOMBSTONE, UNDO, META] {
+                transaction.create_table(Some(name), TableFlags::empty())?;
+            }
+            let meta = transaction.open_table(Some(META))?;
+            transaction.put(&meta, META_IDENTITY, identity_bytes, WriteFlags::empty())?;
+            transaction.put(
+                &meta,
+                META_TIP,
+                encode_tip(ExecutionTip {
+                    height: identity.height,
+                    hash: identity.block_hash,
+                }),
+                WriteFlags::empty(),
+            )?;
+            transaction.commit()?;
+            // `fresh_db` drops here, releasing its handle. `fresh_dir` now
+            // holds a complete, fully-closed environment with no open
+            // handles from this process, so it can be renamed safely.
+        }
+        // Close the current environment before its directory is removed —
+        // MDBX holds this file memory-mapped, and deleting or renaming a
+        // directory out from under a live mapping is not reliable on
+        // Windows. `self.db` is `None` only for the few statements below.
+        drop(self.db.take());
+        fs::remove_dir_all(&self.database_dir)?;
+        fs::rename(&fresh_dir, &self.database_dir)?;
+        // Reopen fresh so MDBX's own bookkeeping matches the directory's
+        // current (renamed-back) path rather than the transient one it was
+        // built under.
+        self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
 
         self.mtp_by_height.extend_from_slice(mtp_extension);
         self.base = new_base;
         self.identity = identity.clone();
         new_snapshot_path.clone_into(&mut self.snapshot_path);
         new_index_path.clone_into(&mut self.index_path);
+        cleanup.disarm();
         Ok(RebaseReport {
             identity,
             coins,
@@ -798,6 +849,48 @@ impl SnapshotOverlayChainstate {
             }
         }
         Ok(kept)
+    }
+}
+
+/// Removes its tracked paths on drop unless [`Self::disarm`] was called.
+///
+/// [`SnapshotOverlayChainstate::rebase_into`] uses this so every early
+/// return — including a re-verification failure after the new snapshot file
+/// was already published — cleans up its own partial output instead of
+/// leaving a file that would block a retry at the same target height.
+#[derive(Default)]
+struct RemoveFilesOnDrop {
+    paths: Vec<PathBuf>,
+    disarmed: bool,
+}
+
+impl RemoveFilesOnDrop {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    /// Stops tracking every previously tracked path and tracks only `path`.
+    ///
+    /// Used when a file is renamed: the old path no longer exists, so only
+    /// the new path should be removed if a later step fails.
+    fn replace(&mut self, path: PathBuf) {
+        self.paths.clear();
+        self.paths.push(path);
+    }
+
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for RemoveFilesOnDrop {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -912,7 +1005,7 @@ impl OverlayGroupReader {
 
 impl UtxoStore for SnapshotOverlayChainstate {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
             return Utxo::decode(&value).map(Some);
@@ -932,7 +1025,7 @@ impl UtxoStore for SnapshotOverlayChainstate {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         let mut results = Vec::with_capacity(outpoints.len());
@@ -965,7 +1058,7 @@ impl UtxoStore for SnapshotOverlayChainstate {
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         let undo = self
@@ -977,7 +1070,7 @@ impl UtxoStore for SnapshotOverlayChainstate {
 
     fn undo(&self, undo: &UtxoUndo, _now: u64, _hot_window_secs: u64) -> Result<(), UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         self.disconnect_mutation(
@@ -1015,7 +1108,7 @@ impl UtxoStore for SnapshotOverlayChainstate {
     }
 
     fn tier_stats(&self) -> Result<TierStats, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         let hot = u64::try_from(transaction.table_stat(&overlay)?.entries())
@@ -1031,7 +1124,7 @@ impl UtxoStore for SnapshotOverlayChainstate {
 
 impl ExecutionChainStore for SnapshotOverlayChainstate {
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
-        let transaction = self.db.begin_ro_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_ro_txn().map_err(utxo_mdbx)?;
         let meta = transaction.open_table(Some(META)).map_err(utxo_mdbx)?;
         Self::read_tip(&transaction, &meta)
     }
@@ -1044,7 +1137,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
     }
 
     fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError> {
-        let transaction = self.db.begin_ro_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_ro_txn().map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
         transaction
             .get::<Vec<u8>>(&undo, &hash.to_byte_array())
@@ -1063,7 +1156,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
         let mut expired = Vec::new();
         {
@@ -1107,7 +1200,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
         let undo_table = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
@@ -1142,7 +1235,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         _transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(utxo_mdbx)?;
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let meta = transaction.open_table(Some(META)).map_err(utxo_mdbx)?;
         let current = Self::read_tip(&transaction, &meta)?;
         if current != expected_current || parent.height.checked_add(1) != Some(current.height) {
@@ -1180,6 +1273,29 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         transaction.commit().map_err(utxo_mdbx)?;
         Ok(UtxoUndo::from_parts(created.to_vec(), spent.to_vec()))
     }
+}
+
+/// Opens (creating if absent) an MDBX environment with the fixed four-table
+/// geometry every constructor in this module shares.
+fn open_environment(
+    database_dir: &Path,
+    capacity_bytes: u64,
+) -> Result<Database<NoWriteMap>, SnapshotOverlayError> {
+    fs::create_dir_all(database_dir)?;
+    let capacity = isize::try_from(capacity_bytes)
+        .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
+    Ok(Database::open_with_options(
+        database_dir,
+        DatabaseOptions {
+            max_tables: Some(4),
+            mode: Mode::ReadWrite(ReadWriteOptions {
+                sync_mode: SyncMode::Durable,
+                max_size: Some(capacity),
+                ..ReadWriteOptions::default()
+            }),
+            ..DatabaseOptions::default()
+        },
+    )?)
 }
 
 fn utxo_mdbx(error: libmdbx::Error) -> ChainStoreError {
@@ -1712,6 +1828,172 @@ mod tests {
         assert!(usage.used_bytes <= usage.capacity_bytes);
     }
 
+    /// Regression test for a real find during a mainnet soak: MDBX's file
+    /// high-water mark (`last_pgno`) never shrinks after `clear_table`, so a
+    /// capacity metric that ignores the freelist keeps reporting the
+    /// pre-rebase level forever, making every later `needs_rebase` check
+    /// true almost immediately — a hard 3 GiB budget degenerating into a
+    /// rebase every few blocks. `capacity()` must instead report pages
+    /// actually in use.
+    #[test]
+    fn capacity_drops_after_rebase_clears_the_overlay() {
+        let directory = TempDir::new().unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let mut store = open_store(
+            directory.path(),
+            &snapshot_path,
+            &index_path,
+            &identity,
+            8 << 20,
+        )
+        .unwrap();
+        let mut parent = identity.block_hash;
+        let mut height = BASE_HEIGHT;
+        for round in 0..48_u32 {
+            let next_height = height + 1;
+            let created: Vec<(OutPointKey, Utxo)> = (0..8_u32)
+                .map(|index| {
+                    (
+                        key(u8::try_from(30 + round).unwrap(), index),
+                        Utxo {
+                            script_pubkey: vec![0x6a; 9_500],
+                            ..overlay_coin(next_height, 1)
+                        },
+                    )
+                })
+                .collect();
+            store
+                .commit_connect(
+                    parent,
+                    tip(next_height, block_hash(next_height)),
+                    &[],
+                    &created,
+                    &[],
+                )
+                .unwrap();
+            parent = block_hash(next_height);
+            height = next_height;
+        }
+        let before_rebase = store.capacity().unwrap();
+        assert!(
+            before_rebase.used_percent() >= 50,
+            "fixture must grow the overlay substantially before rebasing"
+        );
+
+        let new_snapshot = directory.path().join(format!("utxo-{height}.dat"));
+        let new_index = directory.path().join(format!("utxo-{height}.rbtcidx"));
+        let mtp_extension: Vec<u32> = (BASE_HEIGHT + 1..=height).map(mtp_for).collect();
+        store
+            .rebase_into(&new_snapshot, &new_index, &mtp_extension)
+            .unwrap();
+
+        let after_rebase = store.capacity().unwrap();
+        assert!(
+            after_rebase.used_bytes < before_rebase.used_bytes / 4,
+            "capacity must reflect the cleared overlay, not the pre-rebase high-water mark: before={} after={}",
+            before_rebase.used_bytes,
+            after_rebase.used_bytes,
+        );
+        assert!(!store.needs_rebase(before_rebase.used_percent()).unwrap());
+    }
+
+    /// Regression test for a real find during a mainnet soak: after
+    /// `capacity()` was corrected to track `last_pgno` (matching what
+    /// `MDBX_MAP_FULL` actually checks, see
+    /// `capacity_drops_after_rebase_clears_the_overlay`'s doc comment),
+    /// clearing tables in place was not enough — `last_pgno` never shrinks,
+    /// so a second growth-to-ceiling cycle immediately hit `MDBX_MAP_FULL`
+    /// again despite `needs_rebase` reporting the environment as empty right
+    /// after the first rebase. `rebase_into` must recreate the environment
+    /// file, not just clear its tables, so every cycle gets the full budget.
+    #[test]
+    fn repeated_fill_and_rebase_cycles_never_get_stuck() {
+        let directory = TempDir::new().unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let mut store = open_store(
+            directory.path(),
+            &snapshot_path,
+            &index_path,
+            &identity,
+            8 << 20,
+        )
+        .unwrap();
+        let mut parent = identity.block_hash;
+        let mut height = BASE_HEIGHT;
+        let mut base_height = BASE_HEIGHT;
+        let mut rebases = 0;
+        for cycle in 0..3_u32 {
+            // Fill until at or past the rebase threshold, then rebase, for
+            // three consecutive cycles reusing the same environment file.
+            loop {
+                let next_height = height + 1;
+                let created: Vec<(OutPointKey, Utxo)> = (0..8_u32)
+                    .map(|index| {
+                        (
+                            key(
+                                u8::try_from(30 + cycle * 8 + index).unwrap(),
+                                next_height % 251,
+                            ),
+                            Utxo {
+                                script_pubkey: vec![0x6a; 9_500],
+                                ..overlay_coin(next_height, 1)
+                            },
+                        )
+                    })
+                    .collect();
+                store
+                    .commit_connect(
+                        parent,
+                        tip(next_height, block_hash(next_height)),
+                        &[],
+                        &created,
+                        &[],
+                    )
+                    .unwrap();
+                parent = block_hash(next_height);
+                height = next_height;
+                if store.needs_rebase(70).unwrap() {
+                    break;
+                }
+            }
+            let mtp_extension: Vec<u32> = (base_height + 1..=height).map(mtp_for).collect();
+            let new_snapshot = directory.path().join(format!("utxo-{height}.dat"));
+            let new_index = directory.path().join(format!("utxo-{height}.rbtcidx"));
+            store
+                .rebase_into(&new_snapshot, &new_index, &mtp_extension)
+                .unwrap();
+            base_height = height;
+            rebases += 1;
+            let after = store.capacity().unwrap();
+            assert!(
+                after.used_percent() < 20,
+                "cycle {cycle}: capacity must reset near zero after rebase, got {}%",
+                after.used_percent()
+            );
+        }
+        assert_eq!(rebases, 3);
+        // The environment still accepts writes after three cycles.
+        store
+            .commit_connect(
+                parent,
+                tip(height + 1, block_hash(height + 1)),
+                &[],
+                &[(key(200, 0), overlay_coin(height + 1, 1))],
+                &[],
+            )
+            .unwrap();
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn rebase_folds_overlay_and_tombstones_into_a_new_base() {
@@ -1846,6 +2128,292 @@ mod tests {
                 32 << 20,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_failed_rebase_leaves_no_output_files_and_a_retry_can_proceed() {
+        let directory = TempDir::new().unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let mut store = open_store(
+            directory.path(),
+            &snapshot_path,
+            &index_path,
+            &identity,
+            32 << 20,
+        )
+        .unwrap();
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip(101, block_hash(101)),
+                &[],
+                &[(key(9, 0), overlay_coin(101, 111))],
+                &[],
+            )
+            .unwrap();
+
+        let new_snapshot = directory.path().join("utxo-101.dat");
+        let new_index = directory.path().join("utxo-101.rbtcidx");
+        // A wrong MTP value fails the merge mid-write, after the temporary
+        // file was already created.
+        let error = store
+            .rebase_into(&new_snapshot, &new_index, &[9999])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotOverlayError::Invalid("MTP extension disagrees with a folded overlay coin")
+        ));
+        assert!(
+            !new_snapshot.exists(),
+            "no snapshot output should survive a failed rebase"
+        );
+        assert!(
+            !new_index.exists(),
+            "no index output should survive a failed rebase"
+        );
+        assert!(
+            !directory.path().join("utxo-101.dat.tmp").exists(),
+            "no temporary file should survive a failed rebase"
+        );
+
+        // A retry at the same target height with correct data now succeeds,
+        // instead of failing closed on "output paths already exist".
+        let report = store
+            .rebase_into(&new_snapshot, &new_index, &[mtp_for(101)])
+            .unwrap();
+        assert_eq!(report.identity.height, 101);
+        assert!(new_snapshot.exists());
+        assert!(new_index.exists());
+    }
+
+    /// Ad-hoc diagnostic, not part of the regression suite: replays a real
+    /// Ad-hoc diagnostic: prints raw MDBX `info()`/`freelist()`/`capacity()`
+    /// values for a live overlay environment, to find why `needs_rebase`
+    /// stopped tripping despite repeated `MDBX_MAP_FULL` commit failures.
+    ///
+    /// Set `RBTC_DEBUG_OVERLAY_MDBX` and `RBTC_DEBUG_CAPACITY_BYTES`.
+    #[test]
+    #[ignore]
+    fn diagnose_capacity_accounting() {
+        let (Ok(overlay_mdbx), Ok(capacity_bytes)) = (
+            std::env::var("RBTC_DEBUG_OVERLAY_MDBX"),
+            std::env::var("RBTC_DEBUG_CAPACITY_BYTES"),
+        ) else {
+            return;
+        };
+        let capacity_bytes: u64 = capacity_bytes.parse().unwrap();
+        let capacity = isize::try_from(capacity_bytes).unwrap();
+        let db: Database<NoWriteMap> = Database::open_with_options(
+            &overlay_mdbx,
+            DatabaseOptions {
+                max_tables: Some(4),
+                mode: Mode::ReadWrite(ReadWriteOptions {
+                    sync_mode: SyncMode::Durable,
+                    max_size: Some(capacity),
+                    ..ReadWriteOptions::default()
+                }),
+                ..DatabaseOptions::default()
+            },
+        )
+        .unwrap();
+        let info = db.info().unwrap();
+        let stat = db.stat().unwrap();
+        let freelist = db.freelist().unwrap();
+        println!(
+            "last_pgno={} page_size={} freelist_pages={} map_size={}",
+            info.last_pgno(),
+            stat.page_size(),
+            freelist,
+            info.map_size(),
+        );
+        let last_page = u64::try_from(info.last_pgno()).unwrap();
+        let page_size = u64::from(stat.page_size());
+        let free_pages = u64::try_from(freelist).unwrap();
+        let pages_in_use = (last_page + 1).saturating_sub(free_pages);
+        let used_bytes = pages_in_use.saturating_mul(page_size);
+        println!(
+            "computed used_bytes={used_bytes} capacity_bytes={capacity_bytes} percent={}",
+            used_bytes.saturating_mul(100) / capacity_bytes.max(1),
+        );
+
+        let transaction = db.begin_ro_txn().unwrap();
+        for name in [OVERLAY, TOMBSTONE, UNDO, META] {
+            let table = transaction.open_table(Some(name)).unwrap();
+            let stat = transaction.table_stat(&table).unwrap();
+            println!("table {name}: entries={}", stat.entries());
+        }
+    }
+
+    /// Ad-hoc diagnostic, not part of the regression suite: replays a real
+    /// rebase's merge against untouched MDBX state and diffs it coin-by-coin
+    /// against a rebase output file already on disk, to find the first
+    /// divergence after a `CommitmentMismatch` in the field.
+    ///
+    /// Set `RBTC_DEBUG_BASE_SNAPSHOT`, `RBTC_DEBUG_OVERLAY_MDBX`,
+    /// `RBTC_DEBUG_BASE_HEIGHT`, and `RBTC_DEBUG_REBASED_SNAPSHOT` to run it.
+    #[test]
+    #[ignore]
+    #[allow(clippy::too_many_lines)]
+    fn diagnose_rebase_commitment_mismatch() {
+        let (Ok(base_snapshot), Ok(overlay_mdbx), Ok(base_height), Ok(rebased_snapshot)) = (
+            std::env::var("RBTC_DEBUG_BASE_SNAPSHOT"),
+            std::env::var("RBTC_DEBUG_OVERLAY_MDBX"),
+            std::env::var("RBTC_DEBUG_BASE_HEIGHT"),
+            std::env::var("RBTC_DEBUG_REBASED_SNAPSHOT"),
+        ) else {
+            return;
+        };
+        let base_height: u32 = base_height.parse().unwrap();
+        let capacity = isize::try_from(3_i64 << 30).unwrap();
+        let db: Database<NoWriteMap> = Database::open_with_options(
+            &overlay_mdbx,
+            DatabaseOptions {
+                max_tables: Some(4),
+                mode: Mode::ReadWrite(ReadWriteOptions {
+                    sync_mode: SyncMode::Durable,
+                    max_size: Some(capacity),
+                    ..ReadWriteOptions::default()
+                }),
+                ..DatabaseOptions::default()
+            },
+        )
+        .unwrap();
+        let transaction = db.begin_ro_txn().unwrap();
+        let overlay = transaction.open_table(Some(OVERLAY)).unwrap();
+        let tombstone = transaction.open_table(Some(TOMBSTONE)).unwrap();
+
+        // Phase 1: replay the exact expected-side merge rebase_into performs.
+        let mut base_groups = BaseGroupReader::new(std::path::Path::new(&base_snapshot)).unwrap();
+        let mut overlay_groups = OverlayGroupReader::new(&transaction, &overlay).unwrap();
+        let mut base_group = base_groups.next_group().unwrap();
+        let mut overlay_group = overlay_groups.next_group();
+        let mut expected_full: Vec<([u8; 32], u32, Utxo)> = Vec::new();
+        loop {
+            let take_base = match (&base_group, &overlay_group) {
+                (None, None) => break,
+                (Some(_), None) => (true, false),
+                (None, Some(_)) => (false, true),
+                (Some(base), Some(new)) => match base.0.cmp(&new.0) {
+                    std::cmp::Ordering::Less => (true, false),
+                    std::cmp::Ordering::Greater => (false, true),
+                    std::cmp::Ordering::Equal => (true, true),
+                },
+            };
+            let mut txid = [0_u8; 32];
+            let mut coins_in_group = Vec::new();
+            if take_base.0 {
+                let base = base_group.take().unwrap();
+                txid = base.0;
+                coins_in_group =
+                    SnapshotOverlayChainstate::filter_tombstoned(&transaction, &tombstone, &base)
+                        .unwrap();
+                base_group = base_groups.next_group().unwrap();
+            }
+            if take_base.1 {
+                let (new_txid, mut new_coins) = overlay_group.take().unwrap();
+                txid = new_txid;
+                coins_in_group.append(&mut new_coins);
+                overlay_group = overlay_groups.next_group();
+            }
+            coins_in_group.sort_unstable_by_key(|(vout, _)| *vout);
+            for (vout, utxo) in coins_in_group {
+                expected_full.push((txid, vout, utxo));
+            }
+        }
+        println!("expected coin count: {}", expected_full.len());
+
+        // Phase 2: decode the already-written rebase output file the same
+        // way scan_snapshot / the activation loader would.
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&rebased_snapshot).unwrap());
+        let metadata = crate::core_snapshot::read_metadata(&mut reader).unwrap();
+        println!("rebased file coin count: {}", metadata.coins_count);
+        let mut actual_full: Vec<([u8; 32], u32, Utxo)> = Vec::with_capacity(expected_full.len());
+        let mut remaining = metadata.coins_count;
+        while remaining > 0 {
+            let mut txid = [0_u8; 32];
+            std::io::Read::read_exact(&mut reader, &mut txid).unwrap();
+            let group_count = crate::core_snapshot::read_compact_size(&mut reader).unwrap();
+            let mut group = Vec::new();
+            for _ in 0..group_count {
+                let vout =
+                    u32::try_from(crate::core_snapshot::read_compact_size(&mut reader).unwrap())
+                        .unwrap();
+                let code =
+                    u32::try_from(crate::core_snapshot::read_core_varint(&mut reader).unwrap())
+                        .unwrap();
+                let amount = crate::core_snapshot::read_core_varint(&mut reader).unwrap();
+                let value_sats = crate::core_snapshot::decompress_amount(amount).unwrap();
+                let script_pubkey = crate::core_snapshot::decompress_script(&mut reader).unwrap();
+                group.push((
+                    vout,
+                    Utxo {
+                        value_sats,
+                        height: code >> 1,
+                        is_coinbase: code & 1 == 1,
+                        last_touched: 0,
+                        creation_mtp: 0,
+                        script_pubkey,
+                    },
+                ));
+                remaining -= 1;
+            }
+            group.sort_unstable_by_key(|(vout, _)| *vout);
+            for (vout, utxo) in group {
+                actual_full.push((txid, vout, utxo));
+            }
+        }
+
+        println!(
+            "expected={} actual={} (base_height={base_height})",
+            expected_full.len(),
+            actual_full.len()
+        );
+        let mut mismatches = 0;
+        for (index, (exp, act)) in expected_full.iter().zip(actual_full.iter()).enumerate() {
+            if exp.0 != act.0
+                || exp.1 != act.1
+                || exp.2.value_sats != act.2.value_sats
+                || exp.2.height != act.2.height
+                || exp.2.is_coinbase != act.2.is_coinbase
+                || exp.2.script_pubkey != act.2.script_pubkey
+            {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    println!(
+                        "MISMATCH at index {index}: expected txid={:02x?} vout={} value={} height={} coinbase={} script={:02x?}",
+                        exp.0,
+                        exp.1,
+                        exp.2.value_sats,
+                        exp.2.height,
+                        exp.2.is_coinbase,
+                        exp.2.script_pubkey
+                    );
+                    println!(
+                        "              actual   txid={:02x?} vout={} value={} height={} coinbase={} script={:02x?}",
+                        act.0,
+                        act.1,
+                        act.2.value_sats,
+                        act.2.height,
+                        act.2.is_coinbase,
+                        act.2.script_pubkey
+                    );
+                }
+            }
+        }
+        println!(
+            "total mismatches: {mismatches} / {}",
+            expected_full.len().min(actual_full.len())
+        );
+        assert_eq!(expected_full.len(), actual_full.len(), "coin counts differ");
+        assert_eq!(
+            mismatches, 0,
+            "{mismatches} coins diverged between expected and actual"
         );
     }
 }

@@ -594,10 +594,17 @@ pub(crate) fn compress_script(out: &mut Vec<u8>, script: &[u8]) {
             write_core_varint(out, u64::from(*parity));
             out.extend_from_slice(x);
         }
-        [65, key @ .., 0xac] if key.len() == 65 && PublicKey::from_slice(key).is_ok() => {
-            // Core stores the x coordinate behind size 4/5, deriving the y
-            // parity from the size; only a valid point can round-trip through
-            // decompression's uncompressed serialization.
+        [65, key @ .., 0xac]
+            if key.len() == 65 && key[0] == 0x04 && PublicKey::from_slice(key).is_ok() =>
+        {
+            // Core's CompressScript only compresses the standard uncompressed
+            // tag (0x04); SEC1's rarely-used hybrid tags (0x06/0x07) parse as
+            // valid points through libsecp256k1 but are never compressed by
+            // Core, so compressing them here would be lossy: decompression's
+            // `serialize_uncompressed` always re-emits tag 0x04, silently
+            // discarding an original hybrid tag. Requiring the exact tag
+            // keeps this the precise inverse of `decompress_script`, whose
+            // own output is always tag 0x04.
             write_core_varint(out, 4 + u64::from(key[64] & 1));
             out.extend_from_slice(&key[1..33]);
         }
@@ -722,6 +729,8 @@ fn write_compact_size_hash(engine: &mut sha256::HashEngine, value: u64) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use bitcoin::hex::FromHex;
 
     use super::*;
 
@@ -876,6 +885,15 @@ mod tests {
         .serialize_uncompressed();
         let p2pk_uncompressed = [&[65][..], &generator_uncompressed, &[0xac]].concat();
         let invalid_uncompressed = [&[65, 4][..], &[0xff_u8; 64], &[0xac]].concat();
+        // SEC1's rarely-used hybrid tag (0x06 = even Y, redundant with the
+        // explicit Y bytes) is a real historic Bitcoin script pattern: height
+        // 707,034's coin at the 935,000 mainnet snapshot is a P2PK output
+        // using it. `libsecp256k1` parses hybrid keys as valid points, but
+        // Core's CompressScript never compresses them, so they must stay raw
+        // to round-trip exactly; only the tag byte differs from the
+        // already-covered standard-uncompressed case above.
+        let mut p2pk_hybrid_even_y = p2pk_uncompressed.clone();
+        p2pk_hybrid_even_y[1] = 0x06;
         let raw = vec![0x51, 0xac];
         let empty: Vec<u8> = Vec::new();
 
@@ -885,6 +903,7 @@ mod tests {
             (&compressed_p2pk, 2),
             (&p2pk_uncompressed, 4),
             (&invalid_uncompressed, 67 + 6),
+            (&p2pk_hybrid_even_y, 67 + 6),
             (&raw, 2 + 6),
             (&empty, 6),
         ] {
@@ -894,6 +913,28 @@ mod tests {
             let decoded = decompress_script(&mut Cursor::new(bytes)).unwrap();
             assert_eq!(&decoded, script);
         }
+    }
+
+    /// Regression test for a real mainnet coin found while rebasing past
+    /// height 935,000: a height-707,034 P2PK output using SEC1's hybrid
+    /// uncompressed tag 0x07. `compress_script` previously accepted any tag
+    /// `PublicKey::from_slice` parses, silently normalizing hybrid tags to
+    /// the standard 0x04 on decompression and breaking the UTXO-set
+    /// commitment. It must instead leave this script exactly as Core does:
+    /// uncompressed, byte for byte.
+    #[test]
+    fn hybrid_tagged_uncompressed_pubkey_stays_raw_and_exact() {
+        let script = <Vec<u8>>::from_hex(
+            "410719c980631d9039e3abe7768ec96e91c97cb85073c579d3c8eebe12ec86f42fbf08be7bd54fa7ebe9dad426b6777bdb6ccaa00a69ff040ca526f67ccdd2bf40d3ac",
+        )
+        .unwrap();
+        assert_eq!(script.len(), 67);
+        assert_eq!(script[1], 0x07);
+        let mut bytes = Vec::new();
+        compress_script(&mut bytes, &script);
+        // Raw fallback, not the lossy compressed-pubkey path.
+        assert_eq!(bytes[0], 67 + 6);
+        assert_eq!(decompress_script(&mut Cursor::new(bytes)).unwrap(), script);
     }
 
     #[test]
