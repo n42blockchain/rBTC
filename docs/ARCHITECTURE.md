@@ -649,6 +649,25 @@ conflicts with explorer, wallet, index, and other snapshot or offline modes,
 executes to the header tip observed after the initial synchronization, and
 exits; a binary built without the `mdbx` feature refuses it at startup.
 
+`--snapshot-overlay-engine redb` runs the same catch-up on a redb overlay
+instead, so the two engines can be compared on identical work. The stores are
+built to one contract — the same base, the same four logical tables, the same
+one-transaction-per-block atomicity, the same `overlay → tombstone → base`
+read order, and a shared implementation of the base reader, identity codec,
+and rebase merge — and the catch-up loop itself is written once, generic over
+an `OverlayCatchupStore` trait. Only two behaviours differ, and they are the
+comparison:
+
+- **Budget enforcement.** MDBX's geometry ceiling refuses the offending
+  commit outright with `MDBX_MAP_FULL`. redb has no such ceiling, so the
+  budget is policy-enforced by measuring the file after each commit, which a
+  single batch can overshoot before the next check sees it.
+- **Space reclamation.** redb's `compact()` shrinks the file in place;
+  `libmdbx-rs` 0.6.6 exposes no equivalent, which is why the MDBX rebase has
+  to recreate its environment file. `--snapshot-overlay-compact-percent`
+  (default 50, well below the 85 rebase threshold) controls how early the
+  redb engine tries reclaiming space before resorting to a full rebase.
+
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror
 (`bitcoin-snapshots.jaonoctus.dev`, `files-vps02.jaonoctus.dev/utxo-935000.dat`)
@@ -691,7 +710,37 @@ clean run from height 935,000 to the live tip: two rebases (at 947,032 and
 956,056, roughly 9,000–9,700 blocks apart — proportionally longer than the
 3 GiB ceiling's single 2,240-block interval, confirming budget and interval
 scale together), reaching height 960,205 with the overlay at 42% of its
-10 GiB budget and exiting 0. Per-batch execution (64 blocks) held steady at
+10 GiB budget and exiting 0.
+
+The redb engine was then measured on the same snapshot and the same 3 GiB
+budget, with compaction enabled at 50%. Two results stand out, and they point
+in opposite directions:
+
+- **Active compaction reclaimed nothing during catch-up.** Across 15 attempts
+  spanning three distinct file sizes (1.61, 2.36, and 3.23 GB), every single
+  one released zero bytes. This is not a defect: compaction returns space
+  freed by deletion, and a catch-up overlay is dominated by *live* data —
+  coins the chain has just created, plus per-block undo still inside the
+  retention window — with very little garbage to collect. The attempts are
+  cheap (redb detects there is nothing to move and returns without rewriting
+  the file; batch-to-batch time was indistinguishable from batches with no
+  compaction), but they are also useless, so the driver now backs off after a
+  fruitless attempt until the file has actually grown. Compaction *is*
+  effective where deletion is bulk: the rebase, which clears every table,
+  took the file from 3.23 GB to 1.18 GB in place — the reclamation MDBX can
+  only get by recreating its environment file.
+- **redb's coarse file growth defeats a policy-enforced budget.** The
+  overlay went from 1.61 GB straight to 3.23 GB in a single step, overshooting
+  the 3 GiB budget before any check could see it, and reached its first
+  rebase after only 704 blocks versus MDBX's 2,240 at the same budget. With
+  no geometry ceiling to refuse the oversized commit, a measured-after-the-fact
+  budget cannot hold a limit that the engine can cross by a full doubling.
+
+For a hard, small budget this makes MDBX the better fit despite lacking
+in-place compaction: an engine-enforced ceiling is what actually bounds the
+file, and compaction turns out not to help during the workload the bound
+exists for. redb's compaction earns its place at the rebase boundary, not
+between batches. Per-batch execution (64 blocks) held steady at
 6–12 seconds including download, structure validation, staging, consensus
 execution, and publish. `capacity()` reports `last_pgno`-based usage — the
 figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical

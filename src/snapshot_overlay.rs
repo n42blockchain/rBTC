@@ -67,10 +67,10 @@ const OVERLAY: &str = "utxo_overlay";
 const TOMBSTONE: &str = "utxo_spent_base";
 const UNDO: &str = "block_undos";
 const META: &str = "meta";
-const META_IDENTITY: &[u8] = b"identity";
-const META_TIP: &[u8] = b"tip";
-const IDENTITY_BYTES: usize = 4 + 32 + 4 + 8 + 8 + 32 + 64;
-const TIP_BYTES: usize = 4 + 32;
+pub(crate) const META_IDENTITY: &[u8] = b"identity";
+pub(crate) const META_TIP: &[u8] = b"tip";
+pub(crate) const IDENTITY_BYTES: usize = 4 + 32 + 4 + 8 + 8 + 32 + 64;
+pub(crate) const TIP_BYTES: usize = 4 + 32;
 
 /// Failures while opening, rebasing, or inspecting the overlay chainstate.
 #[derive(Debug, Error)]
@@ -928,13 +928,13 @@ impl SnapshotOverlayChainstate {
 /// was already published — cleans up its own partial output instead of
 /// leaving a file that would block a retry at the same target height.
 #[derive(Default)]
-struct RemoveFilesOnDrop {
+pub(crate) struct RemoveFilesOnDrop {
     paths: Vec<PathBuf>,
     disarmed: bool,
 }
 
 impl RemoveFilesOnDrop {
-    fn track(&mut self, path: PathBuf) {
+    pub(crate) fn track(&mut self, path: PathBuf) {
         self.paths.push(path);
     }
 
@@ -942,12 +942,12 @@ impl RemoveFilesOnDrop {
     ///
     /// Used when a file is renamed: the old path no longer exists, so only
     /// the new path should be removed if a later step fails.
-    fn replace(&mut self, path: PathBuf) {
+    pub(crate) fn replace(&mut self, path: PathBuf) {
         self.paths.clear();
         self.paths.push(path);
     }
 
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.disarmed = true;
     }
 }
@@ -964,13 +964,13 @@ impl Drop for RemoveFilesOnDrop {
 }
 
 /// Sequentially decodes txid groups from the retained snapshot file.
-struct BaseGroupReader {
+pub(crate) struct BaseGroupReader {
     reader: BufReader<File>,
     remaining: u64,
 }
 
 impl BaseGroupReader {
-    fn new(snapshot_path: &Path) -> Result<Self, SnapshotOverlayError> {
+    pub(crate) fn new(snapshot_path: &Path) -> Result<Self, SnapshotOverlayError> {
         let mut reader = BufReader::new(File::open(snapshot_path)?);
         let metadata = read_metadata(&mut reader).map_err(index_read_error)?;
         Ok(Self {
@@ -980,7 +980,9 @@ impl BaseGroupReader {
     }
 
     #[allow(clippy::type_complexity)]
-    fn next_group(&mut self) -> Result<Option<([u8; 32], Vec<(u32, Utxo)>)>, SnapshotOverlayError> {
+    pub(crate) fn next_group(
+        &mut self,
+    ) -> Result<Option<([u8; 32], Vec<(u32, Utxo)>)>, SnapshotOverlayError> {
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -1383,21 +1385,21 @@ fn utxo_mdbx(error: libmdbx::Error) -> ChainStoreError {
     ChainStoreError::Utxo(UtxoError::Mdbx(error))
 }
 
-fn chain_store_to_utxo(error: ChainStoreError) -> UtxoError {
+pub(crate) fn chain_store_to_utxo(error: ChainStoreError) -> UtxoError {
     match error {
         ChainStoreError::Utxo(error) => error,
         _ => UtxoError::Malformed("overlay chainstate mutation failed"),
     }
 }
 
-fn index_read_error(error: impl Into<CoreSnapshotIndexError>) -> UtxoError {
+pub(crate) fn index_read_error(error: impl Into<CoreSnapshotIndexError>) -> UtxoError {
     match error.into() {
         CoreSnapshotIndexError::Io(error) => UtxoError::Io(error),
         _ => UtxoError::Malformed("snapshot base read failed"),
     }
 }
 
-fn encode_identity(
+pub(crate) fn encode_identity(
     identity: &SnapshotBaseIdentity,
     base: &CoreSnapshotUtxoIndex,
 ) -> Result<Vec<u8>, SnapshotOverlayError> {
@@ -1418,7 +1420,7 @@ fn encode_identity(
     Ok(bytes)
 }
 
-fn decode_identity(bytes: &[u8]) -> Result<SnapshotBaseIdentity, SnapshotOverlayError> {
+pub(crate) fn decode_identity(bytes: &[u8]) -> Result<SnapshotBaseIdentity, SnapshotOverlayError> {
     let bytes: &[u8; IDENTITY_BYTES] = bytes
         .try_into()
         .map_err(|_| SnapshotOverlayError::Invalid("identity record width"))?;
@@ -1439,14 +1441,14 @@ fn decode_identity(bytes: &[u8]) -> Result<SnapshotBaseIdentity, SnapshotOverlay
     })
 }
 
-fn encode_tip(tip: ExecutionTip) -> [u8; TIP_BYTES] {
+pub(crate) fn encode_tip(tip: ExecutionTip) -> [u8; TIP_BYTES] {
     let mut bytes = [0_u8; TIP_BYTES];
     bytes[..4].copy_from_slice(&tip.height.to_le_bytes());
     bytes[4..].copy_from_slice(&tip.hash.to_byte_array());
     bytes
 }
 
-fn decode_tip(bytes: &[u8]) -> Result<ExecutionTip, ChainStoreError> {
+pub(crate) fn decode_tip(bytes: &[u8]) -> Result<ExecutionTip, ChainStoreError> {
     let bytes: &[u8; TIP_BYTES] = bytes
         .try_into()
         .map_err(|_| ChainStoreError::Utxo(UtxoError::Malformed("overlay tip record")))?;
@@ -1457,20 +1459,20 @@ fn decode_tip(bytes: &[u8]) -> Result<ExecutionTip, ChainStoreError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use bitcoin::{Network, Txid};
     use tempfile::TempDir;
 
     use super::*;
 
-    const BASE_HEIGHT: u32 = 100;
-    const IMPORT_TIME: u64 = 5_000;
+    pub(crate) const BASE_HEIGHT: u32 = 100;
+    pub(crate) const IMPORT_TIME: u64 = 5_000;
 
-    fn key(txid: u8, vout: u32) -> OutPointKey {
+    pub(crate) fn key(txid: u8, vout: u32) -> OutPointKey {
         OutPointKey::from(OutPoint::new(Txid::from_byte_array([txid; 32]), vout))
     }
 
-    fn mtp_for(height: u32) -> u32 {
+    pub(crate) fn mtp_for(height: u32) -> u32 {
         1_000 + height
     }
 
@@ -1485,7 +1487,7 @@ mod tests {
         }
     }
 
-    fn overlay_coin(height: u32, value_sats: u64) -> Utxo {
+    pub(crate) fn overlay_coin(height: u32, value_sats: u64) -> Utxo {
         Utxo {
             value_sats,
             height,
@@ -1496,19 +1498,19 @@ mod tests {
         }
     }
 
-    fn block_hash(height: u32) -> BlockHash {
+    pub(crate) fn block_hash(height: u32) -> BlockHash {
         let mut bytes = [0_u8; 32];
         bytes[..4].copy_from_slice(&height.to_le_bytes());
         bytes[31] = 0xbb;
         BlockHash::from_byte_array(bytes)
     }
 
-    fn tip(height: u32, hash: BlockHash) -> ExecutionTip {
+    pub(crate) fn tip(height: u32, hash: BlockHash) -> ExecutionTip {
         ExecutionTip { height, hash }
     }
 
     /// The four base coins every test starts from, keyed by ascending txid.
-    fn base_coins() -> Vec<(u8, u32, Utxo)> {
+    pub(crate) fn base_coins() -> Vec<(u8, u32, Utxo)> {
         vec![
             (
                 1,
@@ -1528,7 +1530,7 @@ mod tests {
     }
 
     /// Encodes a canonical snapshot from `coins` and derives its identity.
-    fn write_base_snapshot(
+    pub(crate) fn write_base_snapshot(
         directory: &Path,
         base_height: u32,
         base_hash: BlockHash,

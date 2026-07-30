@@ -65,6 +65,10 @@ impl Drop for InFlightCheckpoint<'_> {
     }
 }
 
+#[cfg(feature = "mdbx")]
+use crate::snapshot_overlay::{SnapshotOverlayChainstate, SnapshotOverlayConfig};
+#[cfg(feature = "mdbx")]
+use crate::snapshot_overlay_redb::SnapshotOverlayRedbChainstate;
 use bitcoin::{
     Block, BlockHash, Network, OutPoint, Transaction, Txid,
     block::Header,
@@ -1805,6 +1809,19 @@ pub enum NodeError {
 const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
+/// Compaction runs well below the rebase threshold: reclaiming space freed by
+/// spends is far cheaper than folding the overlay into a whole new snapshot,
+/// so it is worth trying first and often.
+const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
+
+/// Storage engine backing a snapshot-overlay catch-up run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotOverlayEngine {
+    /// One MDBX environment with an engine-enforced geometry ceiling.
+    Mdbx,
+    /// One redb database with a policy-enforced budget and active compaction.
+    Redb,
+}
 
 /// Snapshot-overlay catch-up configuration: an immutable compressed base
 /// plus one bounded MDBX overlay environment.
@@ -1814,6 +1831,8 @@ struct NodeSnapshotOverlayConfig {
     index: PathBuf,
     capacity_bytes: u64,
     rebase_percent: u8,
+    compact_percent: u8,
+    engine: SnapshotOverlayEngine,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8875,8 +8894,6 @@ async fn sync_snapshot_overlay_node(
     data_dir: PathBuf,
     network_time: &NetworkTime,
 ) -> Result<(), PeerRunError> {
-    use crate::snapshot_overlay::{SnapshotOverlayChainstate, SnapshotOverlayConfig};
-
     let overlay = options
         .snapshot_overlay
         .as_ref()
@@ -8891,10 +8908,20 @@ async fn sync_snapshot_overlay_node(
     )
     .await?;
 
-    let database_dir = data_dir.join("overlay-mdbx");
-    let stored_identity =
-        SnapshotOverlayChainstate::stored_identity(&database_dir, overlay.capacity_bytes)
-            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let (database_path, stored_identity) = match overlay.engine {
+        SnapshotOverlayEngine::Mdbx => {
+            let path = data_dir.join("overlay-mdbx");
+            let stored = SnapshotOverlayChainstate::stored_identity(&path, overlay.capacity_bytes)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            (path, stored)
+        }
+        SnapshotOverlayEngine::Redb => {
+            let path = data_dir.join("overlay.redb");
+            let stored = SnapshotOverlayRedbChainstate::stored_identity(&path)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            (path, stored)
+        }
+    };
     let (identity, snapshot_path, index_path) = match stored_identity {
         None => (
             compiled_overlay_identity(&overlay.snapshot, options.network)?,
@@ -8915,25 +8942,142 @@ async fn sync_snapshot_overlay_node(
             "snapshot base is not on the synchronized active header chain",
         ));
     }
-    let mtp_by_height = creation_mtp_range(&headers, 0, identity.height)?;
-    let import_time = u64::from(unix_time()?);
-    let mut chainstate = SnapshotOverlayChainstate::open(
-        SnapshotOverlayConfig {
-            database_dir,
-            snapshot_path,
-            index_path,
-            capacity_bytes: overlay.capacity_bytes,
-            import_time,
-            mtp_by_height,
-        },
-        Some(&identity),
-    )
-    .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let store_config = SnapshotOverlayConfig {
+        database_dir: database_path,
+        snapshot_path,
+        index_path,
+        capacity_bytes: overlay.capacity_bytes,
+        import_time: u64::from(unix_time()?),
+        mtp_by_height: creation_mtp_range(&headers, 0, identity.height)?,
+    };
+
+    match overlay.engine {
+        SnapshotOverlayEngine::Mdbx => {
+            let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        SnapshotOverlayEngine::Redb => {
+            let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+    }
+}
+
+/// Reclaimed-space summary from one overlay maintenance pass.
+#[cfg(feature = "mdbx")]
+struct OverlayCompaction {
+    before_bytes: u64,
+    after_bytes: u64,
+}
+
+/// The engine-specific capabilities the catch-up loop needs beyond ordinary
+/// block execution, so the loop itself can be written once for both stores.
+#[cfg(feature = "mdbx")]
+trait OverlayCatchupStore: ExecutionChainStore {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity;
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String>;
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String>;
+    /// Reclaims space in place, if this engine can.
+    ///
+    /// Returns `None` when the engine offers no in-place compaction. When to
+    /// call this is the catch-up loop's policy decision, not the store's.
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String>;
+    fn engine_name(&self) -> &'static str;
+}
+
+#[cfg(feature = "mdbx")]
+impl OverlayCatchupStore for SnapshotOverlayChainstate {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        self.capacity().map_err(|error| error.to_string())
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.rebase_into(snapshot, index, mtp_extension)
+            .map_err(|error| error.to_string())
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        // `libmdbx-rs` 0.6.6 exposes no in-place compaction, so this engine
+        // can only reclaim space by recreating its environment file, which
+        // is what a rebase already does. Nothing to run between rebases.
+        Ok(None)
+    }
+
+    fn engine_name(&self) -> &'static str {
+        "mdbx"
+    }
+}
+
+#[cfg(feature = "mdbx")]
+impl OverlayCatchupStore for SnapshotOverlayRedbChainstate {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        self.capacity().map_err(|error| error.to_string())
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.rebase_into(snapshot, index, mtp_extension)
+            .map_err(|error| error.to_string())
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        let report = self.compact().map_err(|error| error.to_string())?;
+        Ok(Some(OverlayCompaction {
+            before_bytes: report.before_bytes,
+            after_bytes: report.after_bytes,
+        }))
+    }
+
+    fn engine_name(&self) -> &'static str {
+        "redb"
+    }
+}
+
+/// Drives bounded catch-up on either overlay engine.
+#[cfg(feature = "mdbx")]
+#[allow(clippy::too_many_lines)]
+async fn run_overlay_catchup<C: OverlayCatchupStore>(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    options: &Options,
+    data_dir: &std::path::Path,
+    headers: &HeaderDag,
+    mut chainstate: C,
+) -> Result<(), PeerRunError> {
+    let overlay = options
+        .snapshot_overlay
+        .as_ref()
+        .expect("snapshot-overlay dispatch requires a parsed configuration");
     let opened_tip = chainstate
         .execution_tip()
         .map_err(|error| error.to_string())?;
+    let identity = chainstate.overlay_base_identity().clone();
     rbtc_info!(
-        "snapshot-overlay chainstate opened: base {}:{} tip {}:{} capacity={} bytes",
+        "snapshot-overlay chainstate opened on {}: base {}:{} tip {}:{} capacity={} bytes",
+        chainstate.engine_name(),
         identity.height,
         identity.block_hash,
         opened_tip.height,
@@ -8963,7 +9107,7 @@ async fn sync_snapshot_overlay_node(
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
     }
     let auxiliary_indexes = AuxiliaryIndexes::open(
-        &data_dir,
+        data_dir,
         options.network,
         NodeIndexConfig {
             transaction: false,
@@ -8975,6 +9119,13 @@ async fn sync_snapshot_overlay_node(
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
     let mut auxiliary_session = None;
     let mut prefetched_blocks = PrefetchedBlocks::default();
+    // Size at which compaction last ran and released nothing. During
+    // catch-up the overlay is dominated by live data — coins the chain just
+    // created, plus undo records still inside the retention window — rather
+    // than by reclaimable garbage, so compaction routinely finds nothing to
+    // release. Without this, every batch past the threshold would re-run it
+    // at the same size and log a meaningless result.
+    let mut fruitless_compaction_bytes: Option<u64> = None;
     loop {
         loop {
             let tip = chainstate
@@ -8988,7 +9139,7 @@ async fn sync_snapshot_overlay_node(
             }
             let rewound = disconnect_execution_tip(
                 &chainstate,
-                &headers,
+                headers,
                 u64::from(unix_time()?),
                 DEFAULT_HOT_WINDOW_SECS,
             )
@@ -9006,18 +9157,42 @@ async fn sync_snapshot_overlay_node(
         if tip.height >= ceiling {
             break;
         }
-        let base_height = chainstate.base_identity().height;
-        if tip.height > base_height
-            && chainstate
-                .needs_rebase(overlay.rebase_percent)
-                .map_err(|error| PeerRunError::transient(error.to_string()))?
-        {
+        let base_height = chainstate.overlay_base_identity().height;
+        // Reclaiming space in place is far cheaper than folding the overlay
+        // into a whole new snapshot, so try that first; only engines that
+        // support it will do anything here.
+        let mut usage = chainstate
+            .overlay_capacity()
+            .map_err(PeerRunError::transient)?;
+        let worth_compacting = usage.used_percent() >= overlay.compact_percent
+            && fruitless_compaction_bytes.is_none_or(|bytes| usage.used_bytes > bytes);
+        if worth_compacting {
+            if let Some(compaction) = chainstate
+                .overlay_compact()
+                .map_err(PeerRunError::transient)?
+            {
+                let released = compaction
+                    .before_bytes
+                    .saturating_sub(compaction.after_bytes);
+                rbtc_info!(
+                    "compacted snapshot overlay: {} bytes to {} bytes (released {})",
+                    compaction.before_bytes,
+                    compaction.after_bytes,
+                    released,
+                );
+                fruitless_compaction_bytes = (released == 0).then_some(compaction.after_bytes);
+                usage = chainstate
+                    .overlay_capacity()
+                    .map_err(PeerRunError::transient)?;
+            }
+        }
+        if tip.height > base_height && usage.used_percent() >= overlay.rebase_percent {
             let (new_snapshot, new_index) =
                 overlay_base_paths_for_height(&overlay.snapshot, tip.height);
-            let extension = creation_mtp_range(&headers, base_height + 1, tip.height)?;
+            let extension = creation_mtp_range(headers, base_height + 1, tip.height)?;
             let report = chainstate
-                .rebase_into(&new_snapshot, &new_index, &extension)
-                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+                .overlay_rebase(&new_snapshot, &new_index, &extension)
+                .map_err(PeerRunError::transient)?;
             rbtc_info!(
                 "rebased snapshot overlay onto {}:{}: coins={} snapshot_bytes={} index_bytes={} folded_overlay={} dropped_tombstones={}",
                 report.identity.height,
@@ -9028,11 +9203,12 @@ async fn sync_snapshot_overlay_node(
                 report.folded_overlay,
                 report.dropped_tombstones,
             );
+            fruitless_compaction_bytes = None;
         }
         download_execute_batch(
             session,
             &options.deployments,
-            &headers,
+            headers,
             &chainstate,
             &ledger,
             None,
@@ -9053,14 +9229,15 @@ async fn sync_snapshot_overlay_node(
         .execution_tip()
         .map_err(|error| error.to_string())?;
     let usage = chainstate
-        .capacity()
-        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+        .overlay_capacity()
+        .map_err(PeerRunError::transient)?;
     rbtc_info!(
-        "snapshot-overlay catch-up reached {}:{} (base {}:{}, overlay at {} percent of {} bytes)",
+        "snapshot-overlay catch-up reached {}:{} on {} (base {}:{}, overlay at {} percent of {} bytes)",
         tip.height,
         tip.hash,
-        chainstate.base_identity().height,
-        chainstate.base_identity().block_hash,
+        chainstate.engine_name(),
+        chainstate.overlay_base_identity().height,
+        chainstate.overlay_base_identity().block_hash,
         usage.used_percent(),
         usage.capacity_bytes,
     );
@@ -13199,6 +13376,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_overlay_index = None;
     let mut snapshot_overlay_capacity = None;
     let mut snapshot_overlay_rebase_percent = None;
+    let mut snapshot_overlay_compact_percent = None;
+    let mut snapshot_overlay_engine = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -13784,6 +13963,39 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 }
                 snapshot_overlay_capacity = Some(capacity);
             }
+            "--snapshot-overlay-engine" => {
+                if snapshot_overlay_engine.is_some() {
+                    return Err(
+                        "--snapshot-overlay-engine cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-engine")?;
+                snapshot_overlay_engine = Some(match value.as_str() {
+                    "mdbx" => SnapshotOverlayEngine::Mdbx,
+                    "redb" => SnapshotOverlayEngine::Redb,
+                    _ => {
+                        return Err(format!(
+                            "unsupported --snapshot-overlay-engine value: {value}"
+                        ));
+                    }
+                });
+            }
+            "--snapshot-overlay-compact-percent" => {
+                if snapshot_overlay_compact_percent.is_some() {
+                    return Err(
+                        "--snapshot-overlay-compact-percent cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-compact-percent")?;
+                let percent = value
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid overlay compaction percent: {value}"))?;
+                if !(10..=95).contains(&percent) {
+                    return Err("overlay compaction percent must be between 10 and 95".to_owned());
+                }
+                snapshot_overlay_compact_percent = Some(percent);
+            }
             "--snapshot-overlay-rebase-percent" => {
                 if snapshot_overlay_rebase_percent.is_some() {
                     return Err(
@@ -14321,9 +14533,13 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     };
     let snapshot_overlay = match (snapshot_overlay_source, snapshot_overlay_index) {
         (None, None) => {
-            if snapshot_overlay_capacity.is_some() || snapshot_overlay_rebase_percent.is_some() {
+            if snapshot_overlay_capacity.is_some()
+                || snapshot_overlay_rebase_percent.is_some()
+                || snapshot_overlay_compact_percent.is_some()
+                || snapshot_overlay_engine.is_some()
+            {
                 return Err(
-                    "overlay capacity and rebase options require --snapshot-overlay-catchup"
+                    "overlay capacity, engine, and rebase options require --snapshot-overlay-catchup"
                         .to_owned(),
                 );
             }
@@ -14336,6 +14552,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES),
             rebase_percent: snapshot_overlay_rebase_percent
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT),
+            compact_percent: snapshot_overlay_compact_percent
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
+            engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
         }),
         _ => {
             return Err(
@@ -19838,6 +20057,8 @@ mod tests {
                 index: PathBuf::from("/srv/snapshots/utxo-935000.rbtcidx"),
                 capacity_bytes: DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES,
                 rebase_percent: DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT,
+                compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
+                engine: SnapshotOverlayEngine::Mdbx,
             })
         );
         for arguments in [
