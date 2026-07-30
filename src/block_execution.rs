@@ -18,7 +18,7 @@ use crate::{
         apply_prevalidated_block_with_deployments, disconnect_block,
         validate_block_structure_with_deployments, verify_deferred_scripts,
     },
-    chain_store::{ChainStoreError, ConnectTransition, RedbChainStore},
+    chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     chainstate::is_unspendable,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
@@ -292,15 +292,15 @@ pub fn recover_pending_transition<S: UtxoStore>(
 /// UTXO effect, block undo, and execution tip are committed in one storage
 /// transaction, so a process crash cannot expose a partially applied block.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_active_block(
-    chainstate: &RedbChainStore,
+pub fn connect_active_block<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     block: &Block,
     now: u64,
     hot_window_secs: u64,
     deployments: &BlockDeploymentContext,
 ) -> Result<AppliedBlock, BlockExecutionError> {
-    let current = chainstate.execution().tip()?;
+    let current = chainstate.execution_tip()?;
     let (applied, transition) = validate_active_block(
         chainstate,
         headers,
@@ -332,8 +332,8 @@ pub fn connect_active_block(
 /// A validation or persistence failure exposes neither a UTXO prefix nor a
 /// corresponding undo/tip prefix.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_active_blocks(
-    chainstate: &RedbChainStore,
+pub fn connect_active_blocks<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     blocks: &[Block],
     now: u64,
@@ -358,8 +358,8 @@ pub fn connect_active_blocks(
 ///
 /// Script, UTXO, lock-time, subsidy, fee, and sigop validation remain enabled.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_prevalidated_active_blocks(
-    chainstate: &RedbChainStore,
+pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     blocks: &[Block],
     now: u64,
@@ -382,8 +382,8 @@ pub fn connect_prevalidated_active_blocks(
 /// Connects structurally authenticated blocks while reusing the transaction
 /// identifiers already computed for their Merkle roots.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_prevalidated_active_blocks_with_txids(
-    chainstate: &RedbChainStore,
+pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
@@ -408,8 +408,8 @@ pub fn connect_prevalidated_active_blocks_with_txids(
 ///
 /// Outputs created earlier in the same batch are deliberately excluded because
 /// execution resolves them through its cumulative in-memory overlay.
-pub fn prefetch_prevalidated_active_block_utxos(
-    chainstate: &RedbChainStore,
+pub fn prefetch_prevalidated_active_block_utxos<C: ExecutionChainStore>(
+    chainstate: &C,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
 ) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
@@ -434,8 +434,8 @@ pub fn prefetch_prevalidated_active_block_utxos(
 
 /// Connects a prevalidated batch using UTXOs read before archive staging ended.
 #[allow(clippy::too_many_arguments)]
-pub fn connect_prevalidated_active_blocks_with_txids_and_utxos(
-    chainstate: &RedbChainStore,
+pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
@@ -505,8 +505,8 @@ fn external_batch_input_outpoints(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn connect_active_blocks_inner(
-    chainstate: &RedbChainStore,
+fn connect_active_blocks_inner<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     blocks: &[Block],
     now: u64,
@@ -535,7 +535,7 @@ fn connect_active_blocks_inner(
         return Err(BlockExecutionError::TransactionIdCount);
     }
 
-    let mut current = chainstate.execution().tip()?;
+    let mut current = chainstate.execution_tip()?;
     let output_count = blocks
         .iter()
         .flat_map(|block| &block.txdata)
@@ -1135,17 +1135,17 @@ fn apply_bip30_rules<S: UtxoStore>(
 /// Unlike [`connect_active_block`], the executed header need not remain on the
 /// newly selected active chain; this is the primitive used to walk back to a
 /// common ancestor before connecting a stronger branch.
-pub fn disconnect_execution_tip(
-    chainstate: &RedbChainStore,
+pub fn disconnect_execution_tip<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     now: u64,
     hot_window_secs: u64,
 ) -> Result<ExecutionTip, BlockExecutionError> {
-    let current = chainstate.execution().tip()?;
+    let current = chainstate.execution_tip()?;
     if current.height == 0 {
         return Err(BlockExecutionError::DisconnectGenesis);
     }
-    if chainstate.execution().assumed_snapshot_base()? == Some(current) {
+    if chainstate.assumed_snapshot_base()? == Some(current) {
         return Err(BlockExecutionError::DisconnectAssumedSnapshotBase {
             height: current.height,
             hash: current.hash,
@@ -1162,8 +1162,7 @@ pub fn disconnect_execution_tip(
         return Err(BlockExecutionError::MissingExecutedHeader(parent_hash));
     }
     let transaction_undos = chainstate
-        .undos()
-        .get(current.hash)?
+        .block_undo(current.hash)?
         .ok_or(BlockExecutionError::MissingUndo(current.hash))?;
     let applied = AppliedBlock {
         hash: current.hash,

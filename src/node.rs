@@ -10090,7 +10090,7 @@ async fn sync_validating_node(
                 }
             }
             let rewound = disconnect_execution_tip(
-                &chainstate,
+                chainstate.as_ref(),
                 &headers,
                 u64::from(unix_time()?),
                 DEFAULT_HOT_WINDOW_SECS,

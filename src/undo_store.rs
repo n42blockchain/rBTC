@@ -349,7 +349,7 @@ fn decode_pending_transition(bytes: &[u8]) -> Result<PendingTransition, UndoStor
     })
 }
 
-fn encode_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UndoStoreError> {
+pub(crate) fn encode_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UndoStoreError> {
     let count =
         u32::try_from(undos.len()).map_err(|_| UndoStoreError::Malformed("transaction count"))?;
     let mut bytes = Vec::new();
@@ -365,7 +365,7 @@ fn encode_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UndoStoreError> {
     Ok(bytes)
 }
 
-fn decode_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, UndoStoreError> {
+pub(crate) fn decode_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, UndoStoreError> {
     let mut cursor = 0;
     let version = take_u32(bytes, &mut cursor, "format version")?;
     if version != FORMAT_VERSION {

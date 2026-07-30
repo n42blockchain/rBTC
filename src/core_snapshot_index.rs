@@ -78,6 +78,29 @@ pub enum CoreSnapshotIndexError {
     /// The index was built from a different snapshot file.
     #[error("snapshot index identity mismatch: {0}")]
     IdentityMismatch(&'static str),
+    /// The decoded UTXO set does not match the expected commitment.
+    #[error("UTXO-set hash mismatch: expected {expected}, got {actual}")]
+    CommitmentMismatch {
+        /// Expected serialized UTXO-set hash.
+        expected: String,
+        /// Hash computed from the decoded snapshot contents.
+        actual: String,
+    },
+}
+
+/// The exact identity a snapshot file must decode to.
+///
+/// For operator-supplied snapshots this comes from a compiled Bitcoin Core 31
+/// release anchor; a locally materialized rebase snapshot instead carries the
+/// identity derived from the node's own validated chainstate at export time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotBaseIdentity {
+    /// Snapshot base height.
+    pub height: u32,
+    /// Exact base block hash.
+    pub block_hash: BlockHash,
+    /// Core's serialized UTXO-set hash in display order.
+    pub hash_serialized: String,
 }
 
 /// Summary of one published snapshot access index.
@@ -139,22 +162,35 @@ pub fn build_core_snapshot_index(
     let metadata = read_metadata(&mut reader)?;
     let anchor = find_anchor(metadata)?;
     drop(reader);
-    build_core_snapshot_index_with_anchor(snapshot_path, index_path, anchor)
+    build_core_snapshot_index_with_identity(snapshot_path, index_path, &anchor_identity(anchor)?)
 }
 
-/// Builds an access index against an explicitly supplied Core 31 identity.
+fn anchor_identity(
+    anchor: Core31AssumeUtxoAnchor,
+) -> Result<SnapshotBaseIdentity, CoreSnapshotIndexError> {
+    Ok(SnapshotBaseIdentity {
+        height: anchor.height,
+        block_hash: anchor
+            .block_hash
+            .parse()
+            .map_err(|_| CoreSnapshotIndexError::Invalid("compiled anchor block hash"))?,
+        hash_serialized: anchor.hash_serialized.to_owned(),
+    })
+}
+
+/// Builds an access index against an explicitly supplied snapshot identity.
 ///
-/// Production callers use [`build_core_snapshot_index`], which resolves the
-/// compiled identity; this entry point exists so tests can authenticate
-/// synthetic snapshots.
+/// Production callers use [`build_core_snapshot_index`] for operator-supplied
+/// files, which resolves the compiled Core 31 identity; rebase materialization
+/// supplies the identity it derived from the node's own validated chainstate.
 ///
 /// # Errors
 ///
 /// Same contract as [`build_core_snapshot_index`].
-pub fn build_core_snapshot_index_with_anchor(
+pub fn build_core_snapshot_index_with_identity(
     snapshot_path: impl AsRef<Path>,
     index_path: impl AsRef<Path>,
-    anchor: Core31AssumeUtxoAnchor,
+    identity: &SnapshotBaseIdentity,
 ) -> Result<CoreSnapshotIndexReport, CoreSnapshotIndexError> {
     let snapshot_path = snapshot_path.as_ref();
     let index_path = index_path.as_ref();
@@ -164,7 +200,7 @@ pub fn build_core_snapshot_index_with_anchor(
         ));
     }
     let (metadata, locations, snapshot_sha256, snapshot_bytes) =
-        scan_snapshot(snapshot_path, anchor)?;
+        scan_snapshot(snapshot_path, identity)?;
 
     let coins = u64::try_from(locations.len()).expect("coin count fits u64");
     let mphf = Mphf::build(
@@ -226,7 +262,7 @@ pub fn build_core_snapshot_index_with_anchor(
     bytes.extend_from_slice(&coins.to_le_bytes());
     bytes.extend_from_slice(&snapshot_bytes.to_le_bytes());
     bytes.extend_from_slice(&snapshot_sha256);
-    bytes.extend_from_slice(&anchor.height.to_le_bytes());
+    bytes.extend_from_slice(&identity.height.to_le_bytes());
     bytes.push(offset_bits);
     bytes.push(backref_bits);
     debug_assert_eq!(bytes.len(), INDEX_HEADER_BYTES);
@@ -255,11 +291,11 @@ pub fn build_core_snapshot_index_with_anchor(
 #[allow(clippy::too_many_lines)]
 fn scan_snapshot(
     snapshot_path: &Path,
-    anchor: Core31AssumeUtxoAnchor,
+    identity: &SnapshotBaseIdentity,
 ) -> Result<(CoreSnapshotMetadata, Vec<CoinLocation>, [u8; 32], u64), CoreSnapshotIndexError> {
     let mut reader = DigestReader::new(BufReader::new(File::open(snapshot_path)?));
     let metadata = read_metadata(&mut reader)?;
-    if metadata.base_block_hash.to_string() != anchor.block_hash {
+    if metadata.base_block_hash != identity.block_hash {
         return Err(CoreSnapshotError::AnchorMismatch.into());
     }
 
@@ -296,7 +332,7 @@ fn scan_snapshot(
             let code = u32::try_from(code)
                 .map_err(|_| CoreSnapshotError::Invalid("coin code overflow"))?;
             let height = code >> 1;
-            if height > anchor.height {
+            if height > identity.height {
                 return Err(CoreSnapshotError::Invalid("coin height above snapshot base").into());
             }
             let compressed_amount = read_core_varint(&mut reader)?;
@@ -357,12 +393,11 @@ fn scan_snapshot(
     }
 
     let actual = sha256d::Hash::from_engine(core_hash).to_string();
-    if actual != anchor.hash_serialized {
-        return Err(CoreSnapshotError::HashMismatch {
-            expected: anchor.hash_serialized,
+    if actual != identity.hash_serialized {
+        return Err(CoreSnapshotIndexError::CommitmentMismatch {
+            expected: identity.hash_serialized.clone(),
             actual,
-        }
-        .into());
+        });
     }
     let (snapshot_sha256, snapshot_bytes) = reader.finish();
     Ok((metadata, locations, snapshot_sha256, snapshot_bytes))
@@ -612,6 +647,18 @@ impl CoreSnapshotUtxoIndex {
     #[must_use]
     pub const fn coin_count(&self) -> u64 {
         self.coins
+    }
+
+    /// Returns the exact snapshot file length recorded at build time.
+    #[must_use]
+    pub const fn snapshot_bytes(&self) -> u64 {
+        self.snapshot_bytes
+    }
+
+    /// Returns the SHA-256 of the complete snapshot file recorded at build time.
+    #[must_use]
+    pub const fn snapshot_sha256(&self) -> [u8; 32] {
+        self.snapshot_sha256
     }
 }
 
@@ -933,39 +980,32 @@ mod tests {
         ]
     }
 
-    fn anchor_with(base_hash: [u8; 32], hash_serialized: &'static str) -> Core31AssumeUtxoAnchor {
-        Core31AssumeUtxoAnchor {
+    fn identity_with(base_hash: [u8; 32], hash_serialized: &str) -> SnapshotBaseIdentity {
+        SnapshotBaseIdentity {
             height: BASE_HEIGHT,
-            block_hash: Box::leak(
-                BlockHash::from_byte_array(base_hash)
-                    .to_string()
-                    .into_boxed_str(),
-            ),
-            hash_serialized,
-            chain_tx_count: 1,
+            block_hash: BlockHash::from_byte_array(base_hash),
+            hash_serialized: hash_serialized.to_owned(),
         }
     }
 
     /// Builds against a deliberately wrong commitment to learn the exact
-    /// commitment through the strict mismatch error, then returns an anchor
+    /// commitment through the strict mismatch error, then returns an identity
     /// carrying that value; the production hashing path stays authoritative.
-    fn authenticated_anchor(
+    fn authenticated_identity(
         snapshot: &Path,
         base_hash: [u8; 32],
         scratch: &Path,
-    ) -> Core31AssumeUtxoAnchor {
-        let error = build_core_snapshot_index_with_anchor(
+    ) -> SnapshotBaseIdentity {
+        let error = build_core_snapshot_index_with_identity(
             snapshot,
             scratch.join("never-published.rbtcidx"),
-            anchor_with(base_hash, "wrong"),
+            &identity_with(base_hash, "wrong"),
         )
         .unwrap_err();
-        let CoreSnapshotIndexError::Snapshot(CoreSnapshotError::HashMismatch { actual, .. }) =
-            error
-        else {
+        let CoreSnapshotIndexError::CommitmentMismatch { actual, .. } = error else {
             panic!("expected a UTXO-set hash mismatch, got {error}");
         };
-        anchor_with(base_hash, Box::leak(actual.into_boxed_str()))
+        identity_with(base_hash, &actual)
     }
 
     #[test]
@@ -976,9 +1016,10 @@ mod tests {
         let snapshot = directory.path().join("utxo.dat");
         fs::write(&snapshot, &bytes).unwrap();
 
-        let anchor = authenticated_anchor(&snapshot, base_hash, directory.path());
+        let identity = authenticated_identity(&snapshot, base_hash, directory.path());
         let index_path = directory.path().join("utxo.rbtcidx");
-        let report = build_core_snapshot_index_with_anchor(&snapshot, &index_path, anchor).unwrap();
+        let report =
+            build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
         assert_eq!(report.coins, 5);
         assert_eq!(report.snapshot_bytes, u64::try_from(bytes.len()).unwrap());
 
@@ -1005,10 +1046,10 @@ mod tests {
         let snapshot = directory.path().join("utxo.dat");
         fs::write(&snapshot, &bytes).unwrap();
 
-        let error = build_core_snapshot_index_with_anchor(
+        let error = build_core_snapshot_index_with_identity(
             &snapshot,
             directory.path().join("utxo.rbtcidx"),
-            anchor_with(
+            &identity_with(
                 base_hash,
                 "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
             ),
@@ -1016,7 +1057,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            CoreSnapshotIndexError::Snapshot(CoreSnapshotError::HashMismatch { .. })
+            CoreSnapshotIndexError::CommitmentMismatch { .. }
         ));
         assert!(!directory.path().join("utxo.rbtcidx").exists());
     }
@@ -1028,9 +1069,9 @@ mod tests {
         let (bytes, _) = synthetic_snapshot(base_hash, &test_groups());
         let snapshot = directory.path().join("utxo.dat");
         fs::write(&snapshot, &bytes).unwrap();
-        let anchor = authenticated_anchor(&snapshot, base_hash, directory.path());
+        let identity = authenticated_identity(&snapshot, base_hash, directory.path());
         let index_path = directory.path().join("utxo.rbtcidx");
-        build_core_snapshot_index_with_anchor(&snapshot, &index_path, anchor).unwrap();
+        build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
 
         let container = fs::read(&index_path).unwrap();
         let mut tampered = container.clone();
@@ -1057,9 +1098,9 @@ mod tests {
         let (bytes, expected) = synthetic_snapshot(base_hash, &test_groups());
         let snapshot = directory.path().join("utxo.dat");
         fs::write(&snapshot, &bytes).unwrap();
-        let anchor = authenticated_anchor(&snapshot, base_hash, directory.path());
+        let identity = authenticated_identity(&snapshot, base_hash, directory.path());
         let index_path = directory.path().join("utxo.rbtcidx");
-        build_core_snapshot_index_with_anchor(&snapshot, &index_path, anchor).unwrap();
+        build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
 
         // A longer file is rejected before any lookup.
         let longer = directory.path().join("longer.dat");
@@ -1146,10 +1187,10 @@ mod tests {
         let index_path = directory.path().join("utxo.rbtcidx");
         fs::write(&index_path, b"occupied").unwrap();
         assert!(matches!(
-            build_core_snapshot_index_with_anchor(
+            build_core_snapshot_index_with_identity(
                 &snapshot,
                 &index_path,
-                anchor_with(base_hash, "unchecked"),
+                &identity_with(base_hash, "unchecked"),
             )
             .unwrap_err(),
             CoreSnapshotIndexError::Invalid("index output path already exists")

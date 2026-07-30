@@ -595,6 +595,43 @@ by the byte comparison, never answered probabilistically. Coins keep Core's
 compressed representation on disk; nothing is imported, and the index never
 substitutes for activation's trust checks.
 
+The optional `mdbx` feature builds a snapshot-backed overlay chainstate on
+that base. One MDBX environment holds four named tables — coins created above
+the base, tombstones for base coins spent above it, per-block undo keyed by
+block hash, and metadata binding the base identity plus the execution tip —
+so one read-write MDBX transaction commits a block's complete UTXO effect,
+undo record, and tip advance, with the same compare-and-swap tip linkage the
+redb store enforces. Reads resolve overlay → tombstone → base; an overlay
+entry shadows the base even when a tombstone coexists, and reorg restores
+pick their target from the coin's creation height, covering the full
+delete/create/restore matrix for both base and overlay coins. Base coins
+synthesize their BIP68 creation median-time-past from a header-derived
+per-height table, because Core's snapshot format does not carry it. Block
+execution reaches this store through the new `ExecutionChainStore` trait: the
+consensus connect/disconnect entry points are generic over it, and the
+unified redb store implements the same trait unchanged.
+
+The environment is opened with a hard MDBX geometry ceiling (for example
+3 GiB), so growth past the configured budget fails the offending commit
+closed with `MDBX_MAP_FULL` instead of expanding — an engine-enforced bound
+redb cannot express, and the decisive reason this mode selects MDBX while
+redb remains the default unified chainstate; the trade is a vendored C
+dependency against the default build's pure-Rust property. Approaching the
+ceiling triggers a rebase: a pinned MVCC read view streams the old snapshot
+minus tombstones merged with the overlay into a fresh compressed snapshot at
+the current tip, deriving the new Core-format UTXO-set commitment during the
+write; the access-index rebuild then re-decodes the complete file against
+that self-derived identity, so a compression asymmetry cannot survive
+publication. One final MDBX transaction clears the overlay, tombstone, and
+undo tables and switches the stored identity, after which the folded state
+serves from the new immutable base and the capacity budget is available
+again. Undo data does not survive a rebase, so disconnection cannot cross
+the new base — exactly the contract an AssumeUTXO activation establishes —
+and rebases should therefore run when the tip is not at reorganization risk.
+The live network driver still executes against the unified redb store;
+wiring `download_execute_batch` to the generic trait is the remaining step
+before this mode can serve an ordinary catch-up node end to end.
+
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,
 credential-free HTTPS URL plus an exact expected length and a new output file.

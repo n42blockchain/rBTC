@@ -420,12 +420,123 @@ fn validation_bloom_hashes(outpoint: OutPointKey) -> (u64, u64) {
 }
 
 /// One already-validated active-chain transition in an atomic IBD checkpoint.
-pub(crate) struct ConnectTransition {
-    pub(crate) expected_parent: BlockHash,
-    pub(crate) next: ExecutionTip,
-    pub(crate) spent: Vec<OutPointKey>,
-    pub(crate) created: Vec<(OutPointKey, Utxo)>,
-    pub(crate) transaction_undos: Vec<UtxoUndo>,
+pub struct ConnectTransition {
+    /// Hash the durable tip must currently have.
+    pub expected_parent: BlockHash,
+    /// Tip after this transition; exactly one block above the parent.
+    pub next: ExecutionTip,
+    /// Outpoints removed by the block, excluding same-batch creations.
+    pub spent: Vec<OutPointKey>,
+    /// Coins created by the block and still unspent at the batch end.
+    pub created: Vec<(OutPointKey, Utxo)>,
+    /// Per-transaction undo data, empty when undo retention is disabled.
+    pub transaction_undos: Vec<UtxoUndo>,
+}
+
+/// Atomic chainstate surface block execution needs to connect and disconnect
+/// active blocks.
+///
+/// Every commit method must apply its complete effect — UTXO mutation, block
+/// undo, and execution tip — in one storage transaction, so a crash exposes
+/// either the whole transition or none of it. Implementations must also keep
+/// [`UtxoStore::get_many`] results in caller order; the executor's prefetch
+/// verification depends on positional alignment.
+pub trait ExecutionChainStore: UtxoStore {
+    /// Returns the durable execution tip.
+    fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError>;
+    /// Returns the assumed snapshot base below which no undo data exists.
+    fn assumed_snapshot_base(&self) -> Result<Option<ExecutionTip>, ChainStoreError>;
+    /// Returns the stored per-transaction undo list for an executed block.
+    fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError>;
+    /// Reports whether connect transitions must carry block undo data.
+    fn retains_block_undo(&self) -> bool;
+    /// Commits one block's net UTXO effect, undo, and tip advance atomically.
+    ///
+    /// The stored tip must equal `expected_parent` and `next` must extend it
+    /// by exactly one block, checked inside the same transaction.
+    fn commit_connect(
+        &self,
+        expected_parent: BlockHash,
+        next: ExecutionTip,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+        transaction_undos: &[UtxoUndo],
+    ) -> Result<UtxoUndo, ChainStoreError>;
+    /// Commits a contiguous batch of validated transitions atomically.
+    fn commit_connect_batch(
+        &self,
+        transitions: &[ConnectTransition],
+    ) -> Result<(), ChainStoreError>;
+    /// Reverses the tip block and removes its undo in one transaction.
+    fn commit_disconnect(
+        &self,
+        expected_current: ExecutionTip,
+        parent: ExecutionTip,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+        transaction_undos: &[UtxoUndo],
+    ) -> Result<UtxoUndo, ChainStoreError>;
+}
+
+impl ExecutionChainStore for RedbChainStore {
+    fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
+        Ok(self.execution().tip()?)
+    }
+
+    fn assumed_snapshot_base(&self) -> Result<Option<ExecutionTip>, ChainStoreError> {
+        Ok(self.execution().assumed_snapshot_base()?)
+    }
+
+    fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError> {
+        Ok(self.undos().get(hash)?)
+    }
+
+    fn retains_block_undo(&self) -> bool {
+        RedbChainStore::retains_block_undo(self)
+    }
+
+    fn commit_connect(
+        &self,
+        expected_parent: BlockHash,
+        next: ExecutionTip,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+        transaction_undos: &[UtxoUndo],
+    ) -> Result<UtxoUndo, ChainStoreError> {
+        RedbChainStore::commit_connect(
+            self,
+            expected_parent,
+            next,
+            spent,
+            created,
+            transaction_undos,
+        )
+    }
+
+    fn commit_connect_batch(
+        &self,
+        transitions: &[ConnectTransition],
+    ) -> Result<(), ChainStoreError> {
+        RedbChainStore::commit_connect_batch(self, transitions)
+    }
+
+    fn commit_disconnect(
+        &self,
+        expected_current: ExecutionTip,
+        parent: ExecutionTip,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+        transaction_undos: &[UtxoUndo],
+    ) -> Result<UtxoUndo, ChainStoreError> {
+        RedbChainStore::commit_disconnect(
+            self,
+            expected_current,
+            parent,
+            spent,
+            created,
+            transaction_undos,
+        )
+    }
 }
 
 /// Reorg-consistent spent-output coin-age observations for one chainstate.

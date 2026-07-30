@@ -522,6 +522,91 @@ fn read_byte(reader: &mut impl Read) -> Result<u8, CoreSnapshotError> {
     Ok(byte[0])
 }
 
+/// Encodes a satoshi amount with Core's `CompressAmount` transform, the exact
+/// inverse of [`decompress_amount`].
+pub(crate) fn compress_amount(mut amount: u64) -> u64 {
+    if amount == 0 {
+        return 0;
+    }
+    let mut exponent = 0_u64;
+    while amount % 10 == 0 && exponent < 9 {
+        amount /= 10;
+        exponent += 1;
+    }
+    if exponent < 9 {
+        let digit = amount % 10;
+        amount /= 10;
+        1 + (amount * 9 + digit - 1) * 10 + exponent
+    } else {
+        1 + (amount - 1) * 10 + 9
+    }
+}
+
+/// Appends Core's `VARINT` encoding, the exact inverse of [`read_core_varint`].
+pub(crate) fn write_core_varint(out: &mut Vec<u8>, mut value: u64) {
+    let mut reversed = Vec::with_capacity(10);
+    loop {
+        let low = u8::try_from(value & 0x7f).expect("seven bits fit u8");
+        reversed.push(low | if reversed.is_empty() { 0x00 } else { 0x80 });
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7) - 1;
+    }
+    reversed.reverse();
+    out.extend_from_slice(&reversed);
+}
+
+/// Appends a canonical Bitcoin CompactSize, the inverse of [`read_compact_size`].
+pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
+    if value < 253 {
+        out.push(u8::try_from(value).expect("small CompactSize fits u8"));
+    } else if let Ok(value16) = u16::try_from(value) {
+        out.push(253);
+        out.extend_from_slice(&value16.to_le_bytes());
+    } else if let Ok(value32) = u32::try_from(value) {
+        out.push(254);
+        out.extend_from_slice(&value32.to_le_bytes());
+    } else {
+        out.push(255);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Appends Core's compressed script encoding, the exact inverse of
+/// [`decompress_script`]: the six standard templates when the script matches
+/// one, otherwise the raw bytes behind a `length + 6` size prefix.
+pub(crate) fn compress_script(out: &mut Vec<u8>, script: &[u8]) {
+    match script {
+        [0x76, 0xa9, 20, hash @ .., 0x88, 0xac] if hash.len() == 20 => {
+            write_core_varint(out, 0);
+            out.extend_from_slice(hash);
+        }
+        [0xa9, 20, hash @ .., 0x87] if hash.len() == 20 => {
+            write_core_varint(out, 1);
+            out.extend_from_slice(hash);
+        }
+        [33, parity @ (2 | 3), x @ .., 0xac] if x.len() == 32 => {
+            write_core_varint(out, u64::from(*parity));
+            out.extend_from_slice(x);
+        }
+        [65, key @ .., 0xac] if key.len() == 65 && PublicKey::from_slice(key).is_ok() => {
+            // Core stores the x coordinate behind size 4/5, deriving the y
+            // parity from the size; only a valid point can round-trip through
+            // decompression's uncompressed serialization.
+            write_core_varint(out, 4 + u64::from(key[64] & 1));
+            out.extend_from_slice(&key[1..33]);
+        }
+        raw => {
+            write_core_varint(
+                out,
+                u64::try_from(raw.len()).expect("script length fits u64") + 6,
+            );
+            out.extend_from_slice(raw);
+        }
+    }
+}
+
 pub(crate) fn decompress_amount(mut value: u64) -> Option<u64> {
     if value == 0 {
         return Some(0);
@@ -728,6 +813,83 @@ mod tests {
     fn rejects_noncanonical_compact_size() {
         let error = read_compact_size(&mut Cursor::new([253, 1, 0])).unwrap_err();
         assert!(matches!(error, CoreSnapshotError::Invalid(_)));
+    }
+
+    #[test]
+    fn amount_compression_roundtrips_core_values() {
+        for amount in [
+            0_u64,
+            1,
+            330,
+            546,
+            1_000,
+            12_345,
+            50_0000_0000,
+            2_099_999_997_690_000,
+            u64::from(u32::MAX),
+        ] {
+            assert_eq!(decompress_amount(compress_amount(amount)), Some(amount));
+        }
+        for compressed in 0_u64..10_000 {
+            if let Some(amount) = decompress_amount(compressed) {
+                assert_eq!(compress_amount(amount), compressed);
+            }
+        }
+    }
+
+    #[test]
+    fn varint_and_compact_size_encoders_roundtrip() {
+        for value in [
+            0_u64, 1, 0x7f, 0x80, 0x407f, 0x4080, 252, 253, 65_535, 65_536, 1_000_000,
+        ] {
+            let mut bytes = Vec::new();
+            write_core_varint(&mut bytes, value);
+            assert_eq!(read_core_varint(&mut Cursor::new(bytes)).unwrap(), value);
+
+            let mut bytes = Vec::new();
+            write_compact_size(&mut bytes, value);
+            assert_eq!(read_compact_size(&mut Cursor::new(bytes)).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn script_compression_roundtrips_templates_and_raw_scripts() {
+        let p2pkh = [&[0x76, 0xa9, 20][..], &[7_u8; 20], &[0x88, 0xac]].concat();
+        let p2sh = [&[0xa9, 20][..], &[8_u8; 20], &[0x87]].concat();
+        let compressed_p2pk = [&[33, 2][..], &[9_u8; 32], &[0xac]].concat();
+        let generator_uncompressed = PublicKey::from_slice(
+            &[
+                &[2][..],
+                &[
+                    0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+                    0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2,
+                    0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+                ],
+            ]
+            .concat(),
+        )
+        .unwrap()
+        .serialize_uncompressed();
+        let p2pk_uncompressed = [&[65][..], &generator_uncompressed, &[0xac]].concat();
+        let invalid_uncompressed = [&[65, 4][..], &[0xff_u8; 64], &[0xac]].concat();
+        let raw = vec![0x51, 0xac];
+        let empty: Vec<u8> = Vec::new();
+
+        for (script, expected_prefix) in [
+            (&p2pkh, 0_u8),
+            (&p2sh, 1),
+            (&compressed_p2pk, 2),
+            (&p2pk_uncompressed, 4),
+            (&invalid_uncompressed, 67 + 6),
+            (&raw, 2 + 6),
+            (&empty, 6),
+        ] {
+            let mut bytes = Vec::new();
+            compress_script(&mut bytes, script);
+            assert_eq!(bytes[0], expected_prefix, "prefix for {script:02x?}");
+            let decoded = decompress_script(&mut Cursor::new(bytes)).unwrap();
+            assert_eq!(&decoded, script);
+        }
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub mod rebroadcast_store;
 pub mod signet;
 pub mod snapshot;
 pub mod snapshot_download;
+#[cfg(feature = "mdbx")]
+pub mod snapshot_overlay;
 pub mod transaction_admission;
 pub mod transaction_policy;
 pub mod transaction_pool_store;
