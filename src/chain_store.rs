@@ -476,6 +476,35 @@ pub trait ExecutionChainStore: UtxoStore {
         created: &[(OutPointKey, Utxo)],
         transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError>;
+    /// Removes block undo below `retain_from_height`, resolving every stored
+    /// hash through the authenticated header DAG first.
+    ///
+    /// The default keeps all undo; stores with their own retention windows
+    /// override this so the retained-ledger floor also bounds undo growth.
+    fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        let (_, _) = (headers, retain_from_height);
+        Ok(0)
+    }
+    /// Takes an advisory candidate for legacy validation-journal migration.
+    ///
+    /// Only journal-backed stores return candidates; the default is `None`.
+    fn take_hottest_legacy_validation_delta(&self) -> Option<u32> {
+        None
+    }
+    /// Rewrites one legacy validation-journal row as sorted shards.
+    ///
+    /// The default reports that no migration was necessary.
+    fn shard_legacy_validation_delta(
+        &self,
+        height: u32,
+    ) -> Result<Option<ValidationDeltaShardMigration>, ChainStoreError> {
+        let _ = height;
+        Ok(None)
+    }
 }
 
 impl ExecutionChainStore for RedbChainStore {
@@ -536,6 +565,25 @@ impl ExecutionChainStore for RedbChainStore {
             created,
             transaction_undos,
         )
+    }
+
+    fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        RedbChainStore::prune_block_undos_before(self, headers, retain_from_height)
+    }
+
+    fn take_hottest_legacy_validation_delta(&self) -> Option<u32> {
+        RedbChainStore::take_hottest_legacy_validation_delta(self)
+    }
+
+    fn shard_legacy_validation_delta(
+        &self,
+        height: u32,
+    ) -> Result<Option<ValidationDeltaShardMigration>, ChainStoreError> {
+        RedbChainStore::shard_legacy_validation_delta(self, height)
     }
 }
 

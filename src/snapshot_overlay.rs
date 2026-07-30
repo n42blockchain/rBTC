@@ -58,6 +58,7 @@ use crate::{
         build_core_snapshot_index_with_identity,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
+    headers::HeaderDag,
     undo_store::{decode_block_undo, encode_block_undo},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -176,23 +177,9 @@ impl SnapshotOverlayChainstate {
     /// identity mismatch, or an MTP table that does not cover the base.
     pub fn open(
         config: SnapshotOverlayConfig,
-        identity: &SnapshotBaseIdentity,
+        identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
         let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
-        if base.base_height() != identity.height || base.base_block_hash() != identity.block_hash {
-            return Err(SnapshotOverlayError::Invalid(
-                "access index does not match the supplied base identity",
-            ));
-        }
-        let expected_mtp_len = usize::try_from(identity.height)
-            .ok()
-            .and_then(|height| height.checked_add(1))
-            .ok_or(SnapshotOverlayError::Invalid("base height overflows"))?;
-        if config.mtp_by_height.len() != expected_mtp_len {
-            return Err(SnapshotOverlayError::Invalid(
-                "creation-MTP table must cover exactly heights 0..=base",
-            ));
-        }
         fs::create_dir_all(&config.database_dir)?;
         let capacity = isize::try_from(config.capacity_bytes)
             .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
@@ -208,16 +195,25 @@ impl SnapshotOverlayChainstate {
                 ..DatabaseOptions::default()
             },
         )?;
-        let identity_bytes = encode_identity(identity, &base)?;
-        {
+        let identity = {
             let transaction = db.begin_rw_txn()?;
             for name in [OVERLAY, TOMBSTONE, UNDO, META] {
                 transaction.create_table(Some(name), TableFlags::empty())?;
             }
             let meta = transaction.open_table(Some(META))?;
-            match transaction.get::<Vec<u8>>(&meta, META_IDENTITY)? {
-                None => {
-                    transaction.put(&meta, META_IDENTITY, &identity_bytes, WriteFlags::empty())?;
+            let effective = match (transaction.get::<Vec<u8>>(&meta, META_IDENTITY)?, identity) {
+                (None, None) => {
+                    return Err(SnapshotOverlayError::Invalid(
+                        "a fresh environment requires an explicit base identity",
+                    ));
+                }
+                (None, Some(identity)) => {
+                    transaction.put(
+                        &meta,
+                        META_IDENTITY,
+                        encode_identity(identity, &base)?,
+                        WriteFlags::empty(),
+                    )?;
                     transaction.put(
                         &meta,
                         META_TIP,
@@ -227,20 +223,49 @@ impl SnapshotOverlayChainstate {
                         }),
                         WriteFlags::empty(),
                     )?;
+                    identity.clone()
                 }
-                Some(stored) if stored == identity_bytes => {}
-                Some(_) => {
-                    return Err(SnapshotOverlayError::Invalid(
-                        "environment is bound to a different snapshot base",
-                    ));
+                (Some(stored), supplied) => {
+                    let decoded = decode_identity(&stored)?;
+                    if let Some(supplied) = supplied {
+                        if *supplied != decoded {
+                            return Err(SnapshotOverlayError::Invalid(
+                                "environment is bound to a different snapshot base",
+                            ));
+                        }
+                    }
+                    // Re-encoding against the opened index verifies that the
+                    // supplied files still carry the bound network, coin
+                    // count, byte length, and content digest.
+                    if encode_identity(&decoded, &base)? != stored {
+                        return Err(SnapshotOverlayError::Invalid(
+                            "snapshot files do not match the bound base identity",
+                        ));
+                    }
+                    decoded
                 }
-            }
+            };
             transaction.commit()?;
+            effective
+        };
+        if base.base_height() != identity.height || base.base_block_hash() != identity.block_hash {
+            return Err(SnapshotOverlayError::Invalid(
+                "access index does not match the supplied base identity",
+            ));
+        }
+        let expected_mtp_len = usize::try_from(identity.height)
+            .ok()
+            .and_then(|height| height.checked_add(1))
+            .ok_or(SnapshotOverlayError::Invalid("base height overflows"))?;
+        if config.mtp_by_height.len() != expected_mtp_len {
+            return Err(SnapshotOverlayError::Invalid(
+                "creation-MTP table must cover exactly heights 0..=base",
+            ));
         }
         Ok(Self {
             db,
             base,
-            identity: identity.clone(),
+            identity,
             mtp_by_height: config.mtp_by_height,
             import_time: config.import_time,
             capacity_bytes: config.capacity_bytes,
@@ -248,6 +273,45 @@ impl SnapshotOverlayChainstate {
             index_path: config.index_path,
             write_guard: Mutex::new(()),
         })
+    }
+
+    /// Returns the base identity a previously bound environment stores, or
+    /// `None` when `database_dir` has no bound environment yet.
+    ///
+    /// The driver uses this to resume after a rebase, when the current base
+    /// is no longer any compiled release anchor.
+    ///
+    /// # Errors
+    ///
+    /// Fails on I/O or MDBX errors, or a malformed identity record.
+    pub fn stored_identity(
+        database_dir: &Path,
+        capacity_bytes: u64,
+    ) -> Result<Option<SnapshotBaseIdentity>, SnapshotOverlayError> {
+        if !database_dir.join("mdbx.dat").exists() {
+            return Ok(None);
+        }
+        let capacity = isize::try_from(capacity_bytes)
+            .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
+        let db: Database<NoWriteMap> = Database::open_with_options(
+            database_dir,
+            DatabaseOptions {
+                max_tables: Some(4),
+                mode: Mode::ReadWrite(ReadWriteOptions {
+                    sync_mode: SyncMode::Durable,
+                    max_size: Some(capacity),
+                    ..ReadWriteOptions::default()
+                }),
+                ..DatabaseOptions::default()
+            },
+        )?;
+        let transaction = db.begin_rw_txn()?;
+        transaction.create_table(Some(META), TableFlags::empty())?;
+        let meta = transaction.open_table(Some(META))?;
+        transaction
+            .get::<Vec<u8>>(&meta, META_IDENTITY)?
+            .map(|stored| decode_identity(&stored))
+            .transpose()
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -993,6 +1057,47 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         true
     }
 
+    fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_rw_txn().map_err(utxo_mdbx)?;
+        let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
+        let mut expired = Vec::new();
+        {
+            let mut cursor = transaction.cursor(&undo).map_err(utxo_mdbx)?;
+            for row in cursor.iter_start::<Vec<u8>, ()>() {
+                let (key, ()) = row.map_err(utxo_mdbx)?;
+                let key: [u8; 32] = key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ChainStoreError::Utxo(UtxoError::Malformed("undo key width")))?;
+                let hash = BlockHash::from_byte_array(key);
+                let header =
+                    headers
+                        .get(&hash)
+                        .ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
+                            "block undo references an unknown header",
+                        )))?;
+                if header.height < retain_from_height {
+                    expired.push(hash);
+                }
+            }
+        }
+        let mut removed = 0_u64;
+        for hash in expired {
+            removed += u64::from(
+                transaction
+                    .del(&undo, hash.to_byte_array(), None)
+                    .map_err(utxo_mdbx)?,
+            );
+        }
+        transaction.commit().map_err(utxo_mdbx)?;
+        Ok(removed)
+    }
+
     fn commit_connect(
         &self,
         expected_parent: BlockHash,
@@ -1114,6 +1219,27 @@ fn encode_identity(
     bytes.extend_from_slice(hash);
     debug_assert_eq!(bytes.len(), IDENTITY_BYTES);
     Ok(bytes)
+}
+
+fn decode_identity(bytes: &[u8]) -> Result<SnapshotBaseIdentity, SnapshotOverlayError> {
+    let bytes: &[u8; IDENTITY_BYTES] = bytes
+        .try_into()
+        .map_err(|_| SnapshotOverlayError::Invalid("identity record width"))?;
+    let block_hash = BlockHash::from_byte_array(bytes[4..36].try_into().expect("fixed record"));
+    let height = u32::from_le_bytes(bytes[36..40].try_into().expect("fixed record"));
+    let hash_serialized = std::str::from_utf8(&bytes[88..152])
+        .map_err(|_| SnapshotOverlayError::Invalid("identity hash encoding"))?;
+    if !hash_serialized
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(SnapshotOverlayError::Invalid("identity hash encoding"));
+    }
+    Ok(SnapshotBaseIdentity {
+        height,
+        block_hash,
+        hash_serialized: hash_serialized.to_owned(),
+    })
 }
 
 fn encode_tip(tip: ExecutionTip) -> [u8; TIP_BYTES] {
@@ -1269,7 +1395,7 @@ mod tests {
                 import_time: IMPORT_TIME,
                 mtp_by_height: (0..=identity.height).map(mtp_for).collect(),
             },
-            identity,
+            Some(identity),
         )
     }
 
@@ -1701,9 +1827,10 @@ mod tests {
                 import_time: IMPORT_TIME,
                 mtp_by_height: (0..=102).map(mtp_for).collect(),
             },
-            &report.identity,
+            None,
         )
         .unwrap();
+        assert_eq!(reopened.base_identity(), &report.identity);
         assert_eq!(reopened.execution_tip().unwrap(), tip(103, block_hash(103)));
         assert_eq!(reopened.get(key(9, 1)).unwrap(), None);
         assert!(reopened.get(key(11, 0)).unwrap().is_some());

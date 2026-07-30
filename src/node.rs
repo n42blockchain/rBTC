@@ -92,7 +92,8 @@ use rbtc::{
         validate_block_structure_with_deployments_and_txids,
     },
     chain_store::{
-        ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
+        ChainStoreError, ChainStoreOptions, ExecutionChainStore, RedbChainStore,
+        ValidationDeltaShardMigration,
     },
     core_snapshot::verify_core31_snapshot,
     core_snapshot_index::build_core_snapshot_index,
@@ -267,6 +268,7 @@ struct Options {
     logging: NodeLogConfig,
     runtime_control: Arc<RuntimeControl>,
     observer: Option<NodeObserver>,
+    snapshot_overlay: Option<NodeSnapshotOverlayConfig>,
 }
 
 struct AuxiliaryIndexes {
@@ -510,6 +512,7 @@ impl NodeConfig {
             logging: self.logging,
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .map_err(NodeConfigError::new)
     }
@@ -1797,6 +1800,20 @@ pub enum NodeError {
     /// The host dropped or reused the control channel unexpectedly.
     #[error("node control channel is closed")]
     ControlChannelClosed,
+}
+
+const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
+
+/// Snapshot-overlay catch-up configuration: an immutable compressed base
+/// plus one bounded MDBX overlay environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NodeSnapshotOverlayConfig {
+    snapshot: PathBuf,
+    index: PathBuf,
+    capacity_bytes: u64,
+    rebase_percent: u8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8429,7 +8446,9 @@ async fn run_connected_peer(
             discover_peer_addresses(&mut session, store, remote).await;
         }
         let transfer_before = session.block_transfer_stats();
-        let result = if let Some(validation_dir) = &options.complete_assumeutxo {
+        let result = if options.snapshot_overlay.is_some() {
+            sync_snapshot_overlay_node(&mut session, options, path.clone(), network_time).await
+        } else if let Some(validation_dir) = &options.complete_assumeutxo {
             complete_assumeutxo_validation(
                 &mut session,
                 options,
@@ -8838,6 +8857,258 @@ async fn sync_headers(
         dag.active_tip().hash
     );
     Ok(dag)
+}
+
+/// Runs a bounded snapshot-overlay catch-up: headers first, then block
+/// execution on the immutable compressed base plus its MDBX overlay
+/// environment, rebasing onto a fresh snapshot when the overlay approaches
+/// its hard capacity ceiling.
+///
+/// The mode is deliberately bounded (`--once`): it executes to the header
+/// tip observed after the initial headers synchronization and exits, and it
+/// serves no explorer, wallet, or mempool surface.
+#[cfg(feature = "mdbx")]
+#[allow(clippy::too_many_lines)]
+async fn sync_snapshot_overlay_node(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    options: &Options,
+    data_dir: PathBuf,
+    network_time: &NetworkTime,
+) -> Result<(), PeerRunError> {
+    use crate::snapshot_overlay::{SnapshotOverlayChainstate, SnapshotOverlayConfig};
+
+    let overlay = options
+        .snapshot_overlay
+        .as_ref()
+        .expect("snapshot-overlay dispatch requires a parsed configuration");
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+    let headers = sync_headers(
+        session,
+        &options.deployments,
+        data_dir.join("headers.redb"),
+        network_time,
+    )
+    .await?;
+
+    let database_dir = data_dir.join("overlay-mdbx");
+    let identity =
+        match SnapshotOverlayChainstate::stored_identity(&database_dir, overlay.capacity_bytes)
+            .map_err(|error| PeerRunError::transient(error.to_string()))?
+        {
+            Some(identity) => identity,
+            None => compiled_overlay_identity(&overlay.snapshot, options.network)?,
+        };
+    if headers
+        .active_header_at(identity.height)
+        .is_none_or(|header| header.hash != identity.block_hash)
+    {
+        return Err(PeerRunError::transient(
+            "snapshot base is not on the synchronized active header chain",
+        ));
+    }
+    let mtp_by_height = creation_mtp_range(&headers, 0, identity.height)?;
+    let import_time = u64::from(unix_time()?);
+    let mut chainstate = SnapshotOverlayChainstate::open(
+        SnapshotOverlayConfig {
+            database_dir,
+            snapshot_path: overlay.snapshot.clone(),
+            index_path: overlay.index.clone(),
+            capacity_bytes: overlay.capacity_bytes,
+            import_time,
+            mtp_by_height,
+        },
+        Some(&identity),
+    )
+    .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let opened_tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
+    rbtc_info!(
+        "snapshot-overlay chainstate opened: base {}:{} tip {}:{} capacity={} bytes",
+        identity.height,
+        identity.block_hash,
+        opened_tip.height,
+        opened_tip.hash,
+        overlay.capacity_bytes,
+    );
+
+    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let auxiliary_indexes = AuxiliaryIndexes::open(
+        &data_dir,
+        options.network,
+        NodeIndexConfig {
+            transaction: false,
+            spent_output: false,
+            basic_filter: false,
+        },
+    )
+    .map_err(PeerRunError::local)?;
+    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let mut auxiliary_session = None;
+    let mut prefetched_blocks = PrefetchedBlocks::default();
+    loop {
+        loop {
+            let tip = chainstate
+                .execution_tip()
+                .map_err(|error| error.to_string())?;
+            if headers
+                .active_header_at(tip.height)
+                .is_some_and(|header| header.hash == tip.hash)
+            {
+                break;
+            }
+            let rewound = disconnect_execution_tip(
+                &chainstate,
+                &headers,
+                u64::from(unix_time()?),
+                DEFAULT_HOT_WINDOW_SECS,
+            )
+            .map_err(|error| PeerRunError::block(&error))?;
+            rbtc_info!(
+                "disconnected stale overlay tip back to {}:{}",
+                rewound.height,
+                rewound.hash
+            );
+        }
+        let tip = chainstate
+            .execution_tip()
+            .map_err(|error| error.to_string())?;
+        let ceiling = headers.active_tip().height;
+        if tip.height >= ceiling {
+            break;
+        }
+        let base_height = chainstate.base_identity().height;
+        if tip.height > base_height
+            && chainstate
+                .needs_rebase(overlay.rebase_percent)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?
+        {
+            let directory = overlay
+                .snapshot
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default();
+            let new_snapshot = directory.join(format!("utxo-{}.dat", tip.height));
+            let new_index = directory.join(format!("utxo-{}.rbtcidx", tip.height));
+            let extension = creation_mtp_range(&headers, base_height + 1, tip.height)?;
+            let report = chainstate
+                .rebase_into(&new_snapshot, &new_index, &extension)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            rbtc_info!(
+                "rebased snapshot overlay onto {}:{}: coins={} snapshot_bytes={} index_bytes={} folded_overlay={} dropped_tombstones={}",
+                report.identity.height,
+                report.identity.block_hash,
+                report.coins,
+                report.snapshot_bytes,
+                report.index_bytes,
+                report.folded_overlay,
+                report.dropped_tombstones,
+            );
+        }
+        download_execute_batch(
+            session,
+            &options.deployments,
+            &headers,
+            &chainstate,
+            &ledger,
+            None,
+            None,
+            None,
+            &auxiliary_indexes,
+            &[],
+            &transaction_pool,
+            Some(ceiling),
+            options.validation_limits.max_blocks_per_batch,
+            &mut auxiliary_session,
+            &mut prefetched_blocks,
+            true,
+        )
+        .await?;
+    }
+    let tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
+    let usage = chainstate
+        .capacity()
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    rbtc_info!(
+        "snapshot-overlay catch-up reached {}:{} (base {}:{}, overlay at {} percent of {} bytes)",
+        tip.height,
+        tip.hash,
+        chainstate.base_identity().height,
+        chainstate.base_identity().block_hash,
+        usage.used_percent(),
+        usage.capacity_bytes,
+    );
+    Ok(())
+}
+
+/// Resolves the compiled Core 31 identity for an operator-supplied snapshot.
+#[cfg(feature = "mdbx")]
+fn compiled_overlay_identity(
+    snapshot: &std::path::Path,
+    network: Network,
+) -> Result<crate::core_snapshot_index::SnapshotBaseIdentity, PeerRunError> {
+    let mut reader = std::io::BufReader::new(fs::File::open(snapshot).map_err(|error| {
+        PeerRunError::transient(format!("open snapshot {}: {error}", snapshot.display()))
+    })?);
+    let metadata = crate::core_snapshot::read_metadata(&mut reader)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    if metadata.network != network {
+        return Err(PeerRunError::transient(
+            "snapshot network does not match the selected network",
+        ));
+    }
+    let anchor = crate::core_snapshot::find_anchor(metadata)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    Ok(crate::core_snapshot_index::SnapshotBaseIdentity {
+        height: anchor.height,
+        block_hash: anchor
+            .block_hash
+            .parse()
+            .map_err(|_| PeerRunError::transient("compiled anchor block hash"))?,
+        hash_serialized: anchor.hash_serialized.to_owned(),
+    })
+}
+
+/// Derives creation median-time-past values for heights `from..=through`
+/// from the validated active header chain.
+#[cfg(feature = "mdbx")]
+fn creation_mtp_range(
+    headers: &HeaderDag,
+    from: u32,
+    through: u32,
+) -> Result<Vec<u32>, PeerRunError> {
+    let mut table = Vec::new();
+    for height in from..=through {
+        if height == 0 {
+            table.push(0);
+            continue;
+        }
+        let parent = headers.active_header_at(height - 1).ok_or_else(|| {
+            PeerRunError::transient(format!("missing active header at height {}", height - 1))
+        })?;
+        let mtp = headers.median_time_past(parent.hash).ok_or_else(|| {
+            PeerRunError::transient(format!("missing median time past at height {}", height - 1))
+        })?;
+        table.push(mtp);
+    }
+    Ok(table)
+}
+
+/// Fails closed when the binary was built without the MDBX backend.
+#[cfg(not(feature = "mdbx"))]
+async fn sync_snapshot_overlay_node(
+    _session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    _options: &Options,
+    _data_dir: PathBuf,
+    _network_time: &NetworkTime,
+) -> Result<(), PeerRunError> {
+    Err(PeerRunError::transient(
+        "snapshot-overlay catch-up requires a build with the mdbx feature",
+    ))
 }
 
 fn unseen_header_suffix<'a>(
@@ -10143,7 +10414,7 @@ async fn sync_validating_node(
             &compact_candidates,
         )
         .await?;
-        let startup_pruned = prune_expired_block_undos(&chainstate, &headers, &ledger)?;
+        let startup_pruned = prune_expired_block_undos(chainstate.as_ref(), &headers, &ledger)?;
         prune_expired_auxiliary_index_undos(&auxiliary_indexes, &ledger)?;
         if startup_pruned > 0 {
             rbtc_info!(
@@ -10471,7 +10742,7 @@ async fn sync_validating_node(
                 session,
                 deployment_config,
                 &headers,
-                &chainstate,
+                chainstate.as_ref(),
                 &ledger,
                 explorer.as_deref(),
                 explorer_events.as_ref(),
@@ -10849,8 +11120,8 @@ async fn reconcile_ledger(
     .await
 }
 
-fn prune_expired_block_undos(
-    chainstate: &RedbChainStore,
+fn prune_expired_block_undos<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
 ) -> Result<u64, String> {
@@ -11618,8 +11889,8 @@ async fn download_parallel_block_pair(
     }
 }
 
-fn shard_validation_delta_candidates(
-    chainstate: &RedbChainStore,
+fn shard_validation_delta_candidates<C: ExecutionChainStore>(
+    chainstate: &C,
     heights: &[u32],
 ) -> Result<Vec<ValidationDeltaShardMigration>, ChainStoreError> {
     let mut migrations = Vec::with_capacity(heights.len());
@@ -11632,11 +11903,11 @@ fn shard_validation_delta_candidates(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn download_execute_batch(
+async fn download_execute_batch<C: ExecutionChainStore>(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
-    chainstate: &RedbChainStore,
+    chainstate: &C,
     ledger: &PrunedBlockLedger,
     explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
@@ -11651,8 +11922,9 @@ async fn download_execute_batch(
     prefetch_next_batch: bool,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
-    let execution_store = chainstate.execution();
-    let tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
     let next_height = tip
         .height
         .checked_add(1)
@@ -12878,6 +13150,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_download_workers = None;
     let mut snapshot_index_source = None;
     let mut snapshot_index_output = None;
+    let mut snapshot_overlay_source = None;
+    let mut snapshot_overlay_index = None;
+    let mut snapshot_overlay_capacity = None;
+    let mut snapshot_overlay_rebase_percent = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -13423,6 +13699,62 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     "--snapshot-index-output",
                 )?));
             }
+            "--snapshot-overlay-catchup" => {
+                if snapshot_overlay_source.is_some() {
+                    return Err(
+                        "--snapshot-overlay-catchup cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_overlay_source = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-catchup",
+                )?));
+            }
+            "--snapshot-overlay-index" => {
+                if snapshot_overlay_index.is_some() {
+                    return Err(
+                        "--snapshot-overlay-index cannot be supplied more than once".to_owned()
+                    );
+                }
+                snapshot_overlay_index = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-index",
+                )?));
+            }
+            "--snapshot-overlay-capacity-bytes" => {
+                if snapshot_overlay_capacity.is_some() {
+                    return Err(
+                        "--snapshot-overlay-capacity-bytes cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-capacity-bytes")?;
+                let capacity = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid overlay capacity: {value}"))?;
+                if capacity < MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES {
+                    return Err(format!(
+                        "overlay capacity must be at least {MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES} bytes"
+                    ));
+                }
+                snapshot_overlay_capacity = Some(capacity);
+            }
+            "--snapshot-overlay-rebase-percent" => {
+                if snapshot_overlay_rebase_percent.is_some() {
+                    return Err(
+                        "--snapshot-overlay-rebase-percent cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-rebase-percent")?;
+                let percent = value
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid overlay rebase percent: {value}"))?;
+                if !(50..=99).contains(&percent) {
+                    return Err("overlay rebase percent must be between 50 and 99".to_owned());
+                }
+                snapshot_overlay_rebase_percent = Some(percent);
+            }
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -13942,6 +14274,72 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             );
         }
     };
+    let snapshot_overlay = match (snapshot_overlay_source, snapshot_overlay_index) {
+        (None, None) => {
+            if snapshot_overlay_capacity.is_some() || snapshot_overlay_rebase_percent.is_some() {
+                return Err(
+                    "overlay capacity and rebase options require --snapshot-overlay-catchup"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        (Some(snapshot), Some(index)) => Some(NodeSnapshotOverlayConfig {
+            snapshot,
+            index,
+            capacity_bytes: snapshot_overlay_capacity
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES),
+            rebase_percent: snapshot_overlay_rebase_percent
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT),
+        }),
+        _ => {
+            return Err(
+                "--snapshot-overlay-catchup and --snapshot-overlay-index must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
+    if snapshot_overlay.is_some() {
+        if data_dir.is_none() {
+            return Err("--snapshot-overlay-catchup requires --data-dir".to_owned());
+        }
+        if !once {
+            return Err(
+                "--snapshot-overlay-catchup is a bounded catch-up run and requires --once"
+                    .to_owned(),
+            );
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || explorer_listen.is_some()
+            || wallet_api_files.is_some()
+            || experimental_network_execution
+            || extend_validation_target
+            || cleanup_validation_dir
+            || transaction_index
+            || spent_output_index
+            || basic_filter_index
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || verify_storage
+            || verify_chain
+            || reindex_from_freezer.is_some()
+            || reindex_chainstate.is_some()
+            || manual_prune_through_height.is_some()
+            || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
+        {
+            return Err(
+                "snapshot-overlay catch-up conflicts with snapshot activation, validation, serving, wallet, index, and offline maintenance modes"
+                    .to_owned(),
+            );
+        }
+    }
     if !verify_storage
         && (storage_audit_max_segments.is_some() || storage_audit_max_bytes.is_some())
     {
@@ -14612,6 +15010,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         },
         runtime_control: Arc::new(RuntimeControl::default()),
         observer: None,
+        snapshot_overlay,
     })
     .map(Some)
 }
@@ -14711,6 +15110,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd --build-core-snapshot-index CORE_DUMPTXOUTSET_FILE --snapshot-index-output FILE\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
             "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
@@ -15442,6 +15842,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         };
         let mut pending = spawn_peer_connections(
             &options,
@@ -19348,6 +19749,118 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parses_only_bounded_snapshot_overlay_catchup() {
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.snapshot_overlay,
+            Some(NodeSnapshotOverlayConfig {
+                snapshot: PathBuf::from("/srv/snapshots/utxo-935000.dat"),
+                index: PathBuf::from("/srv/snapshots/utxo-935000.rbtcidx"),
+                capacity_bytes: DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES,
+                rebase_percent: DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT,
+            })
+        );
+        for arguments in [
+            // The snapshot and index must be supplied together.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+            ],
+            // Bounded catch-up requires --once and --data-dir.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ],
+            // Serving and offline modes conflict.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--explorer-listen",
+                "127.0.0.1:3000",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--txindex",
+            ],
+            // Capacity and rebase options require the mode.
+            vec![
+                "--network",
+                "bitcoin",
+                "--snapshot-overlay-capacity-bytes",
+                "3221225472",
+            ],
+            // Bounds are enforced.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-rebase-percent",
+                "100",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
     fn parses_only_offline_core_snapshot_index_builds() {
         let options = parse_options(
             [
@@ -19478,6 +19991,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -19554,6 +20068,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21182,6 +21697,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -21247,6 +21763,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -21648,6 +22165,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21746,6 +22264,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21823,6 +22342,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21916,6 +22436,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21980,6 +22501,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22040,6 +22562,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22140,6 +22663,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22206,6 +22730,7 @@ mod tests {
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
+                snapshot_overlay: None,
             }),
         )
         .await
@@ -22304,6 +22829,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22395,6 +22921,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22440,6 +22967,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22505,6 +23033,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22564,6 +23093,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22669,6 +23199,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22829,6 +23360,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22940,6 +23472,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -23023,6 +23556,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -23142,6 +23676,7 @@ mod tests {
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
+                snapshot_overlay: None,
             }),
         )
         .await
@@ -23296,6 +23831,7 @@ mod tests {
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
+                snapshot_overlay: None,
             },
             local_nonce,
         )
@@ -23421,6 +23957,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();

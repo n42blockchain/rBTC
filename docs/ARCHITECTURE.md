@@ -627,10 +627,27 @@ undo tables and switches the stored identity, after which the folded state
 serves from the new immutable base and the capacity budget is available
 again. Undo data does not survive a rebase, so disconnection cannot cross
 the new base — exactly the contract an AssumeUTXO activation establishes —
-and rebases should therefore run when the tip is not at reorganization risk.
-The live network driver still executes against the unified redb store;
-wiring `download_execute_batch` to the generic trait is the remaining step
-before this mode can serve an ordinary catch-up node end to end.
+and rebases therefore run during catch-up, when the tip is not at
+reorganization risk.
+
+`--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX` runs the
+complete catch-up on this chainstate. The mode reuses the ordinary outbound
+peer pool and failover: after headers-first synchronization it verifies the
+base block on the active header chain (a fresh environment resolves the
+compiled Core 31 identity; a rebased environment resumes its stored
+self-derived identity), derives the base's creation-MTP table from headers,
+and then drives the same `download_execute_batch` pipeline the redb node
+uses — 16-block protocol requests, parallel structure validation, ledger
+staging, prefetch overlap, and the generic consensus executor — against the
+overlay store, including stale-tip disconnection back to the active chain
+and block-undo pruning below the retained-ledger floor. Between batches it
+checks the capacity high-water mark and rebases onto
+`utxo-<height>.dat`/`.rbtcidx` beside the current snapshot when the
+configured threshold (default 85% of the default 3 GiB ceiling) is reached.
+The mode is deliberately bounded: it requires `--once` and `--data-dir`,
+conflicts with explorer, wallet, index, and other snapshot or offline modes,
+executes to the header tip observed after the initial synchronization, and
+exits; a binary built without the `mdbx` feature refuses it at startup.
 
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,

@@ -524,6 +524,7 @@ fn read_byte(reader: &mut impl Read) -> Result<u8, CoreSnapshotError> {
 
 /// Encodes a satoshi amount with Core's `CompressAmount` transform, the exact
 /// inverse of [`decompress_amount`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
 pub(crate) fn compress_amount(mut amount: u64) -> u64 {
     if amount == 0 {
         return 0;
@@ -543,6 +544,7 @@ pub(crate) fn compress_amount(mut amount: u64) -> u64 {
 }
 
 /// Appends Core's `VARINT` encoding, the exact inverse of [`read_core_varint`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
 pub(crate) fn write_core_varint(out: &mut Vec<u8>, mut value: u64) {
     let mut reversed = Vec::with_capacity(10);
     loop {
@@ -558,6 +560,7 @@ pub(crate) fn write_core_varint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Appends a canonical Bitcoin CompactSize, the inverse of [`read_compact_size`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
 pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
     if value < 253 {
         out.push(u8::try_from(value).expect("small CompactSize fits u8"));
@@ -576,6 +579,7 @@ pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
 /// Appends Core's compressed script encoding, the exact inverse of
 /// [`decompress_script`]: the six standard templates when the script matches
 /// one, otherwise the raw bytes behind a `length + 6` size prefix.
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
 pub(crate) fn compress_script(out: &mut Vec<u8>, script: &[u8]) {
     match script {
         [0x76, 0xa9, 20, hash @ .., 0x88, 0xac] if hash.len() == 20 => {
