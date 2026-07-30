@@ -460,6 +460,15 @@ impl SnapshotOverlayChainstate {
     /// Applies one disconnect mutation: removes coins the block created and
     /// restores coins it spent, picking the restore target from the coin's
     /// creation height relative to the base.
+    ///
+    /// Returns the exact pre-image of every removed key, so a caller can
+    /// build a correct redo `UtxoUndo` for this disconnect (the coins a redo
+    /// would need to remove again are `restored`'s keys; the coins it would
+    /// need to restore, with values, are exactly this return value). A
+    /// removed key is not necessarily overlay-resident: if `restored` (an
+    /// earlier disconnect, or symmetrically this same call reversed later)
+    /// un-tombstoned a base coin, removing it again means re-tombstoning it,
+    /// mirroring `connect_mutation`'s spend handling exactly.
     fn disconnect_mutation(
         &self,
         transaction: &Transaction<'_, RW, NoWriteMap>,
@@ -467,18 +476,33 @@ impl SnapshotOverlayChainstate {
         tombstone: &Table<'_>,
         removed: &[OutPointKey],
         restored: &[(OutPointKey, Utxo)],
-    ) -> Result<(), ChainStoreError> {
+    ) -> Result<Vec<(OutPointKey, Utxo)>, ChainStoreError> {
+        let mut removed_values = Vec::with_capacity(removed.len());
         for key in removed {
-            if transaction
-                .get::<()>(overlay, key.as_bytes())
+            if let Some(value) = transaction
+                .get::<Vec<u8>>(overlay, key.as_bytes())
                 .map_err(utxo_mdbx)?
-                .is_none()
+            {
+                transaction
+                    .del(overlay, key.as_bytes(), None)
+                    .map_err(utxo_mdbx)?;
+                removed_values.push((*key, Utxo::decode(&value)?));
+                continue;
+            }
+            if transaction
+                .get::<()>(tombstone, key.as_bytes())
+                .map_err(utxo_mdbx)?
+                .is_some()
             {
                 return Err(ChainStoreError::Utxo(UtxoError::Missing(*key)));
             }
+            let coin = self
+                .base_utxo(key.to_outpoint())?
+                .ok_or(ChainStoreError::Utxo(UtxoError::Missing(*key)))?;
             transaction
-                .del(overlay, key.as_bytes(), None)
+                .put(tombstone, key.as_bytes(), [], WriteFlags::empty())
                 .map_err(utxo_mdbx)?;
+            removed_values.push((*key, coin));
         }
         for (key, utxo) in restored {
             if utxo.height > self.identity.height {
@@ -505,7 +529,7 @@ impl SnapshotOverlayChainstate {
                     .map_err(utxo_mdbx)?;
             }
         }
-        Ok(())
+        Ok(removed_values)
     }
 
     fn advance_tip(
@@ -805,13 +829,58 @@ impl SnapshotOverlayChainstate {
             // holds a complete, fully-closed environment with no open
             // handles from this process, so it can be renamed safely.
         }
-        // Close the current environment before its directory is removed —
+        // Close the current environment before its directory is touched —
         // MDBX holds this file memory-mapped, and deleting or renaming a
         // directory out from under a live mapping is not reliable on
-        // Windows. `self.db` is `None` only for the few statements below.
+        // Windows. `self.db` is `None` only for the statements below.
+        //
+        // The old directory is moved aside rather than deleted outright, so
+        // a failure partway through the swap can roll back to the exact
+        // pre-rebase state instead of leaving `database_dir` missing — which
+        // `stored_identity` would otherwise read as "no environment yet" and
+        // silently restart catch-up from the original compiled snapshot
+        // identity, discarding every block this store has executed with no
+        // error surfaced. This codebase has hit real transient Windows
+        // file-lock/antivirus contention on directory operations before
+        // (see the git history around data-directory locking), so a bare
+        // `remove_dir_all` followed by `rename` here is not an acceptable
+        // risk for a step that runs on every rebase.
         drop(self.db.take());
-        fs::remove_dir_all(&self.database_dir)?;
-        fs::rename(&fresh_dir, &self.database_dir)?;
+        let trash_dir = self.database_dir.with_file_name({
+            let mut name = self
+                .database_dir
+                .file_name()
+                .ok_or(SnapshotOverlayError::Invalid("overlay directory name"))?
+                .to_owned();
+            name.push(".rebased-out");
+            name
+        });
+        if trash_dir.exists() {
+            fs::remove_dir_all(&trash_dir)?;
+        }
+        if let Err(error) = fs::rename(&self.database_dir, &trash_dir) {
+            // Nothing has moved yet; the old environment is exactly as it
+            // was. Reopening it restores a usable store before reporting
+            // the failure.
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error.into());
+        }
+        match fs::rename(&fresh_dir, &self.database_dir) {
+            Ok(()) => {
+                // Best-effort: the old environment is fully superseded, and
+                // leaving its directory behind costs disk space but nothing
+                // else, so a cleanup failure here does not fail the rebase.
+                let _ = fs::remove_dir_all(&trash_dir);
+            }
+            Err(error) => {
+                // Roll back: restore the pre-rebase directory under its
+                // canonical name so the store's on-disk state matches what
+                // this call is about to report as its outcome.
+                fs::rename(&trash_dir, &self.database_dir)?;
+                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                return Err(error.into());
+            }
+        }
         // Reopen fresh so MDBX's own bookkeeping matches the directory's
         // current (renamed-back) path rather than the transient one it was
         // built under.
@@ -1257,7 +1326,16 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         }
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
-        self.disconnect_mutation(&transaction, &overlay, &tombstone, spent, created)?;
+        // `spent`/`created` name what this disconnect does to the store
+        // (delete `spent`'s keys, insert `created`'s coins) — the reverse of
+        // what a redo of the disconnected block would need. The returned
+        // `UtxoUndo` must describe *this* mutation for `UtxoStore::undo` to
+        // reverse it correctly: the exact pre-images this call removed
+        // (captured by `disconnect_mutation`, since `spent` itself carries no
+        // values) go in the `spent` field, and the keys it inserted —
+        // `created`'s keys — go in the `created` field.
+        let removed_with_values =
+            self.disconnect_mutation(&transaction, &overlay, &tombstone, spent, created)?;
         let undo_table = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
         if !transaction
             .del(&undo_table, current.hash.to_byte_array(), None)
@@ -1271,7 +1349,10 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
             .put(&meta, META_TIP, encode_tip(parent), WriteFlags::empty())
             .map_err(utxo_mdbx)?;
         transaction.commit().map_err(utxo_mdbx)?;
-        Ok(UtxoUndo::from_parts(created.to_vec(), spent.to_vec()))
+        Ok(UtxoUndo::from_parts(
+            removed_with_values,
+            created.iter().map(|(key, _)| *key).collect(),
+        ))
     }
 }
 
@@ -1686,6 +1767,56 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// Regression test for a code-review finding: `commit_disconnect` built
+    /// its returned `UtxoUndo` from `(created, spent)` instead of the
+    /// `UtxoUndo::from_parts(spent, created)` contract, and did not capture
+    /// the actual values of the keys it removed (it only had their keys, not
+    /// the coins those keys held). Both bugs were dormant because the only
+    /// production caller discards the return value; a future caller passing
+    /// it to `UtxoStore::undo` (redoing a disconnected block) would restore
+    /// the wrong coins entirely. This drives `commit_disconnect`, then feeds
+    /// its return value straight into `undo`, and checks that reverses the
+    /// disconnect exactly.
+    #[test]
+    fn commit_disconnect_returns_an_undo_that_correctly_redoes_the_block() {
+        let (_directory, store, identity) = setup(32 << 20);
+        let base_a = store.get(key(1, 0)).unwrap().unwrap();
+
+        let d = overlay_coin(101, 111);
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip(101, block_hash(101)),
+                &[key(1, 0)],
+                &[(key(9, 0), d.clone())],
+                &[],
+            )
+            .unwrap();
+        let pre_disconnect_d = store.get(key(9, 0)).unwrap();
+        let pre_disconnect_a = store.get(key(1, 0)).unwrap();
+        assert_eq!(pre_disconnect_d.as_ref(), Some(&d));
+        assert_eq!(pre_disconnect_a, None);
+
+        let redo = store
+            .commit_disconnect(
+                tip(101, block_hash(101)),
+                tip(BASE_HEIGHT, identity.block_hash),
+                &[key(9, 0)],
+                &[(key(1, 0), base_a.clone())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.get(key(9, 0)).unwrap(), None);
+        assert_eq!(store.get(key(1, 0)).unwrap().as_ref(), Some(&base_a));
+
+        // Feeding the disconnect's own returned undo into `undo` must redo
+        // exactly the disconnected block: D reappears with its real value,
+        // and A is spent again.
+        store.undo(&redo, IMPORT_TIME, 0).unwrap();
+        assert_eq!(store.get(key(9, 0)).unwrap(), pre_disconnect_d);
+        assert_eq!(store.get(key(1, 0)).unwrap(), pre_disconnect_a);
     }
 
     #[test]
@@ -2192,7 +2323,74 @@ mod tests {
         assert!(new_index.exists());
     }
 
-    /// Ad-hoc diagnostic, not part of the regression suite: replays a real
+    /// Regression test for a code-review finding: `rebase_into` used to
+    /// `remove_dir_all` the old environment directory and then `rename` the
+    /// freshly built one into place. If the process were interrupted between
+    /// those two steps (or a transient Windows file-lock/antivirus failure
+    /// hit the rename — this codebase has real history with exactly that
+    /// class of flake), the canonical directory would end up missing.
+    /// `stored_identity` reads a missing directory as "no environment yet",
+    /// so the next open would silently restart catch-up from the original
+    /// compiled snapshot identity instead of failing loudly — discarding
+    /// every block executed so far with no error surfaced.
+    ///
+    /// The fix moves the old directory aside instead of deleting it, so a
+    /// leftover from an interrupted attempt is exactly what a fresh attempt
+    /// finds and cleans up before proceeding. This drives that recovery path
+    /// deterministically by pre-creating the trash directory the way an
+    /// interrupted first attempt would have left it, then checks the rebase
+    /// still succeeds and the store still resolves through the new base.
+    #[test]
+    fn a_leftover_trash_directory_from_an_interrupted_rebase_is_cleaned_up() {
+        let directory = TempDir::new().unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let mut store = open_store(
+            directory.path(),
+            &snapshot_path,
+            &index_path,
+            &identity,
+            32 << 20,
+        )
+        .unwrap();
+        let e = overlay_coin(101, 111);
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip(101, block_hash(101)),
+                &[],
+                &[(key(9, 0), e.clone())],
+                &[],
+            )
+            .unwrap();
+
+        let trash_dir = directory.path().join("overlay-mdbx.rebased-out");
+        fs::create_dir_all(&trash_dir).unwrap();
+        fs::write(trash_dir.join("stale-marker"), b"left over").unwrap();
+
+        let new_snapshot = directory.path().join("utxo-101.dat");
+        let new_index = directory.path().join("utxo-101.rbtcidx");
+        let report = store
+            .rebase_into(&new_snapshot, &new_index, &[mtp_for(101)])
+            .unwrap();
+        assert_eq!(report.identity.height, 101);
+        assert!(
+            !trash_dir.exists(),
+            "the leftover trash directory must be cleaned up"
+        );
+        // The coin is now served from the new base, so `last_touched`
+        // follows import policy rather than the overlay's original value.
+        let folded = store.get(key(9, 0)).unwrap().unwrap();
+        assert_eq!(folded.value_sats, e.value_sats);
+        assert_eq!(folded.height, e.height);
+        assert_eq!(folded.script_pubkey, e.script_pubkey);
+        assert_eq!(store.execution_tip().unwrap(), tip(101, block_hash(101)));
+    }
+
     /// Ad-hoc diagnostic: prints raw MDBX `info()`/`freelist()`/`capacity()`
     /// values for a live overlay environment, to find why `needs_rebase`
     /// stopped tripping despite repeated `MDBX_MAP_FULL` commit failures.

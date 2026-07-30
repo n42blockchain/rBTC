@@ -28,7 +28,7 @@
 
 use std::{
     fs::{self, File},
-    io::{BufReader, Cursor, Read, Write as _},
+    io::{BufReader, Cursor, Read},
     path::Path,
 };
 
@@ -763,25 +763,13 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
 }
 
 /// Publishes through a same-directory temporary file, file sync, and atomic
-/// rename, matching the snapshot downloader's publication protocol.
+/// rename. Delegates to `snapshot::atomic_write`'s pid- and randomly-suffixed,
+/// collision-retrying temporary name instead of a fixed `<name>.tmp` sibling,
+/// so two independent builds racing on the same output path (an operator
+/// rebuild run against a path a live node's rebase is concurrently writing)
+/// cannot collide on the same temporary file.
 fn publish_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let mut temporary_name = file_name.to_owned();
-    temporary_name.push(".tmp");
-    let temporary = path.with_file_name(temporary_name);
-    let mut output = File::create(&temporary)?;
-    output.write_all(bytes)?;
-    output.sync_all()?;
-    drop(output);
-    fs::rename(&temporary, path)?;
-    // Windows has no portable directory fsync; see `diagnostics::sync_directory`.
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    crate::snapshot::atomic_write(path, bytes)
 }
 
 #[cfg(test)]
