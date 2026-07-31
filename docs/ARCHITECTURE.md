@@ -1007,6 +1007,64 @@ byte-identical output — 165,911,302 coins, 9,478,768,311 snapshot bytes,
 1,167,552,096 index bytes, 11,823,028 folded overlay entries. Reordering reads
 provably did not disturb what gets written.
 
+Replaying blocks from a retained ledger rather than fetching them made the
+execution path measurable, and the first measurement overturned the assumption
+the optimization work had been proceeding on. With the network removed,
+`execution-core` split as commit 67.7%, validate 16.0%, submit 2.3%, and
+script-wait 1.7%. Script verification is not the cost of executing a block
+here: the deferred batch hides it so completely that the workers finish about
+100 ms into a six-second batch and then wait. Storage does.
+
+Splitting the commit the same way located the largest single item in the whole
+run:
+
+| commit part | share of commit |
+|---|---:|
+| Base lookups (nested in mutate) | 36.5% |
+| B-tree mutation, excluding those lookups | 26.5% |
+| Durable commit, where any fsync lands | 28.5% |
+| Block undo | 4.5% |
+| Batch fold | 3.7% |
+
+At 36.5% of a commit that is itself 67.7% of execution, those base lookups
+were about a quarter of all execution time. They come from the duplicate check
+on created coins — one full snapshot index lookup per new output, roughly
+250,000 per batch, essentially all misses. An earlier estimate had put them at
+65 ms by counting only spent base coins, missing the created path entirely and
+landing a factor of twenty-seven low; the estimate would have sent the work
+somewhere else entirely.
+
+The check is not redundant and was not weakened. Above the BIP34 anchor the
+in-memory execution path deliberately skips its own durable probe and
+documents that the commit will catch a collision, which makes this the release
+build's only durable duplicate check. Only the read order changed: the probes
+are collected and resolved in one file-ordered batch.
+
+Two replays of the same corpus, differing only in that change, paired
+batch-for-batch over 80 batches:
+
+| | before | after | change |
+|---|---:|---:|---:|
+| `commit-base-lookup` | 130.1s | 80.2s | **−38.3%** |
+| `core-commit` | 357.9s | 304.6s | −14.9% |
+| `execution-core` | 528.0s | 474.7s | **−10.1%** |
+| batch total | 584.4s | 530.8s | −9.2% |
+| `commit-sync` | 102.4s | 101.9s | −0.5% |
+| `core-validate` | 82.5s | 82.0s | −0.7% |
+
+Every untouched component moved by less than 2%, which is the signature a
+controlled comparison should have and the reason the replay harness was built:
+the networked soak that preceded it moved 19% on peer quality alone and could
+not have resolved this.
+
+What remains inside the commit is the durable flush at 28.5% and B-tree
+mutation at 26.5%, neither of which has been addressed. Base lookups are still
+26.3% of the reduced commit, and their remaining cost is the hash computation
+plus two positioned reads per probe. Cutting the probe count rather than
+ordering it would need an index keyed by txid instead of by outpoint, since a
+transaction's outputs share a txid — which is a concrete, measured argument
+for a decision that had been deferred on other grounds.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
