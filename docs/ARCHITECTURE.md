@@ -929,22 +929,43 @@ copy-on-write garbage that `last_pgno` still counts, which is why the
 geometry ceiling is reached well before the live data would suggest.
 
 Index memory was measured separately, on the real 164,241,311-coin index,
-looking up 200,000 outpoints taken from the snapshot itself:
+looking up 200,000 outpoints taken from the snapshot itself. The queries are
+shuffled, because a block's inputs bear no relation to where their coins sit
+in the base; measuring them in snapshot file order flatters the snapshot reads
+and overstates every rate below by roughly two-fold.
 
-| | table resident | table read per lookup |
+| | peak working set | lookups/s |
 |---|---:|---:|
-| Peak working set | 2.17 GiB | **0.15 GiB** |
-| Lookup rate | 474,260/s | 208,330/s |
+| Offset table resident, one at a time | 2.17 GiB | 212,677 |
+| Offset table on disk, one at a time | **0.15 GiB** | 129,306 |
+| Offset table on disk, batched | **0.15 GiB** | **189,456** |
 
-The lookup rates are page-cache-warm on both sides, since verifying the
-container's digest at open streams the whole file; a cold cache would widen
-the gap. An in-process cache for the table was considered and rejected: a
-minimal perfect hash distributes slots uniformly, so hit rate would scale
-linearly with cache size with no working-set knee, entries are bit-packed at
-53 bits against an LRU's ~40 bytes of per-entry overhead, and the memory would
-be anonymous rather than reclaimable — reintroducing exactly what the change
-removed. Reducing the number of reads by resolving a batch's slots in sorted
-file order would help where caching cannot, and is not yet implemented.
+Reading the table from disk costs 39% of the single-lookup rate and returns
+14.5x the memory. Batching recovers most of that: resolving in file order runs
+1.47x faster than one at a time, leaving the on-disk path 11% below the
+resident table while still holding a fifteenth of the memory.
+
+The batch resolves in three phases. Every slot is computed first, with no I/O.
+The offset-table entries are read next in ascending slot order, which is
+ascending byte order. The coin records are read last in ascending snapshot
+offset. Each phase moves forward through one file rather than jumping around
+it, and one window buffer serves the whole batch. Both overlay engines now
+classify a batch against the overlay and tombstone first and hand the misses
+over in a single call.
+
+An in-process cache for the table was considered and rejected. A minimal
+perfect hash distributes slots uniformly, so hit rate would scale linearly
+with cache size with no working-set knee — the condition under which a
+replacement policy earns its keep. Entries are bit-packed at 53 bits against
+an LRU's roughly 40 bytes of per-entry overhead, so the page cache holds
+several times more table per byte. And the memory would be anonymous rather
+than reclaimable, reintroducing exactly what moving the table to disk removed.
+Ordering the reads was the alternative that helps where caching cannot.
+
+All rates are page-cache-warm, since verifying the container's digest at open
+streams the whole file. A cold cache would widen the gap between the resident
+and on-disk rows, and would favour the batched row further, since ordered
+reads are what readahead can serve.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
