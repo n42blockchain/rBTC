@@ -435,27 +435,54 @@ impl SnapshotOverlayChainstate {
                 .map_err(utxo_mdbx)?;
             undo_spent.push((*key, coin));
         }
+        // Every created coin is proved absent from the base before it is
+        // written. Above the BIP34 anchor the in-memory execution path
+        // deliberately skips that proof and leaves it to this commit — see
+        // the contract documented at `apply_validated_changes_transaction` —
+        // so this is the release build's only durable duplicate check and it
+        // stays. What changes is how it reads: measured over 82 replayed
+        // batches these lookups were 36.5% of the whole commit, resolved one
+        // scattered outpoint at a time. They are collected and resolved in
+        // one file-ordered batch instead.
         let mut seen_created = std::collections::BTreeSet::new();
-        for (key, utxo) in created {
+        let mut base_probe: Vec<OutPoint> = Vec::new();
+        let mut base_probe_keys: Vec<OutPointKey> = Vec::new();
+        for (key, _) in created {
             if !seen_created.insert(*key) {
                 return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
             }
-            if !seen_spent.contains(key) {
-                if transaction
-                    .get::<()>(overlay, key.as_bytes())
-                    .map_err(utxo_mdbx)?
-                    .is_some()
-                {
-                    return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
-                }
-                let base_hidden = transaction
-                    .get::<()>(tombstone, key.as_bytes())
-                    .map_err(utxo_mdbx)?
-                    .is_some();
-                if !base_hidden && self.base_utxo(key.to_outpoint())?.is_some() {
-                    return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
-                }
+            if seen_spent.contains(key) {
+                continue;
             }
+            if transaction
+                .get::<()>(overlay, key.as_bytes())
+                .map_err(utxo_mdbx)?
+                .is_some()
+            {
+                return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
+            }
+            let base_hidden = transaction
+                .get::<()>(tombstone, key.as_bytes())
+                .map_err(utxo_mdbx)?
+                .is_some();
+            if !base_hidden {
+                base_probe.push(key.to_outpoint());
+                base_probe_keys.push(*key);
+            }
+        }
+        if !base_probe.is_empty() {
+            let started = Instant::now();
+            let resolved = self.base.get_many(&base_probe).map_err(index_read_error)?;
+            CommitProfile::add(&self.commit_profile.base_lookup, started);
+            // `created` is sorted and the probe preserves that order, so the
+            // reported collision is the same one the unbatched check reported.
+            if let Some(position) = resolved.iter().position(Option::is_some) {
+                return Err(ChainStoreError::Utxo(UtxoError::Duplicate(
+                    base_probe_keys[position],
+                )));
+            }
+        }
+        for (key, utxo) in created {
             transaction
                 .put(overlay, key.as_bytes(), utxo.encode()?, WriteFlags::empty())
                 .map_err(utxo_mdbx)?;
@@ -2637,6 +2664,99 @@ pub(crate) mod tests {
             raw.len(),
             packed.len()
         );
+    }
+
+    /// The durable duplicate check is the release build's only proof that a
+    /// created coin is absent from the base: above the BIP34 anchor the
+    /// in-memory execution path deliberately skips that probe and documents
+    /// that the commit will catch a collision. Batching how those probes read
+    /// must not weaken what they prove, so this pins all three sources a
+    /// collision can come from — the base, the overlay, and the batch itself.
+    #[test]
+    fn commit_rejects_creating_a_coin_that_already_exists() {
+        let (_directory, store, identity) = setup(32 << 20);
+        let tip = ExecutionTip {
+            height: identity.height + 1,
+            hash: block_hash(identity.height + 1),
+        };
+
+        // (1, 0) is a base coin. Recreating it must be refused.
+        let collision = key(1, 0);
+        assert!(
+            store.get(collision).unwrap().is_some(),
+            "fixture precondition"
+        );
+        assert!(matches!(
+            store.commit_connect(
+                identity.block_hash,
+                tip,
+                &[],
+                &[(collision, overlay_coin(identity.height + 1, 10))],
+                &[],
+            ),
+            Err(ChainStoreError::Utxo(UtxoError::Duplicate(duplicate))) if duplicate == collision
+        ));
+
+        // A fresh coin commits, and then recreating that overlay-resident
+        // coin must be refused too.
+        let fresh = key(200, 7);
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip,
+                &[],
+                &[(fresh, overlay_coin(identity.height + 1, 11))],
+                &[],
+            )
+            .unwrap();
+        let next = ExecutionTip {
+            height: tip.height + 1,
+            hash: block_hash(tip.height + 1),
+        };
+        assert!(matches!(
+            store.commit_connect(
+                tip.hash,
+                next,
+                &[],
+                &[(fresh, overlay_coin(next.height, 12))],
+                &[],
+            ),
+            Err(ChainStoreError::Utxo(UtxoError::Duplicate(duplicate))) if duplicate == fresh
+        ));
+
+        // Two creations of the same key inside one commit, which the batch
+        // rejects before any probe runs.
+        assert!(matches!(
+            store.commit_connect(
+                tip.hash,
+                next,
+                &[],
+                &[
+                    (key(201, 0), overlay_coin(next.height, 13)),
+                    (key(201, 0), overlay_coin(next.height, 14)),
+                ],
+                &[],
+            ),
+            Err(ChainStoreError::Utxo(UtxoError::Duplicate(duplicate))) if duplicate == key(201, 0)
+        ));
+
+        // Recreating a base coin that this same commit spends is legitimate:
+        // the spend hides it first, which is what `seen_spent` allows.
+        let respent = key(2, 1);
+        assert!(
+            store.get(respent).unwrap().is_some(),
+            "fixture precondition"
+        );
+        store
+            .commit_connect(
+                tip.hash,
+                next,
+                &[respent],
+                &[(respent, overlay_coin(next.height, 15))],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.get(respent).unwrap().unwrap().value_sats, 15);
     }
 
     /// Regression test for the batch fold: a coin created and then spent
