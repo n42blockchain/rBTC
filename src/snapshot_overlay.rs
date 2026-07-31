@@ -137,6 +137,30 @@ pub struct RebaseReport {
     pub dropped_tombstones: u64,
 }
 
+/// How durably the overlay commits each batch.
+///
+/// Only two of MDBX's four modes are offered, and the omissions are the
+/// point. `SafeNoSync` and `UtterlyNoSync` both trade flushing for database
+/// growth — they pin the last steady commit so freed pages cannot be reused —
+/// and this store runs under a hard capacity ceiling where growth is what
+/// forces a rebase that rewrites the whole base. Buying write speed with
+/// growth would be paid back at roughly 10 GB a rebase.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverlayDurability {
+    /// Flush data and metadata on every commit. Survives any crash.
+    #[default]
+    Durable,
+    /// Flush data but defer the metapage.
+    ///
+    /// Atomicity, consistency, and isolation are preserved; only durability
+    /// of the most recent commit is not, so a crash can undo one batch. That
+    /// is recoverable here rather than merely tolerable: catch-up resumes
+    /// from whatever tip the chainstate holds and re-executes, and the driver
+    /// truncates any block the ledger recorded above that tip. Page write
+    /// volume is unchanged, so unlike the no-sync modes this costs no growth.
+    NoMetaSync,
+}
+
 /// Configuration for opening a snapshot-backed overlay chainstate.
 pub struct SnapshotOverlayConfig {
     /// Directory for the MDBX environment.
@@ -147,6 +171,8 @@ pub struct SnapshotOverlayConfig {
     pub index_path: PathBuf,
     /// Hard MDBX geometry ceiling in bytes (for example 3 GiB).
     pub capacity_bytes: u64,
+    /// Commit durability; see [`OverlayDurability`].
+    pub durability: OverlayDurability,
     /// `last_touched` value synthesized for coins served from the base.
     pub import_time: u64,
     /// Creation median-time-past per height, `0..=base_height`, from the
@@ -165,6 +191,7 @@ pub struct SnapshotOverlayChainstate {
     identity: SnapshotBaseIdentity,
     mtp_by_height: Vec<u32>,
     import_time: u64,
+    durability: OverlayDurability,
     commit_profile: CommitProfile,
     capacity_bytes: u64,
     snapshot_path: PathBuf,
@@ -188,7 +215,11 @@ impl SnapshotOverlayChainstate {
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
         let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
-        let db = open_environment(&config.database_dir, config.capacity_bytes)?;
+        let db = open_environment(
+            &config.database_dir,
+            config.capacity_bytes,
+            config.durability,
+        )?;
         let identity = {
             let transaction = db.begin_rw_txn()?;
             for name in [OVERLAY, TOMBSTONE, UNDO, META] {
@@ -263,6 +294,7 @@ impl SnapshotOverlayChainstate {
             identity,
             mtp_by_height: config.mtp_by_height,
             import_time: config.import_time,
+            durability: config.durability,
             commit_profile: CommitProfile::default(),
             capacity_bytes: config.capacity_bytes,
             snapshot_path: config.snapshot_path,
@@ -287,7 +319,9 @@ impl SnapshotOverlayChainstate {
         if !database_dir.join("mdbx.dat").exists() {
             return Ok(None);
         }
-        let db = open_environment(database_dir, capacity_bytes)?;
+        // Reading a stored identity does not write, so the durability mode
+        // is irrelevant here; the strictest one is the safe default.
+        let db = open_environment(database_dir, capacity_bytes, OverlayDurability::Durable)?;
         let transaction = db.begin_rw_txn()?;
         transaction.create_table(Some(META), TableFlags::empty())?;
         let meta = transaction.open_table(Some(META))?;
@@ -850,7 +884,7 @@ impl SnapshotOverlayChainstate {
             fs::remove_dir_all(&fresh_dir)?;
         }
         {
-            let fresh_db = open_environment(&fresh_dir, self.capacity_bytes)?;
+            let fresh_db = open_environment(&fresh_dir, self.capacity_bytes, self.durability)?;
             let transaction = fresh_db.begin_rw_txn()?;
             for name in [OVERLAY, TOMBSTONE, UNDO, META] {
                 transaction.create_table(Some(name), TableFlags::empty())?;
@@ -904,7 +938,11 @@ impl SnapshotOverlayChainstate {
             // Nothing has moved yet; the old environment is exactly as it
             // was. Reopening it restores a usable store before reporting
             // the failure.
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(open_environment(
+                &self.database_dir,
+                self.capacity_bytes,
+                self.durability,
+            )?);
             return Err(error.into());
         }
         match fs::rename(&fresh_dir, &self.database_dir) {
@@ -919,14 +957,22 @@ impl SnapshotOverlayChainstate {
                 // canonical name so the store's on-disk state matches what
                 // this call is about to report as its outcome.
                 fs::rename(&trash_dir, &self.database_dir)?;
-                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                self.db = Some(open_environment(
+                    &self.database_dir,
+                    self.capacity_bytes,
+                    self.durability,
+                )?);
                 return Err(error.into());
             }
         }
         // Reopen fresh so MDBX's own bookkeeping matches the directory's
         // current (renamed-back) path rather than the transient one it was
         // built under.
-        self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+        self.db = Some(open_environment(
+            &self.database_dir,
+            self.capacity_bytes,
+            self.durability,
+        )?);
 
         self.mtp_by_height.extend_from_slice(mtp_extension);
         self.base = new_base;
@@ -1644,6 +1690,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
 fn open_environment(
     database_dir: &Path,
     capacity_bytes: u64,
+    durability: OverlayDurability,
 ) -> Result<Database<NoWriteMap>, SnapshotOverlayError> {
     fs::create_dir_all(database_dir)?;
     let capacity = isize::try_from(capacity_bytes)
@@ -1653,7 +1700,10 @@ fn open_environment(
         DatabaseOptions {
             max_tables: Some(4),
             mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
+                sync_mode: match durability {
+                    OverlayDurability::Durable => SyncMode::Durable,
+                    OverlayDurability::NoMetaSync => SyncMode::NoMetaSync,
+                },
                 max_size: Some(capacity),
                 ..ReadWriteOptions::default()
             }),
@@ -1872,6 +1922,7 @@ pub(crate) mod tests {
                 snapshot_path: snapshot_path.to_owned(),
                 index_path: index_path.to_owned(),
                 capacity_bytes,
+                durability: OverlayDurability::Durable,
                 import_time: IMPORT_TIME,
                 mtp_by_height: (0..=identity.height).map(mtp_for).collect(),
             },
@@ -2520,6 +2571,7 @@ pub(crate) mod tests {
                 snapshot_path: new_snapshot.clone(),
                 index_path: new_index.clone(),
                 capacity_bytes: 32 << 20,
+                durability: OverlayDurability::Durable,
                 import_time: IMPORT_TIME,
                 mtp_by_height: (0..=102).map(mtp_for).collect(),
             },
