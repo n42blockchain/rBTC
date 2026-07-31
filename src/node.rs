@@ -1910,8 +1910,6 @@ struct NodeSnapshotOverlayConfig {
     rebase_percent: u8,
     compact_percent: u8,
     engine: SnapshotOverlayEngine,
-    /// Commit durability for the overlay's own writes.
-    durability: rbtc::snapshot_overlay::OverlayDurability,
     /// Retained block ledger to replay from instead of downloading.
     ///
     /// Present only for benchmarking: it removes peers from the measured path
@@ -9141,7 +9139,6 @@ async fn sync_snapshot_overlay_node(
         ));
     }
     let store_config = SnapshotOverlayConfig {
-        durability: overlay.durability,
         database_dir: database_path,
         snapshot_path,
         index_path,
@@ -9335,14 +9332,12 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
     }
     // A committed segment can also outlive the chainstate that produced it.
-    // The batch commits the chainstate first and the ledger second, so a
-    // durable chainstate can only ever be ahead — but a relaxed sync mode
-    // lets the chainstate roll back one commit on a crash, and then the
-    // ledger holds heights the chainstate has not executed. Resuming would
-    // append at a height the ledger already covers and fail on contiguity
-    // forever. Truncating to the executed tip is what the reindex driver
-    // already does for the same reason, and it is a no-op in the ordinary
-    // case where nothing is ahead.
+    // The batch commits the chainstate before the ledger, so under a durable
+    // commit the chainstate can only be ahead and this is a no-op. It is kept
+    // because the reverse leaves the driver permanently stuck rather than
+    // merely inconsistent: resuming would append at a height the ledger
+    // already covers and fail on contiguity from then on, and nothing else
+    // would repair it. The reindex driver does the same for the same reason.
     if let Some(first_unexecuted) = opened_tip.height.checked_add(1) {
         let retained_before = ledger
             .stats()
@@ -9357,7 +9352,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             .blocks;
         if retained_after < retained_before {
             rbtc_warn!(
-                "discarded {} retained block(s) above the executed tip {}; the chainstate lost a commit the block ledger had already recorded",
+                "discarded {} retained block(s) above the executed tip {}; the chainstate did not have the commit the block ledger had already recorded",
                 retained_before - retained_after,
                 opened_tip.height
             );
@@ -13710,7 +13705,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_overlay_index = None;
     let mut snapshot_overlay_capacity = None;
     let mut snapshot_overlay_replay_blocks: Option<PathBuf> = None;
-    let mut snapshot_overlay_durability: Option<rbtc::snapshot_overlay::OverlayDurability> = None;
     let mut snapshot_overlay_rebase_percent = None;
     let mut snapshot_overlay_compact_percent = None;
     let mut snapshot_overlay_engine = None;
@@ -14280,24 +14274,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     &mut args,
                     "--snapshot-overlay-index",
                 )?));
-            }
-            "--snapshot-overlay-durability" => {
-                if snapshot_overlay_durability.is_some() {
-                    return Err(
-                        "--snapshot-overlay-durability cannot be supplied more than once"
-                            .to_owned(),
-                    );
-                }
-                let value = required_option_value(&mut args, "--snapshot-overlay-durability")?;
-                snapshot_overlay_durability = Some(match value.as_str() {
-                    "durable" => rbtc::snapshot_overlay::OverlayDurability::Durable,
-                    "no-meta-sync" => rbtc::snapshot_overlay::OverlayDurability::NoMetaSync,
-                    other => {
-                        return Err(format!(
-                            "unknown overlay durability {other}; expected durable or no-meta-sync"
-                        ));
-                    }
-                });
             }
             "--snapshot-overlay-replay-blocks" => {
                 if snapshot_overlay_replay_blocks.is_some() {
@@ -14904,7 +14880,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 || snapshot_overlay_compact_percent.is_some()
                 || snapshot_overlay_engine.is_some()
                 || snapshot_overlay_replay_blocks.is_some()
-                || snapshot_overlay_durability.is_some()
             {
                 return Err(
                     "overlay capacity, engine, replay, and rebase options require --snapshot-overlay-catchup"
@@ -14923,7 +14898,6 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             compact_percent: snapshot_overlay_compact_percent
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
             engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
-            durability: snapshot_overlay_durability.unwrap_or_default(),
             replay_blocks: snapshot_overlay_replay_blocks,
         }),
         _ => {
@@ -20637,7 +20611,6 @@ mod tests {
                 rebase_percent: DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT,
                 compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
                 engine: SnapshotOverlayEngine::Mdbx,
-                durability: rbtc::snapshot_overlay::OverlayDurability::Durable,
                 replay_blocks: None,
             })
         );
@@ -20672,61 +20645,7 @@ mod tests {
             Some(PathBuf::from("/srv/replay/blocks"))
         );
 
-        // Durability is the one option that changes what a crash can lose, so
-        // its spelling is pinned and anything else is refused rather than
-        // silently defaulting to the strict mode.
-        let relaxed = parse_options(
-            [
-                "--network",
-                "bitcoin",
-                "--data-dir",
-                "/tmp/rbtc-overlay",
-                "--once",
-                "--snapshot-overlay-catchup",
-                "/srv/snapshots/utxo-935000.dat",
-                "--snapshot-overlay-index",
-                "/srv/snapshots/utxo-935000.rbtcidx",
-                "--snapshot-overlay-durability",
-                "no-meta-sync",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            relaxed
-                .snapshot_overlay
-                .expect("durability parses with catch-up")
-                .durability,
-            rbtc::snapshot_overlay::OverlayDurability::NoMetaSync
-        );
-
         for arguments in [
-            // An unrecognised durability must not fall back to a default.
-            vec![
-                "--network",
-                "bitcoin",
-                "--data-dir",
-                "/tmp/rbtc-overlay",
-                "--once",
-                "--snapshot-overlay-catchup",
-                "/srv/snapshots/utxo-935000.dat",
-                "--snapshot-overlay-index",
-                "/srv/snapshots/utxo-935000.rbtcidx",
-                "--snapshot-overlay-durability",
-                "safe-no-sync",
-            ],
-            // Durability is a catch-up option like the others.
-            vec![
-                "--network",
-                "bitcoin",
-                "--data-dir",
-                "/tmp/rbtc-overlay",
-                "--once",
-                "--snapshot-overlay-durability",
-                "no-meta-sync",
-            ],
             // Replay is a catch-up option and is rejected without it, the
             // same way capacity and engine are.
             vec![

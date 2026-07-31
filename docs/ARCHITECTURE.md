@@ -1080,6 +1080,42 @@ ordering it would need an index keyed by txid instead of by outpoint, since a
 transaction's outputs share a txid — which is a concrete, measured argument
 for a decision that had been deferred on other grounds.
 
+Relaxing the commit's durability was tried on the strength of that 28.5% and
+withdrawn. MDBX offers three modes weaker than `Durable`, and two of them —
+`SafeNoSync` and `UtterlyNoSync` — buy write speed by pinning the last steady
+commit so freed pages cannot be reused, which grows the database. Under a hard
+capacity ceiling where growth is what forces a rebase, and a rebase rewrites
+roughly 10 GB, that trade is paid back at a rate that makes it a loss. Only
+`NoMetaSync` writes the same pages and defers nothing but metadata, so only it
+was implemented and measured.
+
+Two replays of the same corpus, back to back on the same machine under the
+same load, paired over 133 batches:
+
+| | durable | no-meta-sync | change |
+|---|---:|---:|---:|
+| `commit-sync` | 220.4s | 372.8s | **+69.2%** |
+| `commit-mutate` | 348.8s | 353.8s | +1.4% |
+| `commit-base-lookup` | 147.4s | 147.0s | −0.3% |
+| `execution-core` | 967.2s | 1155.9s | +19.5% |
+| batch total | 1071.6s | 1276.4s | +19.1% |
+
+Deferring the metapage flush made the flush 69% more expensive, not cheaper,
+and every untouched component stayed within 1.4%. The mechanism is in MDBX's
+own description: the deferred flush is taken at the next non-read-only commit.
+Catch-up commits once per batch with a large dirty set, so nothing is saved —
+the deferred metadata is simply paid alongside the next batch's own flush. The
+option was removed rather than kept as a knob that costs durability and returns
+nothing.
+
+One piece of that work is retained on its own merits. The batch commits the
+chainstate before the ledger, so a durable commit can only leave the chainstate
+ahead, and the driver's new truncation of the ledger to the executed tip is a
+no-op today. It stays because the reverse is not merely inconsistent but
+terminal: resuming would append at a height the ledger already covers and fail
+on contiguity from then on, with nothing else in the system able to repair it.
+The reindex driver already does this for the same reason.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at

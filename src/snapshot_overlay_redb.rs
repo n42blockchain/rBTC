@@ -1107,7 +1107,6 @@ mod tests {
                 snapshot_path: snapshot_path.to_owned(),
                 index_path: index_path.to_owned(),
                 capacity_bytes,
-                durability: crate::snapshot_overlay::OverlayDurability::Durable,
                 import_time: IMPORT_TIME,
                 mtp_by_height: (0..=identity.height).map(mtp_for).collect(),
             },
