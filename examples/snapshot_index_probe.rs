@@ -154,11 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hits = 0_u64;
     if batched {
         for chunk in outpoints.chunks(BATCH) {
-            hits += index
-                .get_many(chunk)?
-                .into_iter()
-                .flatten()
-                .count() as u64;
+            hits += index.get_many(chunk)?.into_iter().flatten().count() as u64;
         }
     } else {
         for outpoint in &outpoints {

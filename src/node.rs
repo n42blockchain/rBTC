@@ -185,6 +185,19 @@ const PERCENT_DECIMAL_SCALE: u64 = 100_000;
 const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
 const MIN_PRUNE_RETENTION_BLOCKS: u32 = 288;
+/// Upper bound on the retained block window.
+///
+/// The ceiling used to be the default itself, so a target could only ever
+/// prune harder than default and never keep more — which also made capturing
+/// a replay corpus impossible. Retaining more blocks is not less safe, but it
+/// is not free either: block undo is pruned to exactly the ledger's oldest
+/// retained height, so raising this raises undo storage in step with it, by
+/// roughly the per-block undo size times the extra blocks. An operator asking
+/// for a long window needs a chainstate budget that can hold its undo.
+///
+/// The value keeps a batch-sized segment count well inside the ledger's
+/// 4,096-slot namespace at any realistic batch size.
+const MAX_PRUNE_RETENTION_BLOCKS: u32 = 100_000;
 const MIN_PRUNE_MAX_BYTES: u64 = 550 * 1024 * 1024;
 const DEFAULT_MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MINIMUM_FREE_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
@@ -1176,11 +1189,11 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
 }
 
 fn validate_storage_options(options: &Options) -> Result<(), String> {
-    if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS)
+    if !(MIN_PRUNE_RETENTION_BLOCKS..=MAX_PRUNE_RETENTION_BLOCKS)
         .contains(&options.ledger_retention.max_blocks)
     {
         return Err(format!(
-            "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+            "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {MAX_PRUNE_RETENTION_BLOCKS}"
         ));
     }
     if options.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
@@ -14435,9 +14448,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 let blocks = value
                     .parse::<u32>()
                     .map_err(|_| format!("invalid prune block target: {value}"))?;
-                if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS).contains(&blocks) {
+                if !(MIN_PRUNE_RETENTION_BLOCKS..=MAX_PRUNE_RETENTION_BLOCKS).contains(&blocks) {
                     return Err(format!(
-                        "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+                        "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {MAX_PRUNE_RETENTION_BLOCKS}"
                     ));
                 }
                 prune_blocks = Some(blocks);
@@ -18455,6 +18468,44 @@ mod tests {
         );
         assert_eq!(options.minimum_free_bytes, 2 * 1024 * 1024 * 1024);
 
+        // A window longer than the default is accepted. The ceiling used to be
+        // the default itself, which meant a target could only prune harder
+        // than default and never keep more. Undo storage follows the window,
+        // so this is an operator trade-off rather than a free setting, but it
+        // is a legitimate one — and it is what lets a replay corpus be
+        // captured at all.
+        let long_window = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "30000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(long_window.ledger_retention.max_blocks, 30_000);
+        assert!(
+            parse_options(
+                [
+                    "--network",
+                    "regtest",
+                    "--data-dir",
+                    "/tmp/rbtc-prune-parser",
+                    "--prune-blocks",
+                    &MAX_PRUNE_RETENTION_BLOCKS.to_string(),
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_ok(),
+            "the ceiling itself must be accepted"
+        );
+
         for arguments in [
             vec!["--prune-blocks", "576"],
             vec![
@@ -18467,7 +18518,7 @@ mod tests {
                 "--data-dir",
                 "/tmp/rbtc-prune-parser",
                 "--prune-blocks",
-                "1009",
+                "100001",
             ],
             vec![
                 "--data-dir",

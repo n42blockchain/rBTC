@@ -66,6 +66,13 @@ const INDEX_SEED: u64 = 0x7262_7463_2d69_6478;
 /// Upper bound of one encoded coin: CompactSize vout, coin-code VARINT,
 /// amount VARINT, script-size VARINT, and Core's 10,000-byte script ceiling.
 const MAX_COIN_WINDOW: u64 = 5 + 5 + 10 + 10 + 10_000;
+/// First-attempt read width for one coin record.
+///
+/// Sized to cover a CompactSize vout, the coin-code and amount VARINTs, the
+/// script-size VARINT, and a script well past the 32 bytes the largest
+/// standard template compresses to. Records needing more are re-read at
+/// [`MAX_COIN_WINDOW`].
+const COIN_PROBE_WINDOW: u64 = 128;
 
 /// Failures while building, opening, or querying a snapshot access index.
 #[derive(Debug, Error)]
@@ -752,13 +759,42 @@ impl CoreSnapshotUtxoIndex {
             return Ok(None);
         }
 
-        let window = usize::try_from((self.snapshot_bytes - coin_offset).min(MAX_COIN_WINDOW))
-            .expect("bounded window fits usize");
-        buffer.clear();
-        buffer.resize(window, 0);
-        read_exact_at(&self.snapshot, buffer, coin_offset)?;
-        let mut cursor = Cursor::new(buffer.as_slice());
+        // Read a small window first. `MAX_COIN_WINDOW` is Core's worst case —
+        // a 10,000-byte raw script — but the six standard templates compress
+        // to 20 or 32 bytes, so a whole record is usually well under fifty.
+        // Always reading the worst case copied about 10 KB per lookup to
+        // decode roughly forty bytes of it. A record that genuinely needs
+        // more fails to parse out of the probe and is re-read at full width,
+        // so the outcome is identical either way — a corrupt record still
+        // reaches the same full-window parse it always did.
+        let available = self.snapshot_bytes - coin_offset;
+        let probe = COIN_PROBE_WINDOW.min(available);
+        let full = MAX_COIN_WINDOW.min(available);
+        let mut window = probe;
+        loop {
+            let length = usize::try_from(window).expect("bounded window fits usize");
+            buffer.clear();
+            buffer.resize(length, 0);
+            read_exact_at(&self.snapshot, buffer, coin_offset)?;
+            match self.parse_coin(buffer, vout) {
+                Ok(coin) => return Ok(coin),
+                Err(_) if window < full => window = full,
+                Err(error) => return Err(error),
+            }
+        }
+    }
 
+    /// Decodes one coin record from bytes already read out of the snapshot.
+    ///
+    /// Returns `Ok(None)` when the record's own vout does not match the
+    /// query, which is the second half of the exactness check — the first
+    /// being the group txid compared by the caller.
+    fn parse_coin(
+        &self,
+        bytes: &[u8],
+        vout: u32,
+    ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
+        let mut cursor = Cursor::new(bytes);
         let vout_read = read_compact_size(&mut cursor).map_err(corrupt)?;
         if u64::from(vout) != vout_read {
             return Ok(None);
