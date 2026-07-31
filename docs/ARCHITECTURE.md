@@ -967,6 +967,46 @@ streams the whole file. A cold cache would widen the gap between the resident
 and on-disk rows, and would favour the batched row further, since ordered
 reads are what readahead can serve.
 
+Batching was then measured on a full catch-up rather than a probe: the same
+machine, the same `utxo-935000.dat` and index, the same 10 GiB budget, with
+only the batched read added. The node routes every base lookup through it —
+`prefetch_prevalidated_active_block_utxos` resolves a whole 64-block batch's
+inputs in one `get_many` call, and execution then reads from that result — so
+the `utxo-prefetch` timing isolates exactly what changed.
+
+Over 25,344 matched blocks:
+
+| component | one at a time | batched | change |
+|---|---:|---:|---:|
+| `utxo-prefetch` | 223.6s | 199.2s | **−10.9%** |
+| `execution-core` | 2988.3s | 2973.1s | −0.5% |
+| `structure` | 121.2s | 122.5s | +1.0% |
+| `download` | 63.2s | 91.1s | +44.0% |
+
+The 24.4 seconds saved is real but small against a catch-up: about 0.7% of
+total batch time. Two things account for the gap between this and the probe's
+47%. `get_many` probes the overlay and tombstone tables for every outpoint
+before any base read happens, and that part is unchanged; and the share of
+inputs that reach the base at all falls steadily as the overlay fills, from
+nearly all of them at 935,000 to a minority by the tip. Measured on the first
+49 batches alone, where almost everything misses to the base, the improvement
+was 17.8%.
+
+End-to-end wall clock is not usable here and is deliberately not quoted as a
+result. This run took 73.67 minutes against the previous 62.81, but the
+regression is network: `download` rose 44%, the portion of `execute` outside
+`execution-core` — the wait for blocks to arrive — rose from 166.5s to 805.9s,
+while `execution-core`, `structure`, `stage`, and `publish` were all flat
+within 1%. A soak that fetches 25,000 blocks from live peers cannot resolve a
+storage change worth 0.7%, and treating its total as a verdict would report
+peer quality as a code result.
+
+The run is a strong control in one respect that does not depend on timing at
+all: it rebased at height 955,096, the same height as the previous run, with
+byte-identical output — 165,911,302 coins, 9,478,768,311 snapshot bytes,
+1,167,552,096 index bytes, 11,823,028 folded overlay entries. Reordering reads
+provably did not disturb what gets written.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
