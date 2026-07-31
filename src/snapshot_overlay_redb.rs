@@ -517,7 +517,7 @@ impl SnapshotOverlayRedbChainstate {
         let mut base_groups = BaseGroupReader::new(&self.snapshot_path)?;
         let mut overlay_rows = OverlayGroupReader::new(&overlay)?;
         let mut base_group = base_groups.next_group()?;
-        let mut overlay_group = overlay_rows.next_group();
+        let mut overlay_group = overlay_rows.next_group()?;
         loop {
             let take = match (&base_group, &overlay_group) {
                 (None, None) => break,
@@ -552,7 +552,7 @@ impl SnapshotOverlayRedbChainstate {
                 let (new_txid, mut new_coins) = overlay_group.take().expect("selected above");
                 txid = new_txid;
                 coins_in_group.append(&mut new_coins);
-                overlay_group = overlay_rows.next_group();
+                overlay_group = overlay_rows.next_group()?;
             }
             if coins_in_group.is_empty() {
                 continue;
@@ -628,24 +628,19 @@ impl SnapshotOverlayRedbChainstate {
         let identity_bytes = encode_identity(&identity, &new_base)?;
         {
             let write = self.db.begin_write().map_err(overlay_redb)?;
-            // `retain` with an always-false predicate empties each table
-            // while keeping the table itself defined, matching what the
+            // Dropping each table outright is far cheaper than walking every
+            // row out of it: `retain` with an always-false predicate removes
+            // entries one at a time, rewriting B-tree pages as it goes, which
+            // for a multi-million-row overlay is exactly the write
+            // amplification a rebase is trying to escape. Reopening in the
+            // same transaction recreates them empty, matching what the
             // fresh-open path materializes.
-            write
-                .open_table(OVERLAY)
-                .map_err(overlay_redb)?
-                .retain(|_, _| false)
-                .map_err(overlay_redb)?;
-            write
-                .open_table(TOMBSTONE)
-                .map_err(overlay_redb)?
-                .retain(|_, ()| false)
-                .map_err(overlay_redb)?;
-            write
-                .open_table(UNDO)
-                .map_err(overlay_redb)?
-                .retain(|_, _| false)
-                .map_err(overlay_redb)?;
+            write.delete_table(OVERLAY).map_err(overlay_redb)?;
+            write.delete_table(TOMBSTONE).map_err(overlay_redb)?;
+            write.delete_table(UNDO).map_err(overlay_redb)?;
+            let _ = write.open_table(OVERLAY).map_err(overlay_redb)?;
+            let _ = write.open_table(TOMBSTONE).map_err(overlay_redb)?;
+            let _ = write.open_table(UNDO).map_err(overlay_redb)?;
             let mut meta = write.open_table(META).map_err(overlay_redb)?;
             meta.insert(META_IDENTITY, identity_bytes.as_slice())
                 .map_err(overlay_redb)?;
@@ -682,40 +677,104 @@ impl SnapshotOverlayRedbChainstate {
     }
 }
 
-/// Groups the overlay table's key-ordered rows by txid.
-struct OverlayGroupReader {
-    rows: std::vec::IntoIter<([u8; 36], Utxo)>,
+/// Number of overlay rows read per page while materializing a rebase.
+///
+/// The merge only ever needs the next key in order, so the whole table never
+/// has to be resident. Paging keeps peak memory flat in the overlay's size —
+/// at a 10 GiB budget it can hold several million coins, which materialized
+/// in full would cost hundreds of megabytes on top of the engine's own cache.
+const OVERLAY_PAGE_ROWS: usize = 16_384;
+
+/// Groups the overlay table's key-ordered rows by txid, reading a bounded
+/// page at a time rather than materializing the whole table.
+struct OverlayGroupReader<'txn> {
+    table: &'txn redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    page: std::vec::IntoIter<([u8; 36], Utxo)>,
+    /// Last key returned, so the next page resumes strictly after it.
+    resume_after: Option<[u8; 36]>,
+    exhausted: bool,
     pending: Option<([u8; 36], Utxo)>,
 }
 
-impl OverlayGroupReader {
+impl<'txn> OverlayGroupReader<'txn> {
     fn new(
-        overlay: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+        table: &'txn redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let mut rows = Vec::new();
-        for row in overlay.iter().map_err(overlay_redb)? {
+        let mut reader = Self {
+            table,
+            page: Vec::new().into_iter(),
+            resume_after: None,
+            exhausted: false,
+            pending: None,
+        };
+        reader.fill_page()?;
+        Ok(reader)
+    }
+
+    /// Reads the next bounded run of rows, resuming strictly after the last
+    /// key already returned.
+    fn fill_page(&mut self) -> Result<(), SnapshotOverlayError> {
+        if self.exhausted {
+            return Ok(());
+        }
+        let mut rows = Vec::with_capacity(OVERLAY_PAGE_ROWS);
+        let range = match &self.resume_after {
+            None => self.table.range::<&[u8]>(..).map_err(overlay_redb)?,
+            // Exclusive lower bound: the previous page ended on this key.
+            Some(previous) => self
+                .table
+                .range::<&[u8]>((
+                    std::ops::Bound::Excluded(previous.as_slice()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map_err(overlay_redb)?,
+        };
+        for row in range {
             let (key, value) = row.map_err(overlay_redb)?;
             let key: [u8; 36] = key
                 .value()
                 .try_into()
                 .map_err(|_| SnapshotOverlayError::Invalid("overlay key width"))?;
             rows.push((key, Utxo::decode(value.value())?));
+            if rows.len() == OVERLAY_PAGE_ROWS {
+                break;
+            }
         }
-        Ok(Self {
-            rows: rows.into_iter(),
-            pending: None,
-        })
+        if let Some((last, _)) = rows.last() {
+            self.resume_after = Some(*last);
+        }
+        self.exhausted = rows.len() < OVERLAY_PAGE_ROWS;
+        self.page = rows.into_iter();
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<([u8; 36], Utxo)>, SnapshotOverlayError> {
+        if let Some(row) = self.pending.take() {
+            return Ok(Some(row));
+        }
+        if let Some(row) = self.page.next() {
+            return Ok(Some(row));
+        }
+        if self.exhausted {
+            return Ok(None);
+        }
+        self.fill_page()?;
+        Ok(self.page.next())
     }
 
     #[allow(clippy::type_complexity)]
-    fn next_group(&mut self) -> Option<([u8; 32], Vec<(u32, Utxo)>)> {
-        let first = self.pending.take().or_else(|| self.rows.next())?;
+    fn next_group(&mut self) -> Result<Option<([u8; 32], Vec<(u32, Utxo)>)>, SnapshotOverlayError> {
+        let Some(first) = self.next_row()? else {
+            return Ok(None);
+        };
         let txid: [u8; 32] = first.0[..32].try_into().expect("fixed key length");
         let mut coins = vec![(
             u32::from_le_bytes(first.0[32..].try_into().expect("fixed key length")),
             first.1,
         )];
-        for row in self.rows.by_ref() {
+        // A txid group can straddle a page boundary, so keep pulling rows
+        // until the txid changes rather than until the page runs out.
+        while let Some(row) = self.next_row()? {
             if row.0[..32] == txid {
                 coins.push((
                     u32::from_le_bytes(row.0[32..].try_into().expect("fixed key length")),
@@ -726,7 +785,7 @@ impl OverlayGroupReader {
                 break;
             }
         }
-        Some((txid, coins))
+        Ok(Some((txid, coins)))
     }
 }
 
@@ -889,17 +948,21 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
         &self,
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let (spent, created) = crate::snapshot_overlay::fold_connect_batch(transitions)?;
         let _guard = self.lock();
         let transaction = self.begin_durable_write()?;
         for transition in transitions {
             Self::advance_tip(&transaction, transition.expected_parent, transition.next)?;
-            self.connect_mutation(&transaction, &transition.spent, &transition.created)?;
             let mut undo_table = transaction.open_table(UNDO)?;
             undo_table.insert(
                 transition.next.hash.to_byte_array().as_slice(),
                 encode_block_undo(&transition.transaction_undos)?.as_slice(),
             )?;
         }
+        self.connect_mutation(&transaction, &spent, &created)?;
         transaction.commit()?;
         Ok(())
     }

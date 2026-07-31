@@ -554,6 +554,10 @@ impl SnapshotOverlayChainstate {
     }
 
     fn commit_transitions(&self, transitions: &[ConnectTransition]) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let (spent, created) = fold_connect_batch(transitions)?;
         let _guard = self.lock();
         let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
@@ -567,13 +571,6 @@ impl SnapshotOverlayChainstate {
                 transition.expected_parent,
                 transition.next,
             )?;
-            self.connect_mutation(
-                &transaction,
-                &overlay,
-                &tombstone,
-                &transition.spent,
-                &transition.created,
-            )?;
             let block_undo = encode_block_undo(&transition.transaction_undos)?;
             transaction
                 .put(
@@ -584,6 +581,7 @@ impl SnapshotOverlayChainstate {
                 )
                 .map_err(utxo_mdbx)?;
         }
+        self.connect_mutation(&transaction, &overlay, &tombstone, &spent, &created)?;
         transaction.commit().map_err(utxo_mdbx)?;
         Ok(())
     }
@@ -681,9 +679,9 @@ impl SnapshotOverlayChainstate {
         let mut core_hash = sha256d::Hash::engine();
         let mut written = 0_u64;
         let mut base_groups = BaseGroupReader::new(&self.snapshot_path)?;
-        let mut overlay_groups = OverlayGroupReader::new(&transaction, &overlay)?;
+        let mut overlay_groups = OverlayGroupReader::new(&transaction, overlay)?;
         let mut base_group = base_groups.next_group()?;
-        let mut overlay_group = overlay_groups.next_group();
+        let mut overlay_group = overlay_groups.next_group()?;
         loop {
             let take_base = match (&base_group, &overlay_group) {
                 (None, None) => break,
@@ -707,7 +705,7 @@ impl SnapshotOverlayChainstate {
                 let (new_txid, mut new_coins) = overlay_group.take().expect("selected above");
                 txid = new_txid;
                 coins_in_group.append(&mut new_coins);
-                overlay_group = overlay_groups.next_group();
+                overlay_group = overlay_groups.next_group()?;
             }
             if coins_in_group.is_empty() {
                 continue;
@@ -921,6 +919,44 @@ impl SnapshotOverlayChainstate {
     }
 }
 
+/// Folds a batch of transitions into one sorted UTXO mutation.
+///
+/// Applying each transition separately walks the B-tree once per block, so a
+/// 64-block batch touches the same pages up to 64 times in whatever order the
+/// blocks happen to fall. Folding first collapses coins created and then
+/// spent inside the batch — they never need to reach storage at all — and
+/// sorting means the single remaining pass moves through the tree in key
+/// order, which is what the unified redb chainstate already does for the same
+/// reason.
+///
+/// Tip linkage is still checked per transition, so the compare-and-swap chain
+/// across the batch is unchanged.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fold_connect_batch(
+    transitions: &[ConnectTransition],
+) -> Result<(Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>), ChainStoreError> {
+    let mut spent: std::collections::BTreeSet<OutPointKey> = std::collections::BTreeSet::new();
+    let mut created: std::collections::BTreeMap<OutPointKey, Utxo> =
+        std::collections::BTreeMap::new();
+    for transition in transitions {
+        for key in &transition.spent {
+            // A coin created earlier in this same batch and spent now never
+            // has to be written; anything else is a real spend.
+            if created.remove(key).is_none() && !spent.insert(*key) {
+                return Err(ChainStoreError::Utxo(UtxoError::DuplicateSpend(*key)));
+            }
+        }
+        for (key, utxo) in &transition.created {
+            if created.insert(*key, utxo.clone()).is_some() {
+                return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
+            }
+        }
+    }
+    // `BTreeSet`/`BTreeMap` already yield keys in order, which is the order
+    // the single write pass wants.
+    Ok((spent.into_iter().collect(), created.into_iter().collect()))
+}
+
 /// Removes its tracked paths on drop unless [`Self::disarm`] was called.
 ///
 /// [`SnapshotOverlayChainstate::rebase_into`] uses this so every early
@@ -1024,42 +1060,109 @@ impl BaseGroupReader {
     }
 }
 
-/// Groups the overlay cursor's key-ordered rows by txid.
-struct OverlayGroupReader {
-    rows: std::vec::IntoIter<([u8; 36], Utxo)>,
+/// Number of overlay rows read per page while materializing a rebase.
+///
+/// The merge only ever needs the next key in order, so the whole table never
+/// has to be resident. Paging keeps peak memory flat in the overlay's size —
+/// at a 10 GiB budget it can hold several million coins, which materialized
+/// in full would cost hundreds of megabytes on top of the engine's own cache.
+const OVERLAY_PAGE_ROWS: usize = 16_384;
+
+/// Groups the overlay's key-ordered rows by txid, reading a bounded page at a
+/// time rather than materializing the whole table.
+struct OverlayGroupReader<'txn, K: TransactionKind> {
+    transaction: &'txn Transaction<'txn, K, NoWriteMap>,
+    table: Table<'txn>,
+    page: std::vec::IntoIter<([u8; 36], Utxo)>,
+    /// Last key returned, so the next page resumes strictly after it.
+    resume_after: Option<[u8; 36]>,
+    exhausted: bool,
     pending: Option<([u8; 36], Utxo)>,
 }
 
-impl OverlayGroupReader {
-    fn new<K: TransactionKind>(
-        transaction: &Transaction<'_, K, NoWriteMap>,
-        overlay: &Table<'_>,
+impl<'txn, K: TransactionKind> OverlayGroupReader<'txn, K> {
+    fn new(
+        transaction: &'txn Transaction<'txn, K, NoWriteMap>,
+        table: Table<'txn>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let mut cursor = transaction.cursor(overlay)?;
-        let mut rows = Vec::new();
-        for row in cursor.iter_start::<Vec<u8>, Vec<u8>>() {
-            let (key, value) = row?;
+        let mut reader = Self {
+            transaction,
+            table,
+            page: Vec::new().into_iter(),
+            resume_after: None,
+            exhausted: false,
+            pending: None,
+        };
+        reader.fill_page()?;
+        Ok(reader)
+    }
+
+    /// Reads the next bounded run of rows, resuming strictly after the last
+    /// key already returned.
+    fn fill_page(&mut self) -> Result<(), SnapshotOverlayError> {
+        if self.exhausted {
+            return Ok(());
+        }
+        let mut cursor = self.transaction.cursor(&self.table)?;
+        let mut rows = Vec::with_capacity(OVERLAY_PAGE_ROWS);
+        let first = match self.resume_after {
+            None => cursor.first::<Vec<u8>, Vec<u8>>()?,
+            Some(previous) => {
+                // `set_range` lands on the first key >= the argument, which
+                // is the key just returned, so step once past it.
+                match cursor.set_range::<Vec<u8>, Vec<u8>>(&previous)? {
+                    None => None,
+                    Some(_) => cursor.next::<Vec<u8>, Vec<u8>>()?,
+                }
+            }
+        };
+        let mut row = first;
+        while let Some((key, value)) = row {
             let key: [u8; 36] = key
                 .as_slice()
                 .try_into()
                 .map_err(|_| SnapshotOverlayError::Invalid("overlay key width"))?;
             rows.push((key, Utxo::decode(&value)?));
+            if rows.len() == OVERLAY_PAGE_ROWS {
+                break;
+            }
+            row = cursor.next::<Vec<u8>, Vec<u8>>()?;
         }
-        Ok(Self {
-            rows: rows.into_iter(),
-            pending: None,
-        })
+        if let Some((last, _)) = rows.last() {
+            self.resume_after = Some(*last);
+        }
+        self.exhausted = rows.len() < OVERLAY_PAGE_ROWS;
+        self.page = rows.into_iter();
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<([u8; 36], Utxo)>, SnapshotOverlayError> {
+        if let Some(row) = self.pending.take() {
+            return Ok(Some(row));
+        }
+        if let Some(row) = self.page.next() {
+            return Ok(Some(row));
+        }
+        if self.exhausted {
+            return Ok(None);
+        }
+        self.fill_page()?;
+        Ok(self.page.next())
     }
 
     #[allow(clippy::type_complexity)]
-    fn next_group(&mut self) -> Option<([u8; 32], Vec<(u32, Utxo)>)> {
-        let first = self.pending.take().or_else(|| self.rows.next())?;
+    fn next_group(&mut self) -> Result<Option<([u8; 32], Vec<(u32, Utxo)>)>, SnapshotOverlayError> {
+        let Some(first) = self.next_row()? else {
+            return Ok(None);
+        };
         let txid: [u8; 32] = first.0[..32].try_into().expect("fixed key length");
         let mut coins = vec![(
             u32::from_le_bytes(first.0[32..].try_into().expect("fixed key length")),
             first.1,
         )];
-        for row in self.rows.by_ref() {
+        // A txid group can straddle a page boundary, so keep pulling rows
+        // until the txid changes rather than until the page runs out.
+        while let Some(row) = self.next_row()? {
             if row.0[..32] == txid {
                 coins.push((
                     u32::from_le_bytes(row.0[32..].try_into().expect("fixed key length")),
@@ -1070,7 +1173,7 @@ impl OverlayGroupReader {
                 break;
             }
         }
-        Some((txid, coins))
+        Ok(Some((txid, coins)))
     }
 }
 
@@ -2325,6 +2428,71 @@ pub(crate) mod tests {
         assert!(new_index.exists());
     }
 
+    /// Regression test for the batch fold: a coin created and then spent
+    /// inside the same batch must cancel out and never reach storage, while
+    /// the per-block tip compare-and-swap chain still runs for every
+    /// transition. Folding is what lets a 64-block batch touch the B-tree
+    /// once in key order instead of once per block in arbitrary order.
+    #[test]
+    fn batch_folding_cancels_coins_created_and_spent_within_the_batch() {
+        let (_directory, store, identity) = setup(32 << 20);
+        let ephemeral = overlay_coin(101, 7);
+        let survivor = overlay_coin(102, 9);
+        store
+            .commit_connect_batch(&[
+                ConnectTransition {
+                    expected_parent: identity.block_hash,
+                    next: tip(101, block_hash(101)),
+                    spent: Vec::new(),
+                    created: vec![(key(30, 0), ephemeral)],
+                    transaction_undos: Vec::new(),
+                },
+                ConnectTransition {
+                    expected_parent: block_hash(101),
+                    next: tip(102, block_hash(102)),
+                    // Spends the coin the previous transition created.
+                    spent: vec![key(30, 0)],
+                    created: vec![(key(31, 0), survivor.clone())],
+                    transaction_undos: Vec::new(),
+                },
+            ])
+            .unwrap();
+
+        // The ephemeral coin never existed as far as storage is concerned,
+        // and crucially left no tombstone either — it was never a base coin.
+        assert_eq!(store.get(key(30, 0)).unwrap(), None);
+        assert_eq!(store.get(key(31, 0)).unwrap().as_ref(), Some(&survivor));
+        assert_eq!(store.tier_stats().unwrap(), TierStats { hot: 1, cold: 4 });
+        assert_eq!(store.execution_tip().unwrap(), tip(102, block_hash(102)));
+
+        // Both blocks still recorded their own undo.
+        assert!(store.block_undo(block_hash(101)).unwrap().is_some());
+        assert!(store.block_undo(block_hash(102)).unwrap().is_some());
+
+        // A batch that double-spends across transitions is still rejected.
+        assert!(matches!(
+            store
+                .commit_connect_batch(&[
+                    ConnectTransition {
+                        expected_parent: block_hash(102),
+                        next: tip(103, block_hash(103)),
+                        spent: vec![key(31, 0)],
+                        created: Vec::new(),
+                        transaction_undos: Vec::new(),
+                    },
+                    ConnectTransition {
+                        expected_parent: block_hash(103),
+                        next: tip(104, block_hash(104)),
+                        spent: vec![key(31, 0)],
+                        created: Vec::new(),
+                        transaction_undos: Vec::new(),
+                    },
+                ])
+                .unwrap_err(),
+            ChainStoreError::Utxo(UtxoError::DuplicateSpend(_))
+        ));
+    }
+
     /// Regression test for a code-review finding: `rebase_into` used to
     /// `remove_dir_all` the old environment directory and then `rename` the
     /// freshly built one into place. If the process were interrupted between
@@ -2490,9 +2658,9 @@ pub(crate) mod tests {
 
         // Phase 1: replay the exact expected-side merge rebase_into performs.
         let mut base_groups = BaseGroupReader::new(std::path::Path::new(&base_snapshot)).unwrap();
-        let mut overlay_groups = OverlayGroupReader::new(&transaction, &overlay).unwrap();
+        let mut overlay_groups = OverlayGroupReader::new(&transaction, overlay).unwrap();
         let mut base_group = base_groups.next_group().unwrap();
-        let mut overlay_group = overlay_groups.next_group();
+        let mut overlay_group = overlay_groups.next_group().unwrap();
         let mut expected_full: Vec<([u8; 32], u32, Utxo)> = Vec::new();
         loop {
             let take_base = match (&base_group, &overlay_group) {
@@ -2519,7 +2687,7 @@ pub(crate) mod tests {
                 let (new_txid, mut new_coins) = overlay_group.take().unwrap();
                 txid = new_txid;
                 coins_in_group.append(&mut new_coins);
-                overlay_group = overlay_groups.next_group();
+                overlay_group = overlay_groups.next_group().unwrap();
             }
             coins_in_group.sort_unstable_by_key(|(vout, _)| *vout);
             for (vout, utxo) in coins_in_group {
