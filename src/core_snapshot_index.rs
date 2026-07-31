@@ -23,11 +23,14 @@
 //! network, base block hash, coin count, byte length, and full SHA-256; the
 //! container itself is covered by a trailing SHA-256 and fails closed on any
 //! damage. Peak build memory is one 52-byte location record per coin (about
-//! 8 GiB for the 935,000-height mainnet set), while lookups keep only the
-//! hash levels and packed table resident.
+//! 8 GiB for the 935,000-height mainnet set). Lookups keep only the hash
+//! levels resident — about 68 MiB for that set — and read each packed table
+//! entry from the container at its computed bit position, so the roughly
+//! 1.02 GiB offset table costs one small positioned read per lookup instead
+//! of permanent memory.
 
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{BufReader, Cursor, Read},
     path::Path,
 };
@@ -52,6 +55,10 @@ const INDEX_MAGIC: &[u8; 8] = b"RBTCMPHF";
 const INDEX_VERSION: u16 = 1;
 const INDEX_HEADER_BYTES: usize = 100;
 const INDEX_DIGEST_BYTES: usize = 32;
+/// Staging window for streaming the packed offset table at open.
+///
+/// Must stay a multiple of 8 so the window never splits a 64-bit word.
+const INDEX_READ_WINDOW_BYTES: usize = 1024 * 1024;
 /// Fixed build seed keeps the published index byte-reproducible. The key set
 /// is authenticated against a release-pinned UTXO-set hash, so an adversary
 /// cannot select keys against the fixed SipHash keys.
@@ -415,7 +422,11 @@ pub struct CoreSnapshotUtxoIndex {
     offset_bits: u8,
     backref_bits: u8,
     mphf: Mphf,
-    table: Vec<u64>,
+    /// The index container, kept open so the packed table can be read per
+    /// lookup instead of held in memory.
+    index: File,
+    /// Byte offset of the packed offset table within [`Self::index`].
+    table_start: u64,
     snapshot: File,
 }
 
@@ -437,15 +448,33 @@ impl CoreSnapshotUtxoIndex {
         index_path: impl AsRef<Path>,
         snapshot_path: impl AsRef<Path>,
     ) -> Result<Self, CoreSnapshotIndexError> {
-        let bytes = fs::read(index_path.as_ref())?;
-        if bytes.len() < INDEX_HEADER_BYTES + INDEX_DIGEST_BYTES {
+        // The container is streamed rather than read whole. Buffering it and
+        // then decoding out of that buffer held two copies of a gigabyte-scale
+        // structure at once — for the 935,000-height mainnet index, a 1.08 GiB
+        // read plus a 1.02 GiB offset table, about 2.16 GiB of peak resident
+        // memory to end up holding 1.09 GiB. Streaming keeps only the section
+        // being decoded, so the peak is the final structure itself.
+        //
+        // The cost is that header fields are now parsed before the trailing
+        // digest has been checked, so they must not be trusted to size any
+        // allocation. They are not: every derived length is reconciled against
+        // the file's real length below, which bounds allocation by the bytes
+        // that actually exist. The digest is still verified before `open`
+        // returns, so no lookup is ever served from unverified content.
+        let index_file = File::open(index_path.as_ref())?;
+        let container_bytes = index_file.metadata()?.len();
+        let container_floor = u64::try_from(INDEX_HEADER_BYTES + INDEX_DIGEST_BYTES)
+            .expect("header and digest sizes are small constants");
+        if container_bytes < container_floor {
             return Err(CoreSnapshotIndexError::Invalid("truncated container"));
         }
-        let (body, stored_digest) = bytes.split_at(bytes.len() - INDEX_DIGEST_BYTES);
-        let digest: [u8; 32] = Sha256::digest(body).into();
-        if digest.as_slice() != stored_digest {
-            return Err(CoreSnapshotIndexError::Invalid("container digest mismatch"));
-        }
+        let mut reader = BufReader::new(index_file);
+        let mut container_digest = Sha256::new();
+
+        let mut header = [0_u8; INDEX_HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        container_digest.update(header);
+        let body = &header[..];
         if &body[..8] != INDEX_MAGIC {
             return Err(CoreSnapshotIndexError::Invalid("magic"));
         }
@@ -469,28 +498,83 @@ impl CoreSnapshotUtxoIndex {
         if offset_bits == 0 || offset_bits > 63 || backref_bits == 0 || backref_bits > 32 {
             return Err(CoreSnapshotIndexError::Invalid("entry width out of range"));
         }
-        let (mphf, consumed) = Mphf::decode(&body[INDEX_HEADER_BYTES..])?;
-        if mphf.key_count() != coins {
-            return Err(CoreSnapshotIndexError::Invalid(
-                "hash function does not cover the coin count",
-            ));
-        }
+        // The hash function's own length is not recorded, but the offset
+        // table's is derivable from the header, so the remainder of the body
+        // is the hash function. Reconciling the three against the real file
+        // length is what keeps a damaged header from sizing an allocation:
+        // every section must fit in bytes that exist.
         let entry_bits = u64::from(offset_bits) + u64::from(backref_bits);
         let table_words = coins
             .checked_mul(entry_bits)
             .ok_or(CoreSnapshotIndexError::Invalid("table size overflow"))?
             .div_ceil(64);
-        let table_bytes = usize::try_from(table_words * 8)
-            .map_err(|_| CoreSnapshotIndexError::Invalid("table size overflow"))?;
-        let table_start = INDEX_HEADER_BYTES + consumed;
-        if body.len() != table_start + table_bytes {
-            return Err(CoreSnapshotIndexError::Invalid("table length mismatch"));
+        let table_bytes = table_words
+            .checked_mul(8)
+            .ok_or(CoreSnapshotIndexError::Invalid("table size overflow"))?;
+        let body_bytes = container_bytes
+            - u64::try_from(INDEX_DIGEST_BYTES).expect("digest size is a small constant");
+        let header_bytes =
+            u64::try_from(INDEX_HEADER_BYTES).expect("header size is a small constant");
+        let mphf_bytes = body_bytes
+            .checked_sub(header_bytes)
+            .and_then(|rest| rest.checked_sub(table_bytes))
+            .filter(|mphf_bytes| *mphf_bytes > 0)
+            .ok_or(CoreSnapshotIndexError::Invalid("table length mismatch"))?;
+
+        let mut mphf_section = vec![
+            0_u8;
+            usize::try_from(mphf_bytes).map_err(|_| {
+                CoreSnapshotIndexError::Invalid("hash function exceeds platform limits")
+            })?
+        ];
+        reader.read_exact(&mut mphf_section)?;
+        container_digest.update(&mphf_section);
+        let (mphf, consumed) = Mphf::decode(&mphf_section)?;
+        if consumed != mphf_section.len() {
+            return Err(CoreSnapshotIndexError::Invalid(
+                "hash function length mismatch",
+            ));
         }
-        let table: Vec<u64> = body[table_start..]
-            .chunks_exact(8)
-            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("chunked by 8")))
-            .collect();
-        drop(bytes);
+        drop(mphf_section);
+        if mphf.key_count() != coins {
+            return Err(CoreSnapshotIndexError::Invalid(
+                "hash function does not cover the coin count",
+            ));
+        }
+
+        // The packed table is verified but deliberately not retained. It is
+        // the overwhelming majority of the container — for the 935,000-height
+        // mainnet index, about 1.02 GiB of the 1.08 GiB total — and holding it
+        // resident buys nothing a slot lookup cannot get from the file. Each
+        // lookup instead reads its own entry at a computed bit position (see
+        // `read_table_entry`), trading one small positioned read, which the
+        // page cache absorbs for hot regions, against `coins × entry_bits` of
+        // permanently resident memory. The lookup already reads the snapshot
+        // file for the txid and coin bytes, so this adds a third read to a
+        // path that was never memory-resident to begin with.
+        let table_start = header_bytes + mphf_bytes;
+        let mut window = vec![0_u8; INDEX_READ_WINDOW_BYTES];
+        let mut remaining = table_bytes;
+        while remaining > 0 {
+            let take =
+                usize::try_from(remaining.min(
+                    u64::try_from(INDEX_READ_WINDOW_BYTES).expect("window is a small constant"),
+                ))
+                .expect("bounded by the window length");
+            let filled = &mut window[..take];
+            reader.read_exact(filled)?;
+            container_digest.update(&*filled);
+            remaining -= u64::try_from(take).expect("bounded by the window length");
+        }
+        drop(window);
+
+        // Only now is any of the above trustworthy.
+        let mut stored_digest = [0_u8; INDEX_DIGEST_BYTES];
+        reader.read_exact(&mut stored_digest)?;
+        if <[u8; 32]>::from(container_digest.finalize()) != stored_digest {
+            return Err(CoreSnapshotIndexError::Invalid("container digest mismatch"));
+        }
+        let index = reader.into_inner();
 
         let snapshot = File::open(snapshot_path.as_ref())?;
         if snapshot.metadata()?.len() != snapshot_bytes {
@@ -519,9 +603,45 @@ impl CoreSnapshotUtxoIndex {
             offset_bits,
             backref_bits,
             mphf,
-            table,
+            index,
+            table_start,
             snapshot,
         })
+    }
+
+    /// Reads one packed `(coin_offset, backref)` entry from the index file.
+    ///
+    /// Entries are bit-packed and not byte-aligned, so the read covers the
+    /// bytes the entry straddles and the value is shifted out of them. The
+    /// widths are validated at open to at most 63 and 32 bits, so an entry
+    /// spans at most 95 bits and the covering window is at most 13 bytes —
+    /// always a single positioned read.
+    ///
+    /// The table was written as little-endian 64-bit words, which for bit
+    /// addressing is the same sequence as a little-endian byte stream: global
+    /// bit `b` lives in byte `b / 8` at bit `b % 8` under either reading.
+    fn read_table_entry(&self, slot: u64) -> Result<(u64, u64), CoreSnapshotIndexError> {
+        let entry_bits = u64::from(self.offset_bits) + u64::from(self.backref_bits);
+        let bit_start = slot * entry_bits;
+        let byte_start = bit_start / 8;
+        let bit_in_byte = bit_start % 8;
+        let span_bytes = usize::try_from((bit_in_byte + entry_bits).div_ceil(8))
+            .expect("entry spans at most 13 bytes");
+        let mut covering = [0_u8; 16];
+        read_exact_at(
+            &self.index,
+            &mut covering[..span_bytes],
+            self.table_start + byte_start,
+        )?;
+        // Both masks are narrower than 64 bits — open validates the widths at
+        // 63 and 32 — so neither value can exceed `u64`.
+        let packed = u128::from_le_bytes(covering) >> bit_in_byte;
+        let coin_offset = u64::try_from(packed & ((1_u128 << self.offset_bits) - 1))
+            .expect("offset width is at most 63 bits");
+        let backref =
+            u64::try_from((packed >> self.offset_bits) & ((1_u128 << self.backref_bits) - 1))
+                .expect("backref width is at most 32 bits");
+        Ok((coin_offset, backref))
     }
 
     /// Looks one outpoint up directly in the compressed snapshot file.
@@ -544,14 +664,7 @@ impl CoreSnapshotUtxoIndex {
         let Some(slot) = self.mphf.index(key.as_bytes()) else {
             return Ok(None);
         };
-        let entry_bits = u64::from(self.offset_bits) + u64::from(self.backref_bits);
-        let base = slot * entry_bits;
-        let coin_offset = read_bits(&self.table, base, self.offset_bits);
-        let backref = read_bits(
-            &self.table,
-            base + u64::from(self.offset_bits),
-            self.backref_bits,
-        );
+        let (coin_offset, backref) = self.read_table_entry(slot)?;
         let txid_offset = coin_offset
             .checked_sub(backref)
             .filter(|offset| *offset >= u64::try_from(METADATA_BYTES).expect("constant fits u64"))
@@ -718,16 +831,6 @@ fn write_bits(words: &mut [u64], bit_position: u64, width: u8, value: u64) {
     }
 }
 
-fn read_bits(words: &[u64], bit_position: u64, width: u8) -> u64 {
-    let word = usize::try_from(bit_position / 64).expect("table words fit usize");
-    let shift = bit_position % 64;
-    let mut value = words[word] >> shift;
-    if shift + u64::from(width) > 64 {
-        value |= words[word + 1] << (64 - shift);
-    }
-    value & ((1_u64 << width) - 1)
-}
-
 #[cfg(unix)]
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
@@ -774,6 +877,8 @@ fn publish_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use std::collections::BTreeMap;
 
     use bitcoin::Txid;
@@ -1050,6 +1155,85 @@ mod tests {
         assert!(!directory.path().join("utxo.rbtcidx").exists());
     }
 
+    /// Lookups read each packed entry straight from the container, so the
+    /// bit math has to agree with what `write_bits` laid down — including
+    /// entries that straddle byte and 64-bit word boundaries, which is the
+    /// common case once slots are numbered in the hundreds of millions.
+    ///
+    /// The widths here are the ones the real 935,000-height mainnet index
+    /// uses (34-bit offsets, 19-bit backrefs, 53 bits per entry), because a
+    /// width that happens to divide 64 would not exercise straddling at all.
+    #[test]
+    fn reads_packed_entries_across_byte_and_word_boundaries() {
+        const OFFSET_BITS: u8 = 34;
+        const BACKREF_BITS: u8 = 19;
+        const SLOTS: u64 = 4_096;
+        /// A non-zero, odd table start proves the read is relative to it and
+        /// does not silently assume alignment.
+        const TABLE_START: u64 = 37;
+
+        let entry_bits = u64::from(OFFSET_BITS) + u64::from(BACKREF_BITS);
+        let expected: Vec<(u64, u64)> = (0..SLOTS)
+            .map(|slot| {
+                // Values chosen to keep every bit position in play rather
+                // than clustering near zero.
+                (
+                    slot.wrapping_mul(0x9E37_79B9) & ((1 << OFFSET_BITS) - 1),
+                    (slot.wrapping_mul(0x85EB_CA6B) & ((1 << BACKREF_BITS) - 1)) | 1,
+                )
+            })
+            .collect();
+
+        let mut words = vec![0_u64; usize::try_from((SLOTS * entry_bits).div_ceil(64)).unwrap()];
+        for (slot, (offset, backref)) in expected.iter().enumerate() {
+            let base = u64::try_from(slot).unwrap() * entry_bits;
+            write_bits(&mut words, base, OFFSET_BITS, *offset);
+            write_bits(
+                &mut words,
+                base + u64::from(OFFSET_BITS),
+                BACKREF_BITS,
+                *backref,
+            );
+        }
+
+        let directory = TempDir::new().unwrap();
+        let container_path = directory.path().join("packed.bin");
+        let mut container = vec![0xAB_u8; usize::try_from(TABLE_START).unwrap()];
+        for word in &words {
+            container.extend_from_slice(&word.to_le_bytes());
+        }
+        // Padding past the end: the last entry's covering window may reach
+        // beyond the final word, exactly as it does in a real container whose
+        // table is followed by the trailing digest.
+        container.extend_from_slice(&[0xCD_u8; INDEX_DIGEST_BYTES]);
+        fs::write(&container_path, &container).unwrap();
+
+        let index = CoreSnapshotUtxoIndex {
+            network: Network::Bitcoin,
+            base_block_hash: BlockHash::from_byte_array([0_u8; 32]),
+            base_height: 0,
+            coins: SLOTS,
+            snapshot_bytes: 0,
+            snapshot_sha256: [0_u8; 32],
+            offset_bits: OFFSET_BITS,
+            backref_bits: BACKREF_BITS,
+            mphf: Mphf::build(1, |_| vec![0_u8; 36], INDEX_SEED).unwrap(),
+            index: File::open(&container_path).unwrap(),
+            table_start: TABLE_START,
+            snapshot: File::open(&container_path).unwrap(),
+        };
+
+        for (slot, entry) in expected.iter().enumerate() {
+            assert_eq!(
+                index
+                    .read_table_entry(u64::try_from(slot).unwrap())
+                    .unwrap(),
+                *entry,
+                "slot {slot}"
+            );
+        }
+    }
+
     #[test]
     fn rejects_tampered_or_truncated_containers() {
         let directory = TempDir::new().unwrap();
@@ -1071,12 +1255,27 @@ mod tests {
             CoreSnapshotIndexError::Invalid("container digest mismatch")
         ));
 
-        let truncated_path = directory.path().join("truncated.rbtcidx");
-        fs::write(&truncated_path, &container[..container.len() - 10]).unwrap();
-        assert!(matches!(
-            CoreSnapshotUtxoIndex::open(&truncated_path, &snapshot).unwrap_err(),
-            CoreSnapshotIndexError::Invalid(_)
-        ));
+        // Truncation is checked at several depths rather than one. Because
+        // open streams the container, the section sizes are reconciled against
+        // the file's real length, so where the damage lands decides which
+        // check fires first — a short tail shrinks the derived hash-function
+        // section and is caught decoding it, while deeper cuts fail the
+        // length reconciliation or the header itself. The contract under test
+        // is that every one of them fails closed, not which check catches it.
+        for cut in [1_usize, 10, 64, container.len() / 2, container.len() - 1] {
+            let truncated_path = directory.path().join(format!("truncated-{cut}.rbtcidx"));
+            fs::write(&truncated_path, &container[..container.len() - cut]).unwrap();
+            let error = CoreSnapshotUtxoIndex::open(&truncated_path, &snapshot).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    CoreSnapshotIndexError::Invalid(_)
+                        | CoreSnapshotIndexError::Mphf(_)
+                        | CoreSnapshotIndexError::Io(_)
+                ),
+                "truncation by {cut} must fail closed, got {error}"
+            );
+        }
     }
 
     #[test]
