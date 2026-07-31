@@ -63,8 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let stat = transaction.table_stat(&table)?;
-        let pages =
-            u64::try_from(stat.leaf_pages() + stat.branch_pages() + stat.overflow_pages())?;
+        let pages = u64::try_from(stat.leaf_pages() + stat.branch_pages() + stat.overflow_pages())?;
         total_pages += pages;
         println!(
             "{name:<18} entries={:<12} pages={:<10} bytes={:<14} depth={}",

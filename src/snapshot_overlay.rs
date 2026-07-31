@@ -949,6 +949,46 @@ pub(crate) fn decompress_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, Chain
     decode_block_undo(&encoded).map_err(ChainStoreError::Undo)
 }
 
+/// Resolves many base coins in one batched, file-ordered pass.
+///
+/// Both overlay engines reach the base the same way and differ only in how
+/// they decide which outpoints get there, so the conversion from a snapshot
+/// coin to a stored [`Utxo`] — which needs the base's MTP table and import
+/// time — lives here rather than twice.
+///
+/// The ordering win is inside [`CoreSnapshotUtxoIndex::get_many`]; this
+/// function exists so both engines can hand it a whole batch instead of
+/// resolving outpoints one at a time as they classify them.
+pub(crate) fn base_utxos_batched(
+    base: &CoreSnapshotUtxoIndex,
+    mtp_by_height: &[u32],
+    import_time: u64,
+    outpoints: &[OutPoint],
+) -> Result<Vec<Option<Utxo>>, UtxoError> {
+    base.get_many(outpoints)
+        .map_err(index_read_error)?
+        .into_iter()
+        .map(|coin| {
+            let Some(coin) = coin else {
+                return Ok(None);
+            };
+            let mtp = usize::try_from(coin.height)
+                .ok()
+                .and_then(|height| mtp_by_height.get(height))
+                .copied()
+                .ok_or(UtxoError::Malformed("base coin height above MTP table"))?;
+            Ok(Some(Utxo {
+                value_sats: coin.value_sats,
+                height: coin.height,
+                is_coinbase: coin.is_coinbase,
+                last_touched: import_time,
+                creation_mtp: mtp,
+                script_pubkey: coin.script_pubkey,
+            }))
+        })
+        .collect()
+}
+
 /// Folds a batch of transitions into one sorted UTXO mutation.
 ///
 /// Applying each transition separately walks the B-tree once per block, so a
@@ -1232,7 +1272,12 @@ impl UtxoStore for SnapshotOverlayChainstate {
         let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
-        let mut results = Vec::with_capacity(outpoints.len());
+        // Classify first, resolve the base once. Resolving inline would send
+        // the index one scattered outpoint at a time; collecting the misses
+        // lets the batch be read in file order.
+        let mut results: Vec<(OutPointKey, Option<Utxo>)> = Vec::with_capacity(outpoints.len());
+        let mut base_wanted: Vec<OutPoint> = Vec::new();
+        let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
             if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
                 results.push((*outpoint, Some(Utxo::decode(&value)?)));
@@ -1242,7 +1287,20 @@ impl UtxoStore for SnapshotOverlayChainstate {
             {
                 results.push((*outpoint, None));
             } else {
-                results.push((*outpoint, self.base_utxo(outpoint.to_outpoint())?));
+                base_positions.push(results.len());
+                base_wanted.push(outpoint.to_outpoint());
+                results.push((*outpoint, None));
+            }
+        }
+        if !base_wanted.is_empty() {
+            let resolved = base_utxos_batched(
+                &self.base,
+                &self.mtp_by_height,
+                self.import_time,
+                &base_wanted,
+            )?;
+            for (position, utxo) in base_positions.into_iter().zip(resolved) {
+                results[position].1 = utxo;
             }
         }
         Ok(results)

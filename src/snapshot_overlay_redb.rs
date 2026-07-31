@@ -813,14 +813,31 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
         let transaction = self.db.begin_read()?;
         let overlay = transaction.open_table(OVERLAY)?;
         let tombstone = transaction.open_table(TOMBSTONE)?;
-        let mut results = Vec::with_capacity(outpoints.len());
+        // Classify first, resolve the base once, exactly as the MDBX engine
+        // does — the batched read is what puts the base lookups in file order.
+        let mut results: Vec<(OutPointKey, Option<Utxo>)> = Vec::with_capacity(outpoints.len());
+        let mut base_wanted: Vec<OutPoint> = Vec::new();
+        let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
             if let Some(value) = overlay.get(outpoint.as_bytes().as_slice())? {
                 results.push((*outpoint, Some(Utxo::decode(value.value())?)));
             } else if tombstone.get(outpoint.as_bytes().as_slice())?.is_some() {
                 results.push((*outpoint, None));
             } else {
-                results.push((*outpoint, self.base_utxo(outpoint.to_outpoint())?));
+                base_positions.push(results.len());
+                base_wanted.push(outpoint.to_outpoint());
+                results.push((*outpoint, None));
+            }
+        }
+        if !base_wanted.is_empty() {
+            let resolved = crate::snapshot_overlay::base_utxos_batched(
+                &self.base,
+                &self.mtp_by_height,
+                self.import_time,
+                &base_wanted,
+            )?;
+            for (position, utxo) in base_positions.into_iter().zip(resolved) {
+                results[position].1 = utxo;
             }
         }
         Ok(results)

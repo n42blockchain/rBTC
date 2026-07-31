@@ -664,7 +664,80 @@ impl CoreSnapshotUtxoIndex {
         let Some(slot) = self.mphf.index(key.as_bytes()) else {
             return Ok(None);
         };
-        let (coin_offset, backref) = self.read_table_entry(slot)?;
+        let entry = self.read_table_entry(slot)?;
+        let mut buffer = Vec::new();
+        self.decode_located_coin(&key, outpoint.vout, entry, &mut buffer)
+    }
+
+    /// Resolves many outpoints in one pass, reading in file order.
+    ///
+    /// A minimal perfect hash scatters slots uniformly, so resolving outpoints
+    /// one at a time walks both the index's offset table and the snapshot in
+    /// whatever order the caller happened to supply — the worst case for
+    /// readahead, and the dominant cost once the offset table is read from
+    /// disk rather than held in memory. This resolves in three phases instead:
+    /// every slot is computed first, with no I/O at all; the offset-table
+    /// entries are then read in ascending slot order, which is ascending byte
+    /// order; and the coin records are read last in ascending snapshot offset.
+    /// Each phase moves forward through one file.
+    ///
+    /// Results are returned in the caller's order, one entry per input.
+    /// Duplicate outpoints are resolved independently rather than deduplicated,
+    /// since a batch of block inputs cannot contain the same outpoint twice.
+    ///
+    /// # Errors
+    ///
+    /// Fails on I/O errors or when snapshot bytes no longer decode
+    /// canonically, exactly as [`Self::get`] does.
+    pub fn get_many(
+        &self,
+        outpoints: &[OutPoint],
+    ) -> Result<Vec<Option<CoreSnapshotCoin>>, CoreSnapshotIndexError> {
+        let keys: Vec<OutPointKey> = outpoints.iter().copied().map(OutPointKey::from).collect();
+        let slots: Vec<Option<u64>> = keys
+            .iter()
+            .map(|key| self.mphf.index(key.as_bytes()))
+            .collect();
+
+        // Slot order is byte order: an entry's position is `slot * entry_bits`.
+        let mut by_slot: Vec<usize> = (0..outpoints.len())
+            .filter(|index| slots[*index].is_some())
+            .collect();
+        by_slot.sort_unstable_by_key(|index| slots[*index]);
+        let mut entries: Vec<Option<(u64, u64)>> = vec![None; outpoints.len()];
+        for index in by_slot {
+            let slot = slots[index].expect("filtered to placed slots");
+            entries[index] = Some(self.read_table_entry(slot)?);
+        }
+
+        let mut by_offset: Vec<usize> = (0..outpoints.len())
+            .filter(|index| entries[*index].is_some())
+            .collect();
+        by_offset.sort_unstable_by_key(|index| entries[*index].map(|(offset, _)| offset));
+        let mut coins: Vec<Option<CoreSnapshotCoin>> = vec![None; outpoints.len()];
+        // One buffer for the whole batch: the per-coin window is bounded by
+        // Core's script ceiling, so reusing it avoids an allocation per input.
+        let mut buffer = Vec::new();
+        for index in by_offset {
+            let entry = entries[index].expect("filtered to located entries");
+            coins[index] =
+                self.decode_located_coin(&keys[index], outpoints[index].vout, entry, &mut buffer)?;
+        }
+        Ok(coins)
+    }
+
+    /// Verifies a located entry against the query and decodes its coin.
+    ///
+    /// Shared by [`Self::get`] and [`Self::get_many`] so both apply the same
+    /// exactness checks: the group txid and the coin's own vout are compared
+    /// against the query before any field is returned.
+    fn decode_located_coin(
+        &self,
+        key: &OutPointKey,
+        vout: u32,
+        (coin_offset, backref): (u64, u64),
+        buffer: &mut Vec<u8>,
+    ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
         let txid_offset = coin_offset
             .checked_sub(backref)
             .filter(|offset| *offset >= u64::try_from(METADATA_BYTES).expect("constant fits u64"))
@@ -681,12 +754,13 @@ impl CoreSnapshotUtxoIndex {
 
         let window = usize::try_from((self.snapshot_bytes - coin_offset).min(MAX_COIN_WINDOW))
             .expect("bounded window fits usize");
-        let mut buffer = vec![0_u8; window];
-        read_exact_at(&self.snapshot, &mut buffer, coin_offset)?;
+        buffer.clear();
+        buffer.resize(window, 0);
+        read_exact_at(&self.snapshot, buffer, coin_offset)?;
         let mut cursor = Cursor::new(buffer.as_slice());
 
-        let vout = read_compact_size(&mut cursor).map_err(corrupt)?;
-        if u64::from(outpoint.vout) != vout {
+        let vout_read = read_compact_size(&mut cursor).map_err(corrupt)?;
+        if u64::from(vout) != vout_read {
             return Ok(None);
         }
         let code = read_core_varint(&mut cursor).map_err(corrupt)?;
@@ -1129,6 +1203,51 @@ mod tests {
         assert_eq!(index.get(&absent_vout).unwrap(), None);
         let absent_txid = OutPoint::new(Txid::from_byte_array([8_u8; 32]), 0);
         assert_eq!(index.get(&absent_txid).unwrap(), None);
+    }
+
+    /// The batched path reorders its reads internally, so the contract worth
+    /// pinning is that it is indistinguishable from calling `get` in a loop:
+    /// same answers, same positions, for hits, misses, and repeats alike.
+    #[test]
+    fn batched_lookups_match_single_lookups_in_caller_order() {
+        let directory = TempDir::new().unwrap();
+        let base_hash = [7_u8; 32];
+        let (bytes, expected) = synthetic_snapshot(base_hash, &test_groups());
+        let snapshot = directory.path().join("utxo.dat");
+        fs::write(&snapshot, &bytes).unwrap();
+        let identity = authenticated_identity(&snapshot, base_hash, directory.path());
+        let index_path = directory.path().join("utxo.rbtcidx");
+        build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
+        let index = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
+
+        // Deliberately hostile ordering: reversed hits, interleaved with an
+        // absent vout under a present txid, an entirely absent txid, and a
+        // repeat — none of which the batch may reorder, collapse, or drop.
+        let absent_vout = OutPoint::new(Txid::from_byte_array([1_u8; 32]), 1);
+        let absent_txid = OutPoint::new(Txid::from_byte_array([8_u8; 32]), 0);
+        let present: Vec<OutPoint> = expected.keys().copied().collect();
+        let mut queries: Vec<OutPoint> = Vec::new();
+        for outpoint in present.iter().rev() {
+            queries.push(*outpoint);
+            queries.push(absent_vout);
+        }
+        queries.push(absent_txid);
+        queries.push(present[0]);
+        queries.push(present[0]);
+
+        let batched = index.get_many(&queries).unwrap();
+        assert_eq!(batched.len(), queries.len());
+        for (position, outpoint) in queries.iter().enumerate() {
+            assert_eq!(
+                batched[position],
+                index.get(outpoint).unwrap(),
+                "position {position} of the batch disagrees with a single lookup"
+            );
+        }
+
+        // An empty batch is a legitimate call: a block can spend nothing that
+        // is not already in the overlay.
+        assert!(index.get_many(&[]).unwrap().is_empty());
     }
 
     #[test]

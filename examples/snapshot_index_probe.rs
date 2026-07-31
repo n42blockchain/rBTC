@@ -5,11 +5,11 @@
 //! ordinary `get` path, and reports throughput plus the process's peak
 //! working set — the number that shows whether the offset table is resident.
 //!
-//! Usage: snapshot_index_probe <snapshot.dat> <index.rbtcidx> [lookups]
+//! Usage: snapshot_index_probe <snapshot.dat> <index.rbtcidx> [lookups] [batched]
 //!
 //! The rates and sizes it prints are human-facing statistics, not inputs to
 //! any decision, so the lossy numeric conversions behind them are allowed.
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 use std::{
     env,
@@ -24,6 +24,8 @@ use rbtc::core_snapshot_index::CoreSnapshotUtxoIndex;
 
 const METADATA_BYTES: usize = 5 + 2 + 4 + 32 + 8;
 const MAX_SCRIPT_BYTES: u64 = 10_000;
+/// Inputs resolved per batched call, near a full block's spend count.
+const BATCH: usize = 4_096;
 
 fn read_compact_size(reader: &mut impl Read) -> std::io::Result<u64> {
     let mut first = [0_u8; 1];
@@ -91,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = PathBuf::from(args.next().ok_or("usage: <snapshot> <index> [lookups]")?);
     let index_path = PathBuf::from(args.next().ok_or("usage: <snapshot> <index> [lookups]")?);
     let wanted: usize = args.next().map_or(Ok(200_000), |value| value.parse())?;
+    let batched = args.next().is_some_and(|value| value == "batched");
 
     // Collect outpoints first, so the walk's own buffers are released before
     // the index is opened and the reported peak reflects the index alone.
@@ -136,14 +139,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         index.base_height()
     );
 
+    // Shuffle so the queries do not arrive in snapshot file order, which is
+    // the realistic case: a block's inputs bear no relation to where their
+    // coins sit in the base. Deterministic, so runs stay comparable.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    for position in (1..outpoints.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        outpoints.swap(position, usize::try_from(state % (position as u64 + 1))?);
+    }
+
     let started = Instant::now();
     let mut hits = 0_u64;
-    for outpoint in &outpoints {
-        if index.get(outpoint)?.is_some() {
-            hits += 1;
+    if batched {
+        for chunk in outpoints.chunks(BATCH) {
+            hits += index
+                .get_many(chunk)?
+                .into_iter()
+                .filter(Option::is_some)
+                .count() as u64;
+        }
+    } else {
+        for outpoint in &outpoints {
+            if index.get(outpoint)?.is_some() {
+                hits += 1;
+            }
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
+    println!("mode: {}", if batched { "batched" } else { "single" });
 
     println!(
         "lookups={} hits={hits} misses={} elapsed={elapsed:.2}s rate={:.0}/s",
