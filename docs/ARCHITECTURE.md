@@ -932,26 +932,38 @@ Index memory was measured separately, on the real 164,241,311-coin index,
 looking up 200,000 outpoints taken from the snapshot itself. The queries are
 shuffled, because a block's inputs bear no relation to where their coins sit
 in the base; measuring them in snapshot file order flatters the snapshot reads
-and overstates every rate below by roughly two-fold.
+and overstates every rate below. Each figure is the mean of three runs on an
+otherwise idle machine, which matters more than it sounds — see the caution at
+the end of this section.
 
-| | peak working set | lookups/s |
-|---|---:|---:|
-| Offset table resident, one at a time | 2.17 GiB | 212,677 |
-| Offset table on disk, one at a time | **0.15 GiB** | 129,306 |
-| Offset table on disk, batched | **0.15 GiB** | **189,456** |
+| variant | peak working set | one at a time | batched |
+|---|---:|---:|---:|
+| Offset table resident | 2.17 GiB | 211,142 | — |
+| Offset table on disk, worst-case window | **0.15 GiB** | 127,609 | 185,678 |
+| plus a coin-sized read window | **0.15 GiB** | 149,851 | 201,767 |
+| plus one read covering txid and coin | **0.15 GiB** | 168,489 | **238,936** |
 
-Reading the table from disk costs 39% of the single-lookup rate and returns
-14.5x the memory. Batching recovers most of that: resolving in file order runs
-1.47x faster than one at a time, leaving the on-disk path 11% below the
-resident table while still holding a fifteenth of the memory.
+Moving the table out of memory cost 40% of the single-lookup rate on its own.
+Three changes took it back and past: resolving a batch in file order, reading
+a 128-byte window instead of Core's 10,030-byte worst case, and covering the
+group txid and the coin in one positioned read when they are close enough
+together. The result is that the on-disk path is now **13% faster than the
+resident table while holding a fourteenth of its memory** — not the trade-off
+this started as.
 
 The batch resolves in three phases. Every slot is computed first, with no I/O.
 The offset-table entries are read next in ascending slot order, which is
 ascending byte order. The coin records are read last in ascending snapshot
 offset. Each phase moves forward through one file rather than jumping around
-it, and one window buffer serves the whole batch. Both overlay engines now
+it, and one window buffer serves the whole batch. Both overlay engines
 classify a batch against the overlay and tombstone first and hand the misses
 over in a single call.
+
+The order in which those three changes helped is worth recording, because it
+did not match expectation. Cutting the read window by 78x barely moved the
+batched path — copying was not its cost — while removing one of three
+positioned reads per lookup moved it 18%. The remaining cost is per-call
+overhead, not bytes.
 
 An in-process cache for the table was considered and rejected. A minimal
 perfect hash distributes slots uniformly, so hit rate would scale linearly
@@ -960,12 +972,15 @@ replacement policy earns its keep. Entries are bit-packed at 53 bits against
 an LRU's roughly 40 bytes of per-entry overhead, so the page cache holds
 several times more table per byte. And the memory would be anonymous rather
 than reclaimable, reintroducing exactly what moving the table to disk removed.
-Ordering the reads was the alternative that helps where caching cannot.
 
-All rates are page-cache-warm, since verifying the container's digest at open
-streams the whole file. A cold cache would widen the gap between the resident
-and on-disk rows, and would favour the batched row further, since ordered
-reads are what readahead can serve.
+A caution about how these were obtained, since it nearly produced two wrong
+conclusions. An earlier set of these figures was taken while a 25,000-block
+capture was running on the same disk, and the probe's spread under that load
+was 9.5%. Measured that way, the combined read appeared to be a 14% regression
+and was withheld from a commit on that basis; measured on an idle machine it
+is an 18% improvement. The same contamination understated the read-window
+change as 2.6% on the batched path when it is 8.7%. Storage benchmarks on a
+loaded machine are not measurements.
 
 Batching was then measured on a full catch-up rather than a probe: the same
 machine, the same `utxo-935000.dat` and index, the same 10 GiB budget, with

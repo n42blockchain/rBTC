@@ -9291,15 +9291,25 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         ),
         None => None,
     };
-    if let Some(replay) = replay.as_ref() {
-        let stats = replay.stats().map_err(|error| error.to_string())?;
-        rbtc_info!(
-            "replaying blocks from a retained ledger: {} blocks from height {}, {} bytes",
-            stats.blocks,
-            stats.first_height.unwrap_or_default(),
-            stats.bytes
-        );
-    }
+    let replay_ceiling = match replay.as_ref() {
+        Some(replay) => {
+            let stats = replay.stats().map_err(|error| error.to_string())?;
+            let first = stats
+                .first_height
+                .ok_or_else(|| "replay block ledger retains no blocks".to_owned())?;
+            let last = first
+                .checked_add(stats.blocks)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| "replay block ledger height overflow".to_owned())?;
+            rbtc_info!(
+                "replaying blocks from a retained ledger: {} blocks, heights {first}-{last}, {} bytes",
+                stats.blocks,
+                stats.bytes
+            );
+            Some(last)
+        }
+        None => None,
+    };
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
     // A prior attempt may have staged a downloaded batch and then failed
@@ -9369,7 +9379,16 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         let tip = chainstate
             .execution_tip()
             .map_err(|error| error.to_string())?;
-        let ceiling = headers.active_tip().height;
+        // A replay can only execute blocks the corpus actually retains. The
+        // chain keeps moving after a corpus is captured, so without this the
+        // run reaches the corpus end, asks for the next block, and surfaces
+        // the shortfall as a peer failure — which then exhausts peer failover
+        // over an entirely local condition. Stopping at the corpus end is the
+        // honest outcome: it is as far as the recorded blocks go.
+        let ceiling = match replay_ceiling {
+            Some(replay_ceiling) => headers.active_tip().height.min(replay_ceiling),
+            None => headers.active_tip().height,
+        };
         if tip.height >= ceiling {
             break;
         }
