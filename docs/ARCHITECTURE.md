@@ -1148,11 +1148,26 @@ The costs are real and on the same table. Validation is 12% slower because each
 overlay's working set is larger, and folding is the one commit component that
 grew.
 
-Peak memory is the open question rather than a settled cost. The 64-block
-baseline peaked at 7,219 MB at the paired height. An earlier claim that
-256-block batches cost about 60% more memory was withdrawn: it compared a peak
-from one run against a working set from a different run at a different height,
-which establishes nothing.
+Peak memory is the other cost, and it is measured rather than estimated. Two
+height points agree:
+
+| height | 64-block | 256-block | change |
+|---|---:|---:|---:|
+| ~944,000 | 6,215 MB | 8,261 MB | +32.9% |
+| ~946–948,000 | 7,219 MB | 9,788 MB | +35.6% |
+
+The 256-block figure in the second row is taken slightly further along the
+chain than the 64-block one, so the true gap is a little under 35.6%. An
+earlier claim of about 60% was withdrawn before this was measured: it compared
+a peak from one run against a working set from a different run at a different
+height, which establishes nothing.
+
+So the option buys 24.8% of execution time for roughly 35% more peak memory.
+That interacts with the index work in the same section, which removed about
+2 GB, since 256-block batches add about 2.5 GB back. The two are not the same
+kind of memory — what the index gave up was anonymous and unreclaimable, while
+most of what batching adds is file-backed mapping and per-batch working set —
+but on a memory-constrained host they belong on the same ledger.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
