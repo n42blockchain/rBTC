@@ -810,8 +810,25 @@ at 75% the trigger would never have fired, since the overlay peaked at
 into the 85% rebase threshold — trading ~4 GiB rewrites for ~10.6 GiB ones.
 The threshold stays at 50% and the growth gate does the work.
 
-The residual difference is structural and remains the real trade: MDBX does a
-small number of large planned rewrites, redb a larger number of smaller ones.
+A latest-code rerun measured those changes on the same snapshot at the same
+10 GiB budget. redb reached 960,335 in 76 minutes over 25,335 blocks
+(333 blocks/min) with **two** compactions instead of 72, rewriting 10 GiB
+instead of 314 — **0.40 MiB per block**, a 32-fold reduction, and below the
+0.80 MiB/block the MDBX rerun measured. The growth gate is what did it: the
+first compaction fired at 5.01 GiB and the second not until 6.69 GiB, roughly
+6,000 blocks later, where the old policy re-fired on nearly every batch.
+
+That figure should not be read as redb now costing less maintenance than MDBX,
+because the two runs did not end in the same state. MDBX rebased twice and
+finished at 19% of budget with a 2,017-block overlay over a base advanced to
+958,296. redb never rebased and finished at 58% with a 25,335-block overlay
+over the original 935,000 base. A rebase does more than reclaim pages: it
+folds the overlay into a new base, so every later lookup traverses less
+overlay before reaching it, and it resets the undo table. redb deferred that
+work rather than avoiding it. The honest comparison is that redb's tuned
+compaction defers a rebase cheaply, and MDBX's rebase does more work for
+twice the write cost — which of those is better depends on whether the run
+ends or continues.
 
 SQLite was then benchmarked as a third candidate, since it is the only
 surveyed engine offering both capabilities the other two each lack — an
