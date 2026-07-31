@@ -1,9 +1,11 @@
 //! Opt-in storage benchmarks using a deterministic, generated UTXO workload.
 
 use std::{
+    collections::BTreeMap,
     fs,
     hint::black_box,
     path::Path,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -12,7 +14,7 @@ use rbtc::{
     chain_store::{ChainStoreOptions, RedbChainStore},
     execution_store::ExecutionTip,
     snapshot::{export_snapshot, verify_snapshot},
-    utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
+    utxo::{OutPointKey, RedbUtxoStore, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -419,6 +421,234 @@ fn write_report(report: &BenchmarkReport) {
     }
 }
 
+/// Encodes a coin exactly as `Utxo::encode` lays it out — 29 fixed bytes then
+/// the script — so the SQLite rows are byte-for-byte the same size as the
+/// values the other engines store. That codec is `pub(crate)`, and this is a
+/// separate crate, so it is mirrored here rather than widening the library's
+/// public surface for a benchmark.
+fn encode_coin(utxo: &Utxo) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(29 + utxo.script_pubkey.len());
+    bytes.extend_from_slice(&utxo.value_sats.to_le_bytes());
+    bytes.extend_from_slice(&utxo.height.to_le_bytes());
+    bytes.push(u8::from(utxo.is_coinbase));
+    bytes.extend_from_slice(&utxo.last_touched.to_le_bytes());
+    bytes.extend_from_slice(&utxo.creation_mtp.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(utxo.script_pubkey.len())
+            .expect("benchmark script length fits u32")
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(&utxo.script_pubkey);
+    bytes
+}
+
+fn decode_coin(bytes: &[u8]) -> Utxo {
+    assert!(bytes.len() >= 29, "benchmark coin record is truncated");
+    Utxo {
+        value_sats: u64::from_le_bytes(bytes[..8].try_into().expect("fixed record")),
+        height: u32::from_le_bytes(bytes[8..12].try_into().expect("fixed record")),
+        is_coinbase: bytes[12] == 1,
+        last_touched: u64::from_le_bytes(bytes[13..21].try_into().expect("fixed record")),
+        creation_mtp: u32::from_le_bytes(bytes[21..25].try_into().expect("fixed record")),
+        script_pubkey: bytes[29..].to_vec(),
+    }
+}
+
+/// Benchmark-only SQLite UTXO store.
+///
+/// Evaluated because SQLite is already linked into every rBTC build through
+/// `bdk_wallet`'s rusqlite feature, and it is the only surveyed engine that
+/// offers both an engine-enforced size ceiling (`PRAGMA max_page_count`,
+/// which redb lacks) and in-place compaction (`VACUUM`, which the MDBX
+/// binding lacks). This exists to measure whether its point-lookup
+/// throughput is competitive enough for that to matter; it is deliberately
+/// not production code.
+///
+/// The schema is the closest analogue to the other engines' layout: a
+/// clustered B-tree keyed by the same 36-byte outpoint. `WITHOUT ROWID`
+/// removes SQLite's usual rowid indirection so a lookup is one B-tree
+/// descent, as it is in redb and MDBX. Durability is set to match their
+/// `Durability::Immediate` / `SyncMode::Durable`: every commit is fsynced.
+struct SqliteUtxoStore {
+    connection: Mutex<rusqlite::Connection>,
+}
+
+impl SqliteUtxoStore {
+    fn open(path: &Path) -> Self {
+        let connection = rusqlite::Connection::open(path).expect("open benchmark SQLite database");
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;
+                 CREATE TABLE IF NOT EXISTS utxo (
+                     key BLOB PRIMARY KEY,
+                     value BLOB NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .expect("initialise benchmark SQLite schema");
+        Self {
+            connection: Mutex::new(connection),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl UtxoStore for SqliteUtxoStore {
+    fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare_cached("SELECT value FROM utxo WHERE key = ?1")
+            .expect("prepare benchmark lookup");
+        let mut rows = statement
+            .query([outpoint.as_bytes().as_slice()])
+            .expect("run benchmark lookup");
+        match rows.next().expect("read benchmark lookup row") {
+            None => Ok(None),
+            Some(row) => {
+                let value: Vec<u8> = row.get(0).expect("decode benchmark lookup value");
+                Ok(Some(decode_coin(&value)))
+            }
+        }
+    }
+
+    fn apply(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), UtxoError> {
+        self.apply_with_undo(spent, created).map(|_| ())
+    }
+
+    fn apply_with_undo(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        let mut connection = self.lock();
+        let transaction = connection
+            .transaction()
+            .expect("begin benchmark SQLite transaction");
+        let mut undo_spent = Vec::with_capacity(spent.len());
+        {
+            // Mirrors the other stores: a spend must find its coin and
+            // return the pre-image, so the read cost is counted too.
+            let mut select = transaction
+                .prepare_cached("SELECT value FROM utxo WHERE key = ?1")
+                .expect("prepare benchmark spend read");
+            let mut delete = transaction
+                .prepare_cached("DELETE FROM utxo WHERE key = ?1")
+                .expect("prepare benchmark spend delete");
+            for key in spent {
+                let value: Vec<u8> = select
+                    .query_row([key.as_bytes().as_slice()], |row| row.get(0))
+                    .map_err(|_| UtxoError::Missing(*key))?;
+                undo_spent.push((*key, decode_coin(&value)));
+                delete
+                    .execute([key.as_bytes().as_slice()])
+                    .expect("run benchmark spend delete");
+            }
+            // INSERT (not INSERT OR REPLACE) so a duplicate outpoint is
+            // rejected by the primary key, matching the other stores.
+            let mut insert = transaction
+                .prepare_cached("INSERT INTO utxo (key, value) VALUES (?1, ?2)")
+                .expect("prepare benchmark insert");
+            for (key, utxo) in created {
+                insert
+                    .execute(rusqlite::params![
+                        key.as_bytes().as_slice(),
+                        encode_coin(utxo).as_slice()
+                    ])
+                    .map_err(|_| UtxoError::Duplicate(*key))?;
+            }
+        }
+        transaction
+            .commit()
+            .expect("commit benchmark SQLite transaction");
+        Ok(UtxoUndo::from_parts(
+            undo_spent,
+            created.iter().map(|(key, _)| *key).collect(),
+        ))
+    }
+
+    fn undo(&self, _undo: &UtxoUndo, _now: u64, _hot_window_secs: u64) -> Result<(), UtxoError> {
+        unimplemented!("benchmark store does not exercise undo")
+    }
+
+    fn age_to_cold(&self, _now: u64, _hot_window_secs: u64) -> Result<u64, UtxoError> {
+        Ok(0)
+    }
+
+    fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+        unimplemented!("benchmark store does not exercise snapshots")
+    }
+
+    fn replace_all(
+        &self,
+        _entries: &BTreeMap<OutPointKey, Utxo>,
+        _now: u64,
+        _hot_window_secs: u64,
+    ) -> Result<(), UtxoError> {
+        unimplemented!("benchmark store does not exercise snapshot replacement")
+    }
+
+    fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+        let connection = self.lock();
+        let hot: u64 = connection
+            .query_row("SELECT COUNT(*) FROM utxo", [], |row| row.get(0))
+            .expect("count benchmark UTXOs");
+        Ok(TierStats { hot, cold: 0 })
+    }
+}
+
+fn run_sqlite(workload: Workload) -> BackendResult {
+    let directory = TempDir::new().expect("benchmark tempdir");
+    let path = directory.path().join("utxo.sqlite3");
+    let store = SqliteUtxoStore::open(&path);
+    let initial = initial_entries(workload);
+    let seed_started = Instant::now();
+    store.apply(&[], &initial).expect("seed benchmark UTXOs");
+    let seed = one_phase_timing(seed_started.elapsed(), u64::from(workload.utxo_count));
+    let mutation = run_mutations(&store, workload);
+    let lookup = run_lookups(&store, workload);
+    let database_bytes = directory_bytes(directory.path());
+
+    // VACUUM is SQLite's in-place compaction, the capability the MDBX
+    // binding lacks entirely.
+    let compaction_started = Instant::now();
+    {
+        let connection = store.lock();
+        connection
+            .execute_batch("VACUUM;")
+            .expect("vacuum benchmark SQLite database");
+    }
+    let compaction_elapsed = compaction_started.elapsed();
+    let after_bytes = directory_bytes(directory.path());
+    assert_eq!(
+        store.tier_stats().expect("post-vacuum count").hot,
+        u64::from(workload.utxo_count),
+        "vacuum must preserve every row"
+    );
+    BackendResult {
+        backend: "sqlite-utxo",
+        quick_repair: None,
+        seed,
+        mutation,
+        lookup,
+        database_bytes,
+        compaction: Some(CompactionResult {
+            elapsed_ns: duration_ns(compaction_elapsed),
+            performed: true,
+            before_bytes: database_bytes,
+            after_bytes,
+        }),
+    }
+}
+
 #[test]
 fn generated_workload_is_deterministic_and_bounded() {
     let workload = Workload::new(2, 2, 4, 8).unwrap();
@@ -437,6 +667,7 @@ fn reproducible_storage_workload() {
     let mut backends = vec![run_redb(workload, false), run_redb(workload, true)];
     #[cfg(feature = "mdbx")]
     backends.push(run_mdbx(workload));
+    backends.push(run_sqlite(workload));
     write_report(&BenchmarkReport {
         schema_version: 2,
         generated_fixture: true,

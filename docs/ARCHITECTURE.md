@@ -789,6 +789,40 @@ The threshold stays at 50% and the growth gate does the work.
 The residual difference is structural and remains the real trade: MDBX does a
 small number of large planned rewrites, redb a larger number of smaller ones.
 
+SQLite was then benchmarked as a third candidate, since it is the only
+surveyed engine offering both capabilities the other two each lack — an
+engine-enforced ceiling through `PRAGMA max_page_count`, which redb has no
+equivalent for, and in-place compaction through `VACUUM`, which the MDBX
+binding does not expose — and it is already linked into every build through
+`bdk_wallet`'s rusqlite feature, so adopting it would add no dependency. The
+benchmark drives it through the same `UtxoStore` harness as the other two,
+with a `WITHOUT ROWID` table keyed by the same 36-byte outpoint so a lookup
+is one B-tree descent, and `synchronous = FULL` to match the others' fsync
+-per-commit durability.
+
+Point-lookup latency, the operation block execution performs most:
+
+| engine | 10,000 UTXOs | 2,000,000 UTXOs | p99 at 2M |
+|---|---|---|---|
+| redb | 726 ns | 1,584 ns | 5.2 µs |
+| MDBX | 1,933 ns | 2,353 ns | 3.8 µs |
+| SQLite | 2,411 ns | 4,053 ns | 10.3 µs |
+
+SQLite is 2.6x slower than redb and 1.7x slower than MDBX at the larger size,
+with a p99 roughly double either. That is the cost of the SQL layer on a path
+that executes tens of thousands of lookups per block, and it is enough to
+rule SQLite out for the UTXO hot path despite its otherwise attractive
+feature set. It remains the only candidate that could serve a store needing
+both a hard ceiling and in-place compaction, so the measurement is recorded
+rather than discarded.
+
+Two cautions about these numbers. MDBX scaled best across the two sizes
+(1.2x versus redb's 2.2x), so the ranking at 164M coins is not settled by a
+2M-coin run. And the commit column of the same benchmark is not a fair
+comparison at all: the redb entry drives the full `RedbChainStore`, committing
+tip and undo alongside the UTXO mutation, while the MDBX and SQLite entries
+drive a bare UTXO store. Only the lookup column compares like with like.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at

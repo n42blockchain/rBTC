@@ -1069,6 +1069,7 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "redb",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

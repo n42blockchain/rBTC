@@ -41,6 +41,10 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 proptest = "1.7"
+# Benchmark-only. SQLite is already linked into every build through
+# bdk_wallet's rusqlite feature, so this evaluates an engine the binary
+# already carries rather than adding one.
+rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 

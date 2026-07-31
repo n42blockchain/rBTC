@@ -100,7 +100,13 @@ cargo test --release --all-features --test storage_bench -- --ignored --nocaptur
 
 The storage benchmark generates its block-shaped UTXO population at runtime and
 reports machine-readable JSON; no generated database, snapshot, or result is
-versioned. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
+versioned. It covers redb, MDBX, and a benchmark-only SQLite store — SQLite
+being the one surveyed alternative that offers both an engine-enforced size
+ceiling (`PRAGMA max_page_count`) and in-place compaction (`VACUUM`), and
+already linked into every build through `bdk_wallet`. At a 2,000,000-UTXO
+workload its point lookups measured 4,053 ns against redb's 1,584 ns and
+MDBX's 2,353 ns, with a markedly worse p99 (10.3 µs against 5.2 and 3.8), so
+it is evaluated and recorded rather than adopted; see `docs/ARCHITECTURE.md`. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
 `RBTC_BENCH_UTXOS`, and `RBTC_BENCH_LOOKUPS` to scale the bounded workload, and
 set `RBTC_BENCH_REPORT` to retain the JSON report. The manual Storage benchmark
 workflow uploads that report together with runner CPU, filesystem, and block
