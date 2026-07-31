@@ -1116,6 +1116,44 @@ terminal: resuming would append at a height the ledger already covers and fail
 on contiguity from then on, with nothing else in the system able to repair it.
 The reindex driver already does this for the same reason.
 
+Batch size turned out to be the largest lever in the commit, and it needed
+almost no code — only making `--validation-batch-size` visible to the mode that
+already honoured it. Snapshot-overlay catch-up drives the same batch loop and
+reads `max_blocks_per_batch`, but the option was rejected unless one of the
+AssumeUTXO or reindex modes was also requested, so the limit applied while
+being unsettable.
+
+Two replays back to back on the same machine, same corpus, over the same
+11,008 blocks, normalised per thousand blocks:
+
+| seconds per 1000 blocks | 64-block | 256-block | change |
+|---|---:|---:|---:|
+| `commit-mutate` | 38.04 | 19.55 | **−48.6%** |
+| `commit-sync` | 24.18 | 11.59 | **−52.1%** |
+| `commit-base-lookup` | 15.08 | 11.92 | −20.9% |
+| `commit-fold` | 2.77 | 4.15 | +50.0% |
+| `core-validate` | 17.86 | 20.06 | +12.3% |
+| `execution-core` | 105.02 | 78.46 | **−25.3%** |
+| batch total | 117.13 | 88.13 | **−24.8%** |
+
+The mechanism is two separate effects, and the second was not expected. Halved
+flushing follows directly from committing a quarter as often. But
+`commit-base-lookup` fell too, and the number of duplicate probes depends only
+on how many created coins survive to reach storage — so a wider fold window is
+collapsing more coins that are created and spent inside the same batch, and
+they never reach the B-tree at all. Folding costs 50% more to do it, which is
+four seconds buying eighteen.
+
+The costs are real and on the same table. Validation is 12% slower because each
+overlay's working set is larger, and folding is the one commit component that
+grew.
+
+Peak memory is the open question rather than a settled cost. The 64-block
+baseline peaked at 7,219 MB at the paired height. An earlier claim that
+256-block batches cost about 60% more memory was withdrawn: it compared a peak
+from one run against a working set from a different run at a different height,
+which establishes nothing.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at

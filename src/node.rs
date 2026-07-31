@@ -14828,6 +14828,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         && background_assumeutxo.is_none()
         && reindex_from_freezer.is_none()
         && reindex_chainstate.is_none()
+        // Snapshot-overlay catch-up drives the same batch loop and already
+        // reads `max_blocks_per_batch`, so the limit was honoured there while
+        // being unsettable — the option was invisible to a mode that uses it.
+        && snapshot_overlay_source.is_none()
     {
         return Err(
             "validation resource limits require bounded or automatic AssumeUTXO validation"
