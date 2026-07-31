@@ -88,6 +88,7 @@ use rbtc::{
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
         BlockDeploymentContext, BlockExecutionError,
+        connect_prevalidated_active_blocks_with_breakdown,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
         prefetch_prevalidated_active_block_utxos,
     },
@@ -12597,6 +12598,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         execution_core_at,
         prefetch_elapsed,
         utxo_prefetch_elapsed,
+        breakdown,
     ) = if next_prefetch_hashes.is_empty() {
         let (
             stage_result,
@@ -12654,7 +12656,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
             chainstate,
             headers,
             &blocks,
@@ -12671,6 +12673,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             Instant::now(),
             Duration::ZERO,
             utxo_elapsed,
+            breakdown,
         )
     } else if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
@@ -12720,7 +12723,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                     .expect("scoped UTXO-prefetch thread must not panic");
                 let execution_result = match (stage_result.as_ref(), utxo_result) {
                     (Ok(()), Ok(prefetched_utxos)) => {
-                        Some(connect_prevalidated_active_blocks_with_txids_and_utxos(
+                        Some(connect_prevalidated_active_blocks_with_breakdown(
                             chainstate,
                             headers,
                             &blocks,
@@ -12760,7 +12763,8 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         staged_at = branch_staged_at;
         let execution_result =
             execution_result.expect("successful staging starts chainstate execution");
-        let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
+        let (applied_blocks, breakdown) =
+            execution_result.map_err(|error| PeerRunError::block(&error))?;
         let downloaded_prefetch = match prefetch_result {
             Ok(blocks) => blocks,
             Err(error) => {
@@ -12774,6 +12778,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             execution_core_at,
             prefetch_elapsed,
             utxo_prefetch_elapsed,
+            breakdown,
         )
     } else {
         let (
@@ -12817,7 +12822,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
             chainstate,
             headers,
             &blocks,
@@ -12850,6 +12855,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             execution_core_at,
             prefetch_started.elapsed(),
             utxo_elapsed,
+            breakdown,
         )
     };
     let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
@@ -12898,7 +12904,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -12911,6 +12917,10 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         staged_at.duration_since(structure_validated_at).as_millis(),
         executed_at.duration_since(staged_at).as_millis(),
         execution_core_at.duration_since(staged_at).as_millis(),
+        breakdown.validate.as_millis(),
+        breakdown.submit.as_millis(),
+        breakdown.script_wait.as_millis(),
+        breakdown.commit.as_millis(),
         utxo_prefetch_elapsed.as_millis(),
         prefetch_elapsed.as_millis(),
         indexed_at.duration_since(executed_at).as_millis(),

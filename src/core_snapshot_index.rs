@@ -73,6 +73,11 @@ const MAX_COIN_WINDOW: u64 = 5 + 5 + 10 + 10 + 10_000;
 /// standard template compresses to. Records needing more are re-read at
 /// [`MAX_COIN_WINDOW`].
 const COIN_PROBE_WINDOW: u64 = 128;
+/// Largest span read in one go to cover both a group txid and its coin.
+///
+/// Beyond this the two are far enough apart that one read would move more
+/// bytes than the second syscall costs, so they are read separately.
+const COMBINED_READ_LIMIT: u64 = 512;
 
 /// Failures while building, opening, or querying a snapshot access index.
 #[derive(Debug, Error)]
@@ -753,10 +758,36 @@ impl CoreSnapshotUtxoIndex {
             return Err(CoreSnapshotIndexError::Invalid("offset out of range"));
         }
 
-        let mut txid = [0_u8; 32];
-        read_exact_at(&self.snapshot, &mut txid, txid_offset)?;
-        if txid != key.as_bytes()[..32] {
-            return Ok(None);
+        // The group txid sits `backref` bytes before the coin, so when the
+        // coin is near the front of its group both live inside one short span
+        // and one positioned read serves both. That is the common case — a
+        // backref is the txid, the coin count, and whatever earlier coins of
+        // the same transaction precede this one — and it removes a syscall
+        // from a path whose remaining cost is per-call overhead rather than
+        // bytes moved.
+        let span = backref.saturating_add(COIN_PROBE_WINDOW);
+        let combined = span <= COMBINED_READ_LIMIT && txid_offset + span <= self.snapshot_bytes;
+        if combined {
+            let length = usize::try_from(span).expect("bounded span fits usize");
+            buffer.clear();
+            buffer.resize(length, 0);
+            read_exact_at(&self.snapshot, buffer, txid_offset)?;
+            if buffer[..32] != key.as_bytes()[..32] {
+                return Ok(None);
+            }
+            let coin_start = usize::try_from(backref).expect("bounded backref fits usize");
+            match self.parse_coin(&buffer[coin_start..], vout) {
+                Ok(coin) => return Ok(coin),
+                // Fall through to the widening read below rather than failing:
+                // this record needs more than the probe covered.
+                Err(_) => {}
+            }
+        } else {
+            let mut txid = [0_u8; 32];
+            read_exact_at(&self.snapshot, &mut txid, txid_offset)?;
+            if txid != key.as_bytes()[..32] {
+                return Ok(None);
+            }
         }
 
         // Read a small window first. `MAX_COIN_WINDOW` is Core's worst case —
@@ -768,9 +799,13 @@ impl CoreSnapshotUtxoIndex {
         // so the outcome is identical either way — a corrupt record still
         // reaches the same full-window parse it always did.
         let available = self.snapshot_bytes - coin_offset;
-        let probe = COIN_PROBE_WINDOW.min(available);
         let full = MAX_COIN_WINDOW.min(available);
-        let mut window = probe;
+        // A combined read already tried the probe width for this record.
+        let mut window = if combined {
+            full
+        } else {
+            COIN_PROBE_WINDOW.min(available)
+        };
         loop {
             let length = usize::try_from(window).expect("bounded window fits usize");
             buffer.clear();

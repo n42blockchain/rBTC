@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -351,6 +352,7 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
         None,
         None,
     )
+    .map(|(applied, _)| applied)
 }
 
 /// Connects a downloaded batch whose block structures were already checked
@@ -377,6 +379,7 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
         None,
         None,
     )
+    .map(|(applied, _)| applied)
 }
 
 /// Connects structurally authenticated blocks while reusing the transaction
@@ -402,6 +405,7 @@ pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
         Some(transaction_ids),
         None,
     )
+    .map(|(applied, _)| applied)
 }
 
 /// Reads the external durable UTXOs required by one prevalidated block batch.
@@ -444,6 +448,40 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
 ) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+    connect_prevalidated_active_blocks_with_breakdown(
+        chainstate,
+        headers,
+        blocks,
+        transaction_ids,
+        prefetched_utxos,
+        now,
+        hot_window_secs,
+        deployments,
+    )
+    .map(|(applied, _)| applied)
+}
+
+/// As [`connect_prevalidated_active_blocks_with_txids_and_utxos`], also
+/// reporting where the time went.
+///
+/// The catch-up driver uses this so `execution-core` can be broken down in the
+/// batch log without a profiler, which matters because it is by far the
+/// largest term and the one every optimization question lands on.
+///
+/// # Errors
+///
+/// Identical to [`connect_prevalidated_active_blocks_with_txids_and_utxos`].
+#[allow(clippy::too_many_arguments)]
+pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>(
+    chainstate: &C,
+    headers: &HeaderDag,
+    blocks: &[Block],
+    transaction_ids: &[ValidatedBlockTransactionIds],
+    prefetched_utxos: ActiveBlockUtxoPrefetch,
+    now: u64,
+    hot_window_secs: u64,
+    deployments: &[BlockDeploymentContext],
+) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     connect_active_blocks_inner(
         chainstate,
         headers,
@@ -455,6 +493,35 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
         Some(transaction_ids),
         Some(prefetched_utxos),
     )
+}
+
+/// Where a batch's execution time went inside `execution-core`.
+///
+/// `execution-core` is a single number in the batch log, and it is the largest
+/// one, so any question about it — is the sequential loop the bottleneck, or
+/// are the script workers? — needs it split. The four parts are disjoint and
+/// cover the whole span:
+///
+/// - `validate` is the sequential per-block work: resolving every input from
+///   the UTXO overlay, accounting, maturity, and lock checks. Script
+///   verification is not here; it is deferred.
+/// - `submit` is handing those deferred scripts to the worker pool, which
+///   serializes each transaction and copies its prevouts. It runs on the
+///   sequential thread, so it competes with `validate`.
+/// - `script_wait` is time blocked waiting for the workers to finish. Near
+///   zero means the sequential thread is the bottleneck and the workers were
+///   starved; large means the reverse.
+/// - `commit` is the single storage transaction that publishes the batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionBreakdown {
+    /// Sequential per-block validation, including UTXO resolution.
+    pub validate: Duration,
+    /// Serializing and enqueuing deferred script work.
+    pub submit: Duration,
+    /// Blocked waiting for script workers to drain.
+    pub script_wait: Duration,
+    /// The batch's storage commit.
+    pub commit: Duration,
 }
 
 fn external_batch_input_outpoints(
@@ -515,7 +582,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     structure_prevalidated: bool,
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
     prefetched_utxos: Option<ActiveBlockUtxoPrefetch>,
-) -> Result<Vec<AppliedBlock>, BlockExecutionError> {
+) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
+    let mut breakdown = ExecutionBreakdown::default();
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
             blocks: blocks.len(),
@@ -523,7 +591,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         });
     }
     if blocks.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), breakdown));
     }
     if transaction_ids.is_some_and(|ids| {
         ids.len() != blocks.len()
@@ -571,6 +639,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             .map(|transaction| transaction.input.len() + transaction.output.len())
             .sum();
         let block_overlay = UtxoOverlay::with_capacity(&cumulative, block_capacity);
+        let validate_started = Instant::now();
         let validated = validate_active_block_inner(
             &block_overlay,
             headers,
@@ -583,6 +652,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             true,
             transaction_ids.map(|ids| ids[block_order].as_slice()),
         );
+        breakdown.validate += validate_started.elapsed();
         let (applied, changes, mut block_scripts) = match validated {
             Ok(validated) => validated,
             Err(error) => {
@@ -623,26 +693,32 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             },
         });
         applied_blocks.push(applied);
+        let submit_started = Instant::now();
         if let Some(batch) = &mut script_batch {
             batch.submit(block_scripts);
         } else {
             deferred_scripts.extend(block_scripts);
         }
+        breakdown.submit += submit_started.elapsed();
         current = next;
     }
+    let wait_started = Instant::now();
     let script_failure = if let Some(batch) = script_batch {
         batch.finish()
     } else {
         verify_deferred_scripts(deferred_scripts)
     };
+    breakdown.script_wait = wait_started.elapsed();
     if let Some((index, source)) = script_failure {
         return Err(BlockExecutionError::Block(BlockError::Transaction {
             index,
             source: source.into(),
         }));
     }
+    let commit_started = Instant::now();
     chainstate.commit_connect_batch(&transitions)?;
-    Ok(applied_blocks)
+    breakdown.commit = commit_started.elapsed();
+    Ok((applied_blocks, breakdown))
 }
 
 #[allow(clippy::too_many_arguments)]
