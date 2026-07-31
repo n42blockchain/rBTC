@@ -52,7 +52,7 @@ use crate::{
         SnapshotOverlayConfig, SnapshotOverlayError, chain_store_to_utxo, decode_identity,
         decode_tip, encode_identity, encode_tip, index_read_error,
     },
-    undo_store::{decode_block_undo, encode_block_undo},
+    snapshot_overlay::{compress_block_undo, decompress_block_undo},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -913,7 +913,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
         let transaction = self.db.begin_read()?;
         let undo = transaction.open_table(UNDO)?;
         undo.get(hash.to_byte_array().as_slice())?
-            .map(|bytes| decode_block_undo(bytes.value()).map_err(ChainStoreError::Undo))
+            .map(|bytes| decompress_block_undo(bytes.value()))
             .transpose()
     }
 
@@ -937,7 +937,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
             let mut undo_table = transaction.open_table(UNDO)?;
             undo_table.insert(
                 next.hash.to_byte_array().as_slice(),
-                encode_block_undo(transaction_undos)?.as_slice(),
+                compress_block_undo(transaction_undos)?.as_slice(),
             )?;
         }
         transaction.commit()?;
@@ -959,7 +959,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
             let mut undo_table = transaction.open_table(UNDO)?;
             undo_table.insert(
                 transition.next.hash.to_byte_array().as_slice(),
-                encode_block_undo(&transition.transaction_undos)?.as_slice(),
+                compress_block_undo(&transition.transaction_undos)?.as_slice(),
             )?;
         }
         self.connect_mutation(&transaction, &spent, &created)?;

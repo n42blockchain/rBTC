@@ -571,7 +571,7 @@ impl SnapshotOverlayChainstate {
                 transition.expected_parent,
                 transition.next,
             )?;
-            let block_undo = encode_block_undo(&transition.transaction_undos)?;
+            let block_undo = compress_block_undo(&transition.transaction_undos)?;
             transaction
                 .put(
                     &undo,
@@ -917,6 +917,36 @@ impl SnapshotOverlayChainstate {
         }
         Ok(kept)
     }
+}
+
+/// zstd level used for overlay block undo.
+///
+/// Undo is written on the block-commit hot path, so this trades ratio for
+/// speed: level 1 is the same setting the block archive uses for the same
+/// reason. Measured overlay composition made this worth doing — 951 retained
+/// blocks of undo occupied 952 MB of stored bytes, about 1 MB per block and
+/// the second largest item in the working set after fragmentation. Shrinking
+/// it slows the growth that drives rebases, which matters most for MDBX,
+/// where a rebase is the only way to reclaim anything and costs a full
+/// ~10.6 GB snapshot rewrite.
+const UNDO_COMPRESSION_LEVEL: i32 = 1;
+
+/// Compresses an encoded block-undo record for overlay storage.
+///
+/// The record format itself is unchanged — this wraps `encode_block_undo`
+/// rather than altering it, so the unified redb chainstate's on-disk undo
+/// format is untouched and no migration is implied.
+pub(crate) fn compress_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, ChainStoreError> {
+    let encoded = encode_block_undo(undos)?;
+    zstd::encode_all(encoded.as_slice(), UNDO_COMPRESSION_LEVEL)
+        .map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))
+}
+
+/// Reverses [`compress_block_undo`].
+pub(crate) fn decompress_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, ChainStoreError> {
+    let encoded =
+        zstd::decode_all(bytes).map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))?;
+    decode_block_undo(&encoded).map_err(ChainStoreError::Undo)
 }
 
 /// Folds a batch of transitions into one sorted UTXO mutation.
@@ -1316,7 +1346,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         transaction
             .get::<Vec<u8>>(&undo, &hash.to_byte_array())
             .map_err(utxo_mdbx)?
-            .map(|bytes| decode_block_undo(&bytes).map_err(ChainStoreError::Undo))
+            .map(|bytes| decompress_block_undo(&bytes))
             .transpose()
     }
 
@@ -1385,7 +1415,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
             .put(
                 &undo_table,
                 next.hash.to_byte_array(),
-                encode_block_undo(transaction_undos)?,
+                compress_block_undo(transaction_undos)?,
                 WriteFlags::empty(),
             )
             .map_err(utxo_mdbx)?;
@@ -2426,6 +2456,66 @@ pub(crate) mod tests {
         assert_eq!(report.identity.height, 101);
         assert!(new_snapshot.exists());
         assert!(new_index.exists());
+    }
+
+    /// Undo records are the second largest item in a measured overlay — 951
+    /// retained blocks occupied 952 MB — so they are stored compressed. This
+    /// checks the wrapper round-trips exactly, including the empty case, and
+    /// reports the ratio on block-shaped data so a regression in it is
+    /// visible rather than silent.
+    #[test]
+    fn block_undo_compression_round_trips_and_shrinks() {
+        assert!(
+            decompress_block_undo(&compress_block_undo(&[]).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+
+        // Block-shaped: many transactions, each spending a couple of coins
+        // whose scripts repeat the standard templates, which is what makes
+        // this data compressible at all.
+        let undos: Vec<UtxoUndo> = (0..2_000_u32)
+            .map(|index| {
+                UtxoUndo::from_parts(
+                    (0..2_u32)
+                        .map(|input| {
+                            (
+                                key(u8::try_from(index % 251).unwrap(), input),
+                                base_coin(
+                                    index % 1_000,
+                                    50_000 + u64::from(index),
+                                    [&[0x76, 0xa9, 20][..], &[7_u8; 20], &[0x88, 0xac]].concat(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    (0..2_u32)
+                        .map(|out| key(u8::try_from(index % 251).unwrap(), 100 + out))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let raw = encode_block_undo(&undos).unwrap();
+        let packed = compress_block_undo(&undos).unwrap();
+        let restored = decompress_block_undo(&packed).unwrap();
+
+        assert_eq!(restored.len(), undos.len());
+        for (before, after) in undos.iter().zip(&restored) {
+            assert_eq!(before.spent(), after.spent());
+            assert_eq!(before.created(), after.created());
+        }
+        // The bound is deliberately loose. This fixture repeats one script
+        // across every coin and compresses about 24x, which real undo will
+        // not approach — mainnet scripts carry distinct hashes and keys. 2x
+        // is the floor worth guarding; the real ratio is measured on a soak,
+        // not asserted here.
+        assert!(
+            packed.len() < raw.len() / 2,
+            "block undo should compress at least 2x: {} -> {}",
+            raw.len(),
+            packed.len()
+        );
     }
 
     /// Regression test for the batch fold: a coin created and then spent
