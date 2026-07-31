@@ -34,7 +34,11 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read, Write as _},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use bitcoin::{
@@ -161,6 +165,7 @@ pub struct SnapshotOverlayChainstate {
     identity: SnapshotBaseIdentity,
     mtp_by_height: Vec<u32>,
     import_time: u64,
+    commit_profile: CommitProfile,
     capacity_bytes: u64,
     snapshot_path: PathBuf,
     index_path: PathBuf,
@@ -258,6 +263,7 @@ impl SnapshotOverlayChainstate {
             identity,
             mtp_by_height: config.mtp_by_height,
             import_time: config.import_time,
+            commit_profile: CommitProfile::default(),
             capacity_bytes: config.capacity_bytes,
             snapshot_path: config.snapshot_path,
             index_path: config.index_path,
@@ -355,7 +361,10 @@ impl SnapshotOverlayChainstate {
     }
 
     fn base_utxo(&self, outpoint: OutPoint) -> Result<Option<Utxo>, UtxoError> {
-        let Some(coin) = self.base.get(&outpoint).map_err(index_read_error)? else {
+        let started = Instant::now();
+        let found = self.base.get(&outpoint).map_err(index_read_error);
+        CommitProfile::add(&self.commit_profile.base_lookup, started);
+        let Some(coin) = found? else {
             return Ok(None);
         };
         let mtp = usize::try_from(coin.height)
@@ -557,13 +566,16 @@ impl SnapshotOverlayChainstate {
         if transitions.is_empty() {
             return Ok(());
         }
+        let fold_started = Instant::now();
         let (spent, created) = fold_connect_batch(transitions)?;
+        CommitProfile::add(&self.commit_profile.fold, fold_started);
         let _guard = self.lock();
         let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
         let meta = transaction.open_table(Some(META)).map_err(utxo_mdbx)?;
+        let undo_started = Instant::now();
         for transition in transitions {
             Self::advance_tip(
                 &transaction,
@@ -581,8 +593,13 @@ impl SnapshotOverlayChainstate {
                 )
                 .map_err(utxo_mdbx)?;
         }
+        CommitProfile::add(&self.commit_profile.undo, undo_started);
+        let mutate_started = Instant::now();
         self.connect_mutation(&transaction, &overlay, &tombstone, &spent, &created)?;
+        CommitProfile::add(&self.commit_profile.mutate, mutate_started);
+        let sync_started = Instant::now();
         transaction.commit().map_err(utxo_mdbx)?;
+        CommitProfile::add(&self.commit_profile.sync, sync_started);
         Ok(())
     }
 
@@ -947,6 +964,48 @@ pub(crate) fn decompress_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, Chain
     let encoded =
         zstd::decode_all(bytes).map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))?;
     decode_block_undo(&encoded).map_err(ChainStoreError::Undo)
+}
+
+/// Where one storage commit spent its time, in nanoseconds.
+///
+/// `core-commit` is two thirds of execution, so optimizing it needs it split
+/// the same way `execution-core` itself needed splitting. The parts are
+/// disjoint: folding the batch, writing block undo, resolving spent base
+/// coins for their pre-images, mutating the overlay and tombstone tables, and
+/// the final durable commit — which is where any fsync lands.
+///
+/// Diagnostic only. Counters accumulate across commits and are read and
+/// cleared by the catch-up driver once per batch.
+#[derive(Debug, Default)]
+pub struct CommitProfile {
+    fold: AtomicU64,
+    undo: AtomicU64,
+    base_lookup: AtomicU64,
+    mutate: AtomicU64,
+    sync: AtomicU64,
+}
+
+impl CommitProfile {
+    fn add(counter: &AtomicU64, started: Instant) {
+        counter.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Reads and clears the counters, in milliseconds, in declaration order.
+    ///
+    /// `base_lookup` is nested inside `mutate`, not disjoint from it.
+    pub fn take_millis(&self) -> [u64; 5] {
+        [
+            &self.fold,
+            &self.undo,
+            &self.base_lookup,
+            &self.mutate,
+            &self.sync,
+        ]
+        .map(|counter| counter.swap(0, Ordering::Relaxed) / 1_000_000)
+    }
 }
 
 /// Resolves many base coins in one batched, file-ordered pass.
@@ -1385,6 +1444,10 @@ impl UtxoStore for SnapshotOverlayChainstate {
 }
 
 impl ExecutionChainStore for SnapshotOverlayChainstate {
+    fn take_commit_profile(&self) -> Option<[u64; 5]> {
+        Some(self.commit_profile.take_millis())
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db().begin_ro_txn().map_err(utxo_mdbx)?;
         let meta = transaction.open_table(Some(META)).map_err(utxo_mdbx)?;

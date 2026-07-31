@@ -450,6 +450,16 @@ pub trait ExecutionChainStore: UtxoStore {
     fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError>;
     /// Reports whether connect transitions must carry block undo data.
     fn retains_block_undo(&self) -> bool;
+
+    /// Reads and clears this store's commit profile, if it keeps one.
+    ///
+    /// The batch commit is two thirds of execution time on the snapshot
+    /// overlay, so the engine being tuned reports where inside the commit
+    /// that time went. Stores that do not instrument themselves return
+    /// `None` and the batch log omits it. Diagnostic only.
+    fn take_commit_profile(&self) -> Option<[u64; 5]> {
+        None
+    }
     /// Commits one block's net UTXO effect, undo, and tip advance atomically.
     ///
     /// The stored tip must equal `expected_parent` and `next` must extend it

@@ -12858,6 +12858,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             breakdown,
         )
     };
+    let commit_profile = chainstate.take_commit_profile();
     let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
     carried_prefetch.extend(downloaded_prefetch);
     prefetched_blocks.serialized = carried_prefetch;
@@ -12904,7 +12905,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -12921,6 +12922,11 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         breakdown.submit.as_millis(),
         breakdown.script_wait.as_millis(),
         breakdown.commit.as_millis(),
+        commit_profile.map_or_else(String::new, |[fold, undo, base, mutate, sync]| {
+            format!(
+                " commit-fold={fold}ms commit-undo={undo}ms commit-base-lookup={base}ms commit-mutate={mutate}ms commit-sync={sync}ms"
+            )
+        }),
         utxo_prefetch_elapsed.as_millis(),
         prefetch_elapsed.as_millis(),
         indexed_at.duration_since(executed_at).as_millis(),
