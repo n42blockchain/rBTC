@@ -1635,7 +1635,16 @@ fn is_recent_block(source: &dyn InboundDataSource, hash: BlockHash) -> Result<bo
 mod tests {
     use super::*;
     use crate::p2p::{TransactionRelay, connect_outbound};
-    use bitcoin::{Network, OutPoint, blockdata::constants::genesis_block};
+    use bitcoin::{
+        Network, OutPoint,
+        bip152::BlockTransactionsRequest,
+        blockdata::constants::genesis_block,
+        p2p::{
+            message_blockdata::{GetBlocksMessage, GetHeadersMessage},
+            message_compact_blocks::GetBlockTxn,
+            message_filter::{GetCFCheckpt, GetCFHeaders, GetCFilters},
+        },
+    };
 
     struct GenesisSource {
         block: Block,
@@ -1671,7 +1680,11 @@ mod tests {
         }
 
         fn mempool(&self) -> Result<Vec<Transaction>, String> {
-            Ok(Vec::new())
+            Ok(self
+                .available
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
         }
 
         fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
@@ -1698,8 +1711,13 @@ mod tests {
             Ok(true)
         }
 
-        fn basic_filter(&self, _height: u32) -> Result<Option<InboundBasicFilter>, String> {
-            Ok(None)
+        fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
+            Ok((height == 0).then_some(InboundBasicFilter {
+                block_hash: self.block.block_hash(),
+                filter: vec![0x00],
+                filter_hash: FilterHash::from_byte_array([3; 32]),
+                filter_header: FilterHeader::from_byte_array([4; 32]),
+            }))
         }
 
         fn addresses(&self) -> Result<Vec<SocketAddr>, String> {
@@ -1731,6 +1749,44 @@ mod tests {
         assert!(upload.charge(2, true).is_err());
         assert!(upload.charge(usize::MAX, false).is_ok());
         assert!(is_recent_block(&source, hash).unwrap());
+        assert_eq!(
+            source.utxo(OutPointKey::from(OutPoint::null())).unwrap(),
+            None
+        );
+
+        assert_eq!(
+            requested_filter_range(&source, BASIC_FILTER_TYPE, 0, hash, 1).unwrap(),
+            0..=0
+        );
+        assert!(matches!(
+            requested_filter_range(&source, 1, 0, hash, 1),
+            Err(InboundError::RequestBound(
+                "unsupported compact-filter type"
+            ))
+        ));
+        assert!(matches!(
+            requested_filter_range(&source, BASIC_FILTER_TYPE, 1, hash, 1),
+            Err(InboundError::RequestBound("compact-filter range"))
+        ));
+        assert!(matches!(
+            requested_filter_range(
+                &source,
+                BASIC_FILTER_TYPE,
+                0,
+                BlockHash::from_byte_array([8; 32]),
+                1,
+            ),
+            Err(InboundError::RequestBound(
+                "compact-filter stop hash is not active"
+            ))
+        ));
+
+        let stats = InboundStats::new(10);
+        stats.reject_capacity();
+        stats.reject_source();
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.rejected_capacity_total, 1);
+        assert_eq!(snapshot.rejected_source_total, 1);
     }
 
     #[test]
@@ -1885,6 +1941,34 @@ mod tests {
         );
         let snapshot = stats.snapshot();
         assert!(snapshot.peers[0].preferred);
+    }
+
+    #[test]
+    fn accounting_classifies_every_disconnect_reason() {
+        let stats = Arc::new(InboundStats::new(100));
+        let cases = [
+            InboundError::RequestBudget,
+            InboundError::UploadTarget,
+            InboundError::Protocol(P2pError::WrongMagic),
+            InboundError::RequestBound("test"),
+            InboundError::Io(std::io::Error::other("test")),
+            InboundError::Data("test".to_owned()),
+            InboundError::Evicted,
+        ];
+        for (port, error) in (1_u16..).zip(cases) {
+            stats
+                .accept(SocketAddr::from(([127, 0, 0, 1], port)), false)
+                .finish(Some(&error));
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.completed_total, 7);
+        assert_eq!(snapshot.request_budget_disconnects, 1);
+        assert_eq!(snapshot.upload_target_disconnects, 1);
+        assert_eq!(snapshot.protocol_disconnects, 1);
+        assert_eq!(snapshot.request_bound_disconnects, 1);
+        assert_eq!(snapshot.io_disconnects, 1);
+        assert_eq!(snapshot.data_disconnects, 1);
+        assert_eq!(snapshot.evicted_total, 1);
     }
 
     #[test]
@@ -2045,7 +2129,128 @@ mod tests {
                 .as_slice(),
             &[transaction]
         );
-        drop(peer);
+
+        // Exercise the remaining serving routes over the same real,
+        // checksum-validated connection.
+        let mut transport = peer.into_test_transport();
+        transport
+            .write_message(NetworkMessage::GetHeaders(GetHeadersMessage {
+                version: bitcoin::p2p::PROTOCOL_VERSION,
+                locator_hashes: vec![hash],
+                stop_hash: BlockHash::all_zeros(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Headers(headers) if headers.is_empty()
+        ));
+
+        transport
+            .write_message(NetworkMessage::GetBlocks(GetBlocksMessage::new(
+                vec![hash],
+                BlockHash::all_zeros(),
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Inv(inventory) if inventory.is_empty()
+        ));
+
+        transport
+            .write_message(NetworkMessage::MemPool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Inv(inventory)
+                if inventory == vec![Inventory::WTx(relayed.compute_wtxid())]
+        ));
+
+        let missing = Inventory::Transaction(bitcoin::Txid::from_byte_array([9; 32]));
+        transport
+            .write_message(NetworkMessage::GetData(vec![
+                Inventory::WTx(relayed.compute_wtxid()),
+                missing,
+            ]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Tx(actual) if actual == relayed
+        ));
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::NotFound(inventory) if inventory == vec![missing]
+        ));
+
+        transport
+            .write_message(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::CmpctBlock(_)
+        ));
+        transport
+            .write_message(NetworkMessage::GetBlockTxn(GetBlockTxn {
+                txs_request: BlockTransactionsRequest {
+                    block_hash: hash,
+                    indexes: vec![0],
+                },
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::BlockTxn(response)
+                if response.transactions.block_hash == hash
+                    && response.transactions.transactions.len() == 1
+        ));
+
+        transport
+            .write_message(NetworkMessage::GetCFilters(GetCFilters {
+                filter_type: BASIC_FILTER_TYPE,
+                start_height: 0,
+                stop_hash: hash,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::CFilter(filter)
+                if filter.block_hash == hash && filter.filter == vec![0]
+        ));
+        transport
+            .write_message(NetworkMessage::GetCFHeaders(GetCFHeaders {
+                filter_type: BASIC_FILTER_TYPE,
+                start_height: 0,
+                stop_hash: hash,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::CFHeaders(headers)
+                if headers.stop_hash == hash
+                    && headers.previous_filter_header == FilterHeader::all_zeros()
+                    && headers.filter_hashes == vec![FilterHash::from_byte_array([3; 32])]
+        ));
+        transport
+            .write_message(NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+                filter_type: BASIC_FILTER_TYPE,
+                stop_hash: hash,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap().into_payload(),
+            NetworkMessage::CFCheckpt(checkpoint)
+                if checkpoint.stop_hash == hash && checkpoint.filter_headers.is_empty()
+        ));
+
+        drop(transport);
         timeout(Duration::from_secs(1), async {
             loop {
                 if stats.snapshot().active == 0 {
@@ -2057,6 +2262,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stats.snapshot().completed_total, 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn public_listener_wrapper_accepts_a_real_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source: Arc<dyn InboundDataSource> = Arc::new(GenesisSource::new());
+        let task = tokio::spawn(run_listener(
+            listener,
+            Network::Regtest.magic(),
+            2,
+            "/rbtcd:listener-wrapper/".to_owned(),
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            InboundLimits::default(),
+            source,
+        ));
+        let peer = connect_outbound(
+            address,
+            Network::Regtest.magic(),
+            1,
+            "/rbtcd:wrapper-client/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(peer.remote_version().start_height, 0);
+        drop(peer);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }

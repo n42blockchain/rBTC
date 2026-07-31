@@ -1,9 +1,12 @@
-# Audit follow-up work order
+# Audit follow-up disposition and retained work order
 
-Open items remaining after the four audit passes recorded in
-[docs/AUDIT.md](AUDIT.md). Verified against the tree at merge commit `41fa2cf`
-(`origin/main` `8c7451f` plus the Windows regression fixes); every "current
-state" below was re-checked in code, not carried over from the report.
+Disposition of the items raised after the four audit passes recorded in
+[docs/AUDIT.md](AUDIT.md). The resolution status below records the integrated
+result; the original Group A–D work order is retained afterward as audit
+evidence, not as a list of still-open implementation tasks. The original
+premises were verified against merge commit `41fa2cf` (`origin/main` `8c7451f`
+plus the Windows regression fixes); every "current state" was re-checked in
+code, not carried over from the report.
 
 **Acceptance criteria for every task in this document**, unless a task says
 otherwise:
@@ -54,6 +57,11 @@ Revalidated and executed on 2026-07-27:
   `getblocktemplate` cannot synthesize a historical boundary. A test that only
   calls rBTC, or whose mutated header fails merely with `high-hash`, would not
   be differential evidence and was deliberately not added.
+- **A-32 completed.** The test now receives an explicit event after both peer
+  connections have been accepted but before either handshake is served. That
+  event, rather than elapsed wall time, proves peer startup is concurrent. A
+  separate 60-second timeout remains only as a loaded-runner liveness bound for
+  deadlock detection; it no longer encodes the concurrency property.
 
 Group B decisions:
 
@@ -66,10 +74,11 @@ Group B decisions:
   The deferral required "immutable fixtures prove every persisted digest
   byte-identical", so `tests::digest_fixtures` in `utxo.rs` now pins the
   UTXO-set identity digest, the canonical `key || encoded UTXO` record digest,
-  and the canonical UTXO encoding. The values were captured under 0.10 and hold
-  under 0.11. Compressed artefacts stay unpinned on purpose: archive piece
-  digests track zstd, not `sha2`, so the uncompressed stream they cover is
-  pinned instead. 0.11 dropped `LowerHex` on its output, fixed with one shared
+  the canonical UTXO encoding, and the exact persisted validation-bloom record
+  including its checksum. The values were captured under 0.10 and hold under
+  0.11. Compressed artefacts stay unpinned on purpose: archive piece digests
+  track zstd, not `sha2`, so the uncompressed stream they cover is pinned
+  instead. 0.11 dropped `LowerHex` on its output, fixed with one shared
   `utxo::hex_lower`. `rand` 0.10 is in separately, as the deferral itself
   suggested; `random_range` moved to the new `RngExt` trait, and 0.9 remains in
   the dev graph only because `proptest` pins it.
@@ -81,8 +90,9 @@ Group B decisions:
   `.rbtc.lock`, so mixed-version pairs still exclude each other. The in-file
   marker is retained, and contention reads the sidecar first and falls back to
   it, so a lock taken by an older release is still attributed. The sidecar is
-  owner-only, removed on release, and admitted by both data-directory
-  allowlists.
+  owner-only, published through a create-new staging file plus rename so
+  pre-positioned links cannot redirect a truncate, removed on release, and
+  admitted by both data-directory allowlists.
 - **B-4: retain the repository-owned Core 26 script boundary.** A future
   script-rule deployment, applicable interpreter security fix, or stable kernel
   API that preserves atomic chainstate is the trigger for a separately gated
@@ -322,6 +332,11 @@ under test is that concurrent validation does not *serialize behind* peer
 startup, which can be asserted from observed ordering rather than from elapsed
 time. Do not simply raise the constant without saying why the new value is
 defensible.
+
+**Resolved:** the server sends a one-shot event only after accepting both
+connections and before serving either handshake. The test asserts that event
+first, then independently waits for node completion. The 60-second watchdog is
+only a deadlock/liveness ceiling for loaded shared runners.
 
 ## Group C — accepted limitations, do not "fix"
 

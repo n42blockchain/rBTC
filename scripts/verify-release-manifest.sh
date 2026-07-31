@@ -25,8 +25,9 @@ sha256_file() {
 }
 
 expected_metadata=(
-    "rbtc-release-manifest-v1"
+    "rbtc-release-manifest-v2"
     $'tag\t'
+    $'version\t'
     $'commit\t'
     $'rustc\t'
     $'source_date_epoch\t'
@@ -37,31 +38,34 @@ lines=()
 while IFS= read -r line || [[ -n "$line" ]]; do
     lines[${#lines[@]}]=$line
 done <"$manifest"
-[[ ${#lines[@]} -eq 16 ]] || {
-    echo "manifest must contain exactly 6 metadata and 10 file records" >&2
+[[ ${#lines[@]} -eq 17 ]] || {
+    echo "manifest must contain exactly 7 metadata and 10 file records" >&2
     exit 1
 }
 [[ "${lines[0]}" == "${expected_metadata[0]}" ]] || {
     echo "unsupported release manifest format" >&2
     exit 1
 }
-for index in 1 2 3 4; do
+for index in 1 2 3 4 5; do
     [[ "${lines[$index]}" == "${expected_metadata[$index]}"* ]] || {
         echo "invalid metadata record at line $((index + 1))" >&2
         exit 1
     }
 done
-[[ "${lines[5]}" == "${expected_metadata[5]}" ]] || {
+[[ "${lines[6]}" == "${expected_metadata[6]}" ]] || {
     echo "unsupported data schema" >&2
     exit 1
 }
 
 IFS=$'\t' read -r tag_key tag tag_extra <<<"${lines[1]}"
-IFS=$'\t' read -r commit_key commit commit_extra <<<"${lines[2]}"
-IFS=$'\t' read -r rustc_key rustc_version rustc_extra <<<"${lines[3]}"
-IFS=$'\t' read -r epoch_key source_date_epoch epoch_extra <<<"${lines[4]}"
-[[ "$tag_key" == tag && "$commit_key" == commit && "$rustc_key" == rustc \
+IFS=$'\t' read -r version_key package_version version_extra <<<"${lines[2]}"
+IFS=$'\t' read -r commit_key commit commit_extra <<<"${lines[3]}"
+IFS=$'\t' read -r rustc_key rustc_version rustc_extra <<<"${lines[4]}"
+IFS=$'\t' read -r epoch_key source_date_epoch epoch_extra <<<"${lines[5]}"
+[[ "$tag_key" == tag && "$version_key" == version && "$commit_key" == commit \
+    && "$rustc_key" == rustc \
     && "$epoch_key" == source_date_epoch && -z "${tag_extra:-}" \
+    && -z "${version_extra:-}" \
     && -z "${commit_extra:-}" && -z "${rustc_extra:-}" \
     && -z "${epoch_extra:-}" ]] || {
     echo "manifest metadata records must contain exactly two fields" >&2
@@ -71,6 +75,14 @@ IFS=$'\t' read -r epoch_key source_date_epoch epoch_extra <<<"${lines[4]}"
     echo "release metadata must not be empty" >&2
     exit 1
 }
+[[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+    echo "invalid package version" >&2
+    exit 1
+}
+if [[ "$tag" == v* && "$tag" != "v$package_version" ]]; then
+    echo "manifest tag does not match its package version" >&2
+    exit 1
+fi
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || {
     echo "invalid manifest commit" >&2
     exit 1
@@ -94,10 +106,10 @@ expected_paths=(
 )
 
 for offset in "${!expected_paths[@]}"; do
-    line=${lines[$((offset + 6))]}
+    line=${lines[$((offset + 7))]}
     IFS=$'\t' read -r record digest bytes kind target trust relative extra <<<"$line"
     [[ "$record" == "file" && -z "${extra:-}" ]] || {
-        echo "invalid file record at line $((offset + 7))" >&2
+        echo "invalid file record at line $((offset + 8))" >&2
         exit 1
     }
     [[ "$digest" =~ ^[0-9a-f]{64}$ && "$bytes" =~ ^[0-9]+$ ]] || {
@@ -170,4 +182,4 @@ for offset in "${!expected_paths[@]}"; do
     }
 done
 
-echo "release manifest verified: $tag ($commit)"
+echo "release manifest verified: $tag version $package_version ($commit)"

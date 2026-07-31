@@ -57,16 +57,20 @@ The matrix:
   obtains an RFC3161 SHA-256 timestamp, and verifies with SignTool;
 - generates a CycloneDX 1.5 SBOM and per-platform signed provenance bundles;
 - generates a deterministic, strictly ordered `RELEASE-MANIFEST.tsv` containing
-  the tag, commit, exact Rust version, source epoch, root data schema v3, target,
-  native trust type, byte length, and SHA-256 of all ten required release
-  assets;
+  the tag, package version, commit, exact Rust version, source epoch, root data
+  schema v3, target, native trust type, byte length, and SHA-256 of all ten
+  required release assets;
 - verifies the manifest before and after producing its offline Sigstore bundle,
   uploads a complete draft release, and publishes only after every gate passes.
 
-The manifest generator accepts no symlinks, requires the exact supported
-platform set, and uses fixed record ordering. `scripts/test-release-manifest.sh`
-is run in ordinary CI and proves both a valid assembly and rejection after
-asset tampering.
+The v2 manifest generator accepts no symlinks, requires the exact supported
+platform set, uses fixed record ordering, and rejects a release tag that is not
+exactly `v` plus the package version. The preflight independently reads the
+version through locked Cargo metadata, and every native job runs the complete
+all-feature test suite before executing the built binary's `--version` and
+`--help` paths. `scripts/test-release-manifest.sh` is run in ordinary CI and
+proves valid assembly, tag/version mismatch rejection, and rejection after asset
+tampering.
 
 ## Protected environment inputs
 
@@ -115,8 +119,9 @@ plus Gatekeeper on macOS, and `signtool verify /pa /all` on Windows.
    same clean tag and locked dependency graph.
 2. Run unit/integration tests on each native OS and verify deterministic
    rebuilds where the object format/toolchain permits.
-3. Produce one canonical manifest containing tag, commit, Rust/toolchain,
-   target, artifact SHA-256, SBOM SHA-256, and data/schema compatibility.
+3. Produce one canonical manifest containing tag, package version, commit,
+   Rust/toolchain, target, artifact SHA-256, SBOM SHA-256, and data/schema
+   compatibility.
 4. Sign the canonical manifest once with the release identity.
 5. Apply and independently verify native macOS/Windows signatures; notarize
    macOS and retain the notary log.

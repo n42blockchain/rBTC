@@ -171,7 +171,7 @@ const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_millis(20);
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(5);
-const USER_AGENT: &str = "/rbtcd:0.1.0/";
+const USER_AGENT: &str = concat!("/rbtcd:", env!("CARGO_PKG_VERSION"), "/");
 const MAX_CONFIGURED_PEERS: usize = 16;
 const DEFAULT_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 16;
@@ -209,6 +209,9 @@ const LOCAL_AUTH_TOKEN_RELOAD_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_WALLET_SCAN_PASSES: usize = 64;
 const MAX_COMPACT_TRANSACTION_CANDIDATES: usize = 64;
 const PEER_TRANSACTION_REBROADCAST_INTERVAL_SECS: u32 = 12 * 60 * 60;
+const PEER_CANDIDATE_EXHAUSTED_PREFIX: &str = "peer candidates exhausted: ";
+const PEER_RETRY_INITIAL_SECONDS: u64 = 5;
+const PEER_RETRY_MAX_SECONDS: u64 = 5 * 60;
 const API_AUDIT_FILE: &str = "api-auth-audit.jsonl";
 const MAX_VALIDATION_PAUSE_MS: u64 = 60_000;
 const ADAPTIVE_VALIDATION_BUSY_BATCH_SIZE: usize = 252;
@@ -217,6 +220,8 @@ const VALIDATION_OWNER_FILE: &str = ".rbtc-validation-owner.json";
 const DATA_DIRECTORY_LOCK_FILE: &str = ".rbtc.lock";
 /// Unlocked sidecar describing who holds the lock, readable under contention.
 const DATA_DIRECTORY_LOCK_OWNER_FILE: &str = ".rbtc.lock.owner";
+/// Create-new staging file used to publish the owner sidecar without following links.
+const DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE: &str = ".rbtc.lock.owner.tmp";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
 const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
@@ -2653,18 +2658,40 @@ fn owner_marker_path(data_dir: &std::path::Path) -> PathBuf {
 /// Publishes the owner description where a contending process can read it.
 ///
 /// Best-effort: the marker is diagnostic, so a write failure must not stop a
-/// node that already holds the lock.
+/// node that already holds the lock. The bytes are first written through a
+/// create-new handle and then renamed into place. This prevents a stale or
+/// attacker-controlled sidecar symlink/hardlink from redirecting the truncate
+/// into another file.
 fn write_owner_marker(path: &std::path::Path, marker: &str) {
+    let Some(data_dir) = path.parent() else {
+        return;
+    };
+    let temporary = data_dir.join(DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE);
+    // `remove_file` removes a link itself rather than its target. A fixed
+    // staging name is sufficient because the exclusive data-directory lock
+    // serializes every legitimate publisher.
+    let _ = fs::remove_file(&temporary);
     let mut options = fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    if let Ok(mut file) = options.open(path) {
-        let _ = file.write_all(marker.as_bytes());
-        let _ = file.sync_data();
+    let published = (|| -> io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(marker.as_bytes())?;
+        file.sync_data()?;
+        drop(file);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary, path)
+    })();
+    if published.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
 }
 
@@ -4723,8 +4750,31 @@ impl CliError {
 /// should use [`NodeBuilder`] so shutdown and task ownership remain under the
 /// host application's control.
 pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliError> {
-    match parse_options(arguments) {
+    let mut arguments = arguments.collect::<Vec<_>>();
+    if matches!(
+        arguments.as_slice(),
+        [argument] if argument == "--version" || argument == "-V"
+    ) {
+        print_version();
+        return Ok(());
+    }
+    let check_config_count = arguments
+        .iter()
+        .filter(|argument| argument.as_str() == "--check-config")
+        .count();
+    if check_config_count > 1 {
+        print_usage();
+        return Err(CliError::parse(
+            "--check-config cannot be supplied more than once".to_owned(),
+        ));
+    }
+    arguments.retain(|argument| argument != "--check-config");
+    match parse_options(arguments.into_iter()) {
         Ok(Some(options)) => {
+            if check_config_count == 1 {
+                println!("{}", startup_configuration_summary(&options));
+                return Ok(());
+            }
             let mut logging = options.logging.clone();
             if matches!(
                 options.offline_action.as_ref(),
@@ -4783,7 +4833,13 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
         }
         Ok(None) => {
             print_usage();
-            Ok(())
+            if check_config_count == 1 {
+                Err(CliError::parse(
+                    "--check-config requires a configuration file or launch arguments".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         Err(error) => {
             print_usage();
@@ -6773,7 +6829,70 @@ fn retier_utxos(options: &Options, hot_window_blocks: u32) -> Result<(), String>
 }
 
 #[allow(clippy::too_many_lines)]
+fn is_peer_candidate_exhaustion(error: &str) -> bool {
+    error.starts_with(PEER_CANDIDATE_EXHAUSTED_PREFIX)
+}
+
+fn peer_retry_seconds(attempt: u32, nonce: u64) -> u64 {
+    let exponent = attempt.min(6);
+    let base = PEER_RETRY_INITIAL_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(PEER_RETRY_MAX_SECONDS);
+    let jitter_bound = (base / 4).max(1);
+    let jitter = nonce.rotate_left(attempt % 64) % (jitter_bound + 1);
+    base.saturating_add(jitter).min(PEER_RETRY_MAX_SECONDS)
+}
+
+#[cfg(not(test))]
+fn peer_retry_delay(attempt: u32, nonce: u64) -> Duration {
+    Duration::from_secs(peer_retry_seconds(attempt, nonce))
+}
+
+#[cfg(test)]
+fn peer_retry_delay(attempt: u32, nonce: u64) -> Duration {
+    Duration::from_millis(peer_retry_seconds(attempt, nonce))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_pool(
+    options: &Options,
+    local_nonce: u64,
+    background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
+) -> Result<(), String> {
+    let mut retry_attempt = 0_u32;
+    loop {
+        match run_peer_pool_session(
+            options,
+            local_nonce,
+            background_validation,
+            validation_scheduler,
+        )
+        .await
+        {
+            Err(error)
+                if !options.once
+                    && options.fetch_block.is_none()
+                    && is_peer_candidate_exhaustion(&error) =>
+            {
+                let delay = peer_retry_delay(retry_attempt, local_nonce);
+                retry_attempt = retry_attempt.saturating_add(1);
+                rbtc_warn!(
+                    "{error}; daemon will resolve and retry peer candidates in {} seconds",
+                    delay.as_secs()
+                );
+                tokio::select! {
+                    () = options.runtime_control.shutdown_requested() => return Ok(()),
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_peer_pool_session(
     options: &Options,
     local_nonce: u64,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -6960,13 +7079,12 @@ async fn run_peer_pool(
         }
     }
     if attempted.is_empty() {
-        return Err(
-            "no peer candidates available; provide --connect, enable/configure DNS seeds, or retain a verified peer database"
-                .to_owned(),
-        );
+        return Err(format!(
+            "{PEER_CANDIDATE_EXHAUSTED_PREFIX}no peer candidates available; provide --connect, enable/configure DNS seeds, or retain a verified peer database"
+        ));
     }
     Err(format!(
-        "all {} peer candidates failed: {}",
+        "{PEER_CANDIDATE_EXHAUSTED_PREFIX}all {} peer candidates failed: {}",
         failures.len(),
         failures.join("; ")
     ))
@@ -15412,6 +15530,8 @@ fn print_usage() {
     println!(
         concat!(
             "rbtcd {}\n\nUSAGE:\n",
+            "  rbtcd --version\n",
+            "  rbtcd --check-config --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
@@ -15441,6 +15561,10 @@ fn print_usage() {
         ),
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn print_version() {
+    println!("rbtcd {}", env!("CARGO_PKG_VERSION"));
 }
 
 #[cfg(test)]
@@ -15481,6 +15605,36 @@ mod tests {
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
+
+    #[tokio::test]
+    async fn cli_version_and_config_check_are_side_effect_free() {
+        assert_eq!(
+            USER_AGENT,
+            concat!("/rbtcd:", env!("CARGO_PKG_VERSION"), "/")
+        );
+        run_cli(["--version".to_owned()].into_iter()).await.unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let data_dir = directory.path().join("not-created");
+        run_cli(
+            [
+                "--check-config".to_owned(),
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--data-dir".to_owned(),
+                data_dir.display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .await
+        .unwrap();
+        assert!(!data_dir.exists());
+
+        let error = run_cli(["--check-config".to_owned()].into_iter())
+            .await
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
 
     #[test]
     fn block_throughput_uses_completed_transfer_deltas_and_saturates() {
@@ -16105,6 +16259,79 @@ mod tests {
         .expect("shutdown barrier clears after the checkpoint drops");
         assert!(InFlightCheckpoint::try_enter(&requested, &in_flight).is_none());
         assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
+    fn peer_retry_test_options(once: bool, runtime_control: Arc<RuntimeControl>) -> Options {
+        Options {
+            remotes: Vec::new(),
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: None,
+            once,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: None,
+            mempool_full_rbf: false,
+            cleanup_validation_dir: false,
+            offline_action: None,
+            validation_limits: ValidationLimits::default(),
+            ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
+            cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
+            resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
+            runtime_control,
+            observer: None,
+            snapshot_overlay: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_retries_exhausted_peer_waves_but_once_mode_reports_them() {
+        for attempt in 0..32 {
+            let seconds = peer_retry_seconds(attempt, 0x5a5a_a5a5_1234_5678);
+            assert!((PEER_RETRY_INITIAL_SECONDS..=PEER_RETRY_MAX_SECONDS).contains(&seconds));
+        }
+        assert_eq!(
+            peer_retry_seconds(31, 0x5a5a_a5a5_1234_5678),
+            PEER_RETRY_MAX_SECONDS
+        );
+
+        let runtime_control = Arc::new(RuntimeControl::default());
+        let daemon_options = peer_retry_test_options(false, Arc::clone(&runtime_control));
+        let daemon =
+            tokio::spawn(async move { run_peer_pool(&daemon_options, 1, None, None).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !daemon.is_finished(),
+            "a long-running node must not exit on temporary peer exhaustion"
+        );
+        runtime_control.request_shutdown();
+        timeout(Duration::from_secs(1), daemon)
+            .await
+            .expect("retry backoff must remain responsive to shutdown")
+            .unwrap()
+            .unwrap();
+
+        let once_options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        let error = run_peer_pool(&once_options, 1, None, None)
+            .await
+            .unwrap_err();
+        assert!(is_peer_candidate_exhaustion(&error));
+        assert!(error.contains("no peer candidates available"));
     }
 
     #[tokio::test]
@@ -18019,6 +18246,8 @@ mod tests {
         let known = prop::sample::select(
             [
                 "--help",
+                "--version",
+                "--check-config",
                 "--connect",
                 "--dns-seed",
                 "--no-dns-seeds",
@@ -21287,6 +21516,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn lock_owner_sidecar_replaces_links_without_touching_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().unwrap();
+        let outside = directory.path().join("outside-owner-target");
+        let sidecar = directory.path().join(DATA_DIRECTORY_LOCK_OWNER_FILE);
+        fs::write(&outside, "must remain intact").unwrap();
+
+        symlink(&outside, &sidecar).unwrap();
+        let held = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "must remain intact");
+        assert!(
+            !fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(held);
+
+        fs::hard_link(&outside, &sidecar).unwrap();
+        let held = DataDirectoryLock::acquire(directory.path(), Network::Regtest).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "must remain intact");
+        assert_eq!(fs::metadata(&outside).unwrap().len(), 18);
+        drop(held);
+    }
+
     #[tokio::test]
     async fn readiness_route_returns_service_unavailable_during_ibd() {
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
@@ -23073,11 +23330,13 @@ mod tests {
         let remote = listener.local_addr().unwrap();
         let first_for_server = first.clone();
         let second_for_server = second.clone();
+        let (concurrency_observed, concurrency_confirmed) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             // Both outbound connections must be established before either
             // handshake is serviced, proving this mode is not sequential.
             let (first_stream, _) = listener.accept().await.unwrap();
             let (second_stream, _) = listener.accept().await.unwrap();
+            concurrency_observed.send(()).unwrap();
             let first_peer = serve_concurrent_assumeutxo_peer(
                 first_stream,
                 70,
@@ -23092,51 +23351,54 @@ mod tests {
             );
             tokio::join!(first_peer, second_peer);
         });
-        timeout(
-            Duration::from_secs(15),
-            run(Options {
-                remotes: vec![remote],
-                dns_seeds: Some(Vec::new()),
-                network: Network::Regtest,
-                fetch_block: None,
-                headers_db: None,
-                data_dir: Some(active_dir.clone()),
-                once: true,
-                network_execution: NetworkExecutionMode::Persistent,
-                explorer_listen: None,
-                wallet_api_files: None,
-                rpc_auth_token_file: None,
-                deployments: DeploymentConfig::for_network(Network::Regtest),
-                ibd_policy: IbdPolicy::for_network(Network::Regtest),
-                snapshot: None,
-                finalize_assumeutxo: None,
-                validation_target: None,
-                complete_assumeutxo: None,
-                background_assumeutxo: Some(validation_dir.clone()),
-                mempool_full_rbf: false,
-                cleanup_validation_dir: true,
-                offline_action: None,
-                validation_limits: ValidationLimits {
-                    max_blocks_per_batch: 1,
-                    pause_between_batches: Duration::ZERO,
-                    quick_repair: true,
-                },
-                ledger_retention: LedgerRetention::default(),
-                minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
-                cache: NodeCacheConfig::default(),
-                indexes: NodeIndexConfig::default(),
-                inbound_listen: None,
-                inbound_limits: InboundLimits::default(),
-                resources: NodeResourceConfig::default(),
-                logging: NodeLogConfig::default(),
-                runtime_control: Arc::new(RuntimeControl::default()),
-                observer: None,
-                snapshot_overlay: None,
-            }),
-        )
-        .await
-        .expect("concurrent validation must not wait for sequential peer startup")
-        .unwrap();
+        let node = tokio::spawn(run(Options {
+            remotes: vec![remote],
+            dns_seeds: Some(Vec::new()),
+            network: Network::Regtest,
+            fetch_block: None,
+            headers_db: None,
+            data_dir: Some(active_dir.clone()),
+            once: true,
+            network_execution: NetworkExecutionMode::Persistent,
+            explorer_listen: None,
+            wallet_api_files: None,
+            rpc_auth_token_file: None,
+            deployments: DeploymentConfig::for_network(Network::Regtest),
+            ibd_policy: IbdPolicy::for_network(Network::Regtest),
+            snapshot: None,
+            finalize_assumeutxo: None,
+            validation_target: None,
+            complete_assumeutxo: None,
+            background_assumeutxo: Some(validation_dir.clone()),
+            mempool_full_rbf: false,
+            cleanup_validation_dir: true,
+            offline_action: None,
+            validation_limits: ValidationLimits {
+                max_blocks_per_batch: 1,
+                pause_between_batches: Duration::ZERO,
+                quick_repair: true,
+            },
+            ledger_retention: LedgerRetention::default(),
+            minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
+            cache: NodeCacheConfig::default(),
+            indexes: NodeIndexConfig::default(),
+            inbound_listen: None,
+            inbound_limits: InboundLimits::default(),
+            resources: NodeResourceConfig::default(),
+            logging: NodeLogConfig::default(),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            observer: None,
+            snapshot_overlay: None,
+        }));
+        timeout(Duration::from_secs(60), concurrency_confirmed)
+            .await
+            .expect("node did not establish both peer connections within the liveness budget")
+            .expect("peer server stopped before observing both connections");
+        timeout(Duration::from_secs(60), node)
+            .await
+            .expect("concurrent node run exceeded the loaded-runner liveness budget")
+            .unwrap()
+            .unwrap();
         server.await.unwrap();
 
         let active =
@@ -23970,10 +24232,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "run explicitly with cargo test --release --bin rbtcd tests::reproducible_end_to_end_ibd_workload -- --ignored --exact --nocapture"]
     #[allow(clippy::too_many_lines)]
     async fn reproducible_end_to_end_ibd_workload() {
-        const DEFAULT_BLOCKS: u32 = 100;
+        // Keep a small production-path workload in every test/coverage run.
+        // The benchmark workflow supplies its larger requested size explicitly.
+        const DEFAULT_BLOCKS: u32 = 10;
         const MAX_BLOCKS: u32 = 1_000;
 
         let block_count = std::env::var("RBTC_BENCH_IBD_BLOCKS").map_or(DEFAULT_BLOCKS, |value| {

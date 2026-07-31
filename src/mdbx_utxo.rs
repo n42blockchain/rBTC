@@ -55,6 +55,82 @@ impl MdbxUtxoStore {
             .lock()
             .expect("MDBX write lock not poisoned")
     }
+
+    /// Returns one sorted page across both physical tiers without materializing
+    /// the complete UTXO set.
+    pub fn snapshot_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, UtxoError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_ro_txn()?;
+        let hot = transaction.open_table(Some(HOT))?;
+        let cold = transaction.open_table(Some(COLD))?;
+        let after_bytes = after.map(|outpoint| *outpoint.as_bytes());
+
+        let mut hot_cursor = transaction.cursor(&hot)?;
+        let mut cold_cursor = transaction.cursor(&cold)?;
+        let mut hot_rows = match after_bytes {
+            Some(after) => hot_cursor.iter_from::<Vec<u8>, Vec<u8>>(&after),
+            None => hot_cursor.iter_start::<Vec<u8>, Vec<u8>>(),
+        };
+        let mut cold_rows = match after_bytes {
+            Some(after) => cold_cursor.iter_from::<Vec<u8>, Vec<u8>>(&after),
+            None => cold_cursor.iter_start::<Vec<u8>, Vec<u8>>(),
+        };
+
+        #[allow(clippy::items_after_statements)]
+        fn next_row(
+            rows: &mut impl Iterator<Item = std::result::Result<(Vec<u8>, Vec<u8>), libmdbx::Error>>,
+            after_bytes: Option<&[u8]>,
+        ) -> Result<Option<(OutPointKey, Utxo)>, UtxoError> {
+            loop {
+                let row = rows.next().transpose()?;
+                let Some((key, value)) = row else {
+                    return Ok(None);
+                };
+                if after_bytes.is_some_and(|after| key.as_slice() <= after) {
+                    continue;
+                }
+                let key = OutPointKey::from_bytes(&key)?;
+                return Ok(Some((key, Utxo::decode(&value)?)));
+            }
+        }
+
+        let after_bytes = after_bytes.as_ref().map(<[u8; 36]>::as_slice);
+        let mut hot_next = next_row(&mut hot_rows, after_bytes)?;
+        let mut cold_next = next_row(&mut cold_rows, after_bytes)?;
+        let mut page = Vec::with_capacity(limit);
+        while page.len() < limit && (hot_next.is_some() || cold_next.is_some()) {
+            let take_hot = match (&hot_next, &cold_next) {
+                (Some((hot_key, _)), Some((cold_key, _))) => match hot_key.cmp(cold_key) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => {
+                        return Err(UtxoError::Malformed("outpoint in both tiers"));
+                    }
+                },
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let (key, utxo) = if take_hot {
+                let row = hot_next.take().expect("selected populated row");
+                hot_next = next_row(&mut hot_rows, None)?;
+                row
+            } else {
+                let row = cold_next.take().expect("selected populated row");
+                cold_next = next_row(&mut cold_rows, None)?;
+                row
+            };
+            page.push((key, utxo));
+        }
+        Ok(page)
+    }
 }
 
 impl UtxoStore for MdbxUtxoStore {

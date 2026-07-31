@@ -41,7 +41,7 @@ jobs:
       RBTC_BENCH_IBD_REPORT: target/ibd-benchmark.json
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # stable
+      - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
       - name: Capture runner and storage environment
         run: |
           mkdir -p target
@@ -56,7 +56,7 @@ jobs:
       - name: Run deterministic generated workload
         run: cargo test --locked --release --all-features --test storage_bench reproducible_storage_workload -- --ignored --exact --nocapture
       - name: Run production-path local IBD workload
-        run: cargo test --locked --release --all-features --bin rbtcd tests::reproducible_end_to_end_ibd_workload -- --ignored --exact --nocapture
+        run: cargo test --locked --release --all-features --lib node::tests::reproducible_end_to_end_ibd_workload -- --exact --nocapture
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: storage-benchmark-${{ github.run_id }}

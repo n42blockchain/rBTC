@@ -7,6 +7,18 @@ command-line options. The file must be a regular non-symlink file and may not
 exceed 64 KiB. Unknown keys, unknown network sections, malformed booleans, and
 duplicate scalar keys fail before storage or network startup.
 
+Validate the effective configuration during deployment with:
+
+```text
+rbtcd --check-config --config PATH [COMMAND-LINE OVERRIDES]
+```
+
+The command performs the same merge, type, bound, network, feature-combination,
+and path-relationship validation as startup, prints the bounded secret-free
+startup summary, and exits without installing logging, creating the data
+directory, opening durable state, or connecting peers. `--check-config` is a
+CLI-only deployment action and cannot be placed in the persistent config file.
+
 Global values apply to every network. A matching `[bitcoin]`, `[testnet]`,
 `[testnet4]`, `[signet]`, or `[regtest]` section replaces global scalar values
 and replaces a global repeatable list when that section supplies the same key.

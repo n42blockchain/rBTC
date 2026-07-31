@@ -709,6 +709,11 @@ impl<S> PeerSession<S> {
         self.local_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_test_transport(self) -> V1Transport<S> {
+        self.transport
+    }
+
     /// Returns cumulative measurements for fully received requested block batches.
     #[must_use]
     pub const fn block_transfer_stats(&self) -> BlockTransferStats {
