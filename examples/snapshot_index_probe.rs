@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hits += index
                 .get_many(chunk)?
                 .into_iter()
-                .filter(Option::is_some)
+                .flatten()
                 .count() as u64;
         }
     } else {

@@ -1817,6 +1817,11 @@ pub enum NodeError {
 /// budget is set to. A 3 GiB budget sits below that and forced a rebase
 /// roughly every 1,000 blocks, spending more wall clock rebasing than
 /// executing; 10 GiB completed the same catch-up without rebasing at all.
+/// Byte ceiling for one replayed block batch.
+///
+/// A batch is at most 64 blocks and a block at most 4 MB, so this cannot
+/// truncate a batch; it only bounds the ledger reader's own buffer.
+const REPLAY_BATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
@@ -1891,6 +1896,12 @@ struct NodeSnapshotOverlayConfig {
     rebase_percent: u8,
     compact_percent: u8,
     engine: SnapshotOverlayEngine,
+    /// Retained block ledger to replay from instead of downloading.
+    ///
+    /// Present only for benchmarking: it removes peers from the measured path
+    /// so a storage change can be compared without network variance, which a
+    /// networked soak cannot resolve.
+    replay_blocks: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9256,6 +9267,25 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         overlay.capacity_bytes,
     );
 
+    // `open_persisted` keeps the source ledger's own retention policy, so a
+    // replay directory is opened read-only in effect: this run never prunes
+    // the blocks it is replaying.
+    let replay = match overlay.replay_blocks.as_ref() {
+        Some(path) => Some(
+            PrunedBlockLedger::open_persisted(path)
+                .map_err(|error| format!("open replay block ledger: {error}"))?,
+        ),
+        None => None,
+    };
+    if let Some(replay) = replay.as_ref() {
+        let stats = replay.stats().map_err(|error| error.to_string())?;
+        rbtc_info!(
+            "replaying blocks from a retained ledger: {} blocks from height {}, {} bytes",
+            stats.blocks,
+            stats.first_height.unwrap_or_default(),
+            stats.bytes
+        );
+    }
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
     // A prior attempt may have staged a downloaded batch and then failed
@@ -9397,7 +9427,8 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             options.validation_limits.max_blocks_per_batch,
             &mut auxiliary_session,
             &mut prefetched_blocks,
-            true,
+            replay.is_none(),
+            replay.as_ref(),
         )
         .await?;
     }
@@ -11153,6 +11184,7 @@ async fn sync_validating_node(
                 &mut auxiliary_session,
                 &mut prefetched_blocks,
                 overlap_next_download,
+                None,
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
@@ -12318,6 +12350,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     prefetched_blocks: &mut PrefetchedBlocks,
     prefetch_next_batch: bool,
+    replay: Option<&PrunedBlockLedger>,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
     let tip = chainstate
@@ -12381,6 +12414,51 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     }
     blocks.extend(decoded_prefetch);
     let mut offset = blocks.len();
+    if let Some(replay) = replay {
+        // Replay reads the same blocks from a retained ledger instead of
+        // peers, so a storage change can be measured without the network in
+        // the number. Everything downstream — structure validation, staging,
+        // execution, publication — is the code path the networked run uses.
+        let wanted = u32::try_from(hashes.len() - offset)
+            .map_err(|_| PeerRunError::transient("replay batch exceeds u32"))?;
+        let first = next_height
+            .checked_add(u32::try_from(offset).expect("batch offset fits u32"))
+            .ok_or_else(|| PeerRunError::transient("replay height overflow"))?;
+        let batch = replay
+            .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
+            .map_err(|error| {
+                PeerRunError::transient(format!("replay ledger read at {first}: {error}"))
+            })?;
+        if batch.first_height != first || batch.blocks.is_empty() {
+            return Err(PeerRunError::transient(format!(
+                "replay ledger does not retain height {first}"
+            )));
+        }
+        for bytes in batch.blocks {
+            let block = deserialize::<Block>(&bytes).map_err(|error| {
+                PeerRunError::transient(format!("decode replayed block: {error}"))
+            })?;
+            // The ledger is not a trusted input just because it is local: a
+            // replayed block still has to be the one the active header chain
+            // names, or the run would silently measure different work.
+            if block.block_hash() != hashes[offset] {
+                return Err(PeerRunError::transient(format!(
+                    "replayed block at height {} does not match the active chain",
+                    next_height + u32::try_from(offset).expect("batch offset fits u32")
+                )));
+            }
+            blocks.push(block);
+            offset += 1;
+            if offset == hashes.len() {
+                break;
+            }
+        }
+        if offset < hashes.len() {
+            return Err(PeerRunError::transient(
+                "replay ledger ran out of retained blocks mid-batch",
+            ));
+        }
+    }
     while offset < hashes.len() {
         let remaining = &hashes[offset..];
         if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
@@ -13551,6 +13629,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_overlay_source = None;
     let mut snapshot_overlay_index = None;
     let mut snapshot_overlay_capacity = None;
+    let mut snapshot_overlay_replay_blocks: Option<PathBuf> = None;
     let mut snapshot_overlay_rebase_percent = None;
     let mut snapshot_overlay_compact_percent = None;
     let mut snapshot_overlay_engine = None;
@@ -14119,6 +14198,18 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 snapshot_overlay_index = Some(PathBuf::from(required_option_value(
                     &mut args,
                     "--snapshot-overlay-index",
+                )?));
+            }
+            "--snapshot-overlay-replay-blocks" => {
+                if snapshot_overlay_replay_blocks.is_some() {
+                    return Err(
+                        "--snapshot-overlay-replay-blocks cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                snapshot_overlay_replay_blocks = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-replay-blocks",
                 )?));
             }
             "--snapshot-overlay-capacity-bytes" => {
@@ -14713,9 +14804,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 || snapshot_overlay_rebase_percent.is_some()
                 || snapshot_overlay_compact_percent.is_some()
                 || snapshot_overlay_engine.is_some()
+                || snapshot_overlay_replay_blocks.is_some()
             {
                 return Err(
-                    "overlay capacity, engine, and rebase options require --snapshot-overlay-catchup"
+                    "overlay capacity, engine, replay, and rebase options require --snapshot-overlay-catchup"
                         .to_owned(),
                 );
             }
@@ -14731,6 +14823,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             compact_percent: snapshot_overlay_compact_percent
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
             engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
+            replay_blocks: snapshot_overlay_replay_blocks,
         }),
         _ => {
             return Err(
@@ -20405,9 +20498,68 @@ mod tests {
                 rebase_percent: DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT,
                 compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
                 engine: SnapshotOverlayEngine::Mdbx,
+                replay_blocks: None,
             })
         );
+
+        // Replay swaps the block source for a retained ledger and nothing
+        // else, so it must parse alongside the ordinary options rather than
+        // instead of them.
+        let replayed = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replayed
+                .snapshot_overlay
+                .expect("replay parses with catch-up")
+                .replay_blocks,
+            Some(PathBuf::from("/srv/replay/blocks"))
+        );
+
         for arguments in [
+            // Replay is a catch-up option and is rejected without it, the
+            // same way capacity and engine are.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+            ],
+            // It cannot be supplied twice.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/other",
+            ],
             // The snapshot and index must be supplied together.
             vec![
                 "--network",
