@@ -875,6 +875,77 @@ ratio as an isolated engine microbenchmark. The MDBX rerun wrote
 validated block, making redb's measured 12.7 MiB/block maintenance rate about
 sixteen times larger on these same-budget runs.
 
+A further round of write and memory work was then measured on MDBX at the
+same 10 GiB budget, over the same `utxo-935000.dat` and index, reaching
+960,345 in 397 batches over 25,345 blocks and exiting 0.
+
+Two changes were under test. Block undo is now stored zstd-compressed, chosen
+because a per-table breakdown of the completed redb overlay showed undo as
+the second largest item — 998,307,764 stored bytes across only 951 retained
+blocks, about 1,025 KiB per block — and because MDBX has no compaction, so
+anything that slows file growth directly delays a rebase. Separately, the
+snapshot index no longer holds its packed offset table in memory.
+
+The results that do not depend on the machine:
+
+| | prior rerun | this run |
+|---|---:|---:|
+| Rebases | 2 (947,224, 958,296) | **1** (955,096) |
+| Rebase output rewritten | 21,275,139,513 bytes | 10,646,320,407 bytes |
+| Maintenance write | 0.80 MiB/block | **0.40 MiB/block** |
+| Retained undo | 1,025 KiB/block | **442 KiB/block** |
+| Final overlay | 19% of budget | 25% of budget |
+
+Halving the maintenance write is a direct consequence of rebasing once rather
+than twice, and the deferral is attributable: the prior rerun crossed the 85%
+threshold at 947,224, while this one reached it at 955,096, about 7,900 blocks
+later, on the same budget and base. Freeing roughly 600 MB of undo is what
+bought those blocks.
+
+The undo ratio of 2.32x is a conservative floor, because the two sides are not
+measured the same way: redb's 998,307,764 is a logical stored-byte count while
+MDBX's 435,425,280 counts whole pages, including partial fill and page
+overhead. The compression is at least this good.
+
+Wall-clock is deliberately absent from that table. This run's execution
+interval was 62.81 minutes for 25,345 blocks against the prior rerun's 83.07
+for 25,313, but the prior rerun's rebase artifacts — `utxo-947224.dat` and
+`utxo-958296.dat` — are not present on the machine that produced this one, so
+the two ran on different hardware and the ratio measures that as much as any
+code change. The 62.81 minutes stands as a new local reference point, not as a
+speedup. The single rebase paused block progress for 4.20 minutes, against
+about 4.61 for each of the prior two.
+
+Final overlay composition, at 2,724,679,680 bytes of high-water mark:
+
+| table | entries | page bytes |
+|---|---:|---:|
+| `utxo_overlay` | 4,100,830 | 864,468,992 |
+| `utxo_spent_base` | 3,683,808 | 253,349,888 |
+| `block_undos` | 961 | 435,425,280 |
+
+Live tables account for 57% of the high-water mark; the remainder is
+copy-on-write garbage that `last_pgno` still counts, which is why the
+geometry ceiling is reached well before the live data would suggest.
+
+Index memory was measured separately, on the real 164,241,311-coin index,
+looking up 200,000 outpoints taken from the snapshot itself:
+
+| | table resident | table read per lookup |
+|---|---:|---:|
+| Peak working set | 2.17 GiB | **0.15 GiB** |
+| Lookup rate | 474,260/s | 208,330/s |
+
+The lookup rates are page-cache-warm on both sides, since verifying the
+container's digest at open streams the whole file; a cold cache would widen
+the gap. An in-process cache for the table was considered and rejected: a
+minimal perfect hash distributes slots uniformly, so hit rate would scale
+linearly with cache size with no working-set knee, entries are bit-packed at
+53 bits against an LRU's ~40 bytes of per-entry overhead, and the memory would
+be anonymous rather than reclaimable — reintroducing exactly what the change
+removed. Reducing the number of reads by resolving a batch's slots in sorted
+file order would help where caching cannot, and is not yet implemented.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
