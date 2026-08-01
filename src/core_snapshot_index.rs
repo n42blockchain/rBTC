@@ -52,8 +52,8 @@ use crate::{
 };
 
 const INDEX_MAGIC: &[u8; 8] = b"RBTCMPHF";
-const INDEX_VERSION: u16 = 1;
-const INDEX_HEADER_BYTES: usize = 100;
+const INDEX_VERSION: u16 = 2;
+const INDEX_HEADER_BYTES: usize = 107;
 const INDEX_DIGEST_BYTES: usize = 32;
 /// Staging window for streaming the packed offset table at open.
 ///
@@ -63,21 +63,10 @@ const INDEX_READ_WINDOW_BYTES: usize = 1024 * 1024;
 /// is authenticated against a release-pinned UTXO-set hash, so an adversary
 /// cannot select keys against the fixed SipHash keys.
 const INDEX_SEED: u64 = 0x7262_7463_2d69_6478;
-/// Upper bound of one encoded coin: CompactSize vout, coin-code VARINT,
-/// amount VARINT, script-size VARINT, and Core's 10,000-byte script ceiling.
-const MAX_COIN_WINDOW: u64 = 5 + 5 + 10 + 10 + 10_000;
-/// First-attempt read width for one coin record.
-///
-/// Sized to cover a CompactSize vout, the coin-code and amount VARINTs, the
-/// script-size VARINT, and a script well past the 32 bytes the largest
-/// standard template compresses to. Records needing more are re-read at
-/// [`MAX_COIN_WINDOW`].
-const COIN_PROBE_WINDOW: u64 = 128;
-/// Largest span read in one go to cover both a group txid and its coin.
-///
-/// Beyond this the two are far enough apart that one read would move more
-/// bytes than the second syscall costs, so they are read separately.
-const COMBINED_READ_LIMIT: u64 = 512;
+/// First-attempt read width for one txid group: its 32-byte header, the
+/// coin count, and a coin of standard shape. Groups needing more are re-read
+/// four times wider until they fit.
+const GROUP_PROBE_WINDOW: u64 = 192;
 
 /// Failures while building, opening, or querying a snapshot access index.
 #[derive(Debug, Error)]
@@ -156,10 +145,16 @@ pub struct CoreSnapshotCoin {
     pub script_pubkey: Vec<u8>,
 }
 
-struct CoinLocation {
-    key: [u8; 36],
-    coin_offset: u64,
-    backref: u32,
+/// One txid group's position in the snapshot.
+///
+/// The index keys on the txid rather than on the outpoint, so a slot points
+/// straight at the group header and a group's coins are scanned for the vout.
+/// That is what removes the backward-distance field an outpoint-keyed slot
+/// needed, and it is why the table holds one entry per transaction rather
+/// than one per coin.
+struct GroupLocation {
+    txid: [u8; 32],
+    offset: u64,
 }
 
 /// Builds and atomically publishes an access index beside a retained snapshot.
@@ -221,40 +216,36 @@ pub fn build_core_snapshot_index_with_identity(
     let (metadata, locations, snapshot_sha256, snapshot_bytes) =
         scan_snapshot(snapshot_path, identity)?;
 
-    let coins = u64::try_from(locations.len()).expect("coin count fits u64");
+    let coins = metadata.coins_count;
+    let groups = u64::try_from(locations.len()).expect("group count fits u64");
     let mphf = Mphf::build(
-        coins,
-        |ordinal| locations[usize::try_from(ordinal).expect("coin ordinal fits usize")].key,
+        groups,
+        |ordinal| locations[usize::try_from(ordinal).expect("group ordinal fits usize")].txid,
         INDEX_SEED,
     )?;
 
     let max_offset = locations
         .iter()
-        .map(|location| location.coin_offset)
+        .map(|location| location.offset)
         .max()
-        .expect("scan yields at least one coin");
-    let max_backref = locations
-        .iter()
-        .map(|location| location.backref)
-        .max()
-        .expect("scan yields at least one coin");
+        .expect("scan yields at least one group");
     let offset_bits = bit_width(max_offset);
-    let backref_bits = bit_width(u64::from(max_backref));
-    let entry_bits = u64::from(offset_bits) + u64::from(backref_bits);
+    let entry_bits = u64::from(offset_bits);
     let table_words = usize::try_from(
-        coins
+        groups
             .checked_mul(entry_bits)
             .expect("table bits fit u64")
             .div_ceil(64),
     )
     .expect("table words fit usize");
     let mut table = vec![0_u64; table_words];
-    let mut occupied = vec![0_u64; usize::try_from(coins.div_ceil(64)).expect("bitmap fits usize")];
+    let mut occupied =
+        vec![0_u64; usize::try_from(groups.div_ceil(64)).expect("bitmap fits usize")];
     for location in &locations {
         let slot = mphf
-            .index(&location.key)
+            .index(&location.txid)
             .ok_or(CoreSnapshotIndexError::Invalid("unmapped build key"))?;
-        if slot >= coins {
+        if slot >= groups {
             return Err(CoreSnapshotIndexError::Invalid("slot out of range"));
         }
         let word = usize::try_from(slot / 64).expect("bitmap fits usize");
@@ -263,14 +254,7 @@ pub fn build_core_snapshot_index_with_identity(
             return Err(CoreSnapshotIndexError::Invalid("duplicate slot"));
         }
         occupied[word] |= bit;
-        let base = slot * entry_bits;
-        write_bits(&mut table, base, offset_bits, location.coin_offset);
-        write_bits(
-            &mut table,
-            base + u64::from(offset_bits),
-            backref_bits,
-            u64::from(location.backref),
-        );
+        write_bits(&mut table, slot * entry_bits, offset_bits, location.offset);
     }
 
     let mut bytes = Vec::new();
@@ -282,8 +266,8 @@ pub fn build_core_snapshot_index_with_identity(
     bytes.extend_from_slice(&snapshot_bytes.to_le_bytes());
     bytes.extend_from_slice(&snapshot_sha256);
     bytes.extend_from_slice(&identity.height.to_le_bytes());
+    bytes.extend_from_slice(&groups.to_le_bytes());
     bytes.push(offset_bits);
-    bytes.push(backref_bits);
     debug_assert_eq!(bytes.len(), INDEX_HEADER_BYTES);
     mphf.encode_into(&mut bytes);
     for word in &table {
@@ -311,14 +295,14 @@ pub fn build_core_snapshot_index_with_identity(
 fn scan_snapshot(
     snapshot_path: &Path,
     identity: &SnapshotBaseIdentity,
-) -> Result<(CoreSnapshotMetadata, Vec<CoinLocation>, [u8; 32], u64), CoreSnapshotIndexError> {
+) -> Result<(CoreSnapshotMetadata, Vec<GroupLocation>, [u8; 32], u64), CoreSnapshotIndexError> {
     let mut reader = DigestReader::new(BufReader::new(File::open(snapshot_path)?));
     let metadata = read_metadata(&mut reader)?;
     if metadata.base_block_hash != identity.block_hash {
         return Err(CoreSnapshotError::AnchorMismatch.into());
     }
 
-    let mut locations = Vec::new();
+    let mut locations: Vec<GroupLocation> = Vec::new();
     let mut core_hash = sha256d::Hash::engine();
     let mut previous_txid: Option<[u8; 32]> = None;
     let mut remaining = metadata.coins_count;
@@ -361,14 +345,9 @@ fn scan_snapshot(
                 return Err(CoreSnapshotError::Invalid("amount exceeds MAX_MONEY").into());
             }
             let script_pubkey = decompress_script(&mut reader)?;
-            let backref = coin_offset
-                .checked_sub(txid_offset)
-                .and_then(|span| u32::try_from(span).ok())
-                .ok_or(CoreSnapshotError::Invalid("group span overflow"))?;
             group.push((
                 vout,
                 coin_offset,
-                backref,
                 height,
                 code & 1 == 1,
                 value_sats,
@@ -383,7 +362,7 @@ fn scan_snapshot(
         if group.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(CoreSnapshotError::Invalid("duplicate output index").into());
         }
-        for (vout, coin_offset, backref, height, is_coinbase, value_sats, script_pubkey) in group {
+        for (vout, _coin_offset, height, is_coinbase, value_sats, script_pubkey) in group {
             let mut key = [0_u8; 36];
             key[..32].copy_from_slice(&txid);
             key[32..].copy_from_slice(&vout.to_le_bytes());
@@ -399,12 +378,13 @@ fn scan_snapshot(
                     script_pubkey,
                 },
             );
-            locations.push(CoinLocation {
-                key,
-                coin_offset,
-                backref,
-            });
         }
+        // One record per group, not per coin: the commitment above still
+        // walks every coin, but the index only needs to find the group.
+        locations.push(GroupLocation {
+            txid,
+            offset: txid_offset,
+        });
     }
     let mut trailing = [0_u8; 1];
     if reader.read(&mut trailing)? != 0 {
@@ -431,8 +411,8 @@ pub struct CoreSnapshotUtxoIndex {
     coins: u64,
     snapshot_bytes: u64,
     snapshot_sha256: [u8; 32],
+    groups: u64,
     offset_bits: u8,
-    backref_bits: u8,
     mphf: Mphf,
     /// The index container, kept open so the packed table can be read per
     /// lookup instead of held in memory.
@@ -502,12 +482,12 @@ impl CoreSnapshotUtxoIndex {
         let snapshot_bytes = u64::from_le_bytes(body[54..62].try_into().expect("fixed header"));
         let snapshot_sha256: [u8; 32] = body[62..94].try_into().expect("fixed header");
         let base_height = u32::from_le_bytes(body[94..98].try_into().expect("fixed header"));
-        let offset_bits = body[98];
-        let backref_bits = body[99];
-        if coins == 0 {
-            return Err(CoreSnapshotIndexError::Invalid("empty coin count"));
+        let groups = u64::from_le_bytes(body[98..106].try_into().expect("fixed header"));
+        let offset_bits = body[106];
+        if coins == 0 || groups == 0 || groups > coins {
+            return Err(CoreSnapshotIndexError::Invalid("empty coin or group count"));
         }
-        if offset_bits == 0 || offset_bits > 63 || backref_bits == 0 || backref_bits > 32 {
+        if offset_bits == 0 || offset_bits > 63 {
             return Err(CoreSnapshotIndexError::Invalid("entry width out of range"));
         }
         // The hash function's own length is not recorded, but the offset
@@ -515,8 +495,8 @@ impl CoreSnapshotUtxoIndex {
         // is the hash function. Reconciling the three against the real file
         // length is what keeps a damaged header from sizing an allocation:
         // every section must fit in bytes that exist.
-        let entry_bits = u64::from(offset_bits) + u64::from(backref_bits);
-        let table_words = coins
+        let entry_bits = u64::from(offset_bits);
+        let table_words = groups
             .checked_mul(entry_bits)
             .ok_or(CoreSnapshotIndexError::Invalid("table size overflow"))?
             .div_ceil(64);
@@ -548,9 +528,9 @@ impl CoreSnapshotUtxoIndex {
             ));
         }
         drop(mphf_section);
-        if mphf.key_count() != coins {
+        if mphf.key_count() != groups {
             return Err(CoreSnapshotIndexError::Invalid(
-                "hash function does not cover the coin count",
+                "hash function does not cover the group count",
             ));
         }
 
@@ -612,8 +592,8 @@ impl CoreSnapshotUtxoIndex {
             coins,
             snapshot_bytes,
             snapshot_sha256,
+            groups,
             offset_bits,
-            backref_bits,
             mphf,
             index,
             table_start,
@@ -632,8 +612,16 @@ impl CoreSnapshotUtxoIndex {
     /// The table was written as little-endian 64-bit words, which for bit
     /// addressing is the same sequence as a little-endian byte stream: global
     /// bit `b` lives in byte `b / 8` at bit `b % 8` under either reading.
-    fn read_table_entry(&self, slot: u64) -> Result<(u64, u64), CoreSnapshotIndexError> {
-        let entry_bits = u64::from(self.offset_bits) + u64::from(self.backref_bits);
+    fn read_table_entry(&self, slot: u64) -> Result<u64, CoreSnapshotIndexError> {
+        // The hash is minimal over the group count, so a slot outside it means
+        // the container and the hash disagree — fail rather than read a
+        // position past the table.
+        if slot >= self.groups {
+            return Err(CoreSnapshotIndexError::Invalid(
+                "slot outside the group count",
+            ));
+        }
+        let entry_bits = u64::from(self.offset_bits);
         let bit_start = slot * entry_bits;
         let byte_start = bit_start / 8;
         let bit_in_byte = bit_start % 8;
@@ -648,12 +636,8 @@ impl CoreSnapshotUtxoIndex {
         // Both masks are narrower than 64 bits — open validates the widths at
         // 63 and 32 — so neither value can exceed `u64`.
         let packed = u128::from_le_bytes(covering) >> bit_in_byte;
-        let coin_offset = u64::try_from(packed & ((1_u128 << self.offset_bits) - 1))
-            .expect("offset width is at most 63 bits");
-        let backref =
-            u64::try_from((packed >> self.offset_bits) & ((1_u128 << self.backref_bits) - 1))
-                .expect("backref width is at most 32 bits");
-        Ok((coin_offset, backref))
+        Ok(u64::try_from(packed & ((1_u128 << self.offset_bits) - 1))
+            .expect("offset width is at most 63 bits"))
     }
 
     /// Looks one outpoint up directly in the compressed snapshot file.
@@ -673,12 +657,12 @@ impl CoreSnapshotUtxoIndex {
         outpoint: &OutPoint,
     ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
         let key = OutPointKey::from(*outpoint);
-        let Some(slot) = self.mphf.index(key.as_bytes()) else {
+        let Some(slot) = self.mphf.index(&key.as_bytes()[..32]) else {
             return Ok(None);
         };
-        let entry = self.read_table_entry(slot)?;
+        let group_offset = self.read_table_entry(slot)?;
         let mut buffer = Vec::new();
-        self.decode_located_coin(&key, outpoint.vout, entry, &mut buffer)
+        self.decode_located_coin(&key, outpoint.vout, group_offset, &mut buffer)
     }
 
     /// Resolves many outpoints in one pass, reading in file order.
@@ -708,7 +692,7 @@ impl CoreSnapshotUtxoIndex {
         let keys: Vec<OutPointKey> = outpoints.iter().copied().map(OutPointKey::from).collect();
         let slots: Vec<Option<u64>> = keys
             .iter()
-            .map(|key| self.mphf.index(key.as_bytes()))
+            .map(|key| self.mphf.index(&key.as_bytes()[..32]))
             .collect();
 
         // Slot order is byte order: an entry's position is `slot * entry_bits`.
@@ -716,7 +700,7 @@ impl CoreSnapshotUtxoIndex {
             .filter(|index| slots[*index].is_some())
             .collect();
         by_slot.sort_unstable_by_key(|index| slots[*index]);
-        let mut entries: Vec<Option<(u64, u64)>> = vec![None; outpoints.len()];
+        let mut entries: Vec<Option<u64>> = vec![None; outpoints.len()];
         for index in by_slot {
             let slot = slots[index].expect("filtered to placed slots");
             entries[index] = Some(self.read_table_entry(slot)?);
@@ -725,7 +709,7 @@ impl CoreSnapshotUtxoIndex {
         let mut by_offset: Vec<usize> = (0..outpoints.len())
             .filter(|index| entries[*index].is_some())
             .collect();
-        by_offset.sort_unstable_by_key(|index| entries[*index].map(|(offset, _)| offset));
+        by_offset.sort_unstable_by_key(|index| entries[*index]);
         let mut coins: Vec<Option<CoreSnapshotCoin>> = vec![None; outpoints.len()];
         // One buffer for the whole batch: the per-coin window is bounded by
         // Core's script ceiling, so reusing it avoids an allocation per input.
@@ -738,122 +722,96 @@ impl CoreSnapshotUtxoIndex {
         Ok(coins)
     }
 
-    /// Verifies a located entry against the query and decodes its coin.
+    /// Verifies a located group against the query and decodes one coin.
+    ///
+    /// A slot addresses the group header, so this compares the group's txid to
+    /// the query before anything else — which is what makes a miss cheap, and
+    /// a miss is what the commit's duplicate check almost always gets. Only on
+    /// a txid match does it walk the group for the requested vout; 89.51% of
+    /// groups in the 935,000-height snapshot hold a single coin, so that walk
+    /// is usually one step.
     ///
     /// Shared by [`Self::get`] and [`Self::get_many`] so both apply the same
-    /// exactness checks: the group txid and the coin's own vout are compared
-    /// against the query before any field is returned.
+    /// exactness checks.
     fn decode_located_coin(
         &self,
         key: &OutPointKey,
         vout: u32,
-        (coin_offset, backref): (u64, u64),
+        group_offset: u64,
         buffer: &mut Vec<u8>,
     ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
-        let txid_offset = coin_offset
-            .checked_sub(backref)
-            .filter(|offset| *offset >= u64::try_from(METADATA_BYTES).expect("constant fits u64"))
-            .ok_or(CoreSnapshotIndexError::Invalid("backref out of range"))?;
-        if coin_offset >= self.snapshot_bytes || backref == 0 {
+        if group_offset >= self.snapshot_bytes
+            || group_offset < u64::try_from(METADATA_BYTES).expect("constant fits u64")
+        {
             return Err(CoreSnapshotIndexError::Invalid("offset out of range"));
         }
-
-        // The group txid sits `backref` bytes before the coin, so when the
-        // coin is near the front of its group both live inside one short span
-        // and one positioned read serves both. That is the common case — a
-        // backref is the txid, the coin count, and whatever earlier coins of
-        // the same transaction precede this one — and it removes a syscall
-        // from a path whose remaining cost is per-call overhead rather than
-        // bytes moved.
-        let span = backref.saturating_add(COIN_PROBE_WINDOW);
-        let combined = span <= COMBINED_READ_LIMIT && txid_offset + span <= self.snapshot_bytes;
-        if combined {
-            let length = usize::try_from(span).expect("bounded span fits usize");
-            buffer.clear();
-            buffer.resize(length, 0);
-            read_exact_at(&self.snapshot, buffer, txid_offset)?;
-            if buffer[..32] != key.as_bytes()[..32] {
-                return Ok(None);
-            }
-            let coin_start = usize::try_from(backref).expect("bounded backref fits usize");
-            match self.parse_coin(&buffer[coin_start..], vout) {
-                Ok(coin) => return Ok(coin),
-                // Fall through to the widening read below rather than failing:
-                // this record needs more than the probe covered.
-                Err(_) => {}
-            }
-        } else {
-            let mut txid = [0_u8; 32];
-            read_exact_at(&self.snapshot, &mut txid, txid_offset)?;
-            if txid != key.as_bytes()[..32] {
-                return Ok(None);
-            }
-        }
-
-        // Read a small window first. `MAX_COIN_WINDOW` is Core's worst case —
-        // a 10,000-byte raw script — but the six standard templates compress
-        // to 20 or 32 bytes, so a whole record is usually well under fifty.
-        // Always reading the worst case copied about 10 KB per lookup to
-        // decode roughly forty bytes of it. A record that genuinely needs
-        // more fails to parse out of the probe and is re-read at full width,
-        // so the outcome is identical either way — a corrupt record still
-        // reaches the same full-window parse it always did.
-        let available = self.snapshot_bytes - coin_offset;
-        let full = MAX_COIN_WINDOW.min(available);
-        // A combined read already tried the probe width for this record.
-        let mut window = if combined {
-            full
-        } else {
-            COIN_PROBE_WINDOW.min(available)
-        };
+        let available = self.snapshot_bytes - group_offset;
+        // Start narrow: a single-coin group is a txid, a one-byte count and a
+        // record that the standard templates keep well under fifty bytes.
+        // Anything larger fails to parse out of the probe and is re-read wider,
+        // so the outcome does not depend on the window.
+        let mut window = GROUP_PROBE_WINDOW.min(available);
         loop {
             let length = usize::try_from(window).expect("bounded window fits usize");
             buffer.clear();
             buffer.resize(length, 0);
-            read_exact_at(&self.snapshot, buffer, coin_offset)?;
-            match self.parse_coin(buffer, vout) {
-                Ok(coin) => return Ok(coin),
-                Err(_) if window < full => window = full,
-                Err(error) => return Err(error),
+            read_exact_at(&self.snapshot, buffer, group_offset)?;
+            match self.parse_group(buffer, key, vout) {
+                Ok(found) => return Ok(found),
+                Err(error) if window >= available => return Err(error),
+                Err(_) => {
+                    window = window.saturating_mul(4).min(available);
+                }
             }
         }
     }
 
-    /// Decodes one coin record from bytes already read out of the snapshot.
-    ///
-    /// Returns `Ok(None)` when the record's own vout does not match the
-    /// query, which is the second half of the exactness check — the first
-    /// being the group txid compared by the caller.
-    fn parse_coin(
+    /// Decodes a group read from the snapshot and returns the requested coin.
+    fn parse_group(
         &self,
         bytes: &[u8],
+        key: &OutPointKey,
         vout: u32,
     ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
-        let mut cursor = Cursor::new(bytes);
-        let vout_read = read_compact_size(&mut cursor).map_err(corrupt)?;
-        if u64::from(vout) != vout_read {
+        if bytes.len() < 32 {
+            return Err(CoreSnapshotIndexError::Invalid("truncated group header"));
+        }
+        if bytes[..32] != key.as_bytes()[..32] {
             return Ok(None);
         }
-        let code = read_core_varint(&mut cursor).map_err(corrupt)?;
-        let code = u32::try_from(code)
-            .map_err(|_| CoreSnapshotIndexError::Invalid("coin code overflow"))?;
-        let height = code >> 1;
-        if height > self.base_height {
-            return Err(CoreSnapshotIndexError::Invalid("coin height above base"));
+        let mut cursor = Cursor::new(&bytes[32..]);
+        let count = read_compact_size(&mut cursor).map_err(corrupt)?;
+        if count == 0 || count > MAX_COINS_PER_TXID {
+            return Err(CoreSnapshotIndexError::Invalid(
+                "invalid coins-per-txid count",
+            ));
         }
-        let compressed_amount = read_core_varint(&mut cursor).map_err(corrupt)?;
-        let value_sats = decompress_amount(compressed_amount)
-            .ok_or(CoreSnapshotIndexError::Invalid("amount overflow"))?;
-        if value_sats > MAX_MONEY_SATS {
-            return Err(CoreSnapshotIndexError::Invalid("amount exceeds MAX_MONEY"));
+        for _ in 0..count {
+            let record_vout = read_compact_size(&mut cursor).map_err(corrupt)?;
+            let code = read_core_varint(&mut cursor).map_err(corrupt)?;
+            let code = u32::try_from(code)
+                .map_err(|_| CoreSnapshotIndexError::Invalid("coin code overflow"))?;
+            let height = code >> 1;
+            if height > self.base_height {
+                return Err(CoreSnapshotIndexError::Invalid("coin height above base"));
+            }
+            let compressed_amount = read_core_varint(&mut cursor).map_err(corrupt)?;
+            let value_sats = decompress_amount(compressed_amount)
+                .ok_or(CoreSnapshotIndexError::Invalid("amount overflow"))?;
+            if value_sats > MAX_MONEY_SATS {
+                return Err(CoreSnapshotIndexError::Invalid("amount exceeds MAX_MONEY"));
+            }
+            let script_pubkey = decompress_script(&mut cursor).map_err(corrupt)?;
+            if record_vout == u64::from(vout) {
+                return Ok(Some(CoreSnapshotCoin {
+                    value_sats,
+                    height,
+                    is_coinbase: code & 1 == 1,
+                    script_pubkey,
+                }));
+            }
         }
-        let script_pubkey = decompress_script(&mut cursor).map_err(corrupt)?;
-        Ok(Some(CoreSnapshotCoin {
-            value_sats,
-            height,
-            is_coinbase: code & 1 == 1,
-            script_pubkey,
-        }))
+        Ok(None)
     }
 
     /// Streams the complete snapshot file and rechecks the SHA-256 recorded
@@ -1356,33 +1314,25 @@ mod tests {
     #[test]
     fn reads_packed_entries_across_byte_and_word_boundaries() {
         const OFFSET_BITS: u8 = 34;
-        const BACKREF_BITS: u8 = 19;
         const SLOTS: u64 = 4_096;
         /// A non-zero, odd table start proves the read is relative to it and
         /// does not silently assume alignment.
         const TABLE_START: u64 = 37;
 
-        let entry_bits = u64::from(OFFSET_BITS) + u64::from(BACKREF_BITS);
-        let expected: Vec<(u64, u64)> = (0..SLOTS)
-            .map(|slot| {
-                // Values chosen to keep every bit position in play rather
-                // than clustering near zero.
-                (
-                    slot.wrapping_mul(0x9E37_79B9) & ((1 << OFFSET_BITS) - 1),
-                    (slot.wrapping_mul(0x85EB_CA6B) & ((1 << BACKREF_BITS) - 1)) | 1,
-                )
-            })
+        let entry_bits = u64::from(OFFSET_BITS);
+        // Values chosen to keep every bit position in play rather than
+        // clustering near zero.
+        let expected: Vec<u64> = (0..SLOTS)
+            .map(|slot| slot.wrapping_mul(0x9E37_79B9) & ((1 << OFFSET_BITS) - 1))
             .collect();
 
         let mut words = vec![0_u64; usize::try_from((SLOTS * entry_bits).div_ceil(64)).unwrap()];
-        for (slot, (offset, backref)) in expected.iter().enumerate() {
-            let base = u64::try_from(slot).unwrap() * entry_bits;
-            write_bits(&mut words, base, OFFSET_BITS, *offset);
+        for (slot, offset) in expected.iter().enumerate() {
             write_bits(
                 &mut words,
-                base + u64::from(OFFSET_BITS),
-                BACKREF_BITS,
-                *backref,
+                u64::try_from(slot).unwrap() * entry_bits,
+                OFFSET_BITS,
+                *offset,
             );
         }
 
@@ -1405,9 +1355,9 @@ mod tests {
             coins: SLOTS,
             snapshot_bytes: 0,
             snapshot_sha256: [0_u8; 32],
+            groups: SLOTS,
             offset_bits: OFFSET_BITS,
-            backref_bits: BACKREF_BITS,
-            mphf: Mphf::build(1, |_| vec![0_u8; 36], INDEX_SEED).unwrap(),
+            mphf: Mphf::build(1, |_| [0_u8; 32], INDEX_SEED).unwrap(),
             index: File::open(&container_path).unwrap(),
             table_start: TABLE_START,
             snapshot: File::open(&container_path).unwrap(),
