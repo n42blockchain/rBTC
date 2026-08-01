@@ -1169,6 +1169,48 @@ kind of memory — what the index gave up was anonymous and unreclaimable, while
 most of what batching adds is file-backed mapping and per-batch working set —
 but on a memory-constrained host they belong on the same ledger.
 
+Reclaiming that garbage is now possible on MDBX, and measuring it corrected
+two things this section had claimed.
+
+The first correction is what the capability is. `libmdbx-rs` 0.6.6 exposes no
+compaction, which had been recorded as MDBX offering none. MDBX offers
+`mdbx_env_copy` with `MDBX_CP_COMPACT`; only the Rust binding was missing.
+libmdbx is vendored — the pattern already used for redb and bitcoinconsensus —
+with a safe `copy_compact`, so the `unsafe` stays in the dependency and this
+crate keeps `unsafe_code = "forbid"`. One detail matters for anyone touching
+it: `mdbx_env_copy` takes the pathname of a file that must not yet exist, not a
+directory to populate, so the copy lands at the `mdbx.dat` inside a directory
+created for it.
+
+Measured on a replay at the 50% trigger, the compaction released 51.4% —
+5,388,443,648 bytes down to 2,620,948,480 — matching the 52.5% garbage
+fraction a run settles at. At the same height, an unpompacted run's high-water
+mark was 7.09 GB against the compacted run's 5.32 GB: 2.6 GB of writes bought
+1.77 GB of lasting headroom, where a rebase writes 10.6 GB. The trigger fired
+once and the growth gate did not re-fire over the following 3,700 blocks, so
+the thrashing that a percentage-only threshold produced on redb did not recur.
+
+The second correction is what compaction is for. It was expected to also
+restore speed, on the reasoning that garbage pages grow the B-tree and that is
+what makes `commit-mutate` degrade 1.42x over four thousand blocks. That
+reasoning was wrong. `commit-mutate` did not fall after compaction. Compaction
+discards unreachable pages and leaves every live entry in place, so the tree's
+logical size — which is what decides how many pages a random insertion dirties
+— is unchanged. A rebase resets it because folding the overlay into a new base
+empties the tables, not because it reclaims pages. **Compaction is a space
+tool, not a performance tool**, and the 26.6% execution gain measured across a
+rebase belongs to the fold, not to the reclamation.
+
+What compaction costs in time is not resolved here, and the reason is recorded
+rather than papered over. Two attempts to measure it produced a uniform ~25%
+shift across every component including `core-validate`, which compaction cannot
+touch. Comparing the same pre-compaction window across three runs — where the
+settings do identical work — showed 97.49s, 184.42s and 203.64s per thousand
+blocks, and the run that was slowest had run first. The machine was drifting by
+a factor of two between consecutive runs under other tenants' load. A
+wall-clock A/B whose environment moves an order of magnitude more than the
+effect is not a measurement, and no number from those runs is quoted.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
