@@ -1211,6 +1211,43 @@ a factor of two between consecutive runs under other tenants' load. A
 wall-clock A/B whose environment moves an order of magnitude more than the
 effect is not a measurement, and no number from those runs is quoted.
 
+Keying the index by txid instead of by outpoint was reconsidered, and the
+earlier judgement against it does not survive two measurements.
+
+It had been set aside because the duplicate-check probes were 10.4% of batch
+time, making an index-format change look like poor value. That figure came
+from an idle machine. Running the same catch-up while other tenants competed
+for memory put `commit-base-lookup` at 18.9% and `utxo-prefetch` at 9.7`%`,
+both roughly double their idle share, while CPU-bound components fell as a
+proportion. Those two are the paths that read the 9.4 GB snapshot, and they
+degrade first when the page cache is contended — which is the condition a real
+deployment runs in and an idle benchmark cannot show. An idle baseline
+systematically understates this work.
+
+The trade was then quantified on the real data rather than assumed. Over 3,000
+corpus blocks — 9,290,925 transactions creating 24,360,834 outputs — a
+transaction creates 2.622 outputs, so probing once per transaction instead of
+once per output cuts probe count to 38.1%, a 61.9% reduction. The concern was
+that a txid-keyed hit must then scan its group for the right vout. Scanning the
+935,000-height snapshot says that concern is misplaced: 164,241,311 coins fall
+into 113,879,165 groups, 1.442 coins per group, and **89.51% of groups hold
+exactly one coin**, so for nine hits in ten there is nothing to scan.
+
+Both directions come out favourable or flat. A miss costs the same either way —
+hash, offset read, txid compare, return before the coin is read — so the whole
+difference on that path is 62% fewer of them. A hit adds an average 1.442
+comparisons over bytes already in the window it read. And the key shrinks from
+36 bytes to 32 while the key set falls 30.7%, from 164M outpoints to 114M
+txids, which makes both the hash and the offset table smaller.
+
+What is not established is the end-to-end result. The above is structural
+reasoning over two measured ratios, not a head-to-head run, and the machine
+available at the time was drifting twofold between consecutive runs under other
+load, which is the wrong condition to settle a format decision in. The
+recommendation is to converge on the txid keying, and to do it against a
+head-to-head measurement of hit and miss paths in one process when a quiet
+machine is available — one process, so machine drift moves both sides equally.
+
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
 a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
