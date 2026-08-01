@@ -1240,13 +1240,36 @@ comparisons over bytes already in the window it read. And the key shrinks from
 36 bytes to 32 while the key set falls 30.7%, from 164M outpoints to 114M
 txids, which makes both the hash and the offset table smaller.
 
-What is not established is the end-to-end result. The above is structural
-reasoning over two measured ratios, not a head-to-head run, and the machine
-available at the time was drifting twofold between consecutive runs under other
-load, which is the wrong condition to settle a format decision in. The
-recommendation is to converge on the txid keying, and to do it against a
-head-to-head measurement of hit and miss paths in one process when a quiet
-machine is available — one process, so machine drift moves both sides equally.
+The head-to-head was then run, and it is more favourable than the reasoning
+predicted. Both indexes were opened in one process and measured alternately, so
+the twofold drift this hardware shows between consecutive runs acts on both
+sides equally. Over 200,000 absent txids — the query a duplicate check actually
+makes — the miss path measured:
+
+| pass | outpoint-keyed | txid-keyed | ratio |
+|---|---:|---:|---:|
+| 1 | 146,634/s | 164,976/s | 1.13x |
+| 2 | 133,966/s | 187,829/s | 1.40x |
+| 3 | 136,809/s | 186,406/s | 1.36x |
+
+A miss is not merely as cheap under txid keying, it is about 1.38x cheaper once
+warm. The key set is 30.7% smaller, so the hash has fewer levels and the offset
+table is smaller and closer together. The two effects compound: 38.1% as many
+probes at roughly 1/1.38 the cost each puts the duplicate check at about 27.6%
+of its current cost, a 72% reduction — 10.4% of batch time down to about 2.9%
+idle, and 18.9% down to about 5.2% under contention.
+
+The sidecar is also smaller and faster to publish: 957,969,566 bytes against
+1,155,791,488, 17.1% less, built in 77.9s against 138s.
+
+Three things were wrong in the original judgement against this, and all three
+were assumptions rather than measurements: the 10.4% share came from an idle
+machine when a loaded one shows 18.9%; the in-group scan feared on hits barely
+exists, since 89.51% of groups hold one coin; and misses were assumed to cost
+the same under either keying when they are 1.38x cheaper. Converging on the
+txid keying is the right decision, and the remaining work is the convergence
+itself — the two implementations coexisting is the open item, not whether the
+keying is better.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
