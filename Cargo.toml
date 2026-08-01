@@ -50,6 +50,10 @@ tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 bitcoinconsensus = { path = "vendor/bitcoinconsensus" }
+# Vendored to add a safe `copy_compact` binding for `mdbx_env_copy`, which
+# upstream 0.6.6 does not expose. Keeping the `unsafe` inside the dependency
+# preserves this crate's `unsafe_code = "forbid"`.
+libmdbx = { path = "vendor/libmdbx" }
 redb = { path = "vendor/redb" }
 
 [lints.rust]

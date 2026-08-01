@@ -9209,10 +9209,18 @@ impl OverlayCatchupStore for SnapshotOverlayChainstate {
     }
 
     fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
-        // `libmdbx-rs` 0.6.6 exposes no in-place compaction, so this engine
-        // can only reclaim space by recreating its environment file, which
-        // is what a rebase already does. Nothing to run between rebases.
-        Ok(None)
+        // Upstream `libmdbx-rs` 0.6.6 exposes no compaction, which had been
+        // taken to mean MDBX offers none — it does, through `mdbx_env_copy`
+        // with `MDBX_CP_COMPACT`, and the vendored crate now binds it. A
+        // measured catch-up settles with about half its high-water mark held
+        // by superseded pages the geometry ceiling still counts, so this
+        // reclaims roughly what a rebase would while writing only the live
+        // bytes instead of a whole snapshot and index.
+        let report = SnapshotOverlayChainstate::compact(self).map_err(|error| error.to_string())?;
+        Ok(Some(OverlayCompaction {
+            before_bytes: report.before_bytes,
+            after_bytes: report.after_bytes,
+        }))
     }
 
     fn engine_name(&self) -> &'static str {

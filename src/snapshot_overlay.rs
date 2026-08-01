@@ -944,6 +944,92 @@ impl SnapshotOverlayChainstate {
         })
     }
 
+    /// Reclaims copy-on-write garbage by rewriting the environment compacted.
+    ///
+    /// A measured catch-up settles at roughly half its high-water mark being
+    /// pages that hold nothing: superseded copies a write-ahead B-tree cannot
+    /// reuse yet. The geometry ceiling counts them, because it is checked
+    /// against `last_pgno` rather than against live content, so a rebase ends
+    /// up triggered by garbage rather than by data. Rewriting compacted keeps
+    /// only reachable pages, and costs the live bytes rather than a rebase's
+    /// full snapshot and index — measured at roughly 4.3 GB against 10.6 GB
+    /// at the same trigger point.
+    ///
+    /// The base is untouched: this reclaims space without folding the overlay,
+    /// so it does not reset undo or shorten a lookup's path to the base.
+    ///
+    /// The directory swap is the same discipline the rebase uses, and for the
+    /// same reason: a bare remove-then-rename can leave `database_dir` absent,
+    /// which `stored_identity` reads as "no environment yet" and would restart
+    /// catch-up from the compiled snapshot identity, silently discarding every
+    /// executed block.
+    ///
+    /// # Errors
+    ///
+    /// Fails on I/O or MDBX errors. A failure leaves the store open on its
+    /// pre-compaction environment.
+    pub fn compact(
+        &mut self,
+    ) -> Result<crate::snapshot_overlay_redb::CompactionReport, SnapshotOverlayError> {
+        let before_bytes = self.capacity()?.used_bytes;
+        let fresh_dir = self.database_dir.with_file_name({
+            let mut name = self
+                .database_dir
+                .file_name()
+                .ok_or(SnapshotOverlayError::Invalid("overlay directory name"))?
+                .to_owned();
+            name.push(".compacting");
+            name
+        });
+        if fresh_dir.exists() {
+            fs::remove_dir_all(&fresh_dir)?;
+        }
+        let mut cleanup = RemoveFilesOnDrop::default();
+        cleanup.track(fresh_dir.clone());
+        // `mdbx_env_copy` takes the pathname of the file to write, which must
+        // not exist and whose parent must be writable — not a directory to
+        // populate. This environment is opened in subdirectory layout, so the
+        // copy has to land at the `mdbx.dat` inside a directory created here
+        // for it, or the result would not be openable as an environment.
+        fs::create_dir_all(&fresh_dir)?;
+        self.db().copy_compact(&fresh_dir.join("mdbx.dat"))?;
+
+        drop(self.db.take());
+        let trash_dir = self.database_dir.with_file_name({
+            let mut name = self
+                .database_dir
+                .file_name()
+                .ok_or(SnapshotOverlayError::Invalid("overlay directory name"))?
+                .to_owned();
+            name.push(".compacted-out");
+            name
+        });
+        if trash_dir.exists() {
+            fs::remove_dir_all(&trash_dir)?;
+        }
+        if let Err(error) = fs::rename(&self.database_dir, &trash_dir) {
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error.into());
+        }
+        match fs::rename(&fresh_dir, &self.database_dir) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&trash_dir);
+            }
+            Err(error) => {
+                fs::rename(&trash_dir, &self.database_dir)?;
+                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                return Err(error.into());
+            }
+        }
+        self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+        cleanup.disarm();
+        Ok(crate::snapshot_overlay_redb::CompactionReport {
+            reclaimed: true,
+            before_bytes,
+            after_bytes: self.capacity()?.used_bytes,
+        })
+    }
+
     fn filter_tombstoned<K: TransactionKind>(
         transaction: &Transaction<'_, K, NoWriteMap>,
         tombstone: &Table<'_>,
@@ -2757,6 +2843,86 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(store.get(respent).unwrap().unwrap().value_sats, 15);
+    }
+
+    /// Compaction has to actually reclaim, not merely rewrite. A copy-on-write
+    /// B-tree under repeated overwrite accumulates superseded pages that the
+    /// geometry ceiling still counts, so the property under test is that the
+    /// high-water mark falls while every key still reads back unchanged.
+    #[test]
+    fn compaction_reclaims_copy_on_write_garbage_without_losing_data() {
+        let (_directory, mut store, identity) = setup(64 << 20);
+        let mut parent = identity.block_hash;
+        let mut height = identity.height;
+
+        // Churn: write a set of coins, then repeatedly spend and recreate them
+        // so each round supersedes the previous round's pages.
+        let churn: Vec<OutPointKey> = (0..400_u32).map(|index| key(210, index)).collect();
+        for round in 0..12_u32 {
+            height += 1;
+            let next = ExecutionTip {
+                height,
+                hash: block_hash(height),
+            };
+            let spent: Vec<OutPointKey> = if round == 0 {
+                Vec::new()
+            } else {
+                churn.clone()
+            };
+            let created: Vec<(OutPointKey, Utxo)> = churn
+                .iter()
+                .map(|key| (*key, overlay_coin(height, u64::from(round) + 1)))
+                .collect();
+            store
+                .commit_connect(parent, next, &spent, &created, &[])
+                .unwrap();
+            parent = next.hash;
+        }
+
+        let before = store.capacity().unwrap().used_bytes;
+        let report = store.compact().unwrap();
+        let after = store.capacity().unwrap().used_bytes;
+
+        assert_eq!(report.before_bytes, before);
+        assert_eq!(report.after_bytes, after);
+        // The fixture reclaims about half, which is the same order as the
+        // ~52% garbage fraction a real catch-up settles at. Asserting a third
+        // leaves room for allocator behaviour without accepting a no-op.
+        assert!(
+            after < before * 2 / 3,
+            "compaction must reclaim a substantial share: {before} -> {after}"
+        );
+
+        // The tip and every coin survive, including base coins reached
+        // through the untouched snapshot.
+        assert_eq!(store.execution_tip().unwrap().height, height);
+        for outpoint in &churn {
+            assert_eq!(
+                store.get(*outpoint).unwrap().map(|utxo| utxo.value_sats),
+                Some(12),
+                "churned coin lost by compaction"
+            );
+        }
+        assert!(store.get(key(1, 0)).unwrap().is_some(), "base coin lost");
+
+        // And the store is still writable afterwards.
+        height += 1;
+        store
+            .commit_connect(
+                parent,
+                ExecutionTip {
+                    height,
+                    hash: block_hash(height),
+                },
+                &[],
+                &[(key(211, 0), overlay_coin(height, 99))],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get(key(211, 0)).unwrap().map(|utxo| utxo.value_sats),
+            Some(99)
+        );
     }
 
     /// Regression test for the batch fold: a coin created and then spent
