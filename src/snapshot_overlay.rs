@@ -702,6 +702,10 @@ impl SnapshotOverlayChainstate {
         // early return, so a failed rebase — including a re-verification
         // mismatch after publication — never leaves an orphan blocking a
         // retry at the same target height.
+        // Same precondition the compaction enforces: recovery is only
+        // unambiguous if at most one copy is ever set aside, and clearing
+        // here is safe because the live environment has not moved yet.
+        clear_aside_copies(&self.database_dir)?;
         let mut cleanup = RemoveFilesOnDrop::default();
         let temporary = new_snapshot_path.with_file_name({
             let mut name = new_snapshot_path
@@ -898,9 +902,6 @@ impl SnapshotOverlayChainstate {
             name.push(".rebased-out");
             name
         });
-        if trash_dir.exists() {
-            fs::remove_dir_all(&trash_dir)?;
-        }
         if let Err(error) = fs::rename(&self.database_dir, &trash_dir) {
             // Nothing has moved yet; the old environment is exactly as it
             // was. Reopening it restores a usable store before reporting
@@ -982,6 +983,10 @@ impl SnapshotOverlayChainstate {
             name.push(".compacting");
             name
         });
+        // Recovery can only be unambiguous if at most one copy is ever set
+        // aside, so clear any leftover before moving anything. This runs while
+        // the live environment is intact and in place, so failing is safe.
+        clear_aside_copies(&self.database_dir)?;
         if fresh_dir.exists() {
             fs::remove_dir_all(&fresh_dir)?;
         }
@@ -1005,9 +1010,6 @@ impl SnapshotOverlayChainstate {
             name.push(".compacted-out");
             name
         });
-        if trash_dir.exists() {
-            fs::remove_dir_all(&trash_dir)?;
-        }
         if let Err(error) = fs::rename(&self.database_dir, &trash_dir) {
             self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
             return Err(error.into());
@@ -1157,27 +1159,65 @@ const SWAP_ASIDE_SUFFIXES: [&str; 2] = [".rebased-out", ".compacted-out"];
 /// canonical directory exists and no leftovers do, which is every ordinary
 /// start.
 fn recover_interrupted_swap(database_dir: &Path) -> Result<(), SnapshotOverlayError> {
-    let Some(name) = database_dir.file_name() else {
-        return Ok(());
-    };
     let installed = database_dir.join("mdbx.dat").exists();
-    for suffix in SWAP_ASIDE_SUFFIXES {
-        let aside = database_dir.with_file_name({
-            let mut aside = name.to_owned();
-            aside.push(suffix);
-            aside
-        });
-        if !aside.join("mdbx.dat").exists() {
-            continue;
-        }
-        if installed {
-            // The swap finished; this is the superseded copy the cleanup step
-            // would have removed.
+    let present: Vec<PathBuf> = aside_paths(database_dir)
+        .into_iter()
+        .filter(|aside| aside.join("mdbx.dat").exists())
+        .collect();
+    if installed {
+        // The swap finished; these are superseded copies the cleanup step
+        // would have removed.
+        for aside in present {
             fs::remove_dir_all(&aside)?;
-            continue;
         }
-        fs::rename(&aside, database_dir)?;
         return Ok(());
+    }
+    match present.as_slice() {
+        [] => Ok(()),
+        [aside] => {
+            fs::rename(aside, database_dir)?;
+            Ok(())
+        }
+        // A swap only starts once no copy is set aside, so two of them with
+        // no live directory means that precondition was violated and there is
+        // no sound way to tell which is current. Restoring by a fixed order
+        // would silently reinstate whichever the order happened to name, and
+        // one of them is older — losing executed blocks without an error.
+        // Refuse instead, and say what to look at.
+        _ => Err(SnapshotOverlayError::Invalid(
+            "two set-aside overlay directories and no live one; the newer must be identified by hand before the node can resume",
+        )),
+    }
+}
+
+/// The paths a swap may leave a copy at, in no meaningful order.
+fn aside_paths(database_dir: &Path) -> Vec<PathBuf> {
+    let Some(name) = database_dir.file_name() else {
+        return Vec::new();
+    };
+    SWAP_ASIDE_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            database_dir.with_file_name({
+                let mut aside = name.to_owned();
+                aside.push(suffix);
+                aside
+            })
+        })
+        .collect()
+}
+
+/// Clears every set-aside copy before a swap begins.
+///
+/// A swap's recovery can only be unambiguous if at most one copy is ever set
+/// aside, so each one starts by making that true. This runs while the live
+/// environment is still intact and in place, which is why failing here is safe
+/// — the caller aborts and nothing has moved.
+fn clear_aside_copies(database_dir: &Path) -> Result<(), SnapshotOverlayError> {
+    for aside in aside_paths(database_dir) {
+        if aside.exists() {
+            fs::remove_dir_all(&aside)?;
+        }
     }
     Ok(())
 }
@@ -2068,6 +2108,33 @@ pub(crate) mod tests {
         )
     }
 
+    fn setup_with_paths(
+        capacity_bytes: u64,
+    ) -> (
+        TempDir,
+        SnapshotOverlayChainstate,
+        SnapshotBaseIdentity,
+        PathBuf,
+        PathBuf,
+    ) {
+        let directory = TempDir::new().unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let store = open_store(
+            directory.path(),
+            &snapshot_path,
+            &index_path,
+            &identity,
+            capacity_bytes,
+        )
+        .unwrap();
+        (directory, store, identity, snapshot_path, index_path)
+    }
+
     fn setup(capacity_bytes: u64) -> (TempDir, SnapshotOverlayChainstate, SnapshotBaseIdentity) {
         let directory = TempDir::new().unwrap();
         let (snapshot_path, index_path, identity) = write_base_snapshot(
@@ -2254,12 +2321,13 @@ pub(crate) mod tests {
     /// That window leaves nothing at the canonical path, which
     /// `stored_identity` would read as "no environment yet" and restart
     /// catch-up from the compiled identity, discarding every executed block.
-    /// This simulates the crash for both suffixes and requires the store to
-    /// come back with its tip intact.
+    /// The tip is asserted, not just the identity, because the block that
+    /// matters here is the one the store had executed.
     #[test]
     fn an_interrupted_directory_swap_is_recovered_rather_than_read_as_absent() {
         for suffix in SWAP_ASIDE_SUFFIXES {
-            let (directory, store, identity) = setup(32 << 20);
+            let (directory, store, identity, snapshot_path, index_path) =
+                setup_with_paths(32 << 20);
             let tip = ExecutionTip {
                 height: identity.height + 1,
                 hash: block_hash(identity.height + 1),
@@ -2284,22 +2352,35 @@ pub(crate) mod tests {
                 "the crash window has no live directory"
             );
 
-            let recovered =
-                SnapshotOverlayChainstate::stored_identity(&database_dir, 32 << 20).unwrap();
             assert_eq!(
-                recovered.as_ref().map(|identity| identity.height),
+                SnapshotOverlayChainstate::stored_identity(&database_dir, 32 << 20)
+                    .unwrap()
+                    .map(|identity| identity.height),
                 Some(identity.height),
                 "{suffix}: a set-aside environment must be restored, not read as absent"
             );
             assert!(!aside.exists(), "{suffix}: the set-aside copy is consumed");
-            assert!(
-                database_dir.join("mdbx.dat").exists(),
-                "{suffix}: the environment is back at its canonical path"
+
+            let reopened = open_store(
+                directory.path(),
+                &snapshot_path,
+                &index_path,
+                &identity,
+                32 << 20,
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.execution_tip().unwrap(),
+                tip,
+                "{suffix}: the executed height must survive the crash window"
             );
-            // Reading an identity means the restored environment opened and
-            // its meta table was intact, which is what the crash window would
-            // otherwise have destroyed.
-            let _ = tip;
+            assert_eq!(
+                reopened
+                    .get(key(230, 0))
+                    .unwrap()
+                    .map(|utxo| utxo.value_sats),
+                Some(7)
+            );
         }
     }
 
@@ -2321,6 +2402,57 @@ pub(crate) mod tests {
             Some(identity.height)
         );
         assert!(!aside.exists(), "a superseded copy must not be left behind");
+    }
+
+    /// Two set-aside copies and no live directory means the invariant a swap
+    /// relies on was violated — a rebase's best-effort cleanup failed, the
+    /// node executed on, and a later compaction then crashed mid-swap. Picking
+    /// by a fixed suffix order would restore whichever the order names, and
+    /// one of them is older, so an executed chainstate would be silently
+    /// rolled back. Refusing is the only sound answer.
+    #[test]
+    fn two_set_aside_copies_refuse_to_be_guessed_between() {
+        let (directory, store, identity) = setup(32 << 20);
+        let database_dir = directory.path().join("overlay-mdbx");
+        drop(store);
+        let stale = database_dir.with_file_name("overlay-mdbx.rebased-out");
+        let current = database_dir.with_file_name("overlay-mdbx.compacted-out");
+        for aside in [&stale, &current] {
+            fs::create_dir_all(aside).unwrap();
+            fs::copy(database_dir.join("mdbx.dat"), aside.join("mdbx.dat")).unwrap();
+        }
+        fs::remove_dir_all(&database_dir).unwrap();
+
+        assert!(matches!(
+            SnapshotOverlayChainstate::stored_identity(&database_dir, 32 << 20),
+            Err(SnapshotOverlayError::Invalid(_))
+        ));
+        // Neither is consumed: an operator has to be able to inspect both.
+        assert!(stale.join("mdbx.dat").exists());
+        assert!(current.join("mdbx.dat").exists());
+        let _ = identity;
+    }
+
+    /// A swap begins by clearing whatever an earlier one left behind, so the
+    /// ambiguity above cannot arise from a failed best-effort cleanup.
+    #[test]
+    fn a_swap_clears_stale_copies_before_moving_anything() {
+        let (directory, mut store, identity) = setup(32 << 20);
+        let database_dir = directory.path().join("overlay-mdbx");
+        let stale = database_dir.with_file_name("overlay-mdbx.rebased-out");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("mdbx.dat"), b"stale").unwrap();
+
+        store.compact().unwrap();
+        assert!(
+            !stale.exists(),
+            "a stale copy from an earlier swap must not survive the next one"
+        );
+        assert_eq!(
+            store.execution_tip().unwrap().height,
+            identity.height,
+            "compaction leaves the tip where it was"
+        );
     }
 
     /// An overlay written before undo compression existed must stay usable
