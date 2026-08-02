@@ -159,7 +159,22 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
-const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
+/// Blocks executed and committed as one unit.
+///
+/// Raised from 64 on measurement. Two replays over the same 11,008 blocks,
+/// back to back on one machine, put 256 ahead per thousand blocks:
+/// `commit-mutate` −48.6%, `commit-sync` −52.1%, `execution-core` −25.3%,
+/// batch total −24.8%. Halved flushing follows from committing a quarter as
+/// often; the rest is that a wider fold window collapses more coins created
+/// and spent inside the same batch, so they never reach the B-tree at all —
+/// `commit-base-lookup` fell 20.9% for that reason alone.
+///
+/// It is not free. Peak working set rose about 35% (7,219 MB to 9,788 MB at a
+/// matched height) because a batch holds that many blocks and their folded
+/// mutation at once, and validation is 12% slower per block since each
+/// overlay's working set is larger. A memory-constrained host should lower it
+/// with `--validation-batch-size`.
+const DEFAULT_VALIDATION_BATCH_SIZE: usize = 256;
 const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_VALIDATION_BATCH_SIZE;
@@ -24761,7 +24776,15 @@ mod tests {
                 mempool_full_rbf: false,
                 cleanup_validation_dir: false,
                 offline_action: None,
-                validation_limits: ValidationLimits::default(),
+                // Pinned at the window size on purpose. Above it the node
+                // claims up to three pending peers as auxiliary block
+                // downloaders, which consumes the candidate this test needs
+                // held in reserve. It exercises failover, not batch sizing,
+                // and the default now sits above that threshold.
+                validation_limits: ValidationLimits {
+                    max_blocks_per_batch: VALIDATION_BLOCK_WINDOW_SIZE,
+                    ..ValidationLimits::default()
+                },
                 ledger_retention: LedgerRetention::default(),
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
