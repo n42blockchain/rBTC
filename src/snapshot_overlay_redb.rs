@@ -1297,6 +1297,65 @@ mod tests {
         );
     }
 
+    /// The redb counterpart of the MDBX upgrade regression: this engine writes
+    /// undo through the same codec, so an overlay written before compression
+    /// existed has to stay readable here too, and a reorganization is what
+    /// reaches those records.
+    #[test]
+    fn disconnect_reads_undo_written_before_compression_existed() {
+        let (_directory, store, identity, ..) = setup(32 << 20);
+        let spent_base = key(1, 0);
+        let base_coin = store.get(spent_base).unwrap().expect("fixture base coin");
+        let created = key(9, 0);
+        let next = tip(101, block_hash(101));
+        store
+            .commit_connect(
+                identity.block_hash,
+                next,
+                &[spent_base],
+                &[(created, overlay_coin(101, 111))],
+                &[],
+            )
+            .unwrap();
+
+        // Replace the stored record with the pre-compression encoding.
+        let legacy = crate::undo_store::encode_block_undo(&[UtxoUndo::from_parts(
+            vec![(spent_base, base_coin.clone())],
+            vec![created],
+        )])
+        .unwrap();
+        {
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut table = write.open_table(UNDO).unwrap();
+                table
+                    .insert(next.hash.to_byte_array().as_slice(), legacy.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+        }
+        assert_eq!(
+            store
+                .block_undo(next.hash)
+                .unwrap()
+                .map(|undos| undos.len()),
+            Some(1),
+            "a legacy record must still be readable after the upgrade"
+        );
+
+        store
+            .commit_disconnect(
+                next,
+                tip(identity.height, identity.block_hash),
+                &[created],
+                &[(spent_base, base_coin.clone())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.get(created).unwrap(), None);
+        assert_eq!(store.get(spent_base).unwrap(), Some(base_coin));
+    }
+
     /// The redb counterpart of the MDBX store's undo-contract regression
     /// test: a disconnect's returned undo must redo exactly that block.
     #[test]

@@ -1055,11 +1055,27 @@ impl SnapshotOverlayChainstate {
 /// speed: level 1 is the same setting the block archive uses for the same
 /// reason. Measured overlay composition made this worth doing — 951 retained
 /// blocks of undo occupied 952 MB of stored bytes, about 1 MB per block and
-/// the second largest item in the working set after fragmentation. Shrinking
-/// it slows the growth that drives rebases, which matters most for MDBX,
-/// where a rebase is the only way to reclaim anything and costs a full
-/// ~10.6 GB snapshot rewrite.
+/// the second largest item in the working set after fragmentation.
 const UNDO_COMPRESSION_LEVEL: i32 = 1;
+
+/// Marks an overlay undo record as compressed.
+///
+/// The overlay tables are durable and survive an upgrade, so introducing
+/// compression changed a persisted format. Records written before it exist in
+/// the wild as raw `encode_block_undo` output, and a node that upgrades and
+/// then reorganizes has to read them. An explicit marker makes the two
+/// distinguishable without inferring anything from zstd's own framing, and
+/// leaves room for a third form later.
+const UNDO_ZSTD_MAGIC: &[u8; 4] = b"RUZ1";
+
+/// Ceiling on one decompressed block-undo record.
+///
+/// A damaged or hostile record can declare any output size, and an unbounded
+/// decompressor would allocate whatever it claims. One block's undo holds the
+/// pre-image of every coin it spends, which a 4 MB block bounds well below
+/// this; the limit is generous enough never to reject a real record and small
+/// enough that rejecting is cheap.
+const MAX_DECOMPRESSED_UNDO_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Compresses an encoded block-undo record for overlay storage.
 ///
@@ -1068,15 +1084,47 @@ const UNDO_COMPRESSION_LEVEL: i32 = 1;
 /// format is untouched and no migration is implied.
 pub(crate) fn compress_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, ChainStoreError> {
     let encoded = encode_block_undo(undos)?;
-    zstd::encode_all(encoded.as_slice(), UNDO_COMPRESSION_LEVEL)
-        .map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))
+    let mut framed = Vec::with_capacity(UNDO_ZSTD_MAGIC.len() + encoded.len() / 2);
+    framed.extend_from_slice(UNDO_ZSTD_MAGIC);
+    zstd::stream::copy_encode(encoded.as_slice(), &mut framed, UNDO_COMPRESSION_LEVEL)
+        .map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))?;
+    Ok(framed)
 }
 
-/// Reverses [`compress_block_undo`].
+/// Reverses [`compress_block_undo`], and reads pre-compression records too.
+///
+/// A record without the marker was written before compression existed and is
+/// decoded as-is. That is what lets an existing overlay survive the upgrade:
+/// its retained undo stays readable, and newly written records take the
+/// compressed form.
 pub(crate) fn decompress_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, ChainStoreError> {
-    let encoded =
-        zstd::decode_all(bytes).map_err(|error| ChainStoreError::Utxo(UtxoError::Io(error)))?;
-    decode_block_undo(&encoded).map_err(ChainStoreError::Undo)
+    let Some(frame) = bytes.strip_prefix(UNDO_ZSTD_MAGIC) else {
+        return decode_block_undo(bytes).map_err(ChainStoreError::Undo);
+    };
+    decode_block_undo(&inflate_bounded(frame, MAX_DECOMPRESSED_UNDO_BYTES)?)
+        .map_err(ChainStoreError::Undo)
+}
+
+/// Decompresses at most `limit` bytes, refusing anything longer.
+///
+/// Reading through a bounded reader means a record claiming more than the
+/// limit is rejected after that much work rather than after allocating what it
+/// asked for.
+fn inflate_bounded(frame: &[u8], limit: u64) -> Result<Vec<u8>, ChainStoreError> {
+    let io = |error| ChainStoreError::Utxo(UtxoError::Io(error));
+    let mut decoder = zstd::stream::Decoder::new(frame).map_err(io)?;
+    let mut inflated = Vec::new();
+    let read = std::io::copy(
+        &mut std::io::Read::take(&mut decoder, limit.saturating_add(1)),
+        &mut inflated,
+    )
+    .map_err(io)?;
+    if read > limit {
+        return Err(ChainStoreError::Utxo(UtxoError::Malformed(
+            "block undo record exceeds the decompressed size limit",
+        )));
+    }
+    Ok(inflated)
 }
 
 /// Where one storage commit spent its time, in nanoseconds.
@@ -2145,6 +2193,76 @@ pub(crate) mod tests {
     /// the coins those keys held). Both bugs were dormant because the only
     /// production caller discards the return value; a future caller passing
     /// it to `UtxoStore::undo` (redoing a disconnected block) would restore
+    /// An overlay written before undo compression existed must stay usable
+    /// after the upgrade, and the case that reaches its retained undo is a
+    /// reorganization. This writes a legacy uncompressed record straight into
+    /// the undo table the way the previous binary did, then disconnects
+    /// through the ordinary path, which is the exact sequence an upgraded node
+    /// hits — and the one a format switch without a marker would break.
+    #[test]
+    fn disconnect_reads_undo_written_before_compression_existed() {
+        let (_directory, store, identity) = setup(32 << 20);
+        let created = key(220, 0);
+        let spent_base = key(1, 0);
+        let base_coin = store.get(spent_base).unwrap().expect("fixture base coin");
+        let tip = ExecutionTip {
+            height: identity.height + 1,
+            hash: block_hash(identity.height + 1),
+        };
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip,
+                &[spent_base],
+                &[(created, overlay_coin(tip.height, 42))],
+                &[],
+            )
+            .unwrap();
+
+        // Overwrite the stored record with the pre-compression encoding.
+        let legacy = encode_block_undo(&[UtxoUndo::from_parts(
+            vec![(spent_base, base_coin.clone())],
+            vec![created],
+        )])
+        .unwrap();
+        {
+            let transaction = store.db().begin_rw_txn().unwrap();
+            let undo = transaction.open_table(Some(UNDO)).unwrap();
+            transaction
+                .put(
+                    &undo,
+                    tip.hash.to_byte_array(),
+                    &legacy,
+                    WriteFlags::empty(),
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            store.block_undo(tip.hash).unwrap().map(|undos| undos.len()),
+            Some(1),
+            "a legacy record must still be readable after the upgrade"
+        );
+
+        // And the disconnect that consumes it succeeds, restoring the base
+        // coin and removing what the block created.
+        store
+            .commit_disconnect(
+                tip,
+                ExecutionTip {
+                    height: identity.height,
+                    hash: identity.block_hash,
+                },
+                &[created],
+                &[(spent_base, base_coin.clone())],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.get(created).unwrap(), None);
+        assert_eq!(store.get(spent_base).unwrap(), Some(base_coin));
+        assert_eq!(store.execution_tip().unwrap().height, identity.height);
+    }
+
     /// the wrong coins entirely. This drives `commit_disconnect`, then feeds
     /// its return value straight into `undo`, and checks that reverses the
     /// disconnect exactly.
@@ -2733,6 +2851,42 @@ pub(crate) mod tests {
         let raw = encode_block_undo(&undos).unwrap();
         let packed = compress_block_undo(&undos).unwrap();
         let restored = decompress_block_undo(&packed).unwrap();
+
+        // An overlay written before compression existed holds raw encoded
+        // records, and the tables are durable, so an upgraded node reorganizing
+        // across that history has to read them. Compression must therefore be
+        // a readable-both-ways change, not a format switch.
+        assert!(packed.starts_with(UNDO_ZSTD_MAGIC));
+        assert!(!raw.starts_with(UNDO_ZSTD_MAGIC));
+        let legacy = decompress_block_undo(&raw).unwrap();
+        assert_eq!(legacy.len(), undos.len());
+        for (before, after) in undos.iter().zip(&legacy) {
+            assert_eq!(before.spent(), after.spent());
+            assert_eq!(before.created(), after.created());
+        }
+
+        // A damaged or hostile record can declare any output size. Refusing
+        // past a limit has to happen instead of allocating what it claims, so
+        // the bound is exercised rather than assumed: this frame inflates far
+        // past the tiny limit given here.
+        let bomb =
+            zstd::encode_all(vec![0_u8; 1 << 20].as_slice(), UNDO_COMPRESSION_LEVEL).unwrap();
+        assert!(
+            bomb.len() < 4096,
+            "fixture must be far smaller than it inflates to"
+        );
+        assert!(matches!(
+            inflate_bounded(&bomb, 4096),
+            Err(ChainStoreError::Utxo(UtxoError::Malformed(_)))
+        ));
+        // The same frame within its limit still inflates.
+        assert_eq!(inflate_bounded(&bomb, 1 << 20).unwrap().len(), 1 << 20);
+        // And a record whose marker is present but whose frame is corrupt is
+        // an error rather than a silent empty undo.
+        let mut corrupt = packed.clone();
+        let tail = corrupt.len() - 1;
+        corrupt[tail] ^= 0xFF;
+        assert!(decompress_block_undo(&corrupt).is_err());
 
         assert_eq!(restored.len(), undos.len());
         for (before, after) in undos.iter().zip(&restored) {
