@@ -53,7 +53,7 @@ use crate::{
 
 const INDEX_MAGIC: &[u8; 8] = b"RBTCMPHF";
 const INDEX_VERSION: u16 = 2;
-const INDEX_HEADER_BYTES: usize = 107;
+const INDEX_HEADER_BYTES: usize = 115;
 const INDEX_DIGEST_BYTES: usize = 32;
 /// Staging window for streaming the packed offset table at open.
 ///
@@ -145,6 +145,16 @@ pub struct CoreSnapshotCoin {
     pub script_pubkey: Vec<u8>,
 }
 
+/// What one authenticated pass over a snapshot yields.
+struct ScannedSnapshot {
+    metadata: CoreSnapshotMetadata,
+    groups: Vec<GroupLocation>,
+    snapshot_sha256: [u8; 32],
+    snapshot_bytes: u64,
+    /// Offset just past the last coin, so the widest group can be measured.
+    coin_bytes_end: u64,
+}
+
 /// One txid group's position in the snapshot.
 ///
 /// The index keys on the txid rather than on the outpoint, so a slot points
@@ -213,8 +223,13 @@ pub fn build_core_snapshot_index_with_identity(
             "index output path already exists",
         ));
     }
-    let (metadata, locations, snapshot_sha256, snapshot_bytes) =
-        scan_snapshot(snapshot_path, identity)?;
+    let ScannedSnapshot {
+        metadata,
+        groups: locations,
+        snapshot_sha256,
+        snapshot_bytes,
+        coin_bytes_end,
+    } = scan_snapshot(snapshot_path, identity)?;
 
     let coins = metadata.coins_count;
     let groups = u64::try_from(locations.len()).expect("group count fits u64");
@@ -227,6 +242,18 @@ pub fn build_core_snapshot_index_with_identity(
     let max_offset = locations
         .iter()
         .map(|location| location.offset)
+        .max()
+        .expect("scan yields at least one group");
+    // The widest group this snapshot actually contains, measured rather than
+    // bounded by the format's theoretical ceiling. A reader that knows it
+    // never widens a read past what the file can hold, so a damaged group
+    // count cannot drive an allocation toward the size of the whole file.
+    let max_group_bytes = locations
+        .windows(2)
+        .map(|pair| pair[1].offset.saturating_sub(pair[0].offset))
+        .chain(std::iter::once(coin_bytes_end.saturating_sub(
+            locations.last().expect("at least one group").offset,
+        )))
         .max()
         .expect("scan yields at least one group");
     let offset_bits = bit_width(max_offset);
@@ -267,6 +294,7 @@ pub fn build_core_snapshot_index_with_identity(
     bytes.extend_from_slice(&snapshot_sha256);
     bytes.extend_from_slice(&identity.height.to_le_bytes());
     bytes.extend_from_slice(&groups.to_le_bytes());
+    bytes.extend_from_slice(&max_group_bytes.to_le_bytes());
     bytes.push(offset_bits);
     debug_assert_eq!(bytes.len(), INDEX_HEADER_BYTES);
     mphf.encode_into(&mut bytes);
@@ -295,7 +323,7 @@ pub fn build_core_snapshot_index_with_identity(
 fn scan_snapshot(
     snapshot_path: &Path,
     identity: &SnapshotBaseIdentity,
-) -> Result<(CoreSnapshotMetadata, Vec<GroupLocation>, [u8; 32], u64), CoreSnapshotIndexError> {
+) -> Result<ScannedSnapshot, CoreSnapshotIndexError> {
     let mut reader = DigestReader::new(BufReader::new(File::open(snapshot_path)?));
     let metadata = read_metadata(&mut reader)?;
     if metadata.base_block_hash != identity.block_hash {
@@ -386,6 +414,8 @@ fn scan_snapshot(
             offset: txid_offset,
         });
     }
+    // Where the coin stream ends, so the widest group can be measured.
+    let coin_bytes_end = reader.position();
     let mut trailing = [0_u8; 1];
     if reader.read(&mut trailing)? != 0 {
         return Err(CoreSnapshotError::Invalid("trailing bytes").into());
@@ -399,7 +429,13 @@ fn scan_snapshot(
         });
     }
     let (snapshot_sha256, snapshot_bytes) = reader.finish();
-    Ok((metadata, locations, snapshot_sha256, snapshot_bytes))
+    Ok(ScannedSnapshot {
+        metadata,
+        groups: locations,
+        snapshot_sha256,
+        snapshot_bytes,
+        coin_bytes_end,
+    })
 }
 
 /// A read-only, digest-verified access index over a retained snapshot file.
@@ -412,6 +448,7 @@ pub struct CoreSnapshotUtxoIndex {
     snapshot_bytes: u64,
     snapshot_sha256: [u8; 32],
     groups: u64,
+    max_group_bytes: u64,
     offset_bits: u8,
     mphf: Mphf,
     /// The index container, kept open so the packed table can be read per
@@ -483,12 +520,16 @@ impl CoreSnapshotUtxoIndex {
         let snapshot_sha256: [u8; 32] = body[62..94].try_into().expect("fixed header");
         let base_height = u32::from_le_bytes(body[94..98].try_into().expect("fixed header"));
         let groups = u64::from_le_bytes(body[98..106].try_into().expect("fixed header"));
-        let offset_bits = body[106];
+        let max_group_bytes = u64::from_le_bytes(body[106..114].try_into().expect("fixed header"));
+        let offset_bits = body[114];
         if coins == 0 || groups == 0 || groups > coins {
             return Err(CoreSnapshotIndexError::Invalid("empty coin or group count"));
         }
         if offset_bits == 0 || offset_bits > 63 {
             return Err(CoreSnapshotIndexError::Invalid("entry width out of range"));
+        }
+        if max_group_bytes == 0 || max_group_bytes > snapshot_bytes {
+            return Err(CoreSnapshotIndexError::Invalid("group span out of range"));
         }
         // The hash function's own length is not recorded, but the offset
         // table's is derivable from the header, so the remainder of the body
@@ -593,6 +634,7 @@ impl CoreSnapshotUtxoIndex {
             snapshot_bytes,
             snapshot_sha256,
             groups,
+            max_group_bytes,
             offset_bits,
             mphf,
             index,
@@ -750,7 +792,11 @@ impl CoreSnapshotUtxoIndex {
         // record that the standard templates keep well under fifty bytes.
         // Anything larger fails to parse out of the probe and is re-read wider,
         // so the outcome does not depend on the window.
-        let mut window = GROUP_PROBE_WINDOW.min(available);
+        // Widening stops at the widest group this snapshot actually contains,
+        // recorded when the index was built. Without that ceiling a damaged
+        // group count could drive the read toward the size of the whole file.
+        let ceiling = self.max_group_bytes.min(available);
+        let mut window = GROUP_PROBE_WINDOW.min(ceiling);
         loop {
             let length = usize::try_from(window).expect("bounded window fits usize");
             buffer.clear();
@@ -758,9 +804,9 @@ impl CoreSnapshotUtxoIndex {
             read_exact_at(&self.snapshot, buffer, group_offset)?;
             match self.parse_group(buffer, key, vout) {
                 Ok(found) => return Ok(found),
-                Err(error) if window >= available => return Err(error),
+                Err(error) if window >= ceiling => return Err(error),
                 Err(_) => {
-                    window = window.saturating_mul(4).min(available);
+                    window = window.saturating_mul(4).min(ceiling);
                 }
             }
         }
@@ -1356,6 +1402,7 @@ mod tests {
             snapshot_bytes: 0,
             snapshot_sha256: [0_u8; 32],
             groups: SLOTS,
+            max_group_bytes: 1 << 20,
             offset_bits: OFFSET_BITS,
             mphf: Mphf::build(1, |_| [0_u8; 32], INDEX_SEED).unwrap(),
             index: File::open(&container_path).unwrap(),

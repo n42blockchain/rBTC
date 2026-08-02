@@ -284,6 +284,7 @@ impl SnapshotOverlayChainstate {
         database_dir: &Path,
         capacity_bytes: u64,
     ) -> Result<Option<SnapshotBaseIdentity>, SnapshotOverlayError> {
+        recover_interrupted_swap(database_dir)?;
         if !database_dir.join("mdbx.dat").exists() {
             return Ok(None);
         }
@@ -1077,6 +1078,14 @@ const UNDO_ZSTD_MAGIC: &[u8; 4] = b"RUZ1";
 /// enough that rejecting is cheap.
 const MAX_DECOMPRESSED_UNDO_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Largest zstd window a stored undo record may ask the decoder to allocate.
+///
+/// Bounding the output alone is not enough: a frame declares its own window,
+/// and the decoder sizes an internal buffer from that before producing any
+/// output at all. Compression here runs at level 1, whose window never
+/// approaches 8 MiB, so this rejects only frames this code did not write.
+const MAX_UNDO_WINDOW_LOG: u32 = 23;
+
 /// Compresses an encoded block-undo record for overlay storage.
 ///
 /// The record format itself is unchanged — this wraps `encode_block_undo`
@@ -1113,6 +1122,7 @@ pub(crate) fn decompress_block_undo(bytes: &[u8]) -> Result<Vec<UtxoUndo>, Chain
 fn inflate_bounded(frame: &[u8], limit: u64) -> Result<Vec<u8>, ChainStoreError> {
     let io = |error| ChainStoreError::Utxo(UtxoError::Io(error));
     let mut decoder = zstd::stream::Decoder::new(frame).map_err(io)?;
+    decoder.window_log_max(MAX_UNDO_WINDOW_LOG).map_err(io)?;
     let mut inflated = Vec::new();
     let read = std::io::copy(
         &mut std::io::Read::take(&mut decoder, limit.saturating_add(1)),
@@ -1125,6 +1135,51 @@ fn inflate_bounded(frame: &[u8], limit: u64) -> Result<Vec<u8>, ChainStoreError>
         )));
     }
     Ok(inflated)
+}
+
+/// Suffix a rebase moves the outgoing environment to before installing the new
+/// one, and the suffix compaction uses for the same step.
+const SWAP_ASIDE_SUFFIXES: [&str; 2] = [".rebased-out", ".compacted-out"];
+
+/// Restores an environment left aside by an interrupted rebase or compaction.
+///
+/// Both operations move the live directory aside and then rename the
+/// replacement into its place. The rollback in each covers a rename that
+/// *returns an error*; it cannot cover the process dying between the two, and
+/// that window leaves no directory at the canonical path. `stored_identity`
+/// reads a missing directory as "no environment yet", which would restart
+/// catch-up from the compiled snapshot identity and silently discard every
+/// block the store had executed — so the window has to be closed by looking
+/// for what was set aside rather than by trusting the absence.
+///
+/// A replacement that is already in place means the swap completed and the
+/// set-aside copy is superseded; it is removed. Nothing is done when the
+/// canonical directory exists and no leftovers do, which is every ordinary
+/// start.
+fn recover_interrupted_swap(database_dir: &Path) -> Result<(), SnapshotOverlayError> {
+    let Some(name) = database_dir.file_name() else {
+        return Ok(());
+    };
+    let installed = database_dir.join("mdbx.dat").exists();
+    for suffix in SWAP_ASIDE_SUFFIXES {
+        let aside = database_dir.with_file_name({
+            let mut aside = name.to_owned();
+            aside.push(suffix);
+            aside
+        });
+        if !aside.join("mdbx.dat").exists() {
+            continue;
+        }
+        if installed {
+            // The swap finished; this is the superseded copy the cleanup step
+            // would have removed.
+            fs::remove_dir_all(&aside)?;
+            continue;
+        }
+        fs::rename(&aside, database_dir)?;
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Where one storage commit spent its time, in nanoseconds.
@@ -2193,6 +2248,81 @@ pub(crate) mod tests {
     /// the coins those keys held). Both bugs were dormant because the only
     /// production caller discards the return value; a future caller passing
     /// it to `UtxoStore::undo` (redoing a disconnected block) would restore
+    /// A rebase and a compaction both move the live directory aside and then
+    /// rename the replacement into place. Their rollback covers a rename that
+    /// returns an error; it cannot cover the process dying between the two.
+    /// That window leaves nothing at the canonical path, which
+    /// `stored_identity` would read as "no environment yet" and restart
+    /// catch-up from the compiled identity, discarding every executed block.
+    /// This simulates the crash for both suffixes and requires the store to
+    /// come back with its tip intact.
+    #[test]
+    fn an_interrupted_directory_swap_is_recovered_rather_than_read_as_absent() {
+        for suffix in SWAP_ASIDE_SUFFIXES {
+            let (directory, store, identity) = setup(32 << 20);
+            let tip = ExecutionTip {
+                height: identity.height + 1,
+                hash: block_hash(identity.height + 1),
+            };
+            store
+                .commit_connect(
+                    identity.block_hash,
+                    tip,
+                    &[],
+                    &[(key(230, 0), overlay_coin(tip.height, 7))],
+                    &[],
+                )
+                .unwrap();
+            let database_dir = directory.path().join("overlay-mdbx");
+            drop(store);
+
+            // Exactly the on-disk state a crash between the two renames leaves.
+            let aside = database_dir.with_file_name(format!("overlay-mdbx{suffix}"));
+            fs::rename(&database_dir, &aside).unwrap();
+            assert!(
+                !database_dir.exists(),
+                "the crash window has no live directory"
+            );
+
+            let recovered =
+                SnapshotOverlayChainstate::stored_identity(&database_dir, 32 << 20).unwrap();
+            assert_eq!(
+                recovered.as_ref().map(|identity| identity.height),
+                Some(identity.height),
+                "{suffix}: a set-aside environment must be restored, not read as absent"
+            );
+            assert!(!aside.exists(), "{suffix}: the set-aside copy is consumed");
+            assert!(
+                database_dir.join("mdbx.dat").exists(),
+                "{suffix}: the environment is back at its canonical path"
+            );
+            // Reading an identity means the restored environment opened and
+            // its meta table was intact, which is what the crash window would
+            // otherwise have destroyed.
+            let _ = tip;
+        }
+    }
+
+    /// When the swap did complete, the set-aside copy is superseded and must
+    /// be removed rather than restored over the live environment.
+    #[test]
+    fn a_completed_swap_discards_the_copy_left_aside() {
+        let (directory, store, identity) = setup(32 << 20);
+        let database_dir = directory.path().join("overlay-mdbx");
+        drop(store);
+        let aside = database_dir.with_file_name("overlay-mdbx.compacted-out");
+        fs::create_dir_all(&aside).unwrap();
+        fs::copy(database_dir.join("mdbx.dat"), aside.join("mdbx.dat")).unwrap();
+
+        assert_eq!(
+            SnapshotOverlayChainstate::stored_identity(&database_dir, 32 << 20)
+                .unwrap()
+                .map(|identity| identity.height),
+            Some(identity.height)
+        );
+        assert!(!aside.exists(), "a superseded copy must not be left behind");
+    }
+
     /// An overlay written before undo compression existed must stay usable
     /// after the upgrade, and the case that reaches its retained undo is a
     /// reorganization. This writes a legacy uncompressed record straight into
