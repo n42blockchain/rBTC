@@ -27,6 +27,20 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   plus declared fees, and a bounded 32-bit nonce search. Regtest pipeline
   tests produce their blocks through this module instead of an external
   daemon; it is deliberately not a mining template provider.
+- Optional loopback ZMQ notification endpoint (`--zmq-listen` or the
+  `zmq_listen` config key) for indexers and Lightning nodes. The narrow
+  ZMTP 3.x subset a PUB socket needs — NULL security, READY negotiation
+  limited to SUB/XSUB peers, both subscription encodings — is implemented in
+  bounded safe Rust rather than binding `libzmq`. Notifications follow
+  Core's wire contract (`hashblock`/`hashtx` in display byte order,
+  `rawblock`/`rawtx` consensus bytes, `sequence` labels with mempool
+  sequence numbers) and are emitted per connected block at the batch commit
+  point, per disconnected stale block, and per newly admitted mempool
+  transaction; the independent AssumeUTXO validation chain never publishes.
+  Distribution runs over one bounded queue whose slow subscribers lose
+  counted messages instead of growing node memory. Mempool removals other
+  than block inclusion are not published yet, and non-loopback binds are
+  refused because the endpoint is unauthenticated.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

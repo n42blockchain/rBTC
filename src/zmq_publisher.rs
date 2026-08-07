@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use bitcoin::{BlockHash, Txid, hashes::Hash};
+use bitcoin::consensus::serialize;
+use bitcoin::{Block, BlockHash, Transaction, Txid, hashes::Hash};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -187,6 +188,50 @@ impl ZmqPublisherHandle {
     #[must_use]
     pub fn dropped_messages(&self) -> u64 {
         self.shared.dropped_messages.load(Ordering::Relaxed)
+    }
+}
+
+/// Node-side notification facade pairing the endpoint handle with the
+/// global mempool sequence counter Core's `sequence` topic requires.
+///
+/// Mempool removals other than block inclusion are not published yet: the
+/// admission pool reports replacement and expiry outcomes as counts, so `R`
+/// labels wait for its outcome API to expose the removed identifiers.
+#[derive(Clone)]
+pub struct ZmqNotifier {
+    handle: ZmqPublisherHandle,
+    mempool_sequence: Arc<AtomicU64>,
+}
+
+impl ZmqNotifier {
+    /// Wraps a publication handle with a fresh mempool sequence counter.
+    #[must_use]
+    pub fn new(handle: ZmqPublisherHandle) -> Self {
+        Self {
+            handle,
+            mempool_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Publishes one durably connected block.
+    pub fn block_connected(&self, block: &Block) {
+        self.handle
+            .publish_block_connected(block.block_hash(), serialize(block));
+    }
+
+    /// Publishes one disconnected stale block.
+    pub fn block_disconnected(&self, hash: BlockHash) {
+        self.handle.publish_block_disconnected(hash);
+    }
+
+    /// Publishes one transaction newly accepted into the mempool.
+    pub fn transaction_accepted(&self, transaction: &Transaction) {
+        let sequence = self.mempool_sequence.fetch_add(1, Ordering::Relaxed);
+        self.handle.publish_mempool_transaction(
+            transaction.compute_txid(),
+            serialize(transaction),
+            sequence,
+        );
     }
 }
 

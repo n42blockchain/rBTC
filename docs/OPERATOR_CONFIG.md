@@ -61,7 +61,8 @@ connect=203.0.113.12:48333
 The supported scalar keys are:
 
 - `network`, `data_dir`, `explorer_listen`, `rpc_auth_token_file`,
-  `wallet_descriptors`, `wallet_auth_token_file`
+  `wallet_descriptors`, `wallet_auth_token_file`, `zmq_listen`
+  (loopback-only ZMQ notification endpoint)
 - `minimum_chainwork`, `assumevalid`, `signetchallenge`
 - `complete_assumeutxo`, `background_assumeutxo`,
   `validation_batch_size`, `validation_pause_ms`

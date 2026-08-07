@@ -320,3 +320,85 @@ async fn host_observes_typed_peer_header_execution_and_freezer_state() {
         .unwrap();
     peer.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_configured_zmq_endpoint_accepts_a_subscriber() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let peer = tokio::spawn(serve_idle_regtest_node(listener));
+    let zmq_address: SocketAddr = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    };
+    let directory = TempDir::new().unwrap();
+    let handle = NodeBuilder::new(Network::Regtest, directory.path())
+        .connect(remote)
+        .zmq_listen(zmq_address)
+        .launch()
+        .unwrap();
+    let controller = handle.controller();
+
+    let mut stream = timeout(Duration::from_secs(5), async {
+        loop {
+            match tokio::net::TcpStream::connect(zmq_address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("the configured ZMQ endpoint must start listening");
+
+    let mut greeting = [0u8; 64];
+    greeting[0] = 0xff;
+    greeting[9] = 0x7f;
+    greeting[10] = 3;
+    greeting[12..16].copy_from_slice(b"NULL");
+    stream.write_all(&greeting).await.unwrap();
+    let mut server_greeting = [0u8; 64];
+    timeout(
+        Duration::from_secs(2),
+        stream.read_exact(&mut server_greeting),
+    )
+    .await
+    .expect("server greeting must arrive")
+    .unwrap();
+    assert_eq!(server_greeting[0], 0xff);
+    assert_eq!(server_greeting[10], 3, "the endpoint speaks ZMTP 3.x");
+    assert_eq!(&server_greeting[12..16], b"NULL");
+
+    let mut ready = vec![0x04u8, 0u8, 5u8];
+    ready.extend_from_slice(b"READY");
+    ready.extend_from_slice(&[11u8]);
+    ready.extend_from_slice(b"Socket-Type");
+    ready.extend_from_slice(&3u32.to_be_bytes());
+    ready.extend_from_slice(b"SUB");
+    ready[1] = u8::try_from(ready.len() - 2).unwrap();
+    stream.write_all(&ready).await.unwrap();
+
+    let mut flags = [0u8; 1];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut flags))
+        .await
+        .expect("server READY must arrive")
+        .unwrap();
+    assert_eq!(flags[0] & 0x04, 0x04, "the endpoint answers with a command");
+    let mut length = [0u8; 1];
+    stream.read_exact(&mut length).await.unwrap();
+    let mut body = vec![0u8; usize::from(length[0])];
+    stream.read_exact(&mut body).await.unwrap();
+    assert_eq!(&body[1..6], b"READY");
+    let metadata = String::from_utf8_lossy(&body[6..]).into_owned();
+    assert!(
+        metadata.contains("PUB"),
+        "the endpoint must identify as a PUB socket: {metadata:?}"
+    );
+
+    controller.request_shutdown();
+    timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("node with a ZMQ endpoint must stop cleanly")
+        .unwrap();
+    peer.abort();
+}

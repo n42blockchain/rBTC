@@ -20,6 +20,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   with the specified one-shot v1 retry when a peer closes the v2 attempt.
 - Minimal local block assembly for low-difficulty networks, removing the
   external-daemon dependency from regtest block production in tests.
+- Optional loopback ZMQ notification endpoint (`--zmq-listen`) publishing
+  Core-compatible `hashblock`, `rawblock`, `hashtx`, `rawtx`, and `sequence`
+  topics with bounded slow-subscriber drop accounting.
 
 ### Safety
 

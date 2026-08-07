@@ -2,6 +2,7 @@
 
 mod config_file;
 
+use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -283,6 +284,7 @@ struct Options {
     once: bool,
     network_execution: NetworkExecutionMode,
     explorer_listen: Option<SocketAddr>,
+    zmq_listen: Option<SocketAddr>,
     wallet_api_files: Option<WalletApiFiles>,
     rpc_auth_token_file: Option<PathBuf>,
     deployments: DeploymentConfig,
@@ -412,6 +414,8 @@ pub struct NodeConfig {
     pub storage: NodeStorageConfig,
     /// Optional loopback explorer/RPC/wallet services.
     pub api: Option<NodeApiConfig>,
+    /// Optional loopback ZMQ notification endpoint.
+    pub zmq_listen: Option<SocketAddr>,
     /// Consensus and IBD policy overrides.
     pub consensus: NodeConsensusConfig,
     /// Optional independent genesis validation of an assumed snapshot.
@@ -436,6 +440,7 @@ impl NodeConfig {
             logging: NodeLogConfig::default(),
             storage: NodeStorageConfig::default(),
             api: None,
+            zmq_listen: None,
             consensus: NodeConsensusConfig::default(),
             assumeutxo_validation: None,
         }
@@ -521,6 +526,7 @@ impl NodeConfig {
             once: self.once,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen,
+            zmq_listen: self.zmq_listen,
             wallet_api_files,
             rpc_auth_token_file,
             deployments,
@@ -941,6 +947,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Binds a loopback-only ZMQ notification endpoint.
+    #[must_use]
+    pub fn zmq_listen(mut self, listen: SocketAddr) -> Self {
+        self.config.zmq_listen = Some(listen);
+        self
+    }
+
     /// Mounts optional loopback explorer/RPC/watch-only-wallet services.
     #[must_use]
     pub fn api(mut self, api: NodeApiConfig) -> Self {
@@ -1056,6 +1069,14 @@ impl NodeBuilder {
 
 fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_peer_options(&options)?;
+    if let Some(listen) = options.zmq_listen {
+        if !listen.ip().is_loopback() {
+            return Err(
+                "zmq_listen must use a loopback IP because ZMQ notifications are unauthenticated"
+                    .to_owned(),
+            );
+        }
+    }
     validate_storage_options(&options)?;
     validate_validation_options(&options)?;
     validate_api_options(&options)?;
@@ -6572,7 +6593,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -6586,6 +6607,9 @@ fn startup_configuration_summary(options: &Options) -> String {
             .proxy
             .map_or_else(|| "direct".to_owned(), |proxy| proxy.to_string()),
         options.resources.v2_transport,
+        options
+            .zmq_listen
+            .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
@@ -6946,6 +6970,17 @@ async fn run_peer_pool_session(
 ) -> Result<(), String> {
     let network_time = Arc::new(NetworkTime::default());
     let api_runtime = prepare_api_runtime(options)?;
+    let zmq_publisher = match options.zmq_listen {
+        Some(listen) => Some(
+            ZmqPublisher::bind(listen, ZmqPublisherConfig::default())
+                .await
+                .map_err(|error| format!("bind zmq endpoint: {error}"))?,
+        ),
+        None => None,
+    };
+    let zmq_notifier = zmq_publisher
+        .as_ref()
+        .map(|publisher| ZmqNotifier::new(publisher.handle()));
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::with_capacity(
         options.resources.mempool_max_transactions,
         options.resources.mempool_max_bytes,
@@ -7050,6 +7085,7 @@ async fn run_peer_pool_session(
         local_nonce,
         peer_store.as_ref(),
         api_runtime.as_ref(),
+        zmq_notifier.as_ref(),
         background_validation,
         validation_scheduler,
         &transaction_pool,
@@ -7108,6 +7144,7 @@ async fn run_peer_pool_session(
             local_nonce,
             peer_store.as_ref(),
             api_runtime.as_ref(),
+            zmq_notifier.as_ref(),
             background_validation,
             validation_scheduler,
             &transaction_pool,
@@ -8567,6 +8604,7 @@ async fn try_peer_candidates(
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     api_runtime: Option<&ApiRuntime>,
+    zmq_notifier: Option<&ZmqNotifier>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -8611,6 +8649,7 @@ async fn try_peer_candidates(
                     auxiliary,
                     peer_store.map(Arc::as_ref),
                     api_runtime,
+                    zmq_notifier,
                     background_validation,
                     validation_scheduler,
                     transaction_pool,
@@ -8682,6 +8721,7 @@ async fn run_connected_peer(
     auxiliary: VecDeque<(SocketAddr, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
     api_runtime: Option<&ApiRuntime>,
+    zmq_notifier: Option<&ZmqNotifier>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -8750,6 +8790,7 @@ async fn run_connected_peer(
                 transaction_pool,
                 transaction_relay,
                 network_time,
+                zmq_notifier,
             )
             .await
         };
@@ -8883,6 +8924,7 @@ async fn complete_assumeutxo_validation(
         transaction_pool,
         transaction_relay,
         network_time,
+        None,
     )
     .await?;
     finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
@@ -9545,6 +9587,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             &mut prefetched_blocks,
             replay.is_none(),
             replay.as_ref(),
+            None,
         )
         .await?;
     }
@@ -10269,6 +10312,7 @@ fn admit_pending_peer_transactions(
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
     full_rbf: bool,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<PeerAdmissionProgress, String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let now = unix_time()?;
@@ -10499,6 +10543,13 @@ fn admit_pending_peer_transactions(
     let more_orphan_work = candidate.has_orphan_work(orphan_source);
     *pool = candidate;
     drop(pool);
+    if let Some(zmq) = zmq_notifier {
+        for entry in &relay_snapshot {
+            if accepted_for_relay.contains(&entry.transaction.compute_txid()) {
+                zmq.transaction_accepted(&entry.transaction);
+            }
+        }
+    }
     let relayed =
         relay_selected_transactions(transaction_relay, &relay_snapshot, &accepted_for_relay);
     if !relayed.is_empty() {
@@ -10571,6 +10622,7 @@ async fn sync_validating_node(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     network_time: &NetworkTime,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
     if network_execution.is_experimental() {
         if !supports_experimental_block_execution(network) || !once {
@@ -10924,6 +10976,9 @@ async fn sync_validating_node(
                     },
                 );
             }
+            if let Some(zmq) = zmq_notifier {
+                zmq.block_disconnected(tip.hash);
+            }
             transaction_pool
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11175,6 +11230,7 @@ async fn sync_validating_node(
                             &headers,
                             deployment_config,
                             mempool_full_rbf,
+                            zmq_notifier,
                         )?;
                         let requested_parents = !progress.parent_requests.is_empty();
                         if requested_parents {
@@ -11301,6 +11357,7 @@ async fn sync_validating_node(
                 &mut prefetched_blocks,
                 overlap_next_download,
                 None,
+                zmq_notifier,
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
@@ -12467,6 +12524,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     prefetched_blocks: &mut PrefetchedBlocks,
     prefetch_next_batch: bool,
     replay: Option<&PrunedBlockLedger>,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
     let tip = chainstate
@@ -13003,6 +13061,11 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
+    if let Some(zmq) = zmq_notifier {
+        for block in &blocks {
+            zmq.block_connected(block);
+        }
+    }
     let pruned_undos = prune_expired_block_undos(chainstate, headers, ledger)?;
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
@@ -13705,6 +13768,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut experimental_network_execution = false;
     let mut extend_validation_target = false;
     let mut explorer_listen = None;
+    let mut zmq_listen = None;
     let mut wallet_descriptors = None;
     let mut wallet_auth_token_file = None;
     let mut rpc_auth_token_file = None;
@@ -13873,6 +13937,19 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     );
                 }
                 explorer_listen = Some(address);
+            }
+            "--zmq-listen" => {
+                let value = required_option_value(&mut args, "--zmq-listen")?;
+                let address: SocketAddr = value
+                    .parse()
+                    .map_err(|_| format!("invalid zmq listen address: {value}"))?;
+                if !address.ip().is_loopback() {
+                    return Err(
+                        "--zmq-listen must use a loopback IP because ZMQ notifications are unauthenticated"
+                            .to_owned(),
+                    );
+                }
+                zmq_listen = Some(address);
             }
             "--wallet-descriptors" => {
                 wallet_descriptors = Some(PathBuf::from(required_option_value(
@@ -15588,6 +15665,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         headers_db,
         data_dir,
         once,
+        zmq_listen,
         network_execution: if extend_validation_target {
             NetworkExecutionMode::ExperimentalOnceExtend
         } else if experimental_network_execution {
@@ -15767,7 +15845,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -16504,6 +16582,7 @@ mod tests {
             once,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -16600,6 +16679,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -20893,6 +20973,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -20977,6 +21058,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22631,6 +22713,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors,
                 auth_token,
@@ -22697,6 +22780,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -23102,6 +23186,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23198,6 +23283,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23279,6 +23365,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23366,6 +23453,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23438,6 +23526,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23499,6 +23588,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23593,6 +23683,7 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23663,6 +23754,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23771,6 +23863,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23863,6 +23956,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23909,6 +24003,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23975,6 +24070,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24035,6 +24131,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24141,6 +24238,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24299,6 +24397,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -24414,6 +24513,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24498,6 +24598,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24619,6 +24720,7 @@ mod tests {
                 once: true,
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
+                zmq_listen: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24774,6 +24876,7 @@ mod tests {
                 once: true,
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
+                zmq_listen: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24908,6 +25011,7 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Signet),
