@@ -38,9 +38,10 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   point, per disconnected stale block, and per newly admitted mempool
   transaction; the independent AssumeUTXO validation chain never publishes.
   Distribution runs over one bounded queue whose slow subscribers lose
-  counted messages instead of growing node memory. Mempool removals other
-  than block inclusion are not published yet, and non-loopback binds are
-  refused because the endpoint is unauthenticated.
+  counted messages instead of growing node memory. `R` sequence labels
+  cover expiry, BIP125 replacement, and capacity eviction, while
+  block-confirmed removals stay silent exactly like Core; non-loopback binds
+  are refused because the endpoint is unauthenticated.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

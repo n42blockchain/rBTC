@@ -194,9 +194,9 @@ impl ZmqPublisherHandle {
 /// Node-side notification facade pairing the endpoint handle with the
 /// global mempool sequence counter Core's `sequence` topic requires.
 ///
-/// Mempool removals other than block inclusion are not published yet: the
-/// admission pool reports replacement and expiry outcomes as counts, so `R`
-/// labels wait for its outcome API to expose the removed identifiers.
+/// `R` labels cover expiry, BIP125 replacement, and capacity eviction;
+/// transactions removed because a block confirmed them are deliberately not
+/// published, matching Core's `sequence` contract.
 #[derive(Clone)]
 pub struct ZmqNotifier {
     handle: ZmqPublisherHandle,
@@ -232,6 +232,13 @@ impl ZmqNotifier {
             serialize(transaction),
             sequence,
         );
+    }
+
+    /// Publishes one transaction removed from the mempool for a reason other
+    /// than block inclusion.
+    pub fn transaction_removed(&self, txid: Txid) {
+        let sequence = self.mempool_sequence.fetch_add(1, Ordering::Relaxed);
+        self.handle.publish_mempool_removal(txid, sequence);
     }
 }
 

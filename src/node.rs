@@ -10365,7 +10365,8 @@ fn admit_pending_peer_transactions(
             .hash,
         now,
     );
-    let expired_removed = candidate.remove_with_descendants(&expired);
+    let mut removed_for_notification = candidate.remove_with_descendants(&expired);
+    let expired_removed = removed_for_notification.len();
     let reconciled_removed = candidate.reconcile(chainstate, context);
     let expired_orphans = candidate.prune_orphans(now);
     let mut accepted_messages = Vec::new();
@@ -10402,6 +10403,8 @@ fn admit_pending_peer_transactions(
             match candidate.admit_package_at(chainstate, package, context, now) {
                 Ok(outcome) if !outcome.accepted.is_empty() => {
                     candidate.remove_orphans(&txid_set);
+                    removed_for_notification.extend(outcome.replaced.iter().copied());
+                    removed_for_notification.extend(outcome.evicted.iter().copied());
                     accepted_parents.extend(outcome.accepted.iter().copied());
                     accepted_for_relay.extend(
                         outcome
@@ -10411,19 +10414,23 @@ fn admit_pending_peer_transactions(
                             .filter(|txid| !persisted_txids.contains(txid)),
                     );
                     let mut effects = Vec::new();
-                    if outcome.replaced > 0 {
+                    if !outcome.replaced.is_empty() {
                         effects.push(format!(
                             "replacing {} BIP125 conflict{} or descendant{}",
-                            outcome.replaced,
-                            if outcome.replaced == 1 { "" } else { "s" },
-                            if outcome.replaced == 1 { "" } else { "s" }
+                            outcome.replaced.len(),
+                            if outcome.replaced.len() == 1 { "" } else { "s" },
+                            if outcome.replaced.len() == 1 { "" } else { "s" }
                         ));
                     }
-                    if outcome.evicted > 0 {
+                    if !outcome.evicted.is_empty() {
                         effects.push(format!(
                             "evicting {} oldest entr{} or descendants",
-                            outcome.evicted,
-                            if outcome.evicted == 1 { "y" } else { "ies" }
+                            outcome.evicted.len(),
+                            if outcome.evicted.len() == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            }
                         ));
                     }
                     accepted_messages.push(format!(
@@ -10548,6 +10555,11 @@ fn admit_pending_peer_transactions(
             if accepted_for_relay.contains(&entry.transaction.compute_txid()) {
                 zmq.transaction_accepted(&entry.transaction);
             }
+        }
+        removed_for_notification.sort_unstable();
+        removed_for_notification.dedup();
+        for txid in &removed_for_notification {
+            zmq.transaction_removed(*txid);
         }
     }
     let relayed =

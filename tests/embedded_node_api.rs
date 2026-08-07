@@ -93,6 +93,183 @@ async fn serve_idle_regtest_node(listener: TcpListener) {
     std::future::pending::<()>().await;
 }
 
+/// Serves the embedded-test handshake, withholds the header announcement
+/// until `release` fires, then serves one assembled block and stays
+/// responsive to keepalives.
+async fn serve_one_block_regtest_node(
+    listener: TcpListener,
+    block: bitcoin::Block,
+    release: oneshot::Receiver<()>,
+) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+    assert!(matches!(
+        peer.read_message().await.unwrap().into_payload(),
+        NetworkMessage::Version(_)
+    ));
+    let receiver: SocketAddr = "127.0.0.1:18444".parse().unwrap();
+    let sender: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let mut version = VersionMessage::new(
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        0,
+        Address::new(&receiver, ServiceFlags::NONE),
+        Address::new(&sender, ServiceFlags::NONE),
+        9002,
+        "/rbtc:embedded-test/".to_owned(),
+        1,
+    );
+    version.version = 70_016;
+    peer.write_message(NetworkMessage::Version(version))
+        .await
+        .unwrap();
+    assert!(matches!(
+        peer.read_message().await.unwrap().into_payload(),
+        NetworkMessage::WtxidRelay
+    ));
+    assert!(matches!(
+        peer.read_message().await.unwrap().into_payload(),
+        NetworkMessage::SendAddrV2
+    ));
+    assert!(matches!(
+        peer.read_message().await.unwrap().into_payload(),
+        NetworkMessage::Verack
+    ));
+    peer.write_message(NetworkMessage::WtxidRelay)
+        .await
+        .unwrap();
+    peer.write_message(NetworkMessage::Verack).await.unwrap();
+    let mut released = false;
+    let mut release = Some(release);
+    loop {
+        match peer.read_message().await.unwrap().into_payload() {
+            NetworkMessage::GetHeaders(_) => {
+                if released {
+                    peer.write_message(NetworkMessage::Headers(Vec::new()))
+                        .await
+                        .unwrap();
+                } else {
+                    release.take().unwrap().await.unwrap();
+                    released = true;
+                    peer.write_message(NetworkMessage::Headers(vec![block.header]))
+                        .await
+                        .unwrap();
+                }
+            }
+            NetworkMessage::GetData(_) => {
+                peer.write_message(NetworkMessage::Block(block.clone()))
+                    .await
+                    .unwrap();
+            }
+            NetworkMessage::Ping(nonce) => {
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .unwrap();
+            }
+            NetworkMessage::GetAddr => {
+                peer.write_message(NetworkMessage::AddrV2(Vec::new()))
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Completes the ZMTP 3.x NULL handshake as a SUB peer and issues the
+/// requested prefix subscriptions.
+async fn zmtp_subscribe(address: SocketAddr, subscriptions: &[&[u8]]) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = timeout(Duration::from_secs(5), async {
+        loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("the configured ZMQ endpoint must start listening");
+    let mut greeting = [0u8; 64];
+    greeting[0] = 0xff;
+    greeting[9] = 0x7f;
+    greeting[10] = 3;
+    greeting[12..16].copy_from_slice(b"NULL");
+    stream.write_all(&greeting).await.unwrap();
+    let mut server_greeting = [0u8; 64];
+    timeout(
+        Duration::from_secs(2),
+        stream.read_exact(&mut server_greeting),
+    )
+    .await
+    .expect("server greeting must arrive")
+    .unwrap();
+    assert_eq!(server_greeting[0], 0xff);
+    assert_eq!(server_greeting[10], 3, "the endpoint speaks ZMTP 3.x");
+    assert_eq!(&server_greeting[12..16], b"NULL");
+    let mut ready = vec![0x04u8, 0u8, 5u8];
+    ready.extend_from_slice(b"READY");
+    ready.extend_from_slice(&[11u8]);
+    ready.extend_from_slice(b"Socket-Type");
+    ready.extend_from_slice(&3u32.to_be_bytes());
+    ready.extend_from_slice(b"SUB");
+    ready[1] = u8::try_from(ready.len() - 2).unwrap();
+    stream.write_all(&ready).await.unwrap();
+    let body = read_zmtp_frame(&mut stream, true).await;
+    assert_eq!(&body[1..6], b"READY");
+    let metadata = String::from_utf8_lossy(&body[6..]).into_owned();
+    assert!(
+        metadata.contains("PUB"),
+        "the endpoint must identify as a PUB socket: {metadata:?}"
+    );
+    for prefix in subscriptions {
+        let mut subscribe = vec![0u8, u8::try_from(prefix.len() + 1).unwrap(), 1u8];
+        subscribe.extend_from_slice(prefix);
+        stream.write_all(&subscribe).await.unwrap();
+    }
+    stream.flush().await.unwrap();
+    stream
+}
+
+/// Reads one ZMTP frame body, asserting the command flag when required.
+async fn read_zmtp_frame(stream: &mut tokio::net::TcpStream, command: bool) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut flags = [0u8; 1];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut flags))
+        .await
+        .expect("frame must arrive")
+        .unwrap();
+    assert_eq!(
+        flags[0] & 0x04 != 0,
+        command,
+        "unexpected frame class: flags {:#04x}",
+        flags[0]
+    );
+    let length = if flags[0] & 0x02 == 0 {
+        let mut short = [0u8; 1];
+        stream.read_exact(&mut short).await.unwrap();
+        usize::from(short[0])
+    } else {
+        let mut long = [0u8; 8];
+        stream.read_exact(&mut long).await.unwrap();
+        usize::try_from(u64::from_be_bytes(long)).unwrap()
+    };
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.unwrap();
+    body
+}
+
+/// Reads one topic/body/sequence notification.
+async fn read_zmq_notification(stream: &mut tokio::net::TcpStream) -> (Vec<u8>, Vec<u8>, u32) {
+    let topic = read_zmtp_frame(stream, false).await;
+    let body = read_zmtp_frame(stream, false).await;
+    let sequence = read_zmtp_frame(stream, false).await;
+    (
+        topic,
+        body,
+        u32::from_le_bytes(sequence.try_into().expect("four-byte sequence counter")),
+    )
+}
+
 #[derive(Default)]
 struct CriticalTaskExecutor {
     spawned: AtomicUsize,
@@ -394,6 +571,79 @@ async fn host_configured_zmq_endpoint_accepts_a_subscriber() {
         metadata.contains("PUB"),
         "the endpoint must identify as a PUB socket: {metadata:?}"
     );
+
+    controller.request_shutdown();
+    timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("node with a ZMQ endpoint must stop cleanly")
+        .unwrap();
+    peer.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_zmq_endpoint_publishes_an_executed_block() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let block =
+        rbtc::block_assembly::assemble_block(&rbtc::block_assembly::BlockTemplate::regtest(
+            genesis.block_hash(),
+            1,
+            genesis.header.time + 600,
+        ))
+        .expect("regtest block assembles");
+    let (release, gate) = oneshot::channel();
+    let peer = tokio::spawn(serve_one_block_regtest_node(listener, block.clone(), gate));
+    let zmq_address: SocketAddr = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    };
+    let directory = TempDir::new().unwrap();
+    let handle = NodeBuilder::new(Network::Regtest, directory.path())
+        .connect(remote)
+        .zmq_listen(zmq_address)
+        .launch()
+        .unwrap();
+    let controller = handle.controller();
+
+    let mut subscriber = zmtp_subscribe(zmq_address, &[b""]).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    release.send(()).unwrap();
+
+    let (topic, body, sequence) = read_zmq_notification(&mut subscriber).await;
+    assert_eq!(topic, b"hashblock");
+    let mut display = *bitcoin::hashes::Hash::as_byte_array(&block.block_hash());
+    display.reverse();
+    assert_eq!(body, display);
+    assert_eq!(sequence, 0);
+
+    let (topic, body, _) = read_zmq_notification(&mut subscriber).await;
+    assert_eq!(topic, b"rawblock");
+    assert_eq!(body, bitcoin::consensus::serialize(&block));
+
+    let (topic, body, _) = read_zmq_notification(&mut subscriber).await;
+    assert_eq!(topic, b"sequence");
+    assert_eq!(
+        &body[..32],
+        bitcoin::hashes::Hash::as_byte_array(&block.block_hash())
+    );
+    assert_eq!(body[32], b'C');
+
+    let mut status = controller.subscribe_status();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if status
+                .borrow_and_update()
+                .execution
+                .is_some_and(|tip| tip.height == 1)
+            {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("execution must reach the published block");
 
     controller.request_shutdown();
     timeout(Duration::from_secs(3), handle.wait())
