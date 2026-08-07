@@ -747,14 +747,25 @@ pub enum NodeOnlyNet {
     Ipv4,
     /// Permit only IPv6 destinations.
     Ipv6,
+    /// Permit only v3 onion destinations, which require a SOCKS5 proxy.
+    Onion,
 }
 
 impl NodeOnlyNet {
+    /// Returns whether a routable destination is permitted.
+    ///
+    /// An onion-only restriction permits no IP destination at all, which is
+    /// what makes it a leak guard rather than a preference.
     const fn permits(self, ip: IpAddr) -> bool {
         matches!(
             (self, ip),
             (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
         )
+    }
+
+    /// Returns whether v3 onion destinations are permitted.
+    const fn permits_onion(self) -> bool {
+        matches!(self, Self::Any | Self::Onion)
     }
 }
 
@@ -1174,6 +1185,26 @@ fn validate_index_options(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves repeated `--onlynet` values into one restriction.
+///
+/// Only single families and the complete pair of IP families are
+/// expressible, so an unsupported mixture is refused rather than silently
+/// widened. Repeating both IP families keeps its historical meaning of no
+/// restriction.
+fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
+    match values {
+        [] => Ok(NodeOnlyNet::Any),
+        [family] => Ok(*family),
+        [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6] | [NodeOnlyNet::Ipv6, NodeOnlyNet::Ipv4] => {
+            Ok(NodeOnlyNet::Any)
+        }
+        _ => Err(
+            "--onlynet accepts one network, or both IP families; onion cannot be combined with another network"
+                .to_owned(),
+        ),
+    }
+}
+
 fn validate_peer_options(options: &Options) -> Result<(), String> {
     if options
         .data_dir
@@ -1198,6 +1229,17 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
         return Err(format!(
             "preferred peer {remote} is excluded by the configured --onlynet"
         ));
+    }
+    if options.resources.only_net == NodeOnlyNet::Onion {
+        // Onion destinations are reachable only through a proxy, so an
+        // onion-only node without one has no route at all. Failing here keeps
+        // that from degrading into silent direct connections.
+        if options.resources.proxy.is_none() {
+            return Err(
+                "--onlynet onion requires --proxy because onion services are reachable only through a SOCKS5 proxy"
+                    .to_owned(),
+            );
+        }
     }
     if let Some(seeds) = &options.dns_seeds {
         if seeds.len() > MAX_DNS_SEEDS {
@@ -7418,6 +7460,22 @@ async fn run_peer_pool_session(
             }
             if options.resources.only_net.permits(learned.ip()) && !remotes.contains(&learned) {
                 remotes.push(learned);
+            }
+        }
+        // Onion candidates are only meaningful behind a proxy. Dialing them
+        // needs the outbound scheduler to carry proxied targets rather than
+        // sockets, so for now their availability is reported rather than
+        // scheduled; an onion-only launch surfaces that explicitly instead of
+        // spinning without peers.
+        if options.resources.only_net.permits_onion() && options.resources.proxy.is_some() {
+            let onions = store
+                .onion_candidates(now, MAX_CONFIGURED_PEERS)
+                .map_err(|error| error.to_string())?;
+            if !onions.is_empty() {
+                rbtc_info!(
+                    "{} persisted onion candidates are eligible; onion outbound scheduling is not enabled yet",
+                    onions.len()
+                );
             }
         }
     }
@@ -14252,6 +14310,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 let family = match value.as_str() {
                     "ipv4" => NodeOnlyNet::Ipv4,
                     "ipv6" => NodeOnlyNet::Ipv6,
+                    "onion" => NodeOnlyNet::Onion,
                     _ => return Err(format!("unsupported --onlynet value: {value}")),
                 };
                 if !only_net_values.contains(&family) {
@@ -16114,13 +16173,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
             mempool_max_transactions: mempool_max_transactions.unwrap_or(MAX_ADMITTED_TRANSACTIONS),
             mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
-            only_net: match only_net_values.as_slice() {
-                []
-                | [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6]
-                | [NodeOnlyNet::Ipv6, NodeOnlyNet::Ipv4] => NodeOnlyNet::Any,
-                [family] => *family,
-                _ => unreachable!("only two deduplicated address families exist"),
-            },
+            only_net: resolve_only_net(&only_net_values)?,
             proxy: outbound_proxy,
             v2_transport,
         },
@@ -16217,7 +16270,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -16897,6 +16950,74 @@ mod tests {
             .unwrap();
         assert!(past_end["entries"].as_array().unwrap().is_empty());
         assert!(past_end["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn onlynet_onion_requires_a_proxy_and_excludes_routable_peers() {
+        let directory = TempDir::new().unwrap();
+        let base = [
+            "--network".to_owned(),
+            "regtest".to_owned(),
+            "--no-dns-seeds".to_owned(),
+            // A data directory supplies the persisted bootstrap source an
+            // onion-only launch depends on.
+            "--data-dir".to_owned(),
+            directory.path().display().to_string(),
+        ];
+        let onion_only = |extra: &[&str]| {
+            let mut arguments = base.to_vec();
+            arguments.extend(["--onlynet".to_owned(), "onion".to_owned()]);
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = onion_only(&[]) else {
+            panic!("onion-only without a proxy must fail closed");
+        };
+        assert!(
+            error.contains("--proxy"),
+            "onion-only without a proxy must fail closed: {error}"
+        );
+
+        let Err(error) = onion_only(&["--proxy", "127.0.0.1:9050", "--connect", "127.0.0.1:18444"])
+        else {
+            panic!("onion-only must refuse routable peers");
+        };
+        assert!(
+            error.contains("excluded by the configured --onlynet"),
+            "onion-only must refuse routable peers: {error}"
+        );
+
+        let options = onion_only(&["--proxy", "127.0.0.1:9050"])
+            .unwrap()
+            .expect("a proxied onion-only launch parses");
+        assert_eq!(options.resources.only_net, NodeOnlyNet::Onion);
+        assert!(options.resources.only_net.permits_onion());
+        assert!(
+            !options
+                .resources
+                .only_net
+                .permits("127.0.0.1".parse().unwrap()),
+            "an onion-only restriction permits no IP destination"
+        );
+
+        for family in [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6] {
+            assert!(
+                !family.permits_onion(),
+                "an IP-only restriction excludes onion"
+            );
+        }
+        assert!(NodeOnlyNet::Any.permits_onion());
+
+        assert_eq!(resolve_only_net(&[]).unwrap(), NodeOnlyNet::Any);
+        assert_eq!(
+            resolve_only_net(&[NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6]).unwrap(),
+            NodeOnlyNet::Any
+        );
+        assert!(
+            resolve_only_net(&[NodeOnlyNet::Ipv4, NodeOnlyNet::Onion]).is_err(),
+            "mixing onion with an IP family is refused rather than widened"
+        );
     }
 
     #[test]
