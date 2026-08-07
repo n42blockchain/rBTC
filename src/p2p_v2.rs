@@ -12,9 +12,14 @@
 
 use std::sync::OnceLock;
 
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::p2p::Magic;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::secp256k1::ellswift::{ElligatorSwift, ElligatorSwiftParty};
 use bitcoin::secp256k1::{All, Secp256k1, SecretKey};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::p2p::MAX_PROTOCOL_MESSAGE_LEN;
 use chacha20::ChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20poly1305::aead::{Aead, Payload};
@@ -52,6 +57,46 @@ const MAX_HANDSHAKE_PACKETS: usize = 64;
 const MAX_HANDSHAKE_PACKET_CONTENTS: usize = 4_000_000;
 /// Bound on secret-key generation attempts before failing closed.
 const MAX_KEY_GENERATION_ATTEMPTS: usize = 64;
+/// Bound on consecutive post-handshake decoy packets per message read.
+const MAX_CONSECUTIVE_DECOY_PACKETS: usize = 64;
+/// Length of a v1 message envelope header preceding the payload.
+const V1_ENVELOPE_HEADER_LEN: usize = 24;
+/// Length of the fixed command-name field shared by v1 envelopes and the
+/// v2 long-form message type.
+const COMMAND_LEN: usize = 12;
+/// Maximum v2 message-type encoding length (long form: `0x00` + command).
+const MAX_TYPE_LEN: usize = 1 + COMMAND_LEN;
+/// BIP324 short message-type IDs in protocol order; index plus one is the ID.
+const V2_SHORT_ID_COMMANDS: [&str; 28] = [
+    "addr",
+    "block",
+    "blocktxn",
+    "cmpctblock",
+    "feefilter",
+    "filteradd",
+    "filterclear",
+    "filterload",
+    "getblocks",
+    "getblocktxn",
+    "getdata",
+    "getheaders",
+    "headers",
+    "inv",
+    "mempool",
+    "merkleblock",
+    "notfound",
+    "ping",
+    "pong",
+    "sendcmpct",
+    "tx",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "addrv2",
+];
 
 /// Errors from the v2 record layer.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -636,6 +681,317 @@ fn generate_handshake_keypair(
     })
 }
 
+/// Errors from the v2 transport wrapper.
+#[derive(Debug, Error)]
+pub enum V2TransportError {
+    /// The underlying stream failed.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// The handshake state machine rejected the peer.
+    #[error(transparent)]
+    Handshake(#[from] V2HandshakeError),
+    /// The record layer rejected a packet.
+    #[error(transparent)]
+    Crypto(#[from] V2CryptoError),
+    /// The peer closed the connection before completing the v2 handshake;
+    /// the caller may retry the address once over the v1 transport.
+    #[error("the peer closed the connection before completing the v2 handshake")]
+    PeerRejectedV2,
+    /// A packet carried no or a malformed message type.
+    #[error("v2 message type is unknown or malformed")]
+    MessageType,
+    /// A packet announced contents beyond the transport bound.
+    #[error("v2 message length {length} exceeds the {limit}-byte bound")]
+    Oversize {
+        /// The announced contents length.
+        length: usize,
+        /// The enforced ceiling.
+        limit: usize,
+    },
+    /// The message payload failed consensus decoding.
+    #[error("v2 message payload failed to decode")]
+    Payload,
+    /// The peer streamed more consecutive decoys than the accepted bound.
+    #[error("v2 peer exceeded {limit} consecutive decoy packets")]
+    DecoyBudget {
+        /// The enforced ceiling.
+        limit: usize,
+    },
+}
+
+/// Result of accepting one inbound connection on a v2-capable listener.
+pub enum V2Accepted<S> {
+    /// The peer completed the v2 handshake.
+    V2(Box<V2Transport<S>>),
+    /// The peer opened with the v1 prefix; the connection continues as v1
+    /// and `consumed` holds every byte already read, in order.
+    V1 {
+        /// The wrapped stream, positioned after `consumed`.
+        stream: S,
+        /// Bytes read before v1 was recognized.
+        consumed: Vec<u8>,
+    },
+}
+
+/// An established BIP324 v2 encrypted transport.
+///
+/// The counterpart of [`crate::p2p::V1Transport`]: it owns the stream and the
+/// session ciphers, translates [`NetworkMessage`] to and from v2 packet
+/// contents with BIP324 short message-type IDs, skips bounded decoy traffic,
+/// and enforces the same 4,000,000-byte application-message ceiling. The
+/// caller owns connection timeouts, exactly as with the v1 transport.
+pub struct V2Transport<S> {
+    stream: S,
+    sender: PacketSender,
+    receiver: PacketReceiver,
+    session_id: [u8; 32],
+    magic: Magic,
+    max_payload_len: u32,
+    pending: Vec<u8>,
+}
+
+impl<S> V2Transport<S> {
+    fn from_session(stream: S, session: V2Session, magic: Magic) -> Self {
+        Self {
+            stream,
+            sender: session.sender,
+            receiver: session.receiver,
+            session_id: session.session_id,
+            magic,
+            max_payload_len: MAX_PROTOCOL_MESSAGE_LEN,
+            pending: session.leftover,
+        }
+    }
+
+    /// Changes the maximum accepted application payload length.
+    #[must_use]
+    pub const fn with_max_payload_len(mut self, max_payload_len: u32) -> Self {
+        self.max_payload_len = max_payload_len;
+        self
+    }
+
+    /// Returns the session identifier for out-of-band comparison.
+    #[must_use]
+    pub const fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
+    }
+
+    /// Returns the wrapped stream after the peer session ends.
+    #[must_use]
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> V2Transport<S> {
+    /// Runs the initiator handshake on an established outbound stream.
+    ///
+    /// A clean close before completion maps to
+    /// [`V2TransportError::PeerRejectedV2`], the only error after which the
+    /// caller should reconnect over v1; every other error is an ordinary
+    /// connection failure or a protocol violation.
+    pub async fn connect_outbound(mut stream: S, magic: Magic) -> Result<Self, V2TransportError> {
+        let (mut handshake, first) = V2Handshake::initiator(magic, random_garbage())?;
+        stream.write_all(&first).await?;
+        stream.flush().await?;
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(V2TransportError::PeerRejectedV2);
+            }
+            let step = handshake.push_bytes(&chunk[..read])?;
+            if !step.send.is_empty() {
+                stream.write_all(&step.send).await?;
+                stream.flush().await?;
+            }
+            match step.event {
+                HandshakeEvent::NeedMoreData => {}
+                HandshakeEvent::PeerSpeaksV1 { .. } => {
+                    return Err(V2TransportError::PeerRejectedV2);
+                }
+                HandshakeEvent::Complete(session) => {
+                    return Ok(Self::from_session(stream, *session, magic));
+                }
+            }
+        }
+    }
+
+    /// Runs the responder handshake on an accepted inbound stream.
+    ///
+    /// A peer that opens with the v1 prefix is returned as
+    /// [`V2Accepted::V1`] together with the bytes already consumed, so the
+    /// same connection can continue over the v1 transport.
+    pub async fn accept_inbound(
+        mut stream: S,
+        magic: Magic,
+    ) -> Result<V2Accepted<S>, V2TransportError> {
+        let mut handshake = V2Handshake::responder(magic, random_garbage())?;
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(V2TransportError::PeerRejectedV2);
+            }
+            let step = handshake.push_bytes(&chunk[..read])?;
+            if !step.send.is_empty() {
+                stream.write_all(&step.send).await?;
+                stream.flush().await?;
+            }
+            match step.event {
+                HandshakeEvent::NeedMoreData => {}
+                HandshakeEvent::PeerSpeaksV1 { received } => {
+                    return Ok(V2Accepted::V1 {
+                        stream,
+                        consumed: received,
+                    });
+                }
+                HandshakeEvent::Complete(session) => {
+                    return Ok(V2Accepted::V2(Box::new(Self::from_session(
+                        stream, *session, magic,
+                    ))));
+                }
+            }
+        }
+    }
+
+    /// Reads one application message, skipping bounded decoy packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, authentication, size, decoy-budget, or decode errors;
+    /// every error is terminal for the connection.
+    pub async fn read_message(&mut self) -> Result<NetworkMessage, V2TransportError> {
+        for _ in 0..=MAX_CONSECUTIVE_DECOY_PACKETS {
+            let mut length_bytes = [0u8; LENGTH_FIELD_LEN];
+            self.read_exact_buffered(&mut length_bytes).await?;
+            let length = self.receiver.decrypt_length(length_bytes);
+            let limit =
+                usize::try_from(self.max_payload_len).expect("u32 fits usize") + MAX_TYPE_LEN;
+            if length > limit {
+                return Err(V2TransportError::Oversize { length, limit });
+            }
+            let mut ciphertext = vec![0u8; HEADER_LEN + length + TAG_LEN];
+            self.read_exact_buffered(&mut ciphertext).await?;
+            let (ignore, contents) = self.receiver.decrypt_packet(&[], &ciphertext)?;
+            if ignore {
+                continue;
+            }
+            return decode_v2_contents(self.magic, &contents);
+        }
+        Err(V2TransportError::DecoyBudget {
+            limit: MAX_CONSECUTIVE_DECOY_PACKETS,
+        })
+    }
+
+    /// Writes one application message as a v2 packet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the peer stream cannot accept the packet.
+    pub async fn write_message(&mut self, message: NetworkMessage) -> Result<(), V2TransportError> {
+        let contents = encode_v2_contents(self.magic, message);
+        let packet = self.sender.encrypt_packet(&contents, &[], false)?;
+        self.stream.write_all(&packet).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Writes one decoy packet the peer authenticates and discards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the peer stream cannot accept the packet.
+    pub async fn write_decoy(&mut self, contents: &[u8]) -> Result<(), V2TransportError> {
+        let packet = self.sender.encrypt_packet(contents, &[], true)?;
+        self.stream.write_all(&packet).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    async fn read_exact_buffered(&mut self, target: &mut [u8]) -> Result<(), std::io::Error> {
+        let take = self.pending.len().min(target.len());
+        if take > 0 {
+            target[..take].copy_from_slice(&self.pending[..take]);
+            self.pending.drain(..take);
+        }
+        if take < target.len() {
+            self.stream.read_exact(&mut target[take..]).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Draws uniform random garbage for one handshake side.
+fn random_garbage() -> Vec<u8> {
+    let length = usize::from(rand::random::<u16>()) % (MAX_GARBAGE_LEN + 1);
+    (0..length).map(|_| rand::random::<u8>()).collect()
+}
+
+/// Encodes one application message as v2 packet contents: a short
+/// message-type ID where BIP324 defines one, the long form otherwise, then
+/// the ordinary consensus payload bytes.
+fn encode_v2_contents(magic: Magic, message: NetworkMessage) -> Vec<u8> {
+    let envelope = crate::p2p::encode_v1(magic, message);
+    let command = &envelope[4..4 + COMMAND_LEN];
+    let payload = &envelope[V1_ENVELOPE_HEADER_LEN..];
+    let name_len = command
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(COMMAND_LEN);
+    let short_id = V2_SHORT_ID_COMMANDS
+        .iter()
+        .position(|known| known.as_bytes() == &command[..name_len]);
+    if let Some(index) = short_id {
+        let mut contents = Vec::with_capacity(1 + payload.len());
+        contents.push(u8::try_from(index + 1).expect("short-ID table fits one byte"));
+        contents.extend_from_slice(payload);
+        contents
+    } else {
+        let mut contents = Vec::with_capacity(MAX_TYPE_LEN + payload.len());
+        contents.push(0);
+        contents.extend_from_slice(command);
+        contents.extend_from_slice(payload);
+        contents
+    }
+}
+
+/// Decodes v2 packet contents into an application message by synthesizing
+/// the equivalent v1 envelope, so payload parsing, unknown-command handling,
+/// and the repository's v1 decoding tolerances stay identical across
+/// transports.
+fn decode_v2_contents(magic: Magic, contents: &[u8]) -> Result<NetworkMessage, V2TransportError> {
+    let (command, payload) = match contents.split_first() {
+        None => return Err(V2TransportError::MessageType),
+        Some((0, rest)) => {
+            if rest.len() < COMMAND_LEN {
+                return Err(V2TransportError::MessageType);
+            }
+            let mut command = [0u8; COMMAND_LEN];
+            command.copy_from_slice(&rest[..COMMAND_LEN]);
+            (command, &rest[COMMAND_LEN..])
+        }
+        Some((&id, rest)) => {
+            let Some(name) = V2_SHORT_ID_COMMANDS.get(usize::from(id) - 1) else {
+                return Err(V2TransportError::MessageType);
+            };
+            let mut command = [0u8; COMMAND_LEN];
+            command[..name.len()].copy_from_slice(name.as_bytes());
+            (command, rest)
+        }
+    };
+    let length = u32::try_from(payload.len()).map_err(|_| V2TransportError::Payload)?;
+    let mut envelope = Vec::with_capacity(V1_ENVELOPE_HEADER_LEN + payload.len());
+    envelope.extend_from_slice(&magic.to_bytes());
+    envelope.extend_from_slice(&command);
+    envelope.extend_from_slice(&length.to_le_bytes());
+    envelope.extend_from_slice(&sha256d::Hash::hash(payload).as_byte_array()[..4]);
+    envelope.extend_from_slice(payload);
+    crate::p2p::decode_v1(&envelope)
+        .map(RawNetworkMessage::into_payload)
+        .map_err(|_| V2TransportError::Payload)
+}
+
 /// BIP324's rekeying ChaCha20 stream cipher for packet length fields.
 ///
 /// The keystream position runs continuously within one rekey epoch; after
@@ -787,6 +1143,7 @@ fn hkdf_expand32(pseudorandom_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use bitcoin::hex::FromHex;
+    use bitcoin::p2p::message::CommandString;
 
     const VECTORS: &str = include_str!("../tests/data/bip324_packet_encoding_test_vectors.csv");
 
@@ -1249,6 +1606,193 @@ mod tests {
             Err(V2HandshakeError::GarbageTerminatorMissing { limit })
                 if limit == MAX_GARBAGE_LEN + GARBAGE_TERMINATOR_LEN
         ));
+    }
+
+    #[test]
+    fn v2_message_codec_matches_the_short_id_table() {
+        let mut unique: Vec<&str> = V2_SHORT_ID_COMMANDS.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 28, "short-ID table has 28 unique commands");
+        let magic = Magic::REGTEST;
+        let ping = encode_v2_contents(magic, NetworkMessage::Ping(0x1122_3344));
+        assert_eq!(ping[0], 18, "ping short ID");
+        assert!(matches!(
+            decode_v2_contents(magic, &ping),
+            Ok(NetworkMessage::Ping(0x1122_3344))
+        ));
+        let feefilter = encode_v2_contents(magic, NetworkMessage::FeeFilter(1_000));
+        assert_eq!(feefilter[0], 5, "feefilter short ID");
+        assert!(matches!(
+            decode_v2_contents(magic, &feefilter),
+            Ok(NetworkMessage::FeeFilter(1_000))
+        ));
+        let getaddr = encode_v2_contents(magic, NetworkMessage::GetAddr);
+        assert_eq!(getaddr[0], 0, "getaddr uses the long form");
+        assert_eq!(&getaddr[1..8], b"getaddr");
+        assert!(matches!(
+            decode_v2_contents(magic, &getaddr),
+            Ok(NetworkMessage::GetAddr)
+        ));
+        let verack = encode_v2_contents(magic, NetworkMessage::Verack);
+        assert_eq!(verack[0], 0, "verack uses the long form");
+        assert!(matches!(
+            decode_v2_contents(magic, &verack),
+            Ok(NetworkMessage::Verack)
+        ));
+        let unknown = encode_v2_contents(
+            magic,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static("bogus").expect("short command"),
+                payload: vec![1, 2, 3],
+            },
+        );
+        assert_eq!(unknown[0], 0, "unknown commands use the long form");
+        match decode_v2_contents(magic, &unknown) {
+            Ok(NetworkMessage::Unknown { command, payload }) => {
+                assert_eq!(command.as_ref(), "bogus");
+                assert_eq!(payload, vec![1, 2, 3]);
+            }
+            other => panic!("unknown command must round-trip, got {other:?}"),
+        }
+        assert!(matches!(
+            decode_v2_contents(magic, &[]),
+            Err(V2TransportError::MessageType)
+        ));
+        assert!(matches!(
+            decode_v2_contents(magic, &[29]),
+            Err(V2TransportError::MessageType)
+        ));
+        assert!(matches!(
+            decode_v2_contents(magic, &[0, b'x']),
+            Err(V2TransportError::MessageType)
+        ));
+        assert!(matches!(
+            decode_v2_contents(magic, &[18, 1, 2]),
+            Err(V2TransportError::Payload)
+        ));
+    }
+
+    async fn connected_transport_pair() -> (
+        V2Transport<tokio::io::DuplexStream>,
+        V2Transport<tokio::io::DuplexStream>,
+    ) {
+        let (client_end, server_end) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(V2Transport::accept_inbound(server_end, Magic::REGTEST));
+        let client = V2Transport::connect_outbound(client_end, Magic::REGTEST)
+            .await
+            .expect("outbound v2 handshake");
+        let V2Accepted::V2(server) = server
+            .await
+            .expect("server task")
+            .expect("inbound v2 handshake")
+        else {
+            panic!("the inbound side must negotiate v2");
+        };
+        (client, *server)
+    }
+
+    #[tokio::test]
+    async fn v2_transports_complete_and_exchange_messages_over_a_stream() {
+        let (mut client, mut server) = connected_transport_pair().await;
+        assert_eq!(client.session_id(), server.session_id());
+        client
+            .write_message(NetworkMessage::Ping(7))
+            .await
+            .expect("ping sends");
+        assert!(matches!(
+            server.read_message().await,
+            Ok(NetworkMessage::Ping(7))
+        ));
+        server
+            .write_decoy(b"traffic shaping")
+            .await
+            .expect("decoy sends");
+        server
+            .write_message(NetworkMessage::Pong(7))
+            .await
+            .expect("pong sends");
+        assert!(
+            matches!(client.read_message().await, Ok(NetworkMessage::Pong(7))),
+            "the decoy before the pong must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_reader_skips_decoys_within_budget_and_fails_beyond_it() {
+        let (mut client, mut server) = connected_transport_pair().await;
+        for _ in 0..MAX_CONSECUTIVE_DECOY_PACKETS {
+            server.write_decoy(b"decoy").await.expect("decoy sends");
+        }
+        server
+            .write_message(NetworkMessage::Ping(1))
+            .await
+            .expect("ping sends");
+        assert!(matches!(
+            client.read_message().await,
+            Ok(NetworkMessage::Ping(1))
+        ));
+        for _ in 0..=MAX_CONSECUTIVE_DECOY_PACKETS {
+            server.write_decoy(b"decoy").await.expect("decoy sends");
+        }
+        server
+            .write_message(NetworkMessage::Ping(2))
+            .await
+            .expect("ping sends");
+        assert!(matches!(
+            client.read_message().await,
+            Err(V2TransportError::DecoyBudget {
+                limit: MAX_CONSECUTIVE_DECOY_PACKETS,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_reader_rejects_an_oversized_announced_length() {
+        let (mut client, server) = connected_transport_pair().await;
+        let limit =
+            usize::try_from(MAX_PROTOCOL_MESSAGE_LEN).expect("u32 fits usize") + MAX_TYPE_LEN;
+        let mut server = server;
+        tokio::spawn(async move {
+            let oversized = vec![0u8; limit + 1];
+            let _ = server.write_decoy(&oversized).await;
+        });
+        assert!(matches!(
+            client.read_message().await,
+            Err(V2TransportError::Oversize { length, limit: bound })
+                if length == limit + 1 && bound == limit
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbound_reports_peer_rejection_on_a_clean_close() {
+        let (client_end, mut server_end) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let mut sink = [0u8; 4096];
+            let _ = server_end.read(&mut sink).await;
+        });
+        let result = V2Transport::connect_outbound(client_end, Magic::REGTEST).await;
+        assert!(matches!(result, Err(V2TransportError::PeerRejectedV2)));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn inbound_recognizes_v1_and_returns_the_consumed_bytes() {
+        let (mut client_end, server_end) = tokio::io::duplex(1 << 20);
+        let mut opening = Magic::BITCOIN.to_bytes().to_vec();
+        opening.extend_from_slice(b"version\0\0\0\0\0");
+        opening.extend_from_slice(b"rest of the v1 version message");
+        client_end
+            .write_all(&opening)
+            .await
+            .expect("v1 opening writes");
+        let accepted = V2Transport::accept_inbound(server_end, Magic::BITCOIN)
+            .await
+            .expect("acceptance decides");
+        let V2Accepted::V1 { consumed, .. } = accepted else {
+            panic!("a v1 opening must be recognized");
+        };
+        assert_eq!(consumed, opening);
     }
 
     #[test]
