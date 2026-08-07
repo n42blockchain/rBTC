@@ -80,8 +80,12 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   requirement, terrible-entry hygiene, retry backoff, and discouragement
   checks. Keeping the books separate means an onion flood can neither
   displace routable peers nor inherit IP-range diversity rules that do not
-  apply to it. Automatic onion-service creation through the Tor control port,
-  `onlynet` integration for onion candidates, and I2P remain open.
+  apply to it. `--onlynet onion` restricts outbound work to onion
+  destinations and fails closed without `--proxy`, because an onion-only node
+  has no other route; mixing onion with an IP family is refused rather than
+  silently widened, and eligible onion candidates are reported at selection.
+  Carrying proxied targets through the outbound scheduler, automatic
+  onion-service creation through the Tor control port, and I2P remain open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete
