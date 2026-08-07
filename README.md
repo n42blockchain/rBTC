@@ -65,6 +65,17 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   an active cooldown. Because the stored record requires at least one recorded
   violation, a manual cooldown on an otherwise clean address occupies the
   first escalation step, and removing it discards that again.
+- Outbound v3 onion destinations through the existing fail-closed SOCKS5
+  proxy. `OnionAddress` validates the base32 alphabet, the 62-character
+  length, the version byte, and the address's own SHA3-256 checksum before a
+  name can reach a proxy or a store, and it round-trips to and from the
+  service public key. The proxy request uses SOCKS5 domain addressing, so the
+  name is resolved inside the anonymity network and this host performs no DNS
+  lookup for it; the local `version` then advertises an unspecified receiver
+  address rather than a routable socket. BIP324 preference and the one-shot
+  v1 retry apply unchanged. Onion address-book persistence, `onlynet`
+  integration, and automatic onion-service creation through the Tor control
+  port remain open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

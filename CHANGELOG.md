@@ -28,6 +28,7 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Authenticated `rbtc.scanchainstate` cursor-paged bounded UTXO-set scan.
 - Authenticated `listbanned` and `setban` administering durable local peer
   cooldowns.
+- Validated v3 onion outbound destinations over SOCKS5 domain addressing.
 
 ### Safety
 

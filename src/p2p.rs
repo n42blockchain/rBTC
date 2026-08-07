@@ -314,6 +314,9 @@ pub enum P2pError {
         /// Maximum standard transaction weight in weight units.
         limit: u64,
     },
+    /// An onion destination failed v3 structural or checksum validation.
+    #[error("onion address is not a valid v3 service")]
+    InvalidOnionAddress,
     /// The BIP324 v2 encrypted transport rejected the session.
     #[error("v2 transport: {0}")]
     V2Transport(#[from] V2TransportError),
@@ -328,6 +331,7 @@ impl P2pError {
     pub const fn is_protocol_violation(&self) -> bool {
         match self {
             Self::Io(_)
+            | Self::InvalidOnionAddress
             | Self::Message(EncodeError::Io(_))
             | Self::HandshakeIncomplete
             | Self::HeadersResponseIncomplete
@@ -370,6 +374,207 @@ impl P2pError {
             | Self::WrongBlockTransactionCount { .. } => true,
             Self::V2Transport(error) => error.is_protocol_violation(),
         }
+    }
+}
+
+/// Length of a v3 onion service name including the `.onion` suffix.
+const ONION_V3_NAME_LEN: usize = 62;
+/// Length of the decoded v3 onion address: 32-byte key, 2-byte checksum, version.
+const ONION_V3_DECODED_LEN: usize = 35;
+/// Version byte every v3 onion address ends with.
+const ONION_V3_VERSION: u8 = 3;
+
+/// A v3 onion service reachable only through a SOCKS5 proxy.
+///
+/// The name is validated on construction — base32 alphabet, exact length,
+/// version byte, and the address's own SHA3-256 checksum — so a malformed or
+/// truncated name can never reach the proxy or a peer store.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OnionAddress {
+    name: String,
+    port: u16,
+}
+
+impl OnionAddress {
+    /// Parses a `<56-char-base32>.onion:PORT` destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not a checksum-valid v3 onion
+    /// address or the port is absent, zero, or unparsable.
+    pub fn parse(value: &str) -> Result<Self, P2pError> {
+        let (name, port) = value
+            .rsplit_once(':')
+            .ok_or(P2pError::InvalidOnionAddress)?;
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or(P2pError::InvalidOnionAddress)?;
+        Self::new(name, port)
+    }
+
+    /// Validates a v3 onion service name and pairs it with a port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name fails any v3 structural or checksum
+    /// rule, or when the port is zero.
+    pub fn new(name: &str, port: u16) -> Result<Self, P2pError> {
+        if port == 0 || name.len() != ONION_V3_NAME_LEN {
+            return Err(P2pError::InvalidOnionAddress);
+        }
+        let name = name.to_ascii_lowercase();
+        let Some(encoded) = name.strip_suffix(".onion") else {
+            return Err(P2pError::InvalidOnionAddress);
+        };
+        let decoded = decode_base32(encoded).ok_or(P2pError::InvalidOnionAddress)?;
+        if decoded.len() != ONION_V3_DECODED_LEN || decoded[34] != ONION_V3_VERSION {
+            return Err(P2pError::InvalidOnionAddress);
+        }
+        if decoded[32..34] != onion_v3_checksum(&decoded[..32]) {
+            return Err(P2pError::InvalidOnionAddress);
+        }
+        Ok(Self { name, port })
+    }
+
+    /// Builds the address of a v3 onion service from its public key.
+    #[must_use]
+    pub fn from_public_key(public_key: [u8; 32], port: u16) -> Self {
+        let mut decoded = Vec::with_capacity(ONION_V3_DECODED_LEN);
+        decoded.extend_from_slice(&public_key);
+        decoded.extend_from_slice(&onion_v3_checksum(&public_key));
+        decoded.push(ONION_V3_VERSION);
+        Self {
+            name: format!("{}.onion", encode_base32(&decoded)),
+            port,
+        }
+    }
+
+    /// Returns the validated `<name>.onion` service name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the destination port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Returns the 32-byte service public key.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; 32] {
+        let decoded = decode_base32(
+            self.name
+                .strip_suffix(".onion")
+                .expect("a validated onion name keeps its suffix"),
+        )
+        .expect("a validated onion name decodes");
+        decoded[..32]
+            .try_into()
+            .expect("a validated onion address carries 32 key bytes")
+    }
+}
+
+impl std::fmt::Display for OnionAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.name, self.port)
+    }
+}
+
+/// Computes a v3 onion address checksum over its public key.
+fn onion_v3_checksum(public_key: &[u8]) -> [u8; 2] {
+    use sha3::Digest;
+    let mut hasher = sha3::Sha3_256::default();
+    hasher.update(b".onion checksum");
+    hasher.update(public_key);
+    hasher.update([ONION_V3_VERSION]);
+    let digest = hasher.finalize();
+    [digest[0], digest[1]]
+}
+
+/// Decodes lowercase RFC 4648 base32 without padding.
+fn decode_base32(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 5 / 8);
+    let mut accumulator: u16 = 0;
+    let mut bits = 0_u32;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'a'..=b'z' => byte - b'a',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        };
+        accumulator = (accumulator << 5) | u16::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(u8::try_from((accumulator >> bits) & 0xff).expect("masked to one byte"));
+        }
+    }
+    // Trailing bits must be zero padding, never discarded data.
+    if bits >= 5 || accumulator & ((1 << bits) - 1) != 0 {
+        return None;
+    }
+    Some(output)
+}
+
+/// Encodes bytes as lowercase RFC 4648 base32 without padding.
+fn encode_base32(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut output = String::with_capacity(input.len().div_ceil(5) * 8);
+    let mut accumulator: u16 = 0;
+    let mut bits = 0_u32;
+    for byte in input {
+        accumulator = (accumulator << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let index = usize::from((accumulator >> bits) & 0x1f);
+            output.push(char::from(ALPHABET[index]));
+        }
+    }
+    if bits > 0 {
+        let index = usize::from((accumulator << (5 - bits)) & 0x1f);
+        output.push(char::from(ALPHABET[index]));
+    }
+    output
+}
+
+/// One proxied destination: a routable socket or an onion service name.
+///
+/// An onion destination is sent to the proxy as a SOCKS5 domain name, so the
+/// proxy resolves it inside the anonymity network and the local host performs
+/// no DNS lookup for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProxyTarget {
+    /// A routable IPv4 or IPv6 destination encoded as an IP literal.
+    Socket(SocketAddr),
+    /// A v3 onion service encoded as a SOCKS5 domain name.
+    Onion(OnionAddress),
+}
+
+impl ProxyTarget {
+    /// Returns the destination port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        match self {
+            Self::Socket(socket) => socket.port(),
+            Self::Onion(onion) => onion.port(),
+        }
+    }
+}
+
+impl From<SocketAddr> for ProxyTarget {
+    fn from(socket: SocketAddr) -> Self {
+        Self::Socket(socket)
+    }
+}
+
+impl From<OnionAddress> for ProxyTarget {
+    fn from(onion: OnionAddress) -> Self {
+        Self::Onion(onion)
     }
 }
 
@@ -2450,12 +2655,46 @@ pub async fn connect_outbound_via_socks5_with_transport(
     start_height: i32,
     prefer_v2: bool,
 ) -> Result<PeerSession<TcpStream>, P2pError> {
+    connect_proxied_target(
+        proxy,
+        &ProxyTarget::Socket(remote),
+        magic,
+        nonce,
+        user_agent,
+        start_height,
+        prefer_v2,
+    )
+    .await
+}
+
+/// Opens an outbound connection to one proxied destination, which may be a
+/// v3 onion service.
+///
+/// An onion destination is sent to the proxy as a SOCKS5 domain name, so the
+/// name is resolved inside the anonymity network and this host performs no
+/// DNS lookup for it. The `version` message then advertises an unspecified
+/// receiver address, because a routable socket would defeat the
+/// destination's anonymity.
+///
+/// # Errors
+///
+/// Returns proxy, I/O, transport, or negotiation errors.
+pub async fn connect_proxied_target(
+    proxy: SocketAddr,
+    remote: &ProxyTarget,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+    prefer_v2: bool,
+) -> Result<PeerSession<TcpStream>, P2pError> {
     validate_user_agent(&user_agent)?;
+    let advertised = proxy_version_address(remote);
     if prefer_v2 {
         let stream = open_socks5_stream(proxy, remote).await?;
         if let Some(session) = try_outbound_v2(
             stream,
-            remote,
+            advertised,
             magic,
             nonce,
             user_agent.clone(),
@@ -2467,12 +2706,30 @@ pub async fn connect_outbound_via_socks5_with_transport(
         }
     }
     let stream = open_socks5_stream(proxy, remote).await?;
-    complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+    complete_outbound_handshake(stream, advertised, magic, nonce, user_agent, start_height).await
+}
+
+/// Returns the destination address placed in the local `version` message.
+///
+/// An onion service has no routable socket, so its `version` receiver field
+/// carries an unspecified address with the service port. Peers do not use
+/// this field for routing.
+fn proxy_version_address(remote: &ProxyTarget) -> SocketAddr {
+    match remote {
+        ProxyTarget::Socket(socket) => *socket,
+        ProxyTarget::Onion(onion) => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), onion.port())
+        }
+    }
 }
 
 /// Establishes one TCP stream to `remote` through a no-authentication SOCKS5
-/// proxy, encoding the destination as an IP literal.
-async fn open_socks5_stream(proxy: SocketAddr, remote: SocketAddr) -> Result<TcpStream, P2pError> {
+/// proxy, encoding a routable destination as an IP literal and an onion
+/// service as a domain name.
+async fn open_socks5_stream(
+    proxy: SocketAddr,
+    remote: &ProxyTarget,
+) -> Result<TcpStream, P2pError> {
     let mut stream = TcpStream::connect(proxy).await?;
     stream.write_all(&[5, 1, 0]).await?;
     let mut greeting = [0_u8; 2];
@@ -2483,17 +2740,26 @@ async fn open_socks5_stream(proxy: SocketAddr, remote: SocketAddr) -> Result<Tcp
             "SOCKS5 proxy rejected no-authentication method",
         )));
     }
-    let mut request = Vec::with_capacity(22);
+    let mut request = Vec::with_capacity(22 + ONION_V3_NAME_LEN);
     request.extend_from_slice(&[5, 1, 0]);
-    match remote.ip() {
-        IpAddr::V4(ip) => {
-            request.push(1);
-            request.extend_from_slice(&ip.octets());
+    match remote {
+        ProxyTarget::Onion(onion) => {
+            request.push(3);
+            request.push(
+                u8::try_from(onion.name().len()).expect("a validated onion name is 62 bytes"),
+            );
+            request.extend_from_slice(onion.name().as_bytes());
         }
-        IpAddr::V6(ip) => {
-            request.push(4);
-            request.extend_from_slice(&ip.octets());
-        }
+        ProxyTarget::Socket(socket) => match socket.ip() {
+            IpAddr::V4(ip) => {
+                request.push(1);
+                request.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                request.push(4);
+                request.extend_from_slice(&ip.octets());
+            }
+        },
     }
     request.extend_from_slice(&remote.port().to_be_bytes());
     stream.write_all(&request).await?;
@@ -5386,6 +5652,101 @@ mod tests {
         drop(client);
         target_server.await.unwrap();
         proxy_server.await.unwrap();
+    }
+
+    #[test]
+    fn onion_addresses_round_trip_and_reject_malformed_names() {
+        // Torproject's published v3 service, a real checksum-valid address.
+        let known = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
+        let address = OnionAddress::parse(&format!("{known}:8333")).expect("valid v3 address");
+        assert_eq!(address.name(), known);
+        assert_eq!(address.port(), 8333);
+        assert_eq!(address.to_string(), format!("{known}:8333"));
+        assert_eq!(
+            OnionAddress::from_public_key(address.public_key(), 8333),
+            address,
+            "an address rebuilt from its key is identical"
+        );
+        assert_eq!(
+            OnionAddress::new(&known.to_ascii_uppercase(), 8333).expect("case is normalized"),
+            address
+        );
+
+        let mut wrong_checksum = known.as_bytes().to_vec();
+        wrong_checksum[54] = if wrong_checksum[54] == b'a' {
+            b'b'
+        } else {
+            b'a'
+        };
+        let wrong_checksum = String::from_utf8(wrong_checksum).expect("ascii");
+        for invalid in [
+            wrong_checksum.as_str(),
+            "short.onion",
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.example",
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53w1d.onion",
+        ] {
+            assert!(
+                matches!(
+                    OnionAddress::new(invalid, 8333),
+                    Err(P2pError::InvalidOnionAddress)
+                ),
+                "{invalid} must be refused"
+            );
+        }
+        assert!(matches!(
+            OnionAddress::new(known, 0),
+            Err(P2pError::InvalidOnionAddress)
+        ));
+        assert!(
+            matches!(
+                OnionAddress::parse(known),
+                Err(P2pError::InvalidOnionAddress)
+            ),
+            "a destination without a port is refused"
+        );
+        assert!(
+            !P2pError::InvalidOnionAddress.is_protocol_violation(),
+            "a local address mistake never discourages a peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn socks5_sends_an_onion_destination_as_a_domain_name() {
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[..3], [5, 1, 0]);
+            assert_eq!(header[3], 3, "an onion destination uses the domain form");
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut name = vec![0_u8; usize::from(length[0])];
+            stream.read_exact(&mut name).await.unwrap();
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            (String::from_utf8(name).unwrap(), u16::from_be_bytes(port))
+        });
+        let onion = OnionAddress::parse(
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:8333",
+        )
+        .expect("valid v3 address");
+        let stream = open_socks5_stream(proxy_address, &onion.clone().into())
+            .await
+            .expect("the proxy accepts the onion destination");
+        drop(stream);
+        let (name, port) = proxy.await.unwrap();
+        assert_eq!(name, onion.name());
+        assert_eq!(port, 8333);
     }
 
     #[tokio::test]
