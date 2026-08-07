@@ -2142,7 +2142,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Headers(headers) if headers.is_empty()
         ));
 
@@ -2154,7 +2154,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Inv(inventory) if inventory.is_empty()
         ));
 
@@ -2163,7 +2163,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Inv(inventory)
                 if inventory == vec![Inventory::WTx(relayed.compute_wtxid())]
         ));
@@ -2177,11 +2177,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Tx(actual) if actual == relayed
         ));
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::NotFound(inventory) if inventory == vec![missing]
         ));
 
@@ -2190,7 +2190,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CmpctBlock(_)
         ));
         transport
@@ -2203,7 +2203,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::BlockTxn(response)
                 if response.transactions.block_hash == hash
                     && response.transactions.transactions.len() == 1
@@ -2218,7 +2218,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFilter(filter)
                 if filter.block_hash == hash && filter.filter == vec![0]
         ));
@@ -2231,7 +2231,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFHeaders(headers)
                 if headers.stop_hash == hash
                     && headers.previous_filter_header == FilterHeader::all_zeros()
@@ -2245,7 +2245,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFCheckpt(checkpoint)
                 if checkpoint.stop_hash == hash && checkpoint.filter_headers.is_empty()
         ));

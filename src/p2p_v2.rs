@@ -466,6 +466,31 @@ impl V2Handshake {
         })
     }
 
+    /// Deterministic responder constructor for fuzzing and reproducible
+    /// harnesses only: the caller supplies the secret material, so sessions
+    /// built this way must never carry real traffic.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn responder_with_secret(
+        magic: Magic,
+        garbage: Vec<u8>,
+        secret: [u8; 32],
+        aux_rand: [u8; 32],
+    ) -> Option<Self> {
+        Self::validate_garbage(&garbage).ok()?;
+        let secret = SecretKey::from_slice(&secret).ok()?;
+        let our_ellswift = ElligatorSwift::from_seckey(secp_context(), secret, Some(aux_rand));
+        Some(Self {
+            role: Role::Responder,
+            magic,
+            secret,
+            our_ellswift,
+            our_garbage: garbage,
+            buffer: Vec::new(),
+            state: HandshakeState::AwaitingKey,
+        })
+    }
+
     fn validate_garbage(garbage: &[u8]) -> Result<(), V2HandshakeError> {
         if garbage.len() > MAX_GARBAGE_LEN {
             return Err(V2HandshakeError::OversizedGarbage {
@@ -719,6 +744,29 @@ pub enum V2TransportError {
     },
 }
 
+impl V2TransportError {
+    /// Returns whether the error proves the remote peer violated the v2
+    /// protocol, mirroring [`crate::p2p::P2pError::is_protocol_violation`].
+    ///
+    /// I/O failures, a pre-handshake close, and local misuse are deliberately
+    /// not classified as peer misbehavior.
+    #[must_use]
+    pub const fn is_protocol_violation(&self) -> bool {
+        match self {
+            Self::Io(_) | Self::PeerRejectedV2 => false,
+            Self::Handshake(error) => !matches!(
+                error,
+                V2HandshakeError::KeyGeneration { .. } | V2HandshakeError::Finished
+            ),
+            Self::Crypto(_)
+            | Self::MessageType
+            | Self::Oversize { .. }
+            | Self::Payload
+            | Self::DecoyBudget { .. } => true,
+        }
+    }
+}
+
 /// Result of accepting one inbound connection on a v2-capable listener.
 pub enum V2Accepted<S> {
     /// The peer completed the v2 handshake.
@@ -862,6 +910,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V2Transport<S> {
     /// Returns I/O, authentication, size, decoy-budget, or decode errors;
     /// every error is terminal for the connection.
     pub async fn read_message(&mut self) -> Result<NetworkMessage, V2TransportError> {
+        self.read_message_with_payload_len()
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Reads one application message together with its consensus payload
+    /// length, skipping bounded decoy packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, authentication, size, decoy-budget, or decode errors;
+    /// every error is terminal for the connection.
+    pub async fn read_message_with_payload_len(
+        &mut self,
+    ) -> Result<(NetworkMessage, usize), V2TransportError> {
         for _ in 0..=MAX_CONSECUTIVE_DECOY_PACKETS {
             let mut length_bytes = [0u8; LENGTH_FIELD_LEN];
             self.read_exact_buffered(&mut length_bytes).await?;
@@ -877,7 +940,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V2Transport<S> {
             if ignore {
                 continue;
             }
-            return decode_v2_contents(self.magic, &contents);
+            let type_len = if contents.first() == Some(&0) {
+                MAX_TYPE_LEN
+            } else {
+                1
+            };
+            let payload_len = contents.len().saturating_sub(type_len);
+            return decode_v2_contents(self.magic, &contents).map(|message| (message, payload_len));
         }
         Err(V2TransportError::DecoyBudget {
             limit: MAX_CONSECUTIVE_DECOY_PACKETS,
@@ -960,7 +1029,15 @@ fn encode_v2_contents(magic: Magic, message: NetworkMessage) -> Vec<u8> {
 /// the equivalent v1 envelope, so payload parsing, unknown-command handling,
 /// and the repository's v1 decoding tolerances stay identical across
 /// transports.
-fn decode_v2_contents(magic: Magic, contents: &[u8]) -> Result<NetworkMessage, V2TransportError> {
+///
+/// # Errors
+///
+/// Returns a message-type error for an empty, unknown, or truncated type
+/// encoding, and a payload error when consensus decoding rejects the bytes.
+pub fn decode_v2_contents(
+    magic: Magic,
+    contents: &[u8],
+) -> Result<NetworkMessage, V2TransportError> {
     let (command, payload) = match contents.split_first() {
         None => return Err(V2TransportError::MessageType),
         Some((0, rest)) => {

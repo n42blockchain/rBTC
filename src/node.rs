@@ -127,8 +127,8 @@ use rbtc::{
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
         MAX_PENDING_TRANSACTION_INVENTORY, MAX_PENDING_TRANSACTIONS, MAX_PROTOCOL_MESSAGE_LEN,
-        MempoolRelaySource, P2pError, PeerSession, TransactionRelay, connect_outbound,
-        connect_outbound_via_socks5,
+        MempoolRelaySource, P2pError, PeerSession, TransactionRelay,
+        connect_outbound_via_socks5_with_transport, connect_outbound_with_transport,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rbtc_info, rbtc_warn,
@@ -725,6 +725,10 @@ pub struct NodeResourceConfig {
     pub only_net: NodeOnlyNet,
     /// Optional no-authentication SOCKS5 proxy for every outbound peer socket.
     pub proxy: Option<SocketAddr>,
+    /// Prefer the BIP324 v2 encrypted transport on outbound connections,
+    /// retrying each address once over v1 when the peer closes the v2
+    /// handshake attempt.
+    pub v2_transport: bool,
 }
 
 /// Outbound peer address-family restriction.
@@ -759,6 +763,7 @@ impl Default for NodeResourceConfig {
             mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            v2_transport: false,
         }
     }
 }
@@ -6567,7 +6572,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -6580,6 +6585,7 @@ fn startup_configuration_summary(options: &Options) -> String {
             .resources
             .proxy
             .map_or_else(|| "direct".to_owned(), |proxy| proxy.to_string()),
+        options.resources.v2_transport,
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
@@ -7987,6 +7993,7 @@ impl PendingPeer {
     }
 }
 
+#[cfg(test)]
 async fn connect_peer(
     deployments: DeploymentConfig,
     remote: SocketAddr,
@@ -7995,27 +8002,50 @@ async fn connect_peer(
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
+    connect_peer_with_transport(
+        deployments,
+        remote,
+        proxy,
+        local_nonce,
+        require_full_services,
+        peer_store,
+        false,
+    )
+    .await
+}
+
+async fn connect_peer_with_transport(
+    deployments: DeploymentConfig,
+    remote: SocketAddr,
+    proxy: Option<SocketAddr>,
+    local_nonce: u64,
+    require_full_services: bool,
+    peer_store: Option<Arc<RedbPeerStore>>,
+    prefer_v2: bool,
+) -> Result<ConnectedPeer, PeerRunError> {
     let handshake_started = Instant::now();
     let mut session = timeout(PEER_TIMEOUT, async {
         match proxy {
             Some(proxy) => {
-                connect_outbound_via_socks5(
+                connect_outbound_via_socks5_with_transport(
                     proxy,
                     remote,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
                     0,
+                    prefer_v2,
                 )
                 .await
             }
             None => {
-                connect_outbound(
+                connect_outbound_with_transport(
                     remote,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
                     0,
+                    prefer_v2,
                 )
                 .await
             }
@@ -8219,6 +8249,7 @@ async fn connect_and_maintain_standby(
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
+    prefer_v2: bool,
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
     transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
@@ -8228,13 +8259,14 @@ async fn connect_and_maintain_standby(
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
-    let mut connected = connect_peer(
+    let mut connected = connect_peer_with_transport(
         deployments,
         remote,
         proxy,
         local_nonce,
         require_full_services,
         peer_store,
+        prefer_v2,
     )
     .await?;
     let local_time = unix_time().map_err(PeerRunError::transient)?;
@@ -8353,6 +8385,7 @@ fn spawn_peer_connections(
                 local_nonce,
                 require_full_services,
                 peer_store,
+                options.resources.v2_transport,
                 ready_sender,
                 activate_receiver,
                 transaction_relay,
@@ -13694,6 +13727,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = true;
+    let mut v2_transport = false;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -13969,6 +14003,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             }
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--no-mempool-full-rbf" => mempool_full_rbf = false,
+            "--v2-transport" => v2_transport = true,
+            "--no-v2-transport" => v2_transport = false,
             "--txindex" => transaction_index = true,
             "--no-txindex" => transaction_index = false,
             "--spent-output-index" => spent_output_index = true,
@@ -15636,6 +15672,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 _ => unreachable!("only two deduplicated address families exist"),
             },
             proxy: outbound_proxy,
+            v2_transport,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -15730,7 +15767,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -15788,7 +15825,7 @@ mod tests {
         chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
-        p2p::{PeerAddress, V1Transport},
+        p2p::{PeerAddress, V1Transport, connect_outbound},
         snapshot::export_snapshot,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
         wallet::DEFAULT_WALLET_GAP_LIMIT,
@@ -16863,6 +16900,7 @@ mod tests {
             210,
             true,
             None,
+            false,
             ready_sender,
             activation,
             None,
@@ -18856,6 +18894,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
 
@@ -19068,6 +19107,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -19112,6 +19152,7 @@ mod tests {
             mempool_max_bytes: 300 * 1024 * 1024,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            v2_transport: false,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -19159,6 +19200,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -19249,6 +19291,7 @@ mod tests {
                 mempool_max_bytes: 64 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()

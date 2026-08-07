@@ -34,6 +34,8 @@ use tokio::{
     net::TcpStream,
 };
 
+use crate::p2p_v2::{V2Transport, V2TransportError};
+
 /// Bitcoin Core 26's maximum accepted v1 P2P payload size (4,000,000 bytes).
 pub const MAX_PROTOCOL_MESSAGE_LEN: u32 = 4_000_000;
 const V1_HEADER_LEN: usize = 24;
@@ -312,6 +314,9 @@ pub enum P2pError {
         /// Maximum standard transaction weight in weight units.
         limit: u64,
     },
+    /// The BIP324 v2 encrypted transport rejected the session.
+    #[error("v2 transport: {0}")]
+    V2Transport(#[from] V2TransportError),
 }
 
 impl P2pError {
@@ -363,6 +368,7 @@ impl P2pError {
             | Self::MalformedCompactBlock { .. }
             | Self::UnexpectedBlockTransactions(_)
             | Self::WrongBlockTransactionCount { .. } => true,
+            Self::V2Transport(error) => error.is_protocol_violation(),
         }
     }
 }
@@ -604,7 +610,7 @@ impl CompactBlockReconstruction {
 /// The session owns its transport, so messages left after handshake remain in
 /// order for header and block synchronisation.
 pub struct PeerSession<S> {
-    transport: V1Transport<S>,
+    transport: PeerTransport<S>,
     local_id: u64,
     remote_version: VersionMessage,
     wtxid_relay: bool,
@@ -674,8 +680,8 @@ pub struct TransactionRequestOutcome {
 }
 
 impl<S> PeerSession<S> {
-    fn new(transport: V1Transport<S>, remote_version: VersionMessage) -> Self {
-        let wtxid_relay = transport.peer_wtxid_relay;
+    fn new(transport: PeerTransport<S>, remote_version: VersionMessage) -> Self {
+        let wtxid_relay = transport.peer_wtxid_relay();
         Self {
             transport,
             local_id: next_session_id(),
@@ -710,7 +716,7 @@ impl<S> PeerSession<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_test_transport(self) -> V1Transport<S> {
+    pub(crate) fn into_test_transport(self) -> PeerTransport<S> {
         self.transport
     }
 
@@ -765,7 +771,7 @@ impl<S> PeerSession<S> {
 
     /// Returns the underlying framed transport.
     #[must_use]
-    pub fn into_transport(self) -> V1Transport<S> {
+    pub fn into_transport(self) -> PeerTransport<S> {
         self.transport
     }
 
@@ -880,64 +886,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
     /// Returns an error for malformed transport frames, an invalid handshake
     /// ordering, or a peer that does not finish negotiation promptly.
     pub async fn handshake(&mut self, local: VersionMessage) -> Result<VersionMessage, P2pError> {
-        let local_protocol_version = local.version;
-        self.write_message(NetworkMessage::Version(local)).await?;
-
-        let mut remote_version = None;
-        let mut received_verack = false;
-        for _ in 0..MAX_HANDSHAKE_MESSAGES {
-            match self.read_message().await?.into_payload() {
-                NetworkMessage::Version(version) => {
-                    if version.version < MIN_PEER_PROTOCOL_VERSION {
-                        return Err(P2pError::ObsoleteVersion {
-                            actual: version.version,
-                            minimum: MIN_PEER_PROTOCOL_VERSION,
-                        });
-                    }
-                    validate_user_agent(&version.user_agent)?;
-                    let common_version = local_protocol_version.min(version.version);
-                    if remote_version.replace(version).is_some() {
-                        return Err(P2pError::DuplicateVersion);
-                    }
-                    if common_version >= ADDRESS_RELAY_VERSION {
-                        self.write_message(NetworkMessage::WtxidRelay).await?;
-                        self.write_message(NetworkMessage::SendAddrV2).await?;
-                    }
-                    self.write_message(NetworkMessage::Verack).await?;
-                }
-                NetworkMessage::Verack => {
-                    if remote_version.is_none() {
-                        return Err(P2pError::VerackBeforeVersion);
-                    }
-                    received_verack = true;
-                }
-                NetworkMessage::WtxidRelay
-                    if remote_version
-                        .as_ref()
-                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
-                {
-                    self.peer_wtxid_relay = true;
-                }
-                NetworkMessage::SendAddrV2
-                    if remote_version
-                        .as_ref()
-                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
-                {
-                    self.peer_addrv2 = true;
-                }
-                NetworkMessage::Ping(nonce) => {
-                    self.write_message(NetworkMessage::Pong(nonce)).await?;
-                }
-                _ => {}
-            }
-
-            if received_verack {
-                if let Some(version) = remote_version {
-                    return Ok(version);
-                }
-            }
-        }
-        Err(P2pError::HandshakeIncomplete)
+        negotiate_version_outbound(self, local).await
     }
 
     /// Performs the accepting side of the bounded v1 `version`/`verack`
@@ -956,68 +905,328 @@ impl<S: AsyncRead + AsyncWrite + Unpin> V1Transport<S> {
         &mut self,
         local: VersionMessage,
     ) -> Result<VersionMessage, P2pError> {
-        validate_user_agent(&local.user_agent)?;
-        let local_protocol_version = local.version;
-        let local_nonce = local.nonce;
-        let mut remote_version = None;
-        let mut received_verack = false;
-        for _ in 0..MAX_HANDSHAKE_MESSAGES {
-            match self.read_message().await?.into_payload() {
-                NetworkMessage::Version(version) => {
-                    if version.version < MIN_PEER_PROTOCOL_VERSION {
-                        return Err(P2pError::ObsoleteVersion {
-                            actual: version.version,
-                            minimum: MIN_PEER_PROTOCOL_VERSION,
-                        });
-                    }
-                    validate_user_agent(&version.user_agent)?;
-                    if version.nonce == local_nonce {
-                        return Err(P2pError::SelfConnection);
-                    }
-                    let common_version = local_protocol_version.min(version.version);
-                    if remote_version.replace(version).is_some() {
-                        return Err(P2pError::DuplicateVersion);
-                    }
-                    self.write_message(NetworkMessage::Version(local.clone()))
+        negotiate_version_inbound(self, local).await
+    }
+}
+
+/// One negotiated peer channel: reads and writes application messages and
+/// records the peer's in-band feature announcements. Implemented by both the
+/// v1 and v2 transports so `version`/`verack` negotiation exists once.
+trait MessageChannel {
+    async fn read_app_message(&mut self) -> Result<NetworkMessage, P2pError>;
+    async fn write_app_message(&mut self, message: NetworkMessage) -> Result<(), P2pError>;
+    fn note_peer_wtxid_relay(&mut self);
+    fn note_peer_addrv2(&mut self);
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> MessageChannel for V1Transport<S> {
+    async fn read_app_message(&mut self) -> Result<NetworkMessage, P2pError> {
+        Ok(self.read_message().await?.into_payload())
+    }
+
+    async fn write_app_message(&mut self, message: NetworkMessage) -> Result<(), P2pError> {
+        self.write_message(message).await
+    }
+
+    fn note_peer_wtxid_relay(&mut self) {
+        self.peer_wtxid_relay = true;
+    }
+
+    fn note_peer_addrv2(&mut self) {
+        self.peer_addrv2 = true;
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> MessageChannel for PeerTransport<S> {
+    async fn read_app_message(&mut self) -> Result<NetworkMessage, P2pError> {
+        self.read_message().await
+    }
+
+    async fn write_app_message(&mut self, message: NetworkMessage) -> Result<(), P2pError> {
+        self.write_message(message).await
+    }
+
+    fn note_peer_wtxid_relay(&mut self) {
+        match self {
+            Self::V1(transport) => transport.peer_wtxid_relay = true,
+            Self::V2 {
+                peer_wtxid_relay, ..
+            } => *peer_wtxid_relay = true,
+        }
+    }
+
+    fn note_peer_addrv2(&mut self) {
+        match self {
+            Self::V1(transport) => transport.peer_addrv2 = true,
+            Self::V2 { peer_addrv2, .. } => *peer_addrv2 = true,
+        }
+    }
+}
+
+/// Performs the initiating side of the bounded `version`/`verack` handshake
+/// over an established channel; see [`V1Transport::handshake`] for the
+/// contract.
+async fn negotiate_version_outbound<C: MessageChannel>(
+    channel: &mut C,
+    local: VersionMessage,
+) -> Result<VersionMessage, P2pError> {
+    let local_protocol_version = local.version;
+    channel
+        .write_app_message(NetworkMessage::Version(local))
+        .await?;
+
+    let mut remote_version = None;
+    let mut received_verack = false;
+    for _ in 0..MAX_HANDSHAKE_MESSAGES {
+        match channel.read_app_message().await? {
+            NetworkMessage::Version(version) => {
+                if version.version < MIN_PEER_PROTOCOL_VERSION {
+                    return Err(P2pError::ObsoleteVersion {
+                        actual: version.version,
+                        minimum: MIN_PEER_PROTOCOL_VERSION,
+                    });
+                }
+                validate_user_agent(&version.user_agent)?;
+                let common_version = local_protocol_version.min(version.version);
+                if remote_version.replace(version).is_some() {
+                    return Err(P2pError::DuplicateVersion);
+                }
+                if common_version >= ADDRESS_RELAY_VERSION {
+                    channel
+                        .write_app_message(NetworkMessage::WtxidRelay)
                         .await?;
-                    if common_version >= ADDRESS_RELAY_VERSION {
-                        self.write_message(NetworkMessage::WtxidRelay).await?;
-                        self.write_message(NetworkMessage::SendAddrV2).await?;
-                    }
-                    self.write_message(NetworkMessage::Verack).await?;
+                    channel
+                        .write_app_message(NetworkMessage::SendAddrV2)
+                        .await?;
                 }
-                NetworkMessage::Verack => {
-                    if remote_version.is_none() {
-                        return Err(P2pError::VerackBeforeVersion);
-                    }
-                    received_verack = true;
-                }
-                NetworkMessage::WtxidRelay
-                    if remote_version
-                        .as_ref()
-                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
-                {
-                    self.peer_wtxid_relay = true;
-                }
-                NetworkMessage::SendAddrV2
-                    if remote_version
-                        .as_ref()
-                        .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
-                {
-                    self.peer_addrv2 = true;
-                }
-                NetworkMessage::Ping(nonce) => {
-                    self.write_message(NetworkMessage::Pong(nonce)).await?;
-                }
-                _ => {}
+                channel.write_app_message(NetworkMessage::Verack).await?;
             }
-            if received_verack {
-                if let Some(version) = remote_version {
-                    return Ok(version);
+            NetworkMessage::Verack => {
+                if remote_version.is_none() {
+                    return Err(P2pError::VerackBeforeVersion);
                 }
+                received_verack = true;
+            }
+            NetworkMessage::WtxidRelay
+                if remote_version
+                    .as_ref()
+                    .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+            {
+                channel.note_peer_wtxid_relay();
+            }
+            NetworkMessage::SendAddrV2
+                if remote_version
+                    .as_ref()
+                    .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+            {
+                channel.note_peer_addrv2();
+            }
+            NetworkMessage::Ping(nonce) => {
+                channel
+                    .write_app_message(NetworkMessage::Pong(nonce))
+                    .await?;
+            }
+            _ => {}
+        }
+
+        if received_verack {
+            if let Some(version) = remote_version {
+                return Ok(version);
             }
         }
-        Err(P2pError::HandshakeIncomplete)
+    }
+    Err(P2pError::HandshakeIncomplete)
+}
+
+/// Performs the accepting side of the bounded `version`/`verack` handshake
+/// over an established channel; see [`V1Transport::handshake_inbound`] for
+/// the contract.
+async fn negotiate_version_inbound<C: MessageChannel>(
+    channel: &mut C,
+    local: VersionMessage,
+) -> Result<VersionMessage, P2pError> {
+    validate_user_agent(&local.user_agent)?;
+    let local_protocol_version = local.version;
+    let local_nonce = local.nonce;
+    let mut remote_version = None;
+    let mut received_verack = false;
+    for _ in 0..MAX_HANDSHAKE_MESSAGES {
+        match channel.read_app_message().await? {
+            NetworkMessage::Version(version) => {
+                if version.version < MIN_PEER_PROTOCOL_VERSION {
+                    return Err(P2pError::ObsoleteVersion {
+                        actual: version.version,
+                        minimum: MIN_PEER_PROTOCOL_VERSION,
+                    });
+                }
+                validate_user_agent(&version.user_agent)?;
+                if version.nonce == local_nonce {
+                    return Err(P2pError::SelfConnection);
+                }
+                let common_version = local_protocol_version.min(version.version);
+                if remote_version.replace(version).is_some() {
+                    return Err(P2pError::DuplicateVersion);
+                }
+                channel
+                    .write_app_message(NetworkMessage::Version(local.clone()))
+                    .await?;
+                if common_version >= ADDRESS_RELAY_VERSION {
+                    channel
+                        .write_app_message(NetworkMessage::WtxidRelay)
+                        .await?;
+                    channel
+                        .write_app_message(NetworkMessage::SendAddrV2)
+                        .await?;
+                }
+                channel.write_app_message(NetworkMessage::Verack).await?;
+            }
+            NetworkMessage::Verack => {
+                if remote_version.is_none() {
+                    return Err(P2pError::VerackBeforeVersion);
+                }
+                received_verack = true;
+            }
+            NetworkMessage::WtxidRelay
+                if remote_version
+                    .as_ref()
+                    .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+            {
+                channel.note_peer_wtxid_relay();
+            }
+            NetworkMessage::SendAddrV2
+                if remote_version
+                    .as_ref()
+                    .is_some_and(|version| version.version >= ADDRESS_RELAY_VERSION) =>
+            {
+                channel.note_peer_addrv2();
+            }
+            NetworkMessage::Ping(nonce) => {
+                channel
+                    .write_app_message(NetworkMessage::Pong(nonce))
+                    .await?;
+            }
+            _ => {}
+        }
+        if received_verack {
+            if let Some(version) = remote_version {
+                return Ok(version);
+            }
+        }
+    }
+    Err(P2pError::HandshakeIncomplete)
+}
+
+/// One established outbound peer transport: v1 plaintext framing or the
+/// BIP324 v2 encrypted record layer, with the in-band feature announcements
+/// recorded uniformly.
+pub enum PeerTransport<S> {
+    /// Plaintext v1 message framing.
+    V1(V1Transport<S>),
+    /// BIP324 v2 encrypted framing.
+    V2 {
+        /// The encrypted record layer.
+        transport: Box<V2Transport<S>>,
+        /// The peer announced BIP339 `wtxidrelay`.
+        peer_wtxid_relay: bool,
+        /// The peer announced BIP155 `sendaddrv2`.
+        peer_addrv2: bool,
+    },
+}
+
+impl<S> PeerTransport<S> {
+    /// Wraps a completed v2 record layer with cleared negotiation flags.
+    #[must_use]
+    pub fn from_v2(transport: V2Transport<S>) -> Self {
+        Self::V2 {
+            transport: Box::new(transport),
+            peer_wtxid_relay: false,
+            peer_addrv2: false,
+        }
+    }
+
+    /// Returns whether the peer negotiated BIP339 wtxid relay.
+    #[must_use]
+    pub const fn peer_wtxid_relay(&self) -> bool {
+        match self {
+            Self::V1(transport) => transport.peer_wtxid_relay,
+            Self::V2 {
+                peer_wtxid_relay, ..
+            } => *peer_wtxid_relay,
+        }
+    }
+
+    /// Returns whether the peer requested BIP155 address relay.
+    #[must_use]
+    pub const fn peer_addrv2(&self) -> bool {
+        match self {
+            Self::V1(transport) => transport.peer_addrv2,
+            Self::V2 { peer_addrv2, .. } => *peer_addrv2,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> PeerTransport<S> {
+    /// Receives one checksum- or AEAD-validated application message.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, framing, or protocol-limit errors from either transport.
+    pub async fn read_message(&mut self) -> Result<NetworkMessage, P2pError> {
+        self.read_message_with_payload_len()
+            .await
+            .map(|(message, _)| message)
+    }
+
+    /// Receives one application message together with its payload length.
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O, framing, or protocol-limit errors from either transport.
+    pub async fn read_message_with_payload_len(
+        &mut self,
+    ) -> Result<(NetworkMessage, usize), P2pError> {
+        match self {
+            Self::V1(transport) => transport
+                .read_message_with_payload_len()
+                .await
+                .map(|(message, payload_len)| (message.into_payload(), payload_len)),
+            Self::V2 { transport, .. } => Ok(transport.read_message_with_payload_len().await?),
+        }
+    }
+
+    /// Sends one application message over the negotiated framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the peer stream cannot accept the message.
+    pub async fn write_message(&mut self, message: NetworkMessage) -> Result<(), P2pError> {
+        match self {
+            Self::V1(transport) => transport.write_message(message).await,
+            Self::V2 { transport, .. } => Ok(transport.write_message(message).await?),
+        }
+    }
+
+    /// Performs the outbound `version`/`verack` handshake over this
+    /// transport; see [`V1Transport::handshake`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, ordering, or negotiation-budget errors.
+    pub async fn handshake(&mut self, local: VersionMessage) -> Result<VersionMessage, P2pError> {
+        negotiate_version_outbound(self, local).await
+    }
+
+    /// Performs the accepting-side `version`/`verack` handshake over this
+    /// transport; see [`V1Transport::handshake_inbound`] for the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, ordering, or negotiation-budget errors.
+    pub async fn handshake_inbound(
+        &mut self,
+        local: VersionMessage,
+    ) -> Result<VersionMessage, P2pError> {
+        negotiate_version_inbound(self, local).await
     }
 }
 
@@ -1290,7 +1499,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         &mut self,
     ) -> Result<Option<(NetworkMessage, usize)>, P2pError> {
         let (message, payload_len) = self.transport.read_message_with_payload_len().await?;
-        let message = message.into_payload();
         validate_post_handshake_message(&message)?;
         if matches!(
             &message,
@@ -1615,7 +1823,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         if address.port() == 0 {
             return Ok(());
         }
-        if self.transport.peer_addrv2 {
+        if self.transport.peer_addrv2() {
             let addr = match address.ip() {
                 IpAddr::V4(address) => AddrV2::Ipv4(address),
                 IpAddr::V6(address) => AddrV2::Ipv6(address),
@@ -2128,9 +2336,75 @@ pub async fn connect_outbound(
     user_agent: String,
     start_height: i32,
 ) -> Result<PeerSession<TcpStream>, P2pError> {
+    connect_outbound_with_transport(remote, magic, nonce, user_agent, start_height, false).await
+}
+
+/// Opens an outbound connection, optionally preferring the BIP324 v2
+/// encrypted transport.
+///
+/// With `prefer_v2`, the v2 handshake runs first; when the peer closes the
+/// connection before completing it, one fresh connection retries over v1,
+/// exactly as BIP324 specifies. A v2 protocol violation is returned without
+/// a retry.
+///
+/// # Errors
+///
+/// Returns I/O, transport, or negotiation errors from the selected path.
+pub async fn connect_outbound_with_transport(
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+    prefer_v2: bool,
+) -> Result<PeerSession<TcpStream>, P2pError> {
     validate_user_agent(&user_agent)?;
+    if prefer_v2 {
+        let stream = TcpStream::connect(remote).await?;
+        if let Some(session) = try_outbound_v2(
+            stream,
+            remote,
+            magic,
+            nonce,
+            user_agent.clone(),
+            start_height,
+        )
+        .await?
+        {
+            return Ok(session);
+        }
+    }
     let stream = TcpStream::connect(remote).await?;
     complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+}
+
+/// Attempts the v2 transport and version handshake on an established stream.
+///
+/// `Ok(None)` means the peer closed the connection before completing the v2
+/// handshake, so the caller may retry once over v1 on a fresh connection.
+async fn try_outbound_v2(
+    stream: TcpStream,
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+) -> Result<Option<PeerSession<TcpStream>>, P2pError> {
+    let local_address = stream.local_addr()?;
+    match V2Transport::connect_outbound(stream, magic).await {
+        Ok(v2) => {
+            let mut transport = PeerTransport::from_v2(v2);
+            let local_version =
+                build_local_version(remote, local_address, nonce, user_agent, start_height);
+            let remote_version = transport.handshake(local_version).await?;
+            if remote_version.nonce == nonce {
+                return Err(P2pError::SelfConnection);
+            }
+            Ok(Some(PeerSession::new(transport, remote_version)))
+        }
+        Err(V2TransportError::PeerRejectedV2) => Ok(None),
+        Err(error) => Err(P2pError::V2Transport(error)),
+    }
 }
 
 /// Opens an outbound connection through a no-authentication SOCKS5 proxy and
@@ -2147,7 +2421,58 @@ pub async fn connect_outbound_via_socks5(
     user_agent: String,
     start_height: i32,
 ) -> Result<PeerSession<TcpStream>, P2pError> {
+    connect_outbound_via_socks5_with_transport(
+        proxy,
+        remote,
+        magic,
+        nonce,
+        user_agent,
+        start_height,
+        false,
+    )
+    .await
+}
+
+/// Opens an outbound connection through a no-authentication SOCKS5 proxy,
+/// optionally preferring the BIP324 v2 transport with the same one-shot v1
+/// retry as [`connect_outbound_with_transport`]. The retry re-establishes
+/// the proxied stream from scratch.
+///
+/// # Errors
+///
+/// Returns proxy, I/O, transport, or negotiation errors.
+pub async fn connect_outbound_via_socks5_with_transport(
+    proxy: SocketAddr,
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+    prefer_v2: bool,
+) -> Result<PeerSession<TcpStream>, P2pError> {
     validate_user_agent(&user_agent)?;
+    if prefer_v2 {
+        let stream = open_socks5_stream(proxy, remote).await?;
+        if let Some(session) = try_outbound_v2(
+            stream,
+            remote,
+            magic,
+            nonce,
+            user_agent.clone(),
+            start_height,
+        )
+        .await?
+        {
+            return Ok(session);
+        }
+    }
+    let stream = open_socks5_stream(proxy, remote).await?;
+    complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+}
+
+/// Establishes one TCP stream to `remote` through a no-authentication SOCKS5
+/// proxy, encoding the destination as an IP literal.
+async fn open_socks5_stream(proxy: SocketAddr, remote: SocketAddr) -> Result<TcpStream, P2pError> {
     let mut stream = TcpStream::connect(proxy).await?;
     stream.write_all(&[5, 1, 0]).await?;
     let mut greeting = [0_u8; 2];
@@ -2197,18 +2522,17 @@ pub async fn connect_outbound_via_socks5(
     };
     let mut ignored = vec![0_u8; address_bytes + 2];
     stream.read_exact(&mut ignored).await?;
-    complete_outbound_handshake(stream, remote, magic, nonce, user_agent, start_height).await
+    Ok(stream)
 }
 
-async fn complete_outbound_handshake(
-    stream: TcpStream,
+/// Builds the local `version` message advertised on outbound connections.
+fn build_local_version(
     remote: SocketAddr,
-    magic: Magic,
+    local_address: SocketAddr,
     nonce: u64,
     user_agent: String,
     start_height: i32,
-) -> Result<PeerSession<TcpStream>, P2pError> {
-    let local_address = stream.local_addr()?;
+) -> VersionMessage {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2224,8 +2548,20 @@ async fn complete_outbound_handshake(
         start_height,
     );
     local_version.version = PROTOCOL_VERSION;
+    local_version
+}
 
-    let mut transport = V1Transport::new(stream, magic);
+async fn complete_outbound_handshake(
+    stream: TcpStream,
+    remote: SocketAddr,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+) -> Result<PeerSession<TcpStream>, P2pError> {
+    let local_address = stream.local_addr()?;
+    let local_version = build_local_version(remote, local_address, nonce, user_agent, start_height);
+    let mut transport = PeerTransport::V1(V1Transport::new(stream, magic));
     let remote_version = transport.handshake(local_version).await?;
     if remote_version.nonce == nonce {
         return Err(P2pError::SelfConnection);
@@ -2478,11 +2814,11 @@ mod tests {
         let (first_stream, _) = duplex(64);
         let (second_stream, _) = duplex(64);
         let first = PeerSession::new(
-            V1Transport::new(first_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(first_stream, Network::Regtest.magic())),
             version(42),
         );
         let second = PeerSession::new(
-            V1Transport::new(second_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(second_stream, Network::Regtest.magic())),
             version(42),
         );
 
@@ -2890,7 +3226,7 @@ mod tests {
         let expected: SocketAddr = "1.2.3.4:8333".parse().unwrap();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.request_addresses().await.unwrap();
@@ -2951,7 +3287,7 @@ mod tests {
         let ipv6: SocketAddr = "[2001:4860:4860::8888]:8333".parse().unwrap();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_addresses().await.unwrap()
@@ -2989,7 +3325,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(128 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_addresses().await
@@ -3020,7 +3356,7 @@ mod tests {
     fn full_block_ibd_requires_network_and_witness_services() {
         let (stream, _) = duplex(64);
         let session = PeerSession::new(
-            V1Transport::new(stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(stream, Network::Regtest.magic())),
             version(1),
         );
         assert!(matches!(
@@ -3031,7 +3367,10 @@ mod tests {
         let (stream, _) = duplex(64);
         let mut remote = version(2);
         remote.services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let session = PeerSession::new(V1Transport::new(stream, Network::Regtest.magic()), remote);
+        let session = PeerSession::new(
+            PeerTransport::V1(V1Transport::new(stream, Network::Regtest.magic())),
+            remote,
+        );
         session.ensure_full_witness_block_relay().unwrap();
     }
 
@@ -3045,7 +3384,7 @@ mod tests {
             u64::try_from(serialize(&first).len() + serialize(&second).len()).unwrap();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.request_witness_blocks(&expected).await.unwrap();
@@ -3091,7 +3430,7 @@ mod tests {
         let client_expected = expected.clone();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             for request in client_expected.chunks(MAX_BLOCKS_IN_FLIGHT) {
@@ -3149,7 +3488,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = SENDCMPCT_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.negotiate_compact_block_relay().await.unwrap();
@@ -3222,7 +3561,7 @@ mod tests {
         let expected_block = block.clone();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.compact_block_version = Some(COMPACT_BLOCK_VERSION);
@@ -3265,7 +3604,7 @@ mod tests {
         let block_hash = block.block_hash();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.request_witness_blocks(&[block_hash]).await.unwrap();
@@ -3296,7 +3635,7 @@ mod tests {
     async fn block_request_rejects_oversize_and_duplicates_before_writing() {
         let (client_stream, _) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             version(1),
         );
         let hash = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
@@ -3321,7 +3660,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             let result = session.receive_requested_blocks(&[expected_hash]).await;
@@ -3345,7 +3684,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(4096);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             let result = session.receive_requested_blocks(&[expected_hash]).await;
@@ -3379,7 +3718,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(32 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             let block = session
@@ -3411,7 +3750,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(512 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_headers().await
@@ -3442,7 +3781,7 @@ mod tests {
         let expected = transaction.clone();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             let headers = session.receive_headers().await.unwrap();
@@ -3470,7 +3809,7 @@ mod tests {
     fn pending_transaction_queue_drops_oldest_and_rejects_oversized_entries() {
         let (stream, _peer) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(stream, Network::Regtest.magic())),
             version(1),
         );
         let template =
@@ -3506,7 +3845,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_headers().await
@@ -3582,7 +3921,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.ping(42).await
@@ -3621,7 +3960,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.ping(42).await.unwrap();
@@ -3653,7 +3992,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(5 * 1024 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.ping(42).await
@@ -3685,7 +4024,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.ping(42).await
@@ -3718,7 +4057,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = SENDHEADERS_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.prefer_headers_announcements().await
@@ -3738,7 +4077,7 @@ mod tests {
         let mut remote = version(1);
         remote.version = SENDHEADERS_VERSION - 1;
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             remote,
         );
         session.prefer_headers_announcements().await.unwrap();
@@ -3759,7 +4098,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = SENDCMPCT_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.negotiate_compact_block_relay().await
@@ -3782,7 +4121,7 @@ mod tests {
         let mut remote = version(1);
         remote.version = SENDCMPCT_VERSION - 1;
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             remote,
         );
         session.negotiate_compact_block_relay().await.unwrap();
@@ -3801,7 +4140,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session
@@ -3838,10 +4177,10 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
-            session.transport.peer_addrv2 = true;
+            session.transport.note_peer_addrv2();
             session
                 .advertise_address(
                     "[2001:4860:4860::8888]:8333".parse().unwrap(),
@@ -3881,7 +4220,7 @@ mod tests {
         let expected = transaction.clone();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.broadcast_transaction(&transaction).await
@@ -3898,7 +4237,7 @@ mod tests {
 
         let (client_stream, mut server_stream) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             version(1),
         );
         assert!(matches!(
@@ -3932,7 +4271,7 @@ mod tests {
         let expected = transaction.clone();
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.relay_transaction(&relay, 41).await
@@ -3971,7 +4310,7 @@ mod tests {
     fn announced_transaction_index_tracks_aliases_replacement_and_fifo_eviction() {
         let (client_stream, _server_stream) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             version(1),
         );
         let mut retained = Vec::new();
@@ -4042,7 +4381,7 @@ mod tests {
         let client = tokio::spawn(async move {
             let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
             transport.peer_wtxid_relay = true;
-            let mut session = PeerSession::new(transport, version(1));
+            let mut session = PeerSession::new(PeerTransport::V1(transport), version(1));
             session.relay_transaction(&relay, 42).await.unwrap();
             session.read_message().await.unwrap()
         });
@@ -4090,7 +4429,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(1024 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.relay_transaction(&relay, 43).await.unwrap();
@@ -4151,7 +4490,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = FEEFILTER_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.ping(60).await.unwrap();
@@ -4258,7 +4597,7 @@ mod tests {
             transport.peer_wtxid_relay = true;
             let mut remote = version(1);
             remote.version = PROTOCOL_VERSION;
-            let mut session = PeerSession::new(transport, remote);
+            let mut session = PeerSession::new(PeerTransport::V1(transport), remote);
             session.set_mempool_relay_source(source);
             session.ping(70).await
         });
@@ -4328,7 +4667,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = PROTOCOL_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.set_mempool_relay_source(source);
@@ -4397,7 +4736,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = PROTOCOL_VERSION;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.set_mempool_relay_source(source);
@@ -4437,7 +4776,7 @@ mod tests {
             let mut remote = version(1);
             remote.version = MEMPOOL_VERSION - 1;
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 remote,
             );
             session.set_mempool_relay_source(source);
@@ -4482,7 +4821,7 @@ mod tests {
                 let mut remote = version(1);
                 remote.version = PROTOCOL_VERSION;
                 let mut session = PeerSession::new(
-                    V1Transport::new(client_stream, Network::Regtest.magic()),
+                    PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                     remote,
                 );
                 if let Some(source) = source {
@@ -4527,7 +4866,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(4 * 1024 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.relay_transaction(&relay, 45).await
@@ -4571,7 +4910,7 @@ mod tests {
         let client = tokio::spawn(async move {
             let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
             transport.peer_wtxid_relay = true;
-            let mut session = PeerSession::new(transport, version(1));
+            let mut session = PeerSession::new(PeerTransport::V1(transport), version(1));
             session.ping(51).await.unwrap();
             assert_eq!(
                 session.take_pending_transaction_inventory(),
@@ -4637,7 +4976,7 @@ mod tests {
     async fn transaction_inventory_capture_is_negotiated_unique_and_bounded() {
         let (stream, _) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(stream, Network::Regtest.magic())),
             version(1),
         );
         let legacy = Inventory::Transaction(bitcoin::Txid::from_byte_array([1; 32]));
@@ -4663,7 +5002,7 @@ mod tests {
     async fn invalid_transaction_requests_fail_before_writing() {
         let (client_stream, mut server_stream) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             version(1),
         );
         let txid = bitcoin::Txid::from_byte_array([3; 32]);
@@ -4716,7 +5055,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(10 * 1024 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.request_announced_transactions(&inventory).await
@@ -4751,7 +5090,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_requested_block(expected).await
@@ -4782,7 +5121,7 @@ mod tests {
         let (client_stream, server_stream) = duplex(4096);
         let client = tokio::spawn(async move {
             let mut session = PeerSession::new(
-                V1Transport::new(client_stream, Network::Regtest.magic()),
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
                 version(1),
             );
             session.receive_headers().await
@@ -4875,7 +5214,7 @@ mod tests {
     async fn getheaders_rejects_oversized_locator_before_writing() {
         let (client_stream, _) = duplex(64);
         let mut session = PeerSession::new(
-            V1Transport::new(client_stream, Network::Regtest.magic()),
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
             version(1),
         );
         let result = session
@@ -5047,5 +5386,98 @@ mod tests {
         drop(client);
         target_server.await.unwrap();
         proxy_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_prefers_v2_and_negotiates_through_the_encrypted_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let magic = Network::Regtest.magic();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let accepted = crate::p2p_v2::V2Transport::accept_inbound(stream, magic)
+                .await
+                .unwrap();
+            let crate::p2p_v2::V2Accepted::V2(v2) = accepted else {
+                panic!("the initiator must open with v2");
+            };
+            let mut transport = PeerTransport::from_v2(*v2);
+            let mut local = version(9);
+            local.version = PROTOCOL_VERSION;
+            let remote = transport.handshake_inbound(local).await.unwrap();
+            (transport, remote)
+        });
+        let session = connect_outbound_with_transport(
+            address,
+            magic,
+            7,
+            "/rbtcd:client-test/".to_owned(),
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(session.wtxid_relay, "wtxidrelay negotiates through v2");
+        let (mut server_transport, remote_version) = server.await.unwrap();
+        assert_eq!(remote_version.nonce, 7);
+        assert!(server_transport.peer_wtxid_relay());
+        let mut client_transport = session.into_test_transport();
+        assert!(
+            matches!(client_transport, PeerTransport::V2 { .. }),
+            "the negotiated session must run on the v2 transport"
+        );
+        client_transport
+            .write_message(NetworkMessage::Ping(41))
+            .await
+            .unwrap();
+        assert!(matches!(
+            server_transport.read_message().await,
+            Ok(NetworkMessage::Ping(41))
+        ));
+        server_transport
+            .write_message(NetworkMessage::Pong(41))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client_transport.read_message().await,
+            Ok(NetworkMessage::Pong(41))
+        ));
+    }
+
+    #[tokio::test]
+    async fn outbound_falls_back_to_v1_when_the_peer_closes_the_v2_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let magic = Network::Regtest.magic();
+        let server = tokio::spawn(async move {
+            // A v1-only peer reads the unrecognized v2 opening and closes.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = [0u8; 4096];
+            let _ = stream.read(&mut sink).await;
+            drop(stream);
+            // The fallback reconnect completes an ordinary v1 handshake.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut transport = V1Transport::new(stream, magic);
+            let mut local = version(9);
+            local.version = PROTOCOL_VERSION;
+            transport.handshake_inbound(local).await.unwrap()
+        });
+        let session = connect_outbound_with_transport(
+            address,
+            magic,
+            7,
+            "/rbtcd:client-test/".to_owned(),
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(session.wtxid_relay, "wtxidrelay negotiates over v1");
+        let remote_version = server.await.unwrap();
+        assert_eq!(remote_version.nonce, 7);
+        assert!(
+            matches!(session.into_test_transport(), PeerTransport::V1(_)),
+            "the fallback session must run on the v1 transport"
+        );
     }
 }

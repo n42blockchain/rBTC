@@ -5,6 +5,22 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 ## What is implemented now
 
 - Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format. Core 26's 4,000,000-byte message, 256-byte user-agent, 101-hash locator, and 1,000-address response bounds are enforced before unbounded work. Every control or keepalive frame consumes the bounded response budget, pings receive pongs, and a post-handshake `version` is rejected immediately. Modern peers receive Core-ordered BIP339 `wtxidrelay` and BIP155 `sendaddrv2` negotiation before `verack`; bounded `getaddr` decoding supports legacy and IPv4/IPv6 addrv2 responses. One process nonce spans every fallback connection for self-connection detection. Fresh full-history+witness IPv4/IPv6 addresses are quality-filtered into a network-bound, bounded `peers.redb` fallback pool. A persistent random secret assigns learned addresses across 1,024 keyed new buckets and successful handshakes across 256 keyed tried buckets, each capped at 64 entries; old stores generate the secret atomically on first reopen. Pool updates physically prune stale entries, prefer peers that completed prior synchronization sessions over handshake-only records, use known lower successful-handshake latency and then higher completed block-response throughput as tiebreakers within equal reputation, and round-robin both keyed buckets and target `/16` IPv4 or `/32` IPv6 groups so one range cannot monopolize a startup set. Objective wire violations and invalid headers/blocks from learned peers enter a separately bounded, persistent one-hour-to-one-day cooldown; ordinary transport failures do not, a completed synchronization session clears it, and manual connections remain exempt. Public bootstrap uses the network-specific [Bitcoin Core 31 seed list](https://github.com/bitcoin/bitcoin/blob/v31.0/src/kernel/chainparams.cpp), resolves seeds concurrently under per-seed/global bounds, distributes candidates across seed responses, and never admits private, reserved, or actively discouraged public-network results.
+- Opt-in BIP324 v2 encrypted transport for outbound peers (`--v2-transport`
+  CLI flag or `v2_transport` config key, default off). The ElligatorSwift
+  X-only ECDH, network-magic-bound HKDF-SHA256 key schedule, and rekeying
+  FSChaCha20/FSChaCha20Poly1305 record ciphers pass the official BIP324
+  packet-encoding vectors, including the 224-message rekey boundaries. A
+  sans-I/O handshake state machine bounds garbage (4,095 bytes), decoy
+  packets, and per-packet contents, recognizes the v1 prefix on the responder
+  side, and fails closed on every protocol violation. Outbound connections
+  prefer v2 when enabled and retry an address exactly once over v1 after the
+  peer closes the v2 attempt, as BIP324 specifies; `version`/`verack`
+  negotiation runs unchanged through either framing, and v2 sessions reuse
+  the identical 4,000,000-byte message ceiling and misbehavior
+  classification. Ignored `RBTC_BITCOIND` integration tests exercise both the
+  encrypted session and the v1 fallback against a real Core 31 daemon, and a
+  dedicated fuzz target drives the deterministic responder handshake and
+  record layer.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

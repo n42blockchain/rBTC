@@ -16,6 +16,8 @@ fi
 cd "$repo_root"
 cargo +"$toolchain" fuzz run p2p_decode_v1 fuzz/corpus/p2p_decode_v1 -- \
     -runs="$runs" -max_len=65536 -dict=fuzz/dictionaries/p2p_v1.dict
+cargo +"$toolchain" fuzz run p2p_v2_handshake fuzz/corpus/p2p_v2_handshake -- \
+    -runs="$runs" -max_len=65536
 cargo +"$toolchain" fuzz run merkle_proof fuzz/corpus/merkle_proof -- \
     -runs="$runs" -max_len=1124
 cargo +"$toolchain" fuzz run signet_block fuzz/corpus/signet_block -- \

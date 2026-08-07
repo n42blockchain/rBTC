@@ -16,6 +16,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   watch-only external-signer wallet.
 - Cross-platform signed-release, SBOM, provenance, reproducibility, audit,
   fuzzing, and public-network soak gates.
+- Opt-in BIP324 v2 encrypted transport for outbound peers (`--v2-transport`),
+  with the specified one-shot v1 retry when a peer closes the v2 attempt.
 
 ### Safety
 

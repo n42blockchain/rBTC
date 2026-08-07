@@ -994,3 +994,97 @@ fn core_31_and_rbtc_agree_on_bip147_nulldummy_boundary() {
     assert_eq!(accepted.tip_height, 102);
     assert_eq!(core.rpc(&["getblockcount"]).unwrap(), "102");
 }
+
+fn connect_session_with_transport(
+    port: u16,
+    prefer_v2: bool,
+) -> (
+    tokio::runtime::Runtime,
+    rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let session = runtime
+        .block_on(async {
+            let remote = format!("127.0.0.1:{port}").parse().unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                rbtc::p2p::connect_outbound_with_transport(
+                    remote,
+                    Network::Regtest.magic(),
+                    0x5bbc_1e57,
+                    "/rbtcd:v2-interop/".to_owned(),
+                    0,
+                    prefer_v2,
+                ),
+            )
+            .await
+        })
+        .expect("outbound handshake finishes within its deadline")
+        .expect("outbound session establishes");
+    (runtime, session)
+}
+
+fn transport_protocol_reported_by_core(core: &CoreNode) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = core.rpc(&["getpeerinfo"]).unwrap();
+        if let Some(position) = info.find("\"transport_protocol_type\": \"") {
+            let start = position + "\"transport_protocol_type\": \"".len();
+            return info[start..start + 2].to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Core never reported a connected peer: {info}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn v2_transport_interoperates_with_core() {
+    let bitcoind = core_31_bitcoind();
+    let p2p_port = unused_port();
+    let bind = format!("-bind=127.0.0.1:{p2p_port}");
+    let core =
+        CoreNode::start_with_args(&bitcoind, &["-listen=1", "-v2transport=1", bind.as_str()]);
+    assert_core_31(&core);
+    let (runtime, mut session) = connect_session_with_transport(p2p_port, true);
+    assert_eq!(
+        transport_protocol_reported_by_core(&core),
+        "v2",
+        "Core must classify the session as encrypted v2"
+    );
+    let headers = runtime
+        .block_on(async {
+            let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+            session
+                .request_headers(vec![genesis], BlockHash::all_zeros())
+                .await?;
+            session.receive_headers().await
+        })
+        .expect("headers exchange succeeds through the encrypted channel");
+    assert!(
+        headers.is_empty(),
+        "a fresh regtest Core has no headers past genesis"
+    );
+    drop(session);
+}
+
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+fn v2_preference_falls_back_to_v1_against_a_v1_only_core() {
+    let bitcoind = core_31_bitcoind();
+    let p2p_port = unused_port();
+    let bind = format!("-bind=127.0.0.1:{p2p_port}");
+    let core =
+        CoreNode::start_with_args(&bitcoind, &["-listen=1", "-v2transport=0", bind.as_str()]);
+    assert_core_31(&core);
+    let (_runtime, session) = connect_session_with_transport(p2p_port, true);
+    assert_eq!(
+        transport_protocol_reported_by_core(&core),
+        "v1",
+        "the fallback session must run over plaintext v1"
+    );
+    drop(session);
+}

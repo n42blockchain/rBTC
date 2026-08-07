@@ -74,7 +74,8 @@ The supported scalar keys are:
   `log_max_bytes` (1 MiB–1 GiB), and `log_max_files` (2–20)
 - Boolean `dns_seeds`, `once`, `mempool_full_rbf`, `txindex`,
   `spent_output_index`, `block_filter_index`,
-  `cleanup_validation_dir`, and `validation_deferred_repair`
+  `cleanup_validation_dir`, `v2_transport`, and
+  `validation_deferred_repair`
 
 The repeatable keys are `connect`, `dns_seed`, `signetseednode`, `vbparams`,
 and `testactivationheight`. Boolean values are exactly `true`, `false`, `1`,
