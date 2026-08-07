@@ -23,6 +23,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Optional loopback ZMQ notification endpoint (`--zmq-listen`) publishing
   Core-compatible `hashblock`, `rawblock`, `hashtx`, `rawtx`, and `sequence`
   topics with bounded slow-subscriber drop accounting.
+- Authenticated `testmempoolaccept` returning bounded Core-shaped dry-run
+  admission verdicts without mutating the mempool.
 
 ### Safety
 

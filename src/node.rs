@@ -115,7 +115,7 @@ use rbtc::{
     ibd::IbdPolicy,
     inbound::{
         InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
-        run_listener_with_stats_and_relay,
+        TestAcceptResult, run_listener_with_stats_and_relay,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -2971,6 +2971,11 @@ struct NodeRpcOperator {
 }
 
 const MAX_RPC_MEMPOOL_PAGE: usize = 1_000;
+/// Bound on candidates accepted by one dry-run admission request; matches
+/// the admission pool's package ceiling.
+const MAX_RPC_TEST_ACCEPT_TRANSACTIONS: usize = 25;
+/// Bound on one reported rejection reason.
+const MAX_RPC_REJECT_REASON_BYTES: usize = 256;
 const MAX_RPC_BLOCK_CHUNK_BYTES: usize = 24 * 1024;
 
 const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
@@ -2984,6 +2989,7 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "gettxout",
     "rbtc.getblockchunk",
     "rbtc.submitrawtransaction",
+    "testmempoolaccept",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -3033,6 +3039,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "gettxout"
                 | "rbtc.getblockchunk"
                 | "rbtc.submitrawtransaction"
+                | "testmempoolaccept"
         ) {
             return Some(
                 if matches!(
@@ -3469,6 +3476,63 @@ impl NodeRpcOperator {
                     })
                 })
             }
+            "testmempoolaccept" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                let raws = values
+                    .first()
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|_| values.len() == 1)
+                    .filter(|raws| (1..=MAX_RPC_TEST_ACCEPT_TRANSACTIONS).contains(&raws.len()))
+                    .ok_or_else(invalid)?;
+                let transactions = raws
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .and_then(|value| Vec::<u8>::from_hex(value).ok())
+                            .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
+                            .and_then(|raw| deserialize::<Transaction>(&raw).ok())
+                            .ok_or(LocalRpcOperatorError {
+                                code: -22,
+                                message: "Transaction decode failed",
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let results = source
+                    .test_accept(transactions)
+                    .map_err(|_| unavailable())?;
+                Ok(serde_json::Value::Array(
+                    results
+                        .into_iter()
+                        .map(|result| {
+                            let mut entry = serde_json::json!({
+                                "txid": result.txid.to_string(),
+                                "wtxid": result.wtxid.to_string(),
+                                "allowed": result.allowed,
+                            });
+                            let object = entry
+                                .as_object_mut()
+                                .expect("the verdict is built as an object");
+                            if let Some(vsize) = result.vsize {
+                                object.insert("vsize".to_owned(), serde_json::json!(vsize));
+                            }
+                            if let Some(fee_sats) = result.fee_sats {
+                                object.insert(
+                                    "fees".to_owned(),
+                                    serde_json::json!({"base_sats": fee_sats}),
+                                );
+                            }
+                            if let Some(reason) = result.reject_reason {
+                                object.insert(
+                                    "reject-reason".to_owned(),
+                                    serde_json::json!(bounded_reject_reason(&reason)),
+                                );
+                            }
+                            entry
+                        })
+                        .collect(),
+                ))
+            }
             "rbtc.submitrawtransaction" => {
                 let values = params.as_array().ok_or_else(invalid)?;
                 let raw = values
@@ -3501,6 +3565,18 @@ impl NodeRpcOperator {
             _ => unreachable!("data method membership checked"),
         }
     }
+}
+
+/// Truncates a rejection reason at a character boundary within the bound.
+fn bounded_reject_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_RPC_REJECT_REASON_BYTES {
+        return reason;
+    }
+    let mut end = MAX_RPC_REJECT_REASON_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
 }
 
 fn rpc_one_block_hash(params: &serde_json::Value) -> Result<BlockHash, LocalRpcOperatorError> {
@@ -4045,6 +4121,8 @@ struct NodeInboundSource {
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
     pending_transactions: Arc<Mutex<InboundTransactionQueue>>,
     basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
+    deployments: DeploymentConfig,
+    mempool_full_rbf: bool,
 }
 
 struct SharedInboundSource {
@@ -4179,6 +4257,10 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.utxo(outpoint)
     }
 
+    fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
+        self.current()?.test_accept(transactions)
+    }
+
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         self.advertised_address
             .map(|address| (address, self.services))
@@ -4233,6 +4315,85 @@ impl InboundTransactionQueue {
 }
 
 impl NodeInboundSource {
+    /// Evaluates candidates as one package against a throwaway pool clone.
+    ///
+    /// The clone is discarded on every path, so neither a success nor a
+    /// failure can alter the live mempool, chainstate, or relay state.
+    fn dry_run_admission(
+        &self,
+        transactions: Vec<Transaction>,
+    ) -> Result<Vec<TestAcceptResult>, String> {
+        let identities = transactions
+            .iter()
+            .map(|transaction| (transaction.compute_txid(), transaction.compute_wtxid()))
+            .collect::<Vec<_>>();
+        let headers = self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let context = transaction_admission_context(
+            &self.chainstate,
+            &headers,
+            &self.deployments,
+            self.mempool_full_rbf,
+        )?;
+        drop(headers);
+        let now = unix_time()?;
+        let mut candidate = self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outcome =
+            candidate.admit_package_at(self.chainstate.as_ref(), transactions, context, now);
+        Ok(match outcome {
+            Ok(outcome) => {
+                let admitted = candidate
+                    .relay_snapshot()
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            entry.transaction.compute_txid(),
+                            (entry.policy_vsize, entry.fee_sats),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                identities
+                    .into_iter()
+                    .map(|(txid, wtxid)| {
+                        let accepted = outcome.accepted.contains(&txid);
+                        let measures = accepted.then(|| admitted.get(&txid)).flatten();
+                        TestAcceptResult {
+                            txid,
+                            wtxid,
+                            allowed: accepted,
+                            vsize: measures.map(|(vsize, _)| *vsize),
+                            fee_sats: measures.map(|(_, fee_sats)| *fee_sats),
+                            reject_reason: (!accepted).then(|| {
+                                "transaction was already present or not accepted by the package"
+                                    .to_owned()
+                            }),
+                        }
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                identities
+                    .into_iter()
+                    .map(|(txid, wtxid)| TestAcceptResult {
+                        txid,
+                        wtxid,
+                        allowed: false,
+                        vsize: None,
+                        fee_sats: None,
+                        reject_reason: Some(reason.clone()),
+                    })
+                    .collect()
+            }
+        })
+    }
+
     fn execution_height(&self) -> Result<u32, String> {
         self.chainstate
             .execution()
@@ -4326,6 +4487,10 @@ impl InboundDataSource for NodeInboundSource {
         self.chainstate
             .get(outpoint)
             .map_err(|error| error.to_string())
+    }
+
+    fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
+        self.dry_run_admission(transactions)
     }
 
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
@@ -11141,6 +11306,8 @@ async fn sync_validating_node(
                     transaction_pool: Arc::clone(transaction_pool),
                     pending_transactions: Arc::clone(&inbound_transactions),
                     basic_filter: auxiliary_indexes.basic_filter.as_ref().map(Arc::clone),
+                    deployments: deployment_config.clone(),
+                    mempool_full_rbf,
                 });
                 let source: Arc<dyn InboundDataSource> = source;
                 inbound_source_lease = Some(shared.install(source));
@@ -16061,9 +16228,32 @@ mod tests {
     struct RpcTestSource {
         block: Block,
         submitted: Mutex<Vec<Transaction>>,
+        test_accept_calls: Mutex<Vec<usize>>,
     }
 
     impl InboundDataSource for RpcTestSource {
+        fn test_accept(
+            &self,
+            transactions: Vec<Transaction>,
+        ) -> Result<Vec<TestAcceptResult>, String> {
+            self.test_accept_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(transactions.len());
+            Ok(transactions
+                .into_iter()
+                .enumerate()
+                .map(|(index, transaction)| TestAcceptResult {
+                    txid: transaction.compute_txid(),
+                    wtxid: transaction.compute_wtxid(),
+                    allowed: index == 0,
+                    vsize: (index == 0).then_some(141),
+                    fee_sats: (index == 0).then_some(1_000),
+                    reject_reason: (index != 0).then(|| "x".repeat(400)),
+                })
+                .collect())
+        }
+
         fn start_height(&self) -> Result<u32, String> {
             Ok(0)
         }
@@ -16218,6 +16408,7 @@ mod tests {
         let source = Arc::new(RpcTestSource {
             block: block.clone(),
             submitted: Mutex::new(Vec::new()),
+            test_accept_calls: Mutex::new(Vec::new()),
         });
         let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
         let dynamic: Arc<dyn InboundDataSource> = source.clone();
@@ -16275,6 +16466,242 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             1
+        );
+    }
+
+    /// Builds a regtest node data source whose chainstate holds one mature
+    /// spendable coinbase output at the active tip.
+    fn dry_run_test_source(directory: &std::path::Path) -> (NodeInboundSource, OutPoint, Utxo) {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let block =
+            crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+                genesis.block_hash(),
+                1,
+                genesis.header.time + 600,
+            ))
+            .expect("regtest block assembles");
+        dag.insert(block.header).expect("header extends the DAG");
+        let chainstate =
+            RedbChainStore::open(directory.join("chainstate.redb"), Network::Regtest).unwrap();
+        let funding = OutPoint::new(block.txdata[0].compute_txid(), 0);
+        let utxo = Utxo {
+            value_sats: 50_000_000,
+            height: 1,
+            is_coinbase: false,
+            last_touched: u64::from(genesis.header.time),
+            creation_mtp: genesis.header.time,
+            // P2SH wrapping a bare OP_TRUE redeem script: a standard output
+            // the test can spend without carrying a signature.
+            script_pubkey: [
+                vec![0xa9, 0x14],
+                bitcoin::hashes::hash160::Hash::hash(&[0x51])
+                    .to_byte_array()
+                    .to_vec(),
+                vec![0x87],
+            ]
+            .concat(),
+        };
+        chainstate
+            .commit_connect(
+                genesis.block_hash(),
+                rbtc::execution_store::ExecutionTip {
+                    height: 1,
+                    hash: block.block_hash(),
+                },
+                &[],
+                &[(OutPointKey::from(funding), utxo.clone())],
+                &[],
+            )
+            .unwrap();
+        let ledger =
+            PrunedBlockLedger::open(directory.join("blocks"), LedgerRetention::default()).unwrap();
+        (
+            NodeInboundSource {
+                headers: Arc::new(RwLock::new(dag)),
+                chainstate: Arc::new(chainstate),
+                ledger: Arc::new(ledger),
+                transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+                pending_transactions: Arc::new(Mutex::new(InboundTransactionQueue::default())),
+                basic_filter: None,
+                deployments: DeploymentConfig::for_network(Network::Regtest),
+                mempool_full_rbf: true,
+            },
+            funding,
+            utxo,
+        )
+    }
+
+    #[test]
+    fn dry_run_admission_reports_verdicts_without_touching_the_live_pool() {
+        let directory = TempDir::new().unwrap();
+        let (source, funding, funded) = dry_run_test_source(directory.path());
+        let spend = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(funded.value_sats - 10_000),
+                // A v0 32-byte witness program keeps the candidate standard
+                // and above the minimum non-witness transaction size.
+                script_pubkey: ScriptBuf::from_bytes([vec![0x00, 0x20], vec![0x11; 32]].concat()),
+            }],
+        };
+        let txid = spend.compute_txid();
+
+        let verdicts = source.test_accept(vec![spend.clone()]).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].txid, txid);
+        assert_eq!(verdicts[0].wtxid, spend.compute_wtxid());
+        assert!(
+            verdicts[0].allowed,
+            "a funded spend is admissible: {:?}",
+            verdicts[0].reject_reason
+        );
+        assert_eq!(verdicts[0].fee_sats, Some(10_000));
+        assert!(verdicts[0].vsize.is_some_and(|vsize| vsize > 0));
+        assert!(verdicts[0].reject_reason.is_none());
+        assert!(
+            source
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot()
+                .is_empty(),
+            "a dry run must never retain the candidate"
+        );
+
+        let unfunded = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint::new(txid, 7),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            ..spend.clone()
+        };
+        let verdicts = source.test_accept(vec![unfunded]).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].allowed, "an unfunded spend is refused");
+        assert!(
+            verdicts[0]
+                .reject_reason
+                .as_ref()
+                .is_some_and(|reason| !reason.is_empty()),
+            "a refusal carries the admission error"
+        );
+        assert!(
+            source
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot()
+                .is_empty(),
+            "a refused dry run leaves the pool empty"
+        );
+
+        // Repeating the accepted candidate must still report acceptance:
+        // the first dry run may not have advanced any pool state.
+        let repeated = source.test_accept(vec![spend]).unwrap();
+        assert!(
+            repeated[0].allowed,
+            "dry runs are independent of each other"
+        );
+    }
+
+    #[test]
+    fn operator_rpc_dry_run_admission_is_bounded_and_shapes_core_fields() {
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let source = Arc::new(RpcTestSource {
+            block: block.clone(),
+            submitted: Mutex::new(Vec::new()),
+            test_accept_calls: Mutex::new(Vec::new()),
+        });
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = source.clone();
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(hash),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let raw = serialize(&block.txdata[0]).to_lower_hex_string();
+
+        let verdicts = operator
+            .execute(
+                "testmempoolaccept",
+                &serde_json::json!([[raw.clone(), raw.clone()]]),
+            )
+            .unwrap()
+            .unwrap();
+        let verdicts = verdicts.as_array().expect("verdicts are an array");
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0]["allowed"], true);
+        assert_eq!(verdicts[0]["vsize"], 141);
+        assert_eq!(verdicts[0]["fees"]["base_sats"], 1_000);
+        assert!(
+            verdicts[0].get("reject-reason").is_none(),
+            "an accepted candidate carries no rejection reason"
+        );
+        assert_eq!(verdicts[1]["allowed"], false);
+        assert!(
+            verdicts[1].get("vsize").is_none() && verdicts[1].get("fees").is_none(),
+            "a refused candidate reports no measurements"
+        );
+        assert_eq!(
+            verdicts[1]["reject-reason"]
+                .as_str()
+                .expect("a refused candidate carries a reason")
+                .len(),
+            MAX_RPC_REJECT_REASON_BYTES,
+            "reasons are truncated to the accepted bound"
+        );
+
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([[]]),
+            serde_json::json!([raw.clone(), raw.clone()]),
+            serde_json::json!([vec![raw.clone(); MAX_RPC_TEST_ACCEPT_TRANSACTIONS + 1]]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("testmempoolaccept", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed or oversized requests are rejected: {invalid}"
+            );
+        }
+        assert_eq!(
+            operator
+                .execute("testmempoolaccept", &serde_json::json!([["not hex"]]))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            -22,
+            "undecodable candidates are rejected before reaching the source"
+        );
+        assert_eq!(
+            *source
+                .test_accept_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![2],
+            "only the well-formed request reaches the data source"
         );
     }
 

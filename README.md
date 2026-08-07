@@ -42,6 +42,14 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   cover expiry, BIP125 replacement, and capacity eviction, while
   block-confirmed removals stay silent exactly like Core; non-loopback binds
   are refused because the endpoint is unauthenticated.
+- Authenticated `testmempoolaccept` reports Core-shaped dry-run admission
+  verdicts (`txid`, `wtxid`, `allowed`, `vsize`, `fees.base_sats`,
+  `reject-reason`) for a bounded package of at most 25 candidates. The
+  evaluation runs the ordinary consensus and relay-policy admission path
+  against the current chainstate and mempool on a throwaway pool clone, so no
+  candidate is retained, persisted, or relayed on any path — the live pool is
+  byte-for-byte unchanged whether the package is accepted or refused.
+  Rejection reasons are the admission error truncated to 256 bytes.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

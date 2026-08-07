@@ -12,7 +12,7 @@ use std::{
 };
 
 use bitcoin::{
-    Block, BlockHash, Transaction,
+    Block, BlockHash, Transaction, Txid, Wtxid,
     bip152::{BlockTransactions, HeaderAndShortIds},
     bip158::{FilterHash, FilterHeader},
     block::Header,
@@ -510,6 +510,37 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn utxo(&self, _outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
         Ok(None)
     }
+
+    /// Dry-run consensus and policy admission for an authenticated local
+    /// caller.
+    ///
+    /// The candidate transactions are evaluated as one dependency-connected
+    /// package against the current chainstate and mempool, exactly as the
+    /// ordinary admission path would, but nothing is retained, persisted, or
+    /// relayed. Implementations without chain context report no support.
+    fn test_accept(
+        &self,
+        _transactions: Vec<Transaction>,
+    ) -> Result<Vec<TestAcceptResult>, String> {
+        Err("dry-run admission is unavailable on this data source".to_owned())
+    }
+}
+
+/// One dry-run admission verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestAcceptResult {
+    /// Candidate transaction ID.
+    pub txid: Txid,
+    /// Candidate witness transaction ID.
+    pub wtxid: Wtxid,
+    /// Whether ordinary admission would accept the transaction now.
+    pub allowed: bool,
+    /// Policy virtual size, present when the candidate was accepted.
+    pub vsize: Option<usize>,
+    /// Absolute fee in satoshis, present when the candidate was accepted.
+    pub fee_sats: Option<u64>,
+    /// Bounded rejection reason, present when the candidate was refused.
+    pub reject_reason: Option<String>,
 }
 
 /// Inbound listener or peer-service failure.

@@ -56,6 +56,15 @@ Primary references:
 | Mempool policy | TRUC, full-RBF defaults, ephemeral dust, 1p1c package relay, orphan accounting, 0.1 sat/vB defaults, multiple data carriers, and the 2,500 legacy-sigop standard limit changed across 27–31. | Implemented as a separate policy layer with Core 31 cluster/TRUC/standardness bounds and atomic adversarial coverage. Replacement is intentionally a conservative subset; exact feerate-diagram and sibling ordering is P2 and is not labeled exact parity. |
 | Storage/indexes | Pruning cadence, dbcache defaults, coinstats index format, and tx-output-spender index changed. | rBTC's freezer/cache retain independent bounded invariants; configurable pruning, both full reindex paths, and optional tx/spent-output/BIP158 indexes are complete. |
 | RPC/wallet/mining | JSON-RPC, wallet, descriptor, fee, mining IPC, and response fields changed. | rBTC's documented bounded authenticated API and watch-only external-signer wallet are supported; exact Core RPC, hot-wallet, and mining parity is not a validating-node requirement. |
+
+`testmempoolaccept` follows Core's field names and semantics for `txid`,
+`wtxid`, `allowed`, `vsize`, and `reject-reason`, with two deliberate
+differences: fees are reported as `fees.base_sats` in satoshis rather than
+Core's `fees.base` in BTC, because the bounded API reports integral satoshi
+amounts throughout; and the package ceiling is 25 candidates, matching the
+admission pool's package bound rather than Core's separate RPC limit. Reject
+reasons are rBTC admission-error strings truncated to 256 bytes, not Core's
+reject-reason vocabulary.
 | Security | Later releases fixed addr, block-download/storage, and Core queue-lifetime issues. | Each advisory is checked against rBTC's independent bounded transports, pre-validation staging, freezer deletion, and synchronous FFI ownership. Applicable findings must gain a regression before release. |
 
 ## Core 31 acceptance evidence
