@@ -33,6 +33,7 @@ pub mod merkle_proof;
 pub mod mphf;
 pub mod node;
 pub mod p2p;
+pub mod p2p_v2;
 pub mod peer_store;
 pub mod rebroadcast_store;
 pub mod signet;
