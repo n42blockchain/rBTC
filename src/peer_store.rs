@@ -674,6 +674,93 @@ impl RedbPeerStore {
         Ok(discouraged_until)
     }
 
+    /// Discourages one address until `until` on explicit operator request.
+    ///
+    /// Unlike [`RedbPeerStore::record_protocol_violation`], this does not
+    /// escalate: the caller owns the deadline, bounded by the same one-day
+    /// ceiling the automatic cooldown uses, and an existing longer cooldown
+    /// is never shortened. The stored record requires at least one recorded
+    /// violation, so a manual cooldown on an otherwise clean address occupies
+    /// the first escalation step; [`RedbPeerStore::clear_discouragement`]
+    /// discards it again.
+    pub fn discourage_until(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+        until: u32,
+    ) -> Result<u32, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let until = until.min(now.saturating_add(MAX_PROTOCOL_COOLDOWN_SECS));
+        let mut penalties = self.load_penalties()?;
+        let key = address.to_string();
+        let existing = penalties.get(&key);
+        let discouraged_until =
+            existing.map_or(until, |penalty| penalty.discouraged_until.max(until));
+        let violations = existing.map_or(1, |penalty| penalty.violations);
+        let last_violation = existing.map_or(now, |penalty| penalty.last_violation);
+        penalties.insert(
+            key,
+            StoredPenalty {
+                violations,
+                last_violation,
+                discouraged_until,
+            },
+        );
+        let mut penalties = penalties.into_iter().collect::<Vec<_>>();
+        penalties.sort_unstable_by_key(|(_, penalty)| {
+            (
+                std::cmp::Reverse(penalty.discouraged_until),
+                std::cmp::Reverse(penalty.last_violation),
+            )
+        });
+        penalties.truncate(MAX_STORED_PENALTIES);
+        self.replace_penalties(&penalties)?;
+        Ok(discouraged_until)
+    }
+
+    /// Clears any cooldown for one address on explicit operator request.
+    ///
+    /// Returns whether a record existed. The address becomes an ordinary
+    /// candidate again; its accumulated violation count is discarded with it,
+    /// so a later violation restarts escalation from the initial cooldown.
+    pub fn clear_discouragement(
+        &self,
+        address: std::net::SocketAddr,
+    ) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut penalties = self.load_penalties()?;
+        if penalties.remove(&address.to_string()).is_none() {
+            return Ok(false);
+        }
+        let penalties = penalties.into_iter().collect::<Vec<_>>();
+        self.replace_penalties(&penalties)?;
+        Ok(true)
+    }
+
+    /// Returns every stored cooldown with its deadline, newest deadline first.
+    pub fn discouragements(
+        &self,
+        now: u32,
+    ) -> Result<Vec<(std::net::SocketAddr, u32)>, PeerStoreError> {
+        let mut active = self
+            .load_penalties()?
+            .into_iter()
+            .filter_map(|(address, penalty)| {
+                (penalty.discouraged_until > now)
+                    .then(|| {
+                        std::net::SocketAddr::from_str(&address)
+                            .ok()
+                            .map(|address| (address, penalty.discouraged_until))
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        active.sort_unstable_by_key(|(address, until)| {
+            (std::cmp::Reverse(*until), address.to_string())
+        });
+        Ok(active)
+    }
+
     /// Returns all addresses whose objective protocol cooldown is still active.
     pub fn discouraged_addresses(
         &self,

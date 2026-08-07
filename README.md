@@ -56,6 +56,15 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   returns the coin's outpoint, value, height, coinbase flag, and script, plus
   a `next_cursor` that is present only when the page filled completely, so an
   exhausted walk terminates without an extra probe.
+- Authenticated `listbanned` and `setban ADDRESS add|remove [SECONDS]`
+  administer local peer cooldowns durably through the existing peer store. A
+  cooldown makes an address an ineligible outbound candidate and refuses its
+  inbound connections; it never touches consensus state, and the automatic
+  objective-violation cooldown keeps applying independently. Durations are
+  bounded by the same one-day ceiling, default to 24 hours, and never shorten
+  an active cooldown. Because the stored record requires at least one recorded
+  violation, a manual cooldown on an otherwise clean address occupies the
+  first escalation step, and removing it discards that again.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

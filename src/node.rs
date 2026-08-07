@@ -2976,6 +2976,11 @@ const MAX_RPC_MEMPOOL_PAGE: usize = 1_000;
 const MAX_RPC_TEST_ACCEPT_TRANSACTIONS: usize = 25;
 /// Bound on entries returned by one bounded chainstate scan page.
 const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
+/// Default operator cooldown when `setban add` omits a duration; matches
+/// Core's 24-hour default and the automatic cooldown ceiling.
+const DEFAULT_RPC_BAN_SECONDS: u32 = 24 * 60 * 60;
+/// Ceiling shared with the automatic protocol-violation cooldown.
+const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 /// Bound on one reported rejection reason.
 const MAX_RPC_REJECT_REASON_BYTES: usize = 256;
 const MAX_RPC_BLOCK_CHUNK_BYTES: usize = 24 * 1024;
@@ -2993,6 +2998,8 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "rbtc.submitrawtransaction",
     "testmempoolaccept",
     "rbtc.scanchainstate",
+    "listbanned",
+    "setban",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -3030,6 +3037,9 @@ impl LocalRpcOperator for NodeRpcOperator {
                 rbtc::diagnostics::set_level(level);
                 Ok(serde_json::json!({"level": level.as_str()}))
             }));
+        }
+        if matches!(method, "listbanned" | "setban") {
+            return Some(self.execute_peer_administration(method, params));
         }
         if matches!(
             method,
@@ -3315,6 +3325,94 @@ impl NodeRpcOperator {
                     )
             }
             _ => unreachable!("index method membership checked"),
+        }
+    }
+
+    /// Serves the bounded administrative peer-cooldown surface.
+    ///
+    /// This mutates local peer policy only: a cooldown makes an address an
+    /// ineligible outbound candidate and refuses its inbound connections. It
+    /// never touches consensus state, and the automatic objective-violation
+    /// cooldown continues to apply independently.
+    fn execute_peer_administration(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Node storage failure",
+        };
+        let peer_store = self
+            .source
+            .as_ref()
+            .and_then(|source| source.peer_store())
+            .ok_or(LocalRpcOperatorError {
+                code: -28,
+                message: "Node data is not ready",
+            })?;
+        let now = unix_time().map_err(|_| storage())?;
+        if method == "listbanned" {
+            if !rpc_has_no_params(params) {
+                return Err(invalid());
+            }
+            let entries = peer_store.discouragements(now).map_err(|_| storage())?;
+            return Ok(serde_json::Value::Array(
+                entries
+                    .into_iter()
+                    .map(|(address, until)| {
+                        serde_json::json!({
+                            "address": address.to_string(),
+                            "banned_until": until,
+                            "ban_duration": until.saturating_sub(now),
+                        })
+                    })
+                    .collect(),
+            ));
+        }
+        let values = params.as_array().ok_or_else(invalid)?;
+        if !(2..=3).contains(&values.len()) {
+            return Err(invalid());
+        }
+        let address = values[0]
+            .as_str()
+            .and_then(|value| SocketAddr::from_str(value).ok())
+            .ok_or_else(invalid)?;
+        match values[1].as_str().ok_or_else(invalid)? {
+            "add" => {
+                let seconds = match values.get(2) {
+                    None => DEFAULT_RPC_BAN_SECONDS,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|seconds| (1..=MAX_PROTOCOL_COOLDOWN_SECS).contains(seconds))
+                        .ok_or_else(invalid)?,
+                };
+                let until = peer_store
+                    .discourage_until(address, now, now.saturating_add(seconds))
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "banned_until": until,
+                }))
+            }
+            "remove" => {
+                if values.len() != 2 {
+                    return Err(invalid());
+                }
+                let cleared = peer_store
+                    .clear_discouragement(address)
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "removed": cleared,
+                }))
+            }
+            _ => Err(invalid()),
         }
     }
 
@@ -4225,6 +4323,14 @@ impl SharedInboundSource {
             shared: Arc::clone(self),
             source,
         }
+    }
+
+    fn peer_store(&self) -> Option<Arc<RedbPeerStore>> {
+        self.peer_store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)
     }
 
     fn install_peer_store(&self, peer_store: Option<Arc<RedbPeerStore>>) {
@@ -16777,6 +16883,143 @@ mod tests {
             .unwrap();
         assert!(past_end["entries"].as_array().unwrap().is_empty());
         assert!(past_end["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn operator_rpc_administers_bounded_peer_cooldowns() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(Arc::clone(&peer_store)));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+
+        let empty = operator
+            .execute("listbanned", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+
+        let added = operator
+            .execute("setban", &serde_json::json!([address, "add", 600]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(added["address"], address);
+        let now = unix_time().unwrap();
+        let until = u32::try_from(added["banned_until"].as_u64().unwrap()).unwrap();
+        assert!(
+            (now + 590..=now + 600).contains(&until),
+            "the deadline honours the requested duration"
+        );
+        assert!(
+            peer_store
+                .is_discouraged(address.parse().unwrap(), now)
+                .unwrap(),
+            "the cooldown is durable in the peer store"
+        );
+
+        let listed = operator
+            .execute("listbanned", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["address"], address);
+        assert_eq!(listed[0]["banned_until"], u64::from(until));
+
+        // A shorter request never shortens an active cooldown.
+        let shortened = operator
+            .execute("setban", &serde_json::json!([address, "add", 5]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u32::try_from(shortened["banned_until"].as_u64().unwrap()).unwrap(),
+            until,
+            "an existing longer cooldown is retained"
+        );
+
+        let removed = operator
+            .execute("setban", &serde_json::json!([address, "remove"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        assert!(
+            !peer_store
+                .is_discouraged(address.parse().unwrap(), now)
+                .unwrap(),
+            "removal clears the durable cooldown"
+        );
+        assert_eq!(
+            operator
+                .execute("setban", &serde_json::json!([address, "remove"]))
+                .unwrap()
+                .unwrap()["removed"],
+            false,
+            "removing an absent cooldown reports no change"
+        );
+    }
+
+    #[test]
+    fn operator_rpc_rejects_malformed_peer_administration_requests() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(peer_store));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([address]),
+            serde_json::json!(["not-an-address", "add"]),
+            serde_json::json!([address, "purge"]),
+            serde_json::json!([address, "add", 0]),
+            serde_json::json!([address, "add", 24 * 60 * 60 + 1]),
+            serde_json::json!([address, "remove", 60]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("setban", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed administration requests are rejected: {invalid}"
+            );
+        }
+        assert_eq!(
+            operator
+                .execute("listbanned", &serde_json::json!([1]))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            -32602
+        );
     }
 
     #[test]
