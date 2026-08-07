@@ -524,6 +524,20 @@ pub trait InboundDataSource: Send + Sync + 'static {
     ) -> Result<Vec<TestAcceptResult>, String> {
         Err("dry-run admission is unavailable on this data source".to_owned())
     }
+
+    /// One bounded, ordered page of the active UTXO set.
+    ///
+    /// Pages start after `after` in database key order and are limited to
+    /// `limit` entries, so a caller walks the set in fixed memory instead of
+    /// materializing it. Implementations without chain context report no
+    /// support.
+    fn chainstate_page(
+        &self,
+        _after: Option<OutPointKey>,
+        _limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        Err("chainstate scanning is unavailable on this data source".to_owned())
+    }
 }
 
 /// One dry-run admission verdict.

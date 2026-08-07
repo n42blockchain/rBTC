@@ -2974,6 +2974,8 @@ const MAX_RPC_MEMPOOL_PAGE: usize = 1_000;
 /// Bound on candidates accepted by one dry-run admission request; matches
 /// the admission pool's package ceiling.
 const MAX_RPC_TEST_ACCEPT_TRANSACTIONS: usize = 25;
+/// Bound on entries returned by one bounded chainstate scan page.
+const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
 /// Bound on one reported rejection reason.
 const MAX_RPC_REJECT_REASON_BYTES: usize = 256;
 const MAX_RPC_BLOCK_CHUNK_BYTES: usize = 24 * 1024;
@@ -2990,6 +2992,7 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "rbtc.getblockchunk",
     "rbtc.submitrawtransaction",
     "testmempoolaccept",
+    "rbtc.scanchainstate",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -3040,6 +3043,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "rbtc.getblockchunk"
                 | "rbtc.submitrawtransaction"
                 | "testmempoolaccept"
+                | "rbtc.scanchainstate"
         ) {
             return Some(
                 if matches!(
@@ -3533,6 +3537,49 @@ impl NodeRpcOperator {
                         .collect(),
                 ))
             }
+            "rbtc.scanchainstate" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.len() != 2 {
+                    return Err(invalid());
+                }
+                let after = match &values[0] {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(cursor) => {
+                        Some(rpc_outpoint_cursor(cursor).ok_or_else(invalid)?)
+                    }
+                    _ => return Err(invalid()),
+                };
+                let limit = values[1]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|limit| (1..=MAX_RPC_CHAINSTATE_PAGE).contains(limit))
+                    .ok_or_else(invalid)?;
+                let page = source
+                    .chainstate_page(after, limit)
+                    .map_err(|_| unavailable())?;
+                let next_cursor = (page.len() == limit)
+                    .then(|| page.last().map(|(outpoint, _)| outpoint.to_string()))
+                    .flatten();
+                Ok(serde_json::json!({
+                    "entries": page
+                        .into_iter()
+                        .map(|(outpoint, utxo)| {
+                            let outpoint = outpoint.to_outpoint();
+                            serde_json::json!({
+                                "txid": outpoint.txid.to_string(),
+                                "vout": outpoint.vout,
+                                "value_sats": utxo.value_sats,
+                                "height": utxo.height,
+                                "coinbase": utxo.is_coinbase,
+                                "scriptPubKey": {
+                                    "hex": utxo.script_pubkey.to_lower_hex_string()
+                                },
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "next_cursor": next_cursor,
+                }))
+            }
             "rbtc.submitrawtransaction" => {
                 let values = params.as_array().ok_or_else(invalid)?;
                 let raw = values
@@ -3565,6 +3612,14 @@ impl NodeRpcOperator {
             _ => unreachable!("data method membership checked"),
         }
     }
+}
+
+/// Parses a `txid:vout` scan cursor into a database key.
+fn rpc_outpoint_cursor(cursor: &str) -> Option<OutPointKey> {
+    let (txid, vout) = cursor.split_once(':')?;
+    let txid = Txid::from_str(txid).ok()?;
+    let vout = vout.parse::<u32>().ok()?;
+    Some(OutPointKey::from(OutPoint::new(txid, vout)))
 }
 
 /// Truncates a rejection reason at a character boundary within the bound.
@@ -4261,6 +4316,14 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.test_accept(transactions)
     }
 
+    fn chainstate_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        self.current()?.chainstate_page(after, limit)
+    }
+
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         self.advertised_address
             .map(|address| (address, self.services))
@@ -4491,6 +4554,16 @@ impl InboundDataSource for NodeInboundSource {
 
     fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
         self.dry_run_admission(transactions)
+    }
+
+    fn chainstate_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        self.chainstate
+            .utxo_snapshot_page(after, limit)
+            .map_err(|error| error.to_string())
     }
 
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String> {
@@ -16612,6 +16685,136 @@ mod tests {
             repeated[0].allowed,
             "dry runs are independent of each other"
         );
+    }
+
+    #[test]
+    fn operator_rpc_walks_the_chainstate_in_bounded_cursor_pages() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, funding, funded) = dry_run_test_source(directory.path());
+        // Fund three more distinct outpoints so paging has several entries.
+        let extra = (1..4u32)
+            .map(|vout| OutPoint::new(funding.txid, vout))
+            .collect::<Vec<_>>();
+        node_source
+            .chainstate
+            .apply(
+                &[],
+                &extra
+                    .iter()
+                    .map(|outpoint| (OutPointKey::from(*outpoint), funded.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut expected = extra;
+        expected.push(funding);
+        expected.sort_by_key(|outpoint| *OutPointKey::from(*outpoint).as_bytes());
+
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+
+        let mut cursor = serde_json::Value::Null;
+        let mut walked = Vec::new();
+        for _ in 0..8 {
+            let page = operator
+                .execute(
+                    "rbtc.scanchainstate",
+                    &serde_json::json!([cursor.clone(), 3]),
+                )
+                .unwrap()
+                .unwrap();
+            for entry in page["entries"].as_array().expect("entries are an array") {
+                walked.push(OutPoint::new(
+                    Txid::from_str(entry["txid"].as_str().unwrap()).unwrap(),
+                    u32::try_from(entry["vout"].as_u64().unwrap()).unwrap(),
+                ));
+                assert_eq!(entry["value_sats"], funded.value_sats);
+                assert_eq!(entry["height"], funded.height);
+                assert_eq!(entry["coinbase"], funded.is_coinbase);
+                assert_eq!(
+                    entry["scriptPubKey"]["hex"],
+                    funded.script_pubkey.to_lower_hex_string()
+                );
+            }
+            cursor = page["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        assert!(
+            cursor.is_null(),
+            "an exhausted scan reports no continuation cursor"
+        );
+        assert_eq!(walked, expected, "the scan visits every coin exactly once");
+
+        let full = operator
+            .execute("rbtc.scanchainstate", &serde_json::json!([null, 4]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(full["entries"].as_array().unwrap().len(), 4);
+        assert!(
+            !full["next_cursor"].is_null(),
+            "a full page always offers a continuation cursor"
+        );
+        let past_end = operator
+            .execute(
+                "rbtc.scanchainstate",
+                &serde_json::json!([full["next_cursor"].clone(), 4]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(past_end["entries"].as_array().unwrap().is_empty());
+        assert!(past_end["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn operator_rpc_rejects_malformed_chainstate_scan_requests() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, ..) = dry_run_test_source(directory.path());
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        for invalid in [
+            serde_json::json!([null]),
+            serde_json::json!([null, 0]),
+            serde_json::json!([null, MAX_RPC_CHAINSTATE_PAGE + 1]),
+            serde_json::json!(["not-an-outpoint", 1]),
+            serde_json::json!([7, 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("rbtc.scanchainstate", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed scan requests are rejected: {invalid}"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,7 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   topics with bounded slow-subscriber drop accounting.
 - Authenticated `testmempoolaccept` returning bounded Core-shaped dry-run
   admission verdicts without mutating the mempool.
+- Authenticated `rbtc.scanchainstate` cursor-paged bounded UTXO-set scan.
 
 ### Safety
 

@@ -50,6 +50,12 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   candidate is retained, persisted, or relayed on any path — the live pool is
   byte-for-byte unchanged whether the package is accepted or refused.
   Rejection reasons are the admission error truncated to 256 bytes.
+- Authenticated `rbtc.scanchainstate` walks the active UTXO set in bounded
+  cursor pages of at most 1,000 entries, reusing the chainstate's existing
+  fixed-memory paging primitive rather than materializing the set. Each page
+  returns the coin's outpoint, value, height, coinbase flag, and script, plus
+  a `next_cursor` that is present only when the page filled completely, so an
+  exhausted walk terminates without an extra probe.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete
