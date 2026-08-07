@@ -346,8 +346,11 @@ optional where appropriate, and host-runtime compatible.
 - [ ] GUI, legacy wallet import, exact Core RPC field parity, and specialized
   index/mining APIs only in response to a concrete deployment requirement.
 - [ ] Native onion/I2P address persistence and name-proxy discovery.
-- [ ] Administrative peer mutation and a general bounded offline/cursor
-  chainstate scan.
+- [x] Administrative peer mutation and a general bounded cursor chainstate
+  scan. Authenticated `listbanned`/`setban` administer durable local peer
+  cooldowns through the existing peer store, and `rbtc.scanchainstate` walks
+  the active UTXO set in bounded cursor pages over the chainstate's
+  fixed-memory pager. An offline scan without a running node remains open.
 - [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
   the supported conservative replacement subset remains interoperable.
 
