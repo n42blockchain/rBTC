@@ -18,6 +18,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   fuzzing, and public-network soak gates.
 - Opt-in BIP324 v2 encrypted transport for outbound peers (`--v2-transport`),
   with the specified one-shot v1 retry when a peer closes the v2 attempt.
+- Minimal local block assembly for low-difficulty networks, removing the
+  external-daemon dependency from regtest block production in tests.
 
 ### Safety
 

@@ -21,6 +21,12 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   encrypted session and the v1 fallback against a real Core 31 daemon, and a
   dedicated fuzz target drives the deterministic responder handshake and
   record layer.
+- Minimal local block assembly (`block_assembly`) for low-difficulty
+  networks: template-driven coinbase construction with the validator's exact
+  BIP34 height encoding, always-present segwit witness commitments, subsidy
+  plus declared fees, and a bounded 32-bit nonce search. Regtest pipeline
+  tests produce their blocks through this module instead of an external
+  daemon; it is deliberately not a mining template provider.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

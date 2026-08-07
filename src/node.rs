@@ -15821,7 +15821,7 @@ mod tests {
     use proptest::prelude::*;
     use rbtc::{
         api::ExplorerIndex,
-        blockchain::{block_subsidy, block_subsidy_with_interval},
+        blockchain::block_subsidy,
         chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
@@ -18436,43 +18436,10 @@ mod tests {
     }
 
     fn regtest_block_at_height(parent: BlockHash, time: u32, height: u32) -> Block {
-        let coinbase = Transaction {
-            version: TransactionVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: bitcoin::script::Builder::new()
-                    .push_int(i64::from(height))
-                    .push_opcode(bitcoin::opcodes::all::OP_PUSHBYTES_0)
-                    .into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::default(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy_with_interval(height, 150)),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        };
-        let mut block = Block {
-            header: Header {
-                version: Version::from_consensus(4),
-                prev_blockhash: parent,
-                merkle_root: TxMerkleNode::all_zeros(),
-                time,
-                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
-                nonce: 0,
-            },
-            txdata: vec![coinbase],
-        };
-        block.header.merkle_root = block.compute_merkle_root().unwrap();
-        while block
-            .header
-            .validate_pow(Target::MAX_ATTAINABLE_REGTEST)
-            .is_err()
-        {
-            block.header.nonce = block.header.nonce.checked_add(1).unwrap();
-        }
-        block
+        crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+            parent, height, time,
+        ))
+        .expect("regtest block assembles")
     }
 
     fn daemon_argument() -> impl Strategy<Value = String> {
