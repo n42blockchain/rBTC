@@ -578,6 +578,22 @@ impl From<OnionAddress> for ProxyTarget {
     }
 }
 
+/// A v3 onion service learned from `addrv2`.
+///
+/// Onion peers are kept apart from routable addresses everywhere: they are
+/// reachable only through a proxy, they carry no source group usable for
+/// IP-range diversity, and mixing them into the routable pool would let one
+/// pool's bounds displace the other's entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OnionPeerAddress {
+    /// Validated v3 service name and port.
+    pub onion: OnionAddress,
+    /// Service flags advertised with the address.
+    pub services: ServiceFlags,
+    /// Peer-supplied last-seen Unix timestamp.
+    pub last_seen: u32,
+}
+
 /// A directly connectable IPv4 or IPv6 address learned from `addr`/`addrv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerAddress {
@@ -832,6 +848,7 @@ pub struct PeerSession<S> {
     announced_transaction_bytes: usize,
     mempool_relay_source: Option<MempoolRelaySource>,
     block_transfer_stats: BlockTransferStats,
+    onion_addresses: Vec<OnionPeerAddress>,
 }
 
 /// An accepted inbound Bitcoin peer after a bounded v1 handshake.
@@ -905,6 +922,7 @@ impl<S> PeerSession<S> {
             announced_transaction_bytes: 0,
             mempool_relay_source: None,
             block_transfer_stats: BlockTransferStats::default(),
+            onion_addresses: Vec::new(),
         }
     }
 
@@ -923,6 +941,14 @@ impl<S> PeerSession<S> {
     #[cfg(test)]
     pub(crate) fn into_test_transport(self) -> PeerTransport<S> {
         self.transport
+    }
+
+    /// Takes the v3 onion addresses observed in the last `addrv2` response.
+    ///
+    /// The routable and onion halves of one bounded response are returned
+    /// separately because they enter different, independently bounded pools.
+    pub fn take_onion_addresses(&mut self) -> Vec<OnionPeerAddress> {
+        std::mem::take(&mut self.onion_addresses)
     }
 
     /// Returns cumulative measurements for fully received requested block batches.
@@ -2085,16 +2111,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                             count: addresses.len(),
                         });
                     }
-                    return Ok(deduplicate_addresses(addresses.into_iter().filter_map(
-                        |address: AddrV2Message| {
+                    let mut onions = Vec::new();
+                    let routable = addresses
+                        .into_iter()
+                        .filter_map(|address: AddrV2Message| {
+                            if let AddrV2::TorV3(public_key) = address.addr {
+                                if address.port != 0 {
+                                    onions.push(OnionPeerAddress {
+                                        onion: OnionAddress::from_public_key(
+                                            public_key,
+                                            address.port,
+                                        ),
+                                        services: address.services,
+                                        last_seen: address.time,
+                                    });
+                                }
+                                return None;
+                            }
                             let socket = address.socket_addr().ok()?;
                             (socket.port() != 0).then_some(PeerAddress {
                                 socket,
                                 services: address.services,
                                 last_seen: address.time,
                             })
-                        },
-                    )));
+                        })
+                        .collect::<Vec<_>>();
+                    onions.sort_by(|left, right| left.onion.cmp(&right.onion));
+                    onions.dedup_by(|left, right| left.onion == right.onion);
+                    self.onion_addresses = onions;
+                    return Ok(deduplicate_addresses(routable.into_iter()));
                 }
                 _ => {}
             }
@@ -5652,6 +5697,71 @@ mod tests {
         drop(client);
         target_server.await.unwrap();
         proxy_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn addrv2_onion_entries_are_retained_apart_from_routable_addresses() {
+        let (client_stream, server_stream) = duplex(1 << 16);
+        let mut session = PeerSession::new(
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+            version(1),
+        );
+        let full_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let server = tokio::spawn(async move {
+            let mut peer = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            peer.write_message(NetworkMessage::AddrV2(vec![
+                AddrV2Message {
+                    time: 100,
+                    services: full_services,
+                    addr: AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
+                    port: 18_444,
+                },
+                AddrV2Message {
+                    time: 101,
+                    services: full_services,
+                    addr: AddrV2::TorV3([0x11; 32]),
+                    port: 8333,
+                },
+                // A duplicate onion service is folded into one entry.
+                AddrV2Message {
+                    time: 102,
+                    services: full_services,
+                    addr: AddrV2::TorV3([0x11; 32]),
+                    port: 8333,
+                },
+                // A zero port is refused on both address families.
+                AddrV2Message {
+                    time: 103,
+                    services: full_services,
+                    addr: AddrV2::TorV3([0x22; 32]),
+                    port: 0,
+                },
+            ]))
+            .await
+            .unwrap();
+        });
+        session.request_addresses().await.unwrap();
+        let routable = session.receive_addresses().await.unwrap();
+        assert_eq!(routable.len(), 1, "onion entries leave the routable list");
+        assert_eq!(routable[0].socket.port(), 18_444);
+
+        let onions = session.take_onion_addresses();
+        assert_eq!(onions.len(), 1, "duplicates and zero ports are dropped");
+        assert_eq!(
+            onions[0].onion,
+            OnionAddress::from_public_key([0x11; 32], 8333)
+        );
+        assert_eq!(onions[0].services, full_services);
+        assert_eq!(onions[0].last_seen, 101);
+        assert!(
+            session.take_onion_addresses().is_empty(),
+            "taking the batch clears it"
+        );
+        server.await.unwrap();
     }
 
     #[test]

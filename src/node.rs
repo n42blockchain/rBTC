@@ -9435,6 +9435,20 @@ async fn discover_peer_addresses(
                 Ok(_) => {}
                 Err(error) => rbtc_warn!("peer address persistence from {source} failed: {error}"),
             }
+            // Onion services observed in the same bounded response enter
+            // their own independently bounded address book.
+            let onions = session.take_onion_addresses();
+            if !onions.is_empty() {
+                match store.insert_discovered_onion(&onions, now) {
+                    Ok(inserted) if inserted > 0 => rbtc_info!(
+                        "persisted {inserted} learned onion peer addresses from {source}"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        rbtc_warn!("onion peer address persistence from {source} failed: {error}");
+                    }
+                }
+            }
         }
         Ok(Err(error)) => rbtc_warn!("peer address discovery from {source} failed: {error}"),
         Err(_) => rbtc_warn!(

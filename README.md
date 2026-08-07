@@ -73,9 +73,15 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   name is resolved inside the anonymity network and this host performs no DNS
   lookup for it; the local `version` then advertises an unspecified receiver
   address rather than a routable socket. BIP324 preference and the one-shot
-  v1 retry apply unchanged. Onion address-book persistence, `onlynet`
-  integration, and automatic onion-service creation through the Tor control
-  port remain open.
+  v1 retry apply unchanged. Learned onion services persist in their own
+  bounded address book: `addrv2` TorV3 entries are retained apart from
+  routable addresses, deduplicated, and stored in a separate table with an
+  independent 1,024-entry ceiling, the same full-history/witness service
+  requirement, terrible-entry hygiene, retry backoff, and discouragement
+  checks. Keeping the books separate means an onion flood can neither
+  displace routable peers nor inherit IP-range diversity rules that do not
+  apply to it. Automatic onion-service creation through the Tor control port,
+  `onlynet` integration for onion candidates, and I2P remain open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

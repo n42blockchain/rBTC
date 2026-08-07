@@ -17,11 +17,15 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::p2p::PeerAddress;
+use crate::p2p::{OnionAddress, OnionPeerAddress, PeerAddress};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_metadata");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_addresses");
 const PENALTIES: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_penalties");
+/// v3 onion services are kept in their own address book: they are reachable
+/// only through a proxy and carry no IP source group, so they must not share
+/// the routable pool's bounds or diversity rules.
+const ONION_PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_onion_addresses");
 const GENESIS_KEY: &str = "genesis";
 const BUCKET_KEY: &str = "bucket_key";
 const TRIED_COLLISIONS_KEY: &str = "tried_collisions";
@@ -45,6 +49,12 @@ const INITIAL_PROTOCOL_COOLDOWN_SECS: u32 = 60 * 60;
 const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 const PROTOCOL_VIOLATION_DECAY_SECS: u32 = 7 * 24 * 60 * 60;
 const MAX_STORED_PENALTIES: usize = 1_024;
+/// Independent retention ceiling for the onion address book.
+const MAX_STORED_ONION_PEERS: usize = 1_024;
+/// Family marker for onion records, which have no IP range to diversify over.
+const ONION_SOURCE_GROUP_FAMILY: &str = "onion";
+/// Complete source-group value stored on every onion record.
+const ONION_SOURCE_GROUP: &str = "onion:0:0";
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
@@ -99,7 +109,7 @@ pub enum PeerStoreError {
     Malformed(&'static str),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredPeer {
     services: u64,
@@ -198,6 +208,7 @@ impl RedbPeerStore {
             };
             let _peers = transaction.open_table(PEERS)?;
             let _penalties = transaction.open_table(PENALTIES)?;
+            let _onion = transaction.open_table(ONION_PEERS)?;
             bucket_key
         };
         transaction.commit()?;
@@ -420,6 +431,172 @@ impl RedbPeerStore {
         let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.bucket_key);
         self.replace_all_and_collisions(&ordered, &collisions)?;
         Ok(retained)
+    }
+
+    /// Atomically filters and stores one peer-sourced onion address batch.
+    ///
+    /// Entries must advertise full history and witness service, exactly like
+    /// routable candidates. The book is pruned of terrible entries first and
+    /// truncated to its own ceiling afterwards, so a flood of onion addresses
+    /// can neither grow unboundedly nor displace routable peers.
+    pub fn insert_discovered_onion(
+        &self,
+        addresses: &[OnionPeerAddress],
+        now: u32,
+    ) -> Result<usize, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let mut records = self.load_onion_records()?;
+        records.retain(|_, record| {
+            ServiceFlags::from(record.services).has(required) && !is_terrible(record, now)
+        });
+        let mut inserted = 0;
+        for address in addresses {
+            if !address.services.has(required)
+                || address.last_seen == 0
+                || address.last_seen > now.saturating_add(MAX_FUTURE_SECS)
+            {
+                continue;
+            }
+            let key = address.onion.to_string();
+            if let Some(record) = records.get_mut(&key) {
+                record.last_seen = record.last_seen.max(address.last_seen);
+                record.services = address.services.to_u64();
+            } else {
+                records.insert(
+                    key,
+                    StoredPeer {
+                        services: address.services.to_u64(),
+                        last_seen: address.last_seen,
+                        // Onion services have no IP range to diversify
+                        // across, so the group is a constant marker.
+                        source_group: ONION_SOURCE_GROUP.to_owned(),
+                        ..StoredPeer::default()
+                    },
+                );
+                inserted += 1;
+            }
+        }
+        let mut ordered = records.into_iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by(|(left_key, left), (right_key, right)| {
+            peer_priority(left)
+                .cmp(&peer_priority(right))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        ordered.truncate(MAX_STORED_ONION_PEERS);
+        self.replace_onion_records(&ordered)?;
+        Ok(inserted)
+    }
+
+    /// Returns fresh onion candidates in the same reputation order routable
+    /// peers use, skipping discouraged and retry-delayed entries.
+    pub fn onion_candidates(
+        &self,
+        now: u32,
+        limit: usize,
+    ) -> Result<Vec<OnionAddress>, PeerStoreError> {
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let penalties = self.load_penalties()?;
+        let mut candidates = self
+            .load_onion_records()?
+            .into_iter()
+            .filter(|(key, record)| {
+                ServiceFlags::from(record.services).has(required)
+                    && !is_terrible(record, now)
+                    && retry_ready(record, now)
+                    && penalties
+                        .get(key)
+                        .is_none_or(|penalty| penalty.discouraged_until <= now)
+            })
+            .filter_map(|(key, record)| {
+                OnionAddress::parse(&key)
+                    .ok()
+                    .map(|onion| (peer_priority(&record), onion))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, left_onion), (right, right_onion)| {
+            left.cmp(right).then_with(|| left_onion.cmp(right_onion))
+        });
+        candidates.truncate(limit);
+        Ok(candidates.into_iter().map(|(_, onion)| onion).collect())
+    }
+
+    /// Records one attempted onion connection so retry backoff applies.
+    pub fn record_onion_attempt(
+        &self,
+        address: &OnionAddress,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_onion(address, |record| {
+            record.last_attempt = now;
+            record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        })
+    }
+
+    /// Records one completed onion handshake, clearing accumulated failures.
+    pub fn record_onion_success(
+        &self,
+        address: &OnionAddress,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_onion(address, |record| {
+            record.last_success = now;
+            record.consecutive_failures = 0;
+        })
+    }
+
+    fn update_onion(
+        &self,
+        address: &OnionAddress,
+        update: impl FnOnce(&mut StoredPeer),
+    ) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_onion_records()?;
+        let Some(record) = records.get_mut(&address.to_string()) else {
+            return Ok(false);
+        };
+        update(record);
+        let ordered = records.into_iter().collect::<Vec<_>>();
+        self.replace_onion_records(&ordered)?;
+        Ok(true)
+    }
+
+    fn load_onion_records(&self) -> Result<HashMap<String, StoredPeer>, PeerStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(ONION_PEERS)?;
+        let mut records = HashMap::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let key = key.value().to_owned();
+            if OnionAddress::parse(&key).is_err() {
+                return Err(PeerStoreError::Malformed("onion address key"));
+            }
+            records.insert(key, decode_stored_peer(value.value())?);
+        }
+        Ok(records)
+    }
+
+    fn replace_onion_records(
+        &self,
+        records: &[(String, StoredPeer)],
+    ) -> Result<(), PeerStoreError> {
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(ONION_PEERS)?;
+            let keys = table
+                .iter()?
+                .map(|row| row.map(|(key, _)| key.value().to_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            for (key, record) in records {
+                let encoded = serde_json::to_vec(record)?;
+                table.insert(key.as_str(), encoded.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Returns fresh full-history+witness candidates, newest first.
@@ -1047,6 +1224,10 @@ fn valid_source_group(group: &str) -> bool {
             u16::from_str_radix(first, 16).is_ok_and(|value| format!("{value:x}") == first)
                 && u16::from_str_radix(second, 16).is_ok_and(|value| format!("{value:x}") == second)
         }
+        // The onion address book shares this record type but has no IP
+        // range to diversify across, so its entries carry one fixed marker
+        // group. `source_group` never produces it for a routable address.
+        ONION_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
         _ => false,
     }
 }
@@ -2454,6 +2635,127 @@ mod tests {
                 ((false, 2), other_bucket),
             ]),
             vec![first, other_bucket, second]
+        );
+    }
+
+    fn onion(name: &str, port: u16, services: ServiceFlags, last_seen: u32) -> OnionPeerAddress {
+        OnionPeerAddress {
+            onion: OnionAddress::new(name, port).expect("valid v3 address"),
+            services,
+            last_seen,
+        }
+    }
+
+    /// Two distinct checksum-valid v3 service names.
+    fn onion_names() -> [String; 2] {
+        [
+            OnionAddress::from_public_key([0x11; 32], 8333)
+                .name()
+                .to_owned(),
+            OnionAddress::from_public_key([0x22; 32], 8333)
+                .name()
+                .to_owned(),
+        ]
+    }
+
+    #[test]
+    fn onion_addresses_persist_in_their_own_bounded_address_book() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let [first, second] = onion_names();
+
+        assert_eq!(
+            store
+                .insert_discovered_onion(
+                    &[
+                        onion(&first, 8333, services, now - 10),
+                        onion(&second, 8333, services, now - 20),
+                        // Refused: no full-history or witness service.
+                        onion(&first, 8334, ServiceFlags::NONE, now - 10),
+                        // Refused: an implausible future timestamp.
+                        onion(&second, 8335, services, now + 3_600),
+                    ],
+                    now,
+                )
+                .unwrap(),
+            2,
+            "only serviceable, plausibly timed addresses are stored"
+        );
+        let candidates = store.onion_candidates(now, 10).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates.iter().all(|candidate| candidate.port() == 8333),
+            "refused ports never enter the book"
+        );
+
+        // A repeated address updates rather than duplicates.
+        assert_eq!(
+            store
+                .insert_discovered_onion(&[onion(&first, 8333, services, now)], now)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.onion_candidates(now, 10).unwrap().len(), 2);
+
+        // The routable pool is untouched by onion traffic.
+        assert!(store.candidates(now, 10).unwrap().is_empty());
+
+        let target = OnionAddress::new(&first, 8333).unwrap();
+        assert!(store.record_onion_attempt(&target, now).unwrap());
+        assert!(
+            !store.onion_candidates(now, 10).unwrap().contains(&target),
+            "a just-attempted candidate waits for its retry delay"
+        );
+        assert!(store.record_onion_success(&target, now).unwrap());
+        assert!(
+            store.onion_candidates(now, 10).unwrap().contains(&target),
+            "a successful handshake clears the backoff"
+        );
+        assert!(
+            !store
+                .record_onion_attempt(&OnionAddress::from_public_key([0x33; 32], 8333), now)
+                .unwrap(),
+            "recording against an absent address reports no change"
+        );
+
+        drop(store);
+        let reopened = RedbPeerStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(
+            reopened.onion_candidates(now, 10).unwrap().len(),
+            2,
+            "the onion book survives reopen"
+        );
+    }
+
+    #[test]
+    fn onion_address_book_is_truncated_to_its_own_ceiling() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let flood = (0..u16::try_from(MAX_STORED_ONION_PEERS + 64).unwrap())
+            .map(|index| {
+                let mut key = [0_u8; 32];
+                key[..2].copy_from_slice(&index.to_le_bytes());
+                OnionPeerAddress {
+                    onion: OnionAddress::from_public_key(key, 8333),
+                    services,
+                    last_seen: now - 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        store.insert_discovered_onion(&flood, now).unwrap();
+        assert_eq!(
+            store
+                .onion_candidates(now, MAX_STORED_ONION_PEERS * 2)
+                .unwrap()
+                .len(),
+            MAX_STORED_ONION_PEERS,
+            "a flood cannot grow the book past its ceiling"
         );
     }
 }

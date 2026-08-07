@@ -29,6 +29,7 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Authenticated `listbanned` and `setban` administering durable local peer
   cooldowns.
 - Validated v3 onion outbound destinations over SOCKS5 domain addressing.
+- A separate bounded onion address book persisting learned v3 services.
 
 ### Safety
 
