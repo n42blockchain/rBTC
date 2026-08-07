@@ -97,6 +97,15 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   `PeerTargetDisconnected` events; the socket-typed `PeerConnected`/
   `PeerDisconnected` events and the socket-typed status field are unchanged
   and continue to report routable peers only. I2P remains open.
+- `--torcontrol IP:PORT --torcontrol-cookie PATH` publishes an inbound onion
+  service forwarding to the `--listen` socket, which the configuration
+  requires; a non-loopback control port and a half-supplied pair are refused
+  before any database or network open. The generated private key is stored
+  owner-only inside the data directory and replayed on the next launch, so
+  peers that learned the address keep reaching this node across restarts; it
+  is never logged. Shutdown withdraws the service with an explicit
+  `DEL_ONION` rather than relying on the connection close alone. Advertising
+  the published address to peers over `addrv2` remains open.
 - A Tor control-port client publishes and withdraws one ephemeral v3 onion
   service. It speaks only the needed subset — `PROTOCOLINFO` discovery,
   `SAFECOOKIE` challenge-response, `ADD_ONION` with a fresh ED25519-v3 key,

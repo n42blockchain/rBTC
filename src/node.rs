@@ -139,6 +139,7 @@ use rbtc::{
         DEFAULT_SNAPSHOT_CHUNK_BYTES, DEFAULT_SNAPSHOT_DOWNLOAD_WORKERS,
         MAX_SNAPSHOT_DOWNLOAD_WORKERS, SnapshotDownloadConfig, download_snapshot,
     },
+    tor_control::{PublishedOnionService, TorController},
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
         MAX_CONFIGURED_MEMPOOL_BYTES, MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
@@ -285,6 +286,7 @@ struct Options {
     network_execution: NetworkExecutionMode,
     explorer_listen: Option<SocketAddr>,
     zmq_listen: Option<SocketAddr>,
+    tor_control: Option<TorControlOptions>,
     wallet_api_files: Option<WalletApiFiles>,
     rpc_auth_token_file: Option<PathBuf>,
     deployments: DeploymentConfig,
@@ -416,6 +418,9 @@ pub struct NodeConfig {
     pub api: Option<NodeApiConfig>,
     /// Optional loopback ZMQ notification endpoint.
     pub zmq_listen: Option<SocketAddr>,
+    /// Optional Tor control port used to publish an onion service for the
+    /// inbound listener.
+    pub tor_control: Option<NodeTorControlConfig>,
     /// Consensus and IBD policy overrides.
     pub consensus: NodeConsensusConfig,
     /// Optional independent genesis validation of an assumed snapshot.
@@ -441,6 +446,7 @@ impl NodeConfig {
             storage: NodeStorageConfig::default(),
             api: None,
             zmq_listen: None,
+            tor_control: None,
             consensus: NodeConsensusConfig::default(),
             assumeutxo_validation: None,
         }
@@ -527,6 +533,10 @@ impl NodeConfig {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen,
             zmq_listen: self.zmq_listen,
+            tor_control: self.tor_control.map(|tor| TorControlOptions {
+                control: tor.control,
+                cookie: tor.cookie,
+            }),
             wallet_api_files,
             rpc_auth_token_file,
             deployments,
@@ -794,6 +804,22 @@ impl From<&NodePeerTarget> for ProxyTarget {
     }
 }
 
+/// Tor control-port settings for publishing an inbound onion service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeTorControlConfig {
+    /// Loopback control-port address.
+    pub control: SocketAddr,
+    /// Path to Tor's `control_auth_cookie`.
+    pub cookie: PathBuf,
+}
+
+/// Internal mirror of [`NodeTorControlConfig`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TorControlOptions {
+    control: SocketAddr,
+    cookie: PathBuf,
+}
+
 /// Outbound peer address-family restriction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NodeOnlyNet {
@@ -1015,6 +1041,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Publishes an inbound onion service through a Tor control port.
+    #[must_use]
+    pub fn tor_control(mut self, tor_control: NodeTorControlConfig) -> Self {
+        self.config.tor_control = Some(tor_control);
+        self
+    }
+
     /// Binds a loopback-only ZMQ notification endpoint.
     #[must_use]
     pub fn zmq_listen(mut self, listen: SocketAddr) -> Self {
@@ -1137,6 +1170,20 @@ impl NodeBuilder {
 
 fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_peer_options(&options)?;
+    if let Some(tor) = &options.tor_control {
+        if !tor.control.ip().is_loopback() {
+            return Err(
+                "the Tor control port must be reached over loopback because it controls the host's Tor instance"
+                    .to_owned(),
+            );
+        }
+        if options.inbound_listen.is_none() {
+            return Err(
+                "--torcontrol requires --listen because the published onion service forwards to the inbound listener"
+                    .to_owned(),
+            );
+        }
+    }
     if let Some(listen) = options.zmq_listen {
         if !listen.ip().is_loopback() {
             return Err(
@@ -7072,7 +7119,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7089,6 +7136,10 @@ fn startup_configuration_summary(options: &Options) -> String {
         options
             .zmq_listen
             .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
+        options
+            .tor_control
+            .as_ref()
+            .map_or_else(|| "disabled".to_owned(), |tor| tor.control.to_string()),
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
@@ -7509,6 +7560,12 @@ async fn run_peer_pool_session(
         )
     } else {
         None
+    };
+    let _onion_service = match (&options.tor_control, options.inbound_listen) {
+        (Some(tor), Some(listen)) => {
+            Some(publish_inbound_onion_service(options, tor, listen).await?)
+        }
+        _ => None,
     };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
@@ -9489,6 +9546,108 @@ async fn complete_assumeutxo_validation(
         .map_err(PeerRunError::transient)?;
     }
     Ok(())
+}
+
+/// Keeps one published onion service for the lifetime of a node run.
+///
+/// Dropping the guard closes the control connection, which withdraws an
+/// ephemeral service; the explicit `DEL_ONION` on the way out makes the
+/// withdrawal immediate and observable instead of relying on that side
+/// effect.
+struct PublishedInboundOnion {
+    controller: Option<TorController>,
+    service: PublishedOnionService,
+}
+
+impl Drop for PublishedInboundOnion {
+    fn drop(&mut self) {
+        let Some(mut controller) = self.controller.take() else {
+            return;
+        };
+        let service = self.service.clone();
+        // The control connection is async, so the withdrawal runs on the
+        // ambient runtime when one is still available; the connection close
+        // withdraws the ephemeral service either way.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = controller.remove_onion_service(&service).await {
+                    rbtc_warn!(
+                        "withdrawing onion service {} failed: {error}",
+                        service.address
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Publishes an inbound onion service forwarding to the local listener.
+///
+/// A previously stored private key republishes the same address, so peers
+/// that learned it keep reaching this node across restarts. The key is
+/// secret material: it is written owner-only inside the data directory and
+/// never logged.
+async fn publish_inbound_onion_service(
+    options: &Options,
+    tor: &TorControlOptions,
+    listen: SocketAddr,
+) -> Result<PublishedInboundOnion, String> {
+    let key_path = options
+        .data_dir
+        .as_ref()
+        .map(|data_dir| data_dir.join("onion_service_key"));
+    let existing = key_path
+        .as_ref()
+        .and_then(|path| read_owner_only_text_file(path, "onion service key", 4096).ok());
+    let mut controller = TorController::connect(
+        tor.control,
+        &tor.cookie,
+        crate::tor_control::TorControlConfig::default(),
+    )
+    .await
+    .map_err(|error| format!("connect to the Tor control port: {error}"))?;
+    let service = controller
+        .add_onion_service(listen.port(), listen, existing.as_deref())
+        .await
+        .map_err(|error| format!("publish an onion service: {error}"))?;
+    if existing.is_none() && !service.private_key.is_empty() {
+        if let Some(path) = &key_path {
+            if let Err(error) = write_owner_only_secret(path, &service.private_key) {
+                rbtc_warn!(
+                    "persisting the onion service key failed, so the address will change on restart: {error}"
+                );
+            }
+        }
+    }
+    rbtc_info!(
+        "published onion service {} forwarding to {listen}",
+        service.address
+    );
+    Ok(PublishedInboundOnion {
+        controller: Some(controller),
+        service,
+    })
+}
+
+/// Writes one secret owner-only, replacing any previous content.
+fn write_owner_only_secret(path: &std::path::Path, secret: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+    let mut file = open_options
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| format!("restrict {}: {error}", path.display()))?;
+    file.write_all(secret.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("persist {}: {error}", path.display()))
 }
 
 fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
@@ -14362,6 +14521,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut extend_validation_target = false;
     let mut explorer_listen = None;
     let mut zmq_listen = None;
+    let mut tor_control_address = None;
+    let mut tor_control_cookie = None;
     let mut wallet_descriptors = None;
     let mut wallet_auth_token_file = None;
     let mut rpc_auth_token_file = None;
@@ -14531,6 +14692,20 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     );
                 }
                 explorer_listen = Some(address);
+            }
+            "--torcontrol" => {
+                let value = required_option_value(&mut args, "--torcontrol")?;
+                tor_control_address = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid Tor control address: {value}"))?,
+                );
+            }
+            "--torcontrol-cookie" => {
+                tor_control_cookie = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--torcontrol-cookie",
+                )?));
             }
             "--zmq-listen" => {
                 let value = required_option_value(&mut args, "--zmq-listen")?;
@@ -16260,6 +16435,19 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         data_dir,
         once,
         zmq_listen,
+        tor_control: match (tor_control_address, tor_control_cookie) {
+            (Some(control), Some(cookie)) => Some(TorControlOptions { control, cookie }),
+            (Some(_), None) => {
+                return Err(
+                    "--torcontrol requires --torcontrol-cookie identifying Tor's control_auth_cookie"
+                        .to_owned(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err("--torcontrol-cookie requires --torcontrol".to_owned());
+            }
+            (None, None) => None,
+        },
         network_execution: if extend_validation_target {
             NetworkExecutionMode::ExperimentalOnceExtend
         } else if experimental_network_execution {
@@ -16433,7 +16621,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -17189,6 +17377,96 @@ mod tests {
     }
 
     #[test]
+    fn tor_control_options_require_a_cookie_a_listener_and_loopback() {
+        let directory = TempDir::new().unwrap();
+        let launch = |extra: &[&str]| {
+            let mut arguments = vec![
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--no-dns-seeds".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--connect".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+            ];
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = launch(&["--torcontrol", "127.0.0.1:9051"]) else {
+            panic!("a control port without a cookie must fail closed");
+        };
+        assert!(error.contains("--torcontrol-cookie"), "{error}");
+
+        let Err(error) = launch(&["--torcontrol-cookie", "cookie"]) else {
+            panic!("a cookie without a control port must fail closed");
+        };
+        assert!(error.contains("--torcontrol"), "{error}");
+
+        let Err(error) = launch(&[
+            "--torcontrol",
+            "127.0.0.1:9051",
+            "--torcontrol-cookie",
+            "cookie",
+        ]) else {
+            panic!("a control port without a listener must fail closed");
+        };
+        assert!(error.contains("--listen"), "{error}");
+
+        let Err(error) = launch(&[
+            "--torcontrol",
+            "203.0.113.7:9051",
+            "--torcontrol-cookie",
+            "cookie",
+            "--listen",
+            "127.0.0.1:18445",
+        ]) else {
+            panic!("a non-loopback control port must fail closed");
+        };
+        assert!(error.contains("loopback"), "{error}");
+
+        let options = launch(&[
+            "--torcontrol",
+            "127.0.0.1:9051",
+            "--torcontrol-cookie",
+            "cookie",
+            "--listen",
+            "127.0.0.1:18445",
+        ])
+        .unwrap()
+        .expect("a complete Tor control configuration parses");
+        let tor = options.tor_control.expect("the control port is retained");
+        assert_eq!(tor.control, "127.0.0.1:9051".parse().unwrap());
+        assert_eq!(tor.cookie, PathBuf::from("cookie"));
+    }
+
+    #[test]
+    fn owner_only_secrets_are_written_and_read_back() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("onion_service_key");
+        write_owner_only_secret(&path, "ED25519-V3:secret").unwrap();
+        assert_eq!(
+            read_owner_only_text_file(&path, "onion service key", 4096).unwrap(),
+            "ED25519-V3:secret"
+        );
+        // Rewriting replaces rather than appends, so a rotated key cannot
+        // leave the previous one readable in the same file.
+        write_owner_only_secret(&path, "ED25519-V3:rotated").unwrap();
+        assert_eq!(
+            read_owner_only_text_file(&path, "onion service key", 4096).unwrap(),
+            "ED25519-V3:rotated"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
     fn onlynet_onion_requires_a_proxy_and_excludes_routable_peers() {
         let directory = TempDir::new().unwrap();
         let base = [
@@ -17839,6 +18117,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -17936,6 +18215,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22252,6 +22532,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22337,6 +22618,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23992,6 +24274,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors,
                 auth_token,
@@ -24059,6 +24342,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -24465,6 +24749,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24562,6 +24847,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24644,6 +24930,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24732,6 +25019,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24805,6 +25093,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24867,6 +25156,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -24962,6 +25252,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25033,6 +25324,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25142,6 +25434,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25235,6 +25528,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25282,6 +25576,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25349,6 +25644,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25410,6 +25706,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25517,6 +25814,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25676,6 +25974,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -25792,6 +26091,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25877,6 +26177,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -25999,6 +26300,7 @@ mod tests {
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 zmq_listen: None,
+                tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -26155,6 +26457,7 @@ mod tests {
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 zmq_listen: None,
+                tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -26290,6 +26593,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Signet),

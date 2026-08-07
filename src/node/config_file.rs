@@ -32,7 +32,7 @@ const BOOL_KEYS: [&str; 10] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 34] = [
+const VALUE_KEYS: [&str; 36] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -67,6 +67,8 @@ const VALUE_KEYS: [&str; 34] = [
     "wallet_auth_token_file",
     "wallet_descriptors",
     "zmq_listen",
+    "torcontrol",
+    "torcontrol_cookie",
 ];
 
 #[derive(Clone, Debug)]
@@ -398,6 +400,8 @@ fn flag_for_key(key: &str) -> &'static str {
         "wallet_descriptors" => "--wallet-descriptors",
         "whitelist" => "--whitelist",
         "zmq_listen" => "--zmq-listen",
+        "torcontrol" => "--torcontrol",
+        "torcontrol_cookie" => "--torcontrol-cookie",
         _ => unreachable!("known value or list config key"),
     }
 }
@@ -474,6 +478,8 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--wallet-descriptors"
             | "--whitelist"
             | "--zmq-listen"
+            | "--torcontrol"
+            | "--torcontrol-cookie"
     )
     .then_some(group)
 }
@@ -528,6 +534,8 @@ fn option_group(flag: &str) -> &'static str {
         "--wallet-descriptors" => "wallet-descriptors",
         "--whitelist" => "whitelist",
         "--zmq-listen" => "zmq-listen",
+        "--torcontrol" => "torcontrol",
+        "--torcontrol-cookie" => "torcontrol-cookie",
         _ => "unknown",
     }
 }

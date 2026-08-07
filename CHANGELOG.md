@@ -36,6 +36,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Outbound scheduling of persisted onion peers, with address-type-aware
   `PeerTargetConnected`/`PeerTargetDisconnected` events alongside the
   unchanged socket-typed events.
+- `--torcontrol` publishing an inbound onion service with an owner-only,
+  reusable service key.
 
 ### Safety
 

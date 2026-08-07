@@ -62,7 +62,9 @@ The supported scalar keys are:
 
 - `network`, `data_dir`, `explorer_listen`, `rpc_auth_token_file`,
   `wallet_descriptors`, `wallet_auth_token_file`, `zmq_listen`
-  (loopback-only ZMQ notification endpoint)
+  (loopback-only ZMQ notification endpoint), `torcontrol` and
+  `torcontrol_cookie` (loopback Tor control port publishing an inbound onion
+  service; both are required together and need `listen`)
 - `minimum_chainwork`, `assumevalid`, `signetchallenge`
 - `complete_assumeutxo`, `background_assumeutxo`,
   `validation_batch_size`, `validation_pause_ms`
