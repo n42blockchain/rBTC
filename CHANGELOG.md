@@ -31,6 +31,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Validated v3 onion outbound destinations over SOCKS5 domain addressing.
 - A separate bounded onion address book persisting learned v3 services.
 - `--onlynet onion` with fail-closed proxy and combination checks.
+- A bounded Tor control-port client publishing ephemeral v3 onion services
+  with SAFECOOKIE authentication.
 
 ### Safety
 

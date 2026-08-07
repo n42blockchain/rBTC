@@ -84,8 +84,17 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   destinations and fails closed without `--proxy`, because an onion-only node
   has no other route; mixing onion with an IP family is refused rather than
   silently widened, and eligible onion candidates are reported at selection.
-  Carrying proxied targets through the outbound scheduler, automatic
-  onion-service creation through the Tor control port, and I2P remain open.
+  Carrying proxied targets through the outbound scheduler and I2P remain open.
+- A Tor control-port client publishes and withdraws one ephemeral v3 onion
+  service. It speaks only the needed subset — `PROTOCOLINFO` discovery,
+  `SAFECOOKIE` challenge-response, `ADD_ONION` with a fresh ED25519-v3 key,
+  and `DEL_ONION` — and refuses a non-loopback control port, because reaching
+  that port is equivalent to controlling the host's Tor instance. The cookie
+  is read only to compute the challenge and never sent; the control port's
+  own proof is verified before this node discloses its proof, so a port that
+  does not already hold the cookie learns nothing usable. Reply lines and
+  continuation counts are bounded, and the returned address is re-validated
+  through the same v3 checksum rules as a learned address.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

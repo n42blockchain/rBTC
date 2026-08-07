@@ -44,6 +44,7 @@ pub mod snapshot_download;
 pub mod snapshot_overlay;
 #[cfg(feature = "mdbx")]
 pub mod snapshot_overlay_redb;
+pub mod tor_control;
 pub mod transaction_admission;
 pub mod transaction_policy;
 pub mod transaction_pool_store;
