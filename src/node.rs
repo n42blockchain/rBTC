@@ -128,8 +128,8 @@ use rbtc::{
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
         MAX_PENDING_TRANSACTION_INVENTORY, MAX_PENDING_TRANSACTIONS, MAX_PROTOCOL_MESSAGE_LEN,
-        MempoolRelaySource, P2pError, PeerSession, TransactionRelay,
-        connect_outbound_via_socks5_with_transport, connect_outbound_with_transport,
+        MempoolRelaySource, OnionAddress, P2pError, PeerSession, ProxyTarget, TransactionRelay,
+        connect_outbound_with_transport, connect_proxied_target,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rbtc_info, rbtc_warn,
@@ -735,6 +735,63 @@ pub struct NodeResourceConfig {
     /// retrying each address once over v1 when the peer closes the v2
     /// handshake attempt.
     pub v2_transport: bool,
+}
+
+/// One peer destination in an address family the node can dial.
+///
+/// The socket-typed `PeerConnected`/`PeerDisconnected` events cannot express
+/// an onion peer, which has no IP address. Hosts that need to observe every
+/// peer should consume the target-typed events instead; the socket-typed
+/// events remain and continue to report routable peers only.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum NodePeerTarget {
+    /// A routable IPv4 or IPv6 peer.
+    Socket(SocketAddr),
+    /// A v3 onion service reached through the configured proxy.
+    Onion(OnionAddress),
+}
+
+impl NodePeerTarget {
+    /// Returns the routable socket when this peer has one.
+    #[must_use]
+    pub const fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Socket(socket) => Some(*socket),
+            Self::Onion(_) => None,
+        }
+    }
+}
+
+impl std::str::FromStr for NodePeerTarget {
+    type Err = String;
+
+    /// Parses `IP:PORT` or `<service>.onion:PORT`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(socket) = SocketAddr::from_str(value) {
+            return Ok(Self::Socket(socket));
+        }
+        OnionAddress::parse(value)
+            .map(Self::Onion)
+            .map_err(|_| format!("{value} is neither a routable socket nor a v3 onion address"))
+    }
+}
+
+impl std::fmt::Display for NodePeerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(socket) => write!(f, "{socket}"),
+            Self::Onion(onion) => write!(f, "{onion}"),
+        }
+    }
+}
+
+impl From<&NodePeerTarget> for ProxyTarget {
+    fn from(target: &NodePeerTarget) -> Self {
+        match target {
+            NodePeerTarget::Socket(socket) => Self::Socket(*socket),
+            NodePeerTarget::Onion(onion) => Self::Onion(onion.clone()),
+        }
+    }
 }
 
 /// Outbound peer address-family restriction.
@@ -1741,6 +1798,19 @@ pub enum NodeEvent {
         /// Remote peer address.
         address: SocketAddr,
     },
+    /// An outbound peer was selected, in any supported address family.
+    ///
+    /// Emitted for every peer, including onion services that the
+    /// socket-typed `PeerConnected` cannot express.
+    PeerTargetConnected {
+        /// Remote peer destination.
+        target: NodePeerTarget,
+    },
+    /// An outbound peer session ended, in any supported address family.
+    PeerTargetDisconnected {
+        /// Remote peer destination.
+        target: NodePeerTarget,
+    },
     /// Maximum-work header selection advanced or changed.
     HeaderTipChanged {
         /// New active header tip.
@@ -1806,6 +1876,29 @@ impl NodeObserver {
             status.active_peer = None;
             self.status.send_replace(status);
             let _ = self.events.send(NodeEvent::PeerDisconnected { address });
+        }
+    }
+
+    /// Reports one selected peer in any address family.
+    ///
+    /// A routable peer additionally updates the socket-typed status and
+    /// event; an onion peer has no socket to report there.
+    fn peer_target_connected(&self, target: &NodePeerTarget) {
+        let _ = self.events.send(NodeEvent::PeerTargetConnected {
+            target: target.clone(),
+        });
+        if let Some(address) = target.socket() {
+            self.peer_connected(address);
+        }
+    }
+
+    /// Reports one ended peer session in any address family.
+    fn peer_target_disconnected(&self, target: &NodePeerTarget) {
+        let _ = self.events.send(NodeEvent::PeerTargetDisconnected {
+            target: target.clone(),
+        });
+        if let Some(address) = target.socket() {
+            self.peer_disconnected(address);
         }
     }
 
@@ -7428,8 +7521,16 @@ async fn run_peer_pool_session(
     if let Some(source) = &inbound_source {
         source.install_peer_store(peer_store.as_ref().map(Arc::clone));
     }
-    let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
-    let mut remotes = options.remotes.clone();
+    let manual_remotes = options
+        .remotes
+        .iter()
+        .map(|remote| NodePeerTarget::Socket(*remote))
+        .collect::<HashSet<_>>();
+    let mut remotes = options
+        .remotes
+        .iter()
+        .map(|remote| NodePeerTarget::Socket(*remote))
+        .collect::<Vec<_>>();
     if let Some(store) = &peer_store {
         let now = unix_time()?;
         let pruned = store
@@ -7445,10 +7546,11 @@ async fn run_peer_pool_session(
             if remotes.len() == MAX_CONFIGURED_PEERS {
                 break;
             }
+            let incumbent = NodePeerTarget::Socket(collision.incumbent);
             if options.resources.only_net.permits(collision.incumbent.ip())
-                && !remotes.contains(&collision.incumbent)
+                && !remotes.contains(&incumbent)
             {
-                remotes.push(collision.incumbent);
+                remotes.push(incumbent);
             }
         }
         for learned in store
@@ -7458,28 +7560,38 @@ async fn run_peer_pool_session(
             if remotes.len() == MAX_CONFIGURED_PEERS {
                 break;
             }
-            if options.resources.only_net.permits(learned.ip()) && !remotes.contains(&learned) {
-                remotes.push(learned);
+            let learned_target = NodePeerTarget::Socket(learned);
+            if options.resources.only_net.permits(learned.ip())
+                && !remotes.contains(&learned_target)
+            {
+                remotes.push(learned_target);
             }
         }
-        // Onion candidates are only meaningful behind a proxy. Dialing them
-        // needs the outbound scheduler to carry proxied targets rather than
-        // sockets, so for now their availability is reported rather than
-        // scheduled; an onion-only launch surfaces that explicitly instead of
-        // spinning without peers.
+        // Onion candidates are reachable only through a proxy, so they are
+        // consulted only when one is configured and the restriction permits
+        // them. They are appended after routable candidates so an ordinary
+        // node keeps its existing selection order.
         if options.resources.only_net.permits_onion() && options.resources.proxy.is_some() {
-            let onions = store
+            let mut scheduled = 0;
+            for onion in store
                 .onion_candidates(now, MAX_CONFIGURED_PEERS)
-                .map_err(|error| error.to_string())?;
-            if !onions.is_empty() {
-                rbtc_info!(
-                    "{} persisted onion candidates are eligible; onion outbound scheduling is not enabled yet",
-                    onions.len()
-                );
+                .map_err(|error| error.to_string())?
+            {
+                if remotes.len() == MAX_CONFIGURED_PEERS {
+                    break;
+                }
+                let target = NodePeerTarget::Onion(onion);
+                if !remotes.contains(&target) {
+                    remotes.push(target);
+                    scheduled += 1;
+                }
+            }
+            if scheduled > 0 {
+                rbtc_info!("scheduled {scheduled} persisted onion peer candidates");
             }
         }
     }
-    let mut attempted = remotes.iter().copied().collect::<HashSet<_>>();
+    let mut attempted = remotes.iter().cloned().collect::<HashSet<_>>();
     let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS * 2);
     if try_peer_candidates(
         options,
@@ -7513,7 +7625,10 @@ async fn run_peer_pool_session(
         // source. `attempted` remains excluded so no address is retried in the
         // same run.
         let remaining = MAX_CONFIGURED_PEERS;
-        let mut dns_excluded = attempted.clone();
+        let mut dns_excluded = attempted
+            .iter()
+            .filter_map(NodePeerTarget::socket)
+            .collect::<HashSet<_>>();
         if let Some(store) = &peer_store {
             for discouraged in store
                 .discouraged_addresses(unix_time()?)
@@ -7539,7 +7654,11 @@ async fn run_peer_pool_session(
                 resolved.len()
             );
         }
-        attempted.extend(resolved.iter().copied());
+        let resolved = resolved
+            .into_iter()
+            .map(NodePeerTarget::Socket)
+            .collect::<Vec<_>>();
+        attempted.extend(resolved.iter().cloned());
         if try_peer_candidates(
             options,
             &resolved,
@@ -8386,20 +8505,20 @@ async fn negotiate_peer_preferences(
 }
 
 struct ConnectedPeer {
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     session: PeerSession<tokio::net::TcpStream>,
     validated_header_height: Option<u32>,
 }
 
 struct ActivePeerObservation {
     observer: Option<NodeObserver>,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
 }
 
 impl ActivePeerObservation {
-    fn new(observer: Option<NodeObserver>, remote: SocketAddr) -> Self {
+    fn new(observer: Option<NodeObserver>, remote: NodePeerTarget) -> Self {
         if let Some(observer) = &observer {
-            observer.peer_connected(remote);
+            observer.peer_target_connected(&remote);
         }
         Self { observer, remote }
     }
@@ -8408,7 +8527,7 @@ impl ActivePeerObservation {
 impl Drop for ActivePeerObservation {
     fn drop(&mut self) {
         if let Some(observer) = &self.observer {
-            observer.peer_disconnected(self.remote);
+            observer.peer_target_disconnected(&self.remote);
         }
     }
 }
@@ -8435,7 +8554,7 @@ impl PendingPeer {
 #[cfg(test)]
 async fn connect_peer(
     deployments: DeploymentConfig,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
     local_nonce: u64,
     require_full_services: bool,
@@ -8455,20 +8574,28 @@ async fn connect_peer(
 
 async fn connect_peer_with_transport(
     deployments: DeploymentConfig,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
     prefer_v2: bool,
 ) -> Result<ConnectedPeer, PeerRunError> {
+    // An onion destination has no direct route, so a missing proxy is a
+    // configuration fault rather than a peer failure.
+    if matches!(remote, NodePeerTarget::Onion(_)) && proxy.is_none() {
+        return Err(PeerRunError::local(format!(
+            "onion peer {remote} requires a configured SOCKS5 proxy"
+        )));
+    }
     let handshake_started = Instant::now();
+    let target = ProxyTarget::from(&remote);
     let mut session = timeout(PEER_TIMEOUT, async {
-        match proxy {
-            Some(proxy) => {
-                connect_outbound_via_socks5_with_transport(
+        match (proxy, &target) {
+            (Some(proxy), _) => {
+                connect_proxied_target(
                     proxy,
-                    remote,
+                    &target,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
@@ -8477,9 +8604,9 @@ async fn connect_peer_with_transport(
                 )
                 .await
             }
-            None => {
+            (None, ProxyTarget::Socket(socket)) => {
                 connect_outbound_with_transport(
-                    remote,
+                    *socket,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
@@ -8487,6 +8614,9 @@ async fn connect_peer_with_transport(
                     prefer_v2,
                 )
                 .await
+            }
+            (None, ProxyTarget::Onion(_)) => {
+                unreachable!("a proxyless onion destination is refused above")
             }
         }
     })
@@ -8515,8 +8645,13 @@ async fn connect_peer_with_transport(
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| PeerRunError::p2p(&error))?;
-        if let Some(store) = peer_store {
-            record_verified_peer(store.as_ref(), remote, remote_services, handshake_millis);
+        if let (Some(store), Some(routable)) = (peer_store.as_ref(), remote.socket()) {
+            record_verified_peer(store.as_ref(), routable, remote_services, handshake_millis);
+        }
+        if let (Some(store), NodePeerTarget::Onion(onion)) = (peer_store.as_ref(), &remote) {
+            if let Err(error) = store.record_onion_success(onion, unix_time().unwrap_or_default()) {
+                rbtc_warn!("recording onion peer {onion} success failed: {error}");
+            }
         }
     }
     Ok(ConnectedPeer {
@@ -8683,7 +8818,7 @@ impl Drop for TransactionRequestSourceGuard {
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_maintain_standby(
     deployments: DeploymentConfig,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
     local_nonce: u64,
     require_full_services: bool,
@@ -8700,7 +8835,7 @@ async fn connect_and_maintain_standby(
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer_with_transport(
         deployments,
-        remote,
+        remote.clone(),
         proxy,
         local_nonce,
         require_full_services,
@@ -8709,17 +8844,22 @@ async fn connect_and_maintain_standby(
     )
     .await?;
     let local_time = unix_time().map_err(PeerRunError::transient)?;
-    let observed = network_time.observe(
-        remote.ip(),
-        connected.session.remote_version().timestamp,
-        local_time,
-    );
-    rbtc_info!(
-        "network-time sample from {remote}: samples={} offset_seconds={} usable={}",
-        observed.samples,
-        observed.offset_seconds,
-        observed.usable
-    );
+    // Network-time samples are grouped by IP range to stop one operator from
+    // dominating the estimate. An onion peer has no such range, so it is
+    // excluded rather than counted under a fabricated group.
+    if let Some(routable) = remote.socket() {
+        let observed = network_time.observe(
+            routable.ip(),
+            connected.session.remote_version().timestamp,
+            local_time,
+        );
+        rbtc_info!(
+            "network-time sample from {remote}: samples={} offset_seconds={} usable={}",
+            observed.samples,
+            observed.offset_seconds,
+            observed.usable
+        );
+    }
     if let Some((address, services)) = advertised_address {
         timeout(
             PEER_TIMEOUT,
@@ -8784,20 +8924,20 @@ fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
 #[allow(clippy::too_many_arguments)]
 fn spawn_peer_connections(
     options: &Options,
-    remotes: &[SocketAddr],
+    remotes: &[NodePeerTarget],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
     mempool_relay_source: Option<&MempoolRelaySource>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
     network_time: &Arc<NetworkTime>,
-) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
+) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
         .iter()
-        .copied()
+        .cloned()
         .map(|remote| {
-            record_peer_attempt(peer_store.map(Arc::as_ref), remote);
+            record_peer_attempt(peer_store.map(Arc::as_ref), &remote);
             let deployments = options.deployments.clone();
             let peer_store = peer_store.cloned();
             let require_full_services = options.data_dir.is_some();
@@ -8819,7 +8959,7 @@ fn spawn_peer_connections(
             let proxy = options.resources.proxy;
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
-                remote,
+                remote.clone(),
                 proxy,
                 local_nonce,
                 require_full_services,
@@ -8847,7 +8987,7 @@ fn spawn_peer_connections(
         .collect())
 }
 
-async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPeer)>) {
+async fn abort_pending_connections(pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>) {
     for (_, connection) in pending.iter() {
         connection.task.abort();
     }
@@ -8873,7 +9013,7 @@ async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer
 }
 
 async fn activate_next_auxiliary_peer(
-    candidates: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    candidates: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
 ) {
     while let Some((remote, pending)) = candidates.pop_front() {
@@ -8891,8 +9031,8 @@ async fn activate_next_auxiliary_peer(
 }
 
 fn take_ready_auxiliary_peers(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
-) -> VecDeque<(SocketAddr, PendingPeer)> {
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
+) -> VecDeque<(NodePeerTarget, PendingPeer)> {
     let mut selected = VecDeque::new();
     while selected.len() < 3 {
         let Some(index) = pending
@@ -8911,12 +9051,12 @@ fn take_ready_auxiliary_peers(
 }
 
 async fn evict_excess_ready_standbys(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
     maximum_automatic: usize,
-) -> Vec<SocketAddr> {
+) -> Vec<NodePeerTarget> {
     let ready_automatic = pending
         .iter_mut()
         .enumerate()
@@ -8956,7 +9096,7 @@ async fn evict_excess_ready_standbys(
                 rbtc_warn!("standby peer {remote} failed during capacity eviction: {error}");
                 record_peer_failure(
                     peer_store,
-                    remote,
+                    &remote,
                     error.kind,
                     manual_remotes.contains(&remote),
                 );
@@ -8969,9 +9109,9 @@ async fn evict_excess_ready_standbys(
 }
 
 async fn reap_finished_standbys(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
 ) {
     let finished = pending
@@ -8991,7 +9131,7 @@ async fn reap_finished_standbys(
         rbtc_warn!("standby peer {remote} failed: {error}");
         record_peer_failure(
             peer_store,
-            remote,
+            &remote,
             error.kind,
             manual_remotes.contains(&remote),
         );
@@ -9002,7 +9142,7 @@ async fn reap_finished_standbys(
 #[allow(clippy::too_many_arguments)]
 async fn try_peer_candidates(
     options: &Options,
-    remotes: &[SocketAddr],
+    remotes: &[NodePeerTarget],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     api_runtime: Option<&ApiRuntime>,
@@ -9014,7 +9154,7 @@ async fn try_peer_candidates(
     mempool_relay_source: &MempoolRelaySource,
     inbound_source: Option<&Arc<SharedInboundSource>>,
     inbound_server: &mut Option<InboundServer>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<bool, String> {
@@ -9092,7 +9232,7 @@ async fn try_peer_candidates(
         match result {
             Ok(()) => {
                 if completed_validating_session(options) {
-                    record_peer_session_success(peer_store.map(Arc::as_ref), remote);
+                    record_peer_session_success(peer_store.map(Arc::as_ref), &remote);
                 }
                 abort_pending_connections(&mut pending).await;
                 return Ok(true);
@@ -9105,7 +9245,7 @@ async fn try_peer_candidates(
                 rbtc_warn!("peer {remote} failed: {error}");
                 record_peer_failure(
                     peer_store.map(Arc::as_ref),
-                    remote,
+                    &remote,
                     error.kind,
                     manual_remotes.contains(&remote),
                 );
@@ -9120,7 +9260,7 @@ async fn try_peer_candidates(
 async fn run_connected_peer(
     options: &Options,
     connected: ConnectedPeer,
-    auxiliary: VecDeque<(SocketAddr, PendingPeer)>,
+    auxiliary: VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
     api_runtime: Option<&ApiRuntime>,
     zmq_notifier: Option<&ZmqNotifier>,
@@ -9136,7 +9276,11 @@ async fn run_connected_peer(
         mut session,
         validated_header_height,
     } = connected;
-    let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote);
+    let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote.clone());
+    // Address-book maintenance, throughput ranking, and the socket-typed
+    // status view all key on a routable address, which an onion peer has
+    // none of; those steps are skipped rather than given a fabricated one.
+    let routable = remote.socket();
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
         rbtc_info!("activated peer {remote} after standby validation through height {height}");
@@ -9148,7 +9292,9 @@ async fn run_connected_peer(
 
     if let Some(path) = &options.data_dir {
         if let Some(store) = peer_store {
-            discover_peer_addresses(&mut session, store, remote).await;
+            if let Some(routable) = routable {
+                discover_peer_addresses(&mut session, store, routable).await;
+            }
         }
         let transfer_before = session.block_transfer_stats();
         let result = if options.snapshot_overlay.is_some() {
@@ -9175,7 +9321,7 @@ async fn run_connected_peer(
                 path.clone(),
                 &options.runtime_control,
                 options.observer.as_ref(),
-                Some(remote),
+                routable,
                 options.once,
                 options.validation_target,
                 options.validation_limits,
@@ -9196,10 +9342,10 @@ async fn run_connected_peer(
             )
             .await
         };
-        if result.is_ok() {
+        if let (Ok(()), Some(routable)) = (&result, routable) {
             record_peer_block_throughput(
                 peer_store,
-                remote,
+                routable,
                 transfer_before,
                 session.block_transfer_stats(),
             );
@@ -9345,7 +9491,7 @@ async fn complete_assumeutxo_validation(
     Ok(())
 }
 
-fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
     let Some(store) = store else {
         return;
     };
@@ -9356,14 +9502,18 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
             return;
         }
     };
-    if let Err(error) = store.record_attempt(remote, now) {
+    let recorded = match remote {
+        NodePeerTarget::Socket(socket) => store.record_attempt(*socket, now).map(|_| ()),
+        NodePeerTarget::Onion(onion) => store.record_onion_attempt(onion, now).map(|_| ()),
+    };
+    if let Err(error) = recorded {
         rbtc_warn!("peer attempt history for {remote} failed: {error}");
     }
 }
 
 fn record_peer_failure(
     store: Option<&RedbPeerStore>,
-    remote: SocketAddr,
+    remote: &NodePeerTarget,
     kind: PeerFailureKind,
     manual: bool,
 ) {
@@ -9377,13 +9527,22 @@ fn record_peer_failure(
             return;
         }
     };
-    if let Err(error) = store.resolve_tried_collision_probe(remote, false, now) {
+    // Tried-collision probing and protocol cooldowns are keyed by socket
+    // address; an onion peer has neither a collision slot nor an entry in
+    // that keyspace, so its failure is recorded in its own book instead.
+    let Some(routable) = remote.socket() else {
+        if kind == PeerFailureKind::ProtocolViolation && !manual {
+            rbtc_info!("onion peer {remote} failed an objective protocol rule");
+        }
+        return;
+    };
+    if let Err(error) = store.resolve_tried_collision_probe(routable, false, now) {
         rbtc_warn!("tried-collision failure resolution for {remote} failed: {error}");
     }
     if kind != PeerFailureKind::ProtocolViolation || manual {
         return;
     }
-    match store.record_protocol_violation(remote, now) {
+    match store.record_protocol_violation(routable, now) {
         Ok(until) => rbtc_info!(
             "discouraged peer {remote} after an objective protocol violation until Unix time {until}"
         ),
@@ -9391,7 +9550,7 @@ fn record_peer_failure(
     }
 }
 
-fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
     let Some(store) = store else {
         return;
     };
@@ -9402,7 +9561,11 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr
             return;
         }
     };
-    if let Err(error) = store.record_session_success(remote, now) {
+    let recorded = match remote {
+        NodePeerTarget::Socket(socket) => store.record_session_success(*socket, now).map(|_| ()),
+        NodePeerTarget::Onion(onion) => store.record_onion_success(onion, now).map(|_| ()),
+    };
+    if let Err(error) = recorded {
         rbtc_warn!("peer session success for {remote} failed: {error}");
     }
 }
@@ -11025,7 +11188,7 @@ fn admit_pending_peer_transactions(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    mut auxiliary: VecDeque<(SocketAddr, PendingPeer)>,
+    mut auxiliary: VecDeque<(NodePeerTarget, PendingPeer)>,
     network: Network,
     network_execution: NetworkExecutionMode,
     deployment_config: &DeploymentConfig,
@@ -16952,6 +17115,79 @@ mod tests {
         assert!(past_end["next_cursor"].is_null());
     }
 
+    #[tokio::test]
+    async fn onion_peers_are_dialed_only_through_a_proxy_and_skip_socket_bookkeeping() {
+        let onion = OnionAddress::from_public_key([0x44; 32], 8333);
+        let target = NodePeerTarget::Onion(onion.clone());
+        assert_eq!(target.socket(), None);
+        assert_eq!(target.to_string(), onion.to_string());
+        assert_eq!(
+            ProxyTarget::from(&target),
+            ProxyTarget::Onion(onion.clone())
+        );
+        assert_eq!(
+            target.to_string().parse::<NodePeerTarget>().unwrap(),
+            target,
+            "a target round-trips through its textual form"
+        );
+
+        // Without a proxy an onion destination has no route at all, so the
+        // attempt is a local configuration fault rather than a peer failure.
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            None,
+            700,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("a proxyless onion peer cannot be dialed");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("SOCKS5 proxy"));
+
+        // Attempt and failure bookkeeping must reach the onion book and must
+        // not touch the socket-keyed discouragement keyspace.
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = unix_time().unwrap();
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        store
+            .insert_discovered_onion(
+                &[rbtc::p2p::OnionPeerAddress {
+                    onion: onion.clone(),
+                    services,
+                    last_seen: now - 5,
+                }],
+                now,
+            )
+            .unwrap();
+        assert!(store.onion_candidates(now, 10).unwrap().contains(&onion));
+        record_peer_attempt(Some(&store), &target);
+        assert!(
+            !store.onion_candidates(now, 10).unwrap().contains(&onion),
+            "a recorded attempt applies the onion book's retry backoff"
+        );
+        record_peer_failure(
+            Some(&store),
+            &target,
+            PeerFailureKind::ProtocolViolation,
+            false,
+        );
+        assert!(
+            store.discouraged_addresses(now).unwrap().is_empty(),
+            "an onion failure never enters the socket-keyed cooldown table"
+        );
+        record_peer_session_success(Some(&store), &target);
+        assert!(
+            store.onion_candidates(now, 10).unwrap().contains(&onion),
+            "a completed session clears the onion backoff"
+        );
+    }
+
     #[test]
     fn onlynet_onion_requires_a_proxy_and_excludes_routable_peers() {
         let directory = TempDir::new().unwrap();
@@ -17725,9 +17961,14 @@ mod tests {
             observer: None,
             snapshot_overlay: None,
         };
+        let targets = options
+            .remotes
+            .iter()
+            .map(|remote| NodePeerTarget::Socket(*remote))
+            .collect::<Vec<_>>();
         let mut pending = spawn_peer_connections(
             &options,
-            &options.remotes,
+            &targets,
             100,
             None,
             None,
@@ -17740,8 +17981,14 @@ mod tests {
             .await
             .expect("later candidate should handshake while first candidate is stalled")
             .unwrap();
-        assert_eq!(pending.front().unwrap().0, stalled_remote);
-        assert_eq!(pending.back().unwrap().0, ready_remote);
+        assert_eq!(
+            pending.front().unwrap().0,
+            NodePeerTarget::Socket(stalled_remote)
+        );
+        assert_eq!(
+            pending.back().unwrap().0,
+            NodePeerTarget::Socket(ready_remote)
+        );
 
         abort_pending_connections(&mut pending).await;
         release_stalled.send(()).unwrap();
@@ -17763,20 +18010,20 @@ mod tests {
             }
         }
 
-        let protocol_remote = "127.0.0.1:18441".parse().unwrap();
-        let manual_remote = "127.0.0.1:18442".parse().unwrap();
-        let transient_remote = "127.0.0.1:18443".parse().unwrap();
+        let protocol_remote: NodePeerTarget = "127.0.0.1:18441".parse().unwrap();
+        let manual_remote: NodePeerTarget = "127.0.0.1:18442".parse().unwrap();
+        let transient_remote: NodePeerTarget = "127.0.0.1:18443".parse().unwrap();
         let mut pending = VecDeque::from([
             (
-                protocol_remote,
+                protocol_remote.clone(),
                 finished_pending(PeerRunError::protocol("invalid standby header")),
             ),
             (
-                manual_remote,
+                manual_remote.clone(),
                 finished_pending(PeerRunError::protocol("invalid manual standby header")),
             ),
             (
-                transient_remote,
+                transient_remote.clone(),
                 finished_pending(PeerRunError::transient("standby timed out")),
             ),
         ]);
@@ -17794,7 +18041,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let store =
             RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
-        let manual_remotes = HashSet::from([manual_remote]);
+        let manual_remotes = HashSet::from([manual_remote.clone()]);
         let mut failures = Vec::new();
         reap_finished_standbys(&mut pending, Some(&store), &manual_remotes, &mut failures).await;
 
@@ -17808,9 +18055,14 @@ mod tests {
             ]
         );
         let now = unix_time().unwrap();
-        assert!(store.is_discouraged(protocol_remote, now).unwrap());
-        assert!(!store.is_discouraged(manual_remote, now).unwrap());
-        assert!(!store.is_discouraged(transient_remote, now).unwrap());
+        let socket = |target: &NodePeerTarget| target.socket().expect("routable test peer");
+        assert!(store.is_discouraged(socket(&protocol_remote), now).unwrap());
+        assert!(!store.is_discouraged(socket(&manual_remote), now).unwrap());
+        assert!(
+            !store
+                .is_discouraged(socket(&transient_remote), now)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -17836,11 +18088,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let manual = [
+        let manual: [(NodePeerTarget, PendingPeer); 2] = [
             ("127.0.0.1:18600".parse().unwrap(), ready_pending()),
             ("127.0.0.1:18601".parse().unwrap(), ready_pending()),
         ];
-        let manual_remotes = manual.iter().map(|(remote, _)| *remote).collect();
+        let manual_remotes = manual.iter().map(|(remote, _)| remote.clone()).collect();
         let mut pending = automatic.into_iter().chain(manual).collect::<VecDeque<_>>();
         let mut failures = Vec::new();
 
@@ -17865,7 +18117,7 @@ mod tests {
         assert_eq!(
             pending
                 .iter()
-                .map(|(remote, _)| *remote)
+                .map(|(remote, _)| remote.clone())
                 .collect::<Vec<_>>(),
             (18_500_usize..18_500 + DEFAULT_AUTOMATIC_HOT_STANDBYS)
                 .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
@@ -17929,7 +18181,7 @@ mod tests {
 
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             200,
             false,
@@ -17953,7 +18205,7 @@ mod tests {
             .unwrap();
         activate.send(()).unwrap();
         let activated = standby.await.unwrap().unwrap();
-        assert_eq!(activated.remote, remote);
+        assert_eq!(activated.remote, NodePeerTarget::Socket(remote));
 
         drop(activated);
         release_server.send(()).unwrap();
@@ -17995,7 +18247,7 @@ mod tests {
         let (activate, activation) = tokio::sync::oneshot::channel();
         let connection = tokio::spawn(connect_and_maintain_standby(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             210,
             true,
@@ -18083,7 +18335,7 @@ mod tests {
         let (activate_first, first_activation) = tokio::sync::oneshot::channel();
         let first_connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            first_remote,
+            NodePeerTarget::Socket(first_remote),
             None,
             230,
             false,
@@ -18143,7 +18395,7 @@ mod tests {
         let (activate_second, second_activation) = tokio::sync::oneshot::channel();
         let second_connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            second_remote,
+            NodePeerTarget::Socket(second_remote),
             None,
             233,
             false,
@@ -18229,7 +18481,7 @@ mod tests {
 
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             210,
             false,
@@ -18308,7 +18560,7 @@ mod tests {
         });
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             220,
             false,
@@ -18380,7 +18632,7 @@ mod tests {
         ));
         let first = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            first_remote,
+            NodePeerTarget::Socket(first_remote),
             None,
             301,
             false,
@@ -18390,7 +18642,7 @@ mod tests {
         .unwrap();
         let second = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            second_remote,
+            NodePeerTarget::Socket(second_remote),
             None,
             302,
             false,
@@ -18432,8 +18684,14 @@ mod tests {
 
         activate_first.send(()).unwrap();
         activate_second.send(()).unwrap();
-        assert_eq!(first_standby.await.unwrap().unwrap().remote, first_remote);
-        assert_eq!(second_standby.await.unwrap().unwrap().remote, second_remote);
+        assert_eq!(
+            first_standby.await.unwrap().unwrap().remote,
+            NodePeerTarget::Socket(first_remote)
+        );
+        assert_eq!(
+            second_standby.await.unwrap().unwrap().remote,
+            NodePeerTarget::Socket(second_remote)
+        );
     }
 
     #[tokio::test]
@@ -18448,7 +18706,7 @@ mod tests {
         });
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             400,
             false,

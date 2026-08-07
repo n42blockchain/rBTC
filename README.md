@@ -84,7 +84,19 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   destinations and fails closed without `--proxy`, because an onion-only node
   has no other route; mixing onion with an IP family is refused rather than
   silently widened, and eligible onion candidates are reported at selection.
-  Carrying proxied targets through the outbound scheduler and I2P remain open.
+  The outbound scheduler now carries address-type-aware targets, so persisted
+  onion candidates are selected, dialed through the proxy, and ranked in the
+  same ordered wave as routable peers. Bookkeeping that is only meaningful for
+  a routable address is skipped rather than given a fabricated one: an onion
+  peer contributes no network-time sample (those are grouped by IP range), is
+  not offered to address discovery, does not enter the socket-keyed
+  tried-collision or discouragement tables, and records its attempts and
+  successes in the onion book instead. A proxyless onion destination is
+  refused as a local configuration fault, never as a peer failure. Hosts
+  observe every peer through the new `PeerTargetConnected`/
+  `PeerTargetDisconnected` events; the socket-typed `PeerConnected`/
+  `PeerDisconnected` events and the socket-typed status field are unchanged
+  and continue to report routable peers only. I2P remains open.
 - A Tor control-port client publishes and withdraws one ephemeral v3 onion
   service. It speaks only the needed subset — `PROTOCOLINFO` discovery,
   `SAFECOOKIE` challenge-response, `ADD_ONION` with a fresh ED25519-v3 key,
