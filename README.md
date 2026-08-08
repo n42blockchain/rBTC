@@ -271,6 +271,8 @@ scripts/public-network-sync-smoke.sh
 RBTC_FUZZ_RUNS=10000 scripts/run-fuzz-regression.sh
 cargo +nightly-2026-07-13 miri test --lib merkle_proof::tests::verifies_left_and_right_transaction_positions
 RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind cargo test --release --test core_block_differential -- --ignored --nocapture
+RBTC_TOR_CONTROL=127.0.0.1:9051 RBTC_TOR_COOKIE=/path/to/control_auth_cookie RBTC_TOR_SOCKS=127.0.0.1:9050 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
+RBTC_I2P_SAM=127.0.0.1:7656 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
 ```
 
@@ -302,6 +304,22 @@ Because `fuzz/` is an independent Cargo workspace, it explicitly patches
 workspace. CI checks its lock file before running every target under the dated
 `nightly-2026-07-13` toolchain; a local override must likewise name an exact
 dated nightly through `RBTC_FUZZ_TOOLCHAIN`.
+
+The optional anonymity-network gate is separate from every other Tor and
+I2P test in this repository, all of which run against in-process mocks and
+therefore pass without any daemon installed. It exercises the real
+protocols end to end: the Tor case authenticates against a live control
+port, publishes an ephemeral service, waits for its descriptor to reach the
+hash ring, dials that service back through the SOCKS5 port, and completes a
+Bitcoin handshake plus a ping exchange over the resulting circuit before
+withdrawing the service — so a control-port, SOCKS5-addressing, or
+descriptor-timing divergence fails visibly rather than passing against a
+mock. The I2P case creates a SAM session on a live router, checks the
+published destination is BIP155-shaped, republishes the same address from a
+stored key, and confirms an unreachable destination fails within its
+deadline instead of hanging. Each test names the environment variables it
+requires and fails with that message when they are absent, so a partially
+configured run reports what is missing rather than silently passing.
 
 The optional live differential gate requires the matching `bitcoin-cli` beside a Bitcoin Core 31.0 `bitcoind` and rejects another daemon version. It submits the same mined regtest blocks to Core and through rBTC's production header-DAG/block-connection path, including atomic rejection checks for the persisted tip, undo record, and candidate UTXO. The dependency and Core 27–31 change classification is documented in [docs/CORE31_COMPATIBILITY.md](docs/CORE31_COMPATIBILITY.md).
 
