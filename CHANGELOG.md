@@ -53,6 +53,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - `--i2psam` and `--onlynet i2p` dialling persisted I2P peers through a SAM
   session with a reusable owner-only destination key.
 
+### Fixed
+
+- I2P SAM replies are read line-exactly instead of through a buffered
+  reader, which discarded a coalesced follow-up reply and could have
+  consumed the first bytes of a connected peer's stream.
+
 ### Safety
 
 - Snapshot-overlay undo remains readable across the compression upgrade;

@@ -154,6 +154,11 @@ documents for implementation detail and release boundaries.
   structurally before reaching a bridge or a store. The bridge is refused
   unless it is loopback, because it can open streams on this node's behalf,
   and session identifiers, destination keys, and reply lines are all bounded.
+  Reply lines are read one byte at a time rather than through a buffered
+  reader: a router may coalesce a reply with whatever follows it, and after
+  `STREAM CONNECT` what follows is the peer's own traffic, so a reader that
+  read ahead would either swallow the next reply or silently consume the
+  first bytes of the Bitcoin stream.
   Learned I2P destinations follow the same path as onion services:
   `addrv2` I2P entries are retained apart from routable and onion addresses,
   deduplicated, and stored in a third peer-store table with its own
