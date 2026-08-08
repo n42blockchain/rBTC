@@ -312,12 +312,19 @@ fn read_cookie(path: &Path) -> Result<[u8; COOKIE_LEN], TorControlError> {
         .map_err(|_| TorControlError::UnreadableCookie)
 }
 
-/// Returns the value following `name` up to the next space or quote.
+/// Returns the value following `name`.
+///
+/// A quoted value ends at its closing quote and may contain spaces,
+/// which Tor uses for descriptive fields; an unquoted value ends at the
+/// next space.
 fn field<'line>(line: &'line str, name: &str) -> Option<&'line str> {
     let start = line.find(name)? + name.len();
     let rest = &line[start..];
-    let rest = rest.strip_prefix('"').unwrap_or(rest);
-    let end = rest.find([' ', '"', '\r']).unwrap_or(rest.len());
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"').unwrap_or(quoted.len());
+        return Some(&quoted[..end]);
+    }
+    let end = rest.find([' ', '\r']).unwrap_or(rest.len());
     Some(&rest[..end])
 }
 
@@ -594,6 +601,11 @@ mod tests {
     fn parses_reply_fields_and_default_cookie_path() {
         assert_eq!(field("250-ServiceID=abc def", "ServiceID="), Some("abc"));
         assert_eq!(field("250 X=\"quoted\" Y=1", "X="), Some("quoted"));
+        assert_eq!(
+            field("250 X=\"two words\" Y=1", "X="),
+            Some("two words"),
+            "a quoted value keeps its spaces"
+        );
         assert_eq!(field("250 OK", "ServiceID="), None);
         assert_eq!(decode_hex("00FF"), Some(vec![0, 255]));
         assert_eq!(decode_hex("0"), None);

@@ -119,6 +119,18 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   does not already hold the cookie learns nothing usable. Reply lines and
   continuation counts are bounded, and the returned address is re-validated
   through the same v3 checksum rules as a learned address.
+- An I2P SAM v3 client covering the bridge subset a node needs: `HELLO`
+  version negotiation, one long-lived `SESSION CREATE` STREAM session whose
+  destination key can be persisted and replayed to keep a stable published
+  address, and `STREAM CONNECT` on a separate socket per outbound peer, which
+  hands back an ordinary stream the existing v1 or BIP324 handshake drives
+  unchanged. Addresses use BIP155's I2P form — the 32-byte SHA-256 of the
+  destination as a 52-character base32 `.b32.i2p` name — validated
+  structurally before reaching a bridge or a store. The bridge is refused
+  unless it is loopback, because it can open streams on this node's behalf,
+  and session identifiers, destination keys, and reply lines are all bounded.
+  Node wiring — an I2P address book, `onlynet i2p`, and inbound
+  `STREAM ACCEPT` — remains open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

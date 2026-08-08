@@ -24,6 +24,7 @@ pub mod explorer_store;
 pub mod fee_estimator;
 pub mod header_store;
 pub mod headers;
+pub mod i2p_sam;
 pub mod ibd;
 pub mod inbound;
 pub mod index_policy;

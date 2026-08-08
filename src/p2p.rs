@@ -496,7 +496,7 @@ fn onion_v3_checksum(public_key: &[u8]) -> [u8; 2] {
 }
 
 /// Decodes lowercase RFC 4648 base32 without padding.
-fn decode_base32(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base32(input: &str) -> Option<Vec<u8>> {
     let mut output = Vec::with_capacity(input.len() * 5 / 8);
     let mut accumulator: u16 = 0;
     let mut bits = 0_u32;
@@ -521,7 +521,7 @@ fn decode_base32(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Encodes bytes as lowercase RFC 4648 base32 without padding.
-fn encode_base32(input: &[u8]) -> String {
+pub(crate) fn encode_base32(input: &[u8]) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut output = String::with_capacity(input.len().div_ceil(5) * 8);
     let mut accumulator: u16 = 0;

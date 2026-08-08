@@ -40,6 +40,7 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   reusable service key.
 - Announcement of the published onion service to BIP155 peers in both
   directions.
+- An I2P SAM v3 client with validated BIP155 `.b32.i2p` addressing.
 
 ### Safety
 
