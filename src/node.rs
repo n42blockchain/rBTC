@@ -2,7 +2,7 @@
 
 mod config_file;
 
-use crate::i2p_sam::I2pAddress;
+use crate::i2p_sam::{I2pAddress, I2pSamSession};
 use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
@@ -288,6 +288,7 @@ struct Options {
     explorer_listen: Option<SocketAddr>,
     zmq_listen: Option<SocketAddr>,
     tor_control: Option<TorControlOptions>,
+    i2p_sam: Option<SocketAddr>,
     wallet_api_files: Option<WalletApiFiles>,
     rpc_auth_token_file: Option<PathBuf>,
     deployments: DeploymentConfig,
@@ -422,6 +423,8 @@ pub struct NodeConfig {
     /// Optional Tor control port used to publish an onion service for the
     /// inbound listener.
     pub tor_control: Option<NodeTorControlConfig>,
+    /// Optional loopback I2P SAM bridge used to reach and publish I2P peers.
+    pub i2p_sam: Option<SocketAddr>,
     /// Consensus and IBD policy overrides.
     pub consensus: NodeConsensusConfig,
     /// Optional independent genesis validation of an assumed snapshot.
@@ -448,6 +451,7 @@ impl NodeConfig {
             api: None,
             zmq_listen: None,
             tor_control: None,
+            i2p_sam: None,
             consensus: NodeConsensusConfig::default(),
             assumeutxo_validation: None,
         }
@@ -538,6 +542,7 @@ impl NodeConfig {
                 control: tor.control,
                 cookie: tor.cookie,
             }),
+            i2p_sam: self.i2p_sam,
             wallet_api_files,
             rpc_auth_token_file,
             deployments,
@@ -847,6 +852,8 @@ pub enum NodeOnlyNet {
     Ipv6,
     /// Permit only v3 onion destinations, which require a SOCKS5 proxy.
     Onion,
+    /// Permit only I2P destinations, which require a SAM bridge.
+    I2p,
 }
 
 impl NodeOnlyNet {
@@ -864,6 +871,11 @@ impl NodeOnlyNet {
     /// Returns whether v3 onion destinations are permitted.
     const fn permits_onion(self) -> bool {
         matches!(self, Self::Any | Self::Onion)
+    }
+
+    /// Returns whether I2P destinations are permitted.
+    const fn permits_i2p(self) -> bool {
+        matches!(self, Self::Any | Self::I2p)
     }
 }
 
@@ -1056,6 +1068,13 @@ impl NodeBuilder {
         self
     }
 
+    /// Reaches and publishes I2P peers through a loopback SAM bridge.
+    #[must_use]
+    pub fn i2p_sam(mut self, bridge: SocketAddr) -> Self {
+        self.config.i2p_sam = Some(bridge);
+        self
+    }
+
     /// Publishes an inbound onion service through a Tor control port.
     #[must_use]
     pub fn tor_control(mut self, tor_control: NodeTorControlConfig) -> Self {
@@ -1185,6 +1204,20 @@ impl NodeBuilder {
 
 fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_peer_options(&options)?;
+    if let Some(bridge) = options.i2p_sam {
+        if !bridge.ip().is_loopback() {
+            return Err(
+                "the I2P SAM bridge must be reached over loopback because it opens streams on this node's behalf"
+                    .to_owned(),
+            );
+        }
+    }
+    if options.resources.only_net == NodeOnlyNet::I2p && options.i2p_sam.is_none() {
+        return Err(
+            "--onlynet i2p requires --i2psam because I2P destinations are reachable only through a SAM bridge"
+                .to_owned(),
+        );
+    }
     if let Some(tor) = &options.tor_control {
         if !tor.control.ip().is_loopback() {
             return Err(
@@ -1318,7 +1351,7 @@ fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
             Ok(NodeOnlyNet::Any)
         }
         _ => Err(
-            "--onlynet accepts one network, or both IP families; onion cannot be combined with another network"
+            "--onlynet accepts one network, or both IP families; onion and i2p cannot be combined with another network"
                 .to_owned(),
         ),
     }
@@ -3176,6 +3209,8 @@ const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
 /// Default operator cooldown when `setban add` omits a duration; matches
 /// Core's 24-hour default and the automatic cooldown ceiling.
 const DEFAULT_RPC_BAN_SECONDS: u32 = 24 * 60 * 60;
+/// Stable SAM session identifier for this node's I2P destination.
+const I2P_SESSION_ID: &str = "rbtc";
 /// Ceiling shared with the automatic protocol-violation cooldown.
 const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 /// Bound on one reported rejection reason.
@@ -7155,7 +7190,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7176,6 +7211,9 @@ fn startup_configuration_summary(options: &Options) -> String {
             .tor_control
             .as_ref()
             .map_or_else(|| "disabled".to_owned(), |tor| tor.control.to_string()),
+        options
+            .i2p_sam
+            .map_or_else(|| "disabled".to_owned(), |bridge| bridge.to_string()),
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
@@ -7597,6 +7635,10 @@ async fn run_peer_pool_session(
     } else {
         None
     };
+    let i2p_session = match options.i2p_sam {
+        Some(bridge) => Some(Arc::new(create_i2p_session(options, bridge).await?)),
+        None => None,
+    };
     let _onion_service = match (&options.tor_control, options.inbound_listen) {
         (Some(tor), Some(listen)) => {
             let published = publish_inbound_onion_service(options, tor, listen).await?;
@@ -7690,6 +7732,25 @@ async fn run_peer_pool_session(
                 rbtc_info!("scheduled {scheduled} persisted onion peer candidates");
             }
         }
+        if options.resources.only_net.permits_i2p() && options.i2p_sam.is_some() {
+            let mut scheduled = 0;
+            for destination in store
+                .i2p_candidates(now, MAX_CONFIGURED_PEERS)
+                .map_err(|error| error.to_string())?
+            {
+                if remotes.len() == MAX_CONFIGURED_PEERS {
+                    break;
+                }
+                let target = NodePeerTarget::I2p(destination);
+                if !remotes.contains(&target) {
+                    remotes.push(target);
+                    scheduled += 1;
+                }
+            }
+            if scheduled > 0 {
+                rbtc_info!("scheduled {scheduled} persisted I2P peer candidates");
+            }
+        }
     }
     let mut attempted = remotes.iter().cloned().collect::<HashSet<_>>();
     let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS * 2);
@@ -7698,6 +7759,7 @@ async fn run_peer_pool_session(
         &remotes,
         local_nonce,
         peer_store.as_ref(),
+        i2p_session.as_ref(),
         api_runtime.as_ref(),
         zmq_notifier.as_ref(),
         background_validation,
@@ -7764,6 +7826,7 @@ async fn run_peer_pool_session(
             &resolved,
             local_nonce,
             peer_store.as_ref(),
+            i2p_session.as_ref(),
             api_runtime.as_ref(),
             zmq_notifier.as_ref(),
             background_validation,
@@ -8664,6 +8727,7 @@ async fn connect_peer(
         deployments,
         remote,
         proxy,
+        None,
         local_nonce,
         require_full_services,
         peer_store,
@@ -8672,10 +8736,80 @@ async fn connect_peer(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn connect_i2p_peer(
+    session: Arc<I2pSamSession>,
+    destination: &I2pAddress,
+    remote: &NodePeerTarget,
+    deployments: &DeploymentConfig,
+    local_nonce: u64,
+    require_full_services: bool,
+    peer_store: Option<&Arc<RedbPeerStore>>,
+    prefer_v2: bool,
+    handshake_started: Instant,
+) -> Result<ConnectedPeer, PeerRunError> {
+    let stream = timeout(PEER_TIMEOUT, session.connect_stream(destination))
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "I2P stream to {remote} timed out after {} seconds",
+                PEER_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))?;
+    let mut session = timeout(
+        PEER_TIMEOUT,
+        rbtc::p2p::complete_outbound_handshake_on_stream(
+            stream,
+            deployments.message_start(),
+            local_nonce,
+            USER_AGENT.to_owned(),
+            0,
+            prefer_v2,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        PeerRunError::transient(format!(
+            "peer handshake timed out after {} seconds",
+            PEER_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| PeerRunError::p2p(&error))?;
+    let remote_version = session.remote_version();
+    rbtc_info!(
+        "connected to {remote}: version={}, height={}, agent={}",
+        remote_version.version,
+        remote_version.start_height,
+        remote_version.user_agent
+    );
+    let _ = handshake_started;
+    negotiate_peer_preferences(&mut session).await?;
+    if require_full_services {
+        session
+            .ensure_full_witness_block_relay()
+            .map_err(|error| PeerRunError::p2p(&error))?;
+        if let Some(store) = peer_store {
+            if let Err(error) =
+                store.record_i2p_success(destination, unix_time().unwrap_or_default())
+            {
+                rbtc_warn!("recording I2P peer {destination} success failed: {error}");
+            }
+        }
+    }
+    Ok(ConnectedPeer {
+        remote: remote.clone(),
+        session,
+        validated_header_height: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn connect_peer_with_transport(
     deployments: DeploymentConfig,
     remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
+    i2p_session: Option<Arc<I2pSamSession>>,
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
@@ -8689,14 +8823,29 @@ async fn connect_peer_with_transport(
         )));
     }
     let handshake_started = Instant::now();
-    // I2P destinations are dialled through a SAM bridge rather than a proxy;
-    // that session is not wired into the scheduler yet, so such a target is
-    // refused as a local configuration fault instead of being misrouted.
-    let Ok(target) = ProxyTarget::try_from(&remote) else {
-        return Err(PeerRunError::local(format!(
-            "I2P peer {remote} requires a SAM bridge session, which outbound scheduling does not use yet"
-        )));
-    };
+    // I2P destinations are reached through the SAM bridge, never through a
+    // SOCKS5 proxy: substituting one would connect to the wrong network.
+    if let NodePeerTarget::I2p(destination) = &remote {
+        let Some(session) = i2p_session else {
+            return Err(PeerRunError::local(format!(
+                "I2P peer {remote} requires a configured SAM bridge"
+            )));
+        };
+        return connect_i2p_peer(
+            session,
+            destination,
+            &remote,
+            &deployments,
+            local_nonce,
+            require_full_services,
+            peer_store.as_ref(),
+            prefer_v2,
+            handshake_started,
+        )
+        .await;
+    }
+    let target =
+        ProxyTarget::try_from(&remote).expect("only I2P destinations lack a proxy representation");
     let mut session = timeout(PEER_TIMEOUT, async {
         match (proxy, &target) {
             (Some(proxy), _) => {
@@ -8927,6 +9076,7 @@ async fn connect_and_maintain_standby(
     deployments: DeploymentConfig,
     remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
+    i2p_session: Option<Arc<I2pSamSession>>,
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
@@ -8945,6 +9095,7 @@ async fn connect_and_maintain_standby(
         deployments,
         remote.clone(),
         proxy,
+        i2p_session,
         local_nonce,
         require_full_services,
         peer_store,
@@ -9050,6 +9201,7 @@ fn spawn_peer_connections(
     mempool_relay_source: Option<&MempoolRelaySource>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_onion: Option<&(OnionAddress, ServiceFlags)>,
+    i2p_session: Option<&Arc<I2pSamSession>>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
@@ -9078,10 +9230,12 @@ fn spawn_peer_connections(
                 .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
             let advertised_onion = advertised_onion.cloned();
             let proxy = options.resources.proxy;
+            let i2p_session = i2p_session.cloned();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
                 remote.clone(),
                 proxy,
+                i2p_session.clone(),
                 local_nonce,
                 require_full_services,
                 peer_store,
@@ -9268,12 +9422,13 @@ fn advertised_onion_service(
     inbound_source.and_then(|source| source.advertised_onion_service())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn try_peer_candidates(
     options: &Options,
     remotes: &[NodePeerTarget],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
+    i2p_session: Option<&Arc<I2pSamSession>>,
     api_runtime: Option<&ApiRuntime>,
     zmq_notifier: Option<&ZmqNotifier>,
     background_validation: Option<&BackgroundValidationStatus>,
@@ -9297,6 +9452,7 @@ async fn try_peer_candidates(
         Some(mempool_relay_source),
         Some(transaction_pool),
         advertised_onion.as_ref(),
+        i2p_session,
         network_time,
     ) {
         Ok(pending) => pending,
@@ -9620,6 +9776,47 @@ async fn complete_assumeutxo_validation(
         .map_err(PeerRunError::transient)?;
     }
     Ok(())
+}
+
+/// Creates the SAM session used to reach and publish I2P peers.
+///
+/// A stored destination key republishes the same address, so peers that
+/// learned it keep reaching this node across restarts. The key is secret
+/// material: it is written owner-only inside the data directory and never
+/// logged.
+async fn create_i2p_session(
+    options: &Options,
+    bridge: SocketAddr,
+) -> Result<I2pSamSession, String> {
+    let key_path = options
+        .data_dir
+        .as_ref()
+        .map(|data_dir| data_dir.join("i2p_destination_key"));
+    let existing = key_path
+        .as_ref()
+        .and_then(|path| read_owner_only_text_file(path, "i2p destination key", 16 * 1024).ok());
+    let session = I2pSamSession::create(
+        bridge,
+        I2P_SESSION_ID,
+        existing.as_deref(),
+        crate::i2p_sam::I2pSamConfig::default(),
+    )
+    .await
+    .map_err(|error| format!("create the I2P SAM session: {error}"))?;
+    if existing.is_none() {
+        if let Some(path) = &key_path {
+            if let Err(error) = write_owner_only_secret(path, session.destination_key()) {
+                rbtc_warn!(
+                    "persisting the I2P destination key failed, so the address will change on restart: {error}"
+                );
+            }
+        }
+    }
+    rbtc_info!(
+        "created I2P SAM session with destination {}",
+        session.address()
+    );
+    Ok(session)
 }
 
 /// Keeps one published onion service for the lifetime of a node run.
@@ -14609,6 +14806,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut extend_validation_target = false;
     let mut explorer_listen = None;
     let mut zmq_listen = None;
+    let mut i2p_sam = None;
     let mut tor_control_address = None;
     let mut tor_control_cookie = None;
     let mut wallet_descriptors = None;
@@ -14723,6 +14921,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     "ipv4" => NodeOnlyNet::Ipv4,
                     "ipv6" => NodeOnlyNet::Ipv6,
                     "onion" => NodeOnlyNet::Onion,
+                    "i2p" => NodeOnlyNet::I2p,
                     _ => return Err(format!("unsupported --onlynet value: {value}")),
                 };
                 if !only_net_values.contains(&family) {
@@ -14780,6 +14979,14 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     );
                 }
                 explorer_listen = Some(address);
+            }
+            "--i2psam" => {
+                let value = required_option_value(&mut args, "--i2psam")?;
+                i2p_sam = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid I2P SAM bridge address: {value}"))?,
+                );
             }
             "--torcontrol" => {
                 let value = required_option_value(&mut args, "--torcontrol")?;
@@ -16523,6 +16730,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         data_dir,
         once,
         zmq_listen,
+        i2p_sam,
         tor_control: match (tor_control_address, tor_control_cookie) {
             (Some(control), Some(cookie)) => Some(TorControlOptions { control, cookie }),
             (Some(_), None) => {
@@ -16709,7 +16917,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion|i2p ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--i2psam 127.0.0.1:7656] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -17465,6 +17673,90 @@ mod tests {
     }
 
     #[test]
+    fn i2p_sam_options_require_loopback_and_gate_the_i2p_network() {
+        let directory = TempDir::new().unwrap();
+        let launch = |extra: &[&str]| {
+            let mut arguments = vec![
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--no-dns-seeds".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+            ];
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = launch(&[
+            "--connect",
+            "127.0.0.1:18444",
+            "--i2psam",
+            "203.0.113.7:7656",
+        ]) else {
+            panic!("a non-loopback SAM bridge must fail closed");
+        };
+        assert!(error.contains("loopback"), "{error}");
+
+        let Err(error) = launch(&["--onlynet", "i2p"]) else {
+            panic!("i2p-only without a bridge must fail closed");
+        };
+        assert!(error.contains("--i2psam"), "{error}");
+
+        let options = launch(&["--onlynet", "i2p", "--i2psam", "127.0.0.1:7656"])
+            .unwrap()
+            .expect("an i2p-only launch with a bridge parses");
+        assert_eq!(options.resources.only_net, NodeOnlyNet::I2p);
+        assert_eq!(options.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+        assert!(options.resources.only_net.permits_i2p());
+        assert!(
+            !options.resources.only_net.permits_onion()
+                && !options
+                    .resources
+                    .only_net
+                    .permits("127.0.0.1".parse().unwrap()),
+            "an i2p-only restriction excludes every other network"
+        );
+        assert!(!NodeOnlyNet::Onion.permits_i2p());
+        assert!(NodeOnlyNet::Any.permits_i2p());
+        assert!(
+            resolve_only_net(&[NodeOnlyNet::I2p, NodeOnlyNet::Onion]).is_err(),
+            "anonymity networks cannot be combined"
+        );
+    }
+
+    #[tokio::test]
+    async fn i2p_peers_are_refused_without_a_configured_bridge() {
+        let destination = I2pAddress::from_destination_hash([0x77; 32]);
+        let target = NodePeerTarget::I2p(destination.clone());
+        assert_eq!(target.socket(), None);
+        assert_eq!(target.to_string(), destination.to_string());
+        assert_eq!(
+            target.to_string().parse::<NodePeerTarget>().unwrap(),
+            target,
+            "an I2P target round-trips through its textual form"
+        );
+        assert!(
+            ProxyTarget::try_from(&target).is_err(),
+            "an I2P destination has no proxy representation, so it can never be misrouted through SOCKS5"
+        );
+
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target,
+            None,
+            800,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("an I2P peer cannot be dialled without a bridge");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("SAM bridge"), "{}", error.message);
+    }
+
+    #[test]
     fn tor_control_options_require_a_cookie_a_listener_and_loopback() {
         let directory = TempDir::new().unwrap();
         let launch = |extra: &[&str]| {
@@ -18205,6 +18497,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -18303,6 +18596,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -18338,6 +18632,7 @@ mod tests {
             &options,
             &targets,
             100,
+            None,
             None,
             None,
             None,
@@ -18617,6 +18912,7 @@ mod tests {
         let connection = tokio::spawn(connect_and_maintain_standby(
             DeploymentConfig::for_network(Network::Regtest),
             NodePeerTarget::Socket(remote),
+            None,
             None,
             210,
             true,
@@ -22622,6 +22918,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -22708,6 +23005,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -24364,6 +24662,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors,
@@ -24432,6 +24731,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
@@ -24839,6 +25139,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -24937,6 +25238,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25020,6 +25322,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25109,6 +25412,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25183,6 +25487,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25246,6 +25551,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25342,6 +25648,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25414,6 +25721,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25524,6 +25832,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25618,6 +25927,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25666,6 +25976,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25734,6 +26045,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25796,6 +26108,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -25904,6 +26217,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -26064,6 +26378,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
@@ -26181,6 +26496,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -26267,6 +26583,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
@@ -26390,6 +26707,7 @@ mod tests {
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 zmq_listen: None,
+                i2p_sam: None,
                 tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
@@ -26547,6 +26865,7 @@ mod tests {
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
                 zmq_listen: None,
+                i2p_sam: None,
                 tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
@@ -26683,6 +27002,7 @@ mod tests {
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
             zmq_listen: None,
+            i2p_sam: None,
             tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,

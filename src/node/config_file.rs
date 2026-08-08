@@ -32,7 +32,7 @@ const BOOL_KEYS: [&str; 10] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 36] = [
+const VALUE_KEYS: [&str; 37] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -69,6 +69,7 @@ const VALUE_KEYS: [&str; 36] = [
     "zmq_listen",
     "torcontrol",
     "torcontrol_cookie",
+    "i2psam",
 ];
 
 #[derive(Clone, Debug)]
@@ -402,6 +403,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "zmq_listen" => "--zmq-listen",
         "torcontrol" => "--torcontrol",
         "torcontrol_cookie" => "--torcontrol-cookie",
+        "i2psam" => "--i2psam",
         _ => unreachable!("known value or list config key"),
     }
 }
@@ -480,6 +482,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--zmq-listen"
             | "--torcontrol"
             | "--torcontrol-cookie"
+            | "--i2psam"
     )
     .then_some(group)
 }
@@ -536,6 +539,7 @@ fn option_group(flag: &str) -> &'static str {
         "--zmq-listen" => "zmq-listen",
         "--torcontrol" => "torcontrol",
         "--torcontrol-cookie" => "torcontrol-cookie",
+        "--i2psam" => "i2psam",
         _ => "unknown",
     }
 }

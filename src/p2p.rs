@@ -2726,6 +2726,48 @@ pub async fn connect_outbound_with_transport(
 ///
 /// `Ok(None)` means the peer closed the connection before completing the v2
 /// handshake, so the caller may retry once over v1 on a fresh connection.
+/// Completes the outbound handshake on a stream someone else established.
+///
+/// This is the entry point for transports that hand back an already-open
+/// stream — an I2P SAM `STREAM CONNECT`, for example — where there is no
+/// socket to dial and no routable address to report. The local `version`
+/// advertises an unspecified receiver address for the same reason it does
+/// for an onion peer: the destination has no routable socket, and inventing
+/// one would misdescribe the connection.
+///
+/// # Errors
+///
+/// Returns transport, ordering, or negotiation errors; a peer that closes a
+/// v2 attempt yields [`P2pError::V2Transport`] rather than an automatic v1
+/// retry, because the caller owns re-establishing this kind of stream.
+pub async fn complete_outbound_handshake_on_stream(
+    stream: TcpStream,
+    magic: Magic,
+    nonce: u64,
+    user_agent: String,
+    start_height: i32,
+    prefer_v2: bool,
+) -> Result<PeerSession<TcpStream>, P2pError> {
+    validate_user_agent(&user_agent)?;
+    let advertised = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    if prefer_v2 {
+        if let Some(session) = try_outbound_v2(
+            stream,
+            advertised,
+            magic,
+            nonce,
+            user_agent.clone(),
+            start_height,
+        )
+        .await?
+        {
+            return Ok(session);
+        }
+        return Err(P2pError::V2Transport(V2TransportError::PeerRejectedV2));
+    }
+    complete_outbound_handshake(stream, advertised, magic, nonce, user_agent, start_height).await
+}
+
 async fn try_outbound_v2(
     stream: TcpStream,
     remote: SocketAddr,
