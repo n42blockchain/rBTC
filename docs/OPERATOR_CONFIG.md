@@ -1,6 +1,6 @@
 # Operator configuration
 
-Status date: 2026-07-27.
+Status date: 2026-08-08.
 
 `rbtcd --config PATH` loads a strict, bounded `key=value` file before applying
 command-line options. The file must be a regular non-symlink file and may not
@@ -167,8 +167,10 @@ exact resumable output previously owned by this command, and must not alias,
 contain, or sit inside `SOURCE`. Each aggregate archive range is loaded once;
 block structure checks are parallel, freezer staging overlaps UTXO prefetch,
 and full consensus/script execution writes sorted atomic chainstate batches.
-`--validation-batch-size` is 1–1,008, `--validation-pause-ms` can deliberately
-throttle checkpoints, `--validation-deferred-repair` trades faster bulk writes
+`--validation-batch-size` is 1–1,008 and defaults to 256. The examples use 64
+to demonstrate a lower-memory rebuild profile; `--validation-pause-ms` can
+deliberately throttle checkpoints, and `--validation-deferred-repair` trades
+faster bulk writes
 for a potentially slower unclean-restart repair, and the prune/cache/free-space
 options retain their normal hard bounds. A durable owner marker prevents an
 incomplete output from starting as a live node. On restart the command

@@ -3,7 +3,7 @@
 ## Data flow
 
 ```text
-Bitcoin peers (v1 now; BIP324 v2 later)
+Bitcoin peers (v1 and BIP324 v2)
         │
         ▼
 header DAG + chainwork → contextual validator → libbitcoinconsensus scripts
@@ -182,7 +182,7 @@ measurements, not evidence for the final activity threshold.
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
-Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 256-block checkpoint by default; operators may lower the value on memory-constrained hosts or raise it as far as 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
 
 Mainnet output-collision handling follows Core's BIP30 optimization: after the
 authenticated BIP34 anchor, ordinary blocks skip the redundant durable output
@@ -341,11 +341,14 @@ cold-tier validation stores skip that B-tree entirely. Dropping
 live soak database from 23 GiB to 4.0 GiB; the experimental high-memory path
 uses a 16 GiB redb cache so that compact working set and a larger write cache fit
 without changing ordinary-node defaults.
-The default checkpoint remains 64 blocks. Explicit bounded validation may use
-up to 1,008 blocks (approximately 4 GiB at the consensus block-size maximum,
-with an independent 1 GiB ledger-record ceiling) to amortize staged-ledger and
-chainstate durability barriers on adequately provisioned machines; later
-full-block eras should retain a lower memory-aware setting.
+The default checkpoint is now 256 blocks. Measured against 64-block batches it
+reduced total batch time by 24.8% while raising peak working set by roughly 35%;
+memory-constrained operators should lower `--validation-batch-size`. Explicit
+bounded validation may use up to 1,008 blocks (approximately 4 GiB at the
+consensus block-size maximum, with an independent 1 GiB ledger-record ceiling)
+to amortize staged-ledger and chainstate durability barriers on adequately
+provisioned machines; later full-block eras should retain a lower memory-aware
+setting.
 The post-BIP66 soak located that boundary empirically. One stable 1,008-block
 checkpoint took 181.77 seconds after its working set crossed the redb dirty-page
 cache threshold. Splitting the adjacent work into two 504-block checkpoints
@@ -577,23 +580,25 @@ being expanded into redb. Offline
 `--build-core-snapshot-index SNAPSHOT --snapshot-index-output FILE` streams the
 file once under the same canonical-form rules as the activation loader,
 re-derives Core's exact UTXO-set commitment against the compiled release
-identity, and atomically publishes a sidecar container: a BBhash minimal
-perfect hash function over every outpoint (written in safe Rust over keyed
-SipHash-2-4 from the vendored `bitcoin_hashes`, expected three to four bits
-per key at gamma 2) plus a bit-packed table holding each coin's byte offset and the
-backward distance to its txid group header. Field widths are derived from the
-actual maxima, so a mainnet-scale table costs roughly seven bytes per coin.
+identity, and atomically publishes a version-2 sidecar container. Its safe-Rust
+BBhash minimal perfect hash function is keyed by each 32-byte txid group rather
+than every 36-byte outpoint, and its on-disk table bit-packs only the group
+offset. For the height-935,000 mainnet snapshot that means 113,879,165 keys and
+34 bits per table entry instead of 164,241,311 keys and a 53-bit
+offset/back-reference entry.
+
 The container binds the snapshot's network, base block hash and height, coin
-count, exact length, and full SHA-256, and is sealed by a trailing SHA-256
-that open verifies before use; the snapshot header identity and length are
-rechecked at open and the full content digest can be re-verified on demand.
-Lookups resolve one slot, read the 32-byte txid at the group header and the
-coin's CompactSize vout from the file, and only then decompress that single
-coin's amount and script template, so results are exact — a foreign outpoint
-that the minimal perfect hash function maps to an arbitrary slot is rejected
-by the byte comparison, never answered probabilistically. Coins keep Core's
-compressed representation on disk; nothing is imported, and the index never
-substitutes for activation's trust checks.
+and group counts, exact length, full SHA-256, and the maximum encoded group span,
+and is sealed by a trailing SHA-256 that open verifies before use. The snapshot
+header identity and length are rechecked at open and the full content digest can
+be re-verified on demand. A lookup resolves one group slot, verifies the
+32-byte txid, and scans that bounded group for the requested CompactSize vout
+before decompressing the matching amount and script template. A damaged group
+count therefore cannot widen a read toward the complete 9.4 GB file, and a
+foreign key mapped to an arbitrary MPHF slot is rejected rather than answered
+probabilistically. Coins keep Core's compressed representation on disk;
+nothing is imported, and the index never substitutes for activation's trust
+checks.
 
 The optional `mdbx` feature builds a snapshot-backed overlay chainstate on
 that base. One MDBX environment holds four named tables — coins created above
@@ -611,24 +616,35 @@ execution reaches this store through the new `ExecutionChainStore` trait: the
 consensus connect/disconnect entry points are generic over it, and the
 unified redb store implements the same trait unchanged.
 
-The environment is opened with a hard MDBX geometry ceiling (for example
-3 GiB), so growth past the configured budget fails the offending commit
+The environment is opened with a hard MDBX geometry ceiling (10 GiB by
+default), so growth past the configured budget fails the offending commit
 closed with `MDBX_MAP_FULL` instead of expanding — an engine-enforced bound
-redb cannot express, and the decisive reason this mode selects MDBX while
-redb remains the default unified chainstate; the trade is a vendored C
-dependency against the default build's pure-Rust property. Approaching the
-ceiling triggers a rebase: a pinned MVCC read view streams the old snapshot
-minus tombstones merged with the overlay into a fresh compressed snapshot at
-the current tip, deriving the new Core-format UTXO-set commitment during the
-write; the access-index rebuild then re-decodes the complete file against
-that self-derived identity, so a compression asymmetry cannot survive
-publication. One final MDBX transaction clears the overlay, tombstone, and
-undo tables and switches the stored identity, after which the folded state
-serves from the new immutable base and the capacity budget is available
-again. Undo data does not survive a rebase, so disconnection cannot cross
-the new base — exactly the contract an AssumeUTXO activation establishes —
-and rebases therefore run during catch-up, when the tip is not at
-reorganization risk.
+redb cannot express. Below the rebase threshold, the vendored binding exposes
+MDBX's `mdbx_env_copy(..., MDBX_CP_COMPACT)` as safe `copy_compact`: it writes
+only live pages into a fresh environment and swaps that compact copy into place,
+reclaiming copy-on-write garbage without changing the logical overlay or its
+tip. Compaction is a space tool, not a way to shrink the live B-tree or restore
+mutation speed.
+
+Approaching the higher threshold triggers a rebase: a pinned MVCC read view
+streams the old snapshot minus tombstones merged with the overlay into a fresh
+compressed snapshot at the current tip, deriving the new Core-format UTXO-set
+commitment during the write. The access-index rebuild then re-decodes the
+complete file against that self-derived identity, so a compression asymmetry
+cannot survive publication. A fresh empty environment is published with the
+new base identity rather than reusing MDBX's old `last_pgno` high-water mark.
+Undo data does not survive a rebase, so disconnection cannot cross the new base
+— exactly the contract an AssumeUTXO activation establishes — and rebases run
+during catch-up, when the tip is not at reorganization risk.
+
+Both MDBX maintenance operations use a recoverable directory swap. On reopen,
+exactly one set-aside environment is restored if the canonical directory is
+missing; a superseded copy beside a valid live directory is removed. If two
+set-aside candidates exist, recovery preserves both and fails closed instead of
+guessing. Every new swap also removes stale aside suffixes before moving the
+live directory. Overlay undo records use an explicit `RUZ1` zstd frame, retain
+compatibility with raw records written before compression, and cap output at
+256 MiB plus zstd's window at 8 MiB on both overlay engines.
 
 `--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX` runs the
 complete catch-up on this chainstate. The mode reuses the ordinary outbound
@@ -662,11 +678,11 @@ comparison:
   commit outright with `MDBX_MAP_FULL`. redb has no such ceiling, so the
   budget is policy-enforced by measuring the file after each commit, which a
   single batch can overshoot before the next check sees it.
-- **Space reclamation.** redb's `compact()` shrinks the file in place;
-  `libmdbx-rs` 0.6.6 exposes no equivalent, which is why the MDBX rebase has
-  to recreate its environment file. `--snapshot-overlay-compact-percent`
-  (default 50, well below the 85 rebase threshold) controls how early the
-  redb engine tries reclaiming space before resorting to a full rebase.
+- **Space reclamation.** redb's `compact()` rewrites its file in place. MDBX
+  uses a compact copy and crash-safe directory swap because its live file's
+  `last_pgno` does not shrink. `--snapshot-overlay-compact-percent` (default
+  50, below the 85 rebase threshold) controls how early either engine tries
+  reclaiming garbage before a full fold/rebase.
 
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror
@@ -677,14 +693,20 @@ and indexed offline:
 rbtcd --build-core-snapshot-index utxo-935000.dat --snapshot-index-output utxo-935000.rbtcidx
 ```
 
-That authenticated the file against the compiled 935,000 mainnet identity in
-2m18s and published a 1,155,791,488-byte index (19 BBhash levels, 3.30 bits
-per key). Catch-up then ran to the header tip observed at connect time:
+At that revision the outpoint-keyed format authenticated the file against the
+compiled 935,000 mainnet identity in 2m18s and published a
+1,155,791,488-byte index (19 BBhash levels, 3.30 bits per key). These run
+figures are retained as historical evidence; the current txid-group version-2
+format is described above. Catch-up then ran to the header tip observed at
+connect time:
 
 ```
 rbtcd --network bitcoin --data-dir DATA --once \
   --snapshot-overlay-catchup utxo-935000.dat --snapshot-overlay-index utxo-935000.rbtcidx \
-  --snapshot-overlay-capacity-bytes 10737418240
+  --snapshot-overlay-engine mdbx \
+  --snapshot-overlay-capacity-bytes 10737418240 \
+  --snapshot-overlay-compact-percent 50 \
+  --snapshot-overlay-rebase-percent 85
 ```
 
 A first attempt at a 3 GiB ceiling (the default at the time) reached height 960,203 after
@@ -712,8 +734,9 @@ clean run from height 935,000 to the live tip: two rebases (at 947,032 and
 scale together), reaching height 960,205 with the overlay at 42% of its
 10 GiB budget and exiting 0.
 
-A latest-code cold rerun on 2026-07-30 used the same 164,241,311-coin
-`utxo-935000.dat` (9,387,990,306 bytes) and its 1,155,791,488-byte index. It
+A then-current cold rerun on 2026-07-30 used the same 164,241,311-coin
+`utxo-935000.dat` (9,387,990,306 bytes) and its outpoint-keyed
+1,155,791,488-byte index. It
 validated 25,313 blocks in 396 batches and exited 0 at height 960,313. Process
 wall time from the first daemon log record was 90.29 minutes; the interval
 from the start of the first execution batch through the final commit was
@@ -882,8 +905,9 @@ same 10 GiB budget, over the same `utxo-935000.dat` and index, reaching
 Two changes were under test. Block undo is now stored zstd-compressed, chosen
 because a per-table breakdown of the completed redb overlay showed undo as
 the second largest item — 998,307,764 stored bytes across only 951 retained
-blocks, about 1,025 KiB per block — and because MDBX has no compaction, so
-anything that slows file growth directly delays a rebase. Separately, the
+blocks, about 1,025 KiB per block — and because the binding at that revision
+had no MDBX compaction, so anything that slowed file growth directly delayed a
+rebase. Separately, the
 snapshot index no longer holds its packed offset table in memory.
 
 The results that do not depend on the machine:
@@ -968,7 +992,8 @@ overhead, not bytes.
 An in-process cache for the table was considered and rejected. A minimal
 perfect hash distributes slots uniformly, so hit rate would scale linearly
 with cache size with no working-set knee — the condition under which a
-replacement policy earns its keep. Entries are bit-packed at 53 bits against
+replacement policy earns its keep. At the revision measured here, entries were
+bit-packed at 53 bits against
 an LRU's roughly 40 bytes of per-entry overhead, so the page cache holds
 several times more table per byte. And the memory would be anonymous rather
 than reclaimable, reintroducing exactly what moving the table to disk removed.
@@ -1072,13 +1097,12 @@ controlled comparison should have and the reason the replay harness was built:
 the networked soak that preceded it moved 19% on peer quality alone and could
 not have resolved this.
 
-What remains inside the commit is the durable flush at 28.5% and B-tree
-mutation at 26.5%, neither of which has been addressed. Base lookups are still
-26.3% of the reduced commit, and their remaining cost is the hash computation
-plus two positioned reads per probe. Cutting the probe count rather than
-ordering it would need an index keyed by txid instead of by outpoint, since a
-transaction's outputs share a txid — which is a concrete, measured argument
-for a decision that had been deferred on other grounds.
+What remained inside that measured commit was the durable flush at 28.5% and
+B-tree mutation at 26.5%. Base lookups were still 26.3% of the reduced commit,
+and their remaining cost was the hash computation plus two positioned reads per
+probe. That result drove the subsequent version-2 change from outpoint to txid
+keying, allowing all outputs created by one transaction to share one probe and
+one group offset.
 
 Relaxing the commit's durability was tried on the strength of that 28.5% and
 withdrawn. MDBX offers three modes weaker than `Durable`, and two of them —
@@ -1217,7 +1241,7 @@ earlier judgement against it does not survive two measurements.
 It had been set aside because the duplicate-check probes were 10.4% of batch
 time, making an index-format change look like poor value. That figure came
 from an idle machine. Running the same catch-up while other tenants competed
-for memory put `commit-base-lookup` at 18.9% and `utxo-prefetch` at 9.7`%`,
+for memory put `commit-base-lookup` at 18.9% and `utxo-prefetch` at 9.7%,
 both roughly double their idle share, while CPU-bound components fell as a
 proportion. Those two are the paths that read the 9.4 GB snapshot, and they
 degrade first when the page cache is contended — which is the condition a real
@@ -1259,21 +1283,26 @@ probes at roughly 1/1.38 the cost each puts the duplicate check at about 27.6%
 of its current cost, a 72% reduction — 10.4% of batch time down to about 2.9%
 idle, and 18.9% down to about 5.2% under contention.
 
-The sidecar is also smaller and faster to publish: 957,969,566 bytes against
-1,155,791,488, 17.1% less, built in 77.9s against 138s.
+The first txid-keyed comparison sidecar was also smaller and faster to publish:
+957,969,566 bytes against 1,155,791,488, 17.1% less, built in 77.9s against
+138s. Porting that keying into the overlay's bit-packed, on-disk table removed
+the backward-distance field as well. The current version-2 artifact is
+530,926,239 bytes, uses 18 MPHF levels over 113,879,165 groups, and stores one
+34-bit offset per group — 54.1% smaller than the former overlay format.
 
 Three things were wrong in the original judgement against this, and all three
 were assumptions rather than measurements: the 10.4% share came from an idle
 machine when a loaded one shows 18.9%; the in-group scan feared on hits barely
 exists, since 89.51% of groups hold one coin; and misses were assumed to cost
-the same under either keying when they are 1.38x cheaper. Converging on the
-txid keying is the right decision, and the remaining work is the convergence
-itself — the two implementations coexisting is the open item, not whether the
-keying is better.
+the same under either keying when they are 1.38x cheaper. The overlay/CLI index
+now uses txid keying. A separate library-level version-3 index still coexists,
+so format/API reconciliation remains cleanup work rather than an unresolved
+keying decision.
 
 Independent of budget, the enforcement point also stands:
 redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
-a third above the number it was given at 3 GiB. Per-batch execution (64 blocks) held steady at
+a third above the number it was given at 3 GiB. These earlier replays used
+64-block batches, which held steady at
 6–12 seconds including download, structure validation, staging, consensus
 execution, and publish. `capacity()` reports `last_pgno`-based usage — the
 figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical
@@ -1323,7 +1352,7 @@ The marker deliberately survives successful execution and restart, so assumed st
 
 Synchronous staging, UTXO prefetch, script execution, and redb work enter Tokio's blocking region, so each worker is replaced while it waits and two concurrent pipelines cannot deadlock the next-window network futures. Each task has a bounded 8 GiB redb cache, keeping the aggregate bulk cache at 16 GiB while reducing random B-tree read amplification relative to the ordinary 1 GiB live-node cache. Network receive, structure validation, immutable freezer staging, and next-window prefetch remain independent; final redb transactions share one process-wide commit turn, avoiding concurrent random-I/O cache thrash on the same physical device without merging their failure domains. Only the API-serving side maintains an explorer projection; the isolated validator does not build an unused historical transaction index. The active loop publishes its execution/header tips. Until they match, the validator continues with the smaller of its configured batch and a bounded 252-block checkpoint, without an artificial pause; the ceiling keeps consensus-maximum payload below one GiB and amortizes freezer/index/fsync work. Once active serving catches up, its configured batch and pause limits are restored. Keeping a bounded independent window avoids per-block network round trips and durable database transactions without enlarging one peer request or partial publication. The loopback explorer exposes this state at `/api/v1/validation`, including the immutable target, both tips, remaining work, lifecycle phase, throttle state, and terminal error. The active loop consumes successful completion, compares the independently streamed UTXO identity, and commits marker removal while its API remains live. An active-side failure aborts and joins validation; a validation or finalization failure aborts and joins active service, terminates the combined service, and leaves resumable state. `--once` waits for both tasks and performs the same finalization after their stores close. `--complete-assumeutxo` remains the sequential operational fallback.
 
-Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 64; in background mode the same cap applies independently to active base-to-live execution so both pipelines can use bounded dual-peer windows. The downloader fills a checkpoint through 16-block protocol requests so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` applies only to the validator, so serving chainstate retains no artificial pause. Deferred allocator repair applies to both background bulk pipelines: ordinary commits remain atomic and durable, orderly database close emits one quick-repair allocator snapshot, and only an unclean stop pays a full repair on the next open. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
+Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 256; in background mode the same cap applies independently to active base-to-live execution so both pipelines can use bounded dual-peer windows. The downloader fills a checkpoint through 16-block protocol requests so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` applies only to the validator, so serving chainstate retains no artificial pause. Deferred allocator repair applies to both background bulk pipelines: ordinary commits remain atomic and durable, orderly database close emits one quick-repair allocator snapshot, and only an unclean stop pays a full repair on the next open. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
 
 Validation storage is retained by default. The destructive `--cleanup-validation-dir` option is accepted only by the automatic completion modes and is gated by a versioned, owner-only marker created only when rBTC first observed an absent or empty directory. The marker uses strict size-bounded JSON and binds a canonical network and target height/hash; its contents and containing directory are synced on Unix before the claim is considered durable. After successful finalization, cleanup canonicalizes the active and validation paths again, reopens the validation chainstate, requires its non-assumed tip and bound target to equal the snapshot base, allowlists top-level rBTC artifacts, and recursively rejects symlinks and special files. It then atomically renames the directory to a randomized sibling quarantine, syncs the parent, removes the quarantine, and syncs the parent again so both namespace transitions are durable. Failure of the first parent sync rolls the rename back before deletion; failure of the final sync reports that removal completed but its namespace durability is uncertain. An unowned legacy directory or any unexpected artifact is preserved with an error; manual two-step finalization never deletes it.
 

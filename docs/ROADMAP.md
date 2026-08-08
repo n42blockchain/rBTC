@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-07-28.
+Status date: 2026-08-08.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -74,6 +74,11 @@ Primary references:
 - [x] Reproducible storage/IBD benchmarks, compaction verification, simulated
   disk-full tests, and SIGKILL/reopen coverage. Target-device HDD/NVMe numbers are
   performance evidence, not a correctness gate.
+- [x] Retained Core snapshots can serve through a digest-sealed version-2
+  txid-group MPHF index without expanding the base. Experimental MDBX/redb
+  overlays add bounded catch-up, compatible compressed undo, active compaction,
+  authenticated rebase, and fail-closed recovery for interrupted directory
+  swaps. This is a measured `--once` workflow, not the default chainstate.
 
 ### Network, mempool, and services
 
@@ -196,10 +201,11 @@ Primary references:
   fault-injection gates. The first run was invalidated after an unplanned
   peer-exhaustion exit exposed and drove the daemon retry fix. Its evidence is
   retained rather than relabelled as a pass. The replacement immutable-baseline
-  run's formal live window started at `2026-07-28T11:12:36Z`; its one-day
-  recovery exercises are scheduled for `2026-07-29T11:12:36Z` and it cannot
-  satisfy the seven-day gate before `2026-08-04T11:12:36Z`. Current evidence is
-  in [PUBLIC_NETWORK_SOAK.md](PUBLIC_NETWORK_SOAK.md).
+  run's formal live window started at `2026-07-28T11:12:36Z`; its minimum
+  seven-day boundary was `2026-08-04T11:12:36Z`. That time threshold has passed,
+  but no accepted fail-closed final report is versioned in this repository, so
+  elapsed time alone does not complete the gate. Current evidence and the exact
+  acceptance procedure are in [PUBLIC_NETWORK_SOAK.md](PUBLIC_NETWORK_SOAK.md).
 - [x] **External security review.** Review consensus boundaries, script-engine
   provenance, P2P resource accounting, snapshot trust, storage recovery,
   authentication, wallet/PSBT handling, and release supply chain; resolve every
@@ -228,8 +234,8 @@ Primary references:
   clean-host run remain external execution gates.
 
 These are the only blockers to the first production **outbound-only,
-watch-only/external-signer validating-node** claim. Inbound service, an internal
-hot wallet, mining, exact Core RPC parity, BIP324, and target-HDD benchmark
+watch-only/external-signer validating-node** claim. Inbound service, an
+internal hot wallet, mining, exact Core RPC parity, and target-HDD benchmark
 numbers are intentionally not hidden P0 requirements.
 
 ## P1 — normal full-node and operator completeness
@@ -332,11 +338,16 @@ optional where appropriate, and host-runtime compatible.
 
 ## P2 — role-specific extensions
 
-- [ ] BIP324 v2 transport with v1 fallback and Core 31 interoperability tests.
+- [x] BIP324 v2 transport with v1 fallback and Core 31 interoperability tests.
+  Real daemon coverage includes `core_block_differential` (including
+  `v2_transport_interoperates_with_core` and `v2_preference_falls_back_to_v1_against_a_v1_only_core`)
+  against Bitcoin Core 31.0 and btcd 0.26.
 - [ ] Mining interfaces (`getblocktemplate`/`submitblock` or a versioned local
   IPC boundary) only if rBTC is deployed for mining.
-- [ ] ZMQ-compatible or native bounded event publication for indexers; the
+- [x] ZMQ-compatible or native bounded event publication for indexers; the
   existing REST/event path remains sufficient for the base node.
+  The `zmq_publisher::tests` suite now validates subscription-topic filtering,
+  notification labeling, and bounded slow-subscriber drop policy.
 - [ ] Encrypted daemon-held keys and in-process signing only as a separately
   threat-modeled wallet product. The default node continues to prefer watch-only
   descriptors and external signers.

@@ -11,6 +11,13 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Bitcoin, legacy testnet, Testnet4, Signet, and regtest full-node validation.
 - Core 31-compatible AssumeUTXO activation with independent background
   validation.
+- Version-2 Core snapshot access indexes keyed by txid group, with batched
+  file-ordered lookups and a bounded maximum group span. The measured
+  height-935,000 mainnet sidecar is 530,926,239 bytes, 54.1% smaller than the
+  former outpoint-keyed overlay format.
+- Experimental bounded snapshot-backed catch-up on MDBX or redb overlays,
+  including compact/rebase maintenance and a configurable hard or
+  policy-enforced capacity budget.
 - Bounded outbound and optional inbound P2P services, persistent mempool,
   pruned freezer, optional indexes, authenticated operator APIs, and a
   watch-only external-signer wallet.
@@ -48,8 +55,19 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Safety
 
-- rBTC remains pre-release until the seven-day public-network soak and first
-  native signed release complete. It must not hold mainnet private keys.
+- Snapshot-overlay undo remains readable across the compression upgrade;
+  marked zstd records enforce 256 MiB output and 8 MiB window ceilings.
+- Interrupted MDBX compaction/rebase swaps restore an unambiguous set-aside
+  environment and preserve all candidates while failing closed on ambiguity.
+- Atomic validation checkpoints default to 256 blocks after measured replay;
+  `--validation-batch-size` remains available for lower-memory hosts.
+- `2026-08-08` acceptance refresh: real daemon verification passed for
+  BIP324-v2 transport fallback interoperability (`v2_transport_interoperates_with_core`
+  and `v2_preference_falls_back_to_v1_against_a_v1_only_core`), real
+  inbound Torv3/btcd handshakes, and bounded ZMQ topic/filter/subscriber tests.
+- rBTC remains pre-release until an accepted seven-day public-network soak
+  report and the first native signed release complete. It must not hold
+  mainnet private keys.
 
 ### Productization
 
