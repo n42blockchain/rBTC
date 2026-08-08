@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::p2p::{decode_base32, encode_base32};
@@ -291,18 +291,7 @@ async fn command(
         stream.write_all(request.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;
-        let mut reader = BufReader::new(&mut *stream);
-        let mut line = String::new();
-        let read = tokio::io::AsyncReadExt::take(&mut reader, MAX_REPLY_LINE_BYTES)
-            .read_line(&mut line)
-            .await?;
-        if read == 0 {
-            return Err(I2pSamError::MalformedReply);
-        }
-        if u64::try_from(read).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
-            return Err(I2pSamError::OversizedReply);
-        }
-        let line = line.trim_end_matches(['\r', '\n']).to_owned();
+        let line = read_reply_line(stream).await?;
         let result = field(&line, "RESULT=").ok_or(I2pSamError::MalformedReply)?;
         if result != "OK" {
             return Err(I2pSamError::CommandFailed {
@@ -314,6 +303,39 @@ async fn command(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sam command timed out"))?
+}
+
+/// Reads exactly one bounded reply line, consuming no byte beyond it.
+///
+/// Buffered reads must not be used here. A bridge may coalesce a reply with
+/// whatever follows it in one segment, and after `STREAM CONNECT` what
+/// follows is the peer's own traffic: a buffer that read ahead would either
+/// swallow the next reply or silently consume the first bytes of the
+/// Bitcoin stream. Reading a byte at a time costs one syscall per byte on a
+/// handful of short control lines and keeps the socket positioned exactly
+/// after the newline.
+async fn read_reply_line(stream: &mut TcpStream) -> Result<String, I2pSamError> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read_exact(&mut byte).await.map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                I2pSamError::MalformedReply
+            } else {
+                I2pSamError::Io(error)
+            }
+        })?;
+        debug_assert_eq!(read, 1);
+        if byte[0] == b'\n' {
+            break;
+        }
+        if u64::try_from(line.len()).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
+            return Err(I2pSamError::OversizedReply);
+        }
+        line.push(byte[0]);
+    }
+    let line = String::from_utf8(line).map_err(|_| I2pSamError::MalformedReply)?;
+    Ok(line.trim_end_matches('\r').to_owned())
 }
 
 /// Computes the BIP155 destination hash of a SAM destination key.
@@ -371,7 +393,7 @@ mod tests {
     use super::*;
     use sha2::Digest;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     /// A destination key in I2P's base64 alphabet.
@@ -490,6 +512,46 @@ mod tests {
                 )),
             "{commands:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn coalesced_replies_are_read_one_line_at_a_time() {
+        // A real router may put the HELLO reply and the session status in one
+        // segment. A buffered reader would swallow the second line with the
+        // first and report a malformed reply; this reproduces that shape.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("HELLO"),
+                "the client greets first"
+            );
+            // Both replies in one write, before the client sends its second
+            // command.
+            stream
+                .write_all(
+                    format!(
+                        "HELLO REPLY RESULT=OK VERSION=3.3
+SESSION STATUS RESULT=OK DESTINATION={TEST_DESTINATION}
+"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut sink = [0_u8; 256];
+            let _ = stream.read(&mut sink).await;
+            std::future::pending::<()>().await;
+        });
+
+        let session =
+            I2pSamSession::create(bridge, "rbtc-coalesced", None, I2pSamConfig::default())
+                .await
+                .expect("a coalesced reply pair must still be parsed line by line");
+        assert_eq!(session.destination_key(), TEST_DESTINATION);
     }
 
     #[tokio::test]

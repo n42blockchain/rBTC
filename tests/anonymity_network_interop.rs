@@ -88,21 +88,21 @@ fn responder_version(nonce: u64) -> VersionMessage {
     version
 }
 
-/// Accepts one connection and completes the inbound v1 handshake, then
-/// answers one ping so the caller can prove the stream carries traffic in
-/// both directions after negotiation.
+/// Accepts one connection, completes the inbound v1 handshake, and answers
+/// one address request.
+///
+/// The exchange is deliberately a request/response pair rather than a ping.
+/// `PeerSession::read_message` answers keepalive pings internally and only
+/// surfaces application messages, so a caller can never observe a ping and a
+/// test built on one would block until the peer disconnects.
 async fn serve_one_onion_peer(listener: TcpListener) -> Result<String, String> {
     const RESPONDER_NONCE: u64 = 0x5253_504f_4e44_4552;
-    const PING_NONCE: u64 = 0x5a5a_5a5a;
     let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
     let mut peer = V1Transport::new(stream, Network::Bitcoin.magic());
     let remote = peer
         .handshake_inbound(responder_version(RESPONDER_NONCE))
         .await
         .map_err(|error| format!("inbound handshake over onion failed: {error}"))?;
-    peer.write_message(NetworkMessage::Ping(PING_NONCE))
-        .await
-        .map_err(|error| format!("ping over onion failed: {error}"))?;
     loop {
         match peer
             .read_message()
@@ -110,11 +110,16 @@ async fn serve_one_onion_peer(listener: TcpListener) -> Result<String, String> {
             .map_err(|error| format!("read over onion failed: {error}"))?
             .into_payload()
         {
-            NetworkMessage::Pong(nonce) if nonce == PING_NONCE => {
+            NetworkMessage::GetAddr => {
+                peer.write_message(NetworkMessage::AddrV2(Vec::new()))
+                    .await
+                    .map_err(|error| format!("address reply over onion failed: {error}"))?;
                 return Ok(remote.user_agent);
             }
-            NetworkMessage::Pong(nonce) => {
-                return Err(format!("pong carried {nonce:#x}, expected {PING_NONCE:#x}"));
+            NetworkMessage::Ping(nonce) => {
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .map_err(|error| format!("pong over onion failed: {error}"))?;
             }
             _ => continue,
         }
@@ -183,22 +188,22 @@ async fn published_onion_service_is_reachable_through_the_real_tor_network() {
         "the circuit must reach this test's own listener"
     );
 
+    // A request/response round trip proves the circuit carries traffic in
+    // both directions after negotiation, using an API that surfaces its
+    // result to the caller.
     let mut session = session;
-    // Answer the responder's ping so it can observe traffic in both
-    // directions, then let it finish.
-    loop {
-        match session.read_message().await.expect("read over onion") {
-            NetworkMessage::Ping(nonce) => {
-                session
-                    .into_transport()
-                    .write_message(NetworkMessage::Pong(nonce))
-                    .await
-                    .expect("pong over onion");
-                break;
-            }
-            _ => continue,
-        }
-    }
+    session
+        .request_addresses()
+        .await
+        .expect("address request over onion");
+    let learned = session
+        .receive_addresses()
+        .await
+        .expect("address response over onion");
+    assert!(
+        learned.is_empty(),
+        "the responder answers with an empty address set, got {learned:?}"
+    );
     let dialler_agent = responder
         .await
         .expect("responder task")
