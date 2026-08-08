@@ -104,8 +104,11 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   owner-only inside the data directory and replayed on the next launch, so
   peers that learned the address keep reaching this node across restarts; it
   is never logged. Shutdown withdraws the service with an explicit
-  `DEL_ONION` rather than relying on the connection close alone. Advertising
-  the published address to peers over `addrv2` remains open.
+  `DEL_ONION` rather than relying on the connection close alone. The
+  published address is then announced to peers that negotiated BIP155, both
+  on outbound sessions and in the inbound address relay, and never to a
+  legacy `addr` peer, because an onion address has no legacy encoding and
+  must not be replaced by a substitute.
 - A Tor control-port client publishes and withdraws one ephemeral v3 onion
   service. It speaks only the needed subset — `PROTOCOLINFO` discovery,
   `SAFECOOKIE` challenge-response, `ADD_ONION` with a fresh ED25519-v3 key,

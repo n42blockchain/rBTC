@@ -4461,6 +4461,7 @@ struct NodeInboundSource {
 }
 
 struct SharedInboundSource {
+    advertised_onion: RwLock<Option<(OnionAddress, ServiceFlags)>>,
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
     stats: Arc<InboundStats>,
@@ -4475,6 +4476,7 @@ impl SharedInboundSource {
         services: ServiceFlags,
     ) -> Self {
         Self {
+            advertised_onion: RwLock::new(None),
             current: RwLock::new(None),
             peer_store: RwLock::new(None),
             stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
@@ -4505,6 +4507,21 @@ impl SharedInboundSource {
             shared: Arc::clone(self),
             source,
         }
+    }
+
+    /// Records the published onion service announced to peers.
+    fn install_advertised_onion(&self, advertised: Option<(OnionAddress, ServiceFlags)>) {
+        *self
+            .advertised_onion
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    fn advertised_onion_service(&self) -> Option<(OnionAddress, ServiceFlags)> {
+        self.advertised_onion
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn peer_store(&self) -> Option<Arc<RedbPeerStore>> {
@@ -4598,6 +4615,10 @@ impl InboundDataSource for SharedInboundSource {
 
     fn utxo(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
         self.current()?.utxo(outpoint)
+    }
+
+    fn advertised_onion(&self) -> Option<(OnionAddress, ServiceFlags)> {
+        self.advertised_onion_service()
     }
 
     fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
@@ -7563,7 +7584,14 @@ async fn run_peer_pool_session(
     };
     let _onion_service = match (&options.tor_control, options.inbound_listen) {
         (Some(tor), Some(listen)) => {
-            Some(publish_inbound_onion_service(options, tor, listen).await?)
+            let published = publish_inbound_onion_service(options, tor, listen).await?;
+            if let Some(source) = &inbound_source {
+                source.install_advertised_onion(Some((
+                    published.service.address.clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )));
+            }
+            Some(published)
         }
         _ => None,
     };
@@ -8888,6 +8916,7 @@ async fn connect_and_maintain_standby(
     mempool_relay_source: Option<MempoolRelaySource>,
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
+    advertised_onion: Option<(OnionAddress, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer_with_transport(
@@ -8926,6 +8955,17 @@ async fn connect_and_maintain_standby(
         )
         .await
         .map_err(|_| PeerRunError::transient("local address advertisement timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    }
+    if let Some((onion, services)) = advertised_onion {
+        timeout(
+            PEER_TIMEOUT,
+            connected
+                .session
+                .advertise_onion_address(&onion, services, local_time),
+        )
+        .await
+        .map_err(|_| PeerRunError::transient("onion address advertisement timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))?;
     }
     if let Some(source) = mempool_relay_source {
@@ -8987,6 +9027,7 @@ fn spawn_peer_connections(
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
     mempool_relay_source: Option<&MempoolRelaySource>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
+    advertised_onion: Option<&(OnionAddress, ServiceFlags)>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
@@ -9013,6 +9054,7 @@ fn spawn_peer_connections(
                 .inbound_limits
                 .advertised_address
                 .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
+            let advertised_onion = advertised_onion.cloned();
             let proxy = options.resources.proxy;
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
@@ -9029,6 +9071,7 @@ fn spawn_peer_connections(
                 mempool_relay_source,
                 transaction_pool,
                 advertised_address,
+                advertised_onion,
                 network_time,
             ));
             (
@@ -9196,6 +9239,13 @@ async fn reap_finished_standbys(
     }
 }
 
+/// Returns the published onion service announced alongside routable peers.
+fn advertised_onion_service(
+    inbound_source: Option<&Arc<SharedInboundSource>>,
+) -> Option<(OnionAddress, ServiceFlags)> {
+    inbound_source.and_then(|source| source.advertised_onion_service())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_peer_candidates(
     options: &Options,
@@ -9215,6 +9265,7 @@ async fn try_peer_candidates(
     failures: &mut Vec<String>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<bool, String> {
+    let advertised_onion = advertised_onion_service(inbound_source);
     let mut pending = match spawn_peer_connections(
         options,
         remotes,
@@ -9223,6 +9274,7 @@ async fn try_peer_candidates(
         Some(transaction_relay),
         Some(mempool_relay_source),
         Some(transaction_pool),
+        advertised_onion.as_ref(),
         network_time,
     ) {
         Ok(pending) => pending,
@@ -18254,6 +18306,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &Arc::new(NetworkTime::default()),
         )
         .unwrap();
@@ -18538,6 +18591,7 @@ mod tests {
             None,
             None,
             Some(source),
+            None,
             None,
             None,
             Arc::new(NetworkTime::default()),

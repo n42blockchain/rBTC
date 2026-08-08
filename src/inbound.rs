@@ -38,7 +38,7 @@ use tokio::{
 use crate::{
     p2p::{
         InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
-        MAX_INVENTORY_ENTRIES, P2pError, TransactionRelay, accept_inbound,
+        MAX_INVENTORY_ENTRIES, OnionAddress, P2pError, TransactionRelay, accept_inbound,
     },
     utxo::{OutPointKey, Utxo},
 };
@@ -500,6 +500,14 @@ pub trait InboundDataSource: Send + Sync + 'static {
     }
     /// Explicit local address and exact service bits suitable for relay.
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
+        None
+    }
+
+    /// Published local onion service and its exact service bits.
+    ///
+    /// Only peers that negotiated BIP155 can receive it, because an onion
+    /// address has no legacy `addr` encoding.
+    fn advertised_onion(&self) -> Option<(OnionAddress, ServiceFlags)> {
         None
     }
     /// Current local minimum mempool fee in satoshis per 1,000 virtual bytes.
@@ -1339,6 +1347,10 @@ async fn serve_addresses(
             .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE.saturating_sub(addresses.len()))
             .map(|address| (now, Address::new(&address, services))),
     );
+    let onion = peer
+        .addrv2_relay()
+        .then(|| source.advertised_onion())
+        .flatten();
     let message = if peer.addrv2_relay() {
         NetworkMessage::AddrV2(
             addresses
@@ -1357,6 +1369,13 @@ async fn serve_addresses(
                         port: socket.port(),
                     }
                 })
+                .chain(onion.map(|(onion, services)| AddrV2Message {
+                    time: now,
+                    services,
+                    addr: AddrV2::TorV3(onion.public_key()),
+                    port: onion.port(),
+                }))
+                .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
                 .collect(),
         )
     } else {

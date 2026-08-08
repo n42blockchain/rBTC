@@ -2077,6 +2077,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .await
     }
 
+    /// Announces one reachable v3 onion service to the peer.
+    ///
+    /// An onion address has no legacy `addr` encoding, so a peer that did
+    /// not negotiate BIP155 receives nothing rather than a lossy
+    /// substitute. Callers must only advertise a service they actually
+    /// publish, because a peer will retain and gossip it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the peer stream cannot accept the message.
+    pub async fn advertise_onion_address(
+        &mut self,
+        onion: &OnionAddress,
+        services: ServiceFlags,
+        last_seen: u32,
+    ) -> Result<(), P2pError> {
+        if !self.transport.peer_addrv2() {
+            return Ok(());
+        }
+        self.transport
+            .write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
+                time: last_seen,
+                services,
+                addr: AddrV2::TorV3(onion.public_key()),
+                port: onion.port(),
+            }]))
+            .await
+    }
+
     /// Receives one bounded legacy `addr` or BIP155 `addrv2` response.
     ///
     /// Unsupported address families and zero ports are ignored. Repeated IPv4
@@ -5762,6 +5791,55 @@ mod tests {
             "taking the batch clears it"
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn onion_advertisement_requires_addrv2_negotiation() {
+        let onion = OnionAddress::from_public_key([0x66; 32], 8333);
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+
+        // A peer that negotiated BIP155 receives the TorV3 entry.
+        let (client_stream, server_stream) = duplex(1 << 16);
+        let mut transport = V1Transport::new(client_stream, Network::Regtest.magic());
+        transport.peer_addrv2 = true;
+        let mut session = PeerSession::new(PeerTransport::V1(transport), version(1));
+        session
+            .advertise_onion_address(&onion, services, 1_800_000_000)
+            .await
+            .unwrap();
+        let mut peer = V1Transport::new(server_stream, Network::Regtest.magic());
+        let NetworkMessage::AddrV2(announced) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("an addrv2 peer must receive an addrv2 announcement");
+        };
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].addr, AddrV2::TorV3(onion.public_key()));
+        assert_eq!(announced[0].port, 8333);
+        assert_eq!(announced[0].services, services);
+        assert_eq!(announced[0].time, 1_800_000_000);
+
+        // A legacy peer receives nothing, because an onion address has no
+        // `addr` encoding and must never be replaced by a substitute.
+        let (client_stream, server_stream) = duplex(1 << 16);
+        let mut legacy = PeerSession::new(
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+            version(2),
+        );
+        legacy
+            .advertise_onion_address(&onion, services, 1_800_000_000)
+            .await
+            .unwrap();
+        legacy
+            .broadcast_transaction(&compact_test_block().txdata[0])
+            .await
+            .expect_err("a coinbase is refused, proving nothing preceded it");
+        let mut peer = V1Transport::new(server_stream, Network::Regtest.magic());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.read_message())
+                .await
+                .is_err(),
+            "a legacy peer must receive no onion announcement"
+        );
     }
 
     #[test]
