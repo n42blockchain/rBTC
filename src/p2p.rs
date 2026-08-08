@@ -594,6 +594,21 @@ pub struct OnionPeerAddress {
     pub last_seen: u32,
 }
 
+/// An I2P destination learned from `addrv2`.
+///
+/// Like onion services, I2P peers are kept apart from routable addresses:
+/// they are reachable only through a SAM bridge and carry no source group
+/// usable for IP-range diversity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct I2pPeerAddress {
+    /// Validated BIP155 destination.
+    pub i2p: crate::i2p_sam::I2pAddress,
+    /// Service flags advertised with the address.
+    pub services: ServiceFlags,
+    /// Peer-supplied last-seen Unix timestamp.
+    pub last_seen: u32,
+}
+
 /// A directly connectable IPv4 or IPv6 address learned from `addr`/`addrv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerAddress {
@@ -849,6 +864,7 @@ pub struct PeerSession<S> {
     mempool_relay_source: Option<MempoolRelaySource>,
     block_transfer_stats: BlockTransferStats,
     onion_addresses: Vec<OnionPeerAddress>,
+    i2p_addresses: Vec<I2pPeerAddress>,
 }
 
 /// An accepted inbound Bitcoin peer after a bounded v1 handshake.
@@ -923,6 +939,7 @@ impl<S> PeerSession<S> {
             mempool_relay_source: None,
             block_transfer_stats: BlockTransferStats::default(),
             onion_addresses: Vec::new(),
+            i2p_addresses: Vec::new(),
         }
     }
 
@@ -949,6 +966,11 @@ impl<S> PeerSession<S> {
     /// separately because they enter different, independently bounded pools.
     pub fn take_onion_addresses(&mut self) -> Vec<OnionPeerAddress> {
         std::mem::take(&mut self.onion_addresses)
+    }
+
+    /// Takes the I2P destinations observed in the last `addrv2` response.
+    pub fn take_i2p_addresses(&mut self) -> Vec<I2pPeerAddress> {
+        std::mem::take(&mut self.i2p_addresses)
     }
 
     /// Returns cumulative measurements for fully received requested block batches.
@@ -2106,6 +2128,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             .await
     }
 
+    /// Announces one reachable I2P destination to the peer.
+    ///
+    /// I2P has no `addr` encoding and no port, so a peer that did not
+    /// negotiate BIP155 receives nothing and the announced port is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the peer stream cannot accept the message.
+    pub async fn advertise_i2p_address(
+        &mut self,
+        i2p: &crate::i2p_sam::I2pAddress,
+        services: ServiceFlags,
+        last_seen: u32,
+    ) -> Result<(), P2pError> {
+        if !self.transport.peer_addrv2() {
+            return Ok(());
+        }
+        self.transport
+            .write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
+                time: last_seen,
+                services,
+                addr: AddrV2::I2p(i2p.destination_hash()),
+                port: 0,
+            }]))
+            .await
+    }
+
     /// Receives one bounded legacy `addr` or BIP155 `addrv2` response.
     ///
     /// Unsupported address families and zero ports are ignored. Repeated IPv4
@@ -2141,6 +2190,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                         });
                     }
                     let mut onions = Vec::new();
+                    let mut i2p = Vec::new();
                     let routable = addresses
                         .into_iter()
                         .filter_map(|address: AddrV2Message| {
@@ -2157,6 +2207,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                                 }
                                 return None;
                             }
+                            if let AddrV2::I2p(destination) = address.addr {
+                                // I2P peers carry no port; the destination
+                                // alone identifies them.
+                                i2p.push(I2pPeerAddress {
+                                    i2p: crate::i2p_sam::I2pAddress::from_destination_hash(
+                                        destination,
+                                    ),
+                                    services: address.services,
+                                    last_seen: address.time,
+                                });
+                                return None;
+                            }
                             let socket = address.socket_addr().ok()?;
                             (socket.port() != 0).then_some(PeerAddress {
                                 socket,
@@ -2168,6 +2230,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     onions.sort_by(|left, right| left.onion.cmp(&right.onion));
                     onions.dedup_by(|left, right| left.onion == right.onion);
                     self.onion_addresses = onions;
+                    i2p.sort_by(|left, right| left.i2p.cmp(&right.i2p));
+                    i2p.dedup_by(|left, right| left.i2p == right.i2p);
+                    self.i2p_addresses = i2p;
                     return Ok(deduplicate_addresses(routable.into_iter()));
                 }
                 _ => {}

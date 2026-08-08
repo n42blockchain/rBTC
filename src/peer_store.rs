@@ -17,7 +17,8 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::p2p::{OnionAddress, OnionPeerAddress, PeerAddress};
+use crate::i2p_sam::I2pAddress;
+use crate::p2p::{I2pPeerAddress, OnionAddress, OnionPeerAddress, PeerAddress};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_metadata");
 const PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_addresses");
@@ -26,6 +27,9 @@ const PENALTIES: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_penal
 /// only through a proxy and carry no IP source group, so they must not share
 /// the routable pool's bounds or diversity rules.
 const ONION_PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_onion_addresses");
+/// I2P destinations share the onion book's rationale: proxy-only reach and
+/// no IP source group, so they get their own table and bounds.
+const I2P_PEERS: TableDefinition<&str, &[u8]> = TableDefinition::new("peer_i2p_addresses");
 const GENESIS_KEY: &str = "genesis";
 const BUCKET_KEY: &str = "bucket_key";
 const TRIED_COLLISIONS_KEY: &str = "tried_collisions";
@@ -55,6 +59,12 @@ const MAX_STORED_ONION_PEERS: usize = 1_024;
 const ONION_SOURCE_GROUP_FAMILY: &str = "onion";
 /// Complete source-group value stored on every onion record.
 const ONION_SOURCE_GROUP: &str = "onion:0:0";
+/// Independent retention ceiling for the I2P address book.
+const MAX_STORED_I2P_PEERS: usize = 1_024;
+/// Family marker for I2P records.
+const I2P_SOURCE_GROUP_FAMILY: &str = "i2p";
+/// Complete source-group value stored on every I2P record.
+const I2P_SOURCE_GROUP: &str = "i2p:0:0";
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
@@ -209,6 +219,7 @@ impl RedbPeerStore {
             let _peers = transaction.open_table(PEERS)?;
             let _penalties = transaction.open_table(PENALTIES)?;
             let _onion = transaction.open_table(ONION_PEERS)?;
+            let _i2p = transaction.open_table(I2P_PEERS)?;
             bucket_key
         };
         transaction.commit()?;
@@ -583,6 +594,164 @@ impl RedbPeerStore {
         let transaction = self.db.begin_write()?;
         {
             let mut table = transaction.open_table(ONION_PEERS)?;
+            let keys = table
+                .iter()?
+                .map(|row| row.map(|(key, _)| key.value().to_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            for (key, record) in records {
+                let encoded = serde_json::to_vec(record)?;
+                table.insert(key.as_str(), encoded.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically filters and stores one peer-sourced I2P address batch.
+    ///
+    /// The bounds, service requirement, and hygiene match the onion book, so
+    /// neither anonymity network can displace the other or the routable pool.
+    pub fn insert_discovered_i2p(
+        &self,
+        addresses: &[I2pPeerAddress],
+        now: u32,
+    ) -> Result<usize, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let mut records = self.load_i2p_records()?;
+        records.retain(|_, record| {
+            ServiceFlags::from(record.services).has(required) && !is_terrible(record, now)
+        });
+        let mut inserted = 0;
+        for address in addresses {
+            if !address.services.has(required)
+                || address.last_seen == 0
+                || address.last_seen > now.saturating_add(MAX_FUTURE_SECS)
+            {
+                continue;
+            }
+            let key = address.i2p.to_string();
+            if let Some(record) = records.get_mut(&key) {
+                record.last_seen = record.last_seen.max(address.last_seen);
+                record.services = address.services.to_u64();
+            } else {
+                records.insert(
+                    key,
+                    StoredPeer {
+                        services: address.services.to_u64(),
+                        last_seen: address.last_seen,
+                        source_group: I2P_SOURCE_GROUP.to_owned(),
+                        ..StoredPeer::default()
+                    },
+                );
+                inserted += 1;
+            }
+        }
+        let mut ordered = records.into_iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by(|(left_key, left), (right_key, right)| {
+            peer_priority(left)
+                .cmp(&peer_priority(right))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        ordered.truncate(MAX_STORED_I2P_PEERS);
+        self.replace_i2p_records(&ordered)?;
+        Ok(inserted)
+    }
+
+    /// Returns fresh I2P candidates in reputation order.
+    pub fn i2p_candidates(
+        &self,
+        now: u32,
+        limit: usize,
+    ) -> Result<Vec<I2pAddress>, PeerStoreError> {
+        let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let penalties = self.load_penalties()?;
+        let mut candidates = self
+            .load_i2p_records()?
+            .into_iter()
+            .filter(|(key, record)| {
+                ServiceFlags::from(record.services).has(required)
+                    && !is_terrible(record, now)
+                    && retry_ready(record, now)
+                    && penalties
+                        .get(key)
+                        .is_none_or(|penalty| penalty.discouraged_until <= now)
+            })
+            .filter_map(|(key, record)| {
+                I2pAddress::new(&key)
+                    .ok()
+                    .map(|i2p| (peer_priority(&record), i2p))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(left, left_i2p), (right, right_i2p)| {
+            left.cmp(right).then_with(|| left_i2p.cmp(right_i2p))
+        });
+        candidates.truncate(limit);
+        Ok(candidates.into_iter().map(|(_, i2p)| i2p).collect())
+    }
+
+    /// Records one attempted I2P connection so retry backoff applies.
+    pub fn record_i2p_attempt(
+        &self,
+        address: &I2pAddress,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_i2p(address, |record| {
+            record.last_attempt = now;
+            record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+        })
+    }
+
+    /// Records one completed I2P handshake, clearing accumulated failures.
+    pub fn record_i2p_success(
+        &self,
+        address: &I2pAddress,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        self.update_i2p(address, |record| {
+            record.last_success = now;
+            record.consecutive_failures = 0;
+        })
+    }
+
+    fn update_i2p(
+        &self,
+        address: &I2pAddress,
+        update: impl FnOnce(&mut StoredPeer),
+    ) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_i2p_records()?;
+        let Some(record) = records.get_mut(&address.to_string()) else {
+            return Ok(false);
+        };
+        update(record);
+        let ordered = records.into_iter().collect::<Vec<_>>();
+        self.replace_i2p_records(&ordered)?;
+        Ok(true)
+    }
+
+    fn load_i2p_records(&self) -> Result<HashMap<String, StoredPeer>, PeerStoreError> {
+        let transaction = self.db.begin_read()?;
+        let table = transaction.open_table(I2P_PEERS)?;
+        let mut records = HashMap::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            let key = key.value().to_owned();
+            if I2pAddress::new(&key).is_err() {
+                return Err(PeerStoreError::Malformed("i2p address key"));
+            }
+            records.insert(key, decode_stored_peer(value.value())?);
+        }
+        Ok(records)
+    }
+
+    fn replace_i2p_records(&self, records: &[(String, StoredPeer)]) -> Result<(), PeerStoreError> {
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(I2P_PEERS)?;
             let keys = table
                 .iter()?
                 .map(|row| row.map(|(key, _)| key.value().to_owned()))
@@ -1227,7 +1396,7 @@ fn valid_source_group(group: &str) -> bool {
         // The onion address book shares this record type but has no IP
         // range to diversify across, so its entries carry one fixed marker
         // group. `source_group` never produces it for a routable address.
-        ONION_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
+        ONION_SOURCE_GROUP_FAMILY | I2P_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
         _ => false,
     }
 }
@@ -2756,6 +2925,63 @@ mod tests {
                 .len(),
             MAX_STORED_ONION_PEERS,
             "a flood cannot grow the book past its ceiling"
+        );
+    }
+
+    #[test]
+    fn i2p_destinations_persist_in_their_own_bounded_address_book() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("peers.redb");
+        let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let first = I2pAddress::from_destination_hash([0x11; 32]);
+        let second = I2pAddress::from_destination_hash([0x22; 32]);
+        let entry = |i2p: &I2pAddress, services, last_seen| I2pPeerAddress {
+            i2p: i2p.clone(),
+            services,
+            last_seen,
+        };
+
+        assert_eq!(
+            store
+                .insert_discovered_i2p(
+                    &[
+                        entry(&first, services, now - 10),
+                        entry(&second, services, now - 20),
+                        entry(&first, ServiceFlags::NONE, now - 10),
+                    ],
+                    now,
+                )
+                .unwrap(),
+            2,
+            "only serviceable destinations are stored"
+        );
+        assert_eq!(store.i2p_candidates(now, 10).unwrap().len(), 2);
+
+        // The three books stay independent of each other.
+        assert!(store.candidates(now, 10).unwrap().is_empty());
+        assert!(store.onion_candidates(now, 10).unwrap().is_empty());
+
+        assert!(store.record_i2p_attempt(&first, now).unwrap());
+        assert!(
+            !store.i2p_candidates(now, 10).unwrap().contains(&first),
+            "a recorded attempt applies the retry backoff"
+        );
+        assert!(store.record_i2p_success(&first, now).unwrap());
+        assert!(store.i2p_candidates(now, 10).unwrap().contains(&first));
+        assert!(
+            !store
+                .record_i2p_attempt(&I2pAddress::from_destination_hash([0x33; 32]), now)
+                .unwrap()
+        );
+
+        drop(store);
+        let reopened = RedbPeerStore::open(path, Network::Regtest).unwrap();
+        assert_eq!(
+            reopened.i2p_candidates(now, 10).unwrap().len(),
+            2,
+            "the I2P book survives reopen"
         );
     }
 }

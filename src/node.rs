@@ -2,6 +2,7 @@
 
 mod config_file;
 
+use crate::i2p_sam::I2pAddress;
 use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
@@ -759,6 +760,8 @@ pub enum NodePeerTarget {
     Socket(SocketAddr),
     /// A v3 onion service reached through the configured proxy.
     Onion(OnionAddress),
+    /// An I2P destination reached through the configured SAM bridge.
+    I2p(I2pAddress),
 }
 
 impl NodePeerTarget {
@@ -767,7 +770,7 @@ impl NodePeerTarget {
     pub const fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Socket(socket) => Some(*socket),
-            Self::Onion(_) => None,
+            Self::Onion(_) | Self::I2p(_) => None,
         }
     }
 }
@@ -780,9 +783,12 @@ impl std::str::FromStr for NodePeerTarget {
         if let Ok(socket) = SocketAddr::from_str(value) {
             return Ok(Self::Socket(socket));
         }
-        OnionAddress::parse(value)
-            .map(Self::Onion)
-            .map_err(|_| format!("{value} is neither a routable socket nor a v3 onion address"))
+        if let Ok(onion) = OnionAddress::parse(value) {
+            return Ok(Self::Onion(onion));
+        }
+        I2pAddress::new(value).map(Self::I2p).map_err(|_| {
+            format!("{value} is not a routable socket, a v3 onion address, or an I2P destination")
+        })
     }
 }
 
@@ -791,15 +797,24 @@ impl std::fmt::Display for NodePeerTarget {
         match self {
             Self::Socket(socket) => write!(f, "{socket}"),
             Self::Onion(onion) => write!(f, "{onion}"),
+            Self::I2p(i2p) => write!(f, "{i2p}"),
         }
     }
 }
 
-impl From<&NodePeerTarget> for ProxyTarget {
-    fn from(target: &NodePeerTarget) -> Self {
+impl TryFrom<&NodePeerTarget> for ProxyTarget {
+    type Error = ();
+
+    /// Converts the destinations a SOCKS5 proxy can reach.
+    ///
+    /// I2P is deliberately not among them: its destinations are reached
+    /// through a SAM bridge, not a proxy, so silently treating one as a
+    /// proxy target would produce a connection to the wrong network.
+    fn try_from(target: &NodePeerTarget) -> Result<Self, Self::Error> {
         match target {
-            NodePeerTarget::Socket(socket) => Self::Socket(*socket),
-            NodePeerTarget::Onion(onion) => Self::Onion(onion.clone()),
+            NodePeerTarget::Socket(socket) => Ok(Self::Socket(*socket)),
+            NodePeerTarget::Onion(onion) => Ok(Self::Onion(onion.clone())),
+            NodePeerTarget::I2p(_) => Err(()),
         }
     }
 }
@@ -8674,7 +8689,14 @@ async fn connect_peer_with_transport(
         )));
     }
     let handshake_started = Instant::now();
-    let target = ProxyTarget::from(&remote);
+    // I2P destinations are dialled through a SAM bridge rather than a proxy;
+    // that session is not wired into the scheduler yet, so such a target is
+    // refused as a local configuration fault instead of being misrouted.
+    let Ok(target) = ProxyTarget::try_from(&remote) else {
+        return Err(PeerRunError::local(format!(
+            "I2P peer {remote} requires a SAM bridge session, which outbound scheduling does not use yet"
+        )));
+    };
     let mut session = timeout(PEER_TIMEOUT, async {
         match (proxy, &target) {
             (Some(proxy), _) => {
@@ -9716,6 +9738,7 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
     let recorded = match remote {
         NodePeerTarget::Socket(socket) => store.record_attempt(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_attempt(onion, now).map(|_| ()),
+        NodePeerTarget::I2p(i2p) => store.record_i2p_attempt(i2p, now).map(|_| ()),
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer attempt history for {remote} failed: {error}");
@@ -9739,11 +9762,11 @@ fn record_peer_failure(
         }
     };
     // Tried-collision probing and protocol cooldowns are keyed by socket
-    // address; an onion peer has neither a collision slot nor an entry in
-    // that keyspace, so its failure is recorded in its own book instead.
+    // address; an anonymity-network peer has neither a collision slot nor an
+    // entry in that keyspace, so its failure stays in its own book.
     let Some(routable) = remote.socket() else {
         if kind == PeerFailureKind::ProtocolViolation && !manual {
-            rbtc_info!("onion peer {remote} failed an objective protocol rule");
+            rbtc_info!("peer {remote} failed an objective protocol rule");
         }
         return;
     };
@@ -9775,6 +9798,7 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: &NodePeerT
     let recorded = match remote {
         NodePeerTarget::Socket(socket) => store.record_session_success(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_success(onion, now).map(|_| ()),
+        NodePeerTarget::I2p(i2p) => store.record_i2p_success(i2p, now).map(|_| ()),
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer session success for {remote} failed: {error}");
@@ -9878,6 +9902,18 @@ async fn discover_peer_addresses(
                     Ok(_) => {}
                     Err(error) => {
                         rbtc_warn!("onion peer address persistence from {source} failed: {error}");
+                    }
+                }
+            }
+            let destinations = session.take_i2p_addresses();
+            if !destinations.is_empty() {
+                match store.insert_discovered_i2p(&destinations, now) {
+                    Ok(inserted) if inserted > 0 => {
+                        rbtc_info!("persisted {inserted} learned I2P peer addresses from {source}");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        rbtc_warn!("I2P peer address persistence from {source} failed: {error}");
                     }
                 }
             }
@@ -17362,7 +17398,7 @@ mod tests {
         assert_eq!(target.socket(), None);
         assert_eq!(target.to_string(), onion.to_string());
         assert_eq!(
-            ProxyTarget::from(&target),
+            ProxyTarget::try_from(&target).expect("an onion target converts"),
             ProxyTarget::Onion(onion.clone())
         );
         assert_eq!(
