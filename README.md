@@ -134,11 +134,16 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   deduplicated, and stored in a third peer-store table with its own
   1,024-entry ceiling, service requirement, hygiene, and retry backoff, so no
   network can displace another. Attempt and success bookkeeping dispatches to
-  that book. Outbound dialling still refuses an I2P target as a local
-  configuration fault, because the scheduler does not hold a SAM session yet;
-  a SOCKS5 proxy is deliberately never substituted, since that would connect
-  to the wrong network. `--i2psam` configuration, `onlynet i2p`, and inbound
-  `STREAM ACCEPT` remain open.
+  that book. `--i2psam IP:PORT` names the loopback bridge, refused on any
+  other address because it opens streams on this node's behalf; its session
+  key is stored owner-only and replayed so the published destination survives
+  restarts. Persisted I2P candidates then join the same ordered outbound
+  wave, dialled through `STREAM CONNECT` and handed to the ordinary v1 or
+  BIP324 handshake. `--onlynet i2p` restricts outbound work to that network
+  and fails closed without a bridge. A SOCKS5 proxy is never substituted for
+  the bridge — an I2P target has no proxy representation at all — because
+  that would connect to the wrong network. Inbound `STREAM ACCEPT` remains
+  open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

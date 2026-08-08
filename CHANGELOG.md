@@ -43,6 +43,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - An I2P SAM v3 client with validated BIP155 `.b32.i2p` addressing.
 - A separate bounded I2P address book with `addrv2` ingestion and
   announcement.
+- `--i2psam` and `--onlynet i2p` dialling persisted I2P peers through a SAM
+  session with a reusable owner-only destination key.
 
 ### Safety
 
