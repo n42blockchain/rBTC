@@ -27,6 +27,10 @@ bitcoin = { version = "=0.32.102", default-features = true }
 bitcoinconsensus = "0.106"
 bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
 axum = "0.8.9"
+# BIP324 v2 transport record ciphers (FSChaCha20 / FSChaCha20Poly1305 are
+# built on these primitives in `p2p_v2`).
+chacha20 = "0.9"
+chacha20poly1305 = "0.10"
 fs2 = "=0.4.3"
 redb = "2.6.3"
 libmdbx = { version = "0.6.6", optional = true }
@@ -34,6 +38,7 @@ rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+sha3 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -41,11 +46,19 @@ zstd = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 proptest = "1.7"
+# Benchmark-only. SQLite is already linked into every build through
+# bdk_wallet's rusqlite feature, so this evaluates an engine the binary
+# already carries rather than adding one.
+rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 bitcoinconsensus = { path = "vendor/bitcoinconsensus" }
+# Vendored to add a safe `copy_compact` binding for `mdbx_env_copy`, which
+# upstream 0.6.6 does not expose. Keeping the `unsafe` inside the dependency
+# preserves this crate's `unsafe_code = "forbid"`.
+libmdbx = { path = "vendor/libmdbx" }
 redb = { path = "vendor/redb" }
 
 [lints.rust]

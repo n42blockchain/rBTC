@@ -384,7 +384,7 @@ pub fn export_snapshot<S: UtxoStore>(
     Ok(manifest)
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

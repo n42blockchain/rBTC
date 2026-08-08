@@ -1,6 +1,6 @@
 # Operator configuration
 
-Status date: 2026-07-27.
+Status date: 2026-08-08.
 
 `rbtcd --config PATH` loads a strict, bounded `key=value` file before applying
 command-line options. The file must be a regular non-symlink file and may not
@@ -61,7 +61,11 @@ connect=203.0.113.12:48333
 The supported scalar keys are:
 
 - `network`, `data_dir`, `explorer_listen`, `rpc_auth_token_file`,
-  `wallet_descriptors`, `wallet_auth_token_file`
+  `wallet_descriptors`, `wallet_auth_token_file`, `zmq_listen`
+  (loopback-only ZMQ notification endpoint), `torcontrol` and
+  `torcontrol_cookie` (loopback Tor control port publishing an inbound onion
+  service; both are required together and need `listen`), and `i2psam`
+  (loopback I2P SAM bridge)
 - `minimum_chainwork`, `assumevalid`, `signetchallenge`
 - `complete_assumeutxo`, `background_assumeutxo`,
   `validation_batch_size`, `validation_pause_ms`
@@ -74,7 +78,8 @@ The supported scalar keys are:
   `log_max_bytes` (1 MiB–1 GiB), and `log_max_files` (2–20)
 - Boolean `dns_seeds`, `once`, `mempool_full_rbf`, `txindex`,
   `spent_output_index`, `block_filter_index`,
-  `cleanup_validation_dir`, and `validation_deferred_repair`
+  `cleanup_validation_dir`, `v2_transport`, and
+  `validation_deferred_repair`
 
 The repeatable keys are `connect`, `dns_seed`, `signetseednode`, `vbparams`,
 and `testactivationheight`. Boolean values are exactly `true`, `false`, `1`,
@@ -162,8 +167,10 @@ exact resumable output previously owned by this command, and must not alias,
 contain, or sit inside `SOURCE`. Each aggregate archive range is loaded once;
 block structure checks are parallel, freezer staging overlaps UTXO prefetch,
 and full consensus/script execution writes sorted atomic chainstate batches.
-`--validation-batch-size` is 1–1,008, `--validation-pause-ms` can deliberately
-throttle checkpoints, `--validation-deferred-repair` trades faster bulk writes
+`--validation-batch-size` is 1–1,008 and defaults to 256. The examples use 64
+to demonstrate a lower-memory rebuild profile; `--validation-pause-ms` can
+deliberately throttle checkpoints, and `--validation-deferred-repair` trades
+faster bulk writes
 for a potentially slower unclean-restart repair, and the prune/cache/free-space
 options retain their normal hard bounds. A durable owner marker prevents an
 incomplete output from starting as a live node. On restart the command

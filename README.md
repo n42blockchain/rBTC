@@ -2,9 +2,173 @@
 
 High-performance Rust Bitcoin node kernel, designed around a compact and verifiable UTXO set.
 
+> **Release status:** rBTC is still pre-release and must not hold mainnet private
+> keys. Consensus validation, persistent public-network execution, Core 31
+> AssumeUTXO, pruned storage, bounded P2P/API services, and the watch-only
+> external-signer wallet are implemented. The accepted seven-day public-network
+> soak report and first native signed release remain release gates. On
+> 2026-08-08 the real Core 31/btcd interoperability acceptance for BIP324 v2,
+> Torv3 inbound, and bounded ZMQ publication passed.
+
+### Capability map
+
+| Area | Current capability | Boundary |
+| --- | --- | --- |
+| Validation | Full header, block, transaction, script, reorg, and atomic chainstate validation on Bitcoin, legacy testnet, Testnet4, Signet, and regtest | Core 31 consensus/policy behavior is tracked; the repository-owned script adapter remains pinned to Core 26's final `libbitcoinconsensus` ABI |
+| Fast bootstrap | Core 31 `dumptxoutset` v2 activation, ordinary base-to-tip validation, and independent genesis-to-base replay before finalization | Snapshot selection is explicit and release-pinned; a transport digest is not a trust anchor |
+| Storage | redb hot/cold UTXOs, bounded pruned freezer and undo, optional transaction/spent-output/BIP158 indexes, audits, reindex, backup, and recovery procedures | redb is the default production chainstate |
+| Snapshot-backed catch-up | Version-2 txid-group MPHF sidecar plus bounded MDBX or redb overlay catch-up, compaction, rebase, and crash-safe swap recovery | Experimental, `--once`-only workflow; the overlay workflow requires `--features mdbx` |
+| Networking and services | Bounded outbound failover, optional inbound contribution, persistent mempool, explorer/REST, authenticated JSON-RPC, readiness, and metrics | Loopback APIs remain the default; exact Bitcoin Core RPC parity, mining parity, and hot-wallet signing remain out of scope |
+| Wallet and embedding | Watch-only descriptor wallet, unsigned PSBT/external-signature flow, and a library-first multi-instance Tokio API | No daemon-held private keys or in-process signing |
+
+Start with [installation](docs/INSTALLATION.md), validate settings with the
+[operator configuration guide](docs/OPERATOR_CONFIG.md), and use the
+[architecture](docs/ARCHITECTURE.md), [product maturity](docs/PRODUCT_MATURITY.md),
+[roadmap](docs/ROADMAP.md), and [disaster recovery](docs/DISASTER_RECOVERY.md)
+documents for implementation detail and release boundaries.
+
 ## What is implemented now
 
 - Protocol-compatible Bitcoin P2P v1 message framing through `rust-bitcoin`; no custom wire format. Core 26's 4,000,000-byte message, 256-byte user-agent, 101-hash locator, and 1,000-address response bounds are enforced before unbounded work. Every control or keepalive frame consumes the bounded response budget, pings receive pongs, and a post-handshake `version` is rejected immediately. Modern peers receive Core-ordered BIP339 `wtxidrelay` and BIP155 `sendaddrv2` negotiation before `verack`; bounded `getaddr` decoding supports legacy and IPv4/IPv6 addrv2 responses. One process nonce spans every fallback connection for self-connection detection. Fresh full-history+witness IPv4/IPv6 addresses are quality-filtered into a network-bound, bounded `peers.redb` fallback pool. A persistent random secret assigns learned addresses across 1,024 keyed new buckets and successful handshakes across 256 keyed tried buckets, each capped at 64 entries; old stores generate the secret atomically on first reopen. Pool updates physically prune stale entries, prefer peers that completed prior synchronization sessions over handshake-only records, use known lower successful-handshake latency and then higher completed block-response throughput as tiebreakers within equal reputation, and round-robin both keyed buckets and target `/16` IPv4 or `/32` IPv6 groups so one range cannot monopolize a startup set. Objective wire violations and invalid headers/blocks from learned peers enter a separately bounded, persistent one-hour-to-one-day cooldown; ordinary transport failures do not, a completed synchronization session clears it, and manual connections remain exempt. Public bootstrap uses the network-specific [Bitcoin Core 31 seed list](https://github.com/bitcoin/bitcoin/blob/v31.0/src/kernel/chainparams.cpp), resolves seeds concurrently under per-seed/global bounds, distributes candidates across seed responses, and never admits private, reserved, or actively discouraged public-network results.
+- Opt-in BIP324 v2 encrypted transport for outbound peers (`--v2-transport`
+  CLI flag or `v2_transport` config key, default off). The ElligatorSwift
+  X-only ECDH, network-magic-bound HKDF-SHA256 key schedule, and rekeying
+  FSChaCha20/FSChaCha20Poly1305 record ciphers pass the official BIP324
+  packet-encoding vectors, including the 224-message rekey boundaries. A
+  sans-I/O handshake state machine bounds garbage (4,095 bytes), decoy
+  packets, and per-packet contents, recognizes the v1 prefix on the responder
+  side, and fails closed on every protocol violation. Outbound connections
+  prefer v2 when enabled and retry an address exactly once over v1 after the
+  peer closes the v2 attempt, as BIP324 specifies; `version`/`verack`
+  negotiation runs unchanged through either framing, and v2 sessions reuse
+  the identical 4,000,000-byte message ceiling and misbehavior
+  classification. Ignored `RBTC_BITCOIND` integration tests exercise both the
+  encrypted session and the v1 fallback against a real Core 31 daemon, and a
+  dedicated fuzz target drives the deterministic responder handshake and
+  record layer.
+- Minimal local block assembly (`block_assembly`) for low-difficulty
+  networks: template-driven coinbase construction with the validator's exact
+  BIP34 height encoding, always-present segwit witness commitments, subsidy
+  plus declared fees, and a bounded 32-bit nonce search. Regtest pipeline
+  tests produce their blocks through this module instead of an external
+  daemon; it is deliberately not a mining template provider.
+- Optional loopback ZMQ notification endpoint (`--zmq-listen` or the
+  `zmq_listen` config key) for indexers and Lightning nodes. The narrow
+  ZMTP 3.x subset a PUB socket needs — NULL security, READY negotiation
+  limited to SUB/XSUB peers, both subscription encodings — is implemented in
+  bounded safe Rust rather than binding `libzmq`. Notifications follow
+  Core's wire contract (`hashblock`/`hashtx` in display byte order,
+  `rawblock`/`rawtx` consensus bytes, `sequence` labels with mempool
+  sequence numbers) and are emitted per connected block at the batch commit
+  point, per disconnected stale block, and per newly admitted mempool
+  transaction; the independent AssumeUTXO validation chain never publishes.
+  Distribution runs over one bounded queue whose slow subscribers lose
+  counted messages instead of growing node memory. `R` sequence labels
+  cover expiry, BIP125 replacement, and capacity eviction, while
+  block-confirmed removals stay silent exactly like Core; non-loopback binds
+  are refused because the endpoint is unauthenticated.
+- Authenticated `testmempoolaccept` reports Core-shaped dry-run admission
+  verdicts (`txid`, `wtxid`, `allowed`, `vsize`, `fees.base_sats`,
+  `reject-reason`) for a bounded package of at most 25 candidates. The
+  evaluation runs the ordinary consensus and relay-policy admission path
+  against the current chainstate and mempool on a throwaway pool clone, so no
+  candidate is retained, persisted, or relayed on any path — the live pool is
+  byte-for-byte unchanged whether the package is accepted or refused.
+  Rejection reasons are the admission error truncated to 256 bytes.
+- Authenticated `rbtc.scanchainstate` walks the active UTXO set in bounded
+  cursor pages of at most 1,000 entries, reusing the chainstate's existing
+  fixed-memory paging primitive rather than materializing the set. Each page
+  returns the coin's outpoint, value, height, coinbase flag, and script, plus
+  a `next_cursor` that is present only when the page filled completely, so an
+  exhausted walk terminates without an extra probe.
+- Authenticated `listbanned` and `setban ADDRESS add|remove [SECONDS]`
+  administer local peer cooldowns durably through the existing peer store. A
+  cooldown makes an address an ineligible outbound candidate and refuses its
+  inbound connections; it never touches consensus state, and the automatic
+  objective-violation cooldown keeps applying independently. Durations are
+  bounded by the same one-day ceiling, default to 24 hours, and never shorten
+  an active cooldown. Because the stored record requires at least one recorded
+  violation, a manual cooldown on an otherwise clean address occupies the
+  first escalation step, and removing it discards that again.
+- Outbound v3 onion destinations through the existing fail-closed SOCKS5
+  proxy. `OnionAddress` validates the base32 alphabet, the 62-character
+  length, the version byte, and the address's own SHA3-256 checksum before a
+  name can reach a proxy or a store, and it round-trips to and from the
+  service public key. The proxy request uses SOCKS5 domain addressing, so the
+  name is resolved inside the anonymity network and this host performs no DNS
+  lookup for it; the local `version` then advertises an unspecified receiver
+  address rather than a routable socket. BIP324 preference and the one-shot
+  v1 retry apply unchanged. Learned onion services persist in their own
+  bounded address book: `addrv2` TorV3 entries are retained apart from
+  routable addresses, deduplicated, and stored in a separate table with an
+  independent 1,024-entry ceiling, the same full-history/witness service
+  requirement, terrible-entry hygiene, retry backoff, and discouragement
+  checks. Keeping the books separate means an onion flood can neither
+  displace routable peers nor inherit IP-range diversity rules that do not
+  apply to it. `--onlynet onion` restricts outbound work to onion
+  destinations and fails closed without `--proxy`, because an onion-only node
+  has no other route; mixing onion with an IP family is refused rather than
+  silently widened, and eligible onion candidates are reported at selection.
+  The outbound scheduler now carries address-type-aware targets, so persisted
+  onion candidates are selected, dialed through the proxy, and ranked in the
+  same ordered wave as routable peers. Bookkeeping that is only meaningful for
+  a routable address is skipped rather than given a fabricated one: an onion
+  peer contributes no network-time sample (those are grouped by IP range), is
+  not offered to address discovery, does not enter the socket-keyed
+  tried-collision or discouragement tables, and records its attempts and
+  successes in the onion book instead. A proxyless onion destination is
+  refused as a local configuration fault, never as a peer failure. Hosts
+  observe every peer through the new `PeerTargetConnected`/
+  `PeerTargetDisconnected` events; the socket-typed `PeerConnected`/
+  `PeerDisconnected` events and the socket-typed status field are unchanged
+  and continue to report routable peers only. I2P remains open.
+- `--torcontrol IP:PORT --torcontrol-cookie PATH` publishes an inbound onion
+  service forwarding to the `--listen` socket, which the configuration
+  requires; a non-loopback control port and a half-supplied pair are refused
+  before any database or network open. The generated private key is stored
+  owner-only inside the data directory and replayed on the next launch, so
+  peers that learned the address keep reaching this node across restarts; it
+  is never logged. Shutdown withdraws the service with an explicit
+  `DEL_ONION` rather than relying on the connection close alone. The
+  published address is then announced to peers that negotiated BIP155, both
+  on outbound sessions and in the inbound address relay, and never to a
+  legacy `addr` peer, because an onion address has no legacy encoding and
+  must not be replaced by a substitute.
+- A Tor control-port client publishes and withdraws one ephemeral v3 onion
+  service. It speaks only the needed subset — `PROTOCOLINFO` discovery,
+  `SAFECOOKIE` challenge-response, `ADD_ONION` with a fresh ED25519-v3 key,
+  and `DEL_ONION` — and refuses a non-loopback control port, because reaching
+  that port is equivalent to controlling the host's Tor instance. The cookie
+  is read only to compute the challenge and never sent; the control port's
+  own proof is verified before this node discloses its proof, so a port that
+  does not already hold the cookie learns nothing usable. Reply lines and
+  continuation counts are bounded, and the returned address is re-validated
+  through the same v3 checksum rules as a learned address.
+- An I2P SAM v3 client covering the bridge subset a node needs: `HELLO`
+  version negotiation, one long-lived `SESSION CREATE` STREAM session whose
+  destination key can be persisted and replayed to keep a stable published
+  address, and `STREAM CONNECT` on a separate socket per outbound peer, which
+  hands back an ordinary stream the existing v1 or BIP324 handshake drives
+  unchanged. Addresses use BIP155's I2P form — the 32-byte SHA-256 of the
+  destination as a 52-character base32 `.b32.i2p` name — validated
+  structurally before reaching a bridge or a store. The bridge is refused
+  unless it is loopback, because it can open streams on this node's behalf,
+  and session identifiers, destination keys, and reply lines are all bounded.
+  Learned I2P destinations follow the same path as onion services:
+  `addrv2` I2P entries are retained apart from routable and onion addresses,
+  deduplicated, and stored in a third peer-store table with its own
+  1,024-entry ceiling, service requirement, hygiene, and retry backoff, so no
+  network can displace another. Attempt and success bookkeeping dispatches to
+  that book. `--i2psam IP:PORT` names the loopback bridge, refused on any
+  other address because it opens streams on this node's behalf; its session
+  key is stored owner-only and replayed so the published destination survives
+  restarts. Persisted I2P candidates then join the same ordered outbound
+  wave, dialled through `STREAM CONNECT` and handed to the ordinary v1 or
+  BIP324 handshake. `--onlynet i2p` restricts outbound work to that network
+  and fails closed without a bridge. A SOCKS5 proxy is never substituted for
+  the bridge — an I2P target has no proxy representation at all — because
+  that would connect to the wrong network. Inbound `STREAM ACCEPT` remains
+  open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete
@@ -21,6 +185,8 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
   serial, and no block state is committed until every script succeeds.
 - Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots with bounded-memory two-pass import, in-transaction SHA-256/count verification, mandatory maximum-work active-header anchors, atomic publication, and an AssumeUTXO-style background-validation contract. A separate bounded-memory Core 31 `dumptxoutset` v2 loader uses compiled AssumeUTXO identities and Core's exact UTXO-set hash. Explicit HTTPS sources can be downloaded as bounded 64 MiB ranges with 1–8 workers, checkpoint restart, exact-length enforcement, and atomic publication; a real external Core 31 Testnet4 v2 file passes activation.
+- Offline `--build-core-snapshot-index SNAPSHOT --snapshot-index-output FILE` keeps a Core 31 snapshot such as `utxo-935000.dat` as an immutable compressed data source instead of expanding it. The current version-2 sidecar uses a safe-Rust BBhash minimal perfect hash function over txid groups and a bit-packed 34-bit group-offset table. A hit verifies the queried txid and vout against the source bytes before decoding Core's VARINT/script-template record, and the recorded maximum group span bounds every read. Building re-authenticates the release-pinned Core UTXO-set hash. On the real height-935,000 mainnet snapshot, 164,241,311 coins form 113,879,165 groups; the 18-level sidecar is 530,926,239 bytes, down from the former 1,155,791,488-byte outpoint-keyed format.
+- The `mdbx` feature adds a snapshot-backed overlay chainstate on that base. Post-base coins, spent-base tombstones, compressed per-block undo, and the execution tip commit atomically behind the same consensus executor used by redb. Both overlay engines understand legacy raw undo records; new `RUZ1` zstd records have a 256 MiB decompression ceiling and an 8 MiB zstd window ceiling. MDBX enforces a hard geometry budget (10 GiB by default), can reclaim copy-on-write garbage through a compact copy, and rebases only when folding the overlay into a new authenticated snapshot is required; redb uses its native compaction with a policy-enforced budget. Rebase and compaction directory swaps restore one interrupted set-aside copy, fail closed without guessing if two candidates exist, and clear stale copies before a new swap. Bounded `--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX --once` reuses ordinary headers-first download, staged/prefetched execution, stale-tip disconnection, and undo pruning. The default atomic validation batch is 256 blocks and can be lowered with `--validation-batch-size`. See [the architecture measurements](docs/ARCHITECTURE.md) for engine comparisons and memory/I/O trade-offs.
 - Reorg-consistent spent-output ages are aggregated before sorted chainstate
   writes. Offline `--utxo-activity-report` scans current UTXOs in fixed-size
   pages and compares candidate block-age windows against historical spend-hit
@@ -46,7 +212,7 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 
 ## Important safety status
 
-rBTC is **not yet a production release** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, bounded optional inbound contribution, current Core 31 relay-policy bounds, explicit storage/index lifecycle, authenticated operator APIs, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 and Mainnet Core 31 AssumeUTXO acceptance, the data-backed Mainnet hot/cold boundary, the repository-owned script boundary's Core 31 compatibility/live differential matrix, P1 full-node scope, and external audit integration are complete. The remaining release blockers are the time-based seven-day public-network operations soak and exercising a signed supported-platform release with provisioned native identities. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md); the `../n42-26` host ownership, tested task-executor fixture, and licensing boundary are in [docs/N42_EMBEDDING.md](docs/N42_EMBEDDING.md).
+rBTC is **not yet a production release** and must not be trusted with mainnet funds. Mainnet genesis-to-tip validation, ordinary persistent Bitcoin/legacy-testnet/Testnet4/Signet/regtest execution, outbound peer management, bounded optional inbound contribution, current Core 31 relay-policy bounds, explicit storage/index lifecycle, authenticated operator APIs, persistent explorer projections, and crash-safe watch-only/external-signer wallet flows are implemented. Testnet4 and Mainnet Core 31 AssumeUTXO acceptance, the data-backed Mainnet hot/cold boundary, the repository-owned script boundary's Core 31 compatibility/live differential matrix, P1 full-node scope, and external audit integration are complete. The remaining release blockers are an accepted seven-day public-network operations soak report and exercising a signed supported-platform release with provisioned native identities. The exact scope and acceptance gates are in [docs/ROADMAP.md](docs/ROADMAP.md); the `../n42-26` host ownership, tested task-executor fixture, and licensing boundary are in [docs/N42_EMBEDDING.md](docs/N42_EMBEDDING.md).
 
 ### Supported platforms
 
@@ -110,7 +276,13 @@ cargo test --release --all-features --test storage_bench -- --ignored --nocaptur
 
 The storage benchmark generates its block-shaped UTXO population at runtime and
 reports machine-readable JSON; no generated database, snapshot, or result is
-versioned. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
+versioned. It covers redb, MDBX, and a benchmark-only SQLite store — SQLite
+being the one surveyed alternative that offers both an engine-enforced size
+ceiling (`PRAGMA max_page_count`) and in-place compaction (`VACUUM`), and
+already linked into every build through `bdk_wallet`. At a 2,000,000-UTXO
+workload its point lookups measured 4,053 ns against redb's 1,584 ns and
+MDBX's 2,353 ns, with a markedly worse p99 (10.3 µs against 5.2 and 3.8), so
+it is evaluated and recorded rather than adopted; see `docs/ARCHITECTURE.md`. Set `RBTC_BENCH_BLOCKS`, `RBTC_BENCH_UPDATES_PER_BLOCK`,
 `RBTC_BENCH_UTXOS`, and `RBTC_BENCH_LOOKUPS` to scale the bounded workload, and
 set `RBTC_BENCH_REPORT` to retain the JSON report. The manual Storage benchmark
 workflow uploads that report together with runner CPU, filesystem, and block
@@ -546,23 +718,20 @@ every post-base block normally. The historical validator independently rebuilds
 the base UTXO set, and only an exact identity match clears the assumed marker.
 No MPT or new consensus commitment is introduced.
 
-For read-mostly tooling, `CoreSnapshotIndex::build` can create an independent
-BBHash MPHF sidecar for `utxo-935000.dat`. The original Core file is not
-rewritten: one MPHF slot points to each txid group, so all outputs from a
-transaction continue to reuse the single stored txid and Core's amount/script
-compression. `CoreSnapshotIndex::open` binds the sidecar to the snapshot
-metadata, length, and full-file SHA-256, and `get` verifies the txid and vout in
-the source group before returning a UTXO. The sidecar also records the exact
-grouped-key byte count, exposed in total and as average bytes per UTXO. Full
-activation must still use
-`verify_core31_snapshot`; the sidecar is an access accelerator, not a new trust
-anchor. The source modification time is cached with nanosecond precision:
-opening an unchanged file does not hash it again. A changed timestamp triggers
-one full SHA-256 pass; an unchanged digest refreshes the cached timestamp
-atomically, while a changed digest rejects the sidecar.
+Two txid-group indexes are available for read-mostly tooling. The CLI and
+snapshot-overlay path build the version-2 `CoreSnapshotUtxoIndex`: its group
+offsets are bit-packed on disk, batch lookups read the table and source snapshot
+in file order, and the largest group span observed during the authenticated
+build becomes a hard per-lookup read bound. The library-level
+`CoreSnapshotIndex::build` retains a separate version-3 format with eight-byte
+group offsets and cached source modification time for callers that prefer that
+API. Both leave the original Core file untouched, bind their sidecar to its
+identity, and verify txid plus vout from the source group before returning a
+UTXO. Full activation must still use `verify_core31_snapshot`; neither sidecar
+is a trust anchor.
 
-The Core 31 mainnet height-935,000 snapshot and generated v3 MPHF sidecar were
-measured on 2026-07-29:
+The Core 31 mainnet height-935,000 snapshot and both generated MPHF sidecars
+were measured on 2026-07-29 and 2026-08-01:
 
 | Artifact/metric | Measured value |
 | --- | ---: |
@@ -572,14 +741,18 @@ measured on 2026-07-29:
 | Distinct txid groups | 113,879,165 |
 | Grouped outpoint-key bytes | 3,944,314,134 |
 | Grouped key bytes/UTXO | 24.015360 |
-| BBHash sidecar bytes | 957,969,566 |
-| Sidecar/source ratio | 10.2042% |
+| Library v3 sidecar bytes | 957,969,566 |
+| Library v3 sidecar/source ratio | 10.2042% |
+| Overlay/CLI v2 sidecar bytes | 530,926,239 |
+| Overlay/CLI v2 sidecar/source ratio | 5.6554% |
+| Overlay/CLI v2 MPHF levels | 18 |
+| Overlay/CLI v2 table width | 34 bits/group |
 
 The source snapshot SHA-256 was
 `e572ddbe456d254f05fb004cebe225bdb3656074b66f0e9b1c7fa83e1301d486`.
-The sidecar keeps eight-byte group offsets plus the MPHF bitmaps; values,
-compressed scripts, and grouped txids remain exclusively in the original Core
-snapshot.
+The library v3 sidecar keeps eight-byte group offsets; the overlay/CLI v2
+sidecar bit-packs only the group offsets. Values, compressed scripts, and
+grouped txids remain exclusively in the original Core snapshot.
 
 An experimental full-copy comparison also migrated the caught-up mainnet redb
 UTXO set into MDBX in sorted 20,000-row pages. The verified 2026-07-29 report
@@ -642,7 +815,7 @@ The ordinary “successful handshake promotes to tried” rule is conditional on
 
 Persisted selection now applies Core-style terrible-entry hygiene before collision probes or ordinary candidates. A peer attempted within the last minute is protected; otherwise a timestamp more than ten minutes in the future, a zero or over-30-day-old address time, three consecutive failures without any success, or ten failures when the last success is over seven days old makes the entry ineligible. Startup atomically removes those rows and sanitizes collision references, while successful handshakes continue to reset the failure count. Full Core addrman probabilistic selection remains open.
 
-The first validation target is durably bound to the validation database and cannot later be changed or moved behind its executed tip; even a restart that omits the validation flags automatically inherits that ceiling. Successful completion retains the validation directory as audit evidence by default. Add `--validation-batch-size N` (1 through 1,008, default 64) to cap each atomic validation checkpoint and, in background mode, the assumed active chain's independent base-to-live checkpoints as well. `--validation-pause-ms MS` (at most 60 seconds) remains isolated to the genesis validator. `--validation-deferred-repair` applies to both bulk chainstate pipelines in background mode: their database commits remain atomic and durable, while redb writes its large allocator-state snapshot once at orderly close instead of after every catch-up checkpoint; an unclean stop can therefore trade a slower first repair for much faster bulk progress. Each checkpoint is downloaded through 16-block protocol requests; four requests may be pipelined into one ordered 64-block peer window and two independent peers can supply adjacent windows concurrently, then chainstate and any enabled explorer projection are committed once for the aggregate batch. The pipelined receiver preserves duplicate, unsolicited, `notfound`, compact-reconstruction, fallback, payload, and message-count checks without increasing one `getdata` exposure. Explicit checkpoints above 64 are intended for adequately provisioned validation hosts: the 1,008-block ceiling matches the default retained-ledger window and could hold approximately 4 GiB of consensus-maximum block payload before validation working state, subject to the ledger's independent 1 GiB canonical-record ceiling. In background mode, while active execution trails its header tip, the validator remains independently live but limits each checkpoint to the smaller of the configured cap and 252 blocks; this keeps worst-case block payload below one GiB and reduces freezer/index/fsync frequency without an artificial pause. Once active serving catches up, the configured cap is restored. Persisted progress and the effective limits are printed after every batch, and `GET /api/v1/validation` reports both tips, the immutable target, remaining blocks, phase, failure, and current throttle state when the explorer listener is enabled. Snapshot origin remains durable after finalization. A fresh explorer atomically streams the current hot/cold UTXO set into a cursor-paged baseline, so current address UTXOs and all post-snapshot blocks are indexed without pretending unavailable pre-snapshot transaction/block history exists.
+The first validation target is durably bound to the validation database and cannot later be changed or moved behind its executed tip; even a restart that omits the validation flags automatically inherits that ceiling. Successful completion retains the validation directory as audit evidence by default. Add `--validation-batch-size N` (1 through 1,008, default 256) to cap each atomic validation checkpoint and, in background mode, the assumed active chain's independent base-to-live checkpoints as well. The measured default reduces batch time by 24.8% versus 64 blocks, at the cost of roughly 35% higher peak working set; memory-constrained hosts should set a lower value explicitly. `--validation-pause-ms MS` (at most 60 seconds) remains isolated to the genesis validator. `--validation-deferred-repair` applies to both bulk chainstate pipelines in background mode: their database commits remain atomic and durable, while redb writes its large allocator-state snapshot once at orderly close instead of after every catch-up checkpoint; an unclean stop can therefore trade a slower first repair for much faster bulk progress. Each checkpoint is downloaded through 16-block protocol requests; four requests may be pipelined into one ordered 64-block peer window and two independent peers can supply adjacent windows concurrently, then chainstate and any enabled explorer projection are committed once for the aggregate batch. The pipelined receiver preserves duplicate, unsolicited, `notfound`, compact-reconstruction, fallback, payload, and message-count checks without increasing one `getdata` exposure. The 1,008-block ceiling matches the default retained-ledger window and could hold approximately 4 GiB of consensus-maximum block payload before validation working state, subject to the ledger's independent 1 GiB canonical-record ceiling. In background mode, while active execution trails its header tip, the validator remains independently live but limits each checkpoint to the smaller of the configured cap and 252 blocks; this keeps worst-case block payload below one GiB and reduces freezer/index/fsync frequency without an artificial pause. Once active serving catches up, the configured cap is restored. Persisted progress and the effective limits are printed after every batch, and `GET /api/v1/validation` reports both tips, the immutable target, remaining blocks, phase, failure, and current throttle state when the explorer listener is enabled. Snapshot origin remains durable after finalization. A fresh explorer atomically streams the current hot/cold UTXO set into a cursor-paged baseline, so current address UTXOs and all post-snapshot blocks are indexed without pretending unavailable pre-snapshot transaction/block history exists.
 
 The batch log reports download, structure, staging, execution, indexing,
 publication, and total time so later tuning is based on measured phases.

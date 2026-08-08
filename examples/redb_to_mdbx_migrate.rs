@@ -84,7 +84,7 @@ fn parse_args() -> Result<Config, String> {
             "--report" => {
                 report_path = Some(
                     args.get(index + 1)
-                        .map(|path| PathBuf::from(path))
+                        .map(PathBuf::from)
                         .ok_or("--report requires a path")?,
                 );
                 index += 2;
@@ -151,7 +151,7 @@ fn count_redb(store: &RedbUtxoStore, page_size: usize) -> Result<u64, Box<dyn Er
 }
 
 #[cfg(feature = "mdbx")]
-fn migration_start(config: Config) -> Result<(), Box<dyn Error>> {
+fn migration_start(config: &Config) -> Result<(), Box<dyn Error>> {
     if config.target.exists() && !config.overwrite {
         let contains_files = fs::read_dir(&config.target)?.next().is_some();
         if contains_files {
@@ -181,7 +181,7 @@ fn migration_start(config: Config) -> Result<(), Box<dyn Error>> {
         if page.is_empty() {
             break;
         }
-        batch.extend(page.into_iter());
+        batch.extend(page);
         if batch.is_empty() {
             break;
         }
@@ -239,8 +239,8 @@ fn migration_start(config: Config) -> Result<(), Box<dyn Error>> {
 
 #[cfg(feature = "mdbx")]
 fn main() -> Result<(), Box<dyn Error>> {
-    let config = parse_args().map_err(|error| error.to_owned())?;
-    migration_start(config)?;
+    let config = parse_args().map_err(|error| error.clone())?;
+    migration_start(&config)?;
     Ok(())
 }
 

@@ -352,9 +352,9 @@ pub struct PackageAdmissionOutcome {
     /// Exact witness transactions already present in the pool.
     pub already_present: usize,
     /// Existing oldest transactions and descendants evicted for capacity.
-    pub evicted: usize,
+    pub evicted: Vec<Txid>,
     /// Original conflicts and descendants removed by BIP125 replacement.
-    pub replaced: usize,
+    pub replaced: Vec<Txid>,
 }
 
 /// Fee metadata required to apply per-peer transaction announcement filters.
@@ -1147,8 +1147,8 @@ impl TransactionAdmissionPool {
         let outcome = self.admit_package_at(store, vec![transaction], context, now)?;
         Ok(TransactionAdmissionOutcome::Accepted {
             txid,
-            evicted: outcome.evicted,
-            replaced: outcome.replaced,
+            evicted: outcome.evicted.len(),
+            replaced: outcome.replaced.len(),
         })
     }
 
@@ -1194,8 +1194,8 @@ impl TransactionAdmissionPool {
             return Ok(PackageAdmissionOutcome {
                 accepted: Vec::new(),
                 already_present,
-                evicted: 0,
-                replaced: 0,
+                evicted: Vec::new(),
+                replaced: Vec::new(),
             });
         }
 
@@ -1236,7 +1236,7 @@ impl TransactionAdmissionPool {
             accepted,
             already_present,
             evicted,
-            replaced: replacement.txids.len(),
+            replaced: replacement.txids.iter().copied().collect(),
         })
     }
 
@@ -1483,16 +1483,22 @@ impl TransactionAdmissionPool {
     }
 
     /// Removes selected transactions and every retained descendant atomically.
-    pub fn remove_with_descendants(&mut self, roots: &BTreeSet<Txid>) -> usize {
-        let removed = roots
+    pub fn remove_with_descendants(&mut self, roots: &BTreeSet<Txid>) -> Vec<Txid> {
+        let closure = roots
             .iter()
             .flat_map(|txid| self.descendant_closure(*txid))
             .collect::<BTreeSet<_>>();
-        let before = self.entries.len();
-        self.entries
-            .retain(|entry| !removed.contains(&entry.transaction.compute_txid()));
-        let removed = before.saturating_sub(self.entries.len());
-        if removed > 0 {
+        let mut removed = Vec::new();
+        self.entries.retain(|entry| {
+            let txid = entry.transaction.compute_txid();
+            if closure.contains(&txid) {
+                removed.push(txid);
+                false
+            } else {
+                true
+            }
+        });
+        if !removed.is_empty() {
             self.rebuild_indexes();
         }
         removed
@@ -1501,8 +1507,8 @@ impl TransactionAdmissionPool {
     fn evict_to_capacity(
         &mut self,
         protected: &BTreeSet<Txid>,
-    ) -> Result<usize, TransactionAdmissionError> {
-        let mut evicted = 0;
+    ) -> Result<Vec<Txid>, TransactionAdmissionError> {
+        let mut evicted = Vec::new();
         while self.entries.len() > self.max_transactions || self.retained_bytes > self.max_bytes {
             let removed = self
                 .entries
@@ -1530,10 +1536,15 @@ impl TransactionAdmissionPool {
                 self.rolling_minimum_fee_sat_kvb = removed_rate;
                 self.rolling_fee_decay_enabled = false;
             }
-            let before = self.entries.len();
-            self.entries
-                .retain(|entry| !removed.contains(&entry.transaction.compute_txid()));
-            evicted += before.saturating_sub(self.entries.len());
+            self.entries.retain(|entry| {
+                let txid = entry.transaction.compute_txid();
+                if removed.contains(&txid) {
+                    evicted.push(txid);
+                    false
+                } else {
+                    true
+                }
+            });
             self.rebuild_indexes();
         }
         Ok(evicted)
@@ -3032,7 +3043,7 @@ mod tests {
         let outcome = pool
             .admit_package(&store, vec![replacement], full_rbf)
             .unwrap();
-        assert_eq!(outcome.replaced, 1);
+        assert_eq!(outcome.replaced.len(), 1);
         assert_eq!(txids(&pool), vec![replacement_txid]);
     }
 
@@ -3128,8 +3139,8 @@ mod tests {
             .admit_package(&store, vec![replacement], context())
             .unwrap();
         assert_eq!(outcome.accepted, vec![replacement_txid]);
-        assert_eq!(outcome.replaced, 1);
-        assert_eq!(outcome.evicted, 0);
+        assert_eq!(outcome.replaced.len(), 1);
+        assert_eq!(outcome.evicted.len(), 0);
         assert_eq!(txids(&pool), vec![replacement_txid]);
         assert!(!txids(&pool).contains(&original_txid));
     }
@@ -3152,7 +3163,7 @@ mod tests {
         let outcome = pool
             .admit_package(&store, vec![replacement], context())
             .unwrap();
-        assert_eq!(outcome.replaced, 1);
+        assert_eq!(outcome.replaced.len(), 1);
         assert_eq!(txids(&pool), vec![parent_txid, replacement_txid]);
     }
 
@@ -3173,7 +3184,7 @@ mod tests {
         let outcome = pool
             .admit_package(&store, vec![replacement], context())
             .unwrap();
-        assert_eq!(outcome.replaced, 2);
+        assert_eq!(outcome.replaced.len(), 2);
         assert_eq!(txids(&pool), vec![replacement_txid]);
     }
 
@@ -4501,7 +4512,8 @@ mod tests {
         pool.admit(&store, unrelated, context()).unwrap();
 
         assert_eq!(
-            pool.remove_with_descendants(&BTreeSet::from([parent_txid])),
+            pool.remove_with_descendants(&BTreeSet::from([parent_txid]))
+                .len(),
             2
         );
         assert_eq!(txids(&pool), vec![unrelated_txid]);

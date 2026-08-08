@@ -83,6 +83,7 @@ impl MdbxUtxoStore {
             None => cold_cursor.iter_start::<Vec<u8>, Vec<u8>>(),
         };
 
+        #[allow(clippy::items_after_statements)]
         fn next_row(
             rows: &mut impl Iterator<Item = std::result::Result<(Vec<u8>, Vec<u8>), libmdbx::Error>>,
             after_bytes: Option<&[u8]>,
@@ -100,7 +101,7 @@ impl MdbxUtxoStore {
             }
         }
 
-        let after_bytes = after_bytes.as_ref().map(|value| value.as_slice());
+        let after_bytes = after_bytes.as_ref().map(<[u8; 36]>::as_slice);
         let mut hot_next = next_row(&mut hot_rows, after_bytes)?;
         let mut cold_next = next_row(&mut cold_rows, after_bytes)?;
         let mut page = Vec::with_capacity(limit);

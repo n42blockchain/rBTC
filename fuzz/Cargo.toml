@@ -21,6 +21,12 @@ name = "p2p_decode_v1"
 path = "fuzz_targets/p2p_decode_v1.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "p2p_v2_handshake"
+path = "fuzz_targets/p2p_v2_handshake.rs"
+test = false
+doc = false
 bench = false
 
 [[bin]]

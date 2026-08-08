@@ -885,7 +885,7 @@ fn coinbase_has_height(transaction: &bitcoin::Transaction, height: u32) -> bool 
     script.len() >= expected.len() && script[..expected.len()] == expected
 }
 
-fn encode_script_num_push(height: u32) -> Vec<u8> {
+pub(crate) fn encode_script_num_push(height: u32) -> Vec<u8> {
     match height {
         0 => vec![0x00],
         1..=16 => vec![0x50 + u8::try_from(height).expect("small script number")],

@@ -2,6 +2,8 @@
 
 mod config_file;
 
+use crate::i2p_sam::{I2pAddress, I2pSamSession};
+use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -65,6 +67,10 @@ impl Drop for InFlightCheckpoint<'_> {
     }
 }
 
+#[cfg(feature = "mdbx")]
+use crate::snapshot_overlay::{SnapshotOverlayChainstate, SnapshotOverlayConfig};
+#[cfg(feature = "mdbx")]
+use crate::snapshot_overlay_redb::SnapshotOverlayRedbChainstate;
 use bitcoin::{
     Block, BlockHash, Network, OutPoint, Transaction, Txid,
     block::Header,
@@ -84,6 +90,7 @@ use rbtc::{
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
         BlockDeploymentContext, BlockExecutionError,
+        connect_prevalidated_active_blocks_with_breakdown,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
         prefetch_prevalidated_active_block_utxos,
     },
@@ -92,9 +99,11 @@ use rbtc::{
         validate_block_structure_with_deployments_and_txids,
     },
     chain_store::{
-        ChainStoreError, ChainStoreOptions, RedbChainStore, ValidationDeltaShardMigration,
+        ChainStoreError, ChainStoreOptions, ExecutionChainStore, RedbChainStore,
+        ValidationDeltaShardMigration,
     },
     core_snapshot::verify_core31_snapshot,
+    core_snapshot_index::build_core_snapshot_index,
     deployments::{DeploymentConfig, block_deployment_context_for_headers},
     diagnostics::{
         LogConfig, LogLevel, MAX_LOG_FILE_BYTES, MAX_LOG_FILES, MIN_LOG_FILE_BYTES, MIN_LOG_FILES,
@@ -107,7 +116,7 @@ use rbtc::{
     ibd::IbdPolicy,
     inbound::{
         InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
-        run_listener_with_stats_and_relay,
+        TestAcceptResult, run_listener_with_stats_and_relay,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -120,8 +129,8 @@ use rbtc::{
     p2p::{
         BlockTransferStats, MAX_BLOCKS_IN_FLIGHT, MAX_HEADERS_PER_RESPONSE,
         MAX_PENDING_TRANSACTION_INVENTORY, MAX_PENDING_TRANSACTIONS, MAX_PROTOCOL_MESSAGE_LEN,
-        MempoolRelaySource, P2pError, PeerSession, TransactionRelay, connect_outbound,
-        connect_outbound_via_socks5,
+        MempoolRelaySource, OnionAddress, P2pError, PeerSession, ProxyTarget, TransactionRelay,
+        connect_outbound_with_transport, connect_proxied_target,
     },
     peer_store::{RedbPeerStore, is_acceptable_peer_address},
     rbtc_info, rbtc_warn,
@@ -131,6 +140,7 @@ use rbtc::{
         DEFAULT_SNAPSHOT_CHUNK_BYTES, DEFAULT_SNAPSHOT_DOWNLOAD_WORKERS,
         MAX_SNAPSHOT_DOWNLOAD_WORKERS, SnapshotDownloadConfig, download_snapshot,
     },
+    tor_control::{PublishedOnionService, TorController},
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
         MAX_CONFIGURED_MEMPOOL_BYTES, MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
@@ -152,7 +162,22 @@ use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUXILIARY_BLOCK_RESPONSE_GRACE: Duration = Duration::from_secs(2);
-const DEFAULT_VALIDATION_BATCH_SIZE: usize = 64;
+/// Blocks executed and committed as one unit.
+///
+/// Raised from 64 on measurement. Two replays over the same 11,008 blocks,
+/// back to back on one machine, put 256 ahead per thousand blocks:
+/// `commit-mutate` −48.6%, `commit-sync` −52.1%, `execution-core` −25.3%,
+/// batch total −24.8%. Halved flushing follows from committing a quarter as
+/// often; the rest is that a wider fold window collapses more coins created
+/// and spent inside the same batch, so they never reach the B-tree at all —
+/// `commit-base-lookup` fell 20.9% for that reason alone.
+///
+/// It is not free. Peak working set rose about 35% (7,219 MB to 9,788 MB at a
+/// matched height) because a batch holds that many blocks and their folded
+/// mutation at once, and validation is 12% slower per block since each
+/// overlay's working set is larger. A memory-constrained host should lower it
+/// with `--validation-batch-size`.
+const DEFAULT_VALIDATION_BATCH_SIZE: usize = 256;
 const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_VALIDATION_BATCH_SIZE;
@@ -179,6 +204,19 @@ const PERCENT_DECIMAL_SCALE: u64 = 100_000;
 const ACTIVITY_RECOMMENDATION_PERCENT_UNITS: u64 = 99 * PERCENT_DECIMAL_SCALE;
 const UTXO_RETIER_SCAN_BATCH_SIZE: usize = 65_536;
 const MIN_PRUNE_RETENTION_BLOCKS: u32 = 288;
+/// Upper bound on the retained block window.
+///
+/// The ceiling used to be the default itself, so a target could only ever
+/// prune harder than default and never keep more — which also made capturing
+/// a replay corpus impossible. Retaining more blocks is not less safe, but it
+/// is not free either: block undo is pruned to exactly the ledger's oldest
+/// retained height, so raising this raises undo storage in step with it, by
+/// roughly the per-block undo size times the extra blocks. An operator asking
+/// for a long window needs a chainstate budget that can hold its undo.
+///
+/// The value keeps a batch-sized segment count well inside the ledger's
+/// 4,096-slot namespace at any realistic batch size.
+const MAX_PRUNE_RETENTION_BLOCKS: u32 = 100_000;
 const MIN_PRUNE_MAX_BYTES: u64 = 550 * 1024 * 1024;
 const DEFAULT_MINIMUM_FREE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MINIMUM_FREE_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
@@ -248,6 +286,9 @@ struct Options {
     once: bool,
     network_execution: NetworkExecutionMode,
     explorer_listen: Option<SocketAddr>,
+    zmq_listen: Option<SocketAddr>,
+    tor_control: Option<TorControlOptions>,
+    i2p_sam: Option<SocketAddr>,
     wallet_api_files: Option<WalletApiFiles>,
     rpc_auth_token_file: Option<PathBuf>,
     deployments: DeploymentConfig,
@@ -271,6 +312,7 @@ struct Options {
     logging: NodeLogConfig,
     runtime_control: Arc<RuntimeControl>,
     observer: Option<NodeObserver>,
+    snapshot_overlay: Option<NodeSnapshotOverlayConfig>,
 }
 
 struct AuxiliaryIndexes {
@@ -376,6 +418,13 @@ pub struct NodeConfig {
     pub storage: NodeStorageConfig,
     /// Optional loopback explorer/RPC/wallet services.
     pub api: Option<NodeApiConfig>,
+    /// Optional loopback ZMQ notification endpoint.
+    pub zmq_listen: Option<SocketAddr>,
+    /// Optional Tor control port used to publish an onion service for the
+    /// inbound listener.
+    pub tor_control: Option<NodeTorControlConfig>,
+    /// Optional loopback I2P SAM bridge used to reach and publish I2P peers.
+    pub i2p_sam: Option<SocketAddr>,
     /// Consensus and IBD policy overrides.
     pub consensus: NodeConsensusConfig,
     /// Optional independent genesis validation of an assumed snapshot.
@@ -400,6 +449,9 @@ impl NodeConfig {
             logging: NodeLogConfig::default(),
             storage: NodeStorageConfig::default(),
             api: None,
+            zmq_listen: None,
+            tor_control: None,
+            i2p_sam: None,
             consensus: NodeConsensusConfig::default(),
             assumeutxo_validation: None,
         }
@@ -485,6 +537,12 @@ impl NodeConfig {
             once: self.once,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen,
+            zmq_listen: self.zmq_listen,
+            tor_control: self.tor_control.map(|tor| TorControlOptions {
+                control: tor.control,
+                cookie: tor.cookie,
+            }),
+            i2p_sam: self.i2p_sam,
             wallet_api_files,
             rpc_auth_token_file,
             deployments,
@@ -514,6 +572,7 @@ impl NodeConfig {
             logging: self.logging,
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .map_err(NodeConfigError::new)
     }
@@ -688,6 +747,97 @@ pub struct NodeResourceConfig {
     pub only_net: NodeOnlyNet,
     /// Optional no-authentication SOCKS5 proxy for every outbound peer socket.
     pub proxy: Option<SocketAddr>,
+    /// Prefer the BIP324 v2 encrypted transport on outbound connections,
+    /// retrying each address once over v1 when the peer closes the v2
+    /// handshake attempt.
+    pub v2_transport: bool,
+}
+
+/// One peer destination in an address family the node can dial.
+///
+/// The socket-typed `PeerConnected`/`PeerDisconnected` events cannot express
+/// an onion peer, which has no IP address. Hosts that need to observe every
+/// peer should consume the target-typed events instead; the socket-typed
+/// events remain and continue to report routable peers only.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum NodePeerTarget {
+    /// A routable IPv4 or IPv6 peer.
+    Socket(SocketAddr),
+    /// A v3 onion service reached through the configured proxy.
+    Onion(OnionAddress),
+    /// An I2P destination reached through the configured SAM bridge.
+    I2p(I2pAddress),
+}
+
+impl NodePeerTarget {
+    /// Returns the routable socket when this peer has one.
+    #[must_use]
+    pub const fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Socket(socket) => Some(*socket),
+            Self::Onion(_) | Self::I2p(_) => None,
+        }
+    }
+}
+
+impl std::str::FromStr for NodePeerTarget {
+    type Err = String;
+
+    /// Parses `IP:PORT` or `<service>.onion:PORT`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(socket) = SocketAddr::from_str(value) {
+            return Ok(Self::Socket(socket));
+        }
+        if let Ok(onion) = OnionAddress::parse(value) {
+            return Ok(Self::Onion(onion));
+        }
+        I2pAddress::new(value).map(Self::I2p).map_err(|_| {
+            format!("{value} is not a routable socket, a v3 onion address, or an I2P destination")
+        })
+    }
+}
+
+impl std::fmt::Display for NodePeerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socket(socket) => write!(f, "{socket}"),
+            Self::Onion(onion) => write!(f, "{onion}"),
+            Self::I2p(i2p) => write!(f, "{i2p}"),
+        }
+    }
+}
+
+impl TryFrom<&NodePeerTarget> for ProxyTarget {
+    type Error = ();
+
+    /// Converts the destinations a SOCKS5 proxy can reach.
+    ///
+    /// I2P is deliberately not among them: its destinations are reached
+    /// through a SAM bridge, not a proxy, so silently treating one as a
+    /// proxy target would produce a connection to the wrong network.
+    fn try_from(target: &NodePeerTarget) -> Result<Self, Self::Error> {
+        match target {
+            NodePeerTarget::Socket(socket) => Ok(Self::Socket(*socket)),
+            NodePeerTarget::Onion(onion) => Ok(Self::Onion(onion.clone())),
+            NodePeerTarget::I2p(_) => Err(()),
+        }
+    }
+}
+
+/// Tor control-port settings for publishing an inbound onion service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeTorControlConfig {
+    /// Loopback control-port address.
+    pub control: SocketAddr,
+    /// Path to Tor's `control_auth_cookie`.
+    pub cookie: PathBuf,
+}
+
+/// Internal mirror of [`NodeTorControlConfig`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TorControlOptions {
+    control: SocketAddr,
+    cookie: PathBuf,
 }
 
 /// Outbound peer address-family restriction.
@@ -700,14 +850,32 @@ pub enum NodeOnlyNet {
     Ipv4,
     /// Permit only IPv6 destinations.
     Ipv6,
+    /// Permit only v3 onion destinations, which require a SOCKS5 proxy.
+    Onion,
+    /// Permit only I2P destinations, which require a SAM bridge.
+    I2p,
 }
 
 impl NodeOnlyNet {
+    /// Returns whether a routable destination is permitted.
+    ///
+    /// An onion-only restriction permits no IP destination at all, which is
+    /// what makes it a leak guard rather than a preference.
     const fn permits(self, ip: IpAddr) -> bool {
         matches!(
             (self, ip),
             (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
         )
+    }
+
+    /// Returns whether v3 onion destinations are permitted.
+    const fn permits_onion(self) -> bool {
+        matches!(self, Self::Any | Self::Onion)
+    }
+
+    /// Returns whether I2P destinations are permitted.
+    const fn permits_i2p(self) -> bool {
+        matches!(self, Self::Any | Self::I2p)
     }
 }
 
@@ -722,6 +890,7 @@ impl Default for NodeResourceConfig {
             mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            v2_transport: false,
         }
     }
 }
@@ -899,6 +1068,27 @@ impl NodeBuilder {
         self
     }
 
+    /// Reaches and publishes I2P peers through a loopback SAM bridge.
+    #[must_use]
+    pub fn i2p_sam(mut self, bridge: SocketAddr) -> Self {
+        self.config.i2p_sam = Some(bridge);
+        self
+    }
+
+    /// Publishes an inbound onion service through a Tor control port.
+    #[must_use]
+    pub fn tor_control(mut self, tor_control: NodeTorControlConfig) -> Self {
+        self.config.tor_control = Some(tor_control);
+        self
+    }
+
+    /// Binds a loopback-only ZMQ notification endpoint.
+    #[must_use]
+    pub fn zmq_listen(mut self, listen: SocketAddr) -> Self {
+        self.config.zmq_listen = Some(listen);
+        self
+    }
+
     /// Mounts optional loopback explorer/RPC/watch-only-wallet services.
     #[must_use]
     pub fn api(mut self, api: NodeApiConfig) -> Self {
@@ -1014,6 +1204,42 @@ impl NodeBuilder {
 
 fn validate_runtime_options(options: Options) -> Result<Options, String> {
     validate_peer_options(&options)?;
+    if let Some(bridge) = options.i2p_sam {
+        if !bridge.ip().is_loopback() {
+            return Err(
+                "the I2P SAM bridge must be reached over loopback because it opens streams on this node's behalf"
+                    .to_owned(),
+            );
+        }
+    }
+    if options.resources.only_net == NodeOnlyNet::I2p && options.i2p_sam.is_none() {
+        return Err(
+            "--onlynet i2p requires --i2psam because I2P destinations are reachable only through a SAM bridge"
+                .to_owned(),
+        );
+    }
+    if let Some(tor) = &options.tor_control {
+        if !tor.control.ip().is_loopback() {
+            return Err(
+                "the Tor control port must be reached over loopback because it controls the host's Tor instance"
+                    .to_owned(),
+            );
+        }
+        if options.inbound_listen.is_none() {
+            return Err(
+                "--torcontrol requires --listen because the published onion service forwards to the inbound listener"
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(listen) = options.zmq_listen {
+        if !listen.ip().is_loopback() {
+            return Err(
+                "zmq_listen must use a loopback IP because ZMQ notifications are unauthenticated"
+                    .to_owned(),
+            );
+        }
+    }
     validate_storage_options(&options)?;
     validate_validation_options(&options)?;
     validate_api_options(&options)?;
@@ -1111,6 +1337,26 @@ fn validate_index_options(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves repeated `--onlynet` values into one restriction.
+///
+/// Only single families and the complete pair of IP families are
+/// expressible, so an unsupported mixture is refused rather than silently
+/// widened. Repeating both IP families keeps its historical meaning of no
+/// restriction.
+fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
+    match values {
+        [] => Ok(NodeOnlyNet::Any),
+        [family] => Ok(*family),
+        [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6] | [NodeOnlyNet::Ipv6, NodeOnlyNet::Ipv4] => {
+            Ok(NodeOnlyNet::Any)
+        }
+        _ => Err(
+            "--onlynet accepts one network, or both IP families; onion and i2p cannot be combined with another network"
+                .to_owned(),
+        ),
+    }
+}
+
 fn validate_peer_options(options: &Options) -> Result<(), String> {
     if options
         .data_dir
@@ -1135,6 +1381,17 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
         return Err(format!(
             "preferred peer {remote} is excluded by the configured --onlynet"
         ));
+    }
+    if options.resources.only_net == NodeOnlyNet::Onion {
+        // Onion destinations are reachable only through a proxy, so an
+        // onion-only node without one has no route at all. Failing here keeps
+        // that from degrading into silent direct connections.
+        if options.resources.proxy.is_none() {
+            return Err(
+                "--onlynet onion requires --proxy because onion services are reachable only through a SOCKS5 proxy"
+                    .to_owned(),
+            );
+        }
     }
     if let Some(seeds) = &options.dns_seeds {
         if seeds.len() > MAX_DNS_SEEDS {
@@ -1168,11 +1425,11 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
 }
 
 fn validate_storage_options(options: &Options) -> Result<(), String> {
-    if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS)
+    if !(MIN_PRUNE_RETENTION_BLOCKS..=MAX_PRUNE_RETENTION_BLOCKS)
         .contains(&options.ledger_retention.max_blocks)
     {
         return Err(format!(
-            "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+            "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {MAX_PRUNE_RETENTION_BLOCKS}"
         ));
     }
     if options.ledger_retention.max_bytes < MIN_PRUNE_MAX_BYTES {
@@ -1636,6 +1893,19 @@ pub enum NodeEvent {
         /// Remote peer address.
         address: SocketAddr,
     },
+    /// An outbound peer was selected, in any supported address family.
+    ///
+    /// Emitted for every peer, including onion services that the
+    /// socket-typed `PeerConnected` cannot express.
+    PeerTargetConnected {
+        /// Remote peer destination.
+        target: NodePeerTarget,
+    },
+    /// An outbound peer session ended, in any supported address family.
+    PeerTargetDisconnected {
+        /// Remote peer destination.
+        target: NodePeerTarget,
+    },
     /// Maximum-work header selection advanced or changed.
     HeaderTipChanged {
         /// New active header tip.
@@ -1701,6 +1971,29 @@ impl NodeObserver {
             status.active_peer = None;
             self.status.send_replace(status);
             let _ = self.events.send(NodeEvent::PeerDisconnected { address });
+        }
+    }
+
+    /// Reports one selected peer in any address family.
+    ///
+    /// A routable peer additionally updates the socket-typed status and
+    /// event; an onion peer has no socket to report there.
+    fn peer_target_connected(&self, target: &NodePeerTarget) {
+        let _ = self.events.send(NodeEvent::PeerTargetConnected {
+            target: target.clone(),
+        });
+        if let Some(address) = target.socket() {
+            self.peer_connected(address);
+        }
+    }
+
+    /// Reports one ended peer session in any address family.
+    fn peer_target_disconnected(&self, target: &NodePeerTarget) {
+        let _ = self.events.send(NodeEvent::PeerTargetDisconnected {
+            target: target.clone(),
+        });
+        if let Some(address) = target.socket() {
+            self.peer_disconnected(address);
         }
     }
 
@@ -1803,6 +2096,99 @@ pub enum NodeError {
     ControlChannelClosed,
 }
 
+/// Measured default: the overlay's steady-state working set during
+/// mainnet catch-up settles near 4 GiB — coins created above the base plus
+/// per-block undo inside the retention window — independent of what the
+/// budget is set to. A 3 GiB budget sits below that and forced a rebase
+/// roughly every 1,000 blocks, spending more wall clock rebasing than
+/// executing; 10 GiB completed the same catch-up without rebasing at all.
+/// Byte ceiling for one replayed block batch.
+///
+/// A batch is at most 64 blocks and a block at most 4 MB, so this cannot
+/// truncate a batch; it only bounds the ledger reader's own buffer.
+const REPLAY_BATCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
+/// Compaction runs below the rebase threshold, since reclaiming space in
+/// place is far cheaper than folding the overlay into a whole new snapshot: a
+/// compaction rewrites the ~4 GiB survivor, a rebase writes a fresh ~10.6 GiB
+/// snapshot and index.
+///
+/// Kept at 50% deliberately. Raising it looks attractive — a measured mainnet
+/// run at this threshold compacted 72 times, rewriting 314 GiB — but replaying
+/// that run's sizes shows a 75% trigger would never have fired at all, because
+/// the overlay peaked at 6.61 GiB (66%). Compaction would simply stop, and the
+/// file would drift up into the 85% rebase threshold instead, trading ~4 GiB
+/// rewrites for ~10.6 GiB ones. The thrashing is fixed by
+/// [`SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT`] instead, which cuts the same
+/// run to an estimated 9 compactions and 38 GiB without disabling the
+/// mechanism.
+const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
+
+/// Growth over the last post-compaction size required before compacting
+/// again, as a percentage of that size.
+///
+/// The percentage-of-budget threshold alone cannot prevent thrashing: once
+/// the file sits above it, every batch qualifies, however little was freed
+/// last time. Requiring the file to have grown by half again since the last
+/// compaction ties the decision to how much garbage has actually
+/// accumulated, which is what makes the rewrite worth its cost, and adapts
+/// to any budget and working set rather than assuming one.
+const SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT: u64 = 50;
+
+/// Decides whether compacting the overlay now is worth the rewrite it costs.
+///
+/// `used_bytes`/`capacity_bytes` describe the file now, `compact_percent` is
+/// the configured trigger, and `last_compacted_bytes` is the size right after
+/// the previous compaction, if there was one.
+#[cfg(feature = "mdbx")]
+fn overlay_compaction_is_worthwhile(
+    used_bytes: u64,
+    capacity_bytes: u64,
+    compact_percent: u8,
+    last_compacted_bytes: Option<u64>,
+) -> bool {
+    if capacity_bytes == 0 {
+        return false;
+    }
+    let used_percent = used_bytes.saturating_mul(100) / capacity_bytes;
+    if used_percent < u64::from(compact_percent) {
+        return false;
+    }
+    last_compacted_bytes.is_none_or(|bytes| {
+        used_bytes.saturating_sub(bytes)
+            >= bytes.saturating_mul(SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT) / 100
+    })
+}
+
+/// Storage engine backing a snapshot-overlay catch-up run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotOverlayEngine {
+    /// One MDBX environment with an engine-enforced geometry ceiling.
+    Mdbx,
+    /// One redb database with a policy-enforced budget and active compaction.
+    Redb,
+}
+
+/// Snapshot-overlay catch-up configuration: an immutable compressed base
+/// plus one bounded MDBX overlay environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NodeSnapshotOverlayConfig {
+    snapshot: PathBuf,
+    index: PathBuf,
+    capacity_bytes: u64,
+    rebase_percent: u8,
+    compact_percent: u8,
+    engine: SnapshotOverlayEngine,
+    /// Retained block ledger to replay from instead of downloading.
+    ///
+    /// Present only for benchmarking: it removes peers from the measured path
+    /// so a storage change can be compared without network variance, which a
+    /// networked soak cannot resolve.
+    replay_blocks: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OfflineAction {
     UtxoActivityReport,
@@ -1810,6 +2196,10 @@ enum OfflineAction {
         hot_window_blocks: u32,
     },
     DownloadCoreSnapshot(SnapshotDownloadConfig),
+    BuildCoreSnapshotIndex {
+        snapshot: PathBuf,
+        output: PathBuf,
+    },
     VerifyStorage {
         max_segments: u32,
         max_bytes: u64,
@@ -2811,6 +3201,20 @@ struct NodeRpcOperator {
 }
 
 const MAX_RPC_MEMPOOL_PAGE: usize = 1_000;
+/// Bound on candidates accepted by one dry-run admission request; matches
+/// the admission pool's package ceiling.
+const MAX_RPC_TEST_ACCEPT_TRANSACTIONS: usize = 25;
+/// Bound on entries returned by one bounded chainstate scan page.
+const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
+/// Default operator cooldown when `setban add` omits a duration; matches
+/// Core's 24-hour default and the automatic cooldown ceiling.
+const DEFAULT_RPC_BAN_SECONDS: u32 = 24 * 60 * 60;
+/// Stable SAM session identifier for this node's I2P destination.
+const I2P_SESSION_ID: &str = "rbtc";
+/// Ceiling shared with the automatic protocol-violation cooldown.
+const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
+/// Bound on one reported rejection reason.
+const MAX_RPC_REJECT_REASON_BYTES: usize = 256;
 const MAX_RPC_BLOCK_CHUNK_BYTES: usize = 24 * 1024;
 
 const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
@@ -2824,6 +3228,10 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "gettxout",
     "rbtc.getblockchunk",
     "rbtc.submitrawtransaction",
+    "testmempoolaccept",
+    "rbtc.scanchainstate",
+    "listbanned",
+    "setban",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -2862,6 +3270,9 @@ impl LocalRpcOperator for NodeRpcOperator {
                 Ok(serde_json::json!({"level": level.as_str()}))
             }));
         }
+        if matches!(method, "listbanned" | "setban") {
+            return Some(self.execute_peer_administration(method, params));
+        }
         if matches!(
             method,
             "gettxindexlocation"
@@ -2873,6 +3284,8 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "gettxout"
                 | "rbtc.getblockchunk"
                 | "rbtc.submitrawtransaction"
+                | "testmempoolaccept"
+                | "rbtc.scanchainstate"
         ) {
             return Some(
                 if matches!(
@@ -3147,6 +3560,94 @@ impl NodeRpcOperator {
         }
     }
 
+    /// Serves the bounded administrative peer-cooldown surface.
+    ///
+    /// This mutates local peer policy only: a cooldown makes an address an
+    /// ineligible outbound candidate and refuses its inbound connections. It
+    /// never touches consensus state, and the automatic objective-violation
+    /// cooldown continues to apply independently.
+    fn execute_peer_administration(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Node storage failure",
+        };
+        let peer_store = self
+            .source
+            .as_ref()
+            .and_then(|source| source.peer_store())
+            .ok_or(LocalRpcOperatorError {
+                code: -28,
+                message: "Node data is not ready",
+            })?;
+        let now = unix_time().map_err(|_| storage())?;
+        if method == "listbanned" {
+            if !rpc_has_no_params(params) {
+                return Err(invalid());
+            }
+            let entries = peer_store.discouragements(now).map_err(|_| storage())?;
+            return Ok(serde_json::Value::Array(
+                entries
+                    .into_iter()
+                    .map(|(address, until)| {
+                        serde_json::json!({
+                            "address": address.to_string(),
+                            "banned_until": until,
+                            "ban_duration": until.saturating_sub(now),
+                        })
+                    })
+                    .collect(),
+            ));
+        }
+        let values = params.as_array().ok_or_else(invalid)?;
+        if !(2..=3).contains(&values.len()) {
+            return Err(invalid());
+        }
+        let address = values[0]
+            .as_str()
+            .and_then(|value| SocketAddr::from_str(value).ok())
+            .ok_or_else(invalid)?;
+        match values[1].as_str().ok_or_else(invalid)? {
+            "add" => {
+                let seconds = match values.get(2) {
+                    None => DEFAULT_RPC_BAN_SECONDS,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|seconds| (1..=MAX_PROTOCOL_COOLDOWN_SECS).contains(seconds))
+                        .ok_or_else(invalid)?,
+                };
+                let until = peer_store
+                    .discourage_until(address, now, now.saturating_add(seconds))
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "banned_until": until,
+                }))
+            }
+            "remove" => {
+                if values.len() != 2 {
+                    return Err(invalid());
+                }
+                let cleared = peer_store
+                    .clear_discouragement(address)
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "removed": cleared,
+                }))
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_data_query(
         &self,
@@ -3309,6 +3810,106 @@ impl NodeRpcOperator {
                     })
                 })
             }
+            "testmempoolaccept" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                let raws = values
+                    .first()
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|_| values.len() == 1)
+                    .filter(|raws| (1..=MAX_RPC_TEST_ACCEPT_TRANSACTIONS).contains(&raws.len()))
+                    .ok_or_else(invalid)?;
+                let transactions = raws
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .and_then(|value| Vec::<u8>::from_hex(value).ok())
+                            .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
+                            .and_then(|raw| deserialize::<Transaction>(&raw).ok())
+                            .ok_or(LocalRpcOperatorError {
+                                code: -22,
+                                message: "Transaction decode failed",
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let results = source
+                    .test_accept(transactions)
+                    .map_err(|_| unavailable())?;
+                Ok(serde_json::Value::Array(
+                    results
+                        .into_iter()
+                        .map(|result| {
+                            let mut entry = serde_json::json!({
+                                "txid": result.txid.to_string(),
+                                "wtxid": result.wtxid.to_string(),
+                                "allowed": result.allowed,
+                            });
+                            let object = entry
+                                .as_object_mut()
+                                .expect("the verdict is built as an object");
+                            if let Some(vsize) = result.vsize {
+                                object.insert("vsize".to_owned(), serde_json::json!(vsize));
+                            }
+                            if let Some(fee_sats) = result.fee_sats {
+                                object.insert(
+                                    "fees".to_owned(),
+                                    serde_json::json!({"base_sats": fee_sats}),
+                                );
+                            }
+                            if let Some(reason) = result.reject_reason {
+                                object.insert(
+                                    "reject-reason".to_owned(),
+                                    serde_json::json!(bounded_reject_reason(&reason)),
+                                );
+                            }
+                            entry
+                        })
+                        .collect(),
+                ))
+            }
+            "rbtc.scanchainstate" => {
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.len() != 2 {
+                    return Err(invalid());
+                }
+                let after = match &values[0] {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(cursor) => {
+                        Some(rpc_outpoint_cursor(cursor).ok_or_else(invalid)?)
+                    }
+                    _ => return Err(invalid()),
+                };
+                let limit = values[1]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|limit| (1..=MAX_RPC_CHAINSTATE_PAGE).contains(limit))
+                    .ok_or_else(invalid)?;
+                let page = source
+                    .chainstate_page(after, limit)
+                    .map_err(|_| unavailable())?;
+                let next_cursor = (page.len() == limit)
+                    .then(|| page.last().map(|(outpoint, _)| outpoint.to_string()))
+                    .flatten();
+                Ok(serde_json::json!({
+                    "entries": page
+                        .into_iter()
+                        .map(|(outpoint, utxo)| {
+                            let outpoint = outpoint.to_outpoint();
+                            serde_json::json!({
+                                "txid": outpoint.txid.to_string(),
+                                "vout": outpoint.vout,
+                                "value_sats": utxo.value_sats,
+                                "height": utxo.height,
+                                "coinbase": utxo.is_coinbase,
+                                "scriptPubKey": {
+                                    "hex": utxo.script_pubkey.to_lower_hex_string()
+                                },
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    "next_cursor": next_cursor,
+                }))
+            }
             "rbtc.submitrawtransaction" => {
                 let values = params.as_array().ok_or_else(invalid)?;
                 let raw = values
@@ -3341,6 +3942,26 @@ impl NodeRpcOperator {
             _ => unreachable!("data method membership checked"),
         }
     }
+}
+
+/// Parses a `txid:vout` scan cursor into a database key.
+fn rpc_outpoint_cursor(cursor: &str) -> Option<OutPointKey> {
+    let (txid, vout) = cursor.split_once(':')?;
+    let txid = Txid::from_str(txid).ok()?;
+    let vout = vout.parse::<u32>().ok()?;
+    Some(OutPointKey::from(OutPoint::new(txid, vout)))
+}
+
+/// Truncates a rejection reason at a character boundary within the bound.
+fn bounded_reject_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_RPC_REJECT_REASON_BYTES {
+        return reason;
+    }
+    let mut end = MAX_RPC_REJECT_REASON_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
 }
 
 fn rpc_one_block_hash(params: &serde_json::Value) -> Result<BlockHash, LocalRpcOperatorError> {
@@ -3885,9 +4506,12 @@ struct NodeInboundSource {
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
     pending_transactions: Arc<Mutex<InboundTransactionQueue>>,
     basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
+    deployments: DeploymentConfig,
+    mempool_full_rbf: bool,
 }
 
 struct SharedInboundSource {
+    advertised_onion: RwLock<Option<(OnionAddress, ServiceFlags)>>,
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
     stats: Arc<InboundStats>,
@@ -3902,6 +4526,7 @@ impl SharedInboundSource {
         services: ServiceFlags,
     ) -> Self {
         Self {
+            advertised_onion: RwLock::new(None),
             current: RwLock::new(None),
             peer_store: RwLock::new(None),
             stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
@@ -3932,6 +4557,29 @@ impl SharedInboundSource {
             shared: Arc::clone(self),
             source,
         }
+    }
+
+    /// Records the published onion service announced to peers.
+    fn install_advertised_onion(&self, advertised: Option<(OnionAddress, ServiceFlags)>) {
+        *self
+            .advertised_onion
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    fn advertised_onion_service(&self) -> Option<(OnionAddress, ServiceFlags)> {
+        self.advertised_onion
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn peer_store(&self) -> Option<Arc<RedbPeerStore>> {
+        self.peer_store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone)
     }
 
     fn install_peer_store(&self, peer_store: Option<Arc<RedbPeerStore>>) {
@@ -4019,6 +4667,22 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.utxo(outpoint)
     }
 
+    fn advertised_onion(&self) -> Option<(OnionAddress, ServiceFlags)> {
+        self.advertised_onion_service()
+    }
+
+    fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
+        self.current()?.test_accept(transactions)
+    }
+
+    fn chainstate_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        self.current()?.chainstate_page(after, limit)
+    }
+
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         self.advertised_address
             .map(|address| (address, self.services))
@@ -4073,6 +4737,85 @@ impl InboundTransactionQueue {
 }
 
 impl NodeInboundSource {
+    /// Evaluates candidates as one package against a throwaway pool clone.
+    ///
+    /// The clone is discarded on every path, so neither a success nor a
+    /// failure can alter the live mempool, chainstate, or relay state.
+    fn dry_run_admission(
+        &self,
+        transactions: Vec<Transaction>,
+    ) -> Result<Vec<TestAcceptResult>, String> {
+        let identities = transactions
+            .iter()
+            .map(|transaction| (transaction.compute_txid(), transaction.compute_wtxid()))
+            .collect::<Vec<_>>();
+        let headers = self
+            .headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let context = transaction_admission_context(
+            &self.chainstate,
+            &headers,
+            &self.deployments,
+            self.mempool_full_rbf,
+        )?;
+        drop(headers);
+        let now = unix_time()?;
+        let mut candidate = self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outcome =
+            candidate.admit_package_at(self.chainstate.as_ref(), transactions, context, now);
+        Ok(match outcome {
+            Ok(outcome) => {
+                let admitted = candidate
+                    .relay_snapshot()
+                    .into_iter()
+                    .map(|entry| {
+                        (
+                            entry.transaction.compute_txid(),
+                            (entry.policy_vsize, entry.fee_sats),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                identities
+                    .into_iter()
+                    .map(|(txid, wtxid)| {
+                        let accepted = outcome.accepted.contains(&txid);
+                        let measures = accepted.then(|| admitted.get(&txid)).flatten();
+                        TestAcceptResult {
+                            txid,
+                            wtxid,
+                            allowed: accepted,
+                            vsize: measures.map(|(vsize, _)| *vsize),
+                            fee_sats: measures.map(|(_, fee_sats)| *fee_sats),
+                            reject_reason: (!accepted).then(|| {
+                                "transaction was already present or not accepted by the package"
+                                    .to_owned()
+                            }),
+                        }
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                identities
+                    .into_iter()
+                    .map(|(txid, wtxid)| TestAcceptResult {
+                        txid,
+                        wtxid,
+                        allowed: false,
+                        vsize: None,
+                        fee_sats: None,
+                        reject_reason: Some(reason.clone()),
+                    })
+                    .collect()
+            }
+        })
+    }
+
     fn execution_height(&self) -> Result<u32, String> {
         self.chainstate
             .execution()
@@ -4165,6 +4908,20 @@ impl InboundDataSource for NodeInboundSource {
     fn utxo(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
         self.chainstate
             .get(outpoint)
+            .map_err(|error| error.to_string())
+    }
+
+    fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
+        self.dry_run_admission(transactions)
+    }
+
+    fn chainstate_page(
+        &self,
+        after: Option<OutPointKey>,
+        limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        self.chainstate
+            .utxo_snapshot_page(after, limit)
             .map_err(|error| error.to_string())
     }
 
@@ -5010,6 +5767,23 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         );
         return Ok(());
     }
+    if let Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output }) =
+        &options.offline_action
+    {
+        let report =
+            build_core_snapshot_index(snapshot, output).map_err(|error| error.to_string())?;
+        println!(
+            "built snapshot access index {}: coins={} snapshot_bytes={} snapshot_sha256={} index_bytes={} mphf_levels={} mphf_bits={}; the retained snapshot file stays the authoritative compressed data source",
+            output.display(),
+            report.coins,
+            report.snapshot_bytes,
+            report.snapshot_sha256.to_lower_hex_string(),
+            report.index_bytes,
+            report.mphf_levels,
+            report.mphf_bits,
+        );
+        return Ok(());
+    }
     if let Some(OfflineAction::VerifyStorage {
         max_segments,
         max_bytes,
@@ -5187,6 +5961,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         }) => return verify_chain_offline(&options, *depth, *max_block_bytes),
         Some(
             OfflineAction::DownloadCoreSnapshot(_)
+            | OfflineAction::BuildCoreSnapshotIndex { .. }
             | OfflineAction::VerifyStorage { .. }
             | OfflineAction::ReindexFromFreezer { .. }
             | OfflineAction::ReindexChainstate { .. }
@@ -6415,7 +7190,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -6428,6 +7203,17 @@ fn startup_configuration_summary(options: &Options) -> String {
             .resources
             .proxy
             .map_or_else(|| "direct".to_owned(), |proxy| proxy.to_string()),
+        options.resources.v2_transport,
+        options
+            .zmq_listen
+            .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
+        options
+            .tor_control
+            .as_ref()
+            .map_or_else(|| "disabled".to_owned(), |tor| tor.control.to_string()),
+        options
+            .i2p_sam
+            .map_or_else(|| "disabled".to_owned(), |bridge| bridge.to_string()),
         options.resources.automatic_hot_standbys,
         options.once,
         options.mempool_full_rbf,
@@ -6788,6 +7574,17 @@ async fn run_peer_pool_session(
 ) -> Result<(), String> {
     let network_time = Arc::new(NetworkTime::default());
     let api_runtime = prepare_api_runtime(options)?;
+    let zmq_publisher = match options.zmq_listen {
+        Some(listen) => Some(
+            ZmqPublisher::bind(listen, ZmqPublisherConfig::default())
+                .await
+                .map_err(|error| format!("bind zmq endpoint: {error}"))?,
+        ),
+        None => None,
+    };
+    let zmq_notifier = zmq_publisher
+        .as_ref()
+        .map(|publisher| ZmqNotifier::new(publisher.handle()));
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::with_capacity(
         options.resources.mempool_max_transactions,
         options.resources.mempool_max_bytes,
@@ -6838,6 +7635,23 @@ async fn run_peer_pool_session(
     } else {
         None
     };
+    let i2p_session = match options.i2p_sam {
+        Some(bridge) => Some(Arc::new(create_i2p_session(options, bridge).await?)),
+        None => None,
+    };
+    let _onion_service = match (&options.tor_control, options.inbound_listen) {
+        (Some(tor), Some(listen)) => {
+            let published = publish_inbound_onion_service(options, tor, listen).await?;
+            if let Some(source) = &inbound_source {
+                source.install_advertised_onion(Some((
+                    published.service.address.clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )));
+            }
+            Some(published)
+        }
+        _ => None,
+    };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
             RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
@@ -6849,8 +7663,16 @@ async fn run_peer_pool_session(
     if let Some(source) = &inbound_source {
         source.install_peer_store(peer_store.as_ref().map(Arc::clone));
     }
-    let manual_remotes = options.remotes.iter().copied().collect::<HashSet<_>>();
-    let mut remotes = options.remotes.clone();
+    let manual_remotes = options
+        .remotes
+        .iter()
+        .map(|remote| NodePeerTarget::Socket(*remote))
+        .collect::<HashSet<_>>();
+    let mut remotes = options
+        .remotes
+        .iter()
+        .map(|remote| NodePeerTarget::Socket(*remote))
+        .collect::<Vec<_>>();
     if let Some(store) = &peer_store {
         let now = unix_time()?;
         let pruned = store
@@ -6866,10 +7688,11 @@ async fn run_peer_pool_session(
             if remotes.len() == MAX_CONFIGURED_PEERS {
                 break;
             }
+            let incumbent = NodePeerTarget::Socket(collision.incumbent);
             if options.resources.only_net.permits(collision.incumbent.ip())
-                && !remotes.contains(&collision.incumbent)
+                && !remotes.contains(&incumbent)
             {
-                remotes.push(collision.incumbent);
+                remotes.push(incumbent);
             }
         }
         for learned in store
@@ -6879,19 +7702,66 @@ async fn run_peer_pool_session(
             if remotes.len() == MAX_CONFIGURED_PEERS {
                 break;
             }
-            if options.resources.only_net.permits(learned.ip()) && !remotes.contains(&learned) {
-                remotes.push(learned);
+            let learned_target = NodePeerTarget::Socket(learned);
+            if options.resources.only_net.permits(learned.ip())
+                && !remotes.contains(&learned_target)
+            {
+                remotes.push(learned_target);
+            }
+        }
+        // Onion candidates are reachable only through a proxy, so they are
+        // consulted only when one is configured and the restriction permits
+        // them. They are appended after routable candidates so an ordinary
+        // node keeps its existing selection order.
+        if options.resources.only_net.permits_onion() && options.resources.proxy.is_some() {
+            let mut scheduled = 0;
+            for onion in store
+                .onion_candidates(now, MAX_CONFIGURED_PEERS)
+                .map_err(|error| error.to_string())?
+            {
+                if remotes.len() == MAX_CONFIGURED_PEERS {
+                    break;
+                }
+                let target = NodePeerTarget::Onion(onion);
+                if !remotes.contains(&target) {
+                    remotes.push(target);
+                    scheduled += 1;
+                }
+            }
+            if scheduled > 0 {
+                rbtc_info!("scheduled {scheduled} persisted onion peer candidates");
+            }
+        }
+        if options.resources.only_net.permits_i2p() && options.i2p_sam.is_some() {
+            let mut scheduled = 0;
+            for destination in store
+                .i2p_candidates(now, MAX_CONFIGURED_PEERS)
+                .map_err(|error| error.to_string())?
+            {
+                if remotes.len() == MAX_CONFIGURED_PEERS {
+                    break;
+                }
+                let target = NodePeerTarget::I2p(destination);
+                if !remotes.contains(&target) {
+                    remotes.push(target);
+                    scheduled += 1;
+                }
+            }
+            if scheduled > 0 {
+                rbtc_info!("scheduled {scheduled} persisted I2P peer candidates");
             }
         }
     }
-    let mut attempted = remotes.iter().copied().collect::<HashSet<_>>();
+    let mut attempted = remotes.iter().cloned().collect::<HashSet<_>>();
     let mut failures = Vec::with_capacity(MAX_CONFIGURED_PEERS * 2);
     if try_peer_candidates(
         options,
         &remotes,
         local_nonce,
         peer_store.as_ref(),
+        i2p_session.as_ref(),
         api_runtime.as_ref(),
+        zmq_notifier.as_ref(),
         background_validation,
         validation_scheduler,
         &transaction_pool,
@@ -6917,7 +7787,10 @@ async fn run_peer_pool_session(
         // source. `attempted` remains excluded so no address is retried in the
         // same run.
         let remaining = MAX_CONFIGURED_PEERS;
-        let mut dns_excluded = attempted.clone();
+        let mut dns_excluded = attempted
+            .iter()
+            .filter_map(NodePeerTarget::socket)
+            .collect::<HashSet<_>>();
         if let Some(store) = &peer_store {
             for discouraged in store
                 .discouraged_addresses(unix_time()?)
@@ -6943,13 +7816,19 @@ async fn run_peer_pool_session(
                 resolved.len()
             );
         }
-        attempted.extend(resolved.iter().copied());
+        let resolved = resolved
+            .into_iter()
+            .map(NodePeerTarget::Socket)
+            .collect::<Vec<_>>();
+        attempted.extend(resolved.iter().cloned());
         if try_peer_candidates(
             options,
             &resolved,
             local_nonce,
             peer_store.as_ref(),
+            i2p_session.as_ref(),
             api_runtime.as_ref(),
+            zmq_notifier.as_ref(),
             background_validation,
             validation_scheduler,
             &transaction_pool,
@@ -7789,20 +8668,20 @@ async fn negotiate_peer_preferences(
 }
 
 struct ConnectedPeer {
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     session: PeerSession<tokio::net::TcpStream>,
     validated_header_height: Option<u32>,
 }
 
 struct ActivePeerObservation {
     observer: Option<NodeObserver>,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
 }
 
 impl ActivePeerObservation {
-    fn new(observer: Option<NodeObserver>, remote: SocketAddr) -> Self {
+    fn new(observer: Option<NodeObserver>, remote: NodePeerTarget) -> Self {
         if let Some(observer) = &observer {
-            observer.peer_connected(remote);
+            observer.peer_target_connected(&remote);
         }
         Self { observer, remote }
     }
@@ -7811,7 +8690,7 @@ impl ActivePeerObservation {
 impl Drop for ActivePeerObservation {
     fn drop(&mut self) {
         if let Some(observer) = &self.observer {
-            observer.peer_disconnected(self.remote);
+            observer.peer_target_disconnected(&self.remote);
         }
     }
 }
@@ -7835,37 +8714,165 @@ impl PendingPeer {
     }
 }
 
+#[cfg(test)]
 async fn connect_peer(
     deployments: DeploymentConfig,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
+    connect_peer_with_transport(
+        deployments,
+        remote,
+        proxy,
+        None,
+        local_nonce,
+        require_full_services,
+        peer_store,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_i2p_peer(
+    session: Arc<I2pSamSession>,
+    destination: &I2pAddress,
+    remote: &NodePeerTarget,
+    deployments: &DeploymentConfig,
+    local_nonce: u64,
+    require_full_services: bool,
+    peer_store: Option<&Arc<RedbPeerStore>>,
+    prefer_v2: bool,
+    handshake_started: Instant,
+) -> Result<ConnectedPeer, PeerRunError> {
+    let stream = timeout(PEER_TIMEOUT, session.connect_stream(destination))
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "I2P stream to {remote} timed out after {} seconds",
+                PEER_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))?;
+    let mut session = timeout(
+        PEER_TIMEOUT,
+        rbtc::p2p::complete_outbound_handshake_on_stream(
+            stream,
+            deployments.message_start(),
+            local_nonce,
+            USER_AGENT.to_owned(),
+            0,
+            prefer_v2,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        PeerRunError::transient(format!(
+            "peer handshake timed out after {} seconds",
+            PEER_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| PeerRunError::p2p(&error))?;
+    let remote_version = session.remote_version();
+    rbtc_info!(
+        "connected to {remote}: version={}, height={}, agent={}",
+        remote_version.version,
+        remote_version.start_height,
+        remote_version.user_agent
+    );
+    let _ = handshake_started;
+    negotiate_peer_preferences(&mut session).await?;
+    if require_full_services {
+        session
+            .ensure_full_witness_block_relay()
+            .map_err(|error| PeerRunError::p2p(&error))?;
+        if let Some(store) = peer_store {
+            if let Err(error) =
+                store.record_i2p_success(destination, unix_time().unwrap_or_default())
+            {
+                rbtc_warn!("recording I2P peer {destination} success failed: {error}");
+            }
+        }
+    }
+    Ok(ConnectedPeer {
+        remote: remote.clone(),
+        session,
+        validated_header_height: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_peer_with_transport(
+    deployments: DeploymentConfig,
+    remote: NodePeerTarget,
+    proxy: Option<SocketAddr>,
+    i2p_session: Option<Arc<I2pSamSession>>,
+    local_nonce: u64,
+    require_full_services: bool,
+    peer_store: Option<Arc<RedbPeerStore>>,
+    prefer_v2: bool,
+) -> Result<ConnectedPeer, PeerRunError> {
+    // An onion destination has no direct route, so a missing proxy is a
+    // configuration fault rather than a peer failure.
+    if matches!(remote, NodePeerTarget::Onion(_)) && proxy.is_none() {
+        return Err(PeerRunError::local(format!(
+            "onion peer {remote} requires a configured SOCKS5 proxy"
+        )));
+    }
     let handshake_started = Instant::now();
+    // I2P destinations are reached through the SAM bridge, never through a
+    // SOCKS5 proxy: substituting one would connect to the wrong network.
+    if let NodePeerTarget::I2p(destination) = &remote {
+        let Some(session) = i2p_session else {
+            return Err(PeerRunError::local(format!(
+                "I2P peer {remote} requires a configured SAM bridge"
+            )));
+        };
+        return connect_i2p_peer(
+            session,
+            destination,
+            &remote,
+            &deployments,
+            local_nonce,
+            require_full_services,
+            peer_store.as_ref(),
+            prefer_v2,
+            handshake_started,
+        )
+        .await;
+    }
+    let target =
+        ProxyTarget::try_from(&remote).expect("only I2P destinations lack a proxy representation");
     let mut session = timeout(PEER_TIMEOUT, async {
-        match proxy {
-            Some(proxy) => {
-                connect_outbound_via_socks5(
+        match (proxy, &target) {
+            (Some(proxy), _) => {
+                connect_proxied_target(
                     proxy,
-                    remote,
+                    &target,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
                     0,
+                    prefer_v2,
                 )
                 .await
             }
-            None => {
-                connect_outbound(
-                    remote,
+            (None, ProxyTarget::Socket(socket)) => {
+                connect_outbound_with_transport(
+                    *socket,
                     deployments.message_start(),
                     local_nonce,
                     USER_AGENT.to_owned(),
                     0,
+                    prefer_v2,
                 )
                 .await
+            }
+            (None, ProxyTarget::Onion(_)) => {
+                unreachable!("a proxyless onion destination is refused above")
             }
         }
     })
@@ -7894,8 +8901,13 @@ async fn connect_peer(
         session
             .ensure_full_witness_block_relay()
             .map_err(|error| PeerRunError::p2p(&error))?;
-        if let Some(store) = peer_store {
-            record_verified_peer(store.as_ref(), remote, remote_services, handshake_millis);
+        if let (Some(store), Some(routable)) = (peer_store.as_ref(), remote.socket()) {
+            record_verified_peer(store.as_ref(), routable, remote_services, handshake_millis);
+        }
+        if let (Some(store), NodePeerTarget::Onion(onion)) = (peer_store.as_ref(), &remote) {
+            if let Err(error) = store.record_onion_success(onion, unix_time().unwrap_or_default()) {
+                rbtc_warn!("recording onion peer {onion} success failed: {error}");
+            }
         }
     }
     Ok(ConnectedPeer {
@@ -8062,11 +9074,13 @@ impl Drop for TransactionRequestSourceGuard {
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_maintain_standby(
     deployments: DeploymentConfig,
-    remote: SocketAddr,
+    remote: NodePeerTarget,
     proxy: Option<SocketAddr>,
+    i2p_session: Option<Arc<I2pSamSession>>,
     local_nonce: u64,
     require_full_services: bool,
     peer_store: Option<Arc<RedbPeerStore>>,
+    prefer_v2: bool,
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
     transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
@@ -8074,29 +9088,37 @@ async fn connect_and_maintain_standby(
     mempool_relay_source: Option<MempoolRelaySource>,
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
+    advertised_onion: Option<(OnionAddress, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
-    let mut connected = connect_peer(
+    let mut connected = connect_peer_with_transport(
         deployments,
-        remote,
+        remote.clone(),
         proxy,
+        i2p_session,
         local_nonce,
         require_full_services,
         peer_store,
+        prefer_v2,
     )
     .await?;
     let local_time = unix_time().map_err(PeerRunError::transient)?;
-    let observed = network_time.observe(
-        remote.ip(),
-        connected.session.remote_version().timestamp,
-        local_time,
-    );
-    rbtc_info!(
-        "network-time sample from {remote}: samples={} offset_seconds={} usable={}",
-        observed.samples,
-        observed.offset_seconds,
-        observed.usable
-    );
+    // Network-time samples are grouped by IP range to stop one operator from
+    // dominating the estimate. An onion peer has no such range, so it is
+    // excluded rather than counted under a fabricated group.
+    if let Some(routable) = remote.socket() {
+        let observed = network_time.observe(
+            routable.ip(),
+            connected.session.remote_version().timestamp,
+            local_time,
+        );
+        rbtc_info!(
+            "network-time sample from {remote}: samples={} offset_seconds={} usable={}",
+            observed.samples,
+            observed.offset_seconds,
+            observed.usable
+        );
+    }
     if let Some((address, services)) = advertised_address {
         timeout(
             PEER_TIMEOUT,
@@ -8106,6 +9128,17 @@ async fn connect_and_maintain_standby(
         )
         .await
         .map_err(|_| PeerRunError::transient("local address advertisement timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    }
+    if let Some((onion, services)) = advertised_onion {
+        timeout(
+            PEER_TIMEOUT,
+            connected
+                .session
+                .advertise_onion_address(&onion, services, local_time),
+        )
+        .await
+        .map_err(|_| PeerRunError::transient("onion address advertisement timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))?;
     }
     if let Some(source) = mempool_relay_source {
@@ -8161,20 +9194,22 @@ fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
 #[allow(clippy::too_many_arguments)]
 fn spawn_peer_connections(
     options: &Options,
-    remotes: &[SocketAddr],
+    remotes: &[NodePeerTarget],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
     standby_relay: Option<&broadcast::Sender<TransactionRelay>>,
     mempool_relay_source: Option<&MempoolRelaySource>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
+    advertised_onion: Option<&(OnionAddress, ServiceFlags)>,
+    i2p_session: Option<&Arc<I2pSamSession>>,
     network_time: &Arc<NetworkTime>,
-) -> Result<VecDeque<(SocketAddr, PendingPeer)>, String> {
+) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
     let header_seed = standby_header_seed(options)?;
     Ok(remotes
         .iter()
-        .copied()
+        .cloned()
         .map(|remote| {
-            record_peer_attempt(peer_store.map(Arc::as_ref), remote);
+            record_peer_attempt(peer_store.map(Arc::as_ref), &remote);
             let deployments = options.deployments.clone();
             let peer_store = peer_store.cloned();
             let require_full_services = options.data_dir.is_some();
@@ -8193,14 +9228,18 @@ fn spawn_peer_connections(
                 .inbound_limits
                 .advertised_address
                 .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
+            let advertised_onion = advertised_onion.cloned();
             let proxy = options.resources.proxy;
+            let i2p_session = i2p_session.cloned();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
-                remote,
+                remote.clone(),
                 proxy,
+                i2p_session.clone(),
                 local_nonce,
                 require_full_services,
                 peer_store,
+                options.resources.v2_transport,
                 ready_sender,
                 activate_receiver,
                 transaction_relay,
@@ -8208,6 +9247,7 @@ fn spawn_peer_connections(
                 mempool_relay_source,
                 transaction_pool,
                 advertised_address,
+                advertised_onion,
                 network_time,
             ));
             (
@@ -8223,7 +9263,7 @@ fn spawn_peer_connections(
         .collect())
 }
 
-async fn abort_pending_connections(pending: &mut VecDeque<(SocketAddr, PendingPeer)>) {
+async fn abort_pending_connections(pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>) {
     for (_, connection) in pending.iter() {
         connection.task.abort();
     }
@@ -8249,7 +9289,7 @@ async fn activate_pending_peer(mut pending: PendingPeer) -> Result<ConnectedPeer
 }
 
 async fn activate_next_auxiliary_peer(
-    candidates: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    candidates: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
 ) {
     while let Some((remote, pending)) = candidates.pop_front() {
@@ -8267,8 +9307,8 @@ async fn activate_next_auxiliary_peer(
 }
 
 fn take_ready_auxiliary_peers(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
-) -> VecDeque<(SocketAddr, PendingPeer)> {
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
+) -> VecDeque<(NodePeerTarget, PendingPeer)> {
     let mut selected = VecDeque::new();
     while selected.len() < 3 {
         let Some(index) = pending
@@ -8287,12 +9327,12 @@ fn take_ready_auxiliary_peers(
 }
 
 async fn evict_excess_ready_standbys(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
     maximum_automatic: usize,
-) -> Vec<SocketAddr> {
+) -> Vec<NodePeerTarget> {
     let ready_automatic = pending
         .iter_mut()
         .enumerate()
@@ -8332,7 +9372,7 @@ async fn evict_excess_ready_standbys(
                 rbtc_warn!("standby peer {remote} failed during capacity eviction: {error}");
                 record_peer_failure(
                     peer_store,
-                    remote,
+                    &remote,
                     error.kind,
                     manual_remotes.contains(&remote),
                 );
@@ -8345,9 +9385,9 @@ async fn evict_excess_ready_standbys(
 }
 
 async fn reap_finished_standbys(
-    pending: &mut VecDeque<(SocketAddr, PendingPeer)>,
+    pending: &mut VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
 ) {
     let finished = pending
@@ -8367,7 +9407,7 @@ async fn reap_finished_standbys(
         rbtc_warn!("standby peer {remote} failed: {error}");
         record_peer_failure(
             peer_store,
-            remote,
+            &remote,
             error.kind,
             manual_remotes.contains(&remote),
         );
@@ -8375,13 +9415,22 @@ async fn reap_finished_standbys(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Returns the published onion service announced alongside routable peers.
+fn advertised_onion_service(
+    inbound_source: Option<&Arc<SharedInboundSource>>,
+) -> Option<(OnionAddress, ServiceFlags)> {
+    inbound_source.and_then(|source| source.advertised_onion_service())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn try_peer_candidates(
     options: &Options,
-    remotes: &[SocketAddr],
+    remotes: &[NodePeerTarget],
     local_nonce: u64,
     peer_store: Option<&Arc<RedbPeerStore>>,
+    i2p_session: Option<&Arc<I2pSamSession>>,
     api_runtime: Option<&ApiRuntime>,
+    zmq_notifier: Option<&ZmqNotifier>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -8389,10 +9438,11 @@ async fn try_peer_candidates(
     mempool_relay_source: &MempoolRelaySource,
     inbound_source: Option<&Arc<SharedInboundSource>>,
     inbound_server: &mut Option<InboundServer>,
-    manual_remotes: &HashSet<SocketAddr>,
+    manual_remotes: &HashSet<NodePeerTarget>,
     failures: &mut Vec<String>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<bool, String> {
+    let advertised_onion = advertised_onion_service(inbound_source);
     let mut pending = match spawn_peer_connections(
         options,
         remotes,
@@ -8401,6 +9451,8 @@ async fn try_peer_candidates(
         Some(transaction_relay),
         Some(mempool_relay_source),
         Some(transaction_pool),
+        advertised_onion.as_ref(),
+        i2p_session,
         network_time,
     ) {
         Ok(pending) => pending,
@@ -8426,6 +9478,7 @@ async fn try_peer_candidates(
                     auxiliary,
                     peer_store.map(Arc::as_ref),
                     api_runtime,
+                    zmq_notifier,
                     background_validation,
                     validation_scheduler,
                     transaction_pool,
@@ -8466,7 +9519,7 @@ async fn try_peer_candidates(
         match result {
             Ok(()) => {
                 if completed_validating_session(options) {
-                    record_peer_session_success(peer_store.map(Arc::as_ref), remote);
+                    record_peer_session_success(peer_store.map(Arc::as_ref), &remote);
                 }
                 abort_pending_connections(&mut pending).await;
                 return Ok(true);
@@ -8479,7 +9532,7 @@ async fn try_peer_candidates(
                 rbtc_warn!("peer {remote} failed: {error}");
                 record_peer_failure(
                     peer_store.map(Arc::as_ref),
-                    remote,
+                    &remote,
                     error.kind,
                     manual_remotes.contains(&remote),
                 );
@@ -8494,9 +9547,10 @@ async fn try_peer_candidates(
 async fn run_connected_peer(
     options: &Options,
     connected: ConnectedPeer,
-    auxiliary: VecDeque<(SocketAddr, PendingPeer)>,
+    auxiliary: VecDeque<(NodePeerTarget, PendingPeer)>,
     peer_store: Option<&RedbPeerStore>,
     api_runtime: Option<&ApiRuntime>,
+    zmq_notifier: Option<&ZmqNotifier>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
@@ -8509,7 +9563,11 @@ async fn run_connected_peer(
         mut session,
         validated_header_height,
     } = connected;
-    let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote);
+    let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote.clone());
+    // Address-book maintenance, throughput ranking, and the socket-typed
+    // status view all key on a routable address, which an onion peer has
+    // none of; those steps are skipped rather than given a fabricated one.
+    let routable = remote.socket();
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
         rbtc_info!("activated peer {remote} after standby validation through height {height}");
@@ -8521,10 +9579,14 @@ async fn run_connected_peer(
 
     if let Some(path) = &options.data_dir {
         if let Some(store) = peer_store {
-            discover_peer_addresses(&mut session, store, remote).await;
+            if let Some(routable) = routable {
+                discover_peer_addresses(&mut session, store, routable).await;
+            }
         }
         let transfer_before = session.block_transfer_stats();
-        let result = if let Some(validation_dir) = &options.complete_assumeutxo {
+        let result = if options.snapshot_overlay.is_some() {
+            sync_snapshot_overlay_node(&mut session, options, path.clone(), network_time).await
+        } else if let Some(validation_dir) = &options.complete_assumeutxo {
             complete_assumeutxo_validation(
                 &mut session,
                 options,
@@ -8546,7 +9608,7 @@ async fn run_connected_peer(
                 path.clone(),
                 &options.runtime_control,
                 options.observer.as_ref(),
-                Some(remote),
+                routable,
                 options.once,
                 options.validation_target,
                 options.validation_limits,
@@ -8563,13 +9625,14 @@ async fn run_connected_peer(
                 transaction_pool,
                 transaction_relay,
                 network_time,
+                zmq_notifier,
             )
             .await
         };
-        if result.is_ok() {
+        if let (Ok(()), Some(routable)) = (&result, routable) {
             record_peer_block_throughput(
                 peer_store,
-                remote,
+                routable,
                 transfer_before,
                 session.block_transfer_stats(),
             );
@@ -8696,6 +9759,7 @@ async fn complete_assumeutxo_validation(
         transaction_pool,
         transaction_relay,
         network_time,
+        None,
     )
     .await?;
     finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
@@ -8714,7 +9778,150 @@ async fn complete_assumeutxo_validation(
     Ok(())
 }
 
-fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+/// Creates the SAM session used to reach and publish I2P peers.
+///
+/// A stored destination key republishes the same address, so peers that
+/// learned it keep reaching this node across restarts. The key is secret
+/// material: it is written owner-only inside the data directory and never
+/// logged.
+async fn create_i2p_session(
+    options: &Options,
+    bridge: SocketAddr,
+) -> Result<I2pSamSession, String> {
+    let key_path = options
+        .data_dir
+        .as_ref()
+        .map(|data_dir| data_dir.join("i2p_destination_key"));
+    let existing = key_path
+        .as_ref()
+        .and_then(|path| read_owner_only_text_file(path, "i2p destination key", 16 * 1024).ok());
+    let session = I2pSamSession::create(
+        bridge,
+        I2P_SESSION_ID,
+        existing.as_deref(),
+        crate::i2p_sam::I2pSamConfig::default(),
+    )
+    .await
+    .map_err(|error| format!("create the I2P SAM session: {error}"))?;
+    if existing.is_none() {
+        if let Some(path) = &key_path {
+            if let Err(error) = write_owner_only_secret(path, session.destination_key()) {
+                rbtc_warn!(
+                    "persisting the I2P destination key failed, so the address will change on restart: {error}"
+                );
+            }
+        }
+    }
+    rbtc_info!(
+        "created I2P SAM session with destination {}",
+        session.address()
+    );
+    Ok(session)
+}
+
+/// Keeps one published onion service for the lifetime of a node run.
+///
+/// Dropping the guard closes the control connection, which withdraws an
+/// ephemeral service; the explicit `DEL_ONION` on the way out makes the
+/// withdrawal immediate and observable instead of relying on that side
+/// effect.
+struct PublishedInboundOnion {
+    controller: Option<TorController>,
+    service: PublishedOnionService,
+}
+
+impl Drop for PublishedInboundOnion {
+    fn drop(&mut self) {
+        let Some(mut controller) = self.controller.take() else {
+            return;
+        };
+        let service = self.service.clone();
+        // The control connection is async, so the withdrawal runs on the
+        // ambient runtime when one is still available; the connection close
+        // withdraws the ephemeral service either way.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = controller.remove_onion_service(&service).await {
+                    rbtc_warn!(
+                        "withdrawing onion service {} failed: {error}",
+                        service.address
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Publishes an inbound onion service forwarding to the local listener.
+///
+/// A previously stored private key republishes the same address, so peers
+/// that learned it keep reaching this node across restarts. The key is
+/// secret material: it is written owner-only inside the data directory and
+/// never logged.
+async fn publish_inbound_onion_service(
+    options: &Options,
+    tor: &TorControlOptions,
+    listen: SocketAddr,
+) -> Result<PublishedInboundOnion, String> {
+    let key_path = options
+        .data_dir
+        .as_ref()
+        .map(|data_dir| data_dir.join("onion_service_key"));
+    let existing = key_path
+        .as_ref()
+        .and_then(|path| read_owner_only_text_file(path, "onion service key", 4096).ok());
+    let mut controller = TorController::connect(
+        tor.control,
+        &tor.cookie,
+        crate::tor_control::TorControlConfig::default(),
+    )
+    .await
+    .map_err(|error| format!("connect to the Tor control port: {error}"))?;
+    let service = controller
+        .add_onion_service(listen.port(), listen, existing.as_deref())
+        .await
+        .map_err(|error| format!("publish an onion service: {error}"))?;
+    if existing.is_none() && !service.private_key.is_empty() {
+        if let Some(path) = &key_path {
+            if let Err(error) = write_owner_only_secret(path, &service.private_key) {
+                rbtc_warn!(
+                    "persisting the onion service key failed, so the address will change on restart: {error}"
+                );
+            }
+        }
+    }
+    rbtc_info!(
+        "published onion service {} forwarding to {listen}",
+        service.address
+    );
+    Ok(PublishedInboundOnion {
+        controller: Some(controller),
+        service,
+    })
+}
+
+/// Writes one secret owner-only, replacing any previous content.
+fn write_owner_only_secret(path: &std::path::Path, secret: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
+    }
+    let mut file = open_options
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| format!("restrict {}: {error}", path.display()))?;
+    file.write_all(secret.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("persist {}: {error}", path.display()))
+}
+
+fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
     let Some(store) = store else {
         return;
     };
@@ -8725,14 +9932,19 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: SocketAddr) {
             return;
         }
     };
-    if let Err(error) = store.record_attempt(remote, now) {
+    let recorded = match remote {
+        NodePeerTarget::Socket(socket) => store.record_attempt(*socket, now).map(|_| ()),
+        NodePeerTarget::Onion(onion) => store.record_onion_attempt(onion, now).map(|_| ()),
+        NodePeerTarget::I2p(i2p) => store.record_i2p_attempt(i2p, now).map(|_| ()),
+    };
+    if let Err(error) = recorded {
         rbtc_warn!("peer attempt history for {remote} failed: {error}");
     }
 }
 
 fn record_peer_failure(
     store: Option<&RedbPeerStore>,
-    remote: SocketAddr,
+    remote: &NodePeerTarget,
     kind: PeerFailureKind,
     manual: bool,
 ) {
@@ -8746,13 +9958,22 @@ fn record_peer_failure(
             return;
         }
     };
-    if let Err(error) = store.resolve_tried_collision_probe(remote, false, now) {
+    // Tried-collision probing and protocol cooldowns are keyed by socket
+    // address; an anonymity-network peer has neither a collision slot nor an
+    // entry in that keyspace, so its failure stays in its own book.
+    let Some(routable) = remote.socket() else {
+        if kind == PeerFailureKind::ProtocolViolation && !manual {
+            rbtc_info!("peer {remote} failed an objective protocol rule");
+        }
+        return;
+    };
+    if let Err(error) = store.resolve_tried_collision_probe(routable, false, now) {
         rbtc_warn!("tried-collision failure resolution for {remote} failed: {error}");
     }
     if kind != PeerFailureKind::ProtocolViolation || manual {
         return;
     }
-    match store.record_protocol_violation(remote, now) {
+    match store.record_protocol_violation(routable, now) {
         Ok(until) => rbtc_info!(
             "discouraged peer {remote} after an objective protocol violation until Unix time {until}"
         ),
@@ -8760,7 +9981,7 @@ fn record_peer_failure(
     }
 }
 
-fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr) {
+fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
     let Some(store) = store else {
         return;
     };
@@ -8771,7 +9992,12 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: SocketAddr
             return;
         }
     };
-    if let Err(error) = store.record_session_success(remote, now) {
+    let recorded = match remote {
+        NodePeerTarget::Socket(socket) => store.record_session_success(*socket, now).map(|_| ()),
+        NodePeerTarget::Onion(onion) => store.record_onion_success(onion, now).map(|_| ()),
+        NodePeerTarget::I2p(i2p) => store.record_i2p_success(i2p, now).map(|_| ()),
+    };
+    if let Err(error) = recorded {
         rbtc_warn!("peer session success for {remote} failed: {error}");
     }
 }
@@ -8862,6 +10088,32 @@ async fn discover_peer_addresses(
                 Ok(_) => {}
                 Err(error) => rbtc_warn!("peer address persistence from {source} failed: {error}"),
             }
+            // Onion services observed in the same bounded response enter
+            // their own independently bounded address book.
+            let onions = session.take_onion_addresses();
+            if !onions.is_empty() {
+                match store.insert_discovered_onion(&onions, now) {
+                    Ok(inserted) if inserted > 0 => rbtc_info!(
+                        "persisted {inserted} learned onion peer addresses from {source}"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        rbtc_warn!("onion peer address persistence from {source} failed: {error}");
+                    }
+                }
+            }
+            let destinations = session.take_i2p_addresses();
+            if !destinations.is_empty() {
+                match store.insert_discovered_i2p(&destinations, now) {
+                    Ok(inserted) if inserted > 0 => {
+                        rbtc_info!("persisted {inserted} learned I2P peer addresses from {source}");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        rbtc_warn!("I2P peer address persistence from {source} failed: {error}");
+                    }
+                }
+            }
         }
         Ok(Err(error)) => rbtc_warn!("peer address discovery from {source} failed: {error}"),
         Err(_) => rbtc_warn!(
@@ -8933,6 +10185,541 @@ async fn sync_headers(
         dag.active_tip().hash
     );
     Ok(dag)
+}
+
+/// Runs a bounded snapshot-overlay catch-up: headers first, then block
+/// execution on the immutable compressed base plus its MDBX overlay
+/// environment, rebasing onto a fresh snapshot when the overlay approaches
+/// its hard capacity ceiling.
+///
+/// The mode is deliberately bounded (`--once`): it executes to the header
+/// tip observed after the initial headers synchronization and exits, and it
+/// serves no explorer, wallet, or mempool surface.
+#[cfg(feature = "mdbx")]
+#[allow(clippy::too_many_lines)]
+async fn sync_snapshot_overlay_node(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    options: &Options,
+    data_dir: PathBuf,
+    network_time: &NetworkTime,
+) -> Result<(), PeerRunError> {
+    let overlay = options
+        .snapshot_overlay
+        .as_ref()
+        .expect("snapshot-overlay dispatch requires a parsed configuration");
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("create data directory {}: {error}", data_dir.display()))?;
+    let headers = sync_headers(
+        session,
+        &options.deployments,
+        data_dir.join("headers.redb"),
+        network_time,
+    )
+    .await?;
+
+    let (database_path, stored_identity) = match overlay.engine {
+        SnapshotOverlayEngine::Mdbx => {
+            let path = data_dir.join("overlay-mdbx");
+            let stored = SnapshotOverlayChainstate::stored_identity(&path, overlay.capacity_bytes)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            (path, stored)
+        }
+        SnapshotOverlayEngine::Redb => {
+            let path = data_dir.join("overlay.redb");
+            let stored = SnapshotOverlayRedbChainstate::stored_identity(&path)
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            (path, stored)
+        }
+    };
+    let (identity, snapshot_path, index_path) = match stored_identity {
+        None => (
+            compiled_overlay_identity(&overlay.snapshot, options.network)?,
+            overlay.snapshot.clone(),
+            overlay.index.clone(),
+        ),
+        Some(identity) => {
+            let (snapshot_path, index_path) =
+                overlay_base_paths_for_height(&overlay.snapshot, identity.height);
+            (identity, snapshot_path, index_path)
+        }
+    };
+    if headers
+        .active_header_at(identity.height)
+        .is_none_or(|header| header.hash != identity.block_hash)
+    {
+        return Err(PeerRunError::transient(
+            "snapshot base is not on the synchronized active header chain",
+        ));
+    }
+    let store_config = SnapshotOverlayConfig {
+        database_dir: database_path,
+        snapshot_path,
+        index_path,
+        capacity_bytes: overlay.capacity_bytes,
+        import_time: u64::from(unix_time()?),
+        mtp_by_height: creation_mtp_range(&headers, 0, identity.height)?,
+    };
+
+    match overlay.engine {
+        SnapshotOverlayEngine::Mdbx => {
+            let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        SnapshotOverlayEngine::Redb => {
+            let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+    }
+}
+
+/// Reclaimed-space summary from one overlay maintenance pass.
+#[cfg(feature = "mdbx")]
+struct OverlayCompaction {
+    before_bytes: u64,
+    after_bytes: u64,
+}
+
+/// The engine-specific capabilities the catch-up loop needs beyond ordinary
+/// block execution, so the loop itself can be written once for both stores.
+#[cfg(feature = "mdbx")]
+trait OverlayCatchupStore: ExecutionChainStore {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity;
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String>;
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String>;
+    /// Reclaims space in place, if this engine can.
+    ///
+    /// Returns `None` when the engine offers no in-place compaction. When to
+    /// call this is the catch-up loop's policy decision, not the store's.
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String>;
+    fn engine_name(&self) -> &'static str;
+}
+
+#[cfg(feature = "mdbx")]
+impl OverlayCatchupStore for SnapshotOverlayChainstate {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        self.capacity().map_err(|error| error.to_string())
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.rebase_into(snapshot, index, mtp_extension)
+            .map_err(|error| error.to_string())
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        // Upstream `libmdbx-rs` 0.6.6 exposes no compaction, which had been
+        // taken to mean MDBX offers none — it does, through `mdbx_env_copy`
+        // with `MDBX_CP_COMPACT`, and the vendored crate now binds it. A
+        // measured catch-up settles with about half its high-water mark held
+        // by superseded pages the geometry ceiling still counts, so this
+        // reclaims roughly what a rebase would while writing only the live
+        // bytes instead of a whole snapshot and index.
+        let report = SnapshotOverlayChainstate::compact(self).map_err(|error| error.to_string())?;
+        Ok(Some(OverlayCompaction {
+            before_bytes: report.before_bytes,
+            after_bytes: report.after_bytes,
+        }))
+    }
+
+    fn engine_name(&self) -> &'static str {
+        "mdbx"
+    }
+}
+
+#[cfg(feature = "mdbx")]
+impl OverlayCatchupStore for SnapshotOverlayRedbChainstate {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        self.capacity().map_err(|error| error.to_string())
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.rebase_into(snapshot, index, mtp_extension)
+            .map_err(|error| error.to_string())
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        let report = self.compact().map_err(|error| error.to_string())?;
+        Ok(Some(OverlayCompaction {
+            before_bytes: report.before_bytes,
+            after_bytes: report.after_bytes,
+        }))
+    }
+
+    fn engine_name(&self) -> &'static str {
+        "redb"
+    }
+}
+
+/// Drives bounded catch-up on either overlay engine.
+#[cfg(feature = "mdbx")]
+#[allow(clippy::too_many_lines)]
+async fn run_overlay_catchup<C: OverlayCatchupStore>(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    options: &Options,
+    data_dir: &std::path::Path,
+    headers: &HeaderDag,
+    mut chainstate: C,
+) -> Result<(), PeerRunError> {
+    let overlay = options
+        .snapshot_overlay
+        .as_ref()
+        .expect("snapshot-overlay dispatch requires a parsed configuration");
+    let opened_tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
+    let identity = chainstate.overlay_base_identity().clone();
+    rbtc_info!(
+        "snapshot-overlay chainstate opened on {}: base {}:{} tip {}:{} capacity={} bytes",
+        chainstate.engine_name(),
+        identity.height,
+        identity.block_hash,
+        opened_tip.height,
+        opened_tip.hash,
+        overlay.capacity_bytes,
+    );
+
+    // `open_persisted` keeps the source ledger's own retention policy, so a
+    // replay directory is opened read-only in effect: this run never prunes
+    // the blocks it is replaying.
+    let replay = match overlay.replay_blocks.as_ref() {
+        Some(path) => Some(
+            PrunedBlockLedger::open_persisted(path)
+                .map_err(|error| format!("open replay block ledger: {error}"))?,
+        ),
+        None => None,
+    };
+    let replay_ceiling = match replay.as_ref() {
+        Some(replay) => {
+            let stats = replay.stats().map_err(|error| error.to_string())?;
+            let first = stats
+                .first_height
+                .ok_or_else(|| "replay block ledger retains no blocks".to_owned())?;
+            let last = first
+                .checked_add(stats.blocks)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| "replay block ledger height overflow".to_owned())?;
+            rbtc_info!(
+                "replaying blocks from a retained ledger: {} blocks, heights {first}-{last}, {} bytes",
+                stats.blocks,
+                stats.bytes
+            );
+            Some(last)
+        }
+        None => None,
+    };
+    let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    // A prior attempt may have staged a downloaded batch and then failed
+    // before committing it (for example, the chainstate transaction hitting
+    // the hard capacity ceiling) — `download_execute_batch` always stages
+    // fresh for the next batch and does not expect a pre-existing staged
+    // segment, so leaving one in place fails every subsequent attempt at the
+    // same height with "staged segment already exists" instead of
+    // recovering. The redb-backed driver reconciles this against its own
+    // chainstate tip and can resume already-validated staged blocks via
+    // `commit_staged`; this driver takes the simpler always-discard path and
+    // re-downloads, which is a bounded, one-batch bandwidth cost.
+    if ledger
+        .staged()
+        .map_err(|error| PeerRunError::transient(error.to_string()))?
+        .is_some()
+    {
+        ledger
+            .discard_staged()
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    }
+    // A committed segment can also outlive the chainstate that produced it.
+    // The batch commits the chainstate before the ledger, so under a durable
+    // commit the chainstate can only be ahead and this is a no-op. It is kept
+    // because the reverse leaves the driver permanently stuck rather than
+    // merely inconsistent: resuming would append at a height the ledger
+    // already covers and fail on contiguity from then on, and nothing else
+    // would repair it. The reindex driver does the same for the same reason.
+    if let Some(first_unexecuted) = opened_tip.height.checked_add(1) {
+        let retained_before = ledger
+            .stats()
+            .map_err(|error| PeerRunError::transient(error.to_string()))?
+            .blocks;
+        ledger
+            .truncate_from(first_unexecuted)
+            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+        let retained_after = ledger
+            .stats()
+            .map_err(|error| PeerRunError::transient(error.to_string()))?
+            .blocks;
+        if retained_after < retained_before {
+            rbtc_warn!(
+                "discarded {} retained block(s) above the executed tip {}; the chainstate did not have the commit the block ledger had already recorded",
+                retained_before - retained_after,
+                opened_tip.height
+            );
+        }
+    }
+    let auxiliary_indexes = AuxiliaryIndexes::open(
+        data_dir,
+        options.network,
+        NodeIndexConfig {
+            transaction: false,
+            spent_output: false,
+            basic_filter: false,
+        },
+    )
+    .map_err(PeerRunError::local)?;
+    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let mut auxiliary_session = None;
+    let mut prefetched_blocks = PrefetchedBlocks::default();
+    // File size immediately after the last compaction, whatever it released.
+    // Compaction rewrites every surviving byte, so repeating it before
+    // meaningful garbage has re-accumulated costs far more than it returns —
+    // and during catch-up the overlay is mostly live data (coins the chain
+    // just created, plus undo still inside the retention window), so garbage
+    // accumulates slowly. Gating on growth since this point covers both the
+    // fruitless case and the merely uneconomical one.
+    let mut last_compacted_bytes: Option<u64> = None;
+    loop {
+        loop {
+            let tip = chainstate
+                .execution_tip()
+                .map_err(|error| error.to_string())?;
+            if headers
+                .active_header_at(tip.height)
+                .is_some_and(|header| header.hash == tip.hash)
+            {
+                break;
+            }
+            let rewound = disconnect_execution_tip(
+                &chainstate,
+                headers,
+                u64::from(unix_time()?),
+                DEFAULT_HOT_WINDOW_SECS,
+            )
+            .map_err(|error| PeerRunError::block(&error))?;
+            rbtc_info!(
+                "disconnected stale overlay tip back to {}:{}",
+                rewound.height,
+                rewound.hash
+            );
+        }
+        let tip = chainstate
+            .execution_tip()
+            .map_err(|error| error.to_string())?;
+        // A replay can only execute blocks the corpus actually retains. The
+        // chain keeps moving after a corpus is captured, so without this the
+        // run reaches the corpus end, asks for the next block, and surfaces
+        // the shortfall as a peer failure — which then exhausts peer failover
+        // over an entirely local condition. Stopping at the corpus end is the
+        // honest outcome: it is as far as the recorded blocks go.
+        let ceiling = match replay_ceiling {
+            Some(replay_ceiling) => headers.active_tip().height.min(replay_ceiling),
+            None => headers.active_tip().height,
+        };
+        if tip.height >= ceiling {
+            break;
+        }
+        let base_height = chainstate.overlay_base_identity().height;
+        // Reclaiming space in place is far cheaper than folding the overlay
+        // into a whole new snapshot, so try that first; only engines that
+        // support it will do anything here.
+        let mut usage = chainstate
+            .overlay_capacity()
+            .map_err(PeerRunError::transient)?;
+        let worth_compacting = overlay_compaction_is_worthwhile(
+            usage.used_bytes,
+            usage.capacity_bytes,
+            overlay.compact_percent,
+            last_compacted_bytes,
+        );
+        if worth_compacting {
+            if let Some(compaction) = chainstate
+                .overlay_compact()
+                .map_err(PeerRunError::transient)?
+            {
+                let released = compaction
+                    .before_bytes
+                    .saturating_sub(compaction.after_bytes);
+                rbtc_info!(
+                    "compacted snapshot overlay: {} bytes to {} bytes (released {})",
+                    compaction.before_bytes,
+                    compaction.after_bytes,
+                    released,
+                );
+                last_compacted_bytes = Some(compaction.after_bytes);
+                usage = chainstate
+                    .overlay_capacity()
+                    .map_err(PeerRunError::transient)?;
+            }
+        }
+        if tip.height > base_height && usage.used_percent() >= overlay.rebase_percent {
+            let (new_snapshot, new_index) =
+                overlay_base_paths_for_height(&overlay.snapshot, tip.height);
+            let extension = creation_mtp_range(headers, base_height + 1, tip.height)?;
+            let report = chainstate
+                .overlay_rebase(&new_snapshot, &new_index, &extension)
+                .map_err(PeerRunError::transient)?;
+            rbtc_info!(
+                "rebased snapshot overlay onto {}:{}: coins={} snapshot_bytes={} index_bytes={} folded_overlay={} dropped_tombstones={}",
+                report.identity.height,
+                report.identity.block_hash,
+                report.coins,
+                report.snapshot_bytes,
+                report.index_bytes,
+                report.folded_overlay,
+                report.dropped_tombstones,
+            );
+            last_compacted_bytes = None;
+        }
+        download_execute_batch(
+            session,
+            &options.deployments,
+            headers,
+            &chainstate,
+            &ledger,
+            None,
+            None,
+            None,
+            &auxiliary_indexes,
+            &[],
+            &transaction_pool,
+            Some(ceiling),
+            options.validation_limits.max_blocks_per_batch,
+            &mut auxiliary_session,
+            &mut prefetched_blocks,
+            replay.is_none(),
+            replay.as_ref(),
+            None,
+        )
+        .await?;
+    }
+    let tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
+    let usage = chainstate
+        .overlay_capacity()
+        .map_err(PeerRunError::transient)?;
+    rbtc_info!(
+        "snapshot-overlay catch-up reached {}:{} on {} (base {}:{}, overlay at {} percent of {} bytes)",
+        tip.height,
+        tip.hash,
+        chainstate.engine_name(),
+        chainstate.overlay_base_identity().height,
+        chainstate.overlay_base_identity().block_hash,
+        usage.used_percent(),
+        usage.capacity_bytes,
+    );
+    Ok(())
+}
+
+/// Derives the base snapshot/index paths for `height` beside `cli_snapshot`.
+///
+/// A fresh environment opens the operator-supplied files directly (handled
+/// by the caller). Once a rebase has moved the base past them, this
+/// driver's own rebase step is the only writer of new base files, and it
+/// always names them `utxo-<height>.dat`/`.rbtcidx` beside the original
+/// snapshot — reusing that convention here is what lets a restart find the
+/// current base without persisting a file path anywhere.
+#[cfg(feature = "mdbx")]
+fn overlay_base_paths_for_height(
+    cli_snapshot: &std::path::Path,
+    height: u32,
+) -> (PathBuf, PathBuf) {
+    let directory = cli_snapshot
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    (
+        directory.join(format!("utxo-{height}.dat")),
+        directory.join(format!("utxo-{height}.rbtcidx")),
+    )
+}
+
+/// Resolves the compiled Core 31 identity for an operator-supplied snapshot.
+#[cfg(feature = "mdbx")]
+fn compiled_overlay_identity(
+    snapshot: &std::path::Path,
+    network: Network,
+) -> Result<crate::core_snapshot_index::SnapshotBaseIdentity, PeerRunError> {
+    let mut reader = std::io::BufReader::new(fs::File::open(snapshot).map_err(|error| {
+        PeerRunError::transient(format!("open snapshot {}: {error}", snapshot.display()))
+    })?);
+    let metadata = crate::core_snapshot::read_metadata(&mut reader)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    if metadata.network != network {
+        return Err(PeerRunError::transient(
+            "snapshot network does not match the selected network",
+        ));
+    }
+    let anchor = crate::core_snapshot::find_anchor(metadata)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    Ok(crate::core_snapshot_index::SnapshotBaseIdentity {
+        height: anchor.height,
+        block_hash: anchor
+            .block_hash
+            .parse()
+            .map_err(|_| PeerRunError::transient("compiled anchor block hash"))?,
+        hash_serialized: anchor.hash_serialized.to_owned(),
+    })
+}
+
+/// Derives creation median-time-past values for heights `from..=through`
+/// from the validated active header chain.
+#[cfg(feature = "mdbx")]
+fn creation_mtp_range(
+    headers: &HeaderDag,
+    from: u32,
+    through: u32,
+) -> Result<Vec<u32>, PeerRunError> {
+    let mut table = Vec::new();
+    for height in from..=through {
+        if height == 0 {
+            table.push(0);
+            continue;
+        }
+        let parent = headers.active_header_at(height - 1).ok_or_else(|| {
+            PeerRunError::transient(format!("missing active header at height {}", height - 1))
+        })?;
+        let mtp = headers.median_time_past(parent.hash).ok_or_else(|| {
+            PeerRunError::transient(format!("missing median time past at height {}", height - 1))
+        })?;
+        table.push(mtp);
+    }
+    Ok(table)
+}
+
+/// Fails closed when the binary was built without the MDBX backend.
+#[cfg(not(feature = "mdbx"))]
+async fn sync_snapshot_overlay_node(
+    _session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    _options: &Options,
+    _data_dir: PathBuf,
+    _network_time: &NetworkTime,
+) -> Result<(), PeerRunError> {
+    Err(PeerRunError::transient(
+        "snapshot-overlay catch-up requires a build with the mdbx feature",
+    ))
 }
 
 fn unseen_header_suffix<'a>(
@@ -9548,6 +11335,7 @@ fn admit_pending_peer_transactions(
     headers: &HeaderDag,
     deployment_config: &DeploymentConfig,
     full_rbf: bool,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<PeerAdmissionProgress, String> {
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let now = unix_time()?;
@@ -9600,7 +11388,8 @@ fn admit_pending_peer_transactions(
             .hash,
         now,
     );
-    let expired_removed = candidate.remove_with_descendants(&expired);
+    let mut removed_for_notification = candidate.remove_with_descendants(&expired);
+    let expired_removed = removed_for_notification.len();
     let reconciled_removed = candidate.reconcile(chainstate, context);
     let expired_orphans = candidate.prune_orphans(now);
     let mut accepted_messages = Vec::new();
@@ -9637,6 +11426,8 @@ fn admit_pending_peer_transactions(
             match candidate.admit_package_at(chainstate, package, context, now) {
                 Ok(outcome) if !outcome.accepted.is_empty() => {
                     candidate.remove_orphans(&txid_set);
+                    removed_for_notification.extend(outcome.replaced.iter().copied());
+                    removed_for_notification.extend(outcome.evicted.iter().copied());
                     accepted_parents.extend(outcome.accepted.iter().copied());
                     accepted_for_relay.extend(
                         outcome
@@ -9646,19 +11437,23 @@ fn admit_pending_peer_transactions(
                             .filter(|txid| !persisted_txids.contains(txid)),
                     );
                     let mut effects = Vec::new();
-                    if outcome.replaced > 0 {
+                    if !outcome.replaced.is_empty() {
                         effects.push(format!(
                             "replacing {} BIP125 conflict{} or descendant{}",
-                            outcome.replaced,
-                            if outcome.replaced == 1 { "" } else { "s" },
-                            if outcome.replaced == 1 { "" } else { "s" }
+                            outcome.replaced.len(),
+                            if outcome.replaced.len() == 1 { "" } else { "s" },
+                            if outcome.replaced.len() == 1 { "" } else { "s" }
                         ));
                     }
-                    if outcome.evicted > 0 {
+                    if !outcome.evicted.is_empty() {
                         effects.push(format!(
                             "evicting {} oldest entr{} or descendants",
-                            outcome.evicted,
-                            if outcome.evicted == 1 { "y" } else { "ies" }
+                            outcome.evicted.len(),
+                            if outcome.evicted.len() == 1 {
+                                "y"
+                            } else {
+                                "ies"
+                            }
                         ));
                     }
                     accepted_messages.push(format!(
@@ -9778,6 +11573,18 @@ fn admit_pending_peer_transactions(
     let more_orphan_work = candidate.has_orphan_work(orphan_source);
     *pool = candidate;
     drop(pool);
+    if let Some(zmq) = zmq_notifier {
+        for entry in &relay_snapshot {
+            if accepted_for_relay.contains(&entry.transaction.compute_txid()) {
+                zmq.transaction_accepted(&entry.transaction);
+            }
+        }
+        removed_for_notification.sort_unstable();
+        removed_for_notification.dedup();
+        for txid in &removed_for_notification {
+            zmq.transaction_removed(*txid);
+        }
+    }
     let relayed =
         relay_selected_transactions(transaction_relay, &relay_snapshot, &accepted_for_relay);
     if !relayed.is_empty() {
@@ -9825,7 +11632,7 @@ fn admit_pending_peer_transactions(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn sync_validating_node(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    mut auxiliary: VecDeque<(SocketAddr, PendingPeer)>,
+    mut auxiliary: VecDeque<(NodePeerTarget, PendingPeer)>,
     network: Network,
     network_execution: NetworkExecutionMode,
     deployment_config: &DeploymentConfig,
@@ -9850,6 +11657,7 @@ async fn sync_validating_node(
     transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     network_time: &NetworkTime,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
     if network_execution.is_experimental() {
         if !supports_experimental_block_execution(network) || !once {
@@ -10185,7 +11993,7 @@ async fn sync_validating_node(
                 }
             }
             let rewound = disconnect_execution_tip(
-                &chainstate,
+                chainstate.as_ref(),
                 &headers,
                 u64::from(unix_time()?),
                 DEFAULT_HOT_WINDOW_SECS,
@@ -10202,6 +12010,9 @@ async fn sync_validating_node(
                         hash: rewound.hash,
                     },
                 );
+            }
+            if let Some(zmq) = zmq_notifier {
+                zmq.block_disconnected(tip.hash);
             }
             transaction_pool
                 .lock()
@@ -10238,7 +12049,7 @@ async fn sync_validating_node(
             &compact_candidates,
         )
         .await?;
-        let startup_pruned = prune_expired_block_undos(&chainstate, &headers, &ledger)?;
+        let startup_pruned = prune_expired_block_undos(chainstate.as_ref(), &headers, &ledger)?;
         prune_expired_auxiliary_index_undos(&auxiliary_indexes, &ledger)?;
         if startup_pruned > 0 {
             rbtc_info!(
@@ -10353,6 +12164,8 @@ async fn sync_validating_node(
                     transaction_pool: Arc::clone(transaction_pool),
                     pending_transactions: Arc::clone(&inbound_transactions),
                     basic_filter: auxiliary_indexes.basic_filter.as_ref().map(Arc::clone),
+                    deployments: deployment_config.clone(),
+                    mempool_full_rbf,
                 });
                 let source: Arc<dyn InboundDataSource> = source;
                 inbound_source_lease = Some(shared.install(source));
@@ -10454,6 +12267,7 @@ async fn sync_validating_node(
                             &headers,
                             deployment_config,
                             mempool_full_rbf,
+                            zmq_notifier,
                         )?;
                         let requested_parents = !progress.parent_requests.is_empty();
                         if requested_parents {
@@ -10566,7 +12380,7 @@ async fn sync_validating_node(
                 session,
                 deployment_config,
                 &headers,
-                &chainstate,
+                chainstate.as_ref(),
                 &ledger,
                 explorer.as_deref(),
                 explorer_events.as_ref(),
@@ -10579,6 +12393,8 @@ async fn sync_validating_node(
                 &mut auxiliary_session,
                 &mut prefetched_blocks,
                 overlap_next_download,
+                None,
+                zmq_notifier,
             )
             .await?;
             if auxiliary_was_active && auxiliary_session.is_none() {
@@ -10944,8 +12760,8 @@ async fn reconcile_ledger(
     .await
 }
 
-fn prune_expired_block_undos(
-    chainstate: &RedbChainStore,
+fn prune_expired_block_undos<C: ExecutionChainStore>(
+    chainstate: &C,
     headers: &HeaderDag,
     ledger: &PrunedBlockLedger,
 ) -> Result<u64, String> {
@@ -11713,8 +13529,8 @@ async fn download_parallel_block_pair(
     }
 }
 
-fn shard_validation_delta_candidates(
-    chainstate: &RedbChainStore,
+fn shard_validation_delta_candidates<C: ExecutionChainStore>(
+    chainstate: &C,
     heights: &[u32],
 ) -> Result<Vec<ValidationDeltaShardMigration>, ChainStoreError> {
     let mut migrations = Vec::with_capacity(heights.len());
@@ -11727,11 +13543,11 @@ fn shard_validation_delta_candidates(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn download_execute_batch(
+async fn download_execute_batch<C: ExecutionChainStore>(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
     headers: &HeaderDag,
-    chainstate: &RedbChainStore,
+    chainstate: &C,
     ledger: &PrunedBlockLedger,
     explorer: Option<&RedbExplorerIndex>,
     explorer_events: Option<&ExplorerEventHub>,
@@ -11744,10 +13560,13 @@ async fn download_execute_batch(
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     prefetched_blocks: &mut PrefetchedBlocks,
     prefetch_next_batch: bool,
+    replay: Option<&PrunedBlockLedger>,
+    zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
-    let execution_store = chainstate.execution();
-    let tip = execution_store.tip().map_err(|error| error.to_string())?;
+    let tip = chainstate
+        .execution_tip()
+        .map_err(|error| error.to_string())?;
     let next_height = tip
         .height
         .checked_add(1)
@@ -11806,6 +13625,51 @@ async fn download_execute_batch(
     }
     blocks.extend(decoded_prefetch);
     let mut offset = blocks.len();
+    if let Some(replay) = replay {
+        // Replay reads the same blocks from a retained ledger instead of
+        // peers, so a storage change can be measured without the network in
+        // the number. Everything downstream — structure validation, staging,
+        // execution, publication — is the code path the networked run uses.
+        let wanted = u32::try_from(hashes.len() - offset)
+            .map_err(|_| PeerRunError::transient("replay batch exceeds u32"))?;
+        let first = next_height
+            .checked_add(u32::try_from(offset).expect("batch offset fits u32"))
+            .ok_or_else(|| PeerRunError::transient("replay height overflow"))?;
+        let batch = replay
+            .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
+            .map_err(|error| {
+                PeerRunError::transient(format!("replay ledger read at {first}: {error}"))
+            })?;
+        if batch.first_height != first || batch.blocks.is_empty() {
+            return Err(PeerRunError::transient(format!(
+                "replay ledger does not retain height {first}"
+            )));
+        }
+        for bytes in batch.blocks {
+            let block = deserialize::<Block>(&bytes).map_err(|error| {
+                PeerRunError::transient(format!("decode replayed block: {error}"))
+            })?;
+            // The ledger is not a trusted input just because it is local: a
+            // replayed block still has to be the one the active header chain
+            // names, or the run would silently measure different work.
+            if block.block_hash() != hashes[offset] {
+                return Err(PeerRunError::transient(format!(
+                    "replayed block at height {} does not match the active chain",
+                    next_height + u32::try_from(offset).expect("batch offset fits u32")
+                )));
+            }
+            blocks.push(block);
+            offset += 1;
+            if offset == hashes.len() {
+                break;
+            }
+        }
+        if offset < hashes.len() {
+            return Err(PeerRunError::transient(
+                "replay ledger ran out of retained blocks mid-batch",
+            ));
+        }
+    }
     while offset < hashes.len() {
         let remaining = &hashes[offset..];
         if auxiliary_session.is_some() && remaining.len() > VALIDATION_BLOCK_WINDOW_SIZE {
@@ -11931,6 +13795,7 @@ async fn download_execute_batch(
         execution_core_at,
         prefetch_elapsed,
         utxo_prefetch_elapsed,
+        breakdown,
     ) = if next_prefetch_hashes.is_empty() {
         let (
             stage_result,
@@ -11988,7 +13853,7 @@ async fn download_execute_batch(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
             chainstate,
             headers,
             &blocks,
@@ -12005,6 +13870,7 @@ async fn download_execute_batch(
             Instant::now(),
             Duration::ZERO,
             utxo_elapsed,
+            breakdown,
         )
     } else if tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::MultiThread
@@ -12054,7 +13920,7 @@ async fn download_execute_batch(
                     .expect("scoped UTXO-prefetch thread must not panic");
                 let execution_result = match (stage_result.as_ref(), utxo_result) {
                     (Ok(()), Ok(prefetched_utxos)) => {
-                        Some(connect_prevalidated_active_blocks_with_txids_and_utxos(
+                        Some(connect_prevalidated_active_blocks_with_breakdown(
                             chainstate,
                             headers,
                             &blocks,
@@ -12094,7 +13960,8 @@ async fn download_execute_batch(
         staged_at = branch_staged_at;
         let execution_result =
             execution_result.expect("successful staging starts chainstate execution");
-        let applied_blocks = execution_result.map_err(|error| PeerRunError::block(&error))?;
+        let (applied_blocks, breakdown) =
+            execution_result.map_err(|error| PeerRunError::block(&error))?;
         let downloaded_prefetch = match prefetch_result {
             Ok(blocks) => blocks,
             Err(error) => {
@@ -12108,6 +13975,7 @@ async fn download_execute_batch(
             execution_core_at,
             prefetch_elapsed,
             utxo_prefetch_elapsed,
+            breakdown,
         )
     } else {
         let (
@@ -12151,7 +14019,7 @@ async fn download_execute_batch(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let applied_blocks = connect_prevalidated_active_blocks_with_txids_and_utxos(
+        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
             chainstate,
             headers,
             &blocks,
@@ -12184,8 +14052,10 @@ async fn download_execute_batch(
             execution_core_at,
             prefetch_started.elapsed(),
             utxo_elapsed,
+            breakdown,
         )
     };
+    let commit_profile = chainstate.take_commit_profile();
     let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
     carried_prefetch.extend(downloaded_prefetch);
     prefetched_blocks.serialized = carried_prefetch;
@@ -12228,11 +14098,16 @@ async fn download_execute_batch(
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
         .map_err(|error| error.to_string())?;
+    if let Some(zmq) = zmq_notifier {
+        for block in &blocks {
+            zmq.block_connected(block);
+        }
+    }
     let pruned_undos = prune_expired_block_undos(chainstate, headers, ledger)?;
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -12245,6 +14120,15 @@ async fn download_execute_batch(
         staged_at.duration_since(structure_validated_at).as_millis(),
         executed_at.duration_since(staged_at).as_millis(),
         execution_core_at.duration_since(staged_at).as_millis(),
+        breakdown.validate.as_millis(),
+        breakdown.submit.as_millis(),
+        breakdown.script_wait.as_millis(),
+        breakdown.commit.as_millis(),
+        commit_profile.map_or_else(String::new, |[fold, undo, base, mutate, sync]| {
+            format!(
+                " commit-fold={fold}ms commit-undo={undo}ms commit-base-lookup={base}ms commit-mutate={mutate}ms commit-sync={sync}ms"
+            )
+        }),
         utxo_prefetch_elapsed.as_millis(),
         prefetch_elapsed.as_millis(),
         indexed_at.duration_since(executed_at).as_millis(),
@@ -12921,6 +14805,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut experimental_network_execution = false;
     let mut extend_validation_target = false;
     let mut explorer_listen = None;
+    let mut zmq_listen = None;
+    let mut i2p_sam = None;
+    let mut tor_control_address = None;
+    let mut tor_control_cookie = None;
     let mut wallet_descriptors = None;
     let mut wallet_auth_token_file = None;
     let mut rpc_auth_token_file = None;
@@ -12943,6 +14831,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut complete_assumeutxo = None;
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = true;
+    let mut v2_transport = false;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -12971,6 +14860,15 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_download_output = None;
     let mut snapshot_download_bytes = None;
     let mut snapshot_download_workers = None;
+    let mut snapshot_index_source = None;
+    let mut snapshot_index_output = None;
+    let mut snapshot_overlay_source = None;
+    let mut snapshot_overlay_index = None;
+    let mut snapshot_overlay_capacity = None;
+    let mut snapshot_overlay_replay_blocks: Option<PathBuf> = None;
+    let mut snapshot_overlay_rebase_percent = None;
+    let mut snapshot_overlay_compact_percent = None;
+    let mut snapshot_overlay_engine = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
     let mut validation_deferred_repair = false;
@@ -13022,6 +14920,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 let family = match value.as_str() {
                     "ipv4" => NodeOnlyNet::Ipv4,
                     "ipv6" => NodeOnlyNet::Ipv6,
+                    "onion" => NodeOnlyNet::Onion,
+                    "i2p" => NodeOnlyNet::I2p,
                     _ => return Err(format!("unsupported --onlynet value: {value}")),
                 };
                 if !only_net_values.contains(&family) {
@@ -13079,6 +14979,41 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     );
                 }
                 explorer_listen = Some(address);
+            }
+            "--i2psam" => {
+                let value = required_option_value(&mut args, "--i2psam")?;
+                i2p_sam = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid I2P SAM bridge address: {value}"))?,
+                );
+            }
+            "--torcontrol" => {
+                let value = required_option_value(&mut args, "--torcontrol")?;
+                tor_control_address = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid Tor control address: {value}"))?,
+                );
+            }
+            "--torcontrol-cookie" => {
+                tor_control_cookie = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--torcontrol-cookie",
+                )?));
+            }
+            "--zmq-listen" => {
+                let value = required_option_value(&mut args, "--zmq-listen")?;
+                let address: SocketAddr = value
+                    .parse()
+                    .map_err(|_| format!("invalid zmq listen address: {value}"))?;
+                if !address.ip().is_loopback() {
+                    return Err(
+                        "--zmq-listen must use a loopback IP because ZMQ notifications are unauthenticated"
+                            .to_owned(),
+                    );
+                }
+                zmq_listen = Some(address);
             }
             "--wallet-descriptors" => {
                 wallet_descriptors = Some(PathBuf::from(required_option_value(
@@ -13209,6 +15144,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             }
             "--mempool-full-rbf" => mempool_full_rbf = true,
             "--no-mempool-full-rbf" => mempool_full_rbf = false,
+            "--v2-transport" => v2_transport = true,
+            "--no-v2-transport" => v2_transport = false,
             "--txindex" => transaction_index = true,
             "--no-txindex" => transaction_index = false,
             "--spent-output-index" => spent_output_index = true,
@@ -13494,6 +15431,129 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     ));
                 }
             }
+            "--build-core-snapshot-index" => {
+                if snapshot_index_source.is_some() {
+                    return Err(
+                        "--build-core-snapshot-index cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_index_source = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--build-core-snapshot-index",
+                )?));
+            }
+            "--snapshot-index-output" => {
+                if snapshot_index_output.is_some() {
+                    return Err(
+                        "--snapshot-index-output cannot be supplied more than once".to_owned()
+                    );
+                }
+                snapshot_index_output = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-index-output",
+                )?));
+            }
+            "--snapshot-overlay-catchup" => {
+                if snapshot_overlay_source.is_some() {
+                    return Err(
+                        "--snapshot-overlay-catchup cannot be supplied more than once".to_owned(),
+                    );
+                }
+                snapshot_overlay_source = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-catchup",
+                )?));
+            }
+            "--snapshot-overlay-index" => {
+                if snapshot_overlay_index.is_some() {
+                    return Err(
+                        "--snapshot-overlay-index cannot be supplied more than once".to_owned()
+                    );
+                }
+                snapshot_overlay_index = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-index",
+                )?));
+            }
+            "--snapshot-overlay-replay-blocks" => {
+                if snapshot_overlay_replay_blocks.is_some() {
+                    return Err(
+                        "--snapshot-overlay-replay-blocks cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                snapshot_overlay_replay_blocks = Some(PathBuf::from(required_option_value(
+                    &mut args,
+                    "--snapshot-overlay-replay-blocks",
+                )?));
+            }
+            "--snapshot-overlay-capacity-bytes" => {
+                if snapshot_overlay_capacity.is_some() {
+                    return Err(
+                        "--snapshot-overlay-capacity-bytes cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-capacity-bytes")?;
+                let capacity = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid overlay capacity: {value}"))?;
+                if capacity < MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES {
+                    return Err(format!(
+                        "overlay capacity must be at least {MIN_SNAPSHOT_OVERLAY_CAPACITY_BYTES} bytes"
+                    ));
+                }
+                snapshot_overlay_capacity = Some(capacity);
+            }
+            "--snapshot-overlay-engine" => {
+                if snapshot_overlay_engine.is_some() {
+                    return Err(
+                        "--snapshot-overlay-engine cannot be supplied more than once".to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-engine")?;
+                snapshot_overlay_engine = Some(match value.as_str() {
+                    "mdbx" => SnapshotOverlayEngine::Mdbx,
+                    "redb" => SnapshotOverlayEngine::Redb,
+                    _ => {
+                        return Err(format!(
+                            "unsupported --snapshot-overlay-engine value: {value}"
+                        ));
+                    }
+                });
+            }
+            "--snapshot-overlay-compact-percent" => {
+                if snapshot_overlay_compact_percent.is_some() {
+                    return Err(
+                        "--snapshot-overlay-compact-percent cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-compact-percent")?;
+                let percent = value
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid overlay compaction percent: {value}"))?;
+                if !(10..=95).contains(&percent) {
+                    return Err("overlay compaction percent must be between 10 and 95".to_owned());
+                }
+                snapshot_overlay_compact_percent = Some(percent);
+            }
+            "--snapshot-overlay-rebase-percent" => {
+                if snapshot_overlay_rebase_percent.is_some() {
+                    return Err(
+                        "--snapshot-overlay-rebase-percent cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-rebase-percent")?;
+                let percent = value
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid overlay rebase percent: {value}"))?;
+                if !(50..=99).contains(&percent) {
+                    return Err("overlay rebase percent must be between 50 and 99".to_owned());
+                }
+                snapshot_overlay_rebase_percent = Some(percent);
+            }
             "--validation-batch-size" => {
                 if validation_batch_size.is_some() {
                     return Err(
@@ -13650,9 +15710,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 let blocks = value
                     .parse::<u32>()
                     .map_err(|_| format!("invalid prune block target: {value}"))?;
-                if !(MIN_PRUNE_RETENTION_BLOCKS..=DEFAULT_RETENTION_BLOCKS).contains(&blocks) {
+                if !(MIN_PRUNE_RETENTION_BLOCKS..=MAX_PRUNE_RETENTION_BLOCKS).contains(&blocks) {
                     return Err(format!(
-                        "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {DEFAULT_RETENTION_BLOCKS}"
+                        "prune block target must be between {MIN_PRUNE_RETENTION_BLOCKS} and {MAX_PRUNE_RETENTION_BLOCKS}"
                     ));
                 }
                 prune_blocks = Some(blocks);
@@ -13968,6 +16028,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         && background_assumeutxo.is_none()
         && reindex_from_freezer.is_none()
         && reindex_chainstate.is_none()
+        // Snapshot-overlay catch-up drives the same batch loop and already
+        // reads `max_blocks_per_batch`, so the limit was honoured there while
+        // being unsettable — the option was invisible to a mode that uses it.
+        && snapshot_overlay_source.is_none()
     {
         return Err(
             "validation resource limits require bounded or automatic AssumeUTXO validation"
@@ -14003,6 +16067,91 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             );
         }
     };
+    let snapshot_index_build = match (snapshot_index_source, snapshot_index_output) {
+        (None, None) => None,
+        (Some(snapshot), Some(output)) => Some((snapshot, output)),
+        _ => {
+            return Err(
+                "--build-core-snapshot-index and --snapshot-index-output must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
+    let snapshot_overlay = match (snapshot_overlay_source, snapshot_overlay_index) {
+        (None, None) => {
+            if snapshot_overlay_capacity.is_some()
+                || snapshot_overlay_rebase_percent.is_some()
+                || snapshot_overlay_compact_percent.is_some()
+                || snapshot_overlay_engine.is_some()
+                || snapshot_overlay_replay_blocks.is_some()
+            {
+                return Err(
+                    "overlay capacity, engine, replay, and rebase options require --snapshot-overlay-catchup"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        (Some(snapshot), Some(index)) => Some(NodeSnapshotOverlayConfig {
+            snapshot,
+            index,
+            capacity_bytes: snapshot_overlay_capacity
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES),
+            rebase_percent: snapshot_overlay_rebase_percent
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT),
+            compact_percent: snapshot_overlay_compact_percent
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
+            engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
+            replay_blocks: snapshot_overlay_replay_blocks,
+        }),
+        _ => {
+            return Err(
+                "--snapshot-overlay-catchup and --snapshot-overlay-index must be supplied together"
+                    .to_owned(),
+            );
+        }
+    };
+    if snapshot_overlay.is_some() {
+        if data_dir.is_none() {
+            return Err("--snapshot-overlay-catchup requires --data-dir".to_owned());
+        }
+        if !once {
+            return Err(
+                "--snapshot-overlay-catchup is a bounded catch-up run and requires --once"
+                    .to_owned(),
+            );
+        }
+        if snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || explorer_listen.is_some()
+            || wallet_api_files.is_some()
+            || experimental_network_execution
+            || extend_validation_target
+            || cleanup_validation_dir
+            || transaction_index
+            || spent_output_index
+            || basic_filter_index
+            || utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || verify_storage
+            || verify_chain
+            || reindex_from_freezer.is_some()
+            || reindex_chainstate.is_some()
+            || manual_prune_through_height.is_some()
+            || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
+        {
+            return Err(
+                "snapshot-overlay catch-up conflicts with snapshot activation, validation, serving, wallet, index, and offline maintenance modes"
+                    .to_owned(),
+            );
+        }
+    }
     if !verify_storage
         && (storage_audit_max_segments.is_some() || storage_audit_max_bytes.is_some())
     {
@@ -14020,6 +16169,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let offline_action_count = usize::from(utxo_activity_report)
         + usize::from(utxo_retier_window_blocks.is_some())
         + usize::from(snapshot_download.is_some())
+        + usize::from(snapshot_index_build.is_some())
         + usize::from(verify_storage)
         + usize::from(verify_chain)
         + usize::from(reindex_from_freezer.is_some())
@@ -14263,6 +16413,35 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .to_owned(),
         );
     }
+    if snapshot_index_build.is_some()
+        && (utxo_activity_report
+            || utxo_retier_window_blocks.is_some()
+            || verify_storage
+            || data_dir.is_some()
+            || snapshot_activation
+            || finalize_assumeutxo.is_some()
+            || validation_target.is_some()
+            || complete_assumeutxo.is_some()
+            || background_assumeutxo.is_some()
+            || fetch_block.is_some()
+            || headers_db.is_some()
+            || once
+            || explorer_listen.is_some()
+            || !remotes.is_empty()
+            || !dns_seed_values.is_empty()
+            || no_dns_seeds
+            || cleanup_validation_dir
+            || validation_batch_size.is_some()
+            || validation_pause_ms.is_some()
+            || validation_deferred_repair
+            || experimental_network_execution
+            || extend_validation_target)
+    {
+        return Err(
+            "snapshot index building is offline and conflicts with data-dir, peer, synchronization, activation, validation, serving, wallet, and policy modes"
+                .to_owned(),
+        );
+    }
     if utxo_activity_report {
         if data_dir.is_none() {
             return Err("--utxo-activity-report requires --data-dir".to_owned());
@@ -14339,6 +16518,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14358,6 +16538,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14379,6 +16560,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14400,6 +16582,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             || utxo_retier_window_blocks.is_some()
             || verify_storage
             || snapshot_download.is_some()
+            || snapshot_index_build.is_some()
             || fetch_block.is_some()
             || headers_db.is_some())
     {
@@ -14546,6 +16729,21 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         headers_db,
         data_dir,
         once,
+        zmq_listen,
+        i2p_sam,
+        tor_control: match (tor_control_address, tor_control_cookie) {
+            (Some(control), Some(cookie)) => Some(TorControlOptions { control, cookie }),
+            (Some(_), None) => {
+                return Err(
+                    "--torcontrol requires --torcontrol-cookie identifying Tor's control_auth_cookie"
+                        .to_owned(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err("--torcontrol-cookie requires --torcontrol".to_owned());
+            }
+            (None, None) => None,
+        },
         network_execution: if extend_validation_target {
             NetworkExecutionMode::ExperimentalOnceExtend
         } else if experimental_network_execution {
@@ -14571,6 +16769,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             Some(OfflineAction::RetierUtxos { hot_window_blocks })
         } else if let Some(config) = snapshot_download {
             Some(OfflineAction::DownloadCoreSnapshot(config))
+        } else if let Some((snapshot, output)) = snapshot_index_build {
+            Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output })
         } else if verify_storage {
             Some(OfflineAction::VerifyStorage {
                 max_segments: storage_audit_max_segments
@@ -14620,14 +16820,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
             mempool_max_transactions: mempool_max_transactions.unwrap_or(MAX_ADMITTED_TRANSACTIONS),
             mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
-            only_net: match only_net_values.as_slice() {
-                []
-                | [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6]
-                | [NodeOnlyNet::Ipv6, NodeOnlyNet::Ipv4] => NodeOnlyNet::Any,
-                [family] => *family,
-                _ => unreachable!("only two deduplicated address families exist"),
-            },
+            only_net: resolve_only_net(&only_net_values)?,
             proxy: outbound_proxy,
+            v2_transport,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -14637,6 +16832,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
         },
         runtime_control: Arc::new(RuntimeControl::default()),
         observer: None,
+        snapshot_overlay,
     })
     .map(Some)
 }
@@ -14721,7 +16917,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6 ...] [--proxy IP:PORT --no-dns-seeds] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion|i2p ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--i2psam 127.0.0.1:7656] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -14737,6 +16933,8 @@ fn print_usage() {
             "  rbtcd [PEER OPTIONS] --data-dir SOURCE --network bitcoin|testnet|testnet4|signet|regtest --reindex-chainstate OUTPUT [--txindex] [--spent-output-index] [--block-filter-index] [--validation-batch-size 1..1008] [--validation-pause-ms 0..60000] [--validation-deferred-repair] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes BYTES] [--bulk-validation-cache-bytes BYTES]\n",
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
+            "  rbtcd --build-core-snapshot-index CORE_DUMPTXOUTSET_FILE --snapshot-index-output FILE\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
             "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
@@ -14773,11 +16971,11 @@ mod tests {
     use proptest::prelude::*;
     use rbtc::{
         api::ExplorerIndex,
-        blockchain::{block_subsidy, block_subsidy_with_interval},
+        blockchain::block_subsidy,
         chain_store::RedbChainStore,
         header_store::RedbHeaderStore,
         ledger::{LedgerRetention, PrunedBlockLedger},
-        p2p::{PeerAddress, V1Transport},
+        p2p::{PeerAddress, V1Transport, connect_outbound},
         snapshot::export_snapshot,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
         wallet::DEFAULT_WALLET_GAP_LIMIT,
@@ -14923,9 +17121,32 @@ mod tests {
     struct RpcTestSource {
         block: Block,
         submitted: Mutex<Vec<Transaction>>,
+        test_accept_calls: Mutex<Vec<usize>>,
     }
 
     impl InboundDataSource for RpcTestSource {
+        fn test_accept(
+            &self,
+            transactions: Vec<Transaction>,
+        ) -> Result<Vec<TestAcceptResult>, String> {
+            self.test_accept_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(transactions.len());
+            Ok(transactions
+                .into_iter()
+                .enumerate()
+                .map(|(index, transaction)| TestAcceptResult {
+                    txid: transaction.compute_txid(),
+                    wtxid: transaction.compute_wtxid(),
+                    allowed: index == 0,
+                    vsize: (index == 0).then_some(141),
+                    fee_sats: (index == 0).then_some(1_000),
+                    reject_reason: (index != 0).then(|| "x".repeat(400)),
+                })
+                .collect())
+        }
+
         fn start_height(&self) -> Result<u32, String> {
             Ok(0)
         }
@@ -15080,6 +17301,7 @@ mod tests {
         let source = Arc::new(RpcTestSource {
             block: block.clone(),
             submitted: Mutex::new(Vec::new()),
+            test_accept_calls: Mutex::new(Vec::new()),
         });
         let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
         let dynamic: Arc<dyn InboundDataSource> = source.clone();
@@ -15137,6 +17359,824 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             1
+        );
+    }
+
+    /// Builds a regtest node data source whose chainstate holds one mature
+    /// spendable coinbase output at the active tip.
+    fn dry_run_test_source(directory: &std::path::Path) -> (NodeInboundSource, OutPoint, Utxo) {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let block =
+            crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+                genesis.block_hash(),
+                1,
+                genesis.header.time + 600,
+            ))
+            .expect("regtest block assembles");
+        dag.insert(block.header).expect("header extends the DAG");
+        let chainstate =
+            RedbChainStore::open(directory.join("chainstate.redb"), Network::Regtest).unwrap();
+        let funding = OutPoint::new(block.txdata[0].compute_txid(), 0);
+        let utxo = Utxo {
+            value_sats: 50_000_000,
+            height: 1,
+            is_coinbase: false,
+            last_touched: u64::from(genesis.header.time),
+            creation_mtp: genesis.header.time,
+            // P2SH wrapping a bare OP_TRUE redeem script: a standard output
+            // the test can spend without carrying a signature.
+            script_pubkey: [
+                vec![0xa9, 0x14],
+                bitcoin::hashes::hash160::Hash::hash(&[0x51])
+                    .to_byte_array()
+                    .to_vec(),
+                vec![0x87],
+            ]
+            .concat(),
+        };
+        chainstate
+            .commit_connect(
+                genesis.block_hash(),
+                rbtc::execution_store::ExecutionTip {
+                    height: 1,
+                    hash: block.block_hash(),
+                },
+                &[],
+                &[(OutPointKey::from(funding), utxo.clone())],
+                &[],
+            )
+            .unwrap();
+        let ledger =
+            PrunedBlockLedger::open(directory.join("blocks"), LedgerRetention::default()).unwrap();
+        (
+            NodeInboundSource {
+                headers: Arc::new(RwLock::new(dag)),
+                chainstate: Arc::new(chainstate),
+                ledger: Arc::new(ledger),
+                transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+                pending_transactions: Arc::new(Mutex::new(InboundTransactionQueue::default())),
+                basic_filter: None,
+                deployments: DeploymentConfig::for_network(Network::Regtest),
+                mempool_full_rbf: true,
+            },
+            funding,
+            utxo,
+        )
+    }
+
+    #[test]
+    fn dry_run_admission_reports_verdicts_without_touching_the_live_pool() {
+        let directory = TempDir::new().unwrap();
+        let (source, funding, funded) = dry_run_test_source(directory.path());
+        let spend = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(funded.value_sats - 10_000),
+                // A v0 32-byte witness program keeps the candidate standard
+                // and above the minimum non-witness transaction size.
+                script_pubkey: ScriptBuf::from_bytes([vec![0x00, 0x20], vec![0x11; 32]].concat()),
+            }],
+        };
+        let txid = spend.compute_txid();
+
+        let verdicts = source.test_accept(vec![spend.clone()]).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].txid, txid);
+        assert_eq!(verdicts[0].wtxid, spend.compute_wtxid());
+        assert!(
+            verdicts[0].allowed,
+            "a funded spend is admissible: {:?}",
+            verdicts[0].reject_reason
+        );
+        assert_eq!(verdicts[0].fee_sats, Some(10_000));
+        assert!(verdicts[0].vsize.is_some_and(|vsize| vsize > 0));
+        assert!(verdicts[0].reject_reason.is_none());
+        assert!(
+            source
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot()
+                .is_empty(),
+            "a dry run must never retain the candidate"
+        );
+
+        let unfunded = Transaction {
+            input: vec![TxIn {
+                previous_output: OutPoint::new(txid, 7),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x51]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            ..spend.clone()
+        };
+        let verdicts = source.test_accept(vec![unfunded]).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].allowed, "an unfunded spend is refused");
+        assert!(
+            verdicts[0]
+                .reject_reason
+                .as_ref()
+                .is_some_and(|reason| !reason.is_empty()),
+            "a refusal carries the admission error"
+        );
+        assert!(
+            source
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot()
+                .is_empty(),
+            "a refused dry run leaves the pool empty"
+        );
+
+        // Repeating the accepted candidate must still report acceptance:
+        // the first dry run may not have advanced any pool state.
+        let repeated = source.test_accept(vec![spend]).unwrap();
+        assert!(
+            repeated[0].allowed,
+            "dry runs are independent of each other"
+        );
+    }
+
+    #[test]
+    fn operator_rpc_walks_the_chainstate_in_bounded_cursor_pages() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, funding, funded) = dry_run_test_source(directory.path());
+        // Fund three more distinct outpoints so paging has several entries.
+        let extra = (1..4u32)
+            .map(|vout| OutPoint::new(funding.txid, vout))
+            .collect::<Vec<_>>();
+        node_source
+            .chainstate
+            .apply(
+                &[],
+                &extra
+                    .iter()
+                    .map(|outpoint| (OutPointKey::from(*outpoint), funded.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut expected = extra;
+        expected.push(funding);
+        expected.sort_by_key(|outpoint| *OutPointKey::from(*outpoint).as_bytes());
+
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+
+        let mut cursor = serde_json::Value::Null;
+        let mut walked = Vec::new();
+        for _ in 0..8 {
+            let page = operator
+                .execute(
+                    "rbtc.scanchainstate",
+                    &serde_json::json!([cursor.clone(), 3]),
+                )
+                .unwrap()
+                .unwrap();
+            for entry in page["entries"].as_array().expect("entries are an array") {
+                walked.push(OutPoint::new(
+                    Txid::from_str(entry["txid"].as_str().unwrap()).unwrap(),
+                    u32::try_from(entry["vout"].as_u64().unwrap()).unwrap(),
+                ));
+                assert_eq!(entry["value_sats"], funded.value_sats);
+                assert_eq!(entry["height"], funded.height);
+                assert_eq!(entry["coinbase"], funded.is_coinbase);
+                assert_eq!(
+                    entry["scriptPubKey"]["hex"],
+                    funded.script_pubkey.to_lower_hex_string()
+                );
+            }
+            cursor = page["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        assert!(
+            cursor.is_null(),
+            "an exhausted scan reports no continuation cursor"
+        );
+        assert_eq!(walked, expected, "the scan visits every coin exactly once");
+
+        let full = operator
+            .execute("rbtc.scanchainstate", &serde_json::json!([null, 4]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(full["entries"].as_array().unwrap().len(), 4);
+        assert!(
+            !full["next_cursor"].is_null(),
+            "a full page always offers a continuation cursor"
+        );
+        let past_end = operator
+            .execute(
+                "rbtc.scanchainstate",
+                &serde_json::json!([full["next_cursor"].clone(), 4]),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(past_end["entries"].as_array().unwrap().is_empty());
+        assert!(past_end["next_cursor"].is_null());
+    }
+
+    #[tokio::test]
+    async fn onion_peers_are_dialed_only_through_a_proxy_and_skip_socket_bookkeeping() {
+        let onion = OnionAddress::from_public_key([0x44; 32], 8333);
+        let target = NodePeerTarget::Onion(onion.clone());
+        assert_eq!(target.socket(), None);
+        assert_eq!(target.to_string(), onion.to_string());
+        assert_eq!(
+            ProxyTarget::try_from(&target).expect("an onion target converts"),
+            ProxyTarget::Onion(onion.clone())
+        );
+        assert_eq!(
+            target.to_string().parse::<NodePeerTarget>().unwrap(),
+            target,
+            "a target round-trips through its textual form"
+        );
+
+        // Without a proxy an onion destination has no route at all, so the
+        // attempt is a local configuration fault rather than a peer failure.
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            None,
+            700,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("a proxyless onion peer cannot be dialed");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("SOCKS5 proxy"));
+
+        // Attempt and failure bookkeeping must reach the onion book and must
+        // not touch the socket-keyed discouragement keyspace.
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = unix_time().unwrap();
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        store
+            .insert_discovered_onion(
+                &[rbtc::p2p::OnionPeerAddress {
+                    onion: onion.clone(),
+                    services,
+                    last_seen: now - 5,
+                }],
+                now,
+            )
+            .unwrap();
+        assert!(store.onion_candidates(now, 10).unwrap().contains(&onion));
+        record_peer_attempt(Some(&store), &target);
+        assert!(
+            !store.onion_candidates(now, 10).unwrap().contains(&onion),
+            "a recorded attempt applies the onion book's retry backoff"
+        );
+        record_peer_failure(
+            Some(&store),
+            &target,
+            PeerFailureKind::ProtocolViolation,
+            false,
+        );
+        assert!(
+            store.discouraged_addresses(now).unwrap().is_empty(),
+            "an onion failure never enters the socket-keyed cooldown table"
+        );
+        record_peer_session_success(Some(&store), &target);
+        assert!(
+            store.onion_candidates(now, 10).unwrap().contains(&onion),
+            "a completed session clears the onion backoff"
+        );
+    }
+
+    #[test]
+    fn i2p_sam_options_require_loopback_and_gate_the_i2p_network() {
+        let directory = TempDir::new().unwrap();
+        let launch = |extra: &[&str]| {
+            let mut arguments = vec![
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--no-dns-seeds".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+            ];
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = launch(&[
+            "--connect",
+            "127.0.0.1:18444",
+            "--i2psam",
+            "203.0.113.7:7656",
+        ]) else {
+            panic!("a non-loopback SAM bridge must fail closed");
+        };
+        assert!(error.contains("loopback"), "{error}");
+
+        let Err(error) = launch(&["--onlynet", "i2p"]) else {
+            panic!("i2p-only without a bridge must fail closed");
+        };
+        assert!(error.contains("--i2psam"), "{error}");
+
+        let options = launch(&["--onlynet", "i2p", "--i2psam", "127.0.0.1:7656"])
+            .unwrap()
+            .expect("an i2p-only launch with a bridge parses");
+        assert_eq!(options.resources.only_net, NodeOnlyNet::I2p);
+        assert_eq!(options.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+        assert!(options.resources.only_net.permits_i2p());
+        assert!(
+            !options.resources.only_net.permits_onion()
+                && !options
+                    .resources
+                    .only_net
+                    .permits("127.0.0.1".parse().unwrap()),
+            "an i2p-only restriction excludes every other network"
+        );
+        assert!(!NodeOnlyNet::Onion.permits_i2p());
+        assert!(NodeOnlyNet::Any.permits_i2p());
+        assert!(
+            resolve_only_net(&[NodeOnlyNet::I2p, NodeOnlyNet::Onion]).is_err(),
+            "anonymity networks cannot be combined"
+        );
+    }
+
+    #[tokio::test]
+    async fn i2p_peers_are_refused_without_a_configured_bridge() {
+        let destination = I2pAddress::from_destination_hash([0x77; 32]);
+        let target = NodePeerTarget::I2p(destination.clone());
+        assert_eq!(target.socket(), None);
+        assert_eq!(target.to_string(), destination.to_string());
+        assert_eq!(
+            target.to_string().parse::<NodePeerTarget>().unwrap(),
+            target,
+            "an I2P target round-trips through its textual form"
+        );
+        assert!(
+            ProxyTarget::try_from(&target).is_err(),
+            "an I2P destination has no proxy representation, so it can never be misrouted through SOCKS5"
+        );
+
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target,
+            None,
+            800,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("an I2P peer cannot be dialled without a bridge");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("SAM bridge"), "{}", error.message);
+    }
+
+    #[test]
+    fn tor_control_options_require_a_cookie_a_listener_and_loopback() {
+        let directory = TempDir::new().unwrap();
+        let launch = |extra: &[&str]| {
+            let mut arguments = vec![
+                "--network".to_owned(),
+                "regtest".to_owned(),
+                "--no-dns-seeds".to_owned(),
+                "--data-dir".to_owned(),
+                directory.path().display().to_string(),
+                "--connect".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+            ];
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = launch(&["--torcontrol", "127.0.0.1:9051"]) else {
+            panic!("a control port without a cookie must fail closed");
+        };
+        assert!(error.contains("--torcontrol-cookie"), "{error}");
+
+        let Err(error) = launch(&["--torcontrol-cookie", "cookie"]) else {
+            panic!("a cookie without a control port must fail closed");
+        };
+        assert!(error.contains("--torcontrol"), "{error}");
+
+        let Err(error) = launch(&[
+            "--torcontrol",
+            "127.0.0.1:9051",
+            "--torcontrol-cookie",
+            "cookie",
+        ]) else {
+            panic!("a control port without a listener must fail closed");
+        };
+        assert!(error.contains("--listen"), "{error}");
+
+        let Err(error) = launch(&[
+            "--torcontrol",
+            "203.0.113.7:9051",
+            "--torcontrol-cookie",
+            "cookie",
+            "--listen",
+            "127.0.0.1:18445",
+        ]) else {
+            panic!("a non-loopback control port must fail closed");
+        };
+        assert!(error.contains("loopback"), "{error}");
+
+        let options = launch(&[
+            "--torcontrol",
+            "127.0.0.1:9051",
+            "--torcontrol-cookie",
+            "cookie",
+            "--listen",
+            "127.0.0.1:18445",
+        ])
+        .unwrap()
+        .expect("a complete Tor control configuration parses");
+        let tor = options.tor_control.expect("the control port is retained");
+        assert_eq!(tor.control, "127.0.0.1:9051".parse().unwrap());
+        assert_eq!(tor.cookie, PathBuf::from("cookie"));
+    }
+
+    #[test]
+    fn owner_only_secrets_are_written_and_read_back() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("onion_service_key");
+        write_owner_only_secret(&path, "ED25519-V3:secret").unwrap();
+        assert_eq!(
+            read_owner_only_text_file(&path, "onion service key", 4096).unwrap(),
+            "ED25519-V3:secret"
+        );
+        // Rewriting replaces rather than appends, so a rotated key cannot
+        // leave the previous one readable in the same file.
+        write_owner_only_secret(&path, "ED25519-V3:rotated").unwrap();
+        assert_eq!(
+            read_owner_only_text_file(&path, "onion service key", 4096).unwrap(),
+            "ED25519-V3:rotated"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn onlynet_onion_requires_a_proxy_and_excludes_routable_peers() {
+        let directory = TempDir::new().unwrap();
+        let base = [
+            "--network".to_owned(),
+            "regtest".to_owned(),
+            "--no-dns-seeds".to_owned(),
+            // A data directory supplies the persisted bootstrap source an
+            // onion-only launch depends on.
+            "--data-dir".to_owned(),
+            directory.path().display().to_string(),
+        ];
+        let onion_only = |extra: &[&str]| {
+            let mut arguments = base.to_vec();
+            arguments.extend(["--onlynet".to_owned(), "onion".to_owned()]);
+            arguments.extend(extra.iter().map(|value| (*value).to_owned()));
+            parse_options(arguments.into_iter())
+        };
+
+        let Err(error) = onion_only(&[]) else {
+            panic!("onion-only without a proxy must fail closed");
+        };
+        assert!(
+            error.contains("--proxy"),
+            "onion-only without a proxy must fail closed: {error}"
+        );
+
+        let Err(error) = onion_only(&["--proxy", "127.0.0.1:9050", "--connect", "127.0.0.1:18444"])
+        else {
+            panic!("onion-only must refuse routable peers");
+        };
+        assert!(
+            error.contains("excluded by the configured --onlynet"),
+            "onion-only must refuse routable peers: {error}"
+        );
+
+        let options = onion_only(&["--proxy", "127.0.0.1:9050"])
+            .unwrap()
+            .expect("a proxied onion-only launch parses");
+        assert_eq!(options.resources.only_net, NodeOnlyNet::Onion);
+        assert!(options.resources.only_net.permits_onion());
+        assert!(
+            !options
+                .resources
+                .only_net
+                .permits("127.0.0.1".parse().unwrap()),
+            "an onion-only restriction permits no IP destination"
+        );
+
+        for family in [NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6] {
+            assert!(
+                !family.permits_onion(),
+                "an IP-only restriction excludes onion"
+            );
+        }
+        assert!(NodeOnlyNet::Any.permits_onion());
+
+        assert_eq!(resolve_only_net(&[]).unwrap(), NodeOnlyNet::Any);
+        assert_eq!(
+            resolve_only_net(&[NodeOnlyNet::Ipv4, NodeOnlyNet::Ipv6]).unwrap(),
+            NodeOnlyNet::Any
+        );
+        assert!(
+            resolve_only_net(&[NodeOnlyNet::Ipv4, NodeOnlyNet::Onion]).is_err(),
+            "mixing onion with an IP family is refused rather than widened"
+        );
+    }
+
+    #[test]
+    fn operator_rpc_administers_bounded_peer_cooldowns() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(Arc::clone(&peer_store)));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+
+        let empty = operator
+            .execute("listbanned", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        assert!(empty.as_array().unwrap().is_empty());
+
+        let added = operator
+            .execute("setban", &serde_json::json!([address, "add", 600]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(added["address"], address);
+        let now = unix_time().unwrap();
+        let until = u32::try_from(added["banned_until"].as_u64().unwrap()).unwrap();
+        assert!(
+            (now + 590..=now + 600).contains(&until),
+            "the deadline honours the requested duration"
+        );
+        assert!(
+            peer_store
+                .is_discouraged(address.parse().unwrap(), now)
+                .unwrap(),
+            "the cooldown is durable in the peer store"
+        );
+
+        let listed = operator
+            .execute("listbanned", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["address"], address);
+        assert_eq!(listed[0]["banned_until"], u64::from(until));
+
+        // A shorter request never shortens an active cooldown.
+        let shortened = operator
+            .execute("setban", &serde_json::json!([address, "add", 5]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u32::try_from(shortened["banned_until"].as_u64().unwrap()).unwrap(),
+            until,
+            "an existing longer cooldown is retained"
+        );
+
+        let removed = operator
+            .execute("setban", &serde_json::json!([address, "remove"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        assert!(
+            !peer_store
+                .is_discouraged(address.parse().unwrap(), now)
+                .unwrap(),
+            "removal clears the durable cooldown"
+        );
+        assert_eq!(
+            operator
+                .execute("setban", &serde_json::json!([address, "remove"]))
+                .unwrap()
+                .unwrap()["removed"],
+            false,
+            "removing an absent cooldown reports no change"
+        );
+    }
+
+    #[test]
+    fn operator_rpc_rejects_malformed_peer_administration_requests() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(peer_store));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([address]),
+            serde_json::json!(["not-an-address", "add"]),
+            serde_json::json!([address, "purge"]),
+            serde_json::json!([address, "add", 0]),
+            serde_json::json!([address, "add", 24 * 60 * 60 + 1]),
+            serde_json::json!([address, "remove", 60]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("setban", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed administration requests are rejected: {invalid}"
+            );
+        }
+        assert_eq!(
+            operator
+                .execute("listbanned", &serde_json::json!([1]))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            -32602
+        );
+    }
+
+    #[test]
+    fn operator_rpc_rejects_malformed_chainstate_scan_requests() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, ..) = dry_run_test_source(directory.path());
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        for invalid in [
+            serde_json::json!([null]),
+            serde_json::json!([null, 0]),
+            serde_json::json!([null, MAX_RPC_CHAINSTATE_PAGE + 1]),
+            serde_json::json!(["not-an-outpoint", 1]),
+            serde_json::json!([7, 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("rbtc.scanchainstate", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed scan requests are rejected: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_rpc_dry_run_admission_is_bounded_and_shapes_core_fields() {
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let source = Arc::new(RpcTestSource {
+            block: block.clone(),
+            submitted: Mutex::new(Vec::new()),
+            test_accept_calls: Mutex::new(Vec::new()),
+        });
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = source.clone();
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(hash),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let raw = serialize(&block.txdata[0]).to_lower_hex_string();
+
+        let verdicts = operator
+            .execute(
+                "testmempoolaccept",
+                &serde_json::json!([[raw.clone(), raw.clone()]]),
+            )
+            .unwrap()
+            .unwrap();
+        let verdicts = verdicts.as_array().expect("verdicts are an array");
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0]["allowed"], true);
+        assert_eq!(verdicts[0]["vsize"], 141);
+        assert_eq!(verdicts[0]["fees"]["base_sats"], 1_000);
+        assert!(
+            verdicts[0].get("reject-reason").is_none(),
+            "an accepted candidate carries no rejection reason"
+        );
+        assert_eq!(verdicts[1]["allowed"], false);
+        assert!(
+            verdicts[1].get("vsize").is_none() && verdicts[1].get("fees").is_none(),
+            "a refused candidate reports no measurements"
+        );
+        assert_eq!(
+            verdicts[1]["reject-reason"]
+                .as_str()
+                .expect("a refused candidate carries a reason")
+                .len(),
+            MAX_RPC_REJECT_REASON_BYTES,
+            "reasons are truncated to the accepted bound"
+        );
+
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!([[]]),
+            serde_json::json!([raw.clone(), raw.clone()]),
+            serde_json::json!([vec![raw.clone(); MAX_RPC_TEST_ACCEPT_TRANSACTIONS + 1]]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("testmempoolaccept", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602,
+                "malformed or oversized requests are rejected: {invalid}"
+            );
+        }
+        assert_eq!(
+            operator
+                .execute("testmempoolaccept", &serde_json::json!([["not hex"]]))
+                .unwrap()
+                .unwrap_err()
+                .code,
+            -22,
+            "undecodable candidates are rejected before reaching the source"
+        );
+        assert_eq!(
+            *source
+                .test_accept_calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![2],
+            "only the well-formed request reaches the data source"
         );
     }
 
@@ -15456,6 +18496,9 @@ mod tests {
             once,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -15479,6 +18522,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control,
             observer: None,
+            snapshot_overlay: None,
         }
     }
 
@@ -15551,6 +18595,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -15574,11 +18621,19 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         };
+        let targets = options
+            .remotes
+            .iter()
+            .map(|remote| NodePeerTarget::Socket(*remote))
+            .collect::<Vec<_>>();
         let mut pending = spawn_peer_connections(
             &options,
-            &options.remotes,
+            &targets,
             100,
+            None,
+            None,
             None,
             None,
             None,
@@ -15590,8 +18645,14 @@ mod tests {
             .await
             .expect("later candidate should handshake while first candidate is stalled")
             .unwrap();
-        assert_eq!(pending.front().unwrap().0, stalled_remote);
-        assert_eq!(pending.back().unwrap().0, ready_remote);
+        assert_eq!(
+            pending.front().unwrap().0,
+            NodePeerTarget::Socket(stalled_remote)
+        );
+        assert_eq!(
+            pending.back().unwrap().0,
+            NodePeerTarget::Socket(ready_remote)
+        );
 
         abort_pending_connections(&mut pending).await;
         release_stalled.send(()).unwrap();
@@ -15613,20 +18674,20 @@ mod tests {
             }
         }
 
-        let protocol_remote = "127.0.0.1:18441".parse().unwrap();
-        let manual_remote = "127.0.0.1:18442".parse().unwrap();
-        let transient_remote = "127.0.0.1:18443".parse().unwrap();
+        let protocol_remote: NodePeerTarget = "127.0.0.1:18441".parse().unwrap();
+        let manual_remote: NodePeerTarget = "127.0.0.1:18442".parse().unwrap();
+        let transient_remote: NodePeerTarget = "127.0.0.1:18443".parse().unwrap();
         let mut pending = VecDeque::from([
             (
-                protocol_remote,
+                protocol_remote.clone(),
                 finished_pending(PeerRunError::protocol("invalid standby header")),
             ),
             (
-                manual_remote,
+                manual_remote.clone(),
                 finished_pending(PeerRunError::protocol("invalid manual standby header")),
             ),
             (
-                transient_remote,
+                transient_remote.clone(),
                 finished_pending(PeerRunError::transient("standby timed out")),
             ),
         ]);
@@ -15644,7 +18705,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let store =
             RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
-        let manual_remotes = HashSet::from([manual_remote]);
+        let manual_remotes = HashSet::from([manual_remote.clone()]);
         let mut failures = Vec::new();
         reap_finished_standbys(&mut pending, Some(&store), &manual_remotes, &mut failures).await;
 
@@ -15658,9 +18719,14 @@ mod tests {
             ]
         );
         let now = unix_time().unwrap();
-        assert!(store.is_discouraged(protocol_remote, now).unwrap());
-        assert!(!store.is_discouraged(manual_remote, now).unwrap());
-        assert!(!store.is_discouraged(transient_remote, now).unwrap());
+        let socket = |target: &NodePeerTarget| target.socket().expect("routable test peer");
+        assert!(store.is_discouraged(socket(&protocol_remote), now).unwrap());
+        assert!(!store.is_discouraged(socket(&manual_remote), now).unwrap());
+        assert!(
+            !store
+                .is_discouraged(socket(&transient_remote), now)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -15686,11 +18752,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let manual = [
+        let manual: [(NodePeerTarget, PendingPeer); 2] = [
             ("127.0.0.1:18600".parse().unwrap(), ready_pending()),
             ("127.0.0.1:18601".parse().unwrap(), ready_pending()),
         ];
-        let manual_remotes = manual.iter().map(|(remote, _)| *remote).collect();
+        let manual_remotes = manual.iter().map(|(remote, _)| remote.clone()).collect();
         let mut pending = automatic.into_iter().chain(manual).collect::<VecDeque<_>>();
         let mut failures = Vec::new();
 
@@ -15715,7 +18781,7 @@ mod tests {
         assert_eq!(
             pending
                 .iter()
-                .map(|(remote, _)| *remote)
+                .map(|(remote, _)| remote.clone())
                 .collect::<Vec<_>>(),
             (18_500_usize..18_500 + DEFAULT_AUTOMATIC_HOT_STANDBYS)
                 .map(|port| format!("127.0.0.1:{port}").parse().unwrap())
@@ -15779,7 +18845,7 @@ mod tests {
 
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             200,
             false,
@@ -15803,7 +18869,7 @@ mod tests {
             .unwrap();
         activate.send(()).unwrap();
         let activated = standby.await.unwrap().unwrap();
-        assert_eq!(activated.remote, remote);
+        assert_eq!(activated.remote, NodePeerTarget::Socket(remote));
 
         drop(activated);
         release_server.send(()).unwrap();
@@ -15845,16 +18911,19 @@ mod tests {
         let (activate, activation) = tokio::sync::oneshot::channel();
         let connection = tokio::spawn(connect_and_maintain_standby(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
+            None,
             None,
             210,
             true,
             None,
+            false,
             ready_sender,
             activation,
             None,
             None,
             Some(source),
+            None,
             None,
             None,
             Arc::new(NetworkTime::default()),
@@ -15932,7 +19001,7 @@ mod tests {
         let (activate_first, first_activation) = tokio::sync::oneshot::channel();
         let first_connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            first_remote,
+            NodePeerTarget::Socket(first_remote),
             None,
             230,
             false,
@@ -15992,7 +19061,7 @@ mod tests {
         let (activate_second, second_activation) = tokio::sync::oneshot::channel();
         let second_connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            second_remote,
+            NodePeerTarget::Socket(second_remote),
             None,
             233,
             false,
@@ -16078,7 +19147,7 @@ mod tests {
 
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             210,
             false,
@@ -16157,7 +19226,7 @@ mod tests {
         });
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             220,
             false,
@@ -16229,7 +19298,7 @@ mod tests {
         ));
         let first = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            first_remote,
+            NodePeerTarget::Socket(first_remote),
             None,
             301,
             false,
@@ -16239,7 +19308,7 @@ mod tests {
         .unwrap();
         let second = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            second_remote,
+            NodePeerTarget::Socket(second_remote),
             None,
             302,
             false,
@@ -16281,8 +19350,14 @@ mod tests {
 
         activate_first.send(()).unwrap();
         activate_second.send(()).unwrap();
-        assert_eq!(first_standby.await.unwrap().unwrap().remote, first_remote);
-        assert_eq!(second_standby.await.unwrap().unwrap().remote, second_remote);
+        assert_eq!(
+            first_standby.await.unwrap().unwrap().remote,
+            NodePeerTarget::Socket(first_remote)
+        );
+        assert_eq!(
+            second_standby.await.unwrap().unwrap().remote,
+            NodePeerTarget::Socket(second_remote)
+        );
     }
 
     #[tokio::test]
@@ -16297,7 +19372,7 @@ mod tests {
         });
         let connected = connect_peer(
             DeploymentConfig::for_network(Network::Regtest),
-            remote,
+            NodePeerTarget::Socket(remote),
             None,
             400,
             false,
@@ -17385,43 +20460,10 @@ mod tests {
     }
 
     fn regtest_block_at_height(parent: BlockHash, time: u32, height: u32) -> Block {
-        let coinbase = Transaction {
-            version: TransactionVersion::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: bitcoin::script::Builder::new()
-                    .push_int(i64::from(height))
-                    .push_opcode(bitcoin::opcodes::all::OP_PUSHBYTES_0)
-                    .into_script(),
-                sequence: Sequence::MAX,
-                witness: Witness::default(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(block_subsidy_with_interval(height, 150)),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        };
-        let mut block = Block {
-            header: Header {
-                version: Version::from_consensus(4),
-                prev_blockhash: parent,
-                merkle_root: TxMerkleNode::all_zeros(),
-                time,
-                bits: Target::MAX_ATTAINABLE_REGTEST.to_compact_lossy(),
-                nonce: 0,
-            },
-            txdata: vec![coinbase],
-        };
-        block.header.merkle_root = block.compute_merkle_root().unwrap();
-        while block
-            .header
-            .validate_pow(Target::MAX_ATTAINABLE_REGTEST)
-            .is_err()
-        {
-            block.header.nonce = block.header.nonce.checked_add(1).unwrap();
-        }
-        block
+        crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+            parent, height, time,
+        ))
+        .expect("regtest block assembles")
     }
 
     fn daemon_argument() -> impl Strategy<Value = String> {
@@ -17544,6 +20586,44 @@ mod tests {
         );
         assert_eq!(options.minimum_free_bytes, 2 * 1024 * 1024 * 1024);
 
+        // A window longer than the default is accepted. The ceiling used to be
+        // the default itself, which meant a target could only prune harder
+        // than default and never keep more. Undo storage follows the window,
+        // so this is an operator trade-off rather than a free setting, but it
+        // is a legitimate one — and it is what lets a replay corpus be
+        // captured at all.
+        let long_window = parse_options(
+            [
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-prune-parser",
+                "--prune-blocks",
+                "30000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(long_window.ledger_retention.max_blocks, 30_000);
+        assert!(
+            parse_options(
+                [
+                    "--network",
+                    "regtest",
+                    "--data-dir",
+                    "/tmp/rbtc-prune-parser",
+                    "--prune-blocks",
+                    &MAX_PRUNE_RETENTION_BLOCKS.to_string(),
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .is_ok(),
+            "the ceiling itself must be accepted"
+        );
+
         for arguments in [
             vec!["--prune-blocks", "576"],
             vec![
@@ -17556,7 +20636,7 @@ mod tests {
                 "--data-dir",
                 "/tmp/rbtc-prune-parser",
                 "--prune-blocks",
-                "1009",
+                "100001",
             ],
             vec![
                 "--data-dir",
@@ -17805,6 +20885,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
 
@@ -18017,6 +21098,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -18061,6 +21143,7 @@ mod tests {
             mempool_max_bytes: 300 * 1024 * 1024,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            v2_transport: false,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -18108,6 +21191,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -18198,6 +21282,7 @@ mod tests {
                 mempool_max_bytes: 64 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                v2_transport: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()
@@ -19481,6 +22566,311 @@ mod tests {
         }
     }
 
+    /// Regression test built from a measured mainnet run: with a 10 GiB
+    /// budget the overlay's working set settled near 4.4 GiB, so a 50%
+    /// trigger sat only ~0.6 GiB above it and compaction re-fired on nearly
+    /// every batch — 72 compactions rewriting 314 GiB to reclaim 100 GiB.
+    /// The trigger now sits at 75% and, more importantly, will not repeat
+    /// until the file has grown half again over its last compacted size.
+    #[test]
+    #[cfg(feature = "mdbx")]
+    fn overlay_compaction_waits_for_real_growth_before_repeating() {
+        const BUDGET: u64 = 10 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let percent = DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT;
+
+        // Below the 50% trigger: never worth it, whatever the history.
+        assert!(!overlay_compaction_is_worthwhile(
+            4 * GIB,
+            BUDGET,
+            percent,
+            None
+        ));
+        assert!(!overlay_compaction_is_worthwhile(
+            4 * GIB,
+            BUDGET,
+            percent,
+            Some(3 * GIB)
+        ));
+
+        // Above the trigger with no prior compaction: run it.
+        assert!(overlay_compaction_is_worthwhile(
+            5 * GIB,
+            BUDGET,
+            percent,
+            None
+        ));
+
+        // The exact thrashing case that motivated this, in the measured
+        // numbers: compaction left ~4.5 GiB, the file crept back just over
+        // the 5 GiB trigger, and rewriting all 4.5 GiB again is not worth
+        // the ~0.6 GiB it would reclaim.
+        assert!(!overlay_compaction_is_worthwhile(
+            5 * GIB + GIB / 8,
+            BUDGET,
+            percent,
+            Some(4 * GIB + GIB / 2)
+        ));
+
+        // Genuine re-accumulation — half again over the last compacted size
+        // — does justify another pass.
+        assert!(overlay_compaction_is_worthwhile(
+            7 * GIB,
+            BUDGET,
+            percent,
+            Some(4 * GIB + GIB / 2)
+        ));
+
+        // Degenerate inputs stay false rather than dividing by zero.
+        assert!(!overlay_compaction_is_worthwhile(GIB, 0, percent, None));
+    }
+
+    #[test]
+    #[cfg(feature = "mdbx")]
+    fn overlay_base_paths_follow_the_rebase_naming_convention() {
+        // A fresh environment must resolve to the operator's own file names,
+        // whatever they are — this function is only consulted for the
+        // resumed (post-rebase) case in the driver, but must still agree
+        // with rebase_into's own naming so a resumed run finds what an
+        // earlier rebase actually wrote.
+        let cli_snapshot = PathBuf::from("/srv/snapshots/utxo-935000.dat");
+        let (snapshot, index) = overlay_base_paths_for_height(&cli_snapshot, 937_304);
+        assert_eq!(snapshot, PathBuf::from("/srv/snapshots/utxo-937304.dat"));
+        assert_eq!(index, PathBuf::from("/srv/snapshots/utxo-937304.rbtcidx"));
+        assert_ne!(
+            snapshot, cli_snapshot,
+            "a rebased base must not resolve back to the original CLI-supplied file"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parses_only_bounded_snapshot_overlay_catchup() {
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.snapshot_overlay,
+            Some(NodeSnapshotOverlayConfig {
+                snapshot: PathBuf::from("/srv/snapshots/utxo-935000.dat"),
+                index: PathBuf::from("/srv/snapshots/utxo-935000.rbtcidx"),
+                capacity_bytes: DEFAULT_SNAPSHOT_OVERLAY_CAPACITY_BYTES,
+                rebase_percent: DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT,
+                compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
+                engine: SnapshotOverlayEngine::Mdbx,
+                replay_blocks: None,
+            })
+        );
+
+        // Replay swaps the block source for a retained ledger and nothing
+        // else, so it must parse alongside the ordinary options rather than
+        // instead of them.
+        let replayed = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replayed
+                .snapshot_overlay
+                .expect("replay parses with catch-up")
+                .replay_blocks,
+            Some(PathBuf::from("/srv/replay/blocks"))
+        );
+
+        for arguments in [
+            // Replay is a catch-up option and is rejected without it, the
+            // same way capacity and engine are.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+            ],
+            // It cannot be supplied twice.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/blocks",
+                "--snapshot-overlay-replay-blocks",
+                "/srv/replay/other",
+            ],
+            // The snapshot and index must be supplied together.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+            ],
+            // Bounded catch-up requires --once and --data-dir.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ],
+            // Serving and offline modes conflict.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--explorer-listen",
+                "127.0.0.1:3000",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--txindex",
+            ],
+            // Capacity and rebase options require the mode.
+            vec![
+                "--network",
+                "bitcoin",
+                "--snapshot-overlay-capacity-bytes",
+                "3221225472",
+            ],
+            // Bounds are enforced.
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-rebase-percent",
+                "100",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_only_offline_core_snapshot_index_builds() {
+        let options = parse_options(
+            [
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            options.offline_action,
+            Some(OfflineAction::BuildCoreSnapshotIndex { snapshot, output })
+                if snapshot == PathBuf::from("/srv/snapshots/utxo-935000.dat")
+                    && output == PathBuf::from("/srv/snapshots/utxo-935000.rbtcidx")
+        ));
+        for arguments in [
+            vec!["--build-core-snapshot-index", "/srv/snapshots/utxo.dat"],
+            vec!["--snapshot-index-output", "/srv/snapshots/utxo.rbtcidx"],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--data-dir",
+                "/tmp/rbtc",
+            ],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--once",
+            ],
+            vec![
+                "--build-core-snapshot-index",
+                "/srv/snapshots/utxo.dat",
+                "--snapshot-index-output",
+                "/srv/snapshots/utxo.rbtcidx",
+                "--download-core-assumeutxo",
+                "https://example.com/utxo.dat",
+                "--snapshot-download-output",
+                "/tmp/utxo.dat",
+                "--snapshot-download-bytes",
+                "850142614",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn offline_snapshot_cli_activates_and_reopens_the_assumed_base() {
@@ -19527,6 +22917,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -19557,6 +22950,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -19610,6 +23004,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -19633,6 +23030,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21263,6 +24661,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors,
                 auth_token,
@@ -21289,6 +24690,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -21328,6 +24730,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -21354,6 +24759,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         };
 
         let runtime = prepare_api_runtime(&options).unwrap().unwrap();
@@ -21732,6 +25138,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -21755,6 +25164,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21827,6 +25237,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -21853,6 +25266,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21907,6 +25321,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -21930,6 +25347,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -21993,6 +25411,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22023,6 +25444,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22064,6 +25486,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22087,6 +25512,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22124,6 +25550,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22147,6 +25576,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22217,6 +25647,9 @@ mod tests {
             once: false,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22247,6 +25680,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22286,6 +25720,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22313,6 +25750,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         }));
         timeout(Duration::from_secs(60), concurrency_confirmed)
             .await
@@ -22393,6 +25831,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22416,6 +25857,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22484,6 +25926,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22507,6 +25952,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22529,6 +25975,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22552,6 +26001,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -22594,6 +26044,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22617,6 +26070,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22653,6 +26107,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22676,6 +26133,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22758,6 +26216,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -22781,6 +26242,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap_err();
@@ -22915,6 +26377,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: Some("127.0.0.1:0".parse().unwrap()),
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: Some(WalletApiFiles {
                 descriptors: descriptors.clone(),
                 auth_token: auth_token.clone(),
@@ -22941,6 +26406,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -23029,6 +26495,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23052,6 +26521,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -23112,6 +26582,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23135,6 +26608,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();
@@ -23232,6 +26706,9 @@ mod tests {
                 once: true,
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
+                zmq_listen: None,
+                i2p_sam: None,
+                tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23255,6 +26732,7 @@ mod tests {
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
+                snapshot_overlay: None,
             }),
         )
         .await
@@ -23386,6 +26864,9 @@ mod tests {
                 once: true,
                 network_execution: NetworkExecutionMode::Persistent,
                 explorer_listen: None,
+                zmq_listen: None,
+                i2p_sam: None,
+                tor_control: None,
                 wallet_api_files: None,
                 rpc_auth_token_file: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
@@ -23398,7 +26879,15 @@ mod tests {
                 mempool_full_rbf: false,
                 cleanup_validation_dir: false,
                 offline_action: None,
-                validation_limits: ValidationLimits::default(),
+                // Pinned at the window size on purpose. Above it the node
+                // claims up to three pending peers as auxiliary block
+                // downloaders, which consumes the candidate this test needs
+                // held in reserve. It exercises failover, not batch sizing,
+                // and the default now sits above that threshold.
+                validation_limits: ValidationLimits {
+                    max_blocks_per_batch: VALIDATION_BLOCK_WINDOW_SIZE,
+                    ..ValidationLimits::default()
+                },
                 ledger_retention: LedgerRetention::default(),
                 minimum_free_bytes: DEFAULT_MINIMUM_FREE_BYTES,
                 cache: NodeCacheConfig::default(),
@@ -23409,6 +26898,7 @@ mod tests {
                 logging: NodeLogConfig::default(),
                 runtime_control: Arc::new(RuntimeControl::default()),
                 observer: None,
+                snapshot_overlay: None,
             },
             local_nonce,
         )
@@ -23511,6 +27001,9 @@ mod tests {
             once: true,
             network_execution: NetworkExecutionMode::Persistent,
             explorer_listen: None,
+            zmq_listen: None,
+            i2p_sam: None,
+            tor_control: None,
             wallet_api_files: None,
             rpc_auth_token_file: None,
             deployments: DeploymentConfig::for_network(Network::Signet),
@@ -23534,6 +27027,7 @@ mod tests {
             logging: NodeLogConfig::default(),
             runtime_control: Arc::new(RuntimeControl::default()),
             observer: None,
+            snapshot_overlay: None,
         })
         .await
         .unwrap();

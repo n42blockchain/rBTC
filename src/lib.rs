@@ -9,12 +9,14 @@ extern crate self as rbtc;
 pub mod api;
 pub mod archive;
 pub mod auxiliary_index;
+pub mod block_assembly;
 pub mod block_execution;
 pub mod blockchain;
 pub mod chain_store;
 pub mod chainstate;
 pub mod consensus;
 pub mod core_snapshot;
+pub mod core_snapshot_index;
 pub mod deployments;
 pub mod diagnostics;
 pub mod execution_store;
@@ -22,6 +24,7 @@ pub mod explorer_store;
 pub mod fee_estimator;
 pub mod header_store;
 pub mod headers;
+pub mod i2p_sam;
 pub mod ibd;
 pub mod inbound;
 pub mod index_policy;
@@ -29,13 +32,20 @@ pub mod ledger;
 #[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod merkle_proof;
+pub mod mphf;
 pub mod node;
 pub mod p2p;
+pub mod p2p_v2;
 pub mod peer_store;
 pub mod rebroadcast_store;
 pub mod signet;
 pub mod snapshot;
 pub mod snapshot_download;
+#[cfg(feature = "mdbx")]
+pub mod snapshot_overlay;
+#[cfg(feature = "mdbx")]
+pub mod snapshot_overlay_redb;
+pub mod tor_control;
 pub mod transaction_admission;
 pub mod transaction_policy;
 pub mod transaction_pool_store;
@@ -43,6 +53,7 @@ pub mod undo_store;
 pub mod utxo;
 pub mod validation_owner;
 pub mod wallet;
+pub mod zmq_publisher;
 
 pub use utxo::{OutPointKey, Utxo, UtxoStore};
 

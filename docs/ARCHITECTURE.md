@@ -3,7 +3,7 @@
 ## Data flow
 
 ```text
-Bitcoin peers (v1 now; BIP324 v2 later)
+Bitcoin peers (v1 and BIP324 v2)
         │
         ▼
 header DAG + chainwork → contextual validator → libbitcoinconsensus scripts
@@ -182,7 +182,7 @@ measurements, not evidence for the final activity threshold.
 
 redb is selected for the default node because its pure-Rust, ordered copy-on-write B-tree tables, ACID transactions, and concurrent readers keep the build portable. UTXO state is overwhelmingly point lookups plus batched deletes/inserts and needs ordered snapshot iteration. Active UTXOs, per-block undo, and the execution tip now share one physical database and one write transaction; a successful commit exposes all three and an aborted commit exposes none. Legacy split files are rejected instead of being guessed or upgraded in place.
 
-Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 64-block checkpoint by default; explicit high-memory validation may raise that checkpoint to 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
+Block validation runs against a lazy in-memory UTXO overlay and commits the net effect in one redb transaction. redb immediate durability and quick-repair/two-phase commit are enabled for active-chain commits. During IBD, contiguous blocks form a 256-block checkpoint by default; operators may lower the value on memory-constrained hosts or raise it as far as 1,008 while retaining an undo record for every block in ordinary serving state. The writer folds all per-block changes into one outpoint-sorted checkpoint mutation, so an output created and spent inside the checkpoint never enters redb; retained per-block undo and execution-tip transitions remain independently addressable inside the same atomic transaction. Once only one new tip block is available it is committed alone. The acceptance invariant is always an old complete checkpoint or a new complete checkpoint, never a mixed UTXO/undo/tip state.
 
 Mainnet output-collision handling follows Core's BIP30 optimization: after the
 authenticated BIP34 anchor, ordinary blocks skip the redundant durable output
@@ -341,11 +341,14 @@ cold-tier validation stores skip that B-tree entirely. Dropping
 live soak database from 23 GiB to 4.0 GiB; the experimental high-memory path
 uses a 16 GiB redb cache so that compact working set and a larger write cache fit
 without changing ordinary-node defaults.
-The default checkpoint remains 64 blocks. Explicit bounded validation may use
-up to 1,008 blocks (approximately 4 GiB at the consensus block-size maximum,
-with an independent 1 GiB ledger-record ceiling) to amortize staged-ledger and
-chainstate durability barriers on adequately provisioned machines; later
-full-block eras should retain a lower memory-aware setting.
+The default checkpoint is now 256 blocks. Measured against 64-block batches it
+reduced total batch time by 24.8% while raising peak working set by roughly 35%;
+memory-constrained operators should lower `--validation-batch-size`. Explicit
+bounded validation may use up to 1,008 blocks (approximately 4 GiB at the
+consensus block-size maximum, with an independent 1 GiB ledger-record ceiling)
+to amortize staged-ledger and chainstate durability barriers on adequately
+provisioned machines; later full-block eras should retain a lower memory-aware
+setting.
 The post-BIP66 soak located that boundary empirically. One stable 1,008-block
 checkpoint took 181.77 seconds after its working set crossed the redb dirty-page
 cache threshold. Splitting the adjacent work into two 504-block checkpoints
@@ -572,6 +575,740 @@ fully validated chainstate in 173 ms, executed three new blocks through
 `000000000074ec24258d33c6e340032db208128adde0f7841c83fdbbeb3e25ea`,
 and exited in 6.16 seconds.
 
+A retained Core snapshot can additionally serve direct point lookups without
+being expanded into redb. Offline
+`--build-core-snapshot-index SNAPSHOT --snapshot-index-output FILE` streams the
+file once under the same canonical-form rules as the activation loader,
+re-derives Core's exact UTXO-set commitment against the compiled release
+identity, and atomically publishes a version-2 sidecar container. Its safe-Rust
+BBhash minimal perfect hash function is keyed by each 32-byte txid group rather
+than every 36-byte outpoint, and its on-disk table bit-packs only the group
+offset. For the height-935,000 mainnet snapshot that means 113,879,165 keys and
+34 bits per table entry instead of 164,241,311 keys and a 53-bit
+offset/back-reference entry.
+
+The container binds the snapshot's network, base block hash and height, coin
+and group counts, exact length, full SHA-256, and the maximum encoded group span,
+and is sealed by a trailing SHA-256 that open verifies before use. The snapshot
+header identity and length are rechecked at open and the full content digest can
+be re-verified on demand. A lookup resolves one group slot, verifies the
+32-byte txid, and scans that bounded group for the requested CompactSize vout
+before decompressing the matching amount and script template. A damaged group
+count therefore cannot widen a read toward the complete 9.4 GB file, and a
+foreign key mapped to an arbitrary MPHF slot is rejected rather than answered
+probabilistically. Coins keep Core's compressed representation on disk;
+nothing is imported, and the index never substitutes for activation's trust
+checks.
+
+The optional `mdbx` feature builds a snapshot-backed overlay chainstate on
+that base. One MDBX environment holds four named tables — coins created above
+the base, tombstones for base coins spent above it, per-block undo keyed by
+block hash, and metadata binding the base identity plus the execution tip —
+so one read-write MDBX transaction commits a block's complete UTXO effect,
+undo record, and tip advance, with the same compare-and-swap tip linkage the
+redb store enforces. Reads resolve overlay → tombstone → base; an overlay
+entry shadows the base even when a tombstone coexists, and reorg restores
+pick their target from the coin's creation height, covering the full
+delete/create/restore matrix for both base and overlay coins. Base coins
+synthesize their BIP68 creation median-time-past from a header-derived
+per-height table, because Core's snapshot format does not carry it. Block
+execution reaches this store through the new `ExecutionChainStore` trait: the
+consensus connect/disconnect entry points are generic over it, and the
+unified redb store implements the same trait unchanged.
+
+The environment is opened with a hard MDBX geometry ceiling (10 GiB by
+default), so growth past the configured budget fails the offending commit
+closed with `MDBX_MAP_FULL` instead of expanding — an engine-enforced bound
+redb cannot express. Below the rebase threshold, the vendored binding exposes
+MDBX's `mdbx_env_copy(..., MDBX_CP_COMPACT)` as safe `copy_compact`: it writes
+only live pages into a fresh environment and swaps that compact copy into place,
+reclaiming copy-on-write garbage without changing the logical overlay or its
+tip. Compaction is a space tool, not a way to shrink the live B-tree or restore
+mutation speed.
+
+Approaching the higher threshold triggers a rebase: a pinned MVCC read view
+streams the old snapshot minus tombstones merged with the overlay into a fresh
+compressed snapshot at the current tip, deriving the new Core-format UTXO-set
+commitment during the write. The access-index rebuild then re-decodes the
+complete file against that self-derived identity, so a compression asymmetry
+cannot survive publication. A fresh empty environment is published with the
+new base identity rather than reusing MDBX's old `last_pgno` high-water mark.
+Undo data does not survive a rebase, so disconnection cannot cross the new base
+— exactly the contract an AssumeUTXO activation establishes — and rebases run
+during catch-up, when the tip is not at reorganization risk.
+
+Both MDBX maintenance operations use a recoverable directory swap. On reopen,
+exactly one set-aside environment is restored if the canonical directory is
+missing; a superseded copy beside a valid live directory is removed. If two
+set-aside candidates exist, recovery preserves both and fails closed instead of
+guessing. Every new swap also removes stale aside suffixes before moving the
+live directory. Overlay undo records use an explicit `RUZ1` zstd frame, retain
+compatibility with raw records written before compression, and cap output at
+256 MiB plus zstd's window at 8 MiB on both overlay engines.
+
+`--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX` runs the
+complete catch-up on this chainstate. The mode reuses the ordinary outbound
+peer pool and failover: after headers-first synchronization it verifies the
+base block on the active header chain (a fresh environment resolves the
+compiled Core 31 identity; a rebased environment resumes its stored
+self-derived identity), derives the base's creation-MTP table from headers,
+and then drives the same `download_execute_batch` pipeline the redb node
+uses — 16-block protocol requests, parallel structure validation, ledger
+staging, prefetch overlap, and the generic consensus executor — against the
+overlay store, including stale-tip disconnection back to the active chain
+and block-undo pruning below the retained-ledger floor. Between batches it
+checks the capacity high-water mark and rebases onto
+`utxo-<height>.dat`/`.rbtcidx` beside the current snapshot when the
+configured threshold (default 85% of the default 10 GiB ceiling) is reached.
+The mode is deliberately bounded: it requires `--once` and `--data-dir`,
+conflicts with explorer, wallet, index, and other snapshot or offline modes,
+executes to the header tip observed after the initial synchronization, and
+exits; a binary built without the `mdbx` feature refuses it at startup.
+
+`--snapshot-overlay-engine redb` runs the same catch-up on a redb overlay
+instead, so the two engines can be compared on identical work. The stores are
+built to one contract — the same base, the same four logical tables, the same
+one-transaction-per-block atomicity, the same `overlay → tombstone → base`
+read order, and a shared implementation of the base reader, identity codec,
+and rebase merge — and the catch-up loop itself is written once, generic over
+an `OverlayCatchupStore` trait. Only two behaviours differ, and they are the
+comparison:
+
+- **Budget enforcement.** MDBX's geometry ceiling refuses the offending
+  commit outright with `MDBX_MAP_FULL`. redb has no such ceiling, so the
+  budget is policy-enforced by measuring the file after each commit, which a
+  single batch can overshoot before the next check sees it.
+- **Space reclamation.** redb's `compact()` rewrites its file in place. MDBX
+  uses a compact copy and crash-safe directory swap because its live file's
+  `last_pgno` does not shrink. `--snapshot-overlay-compact-percent` (default
+  50, below the 85 rebase threshold) controls how early either engine tries
+  reclaiming garbage before a full fold/rebase.
+
+On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
+164,241,311 coins) was downloaded from a third-party community mirror
+(`bitcoin-snapshots.jaonoctus.dev`, `files-vps02.jaonoctus.dev/utxo-935000.dat`)
+and indexed offline:
+
+```
+rbtcd --build-core-snapshot-index utxo-935000.dat --snapshot-index-output utxo-935000.rbtcidx
+```
+
+At that revision the outpoint-keyed format authenticated the file against the
+compiled 935,000 mainnet identity in 2m18s and published a
+1,155,791,488-byte index (19 BBhash levels, 3.30 bits per key). These run
+figures are retained as historical evidence; the current txid-group version-2
+format is described above. Catch-up then ran to the header tip observed at
+connect time:
+
+```
+rbtcd --network bitcoin --data-dir DATA --once \
+  --snapshot-overlay-catchup utxo-935000.dat --snapshot-overlay-index utxo-935000.rbtcidx \
+  --snapshot-overlay-engine mdbx \
+  --snapshot-overlay-capacity-bytes 10737418240 \
+  --snapshot-overlay-compact-percent 50 \
+  --snapshot-overlay-rebase-percent 85
+```
+
+A first attempt at a 3 GiB ceiling (the default at the time) reached height 960,203 after
+one rebase (at 937,240, 2,240 blocks of live-2024-era Ordinals/Runes-congested
+mainnet growth) and then repeatedly hit `MDBX_MAP_FULL`: `last_pgno` — the
+copy-on-write B-tree's high-water mark, and the only thing the geometry
+ceiling actually checks — never shrinks after `clear_table`, so reusing the
+same environment file after a rebase eventually loses the whole budget
+regardless of logical content. That soak also surfaced a genuine one-coin
+`compress_script` defect (a height-707,034 P2PK output using SEC1's rare
+hybrid uncompressed tag 0x06/0x07, which `libsecp256k1` parses as a valid
+point but Core's `CompressScript` never compresses; compressing it anyway
+made decompression's `serialize_uncompressed` silently normalize the tag to
+0x04, breaking the re-verified UTXO-set commitment) and a missing
+`ledger.discard_staged()` reconciliation step that let a chainstate-commit
+failure leave a staged ledger segment blocking every retry. All three are
+fixed: `compress_script` now requires the exact standard tag, `rebase_into`
+recreates the environment file instead of clearing its tables in place, and
+the driver discards a leftover staged segment before its main loop.
+
+With those fixes and a 10 GiB ceiling, the same snapshot and index drove a
+clean run from height 935,000 to the live tip: two rebases (at 947,032 and
+956,056, roughly 9,000–9,700 blocks apart — proportionally longer than the
+3 GiB ceiling's single 2,240-block interval, confirming budget and interval
+scale together), reaching height 960,205 with the overlay at 42% of its
+10 GiB budget and exiting 0.
+
+A then-current cold rerun on 2026-07-30 used the same 164,241,311-coin
+`utxo-935000.dat` (9,387,990,306 bytes) and its outpoint-keyed
+1,155,791,488-byte index. It
+validated 25,313 blocks in 396 batches and exited 0 at height 960,313. Process
+wall time from the first daemon log record was 90.29 minutes; the interval
+from the start of the first execution batch through the final commit was
+83.07 minutes (305 blocks/min). Batch totals averaged 10.83 seconds, with a
+3.00-second minimum and a 55.32-second cold-first-batch maximum. Ten transient
+peer warnings were recovered through failover and no error was logged.
+
+The rerun rebased at 947,224 after 12,224 blocks and at 958,296 after another
+11,072 blocks. Each rebase paused block progress for about 4.61 minutes:
+
+| Rebase height | Coins | Snapshot bytes | Index bytes | Folded overlay | Dropped tombstones |
+|---:|---:|---:|---:|---:|---:|
+| 947,224 | 165,489,673 | 9,456,185,634 | 1,164,575,992 | 8,416,963 | 7,168,601 |
+| 958,296 | 166,103,491 | 9,485,481,367 | 1,168,896,520 | 7,253,120 | 6,639,302 |
+
+The two measured rebase pauses totaled 9.22 minutes, 11% of execution wall
+time. The final 2,017-block overlay occupied 2,080,374,784 logical bytes
+(2,063,597,568 allocated bytes), reported as 19% of the hard 10 GiB ceiling.
+The active compressed base plus MPHF index was 10,654,377,887 bytes. Benchmark
+directories retain prior rebase generations for audit, so their aggregate
+disk usage is not the active working-set size.
+
+The redb engine was then measured over a complete run on the same snapshot,
+with a 3 GiB budget and compaction enabled at 50%. It reached the same tip
+960,220 and exited 0, taking 3.64 hours for 25,220 blocks (115 blocks/min)
+across 395 batches, 212 compaction attempts, and 24 rebases:
+
+- **Compaction works, and is what contains the file — but it settles above
+  the budget, not at it.** Seventeen of 212 attempts released space, and the
+  steady-state pattern is unmistakable: the overlay repeatedly grew to
+  exactly 4.00 GiB, compaction brought it back to about 2.94 GiB, and the
+  cycle repeated, releasing roughly 1.06 GiB each time. Two further passes
+  fired right after a rebase had emptied the tables, taking 2.06 GiB to
+  0.25 GiB and 2.00 GiB to 0.26 GiB. So in-place compaction genuinely bounds
+  the file — the reclamation `libmdbx-rs` 0.6.6 offers no API for — but it
+  bounds it at an equilibrium oscillating between 2.94 and 4.00 GiB. Peak
+  usage was 4.00 GiB against a 3.00 GiB budget: **133% of the configured
+  limit, permanently**. A measured-after-the-fact budget combined with
+  coarse, doubling file growth does not enforce a ceiling; it finds a stable
+  orbit above one. MDBX's `MDBX_MAP_FULL` refuses the oversized commit
+  instead, which is what a hard budget actually requires.
+- **Rebasing dominated the wall clock.** The 24 rebases consumed 122 minutes,
+  56% of the run, against 92 minutes (42%) of actual block execution.
+  Intervals ranged 640–2,112 blocks with a median of 1,024. Because every
+  rebase streams and re-indexes a ~9.4 GB snapshot, rebase frequency — not
+  per-block execution speed — is what sets end-to-end catch-up time at a
+  small budget.
+- **Retained bases cost far more disk than the budget saves.** Each rebase
+  publishes a new snapshot and index and, by design, leaves the previous one
+  in place as evidence. Twenty-four rebases therefore accumulated about
+  248 GB of retained bases — roughly 10.6 GB apiece — to hold an overlay
+  budget of 3 GiB. Any deployment running at a budget small enough to rebase
+  often needs a retention policy for superseded bases, or the disk saved on
+  the overlay is lost many times over beside it.
+
+redb was then run again at a 10 GiB budget, which changes the picture
+completely: it reached the tip in 2.40 hours over 25,299 blocks with **zero
+rebases**, ending at 57% of budget with the original 935,000 base still in
+place. The overlay's steady-state working set is the same in both runs — the
+file settles around 4 GiB regardless of what it is told — so the 3 GiB budget
+was simply below what this workload needs, and the 24 rebases it forced were
+the consequence of that, not of the engine. Set the budget above the working
+set and the same engine never rebases at all.
+
+Comparing the two 10 GiB runs is closer to controlled but still not clean:
+MDBX covered 940,376→960,205 (19,829 blocks, 55 minutes, 2 rebases, 42% final
+usage) having resumed from an already-advanced state, while redb covered
+935,000→960,299 (25,299 blocks, 144 minutes, 0 rebases, 57% final usage) from
+a cold base. Different block ranges and different starting states make the
+raw 361 vs 175 blocks/min figures unusable as an engine verdict.
+
+Normalising by maintenance I/O per block does compare. redb avoided rebases
+by compacting 72 times, each rewriting the surviving data: roughly 314 GiB
+written to free 100.7 GiB, about **12.7 MiB per block**, against MDBX's two
+rebases at roughly 21 GiB — about **1.1 MiB per block**.
+
+Most of that gap turned out to be a tuning defect on the redb side rather
+than a property of the engine. The overlay's working set settles near
+4.4 GiB, and the compaction trigger sat at 50% of the 10 GiB budget — 5 GiB,
+barely above it. Each pass therefore rewrote the whole ~4.4 GiB survivor to
+reclaim about 1 GiB, and the file re-crossed the trigger almost immediately.
+A percentage-of-budget threshold cannot prevent that on its own: once the
+file is above it, every batch qualifies regardless of how little was freed
+last time. Compaction now additionally requires the file to have grown half
+again over its size after the previous compaction, which ties the decision to
+how much garbage has actually re-accumulated and adapts to any budget and
+working set. Replaying the run's observed sizes under that rule gives an
+estimated 9 compactions and 38 GiB — about **1.5 MiB per block**, close to
+MDBX's 1.1.
+
+Raising the threshold instead was considered and rejected on the same replay:
+at 75% the trigger would never have fired, since the overlay peaked at
+6.61 GiB (66%), so compaction would stop entirely and the file would drift
+into the 85% rebase threshold — trading ~4 GiB rewrites for ~10.6 GiB ones.
+The threshold stays at 50% and the growth gate does the work.
+
+A latest-code rerun measured those changes on the same snapshot at the same
+10 GiB budget. redb reached 960,335 in 76 minutes over 25,335 blocks
+(333 blocks/min) with **two** compactions instead of 72, rewriting 10 GiB
+instead of 314 — **0.40 MiB per block**, a 32-fold reduction, and below the
+0.80 MiB/block the MDBX rerun measured. The growth gate is what did it: the
+first compaction fired at 5.01 GiB and the second not until 6.69 GiB, roughly
+6,000 blocks later, where the old policy re-fired on nearly every batch.
+
+That figure should not be read as redb now costing less maintenance than MDBX,
+because the two runs did not end in the same state. MDBX rebased twice and
+finished at 19% of budget with a 2,017-block overlay over a base advanced to
+958,296. redb never rebased and finished at 58% with a 25,335-block overlay
+over the original 935,000 base. A rebase does more than reclaim pages: it
+folds the overlay into a new base, so every later lookup traverses less
+overlay before reaching it, and it resets the undo table. redb deferred that
+work rather than avoiding it. The honest comparison is that redb's tuned
+compaction defers a rebase cheaply, and MDBX's rebase does more work for
+twice the write cost — which of those is better depends on whether the run
+ends or continues.
+
+SQLite was then benchmarked as a third candidate, since it is the only
+surveyed engine offering both capabilities the other two each lack — an
+engine-enforced ceiling through `PRAGMA max_page_count`, which redb has no
+equivalent for, and in-place compaction through `VACUUM`, which the MDBX
+binding does not expose — and it is already linked into every build through
+`bdk_wallet`'s rusqlite feature, so adopting it would add no dependency. The
+benchmark drives it through the same `UtxoStore` harness as the other two,
+with a `WITHOUT ROWID` table keyed by the same 36-byte outpoint so a lookup
+is one B-tree descent, and `synchronous = FULL` to match the others' fsync
+-per-commit durability.
+
+Point-lookup latency, the operation block execution performs most:
+
+| engine | 10,000 UTXOs | 2,000,000 UTXOs | p99 at 2M |
+|---|---|---|---|
+| redb | 726 ns | 1,584 ns | 5.2 µs |
+| MDBX | 1,933 ns | 2,353 ns | 3.8 µs |
+| SQLite | 2,411 ns | 4,053 ns | 10.3 µs |
+
+SQLite is 2.6x slower than redb and 1.7x slower than MDBX at the larger size,
+with a p99 roughly double either. That is the cost of the SQL layer on a path
+that executes tens of thousands of lookups per block, and it is enough to
+rule SQLite out for the UTXO hot path despite its otherwise attractive
+feature set. It remains the only candidate that could serve a store needing
+both a hard ceiling and in-place compaction, so the measurement is recorded
+rather than discarded.
+
+Two cautions about these numbers. MDBX scaled best across the two sizes
+(1.2x versus redb's 2.2x), so the ranking at 164M coins is not settled by a
+2M-coin run. And the commit column of the same benchmark is not a fair
+comparison at all: the redb entry drives the full `RedbChainStore`, committing
+tip and undo alongside the UTXO mutation, while the MDBX and SQLite entries
+drive a bare UTXO store. Only the lookup column compares like with like.
+
+The latest cold-base MDBX rerun makes the same-budget comparison closer:
+MDBX covered 935,000→960,313 in 90.29 process minutes (83.07 execution
+minutes), with two rebases and 19% final usage; redb covered
+935,000→960,299 in 144 minutes, with zero rebases and 57% final usage. Their
+raw process rates are about 280 and 176 blocks/min respectively, but network
+peers, filesystem cache state, and block workload still prevent treating that
+ratio as an isolated engine microbenchmark. The MDBX rerun wrote
+21,275,139,513 bytes of snapshot-plus-index rebase output, about 0.80 MiB per
+validated block, making redb's measured 12.7 MiB/block maintenance rate about
+sixteen times larger on these same-budget runs.
+
+A further round of write and memory work was then measured on MDBX at the
+same 10 GiB budget, over the same `utxo-935000.dat` and index, reaching
+960,345 in 397 batches over 25,345 blocks and exiting 0.
+
+Two changes were under test. Block undo is now stored zstd-compressed, chosen
+because a per-table breakdown of the completed redb overlay showed undo as
+the second largest item — 998,307,764 stored bytes across only 951 retained
+blocks, about 1,025 KiB per block — and because the binding at that revision
+had no MDBX compaction, so anything that slowed file growth directly delayed a
+rebase. Separately, the
+snapshot index no longer holds its packed offset table in memory.
+
+The results that do not depend on the machine:
+
+| | prior rerun | this run |
+|---|---:|---:|
+| Rebases | 2 (947,224, 958,296) | **1** (955,096) |
+| Rebase output rewritten | 21,275,139,513 bytes | 10,646,320,407 bytes |
+| Maintenance write | 0.80 MiB/block | **0.40 MiB/block** |
+| Retained undo | 1,025 KiB/block | **442 KiB/block** |
+| Final overlay | 19% of budget | 25% of budget |
+
+Halving the maintenance write is a direct consequence of rebasing once rather
+than twice, and the deferral is attributable: the prior rerun crossed the 85%
+threshold at 947,224, while this one reached it at 955,096, about 7,900 blocks
+later, on the same budget and base. Freeing roughly 600 MB of undo is what
+bought those blocks.
+
+The undo ratio of 2.32x is a conservative floor, because the two sides are not
+measured the same way: redb's 998,307,764 is a logical stored-byte count while
+MDBX's 435,425,280 counts whole pages, including partial fill and page
+overhead. The compression is at least this good.
+
+Wall-clock is deliberately absent from that table. This run's execution
+interval was 62.81 minutes for 25,345 blocks against the prior rerun's 83.07
+for 25,313, but the prior rerun's rebase artifacts — `utxo-947224.dat` and
+`utxo-958296.dat` — are not present on the machine that produced this one, so
+the two ran on different hardware and the ratio measures that as much as any
+code change. The 62.81 minutes stands as a new local reference point, not as a
+speedup. The single rebase paused block progress for 4.20 minutes, against
+about 4.61 for each of the prior two.
+
+Final overlay composition, at 2,724,679,680 bytes of high-water mark:
+
+| table | entries | page bytes |
+|---|---:|---:|
+| `utxo_overlay` | 4,100,830 | 864,468,992 |
+| `utxo_spent_base` | 3,683,808 | 253,349,888 |
+| `block_undos` | 961 | 435,425,280 |
+
+Live tables account for 57% of the high-water mark; the remainder is
+copy-on-write garbage that `last_pgno` still counts, which is why the
+geometry ceiling is reached well before the live data would suggest.
+
+Index memory was measured separately, on the real 164,241,311-coin index,
+looking up 200,000 outpoints taken from the snapshot itself. The queries are
+shuffled, because a block's inputs bear no relation to where their coins sit
+in the base; measuring them in snapshot file order flatters the snapshot reads
+and overstates every rate below. Each figure is the mean of three runs on an
+otherwise idle machine, which matters more than it sounds — see the caution at
+the end of this section.
+
+| variant | peak working set | one at a time | batched |
+|---|---:|---:|---:|
+| Offset table resident | 2.17 GiB | 211,142 | — |
+| Offset table on disk, worst-case window | **0.15 GiB** | 127,609 | 185,678 |
+| plus a coin-sized read window | **0.15 GiB** | 149,851 | 201,767 |
+| plus one read covering txid and coin | **0.15 GiB** | 168,489 | **238,936** |
+
+Moving the table out of memory cost 40% of the single-lookup rate on its own.
+Three changes took it back and past: resolving a batch in file order, reading
+a 128-byte window instead of Core's 10,030-byte worst case, and covering the
+group txid and the coin in one positioned read when they are close enough
+together. The result is that the on-disk path is now **13% faster than the
+resident table while holding a fourteenth of its memory** — not the trade-off
+this started as.
+
+The batch resolves in three phases. Every slot is computed first, with no I/O.
+The offset-table entries are read next in ascending slot order, which is
+ascending byte order. The coin records are read last in ascending snapshot
+offset. Each phase moves forward through one file rather than jumping around
+it, and one window buffer serves the whole batch. Both overlay engines
+classify a batch against the overlay and tombstone first and hand the misses
+over in a single call.
+
+The order in which those three changes helped is worth recording, because it
+did not match expectation. Cutting the read window by 78x barely moved the
+batched path — copying was not its cost — while removing one of three
+positioned reads per lookup moved it 18%. The remaining cost is per-call
+overhead, not bytes.
+
+An in-process cache for the table was considered and rejected. A minimal
+perfect hash distributes slots uniformly, so hit rate would scale linearly
+with cache size with no working-set knee — the condition under which a
+replacement policy earns its keep. At the revision measured here, entries were
+bit-packed at 53 bits against
+an LRU's roughly 40 bytes of per-entry overhead, so the page cache holds
+several times more table per byte. And the memory would be anonymous rather
+than reclaimable, reintroducing exactly what moving the table to disk removed.
+
+A caution about how these were obtained, since it nearly produced two wrong
+conclusions. An earlier set of these figures was taken while a 25,000-block
+capture was running on the same disk, and the probe's spread under that load
+was 9.5%. Measured that way, the combined read appeared to be a 14% regression
+and was withheld from a commit on that basis; measured on an idle machine it
+is an 18% improvement. The same contamination understated the read-window
+change as 2.6% on the batched path when it is 8.7%. Storage benchmarks on a
+loaded machine are not measurements.
+
+Batching was then measured on a full catch-up rather than a probe: the same
+machine, the same `utxo-935000.dat` and index, the same 10 GiB budget, with
+only the batched read added. The node routes every base lookup through it —
+`prefetch_prevalidated_active_block_utxos` resolves a whole 64-block batch's
+inputs in one `get_many` call, and execution then reads from that result — so
+the `utxo-prefetch` timing isolates exactly what changed.
+
+Over 25,344 matched blocks:
+
+| component | one at a time | batched | change |
+|---|---:|---:|---:|
+| `utxo-prefetch` | 223.6s | 199.2s | **−10.9%** |
+| `execution-core` | 2988.3s | 2973.1s | −0.5% |
+| `structure` | 121.2s | 122.5s | +1.0% |
+| `download` | 63.2s | 91.1s | +44.0% |
+
+The 24.4 seconds saved is real but small against a catch-up: about 0.7% of
+total batch time. Two things account for the gap between this and the probe's
+47%. `get_many` probes the overlay and tombstone tables for every outpoint
+before any base read happens, and that part is unchanged; and the share of
+inputs that reach the base at all falls steadily as the overlay fills, from
+nearly all of them at 935,000 to a minority by the tip. Measured on the first
+49 batches alone, where almost everything misses to the base, the improvement
+was 17.8%.
+
+End-to-end wall clock is not usable here and is deliberately not quoted as a
+result. This run took 73.67 minutes against the previous 62.81, but the
+regression is network: `download` rose 44%, the portion of `execute` outside
+`execution-core` — the wait for blocks to arrive — rose from 166.5s to 805.9s,
+while `execution-core`, `structure`, `stage`, and `publish` were all flat
+within 1%. A soak that fetches 25,000 blocks from live peers cannot resolve a
+storage change worth 0.7%, and treating its total as a verdict would report
+peer quality as a code result.
+
+The run is a strong control in one respect that does not depend on timing at
+all: it rebased at height 955,096, the same height as the previous run, with
+byte-identical output — 165,911,302 coins, 9,478,768,311 snapshot bytes,
+1,167,552,096 index bytes, 11,823,028 folded overlay entries. Reordering reads
+provably did not disturb what gets written.
+
+Replaying blocks from a retained ledger rather than fetching them made the
+execution path measurable, and the first measurement overturned the assumption
+the optimization work had been proceeding on. With the network removed,
+`execution-core` split as commit 67.7%, validate 16.0%, submit 2.3%, and
+script-wait 1.7%. Script verification is not the cost of executing a block
+here: the deferred batch hides it so completely that the workers finish about
+100 ms into a six-second batch and then wait. Storage does.
+
+Splitting the commit the same way located the largest single item in the whole
+run:
+
+| commit part | share of commit |
+|---|---:|
+| Base lookups (nested in mutate) | 36.5% |
+| B-tree mutation, excluding those lookups | 26.5% |
+| Durable commit, where any fsync lands | 28.5% |
+| Block undo | 4.5% |
+| Batch fold | 3.7% |
+
+At 36.5% of a commit that is itself 67.7% of execution, those base lookups
+were about a quarter of all execution time. They come from the duplicate check
+on created coins — one full snapshot index lookup per new output, roughly
+250,000 per batch, essentially all misses. An earlier estimate had put them at
+65 ms by counting only spent base coins, missing the created path entirely and
+landing a factor of twenty-seven low; the estimate would have sent the work
+somewhere else entirely.
+
+The check is not redundant and was not weakened. Above the BIP34 anchor the
+in-memory execution path deliberately skips its own durable probe and
+documents that the commit will catch a collision, which makes this the release
+build's only durable duplicate check. Only the read order changed: the probes
+are collected and resolved in one file-ordered batch.
+
+Two replays of the same corpus, differing only in that change, paired
+batch-for-batch over 80 batches:
+
+| | before | after | change |
+|---|---:|---:|---:|
+| `commit-base-lookup` | 130.1s | 80.2s | **−38.3%** |
+| `core-commit` | 357.9s | 304.6s | −14.9% |
+| `execution-core` | 528.0s | 474.7s | **−10.1%** |
+| batch total | 584.4s | 530.8s | −9.2% |
+| `commit-sync` | 102.4s | 101.9s | −0.5% |
+| `core-validate` | 82.5s | 82.0s | −0.7% |
+
+Every untouched component moved by less than 2%, which is the signature a
+controlled comparison should have and the reason the replay harness was built:
+the networked soak that preceded it moved 19% on peer quality alone and could
+not have resolved this.
+
+What remained inside that measured commit was the durable flush at 28.5% and
+B-tree mutation at 26.5%. Base lookups were still 26.3% of the reduced commit,
+and their remaining cost was the hash computation plus two positioned reads per
+probe. That result drove the subsequent version-2 change from outpoint to txid
+keying, allowing all outputs created by one transaction to share one probe and
+one group offset.
+
+Relaxing the commit's durability was tried on the strength of that 28.5% and
+withdrawn. MDBX offers three modes weaker than `Durable`, and two of them —
+`SafeNoSync` and `UtterlyNoSync` — buy write speed by pinning the last steady
+commit so freed pages cannot be reused, which grows the database. Under a hard
+capacity ceiling where growth is what forces a rebase, and a rebase rewrites
+roughly 10 GB, that trade is paid back at a rate that makes it a loss. Only
+`NoMetaSync` writes the same pages and defers nothing but metadata, so only it
+was implemented and measured.
+
+Two replays of the same corpus, back to back on the same machine under the
+same load, paired over 133 batches:
+
+| | durable | no-meta-sync | change |
+|---|---:|---:|---:|
+| `commit-sync` | 220.4s | 372.8s | **+69.2%** |
+| `commit-mutate` | 348.8s | 353.8s | +1.4% |
+| `commit-base-lookup` | 147.4s | 147.0s | −0.3% |
+| `execution-core` | 967.2s | 1155.9s | +19.5% |
+| batch total | 1071.6s | 1276.4s | +19.1% |
+
+Deferring the metapage flush made the flush 69% more expensive, not cheaper,
+and every untouched component stayed within 1.4%. The mechanism is in MDBX's
+own description: the deferred flush is taken at the next non-read-only commit.
+Catch-up commits once per batch with a large dirty set, so nothing is saved —
+the deferred metadata is simply paid alongside the next batch's own flush. The
+option was removed rather than kept as a knob that costs durability and returns
+nothing.
+
+One piece of that work is retained on its own merits. The batch commits the
+chainstate before the ledger, so a durable commit can only leave the chainstate
+ahead, and the driver's new truncation of the ledger to the executed tip is a
+no-op today. It stays because the reverse is not merely inconsistent but
+terminal: resuming would append at a height the ledger already covers and fail
+on contiguity from then on, with nothing else in the system able to repair it.
+The reindex driver already does this for the same reason.
+
+Batch size turned out to be the largest lever in the commit, and it needed
+almost no code — only making `--validation-batch-size` visible to the mode that
+already honoured it. Snapshot-overlay catch-up drives the same batch loop and
+reads `max_blocks_per_batch`, but the option was rejected unless one of the
+AssumeUTXO or reindex modes was also requested, so the limit applied while
+being unsettable.
+
+Two replays back to back on the same machine, same corpus, over the same
+11,008 blocks, normalised per thousand blocks:
+
+| seconds per 1000 blocks | 64-block | 256-block | change |
+|---|---:|---:|---:|
+| `commit-mutate` | 38.04 | 19.55 | **−48.6%** |
+| `commit-sync` | 24.18 | 11.59 | **−52.1%** |
+| `commit-base-lookup` | 15.08 | 11.92 | −20.9% |
+| `commit-fold` | 2.77 | 4.15 | +50.0% |
+| `core-validate` | 17.86 | 20.06 | +12.3% |
+| `execution-core` | 105.02 | 78.46 | **−25.3%** |
+| batch total | 117.13 | 88.13 | **−24.8%** |
+
+The mechanism is two separate effects, and the second was not expected. Halved
+flushing follows directly from committing a quarter as often. But
+`commit-base-lookup` fell too, and the number of duplicate probes depends only
+on how many created coins survive to reach storage — so a wider fold window is
+collapsing more coins that are created and spent inside the same batch, and
+they never reach the B-tree at all. Folding costs 50% more to do it, which is
+four seconds buying eighteen.
+
+The costs are real and on the same table. Validation is 12% slower because each
+overlay's working set is larger, and folding is the one commit component that
+grew.
+
+Peak memory is the other cost, and it is measured rather than estimated. Two
+height points agree:
+
+| height | 64-block | 256-block | change |
+|---|---:|---:|---:|
+| ~944,000 | 6,215 MB | 8,261 MB | +32.9% |
+| ~946–948,000 | 7,219 MB | 9,788 MB | +35.6% |
+
+The 256-block figure in the second row is taken slightly further along the
+chain than the 64-block one, so the true gap is a little under 35.6%. An
+earlier claim of about 60% was withdrawn before this was measured: it compared
+a peak from one run against a working set from a different run at a different
+height, which establishes nothing.
+
+So the option buys 24.8% of execution time for roughly 35% more peak memory.
+That interacts with the index work in the same section, which removed about
+2 GB, since 256-block batches add about 2.5 GB back. The two are not the same
+kind of memory — what the index gave up was anonymous and unreclaimable, while
+most of what batching adds is file-backed mapping and per-batch working set —
+but on a memory-constrained host they belong on the same ledger.
+
+Reclaiming that garbage is now possible on MDBX, and measuring it corrected
+two things this section had claimed.
+
+The first correction is what the capability is. `libmdbx-rs` 0.6.6 exposes no
+compaction, which had been recorded as MDBX offering none. MDBX offers
+`mdbx_env_copy` with `MDBX_CP_COMPACT`; only the Rust binding was missing.
+libmdbx is vendored — the pattern already used for redb and bitcoinconsensus —
+with a safe `copy_compact`, so the `unsafe` stays in the dependency and this
+crate keeps `unsafe_code = "forbid"`. One detail matters for anyone touching
+it: `mdbx_env_copy` takes the pathname of a file that must not yet exist, not a
+directory to populate, so the copy lands at the `mdbx.dat` inside a directory
+created for it.
+
+Measured on a replay at the 50% trigger, the compaction released 51.4% —
+5,388,443,648 bytes down to 2,620,948,480 — matching the 52.5% garbage
+fraction a run settles at. At the same height, an unpompacted run's high-water
+mark was 7.09 GB against the compacted run's 5.32 GB: 2.6 GB of writes bought
+1.77 GB of lasting headroom, where a rebase writes 10.6 GB. The trigger fired
+once and the growth gate did not re-fire over the following 3,700 blocks, so
+the thrashing that a percentage-only threshold produced on redb did not recur.
+
+The second correction is what compaction is for. It was expected to also
+restore speed, on the reasoning that garbage pages grow the B-tree and that is
+what makes `commit-mutate` degrade 1.42x over four thousand blocks. That
+reasoning was wrong. `commit-mutate` did not fall after compaction. Compaction
+discards unreachable pages and leaves every live entry in place, so the tree's
+logical size — which is what decides how many pages a random insertion dirties
+— is unchanged. A rebase resets it because folding the overlay into a new base
+empties the tables, not because it reclaims pages. **Compaction is a space
+tool, not a performance tool**, and the 26.6% execution gain measured across a
+rebase belongs to the fold, not to the reclamation.
+
+What compaction costs in time is not resolved here, and the reason is recorded
+rather than papered over. Two attempts to measure it produced a uniform ~25%
+shift across every component including `core-validate`, which compaction cannot
+touch. Comparing the same pre-compaction window across three runs — where the
+settings do identical work — showed 97.49s, 184.42s and 203.64s per thousand
+blocks, and the run that was slowest had run first. The machine was drifting by
+a factor of two between consecutive runs under other tenants' load. A
+wall-clock A/B whose environment moves an order of magnitude more than the
+effect is not a measurement, and no number from those runs is quoted.
+
+Keying the index by txid instead of by outpoint was reconsidered, and the
+earlier judgement against it does not survive two measurements.
+
+It had been set aside because the duplicate-check probes were 10.4% of batch
+time, making an index-format change look like poor value. That figure came
+from an idle machine. Running the same catch-up while other tenants competed
+for memory put `commit-base-lookup` at 18.9% and `utxo-prefetch` at 9.7%,
+both roughly double their idle share, while CPU-bound components fell as a
+proportion. Those two are the paths that read the 9.4 GB snapshot, and they
+degrade first when the page cache is contended — which is the condition a real
+deployment runs in and an idle benchmark cannot show. An idle baseline
+systematically understates this work.
+
+The trade was then quantified on the real data rather than assumed. Over 3,000
+corpus blocks — 9,290,925 transactions creating 24,360,834 outputs — a
+transaction creates 2.622 outputs, so probing once per transaction instead of
+once per output cuts probe count to 38.1%, a 61.9% reduction. The concern was
+that a txid-keyed hit must then scan its group for the right vout. Scanning the
+935,000-height snapshot says that concern is misplaced: 164,241,311 coins fall
+into 113,879,165 groups, 1.442 coins per group, and **89.51% of groups hold
+exactly one coin**, so for nine hits in ten there is nothing to scan.
+
+Both directions come out favourable or flat. A miss costs the same either way —
+hash, offset read, txid compare, return before the coin is read — so the whole
+difference on that path is 62% fewer of them. A hit adds an average 1.442
+comparisons over bytes already in the window it read. And the key shrinks from
+36 bytes to 32 while the key set falls 30.7%, from 164M outpoints to 114M
+txids, which makes both the hash and the offset table smaller.
+
+The head-to-head was then run, and it is more favourable than the reasoning
+predicted. Both indexes were opened in one process and measured alternately, so
+the twofold drift this hardware shows between consecutive runs acts on both
+sides equally. Over 200,000 absent txids — the query a duplicate check actually
+makes — the miss path measured:
+
+| pass | outpoint-keyed | txid-keyed | ratio |
+|---|---:|---:|---:|
+| 1 | 146,634/s | 164,976/s | 1.13x |
+| 2 | 133,966/s | 187,829/s | 1.40x |
+| 3 | 136,809/s | 186,406/s | 1.36x |
+
+A miss is not merely as cheap under txid keying, it is about 1.38x cheaper once
+warm. The key set is 30.7% smaller, so the hash has fewer levels and the offset
+table is smaller and closer together. The two effects compound: 38.1% as many
+probes at roughly 1/1.38 the cost each puts the duplicate check at about 27.6%
+of its current cost, a 72% reduction — 10.4% of batch time down to about 2.9%
+idle, and 18.9% down to about 5.2% under contention.
+
+The first txid-keyed comparison sidecar was also smaller and faster to publish:
+957,969,566 bytes against 1,155,791,488, 17.1% less, built in 77.9s against
+138s. Porting that keying into the overlay's bit-packed, on-disk table removed
+the backward-distance field as well. The current version-2 artifact is
+530,926,239 bytes, uses 18 MPHF levels over 113,879,165 groups, and stores one
+34-bit offset per group — 54.1% smaller than the former overlay format.
+
+Three things were wrong in the original judgement against this, and all three
+were assumptions rather than measurements: the 10.4% share came from an idle
+machine when a loaded one shows 18.9%; the in-group scan feared on hits barely
+exists, since 89.51% of groups hold one coin; and misses were assumed to cost
+the same under either keying when they are 1.38x cheaper. The overlay/CLI index
+now uses txid keying. A separate library-level version-3 index still coexists,
+so format/API reconciliation remains cleanup work rather than an unresolved
+keying decision.
+
+Independent of budget, the enforcement point also stands:
+redb cannot hold a hard ceiling by measurement alone, and its equilibrium sat
+a third above the number it was given at 3 GiB. These earlier replays used
+64-block batches, which held steady at
+6–12 seconds including download, structure validation, staging, consensus
+execution, and publish. `capacity()` reports `last_pgno`-based usage — the
+figure `MDBX_MAP_FULL` actually checks — not a freelist-adjusted "logical
+bytes" figure, which the same soak found could stay low immediately after a
+rebase while the environment was already unable to grow further.
+
 Snapshot distribution remains explicitly operator-selected instead of becoming
 a new trust service. `--download-core-assumeutxo` accepts only a bounded,
 credential-free HTTPS URL plus an exact expected length and a new output file.
@@ -615,7 +1352,7 @@ The marker deliberately survives successful execution and restart, so assumed st
 
 Synchronous staging, UTXO prefetch, script execution, and redb work enter Tokio's blocking region, so each worker is replaced while it waits and two concurrent pipelines cannot deadlock the next-window network futures. Each task has a bounded 8 GiB redb cache, keeping the aggregate bulk cache at 16 GiB while reducing random B-tree read amplification relative to the ordinary 1 GiB live-node cache. Network receive, structure validation, immutable freezer staging, and next-window prefetch remain independent; final redb transactions share one process-wide commit turn, avoiding concurrent random-I/O cache thrash on the same physical device without merging their failure domains. Only the API-serving side maintains an explorer projection; the isolated validator does not build an unused historical transaction index. The active loop publishes its execution/header tips. Until they match, the validator continues with the smaller of its configured batch and a bounded 252-block checkpoint, without an artificial pause; the ceiling keeps consensus-maximum payload below one GiB and amortizes freezer/index/fsync work. Once active serving catches up, its configured batch and pause limits are restored. Keeping a bounded independent window avoids per-block network round trips and durable database transactions without enlarging one peer request or partial publication. The loopback explorer exposes this state at `/api/v1/validation`, including the immutable target, both tips, remaining work, lifecycle phase, throttle state, and terminal error. The active loop consumes successful completion, compares the independently streamed UTXO identity, and commits marker removal while its API remains live. An active-side failure aborts and joins validation; a validation or finalization failure aborts and joins active service, terminates the combined service, and leaves resumable state. `--once` waits for both tasks and performs the same finalization after their stores close. `--complete-assumeutxo` remains the sequential operational fallback.
 
-Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 64; in background mode the same cap applies independently to active base-to-live execution so both pipelines can use bounded dual-peer windows. The downloader fills a checkpoint through 16-block protocol requests so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` applies only to the validator, so serving chainstate retains no artificial pause. Deferred allocator repair applies to both background bulk pipelines: ordinary commits remain atomic and durable, orderly database close emits one quick-repair allocator snapshot, and only an unclean stop pays a full repair on the next open. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
+Both paths use the active marker as target authority, reject equal or nested canonical data directories, symlink paths, and Unix inode aliases, and bind the first target as immutable execution metadata after consensus-configuration binding. Restart accepts only the same height/hash, automatically restores a persisted ceiling when the CLI target is omitted, rejects assumed state, and refuses a target behind the durable tip. The atomic execution store independently rejects a different hash at the target or any transition above it. `--validation-batch-size` caps each aggregate atomic chainstate/explorer checkpoint at 1–1,008 blocks and defaults to 256; in background mode the same cap applies independently to active base-to-live execution so both pipelines can use bounded dual-peer windows. The downloader fills a checkpoint through 16-block protocol requests so a larger durability batch does not enlarge one peer request. The 1,008-block ceiling implies approximately 4 GiB of consensus-maximum payload and is an explicit high-memory validation-host setting, with the ledger's independent 1 GiB record ceiling still enforced. `--validation-pause-ms` applies only to the validator, so serving chainstate retains no artificial pause. Deferred allocator repair applies to both background bulk pipelines: ordinary commits remain atomic and durable, orderly database close emits one quick-repair allocator snapshot, and only an unclean stop pays a full repair on the next open. Finalization requires identical network and consensus identities, exact validation tip/base equality, an optional bound-target/base match, active-header membership, and a streaming canonical merge/hash of both validation UTXO tiers. Only marker removal is committed after the identity is rechecked; snapshot-origin metadata remains durable.
 
 Validation storage is retained by default. The destructive `--cleanup-validation-dir` option is accepted only by the automatic completion modes and is gated by a versioned, owner-only marker created only when rBTC first observed an absent or empty directory. The marker uses strict size-bounded JSON and binds a canonical network and target height/hash; its contents and containing directory are synced on Unix before the claim is considered durable. After successful finalization, cleanup canonicalizes the active and validation paths again, reopens the validation chainstate, requires its non-assumed tip and bound target to equal the snapshot base, allowlists top-level rBTC artifacts, and recursively rejects symlinks and special files. It then atomically renames the directory to a randomized sibling quarantine, syncs the parent, removes the quarantine, and syncs the parent again so both namespace transitions are durable. Failure of the first parent sync rolls the rename back before deletion; failure of the final sync reports that removal completed but its namespace durability is uncertain. An unowned legacy directory or any unexpected artifact is preserved with an error; manual two-step finalization never deletes it.
 

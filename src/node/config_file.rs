@@ -20,7 +20,7 @@ const LIST_KEYS: [&str; 7] = [
     "whitelist",
     "onlynet",
 ];
-const BOOL_KEYS: [&str; 9] = [
+const BOOL_KEYS: [&str; 10] = [
     "block_filter_index",
     "cleanup_validation_dir",
     "dns_seeds",
@@ -29,9 +29,10 @@ const BOOL_KEYS: [&str; 9] = [
     "once",
     "spent_output_index",
     "txindex",
+    "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 33] = [
+const VALUE_KEYS: [&str; 37] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -65,6 +66,10 @@ const VALUE_KEYS: [&str; 33] = [
     "validation_pause_ms",
     "wallet_auth_token_file",
     "wallet_descriptors",
+    "zmq_listen",
+    "torcontrol",
+    "torcontrol_cookie",
+    "i2psam",
 ];
 
 #[derive(Clone, Debug)]
@@ -323,6 +328,8 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
             ("spent_output_index", false) => "--no-spent-output-index",
             ("txindex", true) => "--txindex",
             ("txindex", false) => "--no-txindex",
+            ("v2_transport", true) => "--v2-transport",
+            ("v2_transport", false) => "--no-v2-transport",
             ("validation_deferred_repair", true) => "--validation-deferred-repair",
             ("validation_deferred_repair", false) => "--validation-quick-repair",
             _ => unreachable!("known boolean config key"),
@@ -393,6 +400,10 @@ fn flag_for_key(key: &str) -> &'static str {
         "wallet_auth_token_file" => "--wallet-auth-token-file",
         "wallet_descriptors" => "--wallet-descriptors",
         "whitelist" => "--whitelist",
+        "zmq_listen" => "--zmq-listen",
+        "torcontrol" => "--torcontrol",
+        "torcontrol_cookie" => "--torcontrol-cookie",
+        "i2psam" => "--i2psam",
         _ => unreachable!("known value or list config key"),
     }
 }
@@ -447,6 +458,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--no-once"
             | "--no-spent-output-index"
             | "--no-txindex"
+            | "--no-v2-transport"
             | "--once"
             | "--prune-blocks"
             | "--prune-max-bytes"
@@ -457,6 +469,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--signetseednode"
             | "--testactivationheight"
             | "--txindex"
+            | "--v2-transport"
             | "--validation-batch-size"
             | "--validation-deferred-repair"
             | "--validation-pause-ms"
@@ -466,6 +479,10 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--wallet-auth-token-file"
             | "--wallet-descriptors"
             | "--whitelist"
+            | "--zmq-listen"
+            | "--torcontrol"
+            | "--torcontrol-cookie"
+            | "--i2psam"
     )
     .then_some(group)
 }
@@ -481,6 +498,7 @@ fn option_group(flag: &str) -> &'static str {
         "--no-once" | "--once" => "once",
         "--spent-output-index" | "--no-spent-output-index" => "spent-output-index",
         "--txindex" | "--no-txindex" => "txindex",
+        "--v2-transport" | "--no-v2-transport" => "v2-transport",
         "--validation-deferred-repair" | "--validation-quick-repair" => "validation-repair",
         "--background-assumeutxo" => "background-assumeutxo",
         "--background-chainstate-cache-bytes" => "background-chainstate-cache-bytes",
@@ -518,6 +536,10 @@ fn option_group(flag: &str) -> &'static str {
         "--wallet-auth-token-file" => "wallet-auth-token-file",
         "--wallet-descriptors" => "wallet-descriptors",
         "--whitelist" => "whitelist",
+        "--zmq-listen" => "zmq-listen",
+        "--torcontrol" => "torcontrol",
+        "--torcontrol-cookie" => "torcontrol-cookie",
+        "--i2psam" => "i2psam",
         _ => "unknown",
     }
 }

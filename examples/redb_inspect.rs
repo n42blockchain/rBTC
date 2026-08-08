@@ -1,3 +1,4 @@
+//! Prints table names and entry counts from a redb chainstate file.
 use std::{env, error::Error, fs, path::Path};
 
 use redb::{Database, ReadableTableMetadata, TableHandle};

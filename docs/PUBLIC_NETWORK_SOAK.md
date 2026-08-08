@@ -1,11 +1,17 @@
 # Public-network soak
 
-Status date: 2026-07-28.
+Status date: 2026-08-08.
+
+The minimum seven-day boundary has passed, but this repository does not contain
+an accepted output from the fail-closed finalizer. The release gate therefore
+remains open; wall-clock elapsed time is not evidence that the restart,
+fault-injection, peer-diversity, tip-consistency, and data-growth checks passed.
 
 ## Replacement acceptance run
 
-The current release-gate run started at `2026-07-28T11:12:36Z` and cannot
-satisfy the seven-day duration before `2026-08-04T11:12:36Z`. Evidence is under
+The release-gate run started at `2026-07-28T11:12:36Z` and could not satisfy
+the seven-day duration before `2026-08-04T11:12:36Z`. Its external evidence was
+recorded under
 `/Users/jieliu/Documents/n42/rBTC-public-soak-20260728`. It pins commit
 `83bd350ff2b80d1a31308c380247ac07ae8f7c05`, immutable release binary SHA-256
 `d5c0fe4c36c3e1aaa7b59b1006f6a69f14ebceb53526ce071e627577fd3fec5b`,
@@ -34,9 +40,9 @@ exhausted. It retries with jittered exponential backoff from five seconds to
 five minutes and remains immediately responsive to authenticated or signal
 shutdown. `--once` retains deterministic failure/exit behavior.
 
-The one-day recovery exercises are scheduled for
-`2026-07-29T11:12:36Z`; the fail-closed seven-day finalizer is scheduled for
-`2026-08-04T11:12:36Z`.
+The runbook scheduled the one-day recovery exercises for
+`2026-07-29T11:12:36Z` and the fail-closed seven-day finalizer for
+`2026-08-04T11:12:36Z`; an accepted generated report is still required.
 
 ## Invalidated predecessor run
 

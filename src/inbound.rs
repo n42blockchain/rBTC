@@ -12,7 +12,7 @@ use std::{
 };
 
 use bitcoin::{
-    Block, BlockHash, Transaction,
+    Block, BlockHash, Transaction, Txid, Wtxid,
     bip152::{BlockTransactions, HeaderAndShortIds},
     bip158::{FilterHash, FilterHeader},
     block::Header,
@@ -38,7 +38,7 @@ use tokio::{
 use crate::{
     p2p::{
         InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
-        MAX_INVENTORY_ENTRIES, P2pError, TransactionRelay, accept_inbound,
+        MAX_INVENTORY_ENTRIES, OnionAddress, P2pError, TransactionRelay, accept_inbound,
     },
     utxo::{OutPointKey, Utxo},
 };
@@ -502,6 +502,14 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         None
     }
+
+    /// Published local onion service and its exact service bits.
+    ///
+    /// Only peers that negotiated BIP155 can receive it, because an onion
+    /// address has no legacy `addr` encoding.
+    fn advertised_onion(&self) -> Option<(OnionAddress, ServiceFlags)> {
+        None
+    }
     /// Current local minimum mempool fee in satoshis per 1,000 virtual bytes.
     fn fee_filter_sat_kvb(&self) -> Result<u64, String> {
         Ok(0)
@@ -510,6 +518,51 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn utxo(&self, _outpoint: OutPointKey) -> Result<Option<Utxo>, String> {
         Ok(None)
     }
+
+    /// Dry-run consensus and policy admission for an authenticated local
+    /// caller.
+    ///
+    /// The candidate transactions are evaluated as one dependency-connected
+    /// package against the current chainstate and mempool, exactly as the
+    /// ordinary admission path would, but nothing is retained, persisted, or
+    /// relayed. Implementations without chain context report no support.
+    fn test_accept(
+        &self,
+        _transactions: Vec<Transaction>,
+    ) -> Result<Vec<TestAcceptResult>, String> {
+        Err("dry-run admission is unavailable on this data source".to_owned())
+    }
+
+    /// One bounded, ordered page of the active UTXO set.
+    ///
+    /// Pages start after `after` in database key order and are limited to
+    /// `limit` entries, so a caller walks the set in fixed memory instead of
+    /// materializing it. Implementations without chain context report no
+    /// support.
+    fn chainstate_page(
+        &self,
+        _after: Option<OutPointKey>,
+        _limit: usize,
+    ) -> Result<Vec<(OutPointKey, Utxo)>, String> {
+        Err("chainstate scanning is unavailable on this data source".to_owned())
+    }
+}
+
+/// One dry-run admission verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TestAcceptResult {
+    /// Candidate transaction ID.
+    pub txid: Txid,
+    /// Candidate witness transaction ID.
+    pub wtxid: Wtxid,
+    /// Whether ordinary admission would accept the transaction now.
+    pub allowed: bool,
+    /// Policy virtual size, present when the candidate was accepted.
+    pub vsize: Option<usize>,
+    /// Absolute fee in satoshis, present when the candidate was accepted.
+    pub fee_sats: Option<u64>,
+    /// Bounded rejection reason, present when the candidate was refused.
+    pub reject_reason: Option<String>,
 }
 
 /// Inbound listener or peer-service failure.
@@ -1294,6 +1347,10 @@ async fn serve_addresses(
             .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE.saturating_sub(addresses.len()))
             .map(|address| (now, Address::new(&address, services))),
     );
+    let onion = peer
+        .addrv2_relay()
+        .then(|| source.advertised_onion())
+        .flatten();
     let message = if peer.addrv2_relay() {
         NetworkMessage::AddrV2(
             addresses
@@ -1312,6 +1369,13 @@ async fn serve_addresses(
                         port: socket.port(),
                     }
                 })
+                .chain(onion.map(|(onion, services)| AddrV2Message {
+                    time: now,
+                    services,
+                    addr: AddrV2::TorV3(onion.public_key()),
+                    port: onion.port(),
+                }))
+                .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
                 .collect(),
         )
     } else {
@@ -2142,7 +2206,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Headers(headers) if headers.is_empty()
         ));
 
@@ -2154,7 +2218,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Inv(inventory) if inventory.is_empty()
         ));
 
@@ -2163,7 +2227,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Inv(inventory)
                 if inventory == vec![Inventory::WTx(relayed.compute_wtxid())]
         ));
@@ -2177,11 +2241,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::Tx(actual) if actual == relayed
         ));
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::NotFound(inventory) if inventory == vec![missing]
         ));
 
@@ -2190,7 +2254,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CmpctBlock(_)
         ));
         transport
@@ -2203,7 +2267,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::BlockTxn(response)
                 if response.transactions.block_hash == hash
                     && response.transactions.transactions.len() == 1
@@ -2218,7 +2282,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFilter(filter)
                 if filter.block_hash == hash && filter.filter == vec![0]
         ));
@@ -2231,7 +2295,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFHeaders(headers)
                 if headers.stop_hash == hash
                     && headers.previous_filter_header == FilterHeader::all_zeros()
@@ -2245,7 +2309,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            transport.read_message().await.unwrap().into_payload(),
+            transport.read_message().await.unwrap(),
             NetworkMessage::CFCheckpt(checkpoint)
                 if checkpoint.stop_hash == hash && checkpoint.filter_headers.is_empty()
         ));

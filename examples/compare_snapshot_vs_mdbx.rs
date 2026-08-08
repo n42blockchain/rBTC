@@ -1,12 +1,17 @@
 //! Compare one Core31 `utxo-*.dat` snapshot against MDBX hot/cold UTXO tables.
 //! Can also export a static key-index + value payload layout from the snapshot.
+//!
+//! A diagnostic tool: the ratios it prints are for human reading, and the
+//! stream comparison is a three-way merge whose branches read more clearly
+//! as ordered `if` arms than as a `match` on an ordering.
+#![allow(clippy::cast_precision_loss, clippy::comparison_chain)]
 
 use std::{
     collections::VecDeque,
     env,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[cfg(feature = "mdbx")]
@@ -23,6 +28,7 @@ const MAX_COMPACT_SIZE: u64 = 0x0200_0000;
 const MAX_SCRIPT_BYTES: u64 = 10_000;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum ToolError {
     Io(io::Error),
     Msg(&'static str),
@@ -191,11 +197,11 @@ impl SnapshotMdbxIter {
         for (key, utxo) in page {
             let value_hash = {
                 let mut hasher = Sha256::new();
-                hasher.update(&utxo.value_sats.to_le_bytes());
-                hasher.update(&utxo.height.to_le_bytes());
-                hasher.update(&[u8::from(utxo.is_coinbase)]);
+                hasher.update(utxo.value_sats.to_le_bytes());
+                hasher.update(utxo.height.to_le_bytes());
+                hasher.update([u8::from(utxo.is_coinbase)]);
                 hasher.update(
-                    &u64::try_from(utxo.script_pubkey.len())
+                    u64::try_from(utxo.script_pubkey.len())
                         .expect("usize fits u64")
                         .to_le_bytes(),
                 );
@@ -218,7 +224,7 @@ impl SnapshotMdbxIter {
                 return Ok(None);
             }
         }
-        let item = self.buffer[self.index].clone();
+        let item = self.buffer[self.index];
         self.index += 1;
         Ok(Some(item))
     }
@@ -270,10 +276,10 @@ fn run_compare(
                     mdbx_rows += 1;
                     base_last = Some(base.key);
                     tip_last = Some(*tip_key);
-                    if base.value_hash != *tip_hash {
-                        modified += 1;
-                    } else {
+                    if base.value_hash == *tip_hash {
                         unchanged += 1;
+                    } else {
+                        modified += 1;
                     }
                     snapshot_row = snapshot.next()?;
                     mdbx_row = mdbx_iter.next()?;
@@ -304,8 +310,7 @@ fn run_compare(
     let changed = added + removed + modified;
     let union = added + removed + unchanged + modified;
     println!(
-        "base_unique={}, tip_unique={}, added={}, removed={}, modified={}, unchanged={}",
-        snapshot_rows, mdbx_rows, added, removed, modified, unchanged
+        "base_unique={snapshot_rows}, tip_unique={mdbx_rows}, added={added}, removed={removed}, modified={modified}, unchanged={unchanged}"
     );
     println!(
         "changed={}, union={}, changed/base={:.6}, changed/tip={:.6}, changed/union={:.6}",
@@ -316,7 +321,7 @@ fn run_compare(
         (changed as f64) / (union.max(1) as f64)
     );
     if let Some(directory) = static_dir {
-        export_static(snapshot_path, directory)?;
+        export_static(snapshot_path, &directory)?;
     }
     let duplicate_records = snapshot.duplicate_records;
     if duplicate_records > 0 {
@@ -326,8 +331,8 @@ fn run_compare(
 }
 
 #[cfg(feature = "mdbx")]
-fn export_static(snapshot_path: PathBuf, directory: PathBuf) -> ToolResult<()> {
-    fs::create_dir_all(&directory)?;
+fn export_static(snapshot_path: PathBuf, directory: &Path) -> ToolResult<()> {
+    fs::create_dir_all(directory)?;
     let mut snapshot = SnapshotReader::new(snapshot_path)?;
     let mut index = OpenOptions::new()
         .create(true)

@@ -33,12 +33,12 @@ use crate::{
 
 const SNAPSHOT_MAGIC: &[u8; 5] = b"utxo\xff";
 const SNAPSHOT_VERSION: u16 = 2;
-const METADATA_BYTES: usize = 5 + 2 + 4 + 32 + 8;
+pub(crate) const METADATA_BYTES: usize = 5 + 2 + 4 + 32 + 8;
 const MAX_COMPACT_SIZE: u64 = 0x0200_0000;
 const MAX_SCRIPT_BYTES: u64 = 10_000;
 // Each output contributes at least 9 non-witness bytes, or 36 weight units.
 // Transaction overhead makes this a conservative per-txid upper bound.
-const MAX_COINS_PER_TXID: u64 = 4_000_000 / 36;
+pub(crate) const MAX_COINS_PER_TXID: u64 = 4_000_000 / 36;
 const INDEX_MAGIC: &[u8; 8] = b"RBTCMPH1";
 const INDEX_VERSION: u16 = 3;
 const MAX_INDEX_LEVELS: usize = 64;
@@ -327,7 +327,12 @@ impl CoreSnapshotIndex {
     }
 
     /// Average grouped AssumeUTXO key bytes per individual UTXO.
+    ///
+    /// Reported for operators rather than used in any decision, and both
+    /// operands stay far below `f64`'s exact-integer range for any real
+    /// snapshot, so the conversion cannot lose meaningful precision here.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn average_serialized_key_bytes(&self) -> f64 {
         self.serialized_key_bytes as f64 / self.metadata.coins_count as f64
     }
@@ -473,7 +478,9 @@ fn open_snapshot(
     Ok((reader, metadata))
 }
 
-fn read_metadata(reader: &mut impl Read) -> Result<CoreSnapshotMetadata, CoreSnapshotError> {
+pub(crate) fn read_metadata(
+    reader: &mut impl Read,
+) -> Result<CoreSnapshotMetadata, CoreSnapshotError> {
     let mut header = [0_u8; METADATA_BYTES];
     reader.read_exact(&mut header)?;
     if &header[..5] != SNAPSHOT_MAGIC {
@@ -688,6 +695,7 @@ fn hash_txid(txid: &[u8; 32], seed: u64) -> u64 {
     hash ^ (hash >> 32)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_snapshot_index(
     path: &Path,
     metadata: CoreSnapshotMetadata,
@@ -742,6 +750,7 @@ fn write_snapshot_index(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn read_snapshot_index(
     path: &Path,
 ) -> Result<
@@ -860,7 +869,7 @@ fn build_word_ranks(bits: &[u64]) -> Vec<usize> {
 fn sha256_file(path: &Path) -> Result<[u8; 32], CoreSnapshotError> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
@@ -904,7 +913,7 @@ fn read_u64(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn network_for_magic(magic: Magic) -> Option<Network> {
+pub(crate) fn network_for_magic(magic: Magic) -> Option<Network> {
     [
         Network::Bitcoin,
         Network::Testnet,
@@ -916,7 +925,7 @@ fn network_for_magic(magic: Magic) -> Option<Network> {
     .find(|network| network.magic() == magic)
 }
 
-fn find_anchor(
+pub(crate) fn find_anchor(
     metadata: CoreSnapshotMetadata,
 ) -> Result<Core31AssumeUtxoAnchor, CoreSnapshotError> {
     core31_assumeutxo_anchors(metadata.network)
@@ -1118,7 +1127,7 @@ impl<R: Read> Iterator for CoreCoinReader<'_, R> {
     }
 }
 
-fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
+pub(crate) fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     let first = read_byte(reader)?;
     let value = match first {
         0..=252 => u64::from(first),
@@ -1156,7 +1165,7 @@ fn read_compact_size(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     Ok(value)
 }
 
-fn read_core_varint(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
+pub(crate) fn read_core_varint(reader: &mut impl Read) -> Result<u64, CoreSnapshotError> {
     let mut value = 0_u64;
     loop {
         let byte = read_byte(reader)?;
@@ -1179,7 +1188,103 @@ fn read_byte(reader: &mut impl Read) -> Result<u8, CoreSnapshotError> {
     Ok(byte[0])
 }
 
-fn decompress_amount(mut value: u64) -> Option<u64> {
+/// Encodes a satoshi amount with Core's `CompressAmount` transform, the exact
+/// inverse of [`decompress_amount`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
+pub(crate) fn compress_amount(mut amount: u64) -> u64 {
+    if amount == 0 {
+        return 0;
+    }
+    let mut exponent = 0_u64;
+    while amount % 10 == 0 && exponent < 9 {
+        amount /= 10;
+        exponent += 1;
+    }
+    if exponent < 9 {
+        let digit = amount % 10;
+        amount /= 10;
+        1 + (amount * 9 + digit - 1) * 10 + exponent
+    } else {
+        1 + (amount - 1) * 10 + 9
+    }
+}
+
+/// Appends Core's `VARINT` encoding, the exact inverse of [`read_core_varint`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
+pub(crate) fn write_core_varint(out: &mut Vec<u8>, mut value: u64) {
+    let mut reversed = Vec::with_capacity(10);
+    loop {
+        let low = u8::try_from(value & 0x7f).expect("seven bits fit u8");
+        reversed.push(low | if reversed.is_empty() { 0x00 } else { 0x80 });
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7) - 1;
+    }
+    reversed.reverse();
+    out.extend_from_slice(&reversed);
+}
+
+/// Appends a canonical Bitcoin CompactSize, the inverse of [`read_compact_size`].
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
+pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
+    if value < 253 {
+        out.push(u8::try_from(value).expect("small CompactSize fits u8"));
+    } else if let Ok(value16) = u16::try_from(value) {
+        out.push(253);
+        out.extend_from_slice(&value16.to_le_bytes());
+    } else if let Ok(value32) = u32::try_from(value) {
+        out.push(254);
+        out.extend_from_slice(&value32.to_le_bytes());
+    } else {
+        out.push(255);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Appends Core's compressed script encoding, the exact inverse of
+/// [`decompress_script`]: the six standard templates when the script matches
+/// one, otherwise the raw bytes behind a `length + 6` size prefix.
+#[cfg_attr(not(feature = "mdbx"), allow(dead_code))]
+pub(crate) fn compress_script(out: &mut Vec<u8>, script: &[u8]) {
+    match script {
+        [0x76, 0xa9, 20, hash @ .., 0x88, 0xac] if hash.len() == 20 => {
+            write_core_varint(out, 0);
+            out.extend_from_slice(hash);
+        }
+        [0xa9, 20, hash @ .., 0x87] if hash.len() == 20 => {
+            write_core_varint(out, 1);
+            out.extend_from_slice(hash);
+        }
+        [33, parity @ (2 | 3), x @ .., 0xac] if x.len() == 32 => {
+            write_core_varint(out, u64::from(*parity));
+            out.extend_from_slice(x);
+        }
+        [65, key @ .., 0xac]
+            if key.len() == 65 && key[0] == 0x04 && PublicKey::from_slice(key).is_ok() =>
+        {
+            // Core's CompressScript only compresses the standard uncompressed
+            // tag (0x04); SEC1's rarely-used hybrid tags (0x06/0x07) parse as
+            // valid points through libsecp256k1 but are never compressed by
+            // Core, so compressing them here would be lossy: decompression's
+            // `serialize_uncompressed` always re-emits tag 0x04, silently
+            // discarding an original hybrid tag. Requiring the exact tag
+            // keeps this the precise inverse of `decompress_script`, whose
+            // own output is always tag 0x04.
+            write_core_varint(out, 4 + u64::from(key[64] & 1));
+            out.extend_from_slice(&key[1..33]);
+        }
+        raw => {
+            write_core_varint(
+                out,
+                u64::try_from(raw.len()).expect("script length fits u64") + 6,
+            );
+            out.extend_from_slice(raw);
+        }
+    }
+}
+
+pub(crate) fn decompress_amount(mut value: u64) -> Option<u64> {
     if value == 0 {
         return Some(0);
     }
@@ -1200,7 +1305,7 @@ fn decompress_amount(mut value: u64) -> Option<u64> {
     Some(amount)
 }
 
-fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotError> {
+pub(crate) fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotError> {
     let size = read_core_varint(reader)?;
     match size {
         0 => {
@@ -1260,7 +1365,11 @@ fn decompress_script(reader: &mut impl Read) -> Result<Vec<u8>, CoreSnapshotErro
     }
 }
 
-fn update_core_utxo_hash(engine: &mut sha256::HashEngine, key: OutPointKey, utxo: &Utxo) {
+pub(crate) fn update_core_utxo_hash(
+    engine: &mut sha256::HashEngine,
+    key: OutPointKey,
+    utxo: &Utxo,
+) {
     engine.input(key.as_bytes());
     engine.input(&((utxo.height << 1) + u32::from(u8::from(utxo.is_coinbase))).to_le_bytes());
     engine.input(&utxo.value_sats.to_le_bytes());
@@ -1286,6 +1395,8 @@ fn write_compact_size_hash(engine: &mut sha256::HashEngine, value: u64) {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+
+    use bitcoin::hex::FromHex;
 
     use super::*;
     use tempfile::NamedTempFile;
@@ -1435,6 +1546,115 @@ mod tests {
     fn rejects_noncanonical_compact_size() {
         let error = read_compact_size(&mut Cursor::new([253, 1, 0])).unwrap_err();
         assert!(matches!(error, CoreSnapshotError::Invalid(_)));
+    }
+
+    #[test]
+    fn amount_compression_roundtrips_core_values() {
+        for amount in [
+            0_u64,
+            1,
+            330,
+            546,
+            1_000,
+            12_345,
+            50_0000_0000,
+            2_099_999_997_690_000,
+            u64::from(u32::MAX),
+        ] {
+            assert_eq!(decompress_amount(compress_amount(amount)), Some(amount));
+        }
+        for compressed in 0_u64..10_000 {
+            if let Some(amount) = decompress_amount(compressed) {
+                assert_eq!(compress_amount(amount), compressed);
+            }
+        }
+    }
+
+    #[test]
+    fn varint_and_compact_size_encoders_roundtrip() {
+        for value in [
+            0_u64, 1, 0x7f, 0x80, 0x407f, 0x4080, 252, 253, 65_535, 65_536, 1_000_000,
+        ] {
+            let mut bytes = Vec::new();
+            write_core_varint(&mut bytes, value);
+            assert_eq!(read_core_varint(&mut Cursor::new(bytes)).unwrap(), value);
+
+            let mut bytes = Vec::new();
+            write_compact_size(&mut bytes, value);
+            assert_eq!(read_compact_size(&mut Cursor::new(bytes)).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn script_compression_roundtrips_templates_and_raw_scripts() {
+        let p2pkh = [&[0x76, 0xa9, 20][..], &[7_u8; 20], &[0x88, 0xac]].concat();
+        let p2sh = [&[0xa9, 20][..], &[8_u8; 20], &[0x87]].concat();
+        let compressed_p2pk = [&[33, 2][..], &[9_u8; 32], &[0xac]].concat();
+        let generator_uncompressed = PublicKey::from_slice(
+            &[
+                &[2][..],
+                &[
+                    0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+                    0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2,
+                    0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+                ],
+            ]
+            .concat(),
+        )
+        .unwrap()
+        .serialize_uncompressed();
+        let p2pk_uncompressed = [&[65][..], &generator_uncompressed, &[0xac]].concat();
+        let invalid_uncompressed = [&[65, 4][..], &[0xff_u8; 64], &[0xac]].concat();
+        // SEC1's rarely-used hybrid tag (0x06 = even Y, redundant with the
+        // explicit Y bytes) is a real historic Bitcoin script pattern: height
+        // 707,034's coin at the 935,000 mainnet snapshot is a P2PK output
+        // using it. `libsecp256k1` parses hybrid keys as valid points, but
+        // Core's CompressScript never compresses them, so they must stay raw
+        // to round-trip exactly; only the tag byte differs from the
+        // already-covered standard-uncompressed case above.
+        let mut p2pk_hybrid_even_y = p2pk_uncompressed.clone();
+        p2pk_hybrid_even_y[1] = 0x06;
+        let raw = vec![0x51, 0xac];
+        let empty: Vec<u8> = Vec::new();
+
+        for (script, expected_prefix) in [
+            (&p2pkh, 0_u8),
+            (&p2sh, 1),
+            (&compressed_p2pk, 2),
+            (&p2pk_uncompressed, 4),
+            (&invalid_uncompressed, 67 + 6),
+            (&p2pk_hybrid_even_y, 67 + 6),
+            (&raw, 2 + 6),
+            (&empty, 6),
+        ] {
+            let mut bytes = Vec::new();
+            compress_script(&mut bytes, script);
+            assert_eq!(bytes[0], expected_prefix, "prefix for {script:02x?}");
+            let decoded = decompress_script(&mut Cursor::new(bytes)).unwrap();
+            assert_eq!(&decoded, script);
+        }
+    }
+
+    /// Regression test for a real mainnet coin found while rebasing past
+    /// height 935,000: a height-707,034 P2PK output using SEC1's hybrid
+    /// uncompressed tag 0x07. `compress_script` previously accepted any tag
+    /// `PublicKey::from_slice` parses, silently normalizing hybrid tags to
+    /// the standard 0x04 on decompression and breaking the UTXO-set
+    /// commitment. It must instead leave this script exactly as Core does:
+    /// uncompressed, byte for byte.
+    #[test]
+    fn hybrid_tagged_uncompressed_pubkey_stays_raw_and_exact() {
+        let script = <Vec<u8>>::from_hex(
+            "410719c980631d9039e3abe7768ec96e91c97cb85073c579d3c8eebe12ec86f42fbf08be7bd54fa7ebe9dad426b6777bdb6ccaa00a69ff040ca526f67ccdd2bf40d3ac",
+        )
+        .unwrap();
+        assert_eq!(script.len(), 67);
+        assert_eq!(script[1], 0x07);
+        let mut bytes = Vec::new();
+        compress_script(&mut bytes, &script);
+        // Raw fallback, not the lossy compressed-pubkey path.
+        assert_eq!(bytes[0], 67 + 6);
+        assert_eq!(decompress_script(&mut Cursor::new(bytes)).unwrap(), script);
     }
 
     #[test]

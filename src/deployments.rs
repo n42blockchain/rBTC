@@ -477,7 +477,7 @@ const fn network_tag(network: Network) -> u8 {
     }
 }
 
-const fn halving_interval(network: Network) -> u32 {
+pub(crate) const fn halving_interval(network: Network) -> u32 {
     match network {
         Network::Regtest => REGTEST_HALVING_INTERVAL,
         Network::Bitcoin | Network::Testnet | Network::Testnet4 | Network::Signet => {
