@@ -344,7 +344,11 @@ descriptor-timing divergence fails visibly rather than passing against a
 mock. The I2P case creates a SAM session on a live router, checks the
 published destination is BIP155-shaped, republishes the same address from a
 stored key, and confirms an unreachable destination fails within its
-deadline instead of hanging. Each test names the environment variables it
+deadline instead of hanging. A two-node case then runs both halves against
+the router: two sessions must coexist on one bridge, one accepts while the
+other dials it, and each side must receive the other's destination in
+`addrv2`. Setting `RBTC_I2P_SAM_B` runs the two nodes against separate
+bridges instead. Each test names the environment variables it
 requires and fails with that message when they are absent, so a partially
 configured run reports what is missing rather than silently passing.
 
