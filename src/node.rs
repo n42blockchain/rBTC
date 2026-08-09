@@ -116,7 +116,7 @@ use rbtc::{
     ibd::IbdPolicy,
     inbound::{
         InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
-        TestAcceptResult, run_listener_with_stats_and_relay,
+        TestAcceptResult, run_listener_with_i2p,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -5011,6 +5011,7 @@ impl InboundServer {
         stats: Arc<InboundStats>,
         serve_compact_filters: bool,
         transaction_relay: broadcast::Sender<TransactionRelay>,
+        i2p_session: Option<Arc<I2pSamSession>>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -5026,8 +5027,11 @@ impl InboundServer {
             limits.max_upload_bytes_per_day,
             limits.max_requests_per_minute
         );
+        if i2p_session.is_some() {
+            rbtc_info!("inbound I2P peers are accepted through the configured SAM session");
+        }
         let task = tokio::spawn(async move {
-            run_listener_with_stats_and_relay(
+            run_listener_with_i2p(
                 listener,
                 network.magic(),
                 local_nonce,
@@ -5037,6 +5041,7 @@ impl InboundServer {
                 source,
                 stats,
                 Some(transaction_relay),
+                i2p_session,
             )
             .await
             .map_err(|error| error.to_string())
@@ -7638,6 +7643,19 @@ async fn run_peer_pool_session(
                 inbound_service_flags(options.indexes.basic_filter),
             ))
         });
+    let i2p_session = match options.i2p_sam {
+        Some(bridge) => {
+            let session = Arc::new(create_i2p_session(options, bridge).await?);
+            if let Some(source) = &inbound_source {
+                source.install_advertised_i2p(Some((
+                    session.address().clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )));
+            }
+            Some(session)
+        }
+        None => None,
+    };
     let mut inbound_server = if let (Some(address), Some(source)) =
         (options.inbound_listen, inbound_source.as_ref())
     {
@@ -7655,24 +7673,12 @@ async fn run_peer_pool_session(
                     .stats(),
                 options.indexes.basic_filter,
                 transaction_relay.clone(),
+                i2p_session.clone(),
             )
             .await?,
         )
     } else {
         None
-    };
-    let i2p_session = match options.i2p_sam {
-        Some(bridge) => {
-            let session = Arc::new(create_i2p_session(options, bridge).await?);
-            if let Some(source) = &inbound_source {
-                source.install_advertised_i2p(Some((
-                    session.address().clone(),
-                    inbound_service_flags(options.indexes.basic_filter),
-                )));
-            }
-            Some(session)
-        }
-        None => None,
     };
     let _onion_service = match (&options.tor_control, options.inbound_listen) {
         (Some(tor), Some(listen)) => {

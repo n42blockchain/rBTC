@@ -187,8 +187,15 @@ documents for implementation detail and release boundaries.
   line-exactly because the very next byte already belongs to the peer. The
   SAM session identifier is derived from the network and data directory
   rather than fixed, so two nodes on one host do not collide with
-  `DUPLICATED_ID`. Wiring the accept loop into the inbound service remains
-  open.
+  `DUPLICATED_ID`. The accept loop runs inside the existing
+  inbound service, so I2P and routable peers share one global connection
+  semaphore, upload budget, and statistics rather than forming a second,
+  independently sized service. The per-source and per-group ceilings cannot
+  apply to a peer with no IP, so a separate eight-peer ceiling stands in for
+  them, and a small number of accepts is kept outstanding at the bridge
+  because awaiting one inline would drop a half-open SAM socket whenever
+  another intake won the select. A failing accept retires the I2P intake
+  without stopping the TCP one.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete

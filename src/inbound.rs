@@ -45,6 +45,15 @@ use crate::{
 };
 
 const MAX_GETBLOCKS_RESULTS: usize = 500;
+/// Concurrent inbound I2P peers, bounded independently of routable ones.
+///
+/// I2P peers carry no IP, so the per-source and per-group ceilings cannot
+/// apply to them. This ceiling takes their place, while the global
+/// connection semaphore and upload budget stay shared, so an open SAM bridge
+/// cannot displace routable capacity.
+const MAX_CONCURRENT_I2P_PEERS: usize = 8;
+/// Inbound I2P streams accepted ahead of the serving loop.
+const PENDING_I2P_ACCEPTS: usize = 2;
 const BASIC_FILTER_TYPE: u8 = 0;
 const FILTER_HEADER_INTERVAL: u32 = 1_000;
 const RECENT_BLOCK_UPLOAD_WINDOW: u32 = 288;
@@ -879,14 +888,142 @@ pub async fn run_listener_with_stats_and_relay(
     stats: Arc<InboundStats>,
     transaction_relay: Option<broadcast::Sender<TransactionRelay>>,
 ) -> Result<(), InboundError> {
+    run_listener_with_i2p(
+        listener,
+        magic,
+        local_nonce,
+        user_agent,
+        services,
+        limits,
+        source,
+        stats,
+        transaction_relay,
+        None,
+    )
+    .await
+}
+
+/// Serves inbound peers from a TCP listener and, when configured, from a
+/// SAM session.
+///
+/// Both sources share the global connection semaphore, upload budget, and
+/// statistics, so enabling I2P adds a bounded second intake rather than a
+/// second, independently sized service.
+///
+/// # Errors
+///
+/// Returns an error when the listener fails; a failing SAM accept retires
+/// the I2P intake without stopping the TCP one.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_listener_with_i2p(
+    listener: TcpListener,
+    magic: bitcoin::p2p::Magic,
+    local_nonce: u64,
+    user_agent: String,
+    services: ServiceFlags,
+    limits: InboundLimits,
+    source: Arc<dyn InboundDataSource>,
+    stats: Arc<InboundStats>,
+    transaction_relay: Option<broadcast::Sender<TransactionRelay>>,
+    i2p_session: Option<Arc<crate::i2p_sam::I2pSamSession>>,
+) -> Result<(), InboundError> {
     let global = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip = Arc::new(Mutex::new(HashMap::new()));
     let per_group = Arc::new(Mutex::new(HashMap::new()));
     let upload = Arc::new(UploadBudget::new(limits.max_upload_bytes_per_day));
     let mut peers = JoinSet::new();
     let mut cancellations: HashMap<u64, tokio::sync::oneshot::Sender<()>> = HashMap::new();
+    let i2p_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_I2P_PEERS));
+    // A producer task keeps a small number of accepts outstanding at the
+    // bridge. Awaiting the accept inline would drop a half-open SAM socket
+    // every time another branch of the select won.
+    let mut i2p_accepts = i2p_session.map(|session| {
+        let (sender, receiver) = tokio::sync::mpsc::channel(PENDING_I2P_ACCEPTS);
+        tokio::spawn(async move {
+            loop {
+                match session.accept_stream().await {
+                    Ok(accepted) => {
+                        if sender.send(accepted).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        crate::rbtc_warn!("inbound I2P accept failed: {error}");
+                        return;
+                    }
+                }
+            }
+        });
+        receiver
+    });
     loop {
         tokio::select! {
+            accepted = async {
+                match i2p_accepts.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(accepted) = accepted else {
+                    // The producer retired; stop polling this intake and keep
+                    // serving routable peers.
+                    i2p_accepts = None;
+                    continue;
+                };
+                // I2P peers have no IP, so the per-source and per-group
+                // ceilings cannot apply; their own ceiling stands in while
+                // the global slot keeps total inbound capacity shared.
+                let Ok(i2p_permit) = Arc::clone(&i2p_slots).try_acquire_owned() else {
+                    stats.reject_source();
+                    continue;
+                };
+                let unspecified =
+                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+                let Some(global_permit) = acquire_global_slot(
+                    &global,
+                    &mut peers,
+                    &mut cancellations,
+                    stats.as_ref(),
+                    unspecified,
+                    false,
+                ).await else {
+                    stats.reject_capacity();
+                    continue;
+                };
+                crate::rbtc_info!("accepted inbound I2P peer {}", accepted.peer);
+                // Statistics key on a socket address, which this peer does
+                // not have; the unspecified address records it as reachable
+                // through no IP rather than inventing one.
+                let account = stats.accept(unspecified, false);
+                let source = Arc::clone(&source);
+                let upload = Arc::clone(&upload);
+                let user_agent = user_agent.clone();
+                let relay = transaction_relay.as_ref().map(broadcast::Sender::subscribe);
+                let peer_limits = limits.clone();
+                let id = account.id;
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                peers.spawn(async move {
+                    let _global = global_permit;
+                    let _i2p = i2p_permit;
+                    tokio::select! {
+                        result = serve_peer(
+                            accepted.stream,
+                            magic,
+                            local_nonce,
+                            user_agent,
+                            services,
+                            peer_limits,
+                            source,
+                            upload,
+                            relay,
+                            &account,
+                        ) => account.finish(result.as_ref().err()),
+                        _ = cancelled => account.finish(Some(&InboundError::Evicted)),
+                    }
+                    id
+                });
+                cancellations.insert(id, cancel);
+            }
             accepted = listener.accept() => {
                 let (stream, remote) = accepted?;
                 let preferred = limits.preferred_peer_ips.contains(&remote.ip());

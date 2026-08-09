@@ -8,6 +8,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Added
 
+- Inbound I2P peers are accepted through the configured SAM session and
+  served by the existing inbound service, sharing its capacity and budgets.
+
 - Bitcoin, legacy testnet, Testnet4, Signet, and regtest full-node validation.
 - Core 31-compatible AssumeUTXO activation with independent background
   validation.
