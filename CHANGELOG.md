@@ -55,6 +55,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Fixed
 
+- The I2P SAM session identifier is derived per node instead of fixed, so a
+  second node on the same bridge no longer fails with `DUPLICATED_ID`.
+
 - `--onlynet onion` and `--onlynet i2p` no longer resolve DNS seeds before
   discarding every answer, which leaked the consulted seeds over the clear
   net.

@@ -270,6 +270,56 @@ impl I2pSamSession {
     }
 }
 
+/// One accepted inbound I2P peer.
+pub struct AcceptedI2pPeer {
+    /// The stream carrying ordinary Bitcoin P2P bytes.
+    pub stream: TcpStream,
+    /// The dialling peer's destination.
+    ///
+    /// SAM reports the full Destination of the remote side, from which the
+    /// BIP155 address is derived, so an accepted peer can be recorded and
+    /// ranked exactly like a learned one.
+    pub peer: I2pAddress,
+}
+
+impl I2pSamSession {
+    /// Waits for one inbound stream on this session.
+    ///
+    /// Each accept occupies its own socket, so a caller that wants several
+    /// concurrent inbound peers calls this repeatedly; the bridge queues at
+    /// most one pending connection per outstanding accept. The returned
+    /// stream carries ordinary Bitcoin P2P bytes, so the caller drives the
+    /// same inbound handshake it would on a TCP peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bridge refuses the accept, reports a
+    /// destination this client cannot parse, or any bound is violated.
+    pub async fn accept_stream(&self) -> Result<AcceptedI2pPeer, I2pSamError> {
+        let mut stream = connect_and_greet(self.bridge, self.config).await?;
+        command(
+            &mut stream,
+            &format!("STREAM ACCEPT ID={} SILENT=false", self.session_id),
+            self.config,
+        )
+        .await?;
+        // With `SILENT=false` the bridge writes the dialling peer's
+        // Destination on its own line before any peer byte, so this must be
+        // read line-exactly for the same reason every other reply is: the
+        // very next byte belongs to the peer.
+        let destination = read_reply_line(&mut stream).await?;
+        let destination = destination
+            .split_whitespace()
+            .next()
+            .ok_or(I2pSamError::MalformedReply)?;
+        if destination.len() > MAX_DESTINATION_KEY_LEN {
+            return Err(I2pSamError::OversizedParameter);
+        }
+        let peer = I2pAddress::from_destination_hash(destination_hash(destination)?);
+        Ok(AcceptedI2pPeer { stream, peer })
+    }
+}
+
 /// Connects to the bridge and completes SAM version negotiation.
 async fn connect_and_greet(
     bridge: SocketAddr,
@@ -502,6 +552,11 @@ mod tests {
                             format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n")
                         } else if line.starts_with("STREAM CONNECT") {
                             "STREAM STATUS RESULT=OK\n".to_owned()
+                        } else if line.starts_with("STREAM ACCEPT") {
+                            // Status, then the dialling peer's destination,
+                            // then the peer's own first bytes — all in one
+                            // write, which is what a bridge may really do.
+                            format!("STREAM STATUS RESULT=OK\n{destination}\nPEER-PAYLOAD")
                         } else {
                             "RESULT=I2P_ERROR MESSAGE=\"unsupported command\"\n".to_owned()
                         };
@@ -661,6 +716,51 @@ SESSION STATUS RESULT=OK DESTINATION={destination}
                 .await
                 .expect("a coalesced reply pair must still be parsed line by line");
         assert_eq!(session.destination_key(), test_destination());
+    }
+
+    #[tokio::test]
+    async fn accepted_streams_report_the_peer_and_keep_its_first_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        let commands = serve_sam_bridge(listener, "3.3");
+
+        let session = I2pSamSession::create(bridge, "rbtc-accept", None, I2pSamConfig::default())
+            .await
+            .expect("the session is created");
+        let mut accepted = session.accept_stream().await.expect("an inbound stream");
+
+        // The mock announces this node's own destination, which is enough to
+        // prove the reported peer is derived from the announced Destination
+        // rather than invented.
+        let blob = test_destination_blob();
+        assert_eq!(
+            accepted.peer,
+            I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(
+                &blob[..DESTINATION_BASE_LEN]
+            )))
+        );
+
+        // Everything after the destination line belongs to the peer and must
+        // still be readable: consuming one byte too many here would corrupt
+        // the Bitcoin handshake that follows.
+        let mut payload = [0_u8; 12];
+        accepted
+            .stream
+            .read_exact(&mut payload)
+            .await
+            .expect("the peer's first bytes survive the accept");
+        assert_eq!(&payload, b"PEER-PAYLOAD");
+
+        let commands = commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "STREAM ACCEPT ID=rbtc-accept SILENT=false"),
+            "{commands:?}"
+        );
     }
 
     #[tokio::test]

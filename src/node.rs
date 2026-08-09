@@ -3209,8 +3209,13 @@ const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
 /// Default operator cooldown when `setban add` omits a duration; matches
 /// Core's 24-hour default and the automatic cooldown ceiling.
 const DEFAULT_RPC_BAN_SECONDS: u32 = 24 * 60 * 60;
-/// Stable SAM session identifier for this node's I2P destination.
-const I2P_SESSION_ID: &str = "rbtc";
+/// Prefix of the SAM session identifier for this node's I2P destination.
+///
+/// The identifier must be unique per session on a bridge: a fixed value
+/// makes a second node on the same host fail with `DUPLICATED_ID`, which is
+/// an ordinary configuration — mainnet and Testnet4 side by side, for
+/// instance — rather than an error case.
+const I2P_SESSION_ID_PREFIX: &str = "rbtc";
 /// Ceiling shared with the automatic protocol-violation cooldown.
 const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 /// Bound on one reported rejection reason.
@@ -9863,6 +9868,26 @@ async fn complete_assumeutxo_validation(
 /// learned it keep reaching this node across restarts. The key is secret
 /// material: it is written owner-only inside the data directory and never
 /// logged.
+/// Builds a SAM session identifier unique to this node instance.
+///
+/// The identifier is derived from the network and data directory so two
+/// nodes on one host never collide, and so the same node keeps a stable
+/// identifier across restarts. It stays inside SAM's accepted character set
+/// and length bound.
+fn i2p_session_id(options: &Options) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(options.network.to_string().as_bytes());
+    if let Some(data_dir) = &options.data_dir {
+        digest.update(data_dir.to_string_lossy().as_bytes());
+    }
+    let fingerprint = digest.finalize();
+    format!(
+        "{I2P_SESSION_ID_PREFIX}-{}",
+        crate::utxo::hex_lower(&fingerprint[..8])
+    )
+}
+
 async fn create_i2p_session(
     options: &Options,
     bridge: SocketAddr,
@@ -9884,7 +9909,7 @@ async fn create_i2p_session(
     };
     let session = I2pSamSession::create(
         bridge,
-        I2P_SESSION_ID,
+        &i2p_session_id(options),
         existing.as_deref(),
         crate::i2p_sam::I2pSamConfig::default(),
     )

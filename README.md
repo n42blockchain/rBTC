@@ -181,7 +181,13 @@ documents for implementation detail and release boundaries.
   the bridge — an I2P target has no proxy representation at all — because
   that would connect to the wrong network. The published destination is announced to
   BIP155 peers on outbound sessions and in the inbound address relay, with a
-  zero port because I2P peers carry none. Inbound `STREAM ACCEPT` remains
+  zero port because I2P peers carry none. Inbound `STREAM ACCEPT` reports the dialling
+  peer's Destination alongside the stream, so an accepted peer is recorded
+  and ranked like a learned one; the status and destination lines are read
+  line-exactly because the very next byte already belongs to the peer. The
+  SAM session identifier is derived from the network and data directory
+  rather than fixed, so two nodes on one host do not collide with
+  `DUPLICATED_ID`. Wiring the accept loop into the inbound service remains
   open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
