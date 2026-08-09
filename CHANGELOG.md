@@ -55,6 +55,14 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Fixed
 
+- `--onlynet onion` and `--onlynet i2p` no longer resolve DNS seeds before
+  discarding every answer, which leaked the consulted seeds over the clear
+  net.
+- The published I2P destination is now announced to BIP155 peers; previously
+  the announcement path existed but was never called.
+- A non-ASCII Tor control reply is rejected instead of panicking on a
+  character-boundary split, before authentication.
+
 - I2P SAM replies are read line-exactly instead of through a buffered
   reader, which discarded a coalesced follow-up reply and could have
   consumed the first bytes of a connected peer's stream. SAM command lines

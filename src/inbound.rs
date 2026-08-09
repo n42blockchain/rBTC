@@ -36,6 +36,7 @@ use tokio::{
 };
 
 use crate::{
+    i2p_sam::I2pAddress,
     p2p::{
         InboundPeerSession, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_HEADERS_PER_RESPONSE,
         MAX_INVENTORY_ENTRIES, OnionAddress, P2pError, TransactionRelay, accept_inbound,
@@ -500,6 +501,14 @@ pub trait InboundDataSource: Send + Sync + 'static {
     }
     /// Explicit local address and exact service bits suitable for relay.
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
+        None
+    }
+
+    /// Published local I2P destination and its exact service bits.
+    ///
+    /// Only peers that negotiated BIP155 can receive it; I2P has no legacy
+    /// `addr` encoding and no port.
+    fn advertised_i2p(&self) -> Option<(I2pAddress, ServiceFlags)> {
         None
     }
 
@@ -1351,6 +1360,10 @@ async fn serve_addresses(
         .addrv2_relay()
         .then(|| source.advertised_onion())
         .flatten();
+    let i2p = peer
+        .addrv2_relay()
+        .then(|| source.advertised_i2p())
+        .flatten();
     let message = if peer.addrv2_relay() {
         NetworkMessage::AddrV2(
             addresses
@@ -1374,6 +1387,13 @@ async fn serve_addresses(
                     services,
                     addr: AddrV2::TorV3(onion.public_key()),
                     port: onion.port(),
+                }))
+                .chain(i2p.map(|(i2p, services)| AddrV2Message {
+                    time: now,
+                    services,
+                    addr: AddrV2::I2p(i2p.destination_hash()),
+                    // I2P peers carry no port.
+                    port: 0,
                 }))
                 .take(crate::p2p::MAX_ADDRESSES_PER_MESSAGE)
                 .collect(),

@@ -174,9 +174,14 @@ documents for implementation detail and release boundaries.
   restarts. Persisted I2P candidates then join the same ordered outbound
   wave, dialled through `STREAM CONNECT` and handed to the ordinary v1 or
   BIP324 handshake. `--onlynet i2p` restricts outbound work to that network
-  and fails closed without a bridge. A SOCKS5 proxy is never substituted for
+  and fails closed without a bridge. Both anonymity-only restrictions also
+  short-circuit DNS seed resolution entirely: running the lookups and then
+  discarding every answer would still leak which Bitcoin seeds the node
+  consults, which is the leak the restriction exists to prevent. A SOCKS5 proxy is never substituted for
   the bridge — an I2P target has no proxy representation at all — because
-  that would connect to the wrong network. Inbound `STREAM ACCEPT` remains
+  that would connect to the wrong network. The published destination is announced to
+  BIP155 peers on outbound sessions and in the inbound address relay, with a
+  zero port because I2P peers carry none. Inbound `STREAM ACCEPT` remains
   open.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header

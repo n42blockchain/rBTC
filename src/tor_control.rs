@@ -277,15 +277,25 @@ impl TorController {
                 return Err(TorControlError::OversizedReply);
             }
             let line = line.trim_end_matches(['\r', '\n']).to_owned();
-            if line.len() < 4 {
+            // Split on bytes, not on a char boundary: a reply line is
+            // arbitrary UTF-8, and `split_at` panics when index 3 lands
+            // inside a multi-byte character. The first reply is read before
+            // authentication, so a malformed or hostile local control port
+            // must yield an error rather than abort the process.
+            let bytes = line.as_bytes();
+            if bytes.len() < 4 {
                 return Err(TorControlError::MalformedReply);
             }
-            let (status, rest) = line.split_at(3);
-            let separator = rest.as_bytes()[0];
-            let body = rest[1..].to_owned();
+            let status = std::str::from_utf8(&bytes[..3])
+                .map_err(|_| TorControlError::MalformedReply)?
+                .to_owned();
+            let separator = bytes[3];
+            let body = std::str::from_utf8(&bytes[4..])
+                .map_err(|_| TorControlError::MalformedReply)?
+                .to_owned();
             if !status.starts_with('2') {
                 return Err(TorControlError::CommandFailed {
-                    status: status.to_owned(),
+                    status,
                     detail: body,
                 });
             }
@@ -590,6 +600,40 @@ mod tests {
             Err(TorControlError::UnreadableCookie)
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_non_ascii_reply_is_rejected_rather_than_panicking() {
+        // The first reply is read before authentication, so a hostile or
+        // malfunctioning local control port must not be able to abort the
+        // process by putting a multi-byte character across the split point.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    "25€ not a reply
+"
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = cookie_file(&directory, &[0x11_u8; COOKIE_LEN]);
+        let Err(error) = TorController::connect(control, &path, TorControlConfig::default()).await
+        else {
+            panic!("a non-ASCII reply must not authenticate");
+        };
+        assert!(
+            matches!(
+                error,
+                TorControlError::MalformedReply | TorControlError::CommandFailed { .. }
+            ),
+            "a non-ASCII reply must surface as an error rather than a panic, got {error:?}"
+        );
     }
 
     #[test]

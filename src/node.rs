@@ -4512,6 +4512,7 @@ struct NodeInboundSource {
 
 struct SharedInboundSource {
     advertised_onion: RwLock<Option<(OnionAddress, ServiceFlags)>>,
+    advertised_i2p: RwLock<Option<(I2pAddress, ServiceFlags)>>,
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
     stats: Arc<InboundStats>,
@@ -4527,6 +4528,7 @@ impl SharedInboundSource {
     ) -> Self {
         Self {
             advertised_onion: RwLock::new(None),
+            advertised_i2p: RwLock::new(None),
             current: RwLock::new(None),
             peer_store: RwLock::new(None),
             stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
@@ -4565,6 +4567,21 @@ impl SharedInboundSource {
             .advertised_onion
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    /// Records the I2P destination announced to peers.
+    fn install_advertised_i2p(&self, advertised: Option<(I2pAddress, ServiceFlags)>) {
+        *self
+            .advertised_i2p
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    fn advertised_i2p_destination(&self) -> Option<(I2pAddress, ServiceFlags)> {
+        self.advertised_i2p
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn advertised_onion_service(&self) -> Option<(OnionAddress, ServiceFlags)> {
@@ -4669,6 +4686,10 @@ impl InboundDataSource for SharedInboundSource {
 
     fn advertised_onion(&self) -> Option<(OnionAddress, ServiceFlags)> {
         self.advertised_onion_service()
+    }
+
+    fn advertised_i2p(&self) -> Option<(I2pAddress, ServiceFlags)> {
+        self.advertised_i2p_destination()
     }
 
     fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
@@ -7636,7 +7657,16 @@ async fn run_peer_pool_session(
         None
     };
     let i2p_session = match options.i2p_sam {
-        Some(bridge) => Some(Arc::new(create_i2p_session(options, bridge).await?)),
+        Some(bridge) => {
+            let session = Arc::new(create_i2p_session(options, bridge).await?);
+            if let Some(source) = &inbound_source {
+                source.install_advertised_i2p(Some((
+                    session.address().clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )));
+            }
+            Some(session)
+        }
         None => None,
     };
     let _onion_service = match (&options.tor_control, options.inbound_listen) {
@@ -9119,6 +9149,7 @@ async fn connect_and_maintain_standby(
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
     advertised_onion: Option<(OnionAddress, ServiceFlags)>,
+    advertised_i2p: Option<(I2pAddress, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer_with_transport(
@@ -9158,6 +9189,17 @@ async fn connect_and_maintain_standby(
         )
         .await
         .map_err(|_| PeerRunError::transient("local address advertisement timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    }
+    if let Some((destination, services)) = advertised_i2p {
+        timeout(
+            PEER_TIMEOUT,
+            connected
+                .session
+                .advertise_i2p_address(&destination, services, local_time),
+        )
+        .await
+        .map_err(|_| PeerRunError::transient("I2P address advertisement timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))?;
     }
     if let Some((onion, services)) = advertised_onion {
@@ -9259,6 +9301,12 @@ fn spawn_peer_connections(
                 .advertised_address
                 .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
             let advertised_onion = advertised_onion.cloned();
+            let advertised_i2p = i2p_session.as_ref().map(|session| {
+                (
+                    session.address().clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )
+            });
             let proxy = options.resources.proxy;
             let i2p_session = i2p_session.cloned();
             let task = tokio::spawn(connect_and_maintain_standby(
@@ -9278,6 +9326,7 @@ fn spawn_peer_connections(
                 transaction_pool,
                 advertised_address,
                 advertised_onion,
+                advertised_i2p,
                 network_time,
             ));
             (
@@ -14692,6 +14741,16 @@ async fn resolve_dns_candidates(
     excluded: &HashSet<SocketAddr>,
     limit: usize,
 ) -> (Vec<SocketAddr>, Vec<String>, usize) {
+    // An anonymity-network restriction rejects every resolved IP, so running
+    // the lookups first would send clear-net DNS queries for Bitcoin seed
+    // hostnames and then discard all of the answers — precisely the leak the
+    // restriction exists to prevent. Short-circuit before any query leaves
+    // this host.
+    if !only_net.permits(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        && !only_net.permits(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+    {
+        return (Vec::new(), Vec::new(), 0);
+    }
     let mut lookups = tokio::task::JoinSet::new();
     let seed_count = seeds.len().min(MAX_DNS_SEEDS);
     for (index, seed) in seeds.iter().take(MAX_DNS_SEEDS).cloned().enumerate() {
@@ -17720,6 +17779,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn anonymity_only_restrictions_send_no_dns_query() {
+        // A hostname that would resolve if a query were actually issued. The
+        // restriction must short-circuit before any query leaves the host,
+        // because rejecting the answers afterwards still leaks which seeds a
+        // Tor-only or I2P-only node consults.
+        let seeds = vec![DnsSeed {
+            host: "localhost".to_owned(),
+            port: 18_444,
+        }];
+        for restricted in [NodeOnlyNet::Onion, NodeOnlyNet::I2p] {
+            let (resolved, failures, rejected) =
+                resolve_dns_candidates(Network::Regtest, restricted, &seeds, &HashSet::new(), 16)
+                    .await;
+            assert!(resolved.is_empty(), "{restricted:?} permits no IP peer");
+            assert!(
+                failures.is_empty(),
+                "{restricted:?} must not report lookup failures for queries it never made"
+            );
+            assert_eq!(
+                rejected, 0,
+                "{restricted:?} must reject nothing because it resolves nothing"
+            );
+        }
+
+        // An unrestricted node still resolves.
+        let (resolved, _, _) = resolve_dns_candidates(
+            Network::Regtest,
+            NodeOnlyNet::Any,
+            &seeds,
+            &HashSet::new(),
+            16,
+        )
+        .await;
+        assert!(
+            !resolved.is_empty(),
+            "an unrestricted node must still consult its seeds"
+        );
+    }
+
     #[test]
     fn i2p_sam_options_require_loopback_and_gate_the_i2p_network() {
         let directory = TempDir::new().unwrap();
@@ -18971,6 +19070,7 @@ mod tests {
             None,
             None,
             Some(source),
+            None,
             None,
             None,
             None,
