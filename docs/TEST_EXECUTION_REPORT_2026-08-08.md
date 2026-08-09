@@ -1,9 +1,9 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `cf87ee2`; the earlier
-  `0f47054` and `4f8084f` real-daemon results are retained below as historical
-  baselines only.
+- Revision checked: `audit/group-b-decisions` at `9695792`; the earlier
+  `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are retained below
+  as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -288,3 +288,92 @@ real-daemon interop runs, and same-directory identity replay is proven. The
 I2P `addrv2` two-node receipt and privileged DNS packet capture remain open;
 the seven-day public-network-soak finalizer is also still open in
 `docs/PUBLIC_NETWORK_SOAK.md`.
+
+### `de61422` / `b159fe6` follow-up — 2026-08-09
+
+The branch was fast-forwarded through `de61422`, `b159fe6`, and `9695792`.
+This round specifically rechecked the new inbound-I2P service wiring, the
+two-session SAM exchange, and the existing Core 31/btcd inbound regression.
+
+#### Existing real-daemon interop cases
+
+With the live Tor pair and i2pd SAM on `127.0.0.1:7656`, the three previously
+passing ignored cases (excluding the new `two_nodes` case) were rerun:
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture --skip two_nodes_exchange_i2p_destinations_over_addrv2
+```
+
+Result: `3 passed; 0 failed` in `28.33s` (non-loopback guard, real SAM
+replay/deadline, and real Tor onion/GetAddr exchange).
+
+#### New `two_nodes` case
+
+The supplied command was run against the shared bridge:
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  two_nodes -- --ignored --nocapture
+```
+
+The two sessions were both created on the same bridge and printed distinct
+destinations, so the former `DUPLICATED_ID` failure did not recur. The test did
+not, however, complete its unmodified source form:
+
+- first run: `153.49s`, EOF during the I2P P2P handshake;
+- after restarting i2pd: `108.40s`, EOF while reading the `AddrV2` response;
+- split-bridge variant (`RBTC_I2P_SAM_B=127.0.0.1:7657`): `150.64s`, EOF while
+  reading the `AddrV2` response.
+
+As a diagnostic only, an uncommitted five-second keepalive was inserted after
+the responder wrote its `AddrV2` frame. The split-bridge variant then passed
+`1/1` in `83.03s`, including the STREAM ACCEPT peer-Destination assertion and
+both directions of `addrv2`. This shows that the response-stage EOF is caused
+by the test responder dropping the SAM stream immediately after its final
+write (or by the router requiring that stream to remain open), not by a
+`DUPLICATED_ID` or address-hash failure. The temporary change was reverted and
+is not part of the branch. A shared-bridge run with the same temporary delay
+still hit an earlier routing EOF, so the requested shared-bridge `1/1` remains
+unproven on this router.
+
+The test should keep the responder stream alive until the dialling side has
+acknowledged the address response (a protocol-level acknowledgement is better
+than a fixed sleep) before it is used as a merge gate.
+
+#### Core 31/btcd inbound regression
+
+```bash
+RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind \
+RBTC_BTCD=/Users/jieliu/tools/go/bin/btcd \
+  cargo test --locked --lib -- --ignored --exact \
+  inbound::tests::core31_and_btcd_complete_real_inbound_handshakes --nocapture
+```
+
+Result: `1 passed; 0 failed` in `0.49s`. The TCP inbound path remains healthy.
+This test does not exercise the newly added I2P branch of
+`run_listener_with_i2p`; that branch still lacks an equivalent real-daemon
+inbound-service assertion.
+
+#### Focused current-code regressions
+
+```bash
+cargo fmt --all -- --check
+git diff --check
+cargo test --locked --all-features -- i2p tor_control zmq_publisher
+```
+
+Result: `23 passed; 0 failed`, including the new accepted-stream peer
+Destination/first-byte unit test and all prior SAM, Tor control, peer-store,
+and ZMQ checks.
+
+**Current conclusion:** `de61422` passes the requested Core31/btcd TCP gate and
+the three established real-daemon anonymity cases remain green. The supplied
+unmodified `two_nodes` test is not a `1/1` acceptance on this host because its
+responder closes the I2P stream too soon; the temporary keepalive proves the
+exchange itself on the split-bridge variant, but shared-bridge end-to-end
+evidence and a real `run_listener_with_i2p` acceptance test remain open.
