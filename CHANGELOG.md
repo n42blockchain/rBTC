@@ -57,7 +57,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 - I2P SAM replies are read line-exactly instead of through a buffered
   reader, which discarded a coalesced follow-up reply and could have
-  consumed the first bytes of a connected peer's stream.
+  consumed the first bytes of a connected peer's stream. SAM command lines
+  are written atomically for i2pd framing, and replayed destination keys omit
+  the transient-only signature option.
 
 ### Safety
 
@@ -69,8 +71,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   `--validation-batch-size` remains available for lower-memory hosts.
 - `2026-08-08` acceptance refresh: real daemon verification passed for
   BIP324-v2 transport fallback interoperability (`v2_transport_interoperates_with_core`
-  and `v2_preference_falls_back_to_v1_against_a_v1_only_core`), real
-  inbound Torv3/btcd handshakes, and bounded ZMQ topic/filter/subscriber tests.
+  and `v2_preference_falls_back_to_v1_against_a_v1_only_core`), real inbound
+  Core 31/btcd v1 handshakes, Tor v3 onion/SOCKS and i2pd SAM interoperability,
+  and bounded ZMQ topic/filter/subscriber tests.
 - rBTC remains pre-release until an accepted seven-day public-network soak
   report and the first native signed release complete. It must not hold
   mainnet private keys.

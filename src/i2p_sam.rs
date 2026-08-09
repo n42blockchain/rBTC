@@ -201,14 +201,15 @@ impl I2pSamSession {
         }
         let mut control = connect_and_greet(bridge, config).await?;
         let destination = destination_key.unwrap_or("TRANSIENT");
-        let reply = command(
-            &mut control,
-            &format!(
+        let request = match destination_key {
+            Some(_) => {
+                format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={destination}")
+            }
+            None => format!(
                 "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={destination} SIGNATURE_TYPE=7"
             ),
-            config,
-        )
-        .await?;
+        };
+        let reply = command(&mut control, &request, config).await?;
         let destination_key = field(&reply, "DESTINATION=")
             .ok_or(I2pSamError::MalformedReply)?
             .to_owned();
@@ -288,8 +289,13 @@ async fn command(
     config: I2pSamConfig,
 ) -> Result<String, I2pSamError> {
     tokio::time::timeout(config.timeout, async {
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
+        // Keep the command and its terminator in one write. i2pd's SAM
+        // parser can close a connection when it observes a complete command
+        // line split across two TCP segments before the terminator arrives.
+        let mut wire = Vec::with_capacity(request.len() + 1);
+        wire.extend_from_slice(request.as_bytes());
+        wire.push(b'\n');
+        stream.write_all(&wire).await?;
         stream.flush().await?;
         let line = read_reply_line(stream).await?;
         let result = field(&line, "RESULT=").ok_or(I2pSamError::MalformedReply)?;
@@ -511,6 +517,32 @@ mod tests {
                     peer.name()
                 )),
             "{commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_destination_keys_do_not_set_a_transient_signature_type() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        let commands = serve_sam_bridge(listener, "3.3");
+
+        let session = I2pSamSession::create(
+            bridge,
+            "rbtc-replay",
+            Some(TEST_DESTINATION),
+            I2pSamConfig::default(),
+        )
+        .await
+        .expect("the persisted destination key is accepted");
+        assert_eq!(session.destination_key(), TEST_DESTINATION);
+
+        let commands = commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            commands[1],
+            "SESSION CREATE STYLE=STREAM ID=rbtc-replay DESTINATION=".to_owned() + TEST_DESTINATION
         );
     }
 

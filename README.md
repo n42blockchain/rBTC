@@ -8,7 +8,8 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 > external-signer wallet are implemented. The accepted seven-day public-network
 > soak report and first native signed release remain release gates. On
 > 2026-08-08 the real Core 31/btcd interoperability acceptance for BIP324 v2,
-> Torv3 inbound, and bounded ZMQ publication passed.
+> inbound v1 handshakes, Tor v3 onion/SOCKS, i2pd SAM, and bounded ZMQ
+> publication passed.
 
 ### Capability map
 

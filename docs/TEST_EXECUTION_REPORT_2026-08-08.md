@@ -1,7 +1,7 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Commit checked: `f9bc657`
+- Revision checked: `audit/group-b-decisions` at synchronized fix set (`98e984c` plus the final SAM framing fix recorded below)
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -19,7 +19,7 @@
 2. `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind RBTC_BTCD=/Users/jieliu/tools/go/bin/btcd cargo test --locked --lib -- --ignored --exact inbound::tests::core31_and_btcd_complete_real_inbound_handshakes --nocapture`
    - Result: `1 passed; 0 failed`
    - Runtime: `0.39s`
-   - Coverage includes: real inbound Torv3/btcd handshake smoke test with fixed seed and one-time port lifecycle.
+   - Coverage includes: real inbound Core 31/btcd v1 handshake smoke test with fixed seed and one-time port lifecycle. The test source contains no TorV3, onion, or `addrv2` path.
 
 3. `cargo test --locked tor_control::tests -- --nocapture`
    - Result: `5 passed; 0 failed`
@@ -113,14 +113,37 @@ Overall result: 真实拨号级场景尚未通过（2 项失败）。两处失�
   认证、`ADD_ONION`、描述符扩散、SOCKS5 域名回拨与握手协商均已走通。收尾交换
   已改为 `GetAddr`/`AddrV2` 请求响应往返。
 
-#### 待重跑
+#### 最终复验 — 2026-08-08
 
-修复后 `anonymity_network_interop` 尚未在真实守护进程上重跑。在配置了 tor 与
-i2pd 的主机上执行下列命令，预期 `3 passed; 0 failed`：
+修复后在同一台 macOS 主机上重跑真实守护进程 gate，结果达到预期：
 
 ```bash
 RBTC_TOR_CONTROL=127.0.0.1:9051 RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656   cargo test --release --all-features --test anonymity_network_interop   -- --ignored --nocapture
 ```
 
-在此之前，Tor 与 I2P 仍无真实守护进程级证据：目前唯一的真实外部依赖证据是
-`core_block_differential`（含 BIP324 v2 互联与 v1 回退）与 inbound 握手测试。
+- Result: `3 passed; 0 failed`
+- Runtime: `18.65s`
+- Daemons: Tor control `127.0.0.1:9051`, SOCKS `127.0.0.1:9050`, cookie
+  `/tmp/rbtc-nettest/tor/data/control_auth_cookie`; i2pd 2.61.0 SAM
+  `127.0.0.1:7656` (`/tmp/rbtc-i2pd`).
+- Coverage: `sam_bridge_is_refused_on_a_non_loopback_address` verifies the
+  loopback guard; `sam_sessions_produce_stable_reusable_destinations` creates
+  a real SAM session, replays its persisted destination key, and verifies the
+  unreachable-destination deadline; the Tor case publishes an ephemeral v3
+  onion, reaches it through SOCKS5, completes the v1 handshake, and performs
+  a GetAddr/AddrV2 round trip.
+- Mock regression re-run: `cargo test --locked --all-features -- i2p tor_control`
+  — `16 passed; 0 failed` (the extra case covers replayed destination-key
+  command construction).
+
+During this final run, i2pd exposed one additional framing edge in the same
+SAM command path: writing the command body and its newline as separate writes
+could make i2pd close before replying. `command()` now writes the complete
+line atomically, and replayed destination keys omit the transient-only
+`SIGNATURE_TYPE` option. The regression
+`i2p_sam::tests::replayed_destination_keys_do_not_set_a_transient_signature_type`
+covers the latter; the final mock-filtered run passed `16/16`.
+
+Tor and I2P therefore now have real daemon-level evidence in this report. The
+separate seven-day public-network-soak finalizer remains open in
+`docs/PUBLIC_NETWORK_SOAK.md`.
