@@ -129,8 +129,11 @@ documents for implementation detail and release boundaries.
   before any database or network open. The generated private key is stored
   owner-only inside the data directory and replayed on the next launch, so
   peers that learned the address keep reaching this node across restarts; it
-  is never logged. Shutdown withdraws the service with an explicit
-  `DEL_ONION` rather than relying on the connection close alone. The
+  is never logged. The service is published without
+  `Detach`, so Tor destroys it when the control connection closes, which
+  happens unconditionally when the node stops; an explicit `DEL_ONION` is
+  attempted first to make the withdrawal immediate, but it is best effort
+  because a task spawned during shutdown may never run. The
   published address is then announced to peers that negotiated BIP155, both
   on outbound sessions and in the inbound address relay, and never to a
   legacy `addr` peer, because an onion address has no legacy encoding and

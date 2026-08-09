@@ -9836,9 +9836,12 @@ impl Drop for PublishedInboundOnion {
             return;
         };
         let service = self.service.clone();
-        // The control connection is async, so the withdrawal runs on the
-        // ambient runtime when one is still available; the connection close
-        // withdraws the ephemeral service either way.
+        // Withdrawal is best effort: `DEL_ONION` needs the async runtime, and
+        // a task spawned during shutdown may never be polled. Correctness
+        // does not depend on it. The service was published without `Detach`,
+        // so Tor destroys it when this control connection closes, which
+        // dropping the controller does unconditionally; the explicit command
+        // only makes the withdrawal immediate when the runtime outlives it.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Err(error) = controller.remove_onion_service(&service).await {
