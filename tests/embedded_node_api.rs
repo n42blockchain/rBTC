@@ -625,7 +625,8 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     assert_eq!(topic, b"sequence");
     assert_eq!(
         &body[..32],
-        bitcoin::hashes::Hash::as_byte_array(&block.block_hash())
+        display,
+        "Core reverses the hash on the sequence topic too, so it must match          the hashblock body byte for byte"
     );
     assert_eq!(body[32], b'C');
 

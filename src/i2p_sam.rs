@@ -36,6 +36,10 @@ const DESTINATION_HASH_LEN: usize = 32;
 const MAX_SESSION_ID_LEN: usize = 32;
 /// Bound on a destination key retained from the bridge.
 const MAX_DESTINATION_KEY_LEN: usize = 8 * 1024;
+/// Length of an I2P Destination before its certificate.
+const DESTINATION_BASE_LEN: usize = 387;
+/// Offset of the big-endian certificate length inside a Destination.
+const DESTINATION_CERT_LEN_OFFSET: usize = 385;
 
 /// I2P SAM failures.
 #[derive(Debug, Error)]
@@ -345,12 +349,30 @@ async fn read_reply_line(stream: &mut TcpStream) -> Result<String, I2pSamError> 
 }
 
 /// Computes the BIP155 destination hash of a SAM destination key.
+///
+/// SAM's `DESTINATION=` value is the private-key blob, which begins with the
+/// public Destination and then carries the private signing and encryption
+/// keys. Only the Destination is hashed: it is 387 bytes plus the
+/// certificate length stored big-endian at offsets 385..387. Hashing the
+/// whole blob instead yields a well-formed but unreachable `.b32.i2p` name,
+/// because no peer can derive it from the Destination this node publishes.
 fn destination_hash(destination_key: &str) -> Result<[u8; DESTINATION_HASH_LEN], I2pSamError> {
     use sha2::{Digest, Sha256};
     // SAM renders destinations in I2P's base64 alphabet, which substitutes
     // `-` and `~` for `+` and `/`.
     let decoded = decode_i2p_base64(destination_key).ok_or(I2pSamError::MalformedReply)?;
-    Ok(Sha256::digest(&decoded).into())
+    let certificate_length = decoded
+        .get(DESTINATION_CERT_LEN_OFFSET..DESTINATION_BASE_LEN)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_be_bytes)
+        .ok_or(I2pSamError::MalformedReply)?;
+    let destination_length = DESTINATION_BASE_LEN
+        .checked_add(usize::from(certificate_length))
+        .ok_or(I2pSamError::MalformedReply)?;
+    let destination = decoded
+        .get(..destination_length)
+        .ok_or(I2pSamError::MalformedReply)?;
+    Ok(Sha256::digest(destination).into())
 }
 
 /// Decodes I2P's base64 alphabet without padding requirements.
@@ -402,14 +424,56 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
-    /// A destination key in I2P's base64 alphabet.
-    const TEST_DESTINATION: &str = "abcdEFGH1234-~abcdEFGH1234-~abcdEFGH1234-~";
+    /// Encodes bytes in I2P's base64 alphabet, the inverse of the decoder.
+    fn encode_i2p_base64(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+        let mut output = String::new();
+        let mut accumulator: u32 = 0;
+        let mut bits = 0_u32;
+        for byte in input {
+            accumulator = (accumulator << 8) | u32::from(*byte);
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                output.push(char::from(
+                    ALPHABET[usize::try_from((accumulator >> bits) & 0x3f).expect("masked")],
+                ));
+            }
+        }
+        if bits > 0 {
+            output.push(char::from(
+                ALPHABET[usize::try_from((accumulator << (6 - bits)) & 0x3f).expect("masked")],
+            ));
+        }
+        output
+    }
+
+    /// Builds a structurally realistic SAM destination key.
+    ///
+    /// A real value is the private-key blob: a 387-byte Destination with a
+    /// zero certificate length at offsets 385..387, followed by the private
+    /// signing and encryption keys. Only the Destination prefix determines
+    /// the published `.b32.i2p` address.
+    fn test_destination_blob() -> Vec<u8> {
+        let mut blob = (0..663_u32)
+            .map(|index| u8::try_from(index % 251).expect("modulus fits a byte"))
+            .collect::<Vec<_>>();
+        blob[DESTINATION_CERT_LEN_OFFSET] = 0;
+        blob[DESTINATION_CERT_LEN_OFFSET + 1] = 0;
+        blob
+    }
+
+    fn test_destination() -> String {
+        encode_i2p_base64(&test_destination_blob())
+    }
 
     /// A SAM bridge answering the subset this client speaks.
     ///
     /// Connections are served concurrently because a session holds its
     /// control socket open while every outbound peer opens another one.
     fn serve_sam_bridge(listener: TcpListener, version: &'static str) -> Arc<Mutex<Vec<String>>> {
+        let destination = test_destination();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&commands);
         tokio::spawn(async move {
@@ -418,6 +482,7 @@ mod tests {
                     return;
                 };
                 let recorded = Arc::clone(&recorded);
+                let destination = destination.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
@@ -434,7 +499,7 @@ mod tests {
                         let reply = if line.starts_with("HELLO") {
                             format!("HELLO REPLY RESULT=OK VERSION={version}\n")
                         } else if line.starts_with("SESSION CREATE") {
-                            format!("SESSION STATUS RESULT=OK DESTINATION={TEST_DESTINATION}\n")
+                            format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n")
                         } else if line.starts_with("STREAM CONNECT") {
                             "STREAM STATUS RESULT=OK\n".to_owned()
                         } else {
@@ -487,11 +552,21 @@ mod tests {
         let session = I2pSamSession::create(bridge, "rbtc-test", None, I2pSamConfig::default())
             .await
             .expect("the session is created");
-        assert_eq!(session.destination_key(), TEST_DESTINATION);
+        assert_eq!(session.destination_key(), test_destination());
+        // The address must hash only the Destination prefix, never the
+        // private-key tail that follows it in the SAM blob.
+        let blob = test_destination_blob();
         let expected = I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(
-            decode_i2p_base64(TEST_DESTINATION).unwrap(),
+            &blob[..DESTINATION_BASE_LEN],
         )));
         assert_eq!(session.address(), &expected);
+        let whole_blob =
+            I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(&blob)));
+        assert_ne!(
+            session.address(),
+            &whole_blob,
+            "hashing the private-key tail as well would publish an address no peer can reach"
+        );
 
         let peer = I2pAddress::from_destination_hash([0x11; DESTINATION_HASH_LEN]);
         let stream = session
@@ -529,12 +604,12 @@ mod tests {
         let session = I2pSamSession::create(
             bridge,
             "rbtc-replay",
-            Some(TEST_DESTINATION),
+            Some(&test_destination()),
             I2pSamConfig::default(),
         )
         .await
         .expect("the persisted destination key is accepted");
-        assert_eq!(session.destination_key(), TEST_DESTINATION);
+        assert_eq!(session.destination_key(), test_destination());
 
         let commands = commands
             .lock()
@@ -542,7 +617,8 @@ mod tests {
             .clone();
         assert_eq!(
             commands[1],
-            "SESSION CREATE STYLE=STREAM ID=rbtc-replay DESTINATION=".to_owned() + TEST_DESTINATION
+            "SESSION CREATE STYLE=STREAM ID=rbtc-replay DESTINATION=".to_owned()
+                + &test_destination()
         );
     }
 
@@ -553,6 +629,7 @@ mod tests {
         // first and report a malformed reply; this reproduces that shape.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bridge = listener.local_addr().unwrap();
+        let destination = test_destination();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 256];
@@ -567,7 +644,7 @@ mod tests {
                 .write_all(
                     format!(
                         "HELLO REPLY RESULT=OK VERSION=3.3
-SESSION STATUS RESULT=OK DESTINATION={TEST_DESTINATION}
+SESSION STATUS RESULT=OK DESTINATION={destination}
 "
                     )
                     .as_bytes(),
@@ -583,7 +660,7 @@ SESSION STATUS RESULT=OK DESTINATION={TEST_DESTINATION}
             I2pSamSession::create(bridge, "rbtc-coalesced", None, I2pSamConfig::default())
                 .await
                 .expect("a coalesced reply pair must still be parsed line by line");
-        assert_eq!(session.destination_key(), TEST_DESTINATION);
+        assert_eq!(session.destination_key(), test_destination());
     }
 
     #[tokio::test]

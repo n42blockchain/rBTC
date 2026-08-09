@@ -205,33 +205,28 @@ impl TorController {
         forward_to: SocketAddr,
         private_key: Option<&str>,
     ) -> Result<PublishedOnionService, TorControlError> {
+        // One command, and never `Flags=DiscardPK`: Tor rejects that flag
+        // with a non-`NEW` key type, and with a new key it would discard the
+        // very key this node must persist to keep its address across
+        // restarts.
         let key = private_key.unwrap_or("NEW:ED25519-V3");
         let reply = self
-            .command(&format!(
-                "ADD_ONION {key} Flags=DiscardPK Port={virtual_port},{forward_to}"
-            ))
-            .await;
-        // DiscardPK is only valid with an existing key; retry retaining the
-        // generated key when Tor was asked for a fresh one.
-        let reply = match (private_key, reply) {
-            (None, _) => {
-                self.command(&format!(
-                    "ADD_ONION NEW:ED25519-V3 Port={virtual_port},{forward_to}"
-                ))
-                .await?
-            }
-            (Some(_), reply) => reply?,
-        };
+            .command(&format!("ADD_ONION {key} Port={virtual_port},{forward_to}"))
+            .await?;
         let service_id = reply
             .iter()
             .find_map(|line| field(line, "ServiceID="))
             .ok_or(TorControlError::MalformedReply)?
             .to_owned();
+        // Tor returns `PrivateKey=` only when it generated one; a replayed
+        // key is carried through so the published service always reports the
+        // key that reproduces it.
         let private_key = reply
             .iter()
             .find_map(|line| field(line, "PrivateKey="))
-            .unwrap_or_default()
-            .to_owned();
+            .map(ToOwned::to_owned)
+            .or_else(|| private_key.map(ToOwned::to_owned))
+            .unwrap_or_default();
         let address = OnionAddress::new(&format!("{service_id}.onion"), virtual_port)
             .map_err(|_| TorControlError::InvalidServiceId)?;
         Ok(PublishedOnionService {

@@ -8736,6 +8736,23 @@ async fn connect_peer(
     .await
 }
 
+/// Opens one bounded SAM stream to an I2P destination.
+async fn open_i2p_stream(
+    session: &I2pSamSession,
+    destination: &I2pAddress,
+    remote: &NodePeerTarget,
+) -> Result<tokio::net::TcpStream, PeerRunError> {
+    timeout(PEER_TIMEOUT, session.connect_stream(destination))
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "I2P stream to {remote} timed out after {} seconds",
+                PEER_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_i2p_peer(
     session: Arc<I2pSamSession>,
@@ -8748,34 +8765,47 @@ async fn connect_i2p_peer(
     prefer_v2: bool,
     handshake_started: Instant,
 ) -> Result<ConnectedPeer, PeerRunError> {
-    let stream = timeout(PEER_TIMEOUT, session.connect_stream(destination))
+    // A v2 attempt consumes its stream, and a peer that closes it leaves
+    // nothing to retry on. Open a second stream and fall back to v1, matching
+    // the one-shot retry TCP and proxied peers already get; without it,
+    // enabling --v2-transport would make every v1-only I2P peer undiallable.
+    let mut attempts = if prefer_v2 {
+        vec![true, false]
+    } else {
+        vec![false]
+    };
+    attempts.reverse();
+    let mut session = loop {
+        let prefer_v2 = attempts.pop().expect("the v1 attempt always remains");
+        let stream = open_i2p_stream(&session, destination, remote).await?;
+        let outcome = timeout(
+            PEER_TIMEOUT,
+            rbtc::p2p::complete_outbound_handshake_on_stream(
+                stream,
+                deployments.message_start(),
+                local_nonce,
+                USER_AGENT.to_owned(),
+                0,
+                prefer_v2,
+            ),
+        )
         .await
         .map_err(|_| {
             PeerRunError::transient(format!(
-                "I2P stream to {remote} timed out after {} seconds",
+                "peer handshake timed out after {} seconds",
                 PEER_TIMEOUT.as_secs()
             ))
-        })?
-        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))?;
-    let mut session = timeout(
-        PEER_TIMEOUT,
-        rbtc::p2p::complete_outbound_handshake_on_stream(
-            stream,
-            deployments.message_start(),
-            local_nonce,
-            USER_AGENT.to_owned(),
-            0,
-            prefer_v2,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        PeerRunError::transient(format!(
-            "peer handshake timed out after {} seconds",
-            PEER_TIMEOUT.as_secs()
-        ))
-    })?
-    .map_err(|error| PeerRunError::p2p(&error))?;
+        })?;
+        match outcome {
+            Ok(session) => break session,
+            Err(rbtc::p2p::P2pError::V2Transport(
+                rbtc::p2p_v2::V2TransportError::PeerRejectedV2,
+            )) if !attempts.is_empty() => {
+                rbtc_info!("I2P peer {remote} closed the v2 attempt; retrying over v1");
+            }
+            Err(error) => return Err(PeerRunError::p2p(&error)),
+        }
+    };
     let remote_version = session.remote_version();
     rbtc_info!(
         "connected to {remote}: version={}, height={}, agent={}",
@@ -9792,9 +9822,17 @@ async fn create_i2p_session(
         .data_dir
         .as_ref()
         .map(|data_dir| data_dir.join("i2p_destination_key"));
-    let existing = key_path
-        .as_ref()
-        .and_then(|path| read_owner_only_text_file(path, "i2p destination key", 16 * 1024).ok());
+    // Only a missing file may fall through to a fresh identity. Any other
+    // failure — wrong permissions, an unreadable file, an oversized one —
+    // must stop the launch, because continuing would request a new
+    // destination and then overwrite the key peers already learned.
+    let existing = match key_path.as_ref() {
+        Some(path) if path.exists() => Some(
+            read_owner_only_text_file(path, "i2p destination key", 16 * 1024)
+                .map_err(|error| format!("read the stored I2P destination key: {error}"))?,
+        ),
+        _ => None,
+    };
     let session = I2pSamSession::create(
         bridge,
         I2P_SESSION_ID,
@@ -9870,9 +9908,16 @@ async fn publish_inbound_onion_service(
         .data_dir
         .as_ref()
         .map(|data_dir| data_dir.join("onion_service_key"));
-    let existing = key_path
-        .as_ref()
-        .and_then(|path| read_owner_only_text_file(path, "onion service key", 4096).ok());
+    // As with the I2P key, only absence may produce a fresh identity; every
+    // other failure stops the launch rather than silently replacing the
+    // address peers learned.
+    let existing = match key_path.as_ref() {
+        Some(path) if path.exists() => Some(
+            read_owner_only_text_file(path, "onion service key", 4096)
+                .map_err(|error| format!("read the stored onion service key: {error}"))?,
+        ),
+        _ => None,
+    };
     let mut controller = TorController::connect(
         tor.control,
         &tor.cookie,
