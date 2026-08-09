@@ -273,11 +273,21 @@ async fn sam_sessions_produce_stable_reusable_destinations() {
     );
 }
 
+/// Nonce the dialling side uses to acknowledge the address response.
+const ADDRESS_ACK_NONCE: u64 = 0x4144_4452_5f41_434b;
+
 /// Runs the accepting half of the two-node exchange.
 ///
 /// It completes the inbound handshake, answers the address request with its
 /// own I2P destination, and reports the destination the dialling side
 /// announced, so the caller can check both directions of `addrv2`.
+///
+/// After answering it waits for the dialling side's ping rather than
+/// returning, because returning drops the SAM stream: an accepting side that
+/// closes immediately after its final write races the peer's read, and the
+/// dialler sees EOF instead of the response. Waiting for a protocol-level
+/// acknowledgement ties the lifetime to what the peer actually observed,
+/// which a fixed delay cannot do.
 async fn serve_one_i2p_peer(
     accepted: rbtc::i2p_sam::AcceptedI2pPeer,
     own: I2pAddress,
@@ -303,7 +313,19 @@ async fn serve_one_i2p_peer(
                 }]))
                 .await
                 .map_err(|error| format!("address reply over I2P failed: {error}"))?;
+            }
+            NetworkMessage::Ping(nonce) if nonce == ADDRESS_ACK_NONCE => {
+                // The dialler only sends this after reading the response, so
+                // answering it and returning cannot truncate anything.
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .map_err(|error| format!("acknowledgement over I2P failed: {error}"))?;
                 return Ok(announced);
+            }
+            NetworkMessage::Ping(nonce) => {
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .map_err(|error| format!("pong over I2P failed: {error}"))?;
             }
             NetworkMessage::AddrV2(addresses) => {
                 announced.extend(
@@ -326,6 +348,7 @@ async fn serve_one_i2p_peer(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "set RBTC_I2P_SAM to run two nodes against a real I2P router"]
+#[allow(clippy::too_many_lines)]
 async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
     let bridge = required_socket("RBTC_I2P_SAM");
     // A second bridge is optional: the session identifier is derived per node
@@ -423,6 +446,13 @@ async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
         learned[0].services,
         ServiceFlags::NETWORK | ServiceFlags::WITNESS
     );
+
+    // A round trip the accepting side must answer before it returns, so the
+    // stream stays open until this side has demonstrably read the response.
+    session
+        .ping(ADDRESS_ACK_NONCE)
+        .await
+        .expect("the accepting side acknowledges the address response");
 
     let (observed_dialler, announced) = responder
         .await
