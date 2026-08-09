@@ -36,11 +36,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::{
     Network,
     p2p::{Address, ServiceFlags, message::NetworkMessage, message_network::VersionMessage},
 };
-use rbtc::i2p_sam::{I2pSamConfig, I2pSamSession};
+use rbtc::i2p_sam::{I2pAddress, I2pSamConfig, I2pSamSession};
+use rbtc::p2p::I2pPeerAddress;
 use rbtc::p2p::{OnionAddress, ProxyTarget, V1Transport, connect_proxied_target};
 use rbtc::tor_control::{TorControlConfig, TorController};
 use tokio::net::TcpListener;
@@ -269,6 +271,174 @@ async fn sam_sessions_produce_stable_reusable_destinations() {
         "a refused dial must respect the configured deadline, took {:?}",
         started.elapsed()
     );
+}
+
+/// Runs the accepting half of the two-node exchange.
+///
+/// It completes the inbound handshake, answers the address request with its
+/// own I2P destination, and reports the destination the dialling side
+/// announced, so the caller can check both directions of `addrv2`.
+async fn serve_one_i2p_peer(
+    accepted: rbtc::i2p_sam::AcceptedI2pPeer,
+    own: I2pAddress,
+) -> Result<Vec<I2pPeerAddress>, String> {
+    let mut peer = V1Transport::new(accepted.stream, Network::Bitcoin.magic());
+    peer.handshake_inbound(responder_version(0x4143_4550_5445_4400))
+        .await
+        .map_err(|error| format!("inbound handshake over I2P failed: {error}"))?;
+    let mut announced = Vec::new();
+    loop {
+        match peer
+            .read_message()
+            .await
+            .map_err(|error| format!("read over I2P failed: {error}"))?
+            .into_payload()
+        {
+            NetworkMessage::GetAddr => {
+                peer.write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
+                    time: 1_800_000_000,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr: AddrV2::I2p(own.destination_hash()),
+                    port: 0,
+                }]))
+                .await
+                .map_err(|error| format!("address reply over I2P failed: {error}"))?;
+                return Ok(announced);
+            }
+            NetworkMessage::AddrV2(addresses) => {
+                announced.extend(
+                    addresses
+                        .into_iter()
+                        .filter_map(|address| match address.addr {
+                            AddrV2::I2p(destination) => Some(I2pPeerAddress {
+                                i2p: I2pAddress::from_destination_hash(destination),
+                                services: address.services,
+                                last_seen: address.time,
+                            }),
+                            _ => None,
+                        }),
+                );
+            }
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "set RBTC_I2P_SAM to run two nodes against a real I2P router"]
+async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
+    let bridge = required_socket("RBTC_I2P_SAM");
+    // A second bridge is optional: the session identifier is derived per node
+    // now, so two sessions may share one bridge. Setting RBTC_I2P_SAM_B
+    // exercises the split-bridge deployment instead.
+    let bridge_b = std::env::var("RBTC_I2P_SAM_B")
+        .ok()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .unwrap_or(bridge);
+    let config = I2pSamConfig {
+        timeout: SAM_SESSION_TIMEOUT,
+    };
+
+    // Two live sessions. Sharing one bridge previously failed with
+    // DUPLICATED_ID because the identifier was a fixed constant.
+    let accepting = I2pSamSession::create(bridge, "rbtc-two-node-a", None, config)
+        .await
+        .expect("the accepting session is created");
+    let dialling = I2pSamSession::create(bridge_b, "rbtc-two-node-b", None, config)
+        .await
+        .expect("the dialling session is created; a shared bridge must not report DUPLICATED_ID");
+    assert_ne!(
+        accepting.address(),
+        dialling.address(),
+        "two sessions must hold distinct destinations"
+    );
+    let accepting_shown = accepting.address().clone();
+    println!(
+        "accepting {accepting_shown} / dialling {}",
+        dialling.address()
+    );
+
+    let accepting_address = accepting.address().clone();
+    let dial_target = accepting_address.clone();
+    let responder = tokio::spawn(async move {
+        let accepted = accepting
+            .accept_stream()
+            .await
+            .map_err(|error| format!("accept an I2P stream: {error}"))?;
+        let observed_dialler = accepted.peer.clone();
+        let announced = serve_one_i2p_peer(accepted, accepting_address).await?;
+        Ok::<_, String>((observed_dialler, announced))
+    });
+
+    // The dialling side reaches the accepting destination through the bridge
+    // and drives the ordinary handshake on the returned stream.
+    let stream = dialling
+        .connect_stream(&dial_target)
+        .await
+        .expect("the bridge opens a stream to the accepting destination");
+    let mut session = rbtc::p2p::complete_outbound_handshake_on_stream(
+        stream,
+        Network::Bitcoin.magic(),
+        0x120d_e000,
+        "/rbtc:i2p-interop/".to_owned(),
+        0,
+        false,
+    )
+    .await
+    .expect("the handshake completes over the I2P stream");
+
+    // Announce this side's destination, then ask for the peer's.
+    session
+        .advertise_i2p_address(
+            dialling.address(),
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            1_800_000_000,
+        )
+        .await
+        .expect("announce our destination over I2P");
+    session
+        .request_addresses()
+        .await
+        .expect("address request over I2P");
+    let routable = session
+        .receive_addresses()
+        .await
+        .expect("address response over I2P");
+    assert!(
+        routable.is_empty(),
+        "the peer announces no routable address, got {routable:?}"
+    );
+
+    let learned = session.take_i2p_addresses();
+    assert_eq!(
+        learned.len(),
+        1,
+        "the peer's addrv2 must carry exactly its own I2P destination"
+    );
+    assert_eq!(
+        learned[0].i2p, dial_target,
+        "the received destination must be the accepting node's"
+    );
+    assert_eq!(
+        learned[0].services,
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS
+    );
+
+    let (observed_dialler, announced) = responder
+        .await
+        .expect("responder task")
+        .expect("the responder completed its exchange");
+    assert_eq!(
+        observed_dialler,
+        *dialling.address(),
+        "STREAM ACCEPT must report the destination that actually dialled"
+    );
+    assert_eq!(
+        announced.len(),
+        1,
+        "the accepting side must receive the dialler's announced destination"
+    );
+    assert_eq!(announced[0].i2p, *dialling.address());
 }
 
 /// Proves the SAM bridge is refused on a non-loopback address even when a
