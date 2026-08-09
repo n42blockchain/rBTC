@@ -1,7 +1,8 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at synchronized fix set (`98e984c` plus the final SAM framing fix recorded below)
+- Revision checked: `audit/group-b-decisions` at `0f47054`; the earlier
+  `4f8084f` real-daemon result is retained below as historical baseline only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -147,3 +148,53 @@ covers the latter; the final mock-filtered run passed `16/16`.
 Tor and I2P therefore now have real daemon-level evidence in this report. The
 separate seven-day public-network-soak finalizer remains open in
 `docs/PUBLIC_NETWORK_SOAK.md`.
+
+### `0f47054` follow-up revalidation — 2026-08-09
+
+`0f47054` changes the Tor and I2P node startup paths (onion republication,
+destination hashing, persisted-key error handling, and I2P transport fallback),
+so the preceding `4f8084f` `3/3` result does not cover this revision.
+
+#### Current real-daemon interop gate
+
+The following command was run twice against the same Tor and i2pd daemons:
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
+```
+
+| Run | Result | Runtime | I2P address printed by the test | Onion address printed by the test |
+| --- | --- | ---: | --- | --- |
+| 1 | `3 passed; 0 failed` | `20.17s` | `znkzunzaibatgkaioly5ja4xaliy556sld3kqpbcebvzflwnuwga.b32.i2p` | `47g6dlgbnzfgdu3yud3oyu3kuy5z6pcgkbiks62oeayseyrild43xgad.onion` |
+| 2 | `3 passed; 0 failed` | `12.30s` | `psdncwzouhqfcnnx3bgtgq7dpzzmerfswlzk3hon4xer425bqgba.b32.i2p` | `hb76wbsqulj7i4rzo5ivpgt6w7bcy2syn65bkpyafslxsuxqvj5bj4qd.onion` |
+
+These two test invocations pass on the current revision, but each invocation's
+interop test intentionally creates a fresh temporary identity. Their differing
+addresses are therefore expected and are not cross-process replay evidence.
+
+#### Cross-process persistence check
+
+To exercise the changed node startup paths, I launched the current
+`target/debug/rbtcd` twice with the same `/tmp/rbtc-node-replay` data directory:
+
+```bash
+target/debug/rbtcd --network regtest --no-dns-seeds \
+  --data-dir /tmp/rbtc-node-replay --listen 127.0.0.1:18446 \
+  --torcontrol 127.0.0.1:9051 \
+  --torcontrol-cookie /tmp/rbtc-nettest/tor/data/control_auth_cookie \
+  --i2psam 127.0.0.1:7656 --log-level info
+```
+
+- First process (fresh data directory): created I2P
+  `ffai23hj75a733hy4dqftiycc2curnrybojofdf2jeq6ju24nidq.b32.i2p` and
+  published onion
+  `sbcobh37lmnwdqcgxzfplbzr5miwv73legnlgtdbafauhzfqxzliz6yd.onion:18446`.
+- Process was stopped cleanly; owner-only key files were present at
+  `i2p_destination_key` and `onion_service_key` (mode `0600`).
+- Second process (same data directory): logged exactly the same I2P destination
+  and onion address, then reached the normal no-peer retry loop.
+
+This is the first current-revision evidence that the node's I2P destination
+and Tor v3 onion identity survive a process restart and are actually accepted
+by the live SAM and Tor control services. The seven-day public-network-soak
+finalizer remains open.
