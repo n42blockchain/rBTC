@@ -1,14 +1,15 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `0f47054`; the earlier
-  `4f8084f` real-daemon result is retained below as historical baseline only.
+- Revision checked: `audit/group-b-decisions` at `cf87ee2`; the earlier
+  `0f47054` and `4f8084f` real-daemon results are retained below as historical
+  baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
   - `RBTC_BTCD=/Users/jieliu/tools/go/bin/btcd`
   - `cargo` profile: release for differential/interop suites, debug for unit suites
-- Wall time window: 2026-08-08 (real daemon-backed acceptance checks)
+- Wall time window: 2026-08-08—2026-08-09 (real daemon-backed acceptance checks)
 
 ## Commands run
 
@@ -198,3 +199,92 @@ This is the first current-revision evidence that the node's I2P destination
 and Tor v3 onion identity survive a process restart and are actually accepted
 by the live SAM and Tor control services. The seven-day public-network-soak
 finalizer remains open.
+
+### `cf87ee2` follow-up revalidation — 2026-08-09
+
+`cf87ee2` changes the Tor/I2P startup and relay paths again, including the new
+I2P `addrv2` advertisement and the onlynet DNS short-circuit. Consequently the
+`8bc42f1`/`0f47054` `3/3` results above do not cover this revision.
+
+#### Real-daemon interop gate (two fresh runs)
+
+Both runs used the live Tor control/SOCKS pair (`127.0.0.1:9051` /
+`127.0.0.1:9050`, cookie authentication) and i2pd SAM (`127.0.0.1:7656`):
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+| Run | Result | Runtime | I2P address | Onion address |
+| --- | --- | ---: | --- | --- |
+| 1 | `3 passed; 0 failed` | `20.17s` | `znkzunzaibatgkaioly5ja4xaliy556sld3kqpbcebvzflwnuwga.b32.i2p` | `47g6dlgbnzfgdu3yud3oyu3kuy5z6pcgkbiks62oeayseyrild43xgad.onion` |
+| 2 | `3 passed; 0 failed` | `12.30s` | `psdncwzouhqfcnnx3bgtgq7dpzzmerfswlzk3hon4xer425bqgba.b32.i2p` | `hb76wbsqulj7i4rzo5ivpgt6w7bcy2syn65bkpyafslxsuxqvj5bj4qd.onion` |
+
+The interop fixture intentionally creates a fresh temporary identity per
+invocation, so the differing addresses are expected. They are not replay
+evidence; the current-revision replay check is separate below.
+
+#### Same-data-directory replay (current revision)
+
+`target/debug/rbtcd` was launched, stopped cleanly, and launched again with
+the same `/tmp/rbtc-cf87-replay` directory and the live Tor/i2pd daemons.
+Both processes logged exactly the same values:
+
+- I2P: `kxkyk4rreybwa7hfpjmx4bwqaxvi3dc4pzprvsre64w6ndmyhkdq.b32.i2p`
+- onion: `gbwbr72vtvehrjwfvhoowgkfuac2g7cdpwimwsxfygeyw5fzcxlaprqd.onion:18446`
+
+The persisted `i2p_destination_key` and `onion_service_key` were both
+owner-only (`0600`). This is current-code, cross-process evidence that the
+two identities are reused rather than regenerated.
+
+#### Focused regression and DNS restriction checks
+
+```bash
+cargo fmt --all -- --check
+git diff --check
+cargo test --locked --all-features -- i2p tor_control zmq_publisher
+```
+
+Result: `22 passed; 0 failed`. This includes the coalesced SAM-reply framing
+regression, replayed-key option regression, Tor control tests, I2P peer-store
+tests, and ZMQ publisher tests. The dedicated
+`node::tests::anonymity_only_restrictions_send_no_dns_query` also passed
+(`1 passed; 0 failed`). Real `--onlynet onion` and `--onlynet i2p` launches
+logged `dns=disabled` and exited without a DNS-seed attempt.
+
+#### Two-node I2P/addrv2 attempt — not accepted as pass
+
+This remains the one requested end-to-end gap. A first attempt with both nodes
+on SAM `127.0.0.1:7656` failed with `DUPLICATED_ID`: the current node uses the
+fixed SAM session id `rbtc`, so two simultaneous node sessions cannot share
+one bridge. A second attempt used two live local bridges (`7656` and `7657`)
+and confirmed that both nodes could create real I2P destinations, but the
+TCP peer handshake was reset before an `addrv2` response was observed. The
+logs report `p2p io: Connection reset by peer`; the isolated node has no active
+consensus data source yet, so its inbound handshake is closed before it can
+serve addresses. A Core 31-assisted bootstrap also connected successfully but
+then terminated with `inbound P2P listener task missing` before the second
+node could be attached.
+
+Therefore this run provides no end-to-end proof that a second rbtcd process
+received the I2P entry in `addrv2`; that evidence remains open under task #12.
+The failure is recorded rather than counted as an addrv2 pass.
+
+#### DNS packet capture limitation
+
+`tcpdump` was attempted on both `en0` and `lo0` with a `port 53` filter, but
+this macOS account cannot open `/dev/bpf0` (`Permission denied`); non-interactive
+`sudo` also requires a password. Consequently there is no packet-capture
+claim in this report. The source-level DNS guard test above passed, and the
+real onlynet launches reported `dns=disabled`, but a privileged capture is
+still required for the requested wire-level proof.
+
+**Current-revision conclusion:** Tor and I2P each have two fresh `3/3`
+real-daemon interop runs, and same-directory identity replay is proven. The
+I2P `addrv2` two-node receipt and privileged DNS packet capture remain open;
+the seven-day public-network-soak finalizer is also still open in
+`docs/PUBLIC_NETWORK_SOAK.md`.
