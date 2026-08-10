@@ -1,9 +1,9 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `e3d99cc`; the earlier
-  `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are retained below
-  as historical baselines only.
+- Revision checked: `audit/group-b-decisions` at `3fcf7c7`; the earlier
+  `e3d99cc`, `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are
+  retained below as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -558,3 +558,57 @@ the no-delay restart test pass. The complete five-case command remains red
 (`3/5`) because concurrent Destination publication failed once and the known
 shared-bridge acknowledgement EOF remains. Privileged DNS packet capture is
 unchanged and still open.
+
+### `3fcf7c7` serialized real-daemon suite — 2026-08-10
+
+`3fcf7c7` places a process-wide asynchronous mutex at the start of each of the
+five ignored anonymity-network cases. The acceptance command therefore does
+not depend on the caller remembering `--test-threads=1`, and only one case can
+publish Tor or I2P state at a time.
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+Result against Tor on ports 9050/9051 and i2pd 2.61.0 on port 7656:
+`4 passed; 1 failed` in `171.31s`. This is not a green gate.
+
+- Passed: non-loopback SAM refusal, the real Tor onion circuit, the real I2P
+  inbound-service path, and real SAM destination replay/deadline.
+- The inbound-service case now passes inside the complete suite. This confirms
+  that serialization removes the earlier suite-only LeaseSet lookup failure
+  for that case and preserves its targeted `run_listener_with_i2p` coverage.
+- `two_nodes_exchange_i2p_destinations_over_addrv2` still created two distinct
+  Destinations and reached the final exchange, but failed while the accepting
+  side awaited the address-response acknowledgement:
+  `Io(Custom { kind: UnexpectedEof, error: "early eof" })`.
+
+The matching i2pd log gives a daemon-level cause for the EOF. For the same
+stream (`rSID=4223200223`, `sSID=1943557433`) it records repeated remote-lease
+selection and retransmission through `Resend #10`, followed by:
+
+```text
+Streaming: packet was not ACKed after 10 attempts, terminate
+SAM: Stream read error: Operation canceled
+Streaming: Unexpected stream status=5
+SAM: Read error: End of file
+```
+
+The shared mutex has therefore been validated as useful but does not make the
+shared-bridge two-node case pass. Simultaneous execution of the five tests is
+no longer a sufficient explanation for that failure: the remaining EOF is
+preceded by the real I2P streaming layer exhausting its acknowledgement
+retries and terminating the stream. This evidence warrants investigation of
+the shared-bridge stream/lifecycle path, while this run alone does not assign
+the fault to rBTC rather than router/network behaviour. No product-code change
+was made in response to this result.
+
+**Current `3fcf7c7` conclusion:** serialization raises the full-suite result
+from `3/5` to `4/5` and makes the real inbound-service case reliable in this
+run, but the required `5/5` gate remains open on the shared-bridge two-node
+acknowledgement failure. Privileged DNS packet capture is unchanged and still
+open.
