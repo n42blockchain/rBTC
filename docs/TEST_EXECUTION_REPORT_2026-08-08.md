@@ -1,7 +1,7 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `5d638ae`; the earlier
+- Revision checked: `audit/group-b-decisions` at `e3d99cc`; the earlier
   `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are retained below
   as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
@@ -481,3 +481,80 @@ wire-level capture is claimed.
 two-node `addrv2` 1/1, same-directory identity replay, Core31/btcd inbound,
 Clippy, and full tests pass. Shared-bridge 1/1, a real
 `run_listener_with_i2p` acceptance, and privileged DNS capture remain open.
+
+### `e3d99cc` targeted I2P revalidation — 2026-08-10
+
+`e3d99cc` adds the first real-router acceptance case for
+`run_listener_with_i2p` and changes the production SAM session identifier from
+a stable per-data-directory value to a per-launch value with a random suffix.
+The following results supersede the two corresponding open items above.
+
+#### Real inbound-service acceptance
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  the_inbound_service -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `76.56s` against i2pd 2.61.0. The test dialled
+the real SAM Destination through the router, entered
+`run_listener_with_i2p`, completed the v1 handshake, requested and received
+the regtest genesis block, and asserted `accepted_total == 1`,
+`handshakes_total == 1`, with no capacity/source rejection. This closes the
+previous absence of any real-daemon evidence for the I2P branch of the inbound
+service select.
+
+#### Complete five-case anonymity suite
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+Result: `3 passed; 2 failed` in `139.38s`; this is not a green gate.
+
+- Passed: non-loopback SAM refusal, real SAM destination replay/deadline, and
+  the real Tor onion circuit.
+- `the_inbound_service_accepts_and_serves_a_real_i2p_peer` failed at
+  `STREAM CONNECT` with `CANT_REACH_PEER / LeaseSet not found`. It had passed
+  alone immediately before this run. The concurrent suite made several fresh
+  Destinations compete on one router; matching i2pd logs repeatedly report
+  `destination is not ready`, missing publish confirmations, unavailable
+  inbound/outbound tunnels, and a missing published LeaseSet.
+- `two_nodes_exchange_i2p_destinations_over_addrv2` again completed far enough
+  to print two distinct Destinations, but ended with `early eof` while waiting
+  for the final address-response acknowledgement. This reproduces the
+  shared-bridge failure recorded for `5d638ae`.
+
+The targeted inbound-service result is valid positive coverage of the core
+path, but the exact five-case command is currently sensitive to concurrent
+i2pd publication and does not pass as a suite. Both facts are retained rather
+than replacing one with the other.
+
+#### Immediate same-directory restart
+
+The current debug binary was started twice with the same fresh data directory,
+Tor control endpoint, and i2pd SAM bridge. The second process was spawned
+immediately after the first process exited; the harness inserted no sleep or
+bridge-release delay.
+
+- First launch created its SAM session after `22s`.
+- The immediate second launch created its SAM session after `4s` and did not
+  return `DUPLICATED_ID`.
+- Both launches published exactly the same identities:
+  - I2P: `4ke742y3tfamzvkrevny5xbpsvrnui6cveyalf2leof2uq4tej4a.b32.i2p`
+  - onion: `5bpttc7znpihtzf2cvx6ylblnaq5emws3ptbijxnctqqex344docnnqd.onion:18449`
+- `i2p_destination_key` and `onion_service_key` remained mode `0600`.
+
+This is real-bridge evidence that the random session-ID suffix removes the
+restart collision without changing the persisted public identity.
+
+**Current `e3d99cc` conclusion:** the newly targeted inbound-service test and
+the no-delay restart test pass. The complete five-case command remains red
+(`3/5`) because concurrent Destination publication failed once and the known
+shared-bridge acknowledgement EOF remains. Privileged DNS packet capture is
+unchanged and still open.
