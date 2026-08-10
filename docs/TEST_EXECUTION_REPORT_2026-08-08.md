@@ -1,7 +1,7 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `9695792`; the earlier
+- Revision checked: `audit/group-b-decisions` at `5d638ae`; the earlier
   `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are retained below
   as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
@@ -377,3 +377,107 @@ unmodified `two_nodes` test is not a `1/1` acceptance on this host because its
 responder closes the I2P stream too soon; the temporary keepalive proves the
 exchange itself on the split-bridge variant, but shared-bridge end-to-end
 evidence and a real `run_listener_with_i2p` acceptance test remain open.
+
+### `5d638ae` task #12 revalidation — 2026-08-09
+
+`5d638ae` changes the real two-node I2P test's stream-lifetime handshake: the
+dialling side sends a nonce-bearing ping only after it has received the peer's
+`addrv2`, and the accepting side keeps its SAM stream open for that protocol
+round trip. This section is the acceptance record for the current revision;
+the earlier `3/3`, replay, and TCP results are retained above as history.
+
+#### Real daemon gate (two fresh 3/3 runs)
+
+With Tor control/SOCKS (`127.0.0.1:9051`/`127.0.0.1:9050`, cookie
+`/tmp/rbtc-nettest/tor/data/control_auth_cookie`) and i2pd SAM
+(`127.0.0.1:7656`) running, the established cases were run twice, excluding
+the separately selected two-node test:
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture --skip two_nodes_exchange_i2p_destinations_over_addrv2
+```
+
+- Run 1: `3 passed; 0 failed` in `23.88s` (Tor onion reachability, real SAM
+  replay/deadline, and the loopback bridge guard).
+- Run 2: `3 passed; 0 failed` in `51.58s` (same three live-daemon cases).
+
+#### Task #12 two-node I2P/addrv2 exchange
+
+The split-bridge variant passed on the current test commit:
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 RBTC_I2P_SAM_B=127.0.0.1:7657 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  two_nodes -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `30.38s`. The assertions covered the real
+`STREAM ACCEPT` peer Destination, the completed v1 handshake, and both
+directions of the I2P `addrv2` exchange.
+
+The shared-bridge variant was attempted three times with the required command:
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  two_nodes -- --ignored --nocapture
+```
+
+It is **not accepted as 1/1** on this macOS router. The first attempt failed
+at `STREAM CONNECT` with `CANT_REACH_PEER / LeaseSet not found`; after the
+router was restarted and warmed, the next two attempts completed the connect,
+handshake, and bidirectional `addrv2` assertions but ended with EOF while
+waiting for the final ping acknowledgement (`150.10s` and `108.06s`). The
+i2pd diagnostics concurrently report repeated `Publish confirmation was not
+received`/`destination is not ready` and failed tunnel tests. This is retained
+as a real-daemon failure, not counted as a code pass or silently reclassified
+as a mock result. The split-bridge `1/1` is the current positive evidence for
+the new stream-lifetime change.
+
+#### Same-data-directory identity replay
+
+Using the current `target/debug/rbtcd`, the same fresh data directory was
+started, stopped, and started again after the SAM bridge released the previous
+session. Both successful launches logged exactly:
+
+- I2P: `ock3syazsempnx2joqzov62cbxtx4fffxokplngdqigpjfjqcl3a.b32.i2p`
+- onion: `rkubhi6eg3g32rfnqw6f4fz26rqnqbdsxu2qfyq36pxs5hkkewc25nad.onion:18448`
+
+`i2p_destination_key` and `onion_service_key` were both mode `0600`. An
+immediate restart before i2pd released the prior SAM ID returned
+`DUPLICATED_ID`; waiting for the bridge teardown and retrying produced the
+same addresses, so the persistence result is positive while the daemon
+release timing remains an operational caveat.
+
+#### Required regression and repository gates
+
+- Core 31/btcd inbound regression:
+  `inbound::tests::core31_and_btcd_complete_real_inbound_handshakes` —
+  `1 passed; 0 failed` in `0.37s`.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- Focused current-code set (`i2p`, `tor_control`, `zmq_publisher`, and the
+  source-level anonymity-only DNS guard) — `24 passed; 0 failed`.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` — passed.
+- `cargo test --locked --all-features` — `706 passed; 0 failed; 3 ignored`.
+
+The full repository gates are green on this macOS host. The audit task book's
+Windows gate remains CI-owned and was not executable on this host.
+
+#### Remaining #12 evidence gaps
+
+The new `run_listener_with_i2p` inbound branch still has no real-daemon node
+acceptance test; the Core31/btcd regression above exercises only the TCP
+branch. A privileged DNS packet capture is also still unavailable: current
+`tcpdump -ni lo0 -c 1 'port 53'` fails with `/dev/bpf0: Permission denied`,
+and non-interactive `sudo` requires a password. The source guard and prior
+real `--onlynet onion`/`--onlynet i2p` launches report `dns=disabled`, but no
+wire-level capture is claimed.
+
+**Current task #12 conclusion:** two fresh 3/3 daemon gates, split-bridge
+two-node `addrv2` 1/1, same-directory identity replay, Core31/btcd inbound,
+Clippy, and full tests pass. Shared-bridge 1/1, a real
+`run_listener_with_i2p` acceptance, and privileged DNS capture remain open.
