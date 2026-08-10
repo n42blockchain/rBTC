@@ -348,7 +348,11 @@ deadline instead of hanging. A two-node case then runs both halves against
 the router: two sessions must coexist on one bridge, one accepts while the
 other dials it, and each side must receive the other's destination in
 `addrv2`. Setting `RBTC_I2P_SAM_B` runs the two nodes against separate
-bridges instead. Each test names the environment variables it
+bridges instead. A further case dials the inbound service itself rather than
+a bare session, so the listener's select, shared connection semaphore,
+upload budget, and statistics are exercised on the I2P path too; it asserts
+the peer is accounted as accepted and handshaken and rejected by no ceiling
+keyed on an address it does not have. Each test names the environment variables it
 requires and fails with that message when they are absent, so a partially
 configured run reports what is missing rather than silently passing.
 

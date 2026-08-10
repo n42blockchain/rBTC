@@ -34,6 +34,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
@@ -469,6 +470,154 @@ async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
         "the accepting side must receive the dialler's announced destination"
     );
     assert_eq!(announced[0].i2p, *dialling.address());
+}
+
+/// A minimal data source for the inbound service.
+///
+/// It serves the regtest genesis block and nothing else, which is enough for
+/// a peer to complete the handshake and have one request answered.
+struct GenesisOnlySource {
+    block: bitcoin::Block,
+}
+
+impl rbtc::inbound::InboundDataSource for GenesisOnlySource {
+    fn start_height(&self) -> Result<u32, String> {
+        Ok(0)
+    }
+
+    fn active_header(&self, height: u32) -> Result<Option<bitcoin::block::Header>, String> {
+        Ok((height == 0).then_some(self.block.header))
+    }
+
+    fn active_height(&self, hash: bitcoin::BlockHash) -> Result<Option<u32>, String> {
+        Ok((hash == self.block.block_hash()).then_some(0))
+    }
+
+    fn block(&self, hash: bitcoin::BlockHash) -> Result<Option<Vec<u8>>, String> {
+        Ok((hash == self.block.block_hash()).then(|| bitcoin::consensus::serialize(&self.block)))
+    }
+
+    fn mempool(&self) -> Result<Vec<bitcoin::Transaction>, String> {
+        Ok(Vec::new())
+    }
+
+    fn transaction(
+        &self,
+        _inventory: bitcoin::p2p::message_blockdata::Inventory,
+    ) -> Result<Option<bitcoin::Transaction>, String> {
+        Ok(None)
+    }
+
+    fn submit_transaction(&self, _transaction: bitcoin::Transaction) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn basic_filter(
+        &self,
+        _height: u32,
+    ) -> Result<Option<rbtc::inbound::InboundBasicFilter>, String> {
+        Ok(None)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "set RBTC_I2P_SAM to run the inbound service against a real I2P router"]
+async fn the_inbound_service_accepts_and_serves_a_real_i2p_peer() {
+    let bridge = required_socket("RBTC_I2P_SAM");
+    let bridge_b = std::env::var("RBTC_I2P_SAM_B")
+        .ok()
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .unwrap_or(bridge);
+    let config = I2pSamConfig {
+        timeout: SAM_SESSION_TIMEOUT,
+    };
+
+    // This is the acceptance the library-level two-node case cannot give: the
+    // peer is admitted by `run_listener_with_i2p` itself, so the select, the
+    // shared connection semaphore, the upload budget, and the statistics are
+    // all exercised rather than bypassed.
+    let serving = Arc::new(
+        I2pSamSession::create(bridge, "rbtc-inbound-svc", None, config)
+            .await
+            .expect("the serving session is created"),
+    );
+    let destination = serving.address().clone();
+    println!("inbound service destination {destination}");
+
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+    let source: Arc<dyn rbtc::inbound::InboundDataSource> = Arc::new(GenesisOnlySource {
+        block: genesis.clone(),
+    });
+    let stats = Arc::new(rbtc::inbound::InboundStats::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind local");
+    let (relay, _relay_rx) = tokio::sync::broadcast::channel(8);
+    let service_stats = Arc::clone(&stats);
+    let service = tokio::spawn(rbtc::inbound::run_listener_with_i2p(
+        listener,
+        Network::Regtest.magic(),
+        0x5345_5256_4552_0000,
+        "/rbtc:i2p-service/".to_owned(),
+        ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        rbtc::inbound::InboundLimits::default(),
+        source,
+        service_stats,
+        Some(relay),
+        Some(Arc::clone(&serving)),
+    ));
+
+    // Dial the service through the router and drive an ordinary session.
+    let dialling = I2pSamSession::create(bridge_b, "rbtc-inbound-cli", None, config)
+        .await
+        .expect("the dialling session is created");
+    let stream = dialling
+        .connect_stream(&destination)
+        .await
+        .expect("the bridge reaches the inbound service");
+    let mut session = rbtc::p2p::complete_outbound_handshake_on_stream(
+        stream,
+        Network::Regtest.magic(),
+        0x434c_4945_4e54_0000,
+        "/rbtc:i2p-client/".to_owned(),
+        0,
+        false,
+    )
+    .await
+    .expect("the inbound service completes the handshake");
+    assert_eq!(
+        session.remote_version().user_agent,
+        "/rbtc:i2p-service/",
+        "the circuit must reach the service under test"
+    );
+
+    // One served request proves the peer reached the service path, not just
+    // its handshake.
+    session
+        .request_blocks(&[genesis.block_hash()])
+        .await
+        .expect("block request over I2P");
+    let served = session
+        .receive_requested_block(genesis.block_hash())
+        .await
+        .expect("the service answers the block request");
+    assert_eq!(served.block_hash(), genesis.block_hash());
+
+    let snapshot = stats.snapshot();
+    assert_eq!(
+        snapshot.accepted_total, 1,
+        "the inbound service must have accounted exactly one accepted peer"
+    );
+    assert_eq!(
+        snapshot.handshakes_total, 1,
+        "the accepted peer must be recorded as having completed its handshake"
+    );
+    assert_eq!(
+        snapshot.rejected_capacity_total + snapshot.rejected_source_total,
+        0,
+        "an I2P peer must not be rejected by ceilings keyed on an address it does not have"
+    );
+
+    drop(session);
+    service.abort();
 }
 
 /// Proves the SAM bridge is refused on a non-loopback address even when a

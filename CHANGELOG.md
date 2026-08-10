@@ -58,6 +58,10 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Fixed
 
+- The I2P SAM session identifier carries a random suffix, so a node
+  restarting before its bridge released the previous session no longer
+  collides with itself.
+
 - The I2P SAM session identifier is derived per node instead of fixed, so a
   second node on the same bridge no longer fails with `DUPLICATED_ID`.
 

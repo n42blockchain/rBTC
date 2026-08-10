@@ -9874,12 +9874,14 @@ async fn complete_assumeutxo_validation(
 /// learned it keep reaching this node across restarts. The key is secret
 /// material: it is written owner-only inside the data directory and never
 /// logged.
-/// Builds a SAM session identifier unique to this node instance.
+/// Builds a SAM session identifier unique to this launch.
 ///
-/// The identifier is derived from the network and data directory so two
-/// nodes on one host never collide, and so the same node keeps a stable
-/// identifier across restarts. It stays inside SAM's accepted character set
-/// and length bound.
+/// The identifier combines the network and data directory, so two nodes on
+/// one host never collide, with a random suffix, so a restart never collides
+/// with its own previous session while the bridge is still tearing it down.
+/// Nothing depends on the identifier being stable: the published address
+/// comes from the persisted destination key, not from this name. It stays
+/// inside SAM's accepted character set and length bound.
 fn i2p_session_id(options: &Options) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
@@ -9889,8 +9891,9 @@ fn i2p_session_id(options: &Options) -> String {
     }
     let fingerprint = digest.finalize();
     format!(
-        "{I2P_SESSION_ID_PREFIX}-{}",
-        crate::utxo::hex_lower(&fingerprint[..8])
+        "{I2P_SESSION_ID_PREFIX}-{}-{}",
+        crate::utxo::hex_lower(&fingerprint[..6]),
+        crate::utxo::hex_lower(&rand::random::<[u8; 4]>())
     )
 }
 
