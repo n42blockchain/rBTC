@@ -352,7 +352,12 @@ bridges instead. A further case dials the inbound service itself rather than
 a bare session, so the listener's select, shared connection semaphore,
 upload budget, and statistics are exercised on the I2P path too; it asserts
 the peer is accounted as accepted and handshaken and rejected by no ceiling
-keyed on an address it does not have. Each test names the environment variables it
+keyed on an address it does not have. The cases that publish to an
+anonymity network take a shared lock so they run one at a time: a router
+publishes each destination's LeaseSet and builds its tunnels before it is
+reachable, and asking one daemon to do that for every case at once produced
+`LeaseSet not found` when the suite ran as a whole while each case passed
+alone. Each test names the environment variables it
 requires and fails with that message when they are absent, so a partially
 configured run reports what is missing rather than silently passing.
 

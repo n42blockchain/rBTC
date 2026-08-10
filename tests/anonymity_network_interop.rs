@@ -34,7 +34,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
@@ -58,6 +58,18 @@ const DESCRIPTOR_TIMEOUT: Duration = Duration::from_secs(180);
 const DIAL_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Deadline for one SAM session creation, which builds tunnels first.
 const SAM_SESSION_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Serialises the cases that publish to an anonymity network.
+///
+/// A router publishes each destination's LeaseSet and builds its tunnels
+/// before the destination is reachable, and Tor does the same for a service
+/// descriptor. Running these cases in parallel asks one daemon to do all of
+/// that at once, which is what produced `LeaseSet not found` when the suite
+/// was run as a whole while each case passed on its own. The failure is a
+/// property of the harness, not of the code under test, so the harness takes
+/// the lock rather than the operator having to remember `--test-threads=1`.
+/// The Core differential suite serialises its daemon the same way.
+static ROUTER: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn required_socket(name: &str) -> SocketAddr {
     let value = std::env::var(name)
@@ -132,6 +144,7 @@ async fn serve_one_onion_peer(listener: TcpListener) -> Result<String, String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "set RBTC_TOR_CONTROL, RBTC_TOR_COOKIE, and RBTC_TOR_SOCKS to run against a real Tor daemon"]
 async fn published_onion_service_is_reachable_through_the_real_tor_network() {
+    let _router = ROUTER.lock().await;
     let control = required_socket("RBTC_TOR_CONTROL");
     let cookie = required_path("RBTC_TOR_COOKIE");
     let socks = required_socket("RBTC_TOR_SOCKS");
@@ -225,6 +238,7 @@ async fn published_onion_service_is_reachable_through_the_real_tor_network() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set RBTC_I2P_SAM to run against a real I2P router"]
 async fn sam_sessions_produce_stable_reusable_destinations() {
+    let _router = ROUTER.lock().await;
     let bridge = required_socket("RBTC_I2P_SAM");
     let config = I2pSamConfig {
         timeout: SAM_SESSION_TIMEOUT,
@@ -351,6 +365,7 @@ async fn serve_one_i2p_peer(
 #[ignore = "set RBTC_I2P_SAM to run two nodes against a real I2P router"]
 #[allow(clippy::too_many_lines)]
 async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
+    let _router = ROUTER.lock().await;
     let bridge = required_socket("RBTC_I2P_SAM");
     // A second bridge is optional: the session identifier is derived per node
     // now, so two sessions may share one bridge. Setting RBTC_I2P_SAM_B
@@ -523,6 +538,7 @@ impl rbtc::inbound::InboundDataSource for GenesisOnlySource {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "set RBTC_I2P_SAM to run the inbound service against a real I2P router"]
 async fn the_inbound_service_accepts_and_serves_a_real_i2p_peer() {
+    let _router = ROUTER.lock().await;
     let bridge = required_socket("RBTC_I2P_SAM");
     let bridge_b = std::env::var("RBTC_I2P_SAM_B")
         .ok()
@@ -625,6 +641,7 @@ async fn the_inbound_service_accepts_and_serves_a_real_i2p_peer() {
 #[tokio::test]
 #[ignore = "set RBTC_I2P_SAM to run against a real I2P router"]
 async fn sam_bridge_is_refused_on_a_non_loopback_address() {
+    let _router = ROUTER.lock().await;
     let bridge = required_socket("RBTC_I2P_SAM");
     assert!(
         bridge.ip().is_loopback(),
