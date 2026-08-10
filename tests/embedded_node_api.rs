@@ -405,7 +405,10 @@ async fn host_can_run_two_isolated_nodes_in_one_runtime() {
         .launch()
         .unwrap();
 
-    timeout(Duration::from_secs(2), async {
+    // Both nodes must handshake, but the deadline only guards against a hang:
+    // a tight one turns ordinary scheduling delay on a loaded machine into a
+    // failure, which this test did twice while the suite ran in parallel.
+    timeout(Duration::from_secs(20), async {
         first_accepted.await.unwrap();
         second_accepted.await.unwrap();
     })

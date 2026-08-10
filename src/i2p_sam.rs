@@ -15,6 +15,13 @@
 //! The SAM bridge is a fully privileged local interface — it can open
 //! arbitrary streams on this node's behalf — so the connection is refused
 //! unless it is loopback.
+//!
+//! One property of I2P streaming differs from TCP and shapes how callers must
+//! close: a stream drops data the peer has not yet acknowledged. A live
+//! router was observed retransmitting a final frame ten times and then
+//! terminating the stream for want of an acknowledgement, which the peer saw
+//! as an early EOF. A side that writes last must therefore let the other side
+//! close first, rather than closing as soon as its own write returns.
 
 use std::io;
 use std::net::SocketAddr;
