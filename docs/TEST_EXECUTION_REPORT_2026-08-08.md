@@ -1,9 +1,10 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at `3fcf7c7`; the earlier
-  `e3d99cc`, `cf87ee2`, `0f47054`, and `4f8084f` real-daemon results are
-  retained below as historical baselines only.
+- Revision checked: `audit/group-b-decisions` at merge revision `22fbffe`,
+  which contains the `368bedd` I2P stream-closing change; the earlier
+  `3fcf7c7`, `e3d99cc`, `cf87ee2`, `0f47054`, and `4f8084f` real-daemon
+  results are retained below as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -612,3 +613,51 @@ from `3/5` to `4/5` and makes the real inbound-service case reliable in this
 run, but the required `5/5` gate remains open on the shared-bridge two-node
 acknowledgement failure. Privileged DNS packet capture is unchanged and still
 open.
+
+### `368bedd` shared/split-bridge control experiment — 2026-08-11
+
+The current branch revision is merge commit `22fbffe`, which contains
+`368bedd`. That change makes the dialling side close first after the final
+acknowledgement and keeps the accepting side alive until it observes that
+close. The following two runs used the same binary and test source; only the
+second SAM endpoint was added for the split-bridge run.
+
+#### A: two Destinations on one i2pd bridge
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  two_nodes -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `54.11s`. The test printed distinct accepting
+and dialling Destinations, completed the real SAM stream and Bitcoin handshake,
+verified the accepted peer Destination, exchanged I2P `addrv2` entries in both
+directions, and completed the final acknowledgement/close sequence.
+
+#### B: one Destination on each of two i2pd bridges
+
+```bash
+RBTC_I2P_SAM=127.0.0.1:7656 RBTC_I2P_SAM_B=127.0.0.1:7657 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  two_nodes -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `23.06s`, with the same protocol assertions as
+A. The second router used its separate existing data directory and router
+identity. Its NetDB had no usable RouterInfo files and online reseed stalled,
+so it was bootstrapped with the first router's public RouterInfo snapshot; no
+Destination key, router key, or rBTC state was shared.
+
+Neither daemon log contains `packet was not ACKed after 10 attempts` for these
+runs. Both record SAM stream cancellation when the test deliberately closes
+the dialling side, which is the expected end of the new sequence rather than a
+test failure.
+
+**Current `22fbffe` conclusion:** A and B both pass. This result supports the
+`368bedd` close-order change as the fix for the previously observed final-frame
+failure; the older split-bridge pass is consistent with that topology merely
+having a wider timing window. It does not support downgrading the shared-bridge
+case to an i2pd environment limitation: the same current code now passes that
+case on the same router. The `3fcf7c7` `4/5` result remains valid only as a
+historical pre-fix observation and does not describe the current revision.
