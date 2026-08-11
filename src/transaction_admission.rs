@@ -366,6 +366,11 @@ pub struct AdmittedTransactionRelay {
     pub fee_sats: u64,
     /// Sigop-adjusted mempool virtual size.
     pub policy_vsize: usize,
+    /// Exact sigop cost measured against validated prevouts.
+    ///
+    /// Retained because it cannot be recomputed downstream: P2SH sigops need
+    /// the spent scripts, which a block template builder does not hold.
+    pub sigop_cost: u64,
 }
 
 #[derive(Clone)]
@@ -374,6 +379,7 @@ struct AdmittedTransaction {
     serialized_len: usize,
     fee_sats: u64,
     policy_vsize: usize,
+    sigop_cost: u64,
 }
 
 #[derive(Clone)]
@@ -1109,6 +1115,7 @@ impl TransactionAdmissionPool {
                 transaction: entry.transaction.clone(),
                 fee_sats: entry.fee_sats,
                 policy_vsize: entry.policy_vsize,
+                sigop_cost: entry.sigop_cost,
             })
             .collect()
     }
@@ -1441,6 +1448,7 @@ impl TransactionAdmissionPool {
                 serialized_len,
                 fee_sats: applied.fee_sats,
                 policy_vsize: applied.policy_vsize,
+                sigop_cost: applied.sigop_cost,
             });
             accepted.push(txid);
         }
@@ -2088,6 +2096,7 @@ fn is_child_with_parents_tree(transactions: &[Transaction]) -> bool {
 struct AppliedAdmission {
     fee_sats: u64,
     policy_vsize: usize,
+    sigop_cost: u64,
 }
 
 fn apply_to_overlay<S: UtxoStore>(
@@ -2165,6 +2174,7 @@ fn apply_to_overlay<S: UtxoStore>(
     Ok(AppliedAdmission {
         fee_sats,
         policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
+        sigop_cost: applied.sigop_cost,
     })
 }
 
@@ -2569,6 +2579,7 @@ mod tests {
                 transaction,
                 serialized_len,
                 fee_sats: 0,
+                sigop_cost: 0,
             });
         }
         pool.rebuild_indexes();

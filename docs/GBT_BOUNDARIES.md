@@ -11,8 +11,25 @@ mining" ([ROADMAP.md](ROADMAP.md)) — and nothing here changes that.
 ## Status
 
 `rbtc.submitblock` exists as of 2026-08-11, built along option A below for the
-test-self-sufficiency target. Gaps 1 and 2 are closed for that target; gaps 3
-and 4, and everything `getblocktemplate` needs, are untouched. What the
+test-self-sufficiency target, closing gaps 1 and 2 for it.
+
+Gaps 3 and 4 are closed as library surface on the same date, without an RPC:
+
+- `block_template::select_template_transactions` scores whole ancestor
+  packages, so a fee-paying child pulls its parents in, and fills against both
+  `MAX_BLOCK_WEIGHT` and `MAX_BLOCK_SIGOPS_COST` with Core's coinbase reserve
+  held back. The mempool now retains the sigop cost it measures during
+  admission (`AdmittedTransactionRelay::sigop_cost`), because P2SH sigops need
+  the spent scripts and cannot be recomputed by a template builder.
+- `block_assembly::build_block` assembles without grinding; `grind_block` is
+  the separate step, and `assemble_block` remains their composition.
+- `deployments::template_version_bits` derives the block version from BIP9
+  threshold state and the buried version floor, and reports which deployments
+  are signalling or required.
+
+What remains for a real `getblocktemplate` is the RPC surface itself —
+`mutable`, `capabilities`, `longpollid`, `vbavailable`/`vbrequired` wiring,
+and the JSON encoding — plus the scope questions below. What the
 implementation does **not** do is listed under [What submitblock does
 not do](#what-submitblock-does-not-do).
 
@@ -143,6 +160,12 @@ mining interface.
   path matches prefetched bodies positionally against the active chain, so
   queueing a losing block's body would abort the peer run. Connecting a block
   that causes a reorg remains unimplemented, as noted below.
+- **Selection is greedy, not optimal.** Packages are scored once and taken in
+  descending order; a package that does not fit is skipped and selection
+  continues. Core's incremental descendant updates are not implemented, so a
+  block can be marginally worse-paying than the best possible one. Candidates
+  are also capped at `MAX_TEMPLATE_CANDIDATES`, with the overflow reported in
+  `skipped_over_ceiling` rather than dropped silently.
 - **It defers rather than interleaves.** When a previous batch's prefetch is
   still buffered, staging is skipped for that iteration and the submission
   stays queued.

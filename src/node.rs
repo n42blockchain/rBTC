@@ -20110,11 +20110,13 @@ mod tests {
             policy_vsize: first.vsize(),
             transaction: first,
             fee_sats: 500,
+            sigop_cost: 0,
         };
         let second = AdmittedTransactionRelay {
             policy_vsize: second.vsize(),
             transaction: second,
             fee_sats: 1_000,
+            sigop_cost: 0,
         };
 
         let relayed = relay_selected_transactions(
@@ -20150,6 +20152,7 @@ mod tests {
             policy_vsize: transaction.vsize(),
             transaction: transaction.clone(),
             fee_sats: 1_000,
+            sigop_cost: 0,
         }];
         let (relay, receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         drop(receiver);
