@@ -8,6 +8,14 @@ would have to cross, so the cost is understood before any code is written.
 The roadmap item is deployment-triggered — "only if rBTC is deployed for
 mining" ([ROADMAP.md](ROADMAP.md)) — and nothing here changes that.
 
+## Status
+
+`rbtc.submitblock` exists as of 2026-08-11, built along option A below for the
+test-self-sufficiency target. Gaps 1 and 2 are closed for that target; gaps 3
+and 4, and everything `getblocktemplate` needs, are untouched. What the
+implementation does **not** do is listed under [What submitblock does
+not do](#what-submitblock-does-not-do).
+
 ## Summary
 
 The binding constraint is **header-chain ownership, not chainstate
@@ -117,13 +125,35 @@ exactly what the regtest fixtures already do. Adds no ownership surface and
 needs no new consensus-adjacent code, but it is a harness technique, not a
 mining interface.
 
+## What `submitblock` does not do
+
+- **It does not report whether the block connected.** `execute_data_query` is
+  synchronous (`src/node.rs:3657`), so the handler cannot await the execution
+  loop. It answers `queued` after context-free checks — proof of work against
+  the block's own target, and `validate_block_structure_with_deployments` for
+  the coinbase, Merkle root, weight, and witness commitment — and everything
+  needing chain context is decided later and only logged. Callers confirm with
+  `getbestblockhash`. Giving Core's verdict semantics means making the RPC
+  dispatch async, which is a larger change than the submission path itself.
+- **It caps blocks at 32 KiB**, half the shared 64 KiB JSON-RPC body limit
+  (`src/api.rs:139`), because the hex encoding doubles the payload. Regtest
+  fixtures fit; real blocks do not.
+- **It has no reorg behaviour.** A submitted header that does not take the
+  active tip is recorded and its body is dropped, deliberately: the execution
+  path matches prefetched bodies positionally against the active chain, so
+  queueing a losing block's body would abort the peer run. Connecting a block
+  that causes a reorg remains unimplemented, as noted below.
+- **It defers rather than interleaves.** When a previous batch's prefetch is
+  still buffered, staging is skipped for that iteration and the submission
+  stays queued.
+
 ## Two scope questions to settle first
 
-1. **Which target?** A production miner needs the full BIP22/23/9 surface —
+1. **Which target?** Settled on 2026-08-11: test-toolchain self-sufficiency.
+   A production miner would still need the full BIP22/23/9 surface —
    `mutable`, `capabilities`, `longpollid`, `vbavailable`, fee-optimal
-   selection. Making the test toolchain self-sufficient needs only
-   `submitblock` plus a modest template, and option C may cover it outright.
-   The two differ by roughly an order of magnitude in work.
+   selection — which remains out of scope and roughly an order of magnitude
+   more work.
 2. **Which chainstate modes?** The snapshot-overlay and AssumeUTXO-completion
    paths use different `ExecutionChainStore` implementations
    (`src/snapshot_overlay.rs:1775`, `src/snapshot_overlay_redb.rs:941`).

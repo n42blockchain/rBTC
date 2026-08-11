@@ -100,6 +100,20 @@ impl Default for InboundLimits {
     }
 }
 
+/// The outcome of queueing a locally produced block.
+///
+/// Queueing is all this reports. Whether the block connects is decided later
+/// by the execution loop, which owns the header chain and the chainstate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockSubmission {
+    /// The block is queued for connection.
+    Queued,
+    /// An identical block is already queued.
+    Duplicate,
+    /// The queue is at its ceiling.
+    Full,
+}
+
 /// One active-chain BIP157/158 basic-filter record exposed to peers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundBasicFilter {
@@ -502,6 +516,17 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String>;
     /// Queues one untrusted peer transaction for the node's ordinary admission path.
     fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String>;
+
+    /// Queues a locally produced block for connection by the execution loop.
+    ///
+    /// Unlike every other block this node connects, a submitted block arrives
+    /// before any header announces it, so the execution loop has to stage the
+    /// header itself. Sources that are not backed by that loop cannot do so
+    /// and report the operation as unavailable rather than silently accepting
+    /// a block nothing will ever connect.
+    fn submit_block(&self, _block: Block) -> Result<BlockSubmission, String> {
+        Err("block submission is not available on this node".to_owned())
+    }
     /// BIP158 basic filter data at one active height, when indexed.
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String>;
     /// Diverse, already-vetted IPv4/IPv6 peers suitable for bounded address relay.
