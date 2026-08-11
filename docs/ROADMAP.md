@@ -343,7 +343,12 @@ optional where appropriate, and host-runtime compatible.
   `v2_transport_interoperates_with_core` and `v2_preference_falls_back_to_v1_against_a_v1_only_core`)
   against Bitcoin Core 31.0 and btcd 0.26.
 - [ ] Mining interfaces (`getblocktemplate`/`submitblock` or a versioned local
-  IPC boundary) only if rBTC is deployed for mining.
+  IPC boundary) only if rBTC is deployed for mining. The ownership and
+  concurrency boundaries such an implementation would cross are mapped in
+  [GBT_BOUNDARIES.md](GBT_BOUNDARIES.md): the binding constraint is
+  header-chain ownership rather than chainstate ownership, and two scope
+  questions — production miner versus test self-sufficiency, and which
+  chainstate modes are supported — should be settled before any code.
 - [x] ZMQ-compatible or native bounded event publication for indexers; the
   existing REST/event path remains sufficient for the base node.
   The `zmq_publisher::tests` suite now validates subscription-topic filtering,
