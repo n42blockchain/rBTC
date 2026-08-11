@@ -1,11 +1,10 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Executable revision checked: `audit/group-b-decisions` at `c951387`, which
-  contains the `368bedd` I2P stream-closing change. The later `5eca1a2` changes
-  only mining documentation and was incorporated after the run; the earlier
-  `3fcf7c7`, `e3d99cc`, `cf87ee2`, `0f47054`, and `4f8084f` real-daemon
-  results are retained below as historical baselines only.
+- Executable revision checked: `audit/group-b-decisions` at `a8573b0`, whose
+  product-code revision is `9dc2cba` (`rbtc.submitblock`) and which contains
+  the earlier `368bedd` I2P stream-closing change. Earlier real-daemon results
+  are retained below as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
@@ -726,3 +725,37 @@ inside the complete suite. The preceding first-attempt `4/5` is retained as
 evidence that a fresh Destination can still encounter transient i2pd LeaseSet
 publication failure; the green result is a clean-daemon rerun, not a claim that
 the external router gate is free of environmental variance.
+
+### `a8573b0` post-submitblock five-case rerun — 2026-08-11
+
+The complete gate was rerun after `9dc2cba` added the local block-submission
+path and extended `InboundDataSource`. This resolves the revision-currency gap
+noted above: the executable under test includes that product-code change.
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+Result on the first run: `5 passed; 0 failed` in `137.59s`, after `34.18s` of
+incremental release compilation.
+
+- The real I2P inbound-service case passed first, covering
+  `run_listener_with_i2p`, the extended inbound trait boundary, handshake,
+  served block, budgets, and statistics.
+- The real Tor onion service connected on its first attempt.
+- Real SAM Destination replay/deadline and non-loopback refusal passed.
+- The shared-bridge two-node case passed with distinct Destinations,
+  bidirectional I2P `addrv2`, and the corrected acknowledgement/close sequence.
+
+The i2pd log contains one `Destination to connect not found` from the SAM
+replay case's deliberate unreachable-destination deadline check; it did not
+cause a test failure. There was no exhausted ten-attempt stream retransmission
+and no LeaseSet publication failure in a tested connection.
+
+**Current `a8573b0` conclusion:** the post-`rbtc.submitblock` macOS
+real-daemon gate is green `5/5` on its first complete run. The earlier statement
+that only a rerun could make the current-head gate green is now satisfied.
