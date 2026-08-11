@@ -82,7 +82,7 @@ use bitcoin::{
 use rbtc::{
     api::{
         AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
-        LocalRpcOperator, LocalRpcOperatorError, MAX_RPC_BODY_BYTES,
+        LocalRpcOperator, LocalRpcOperatorError, MAX_RPC_BODY_BYTES, RpcFuture,
         WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
         explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
@@ -157,7 +157,7 @@ use rbtc::{
         parse_wallet_descriptor_config, read_persisted_wallet_sync_height,
     },
 };
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3249,9 +3249,132 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "stop",
 ];
 
+/// A block accepted by the context-free checks and handed to the node.
+struct QueuedSubmission {
+    hash: BlockHash,
+    submission: BlockSubmission,
+}
+
+impl NodeRpcOperator {
+    /// Decodes, context-free-validates, and queues one submitted block.
+    ///
+    /// Shared by both dispatch paths so they cannot drift apart on what they
+    /// accept. Only rejections that need no chain context are decided here;
+    /// everything else is the execution loop's to answer.
+    fn submit_block_for_verdict(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<QueuedSubmission, LocalRpcOperatorError> {
+        let unavailable = || LocalRpcOperatorError {
+            code: -28,
+            message: "Node data is not ready",
+        };
+        let values = params.as_array().ok_or(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        })?;
+        let raw = values
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| values.len() == 1)
+            .and_then(|value| Vec::<u8>::from_hex(value).ok())
+            .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
+            .ok_or(LocalRpcOperatorError {
+                code: -22,
+                message: "Block decode failed",
+            })?;
+        let block = deserialize::<Block>(&raw).map_err(|_| LocalRpcOperatorError {
+            code: -22,
+            message: "Block decode failed",
+        })?;
+        let hash = block.block_hash();
+        if block.header.validate_pow(block.header.target()).is_err() {
+            return Err(LocalRpcOperatorError {
+                code: -25,
+                message: "high-hash",
+            });
+        }
+        // Height zero with BIP34 disabled: the coinbase height commitment
+        // depends on the active chain, so the execution loop checks it.
+        rbtc::blockchain::validate_block_structure_with_deployments(&block, 0, false, true, None)
+            .map_err(|_| LocalRpcOperatorError {
+            code: -25,
+            message: "bad-block-structure",
+        })?;
+        let source = self.source.as_ref().ok_or_else(unavailable)?;
+        let source = source.current().map_err(|_| unavailable())?;
+        let submission = source
+            .submit_block(block)
+            .map_err(|_| LocalRpcOperatorError {
+                code: -32603,
+                message: "Block submission is not available on this node",
+            })?;
+        Ok(QueuedSubmission { hash, submission })
+    }
+
+    /// Describes a submission that never entered the queue.
+    fn describe_unqueued(
+        queued: &QueuedSubmission,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        match queued.submission {
+            BlockSubmission::Duplicate => Ok(serde_json::json!({
+                "hash": queued.hash,
+                "connected": false,
+                "reason": "duplicate",
+            })),
+            BlockSubmission::Full => Err(LocalRpcOperatorError {
+                code: -32040,
+                message: "Block submission queue is full",
+            }),
+            BlockSubmission::Queued(_) => {
+                unreachable!("a queued submission is awaited rather than described")
+            }
+        }
+    }
+}
+
 impl LocalRpcOperator for NodeRpcOperator {
     fn methods(&self) -> &'static [&'static str] {
         NODE_OPERATOR_RPC_METHODS
+    }
+
+    /// Answers `rbtc.submitblock` with the execution loop's real verdict.
+    ///
+    /// Everything else is decided from state this operator already holds, so
+    /// it goes straight to the synchronous path. Submission is the exception:
+    /// the block has to be staged and connected by another task before there
+    /// is anything truthful to say about it.
+    fn execute_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a serde_json::Value,
+    ) -> RpcFuture<'a> {
+        Box::pin(async move {
+            if method != "rbtc.submitblock" {
+                return self.execute(method, params);
+            }
+            let queued = match self.submit_block_for_verdict(params) {
+                Ok(queued) => queued,
+                Err(error) => return Some(Err(error)),
+            };
+            let BlockSubmission::Queued(verdict) = queued.submission else {
+                return Some(Self::describe_unqueued(&queued));
+            };
+            // A closed channel means the node stopped before deciding. That is
+            // not a rejection and must not be reported as one.
+            Some(match verdict.await {
+                Ok(Ok(())) => Ok(serde_json::json!({"hash": queued.hash, "connected": true})),
+                Ok(Err(reason)) => Ok(serde_json::json!({
+                    "hash": queued.hash,
+                    "connected": false,
+                    "reason": reason,
+                })),
+                Err(_) => Err(LocalRpcOperatorError {
+                    code: -32603,
+                    message: "The node stopped before the block was decided",
+                }),
+            })
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3947,58 +4070,19 @@ impl NodeRpcOperator {
                 Ok(serde_json::json!({"txid": txid, "queued": true}))
             }
             "rbtc.submitblock" => {
-                let values = params.as_array().ok_or_else(invalid)?;
-                let raw = values
-                    .first()
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|_| values.len() == 1)
-                    .and_then(|value| Vec::<u8>::from_hex(value).ok())
-                    .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
-                    .ok_or(LocalRpcOperatorError {
-                        code: -22,
-                        message: "Block decode failed",
-                    })?;
-                let block = deserialize::<Block>(&raw).map_err(|_| LocalRpcOperatorError {
-                    code: -22,
-                    message: "Block decode failed",
-                })?;
-                let hash = block.block_hash();
-                // Only context-free rejections can be reported here. This
-                // handler is synchronous, so it cannot await the execution
-                // loop's verdict, and it deliberately answers `queued` rather
-                // than implying the block connected. Callers confirm that with
-                // `getbestblockhash`.
-                if block.header.validate_pow(block.header.target()).is_err() {
-                    return Err(LocalRpcOperatorError {
-                        code: -25,
-                        message: "high-hash",
-                    });
-                }
-                // Height zero with BIP34 disabled: the coinbase height commitment
-                // depends on the active chain, so the execution loop checks it.
-                rbtc::blockchain::validate_block_structure_with_deployments(
-                    &block, 0, false, true, None,
-                )
-                .map_err(|_| LocalRpcOperatorError {
-                    code: -25,
-                    message: "bad-block-structure",
-                })?;
-                match source
-                    .submit_block(block)
-                    .map_err(|_| LocalRpcOperatorError {
-                        code: -32603,
-                        message: "Block submission is not available on this node",
-                    })? {
-                    BlockSubmission::Queued => {
-                        Ok(serde_json::json!({"hash": hash, "queued": true}))
+                // The synchronous dispatcher cannot wait for the execution
+                // loop, so it reports only that the block was queued. The
+                // async dispatcher used by the HTTP route answers with the
+                // real connection verdict; both accept exactly the same
+                // blocks because both queue through one helper.
+                let queued = self.submit_block_for_verdict(params)?;
+                match queued.submission {
+                    BlockSubmission::Queued(_) => {
+                        Ok(serde_json::json!({"hash": queued.hash, "queued": true}))
                     }
-                    BlockSubmission::Duplicate => Ok(
-                        serde_json::json!({"hash": hash, "queued": false, "reason": "duplicate"}),
-                    ),
-                    BlockSubmission::Full => Err(LocalRpcOperatorError {
-                        code: -32040,
-                        message: "Block submission queue is full",
-                    }),
+                    BlockSubmission::Duplicate | BlockSubmission::Full => {
+                        Self::describe_unqueued(&queued)
+                    }
                 }
             }
             _ => unreachable!("data method membership checked"),
@@ -4783,9 +4867,18 @@ impl InboundDataSource for SharedInboundSource {
 /// Bounded because submission has no backpressure of its own: the RPC answers
 /// as soon as the block is queued, so nothing upstream slows down when the
 /// execution loop is busy.
+/// Submissions staged onto the active chain and awaiting an execution verdict.
+type AwaitingSubmissions = Vec<(BlockHash, u32, oneshot::Sender<Result<(), String>>)>;
+
+/// A submitted block and the channel its verdict returns on.
+struct PendingBlock {
+    block: Block,
+    verdict: oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Default)]
 struct PendingBlockQueue {
-    blocks: VecDeque<Block>,
+    blocks: VecDeque<PendingBlock>,
 }
 
 /// How many submitted blocks may await connection at once.
@@ -4794,17 +4887,22 @@ const MAX_PENDING_SUBMITTED_BLOCKS: usize = 16;
 impl PendingBlockQueue {
     fn push(&mut self, block: Block) -> BlockSubmission {
         let hash = block.block_hash();
-        if self.blocks.iter().any(|queued| queued.block_hash() == hash) {
+        if self
+            .blocks
+            .iter()
+            .any(|queued| queued.block.block_hash() == hash)
+        {
             return BlockSubmission::Duplicate;
         }
         if self.blocks.len() >= MAX_PENDING_SUBMITTED_BLOCKS {
             return BlockSubmission::Full;
         }
-        self.blocks.push_back(block);
-        BlockSubmission::Queued
+        let (verdict, receiver) = oneshot::channel();
+        self.blocks.push_back(PendingBlock { block, verdict });
+        BlockSubmission::Queued(receiver)
     }
 
-    fn drain(&mut self) -> Vec<Block> {
+    fn drain(&mut self) -> Vec<PendingBlock> {
         self.blocks.drain(..).collect()
     }
 }
@@ -5023,7 +5121,7 @@ impl InboundDataSource for NodeInboundSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(block);
-        if queued == BlockSubmission::Queued {
+        if matches!(queued, BlockSubmission::Queued(_)) {
             // The execution loop idles on a long poll when it is caught up,
             // which is exactly when a submitted block arrives. Waking it keeps
             // submission latency bounded by the work, not by the poll period.
@@ -10363,6 +10461,35 @@ async fn discover_peer_addresses(
     }
 }
 
+/// Answers every submission whose block has now been executed, or not.
+///
+/// Called after each execution batch. A submission is confirmed only when the
+/// active header at its height is still its own hash *and* the execution tip
+/// has reached that height: a reorg between staging and execution would leave
+/// the first true and the second meaningless on its own.
+fn settle_submitted_blocks(
+    awaiting: &mut AwaitingSubmissions,
+    headers: &HeaderDag,
+    execution_height: u32,
+) {
+    let mut still_pending = Vec::new();
+    for (hash, height, verdict) in std::mem::take(awaiting) {
+        if height > execution_height {
+            still_pending.push((hash, height, verdict));
+            continue;
+        }
+        let connected = headers
+            .active_header_at(height)
+            .is_some_and(|active| active.hash == hash);
+        let _ = verdict.send(if connected {
+            Ok(())
+        } else {
+            Err("the block was replaced on the active chain before it connected".to_owned())
+        });
+    }
+    *awaiting = still_pending;
+}
+
 /// Stages locally submitted blocks so the ordinary execution path connects them.
 ///
 /// Every other block this node connects is announced by a header first. A
@@ -10372,8 +10499,9 @@ async fn discover_peer_addresses(
 /// asking a peer for bytes the node already holds, which keeps full block
 /// validation, indexing, and notification on one path.
 ///
-/// Header-level rejections are logged and dropped: the submitting RPC answered
-/// when the block was queued, so there is no longer anywhere to report them.
+/// A header-level rejection is answered here. A block that reaches the active
+/// chain cannot be answered yet, because it has not been connected: its
+/// channel joins `awaiting` and is settled once execution has run.
 fn stage_submitted_blocks(
     pending: &Mutex<PendingBlockQueue>,
     headers: &mut HeaderDag,
@@ -10381,6 +10509,7 @@ fn stage_submitted_blocks(
     inbound_headers: &RwLock<HeaderDag>,
     network_time: &NetworkTime,
     prefetched_blocks: &mut PrefetchedBlocks,
+    awaiting: &mut AwaitingSubmissions,
 ) -> Result<(), PeerRunError> {
     // Blocks already carried over from a previous batch must be consumed in
     // their own order first; appending behind them would break the contiguous
@@ -10401,12 +10530,13 @@ fn stage_submitted_blocks(
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
     let adjusted = network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?);
     let mut staged_any = false;
-    for block in submitted {
+    for PendingBlock { block, verdict } in submitted {
         let hash = block.block_hash();
         let staged = match headers.stage_batch_contextual(&[block.header], adjusted) {
             Ok(staged) => staged,
             Err(error) => {
                 rbtc_warn!("rejected submitted block {hash}: {error}");
+                let _ = verdict.send(Err(error.to_string()));
                 continue;
             }
         };
@@ -10414,20 +10544,23 @@ fn stage_submitted_blocks(
             // Dropping the guard rolls the header back, so the in-memory DAG
             // and the durable store cannot disagree about it.
             rbtc_warn!("could not persist submitted block header {hash}: {error}");
+            let _ = verdict.send(Err(format!("could not persist the block header: {error}")));
             continue;
         }
         let _ = staged.commit();
         staged_any = true;
         if headers.active_tip().hash == hash {
+            let height = headers.active_tip().height;
             prefetched_blocks.serialized.push(serialize(&block));
-            rbtc_info!(
-                "staged submitted block {hash} at height {}",
-                headers.active_tip().height
-            );
+            awaiting.push((hash, height, verdict));
+            rbtc_info!("staged submitted block {hash} at height {height}");
         } else {
             // A valid header that loses the work comparison stays recorded, but
             // nothing executes it: connection follows the active chain only.
             rbtc_info!("recorded submitted block {hash} off the active chain");
+            let _ = verdict.send(Err(
+                "inconclusive: the header is valid but does not extend the active chain".to_owned(),
+            ));
         }
     }
     if staged_any {
@@ -12256,6 +12389,7 @@ async fn sync_validating_node(
             server.ensure_running().await?;
         }
         let mut prefetched_blocks = PrefetchedBlocks::default();
+        let mut awaiting_submissions = Vec::new();
         loop {
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
@@ -12515,8 +12649,12 @@ async fn sync_validating_node(
                 &inbound_headers,
                 network_time,
                 &mut prefetched_blocks,
+                &mut awaiting_submissions,
             )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            // Settle before anything can return or park: a submission staged in
+            // an earlier iteration is decided as soon as execution passes it.
+            settle_submitted_blocks(&mut awaiting_submissions, &headers, tip.height);
             if let Some(status) = &node_status {
                 status.update(collect_node_status(
                     network,
@@ -17789,10 +17927,12 @@ mod tests {
         let block = submitted_regtest_block(genesis.block_hash(), 1, 1_800_000_000);
         let mut queue = PendingBlockQueue::default();
 
-        assert_eq!(queue.push(block.clone()), BlockSubmission::Queued);
-        assert_eq!(
+        assert!(matches!(
             queue.push(block.clone()),
-            BlockSubmission::Duplicate,
+            BlockSubmission::Queued(_)
+        ));
+        assert!(
+            matches!(queue.push(block.clone()), BlockSubmission::Duplicate),
             "resubmitting the same block must be distinguishable from a full queue"
         );
 
@@ -17805,10 +17945,10 @@ mod tests {
                 1,
                 1_800_000_000 + u32::try_from(offset).unwrap(),
             );
-            assert_eq!(queue.push(filler), BlockSubmission::Queued);
+            assert!(matches!(queue.push(filler), BlockSubmission::Queued(_)));
         }
         let overflow = submitted_regtest_block(genesis.block_hash(), 1, 1_900_000_000);
-        assert_eq!(queue.push(overflow), BlockSubmission::Full);
+        assert!(matches!(queue.push(overflow), BlockSubmission::Full));
         assert_eq!(queue.drain().len(), MAX_PENDING_SUBMITTED_BLOCKS);
     }
 
@@ -17823,10 +17963,10 @@ mod tests {
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
 
         let pending = Mutex::new(PendingBlockQueue::default());
-        assert_eq!(
+        assert!(matches!(
             pending.lock().unwrap().push(block.clone()),
-            BlockSubmission::Queued
-        );
+            BlockSubmission::Queued(_)
+        ));
         let mut prefetched = PrefetchedBlocks::default();
         stage_submitted_blocks(
             &pending,
@@ -17835,6 +17975,7 @@ mod tests {
             &inbound_headers,
             &NetworkTime::default(),
             &mut prefetched,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -17885,6 +18026,7 @@ mod tests {
             &inbound_headers,
             &NetworkTime::default(),
             &mut prefetched,
+            &mut Vec::new(),
         )
         .expect("a rejected submission is not a node failure");
 
@@ -17893,6 +18035,87 @@ mod tests {
             prefetched.serialized.is_empty(),
             "an unconnectable body must never reach the prefetch buffer: the execution path would then fail to match it against the active chain and abort the peer run"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_header_answers_its_submitter_instead_of_only_logging() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let orphan =
+            submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        let BlockSubmission::Queued(verdict) = pending.lock().unwrap().push(orphan) else {
+            panic!("the first submission is queued");
+        };
+        let mut prefetched = PrefetchedBlocks::default();
+        let mut awaiting = Vec::new();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut awaiting,
+        )
+        .unwrap();
+
+        let reason = verdict
+            .await
+            .expect("a rejected header is answered, not dropped")
+            .expect_err("an unconnectable header is not a success");
+        assert!(
+            reason.contains("parent") || reason.contains("Parent"),
+            "the submitter must learn why, not just that it failed: {reason}"
+        );
+        assert!(awaiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connected_submission_is_confirmed_only_after_execution_reaches_it() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        let BlockSubmission::Queued(mut verdict) = pending.lock().unwrap().push(block.clone())
+        else {
+            panic!("the submission is queued");
+        };
+        let mut prefetched = PrefetchedBlocks::default();
+        let mut awaiting = Vec::new();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut awaiting,
+        )
+        .unwrap();
+
+        // Staged but not executed: answering now would claim a connection that
+        // has not happened.
+        assert_eq!(awaiting.len(), 1);
+        settle_submitted_blocks(&mut awaiting, &headers, 0);
+        assert_eq!(awaiting.len(), 1);
+        assert!(
+            verdict.try_recv().is_err(),
+            "a staged block must not be reported as connected before execution reaches it"
+        );
+
+        settle_submitted_blocks(&mut awaiting, &headers, 1);
+        assert!(awaiting.is_empty());
+        assert_eq!(verdict.await.expect("the verdict is delivered"), Ok(()));
     }
 
     #[test]
@@ -17922,6 +18145,7 @@ mod tests {
             &inbound_headers,
             &NetworkTime::default(),
             &mut prefetched,
+            &mut Vec::new(),
         )
         .unwrap();
 
@@ -17958,6 +18182,7 @@ mod tests {
             &inbound_headers,
             &NetworkTime::default(),
             &mut prefetched,
+            &mut Vec::new(),
         )
         .unwrap();
 

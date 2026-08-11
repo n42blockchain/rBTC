@@ -102,12 +102,16 @@ impl Default for InboundLimits {
 
 /// The outcome of queueing a locally produced block.
 ///
-/// Queueing is all this reports. Whether the block connects is decided later
-/// by the execution loop, which owns the header chain and the chainstate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Queueing is decided immediately; whether the block connects is decided
+/// later by the execution loop, which owns the header chain and the
+/// chainstate, and arrives on the channel a queued submission carries.
+#[derive(Debug)]
 pub enum BlockSubmission {
-    /// The block is queued for connection.
-    Queued,
+    /// The block is queued; the channel carries its connection verdict.
+    ///
+    /// A closed channel means the node stopped before deciding, which is not
+    /// the same as a rejection and must not be reported as one.
+    Queued(tokio::sync::oneshot::Receiver<Result<(), String>>),
     /// An identical block is already queued.
     Duplicate,
     /// The queue is at its ceiling.
