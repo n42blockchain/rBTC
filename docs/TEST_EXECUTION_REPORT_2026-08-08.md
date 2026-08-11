@@ -710,6 +710,16 @@ The exact command above was run again. Result: `5 passed; 0 failed` in
   the real SAM dial, Bitcoin handshake, served block, admission budgets, and
   inbound statistics.
 
+**Revision currency:** `9dc2cba` (`rbtc.submitblock`) landed after this run and
+does change the tested binary, so this gate describes `c951387` and not the
+current branch head. Reading the diff, the added code is off the interop path:
+`src/inbound.rs` gains only a defaulted trait method and an enum, leaving
+`run_listener_with_i2p` and the serving logic untouched, and the one change to
+existing runtime behaviour — `wait_for_peer_poll` ending its wait early on a
+submission — sits in the peer execution loop, which none of these five cases
+drive. That is an argument from reading the diff, not a run; only a rerun makes
+the gate green on the current head.
+
 **Current `c951387` conclusion:** the complete five-case real-daemon gate has
 a green `5/5` macOS run, and the shared-bridge close-order fix remains green
 inside the complete suite. The preceding first-attempt `4/5` is retained as
