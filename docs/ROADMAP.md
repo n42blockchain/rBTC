@@ -342,13 +342,16 @@ optional where appropriate, and host-runtime compatible.
   Real daemon coverage includes `core_block_differential` (including
   `v2_transport_interoperates_with_core` and `v2_preference_falls_back_to_v1_against_a_v1_only_core`)
   against Bitcoin Core 31.0 and btcd 0.26.
-- [ ] Mining interfaces (`getblocktemplate`/`submitblock` or a versioned local
-  IPC boundary) only if rBTC is deployed for mining. The ownership and
-  concurrency boundaries such an implementation would cross are mapped in
-  [GBT_BOUNDARIES.md](GBT_BOUNDARIES.md): the binding constraint is
-  header-chain ownership rather than chainstate ownership, and two scope
-  questions — production miner versus test self-sufficiency, and which
-  chainstate modes are supported — should be settled before any code.
+- [x] Mining interfaces scoped to test self-sufficiency and interface parity,
+  not production mining. `rbtc.submitblock` stages a locally produced header
+  in the execution loop and answers with the real connection verdict;
+  `getblocktemplate` serves the BIP22/23 fields this node can state
+  truthfully, with package-aware selection bounded by the block weight and
+  sigop limits and a derived block version. Any chainstate not independently
+  validated from genesis is refused outright. `longpollid`, proposal mode, and
+  a live rather than snapshot header view remain open and are recorded, with
+  the ownership boundaries the work crossed, in
+  [GBT_BOUNDARIES.md](GBT_BOUNDARIES.md).
 - [x] ZMQ-compatible or native bounded event publication for indexers; the
   existing REST/event path remains sufficient for the base node.
   The `zmq_publisher::tests` suite now validates subscription-topic filtering,
@@ -361,7 +364,14 @@ optional where appropriate, and host-runtime compatible.
   one durability boundary. MDBX benchmark availability alone is insufficient.
 - [ ] GUI, legacy wallet import, exact Core RPC field parity, and specialized
   index/mining APIs only in response to a concrete deployment requirement.
-- [ ] Native onion/I2P address persistence and name-proxy discovery.
+- [x] Native onion/I2P address persistence. The inbound onion service stores
+  its ED25519 key owner-only and republishes it on every start, and a SAM
+  session replays a stored destination key, so both addresses survive a
+  restart.
+- [ ] Name-proxy discovery. A SOCKS5 proxy currently refuses to run alongside
+  DNS seeds rather than resolving seed hostnames through the proxy, which
+  fails closed against resolver leaks but leaves an operator on explicit peers
+  or the persisted peer database for bootstrap.
 - [x] Administrative peer mutation and a general bounded cursor chainstate
   scan. Authenticated `listbanned`/`setban` administer durable local peer
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks
