@@ -39,6 +39,7 @@ pub mod p2p;
 pub mod p2p_v2;
 pub mod peer_store;
 pub mod rebroadcast_store;
+pub mod seed_name;
 pub mod signet;
 pub mod snapshot;
 pub mod snapshot_download;

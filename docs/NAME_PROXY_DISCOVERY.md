@@ -88,6 +88,25 @@ Bitcoin address discovery.
 This is the existing safest behavior and remains a supported choice. It is the
 fallback when no deployment requires automatic proxied bootstrap.
 
+## Implementation status
+
+At `b39f75d` nothing of this design existed. As of 2026-08-11 the name rule
+alone is implemented, in `src/seed_name.rs`: `SeedName::parse` is the only
+constructor, so no unvalidated string can reach an encoder, and it refuses NUL,
+path, whitespace, CR/LF, port suffixes, `@`, non-ASCII, empty labels,
+over-long labels, hyphens at label edges, unqualified single labels, and IP
+literals, while normalising case and a trailing root dot so two spellings of
+one authority cannot reach the proxy as different names. Six unit tests cover
+those, including that every accepted name fits the single-byte SOCKS5 length
+prefix.
+
+Everything else below remains unimplemented: the `--name-proxy` flag and its
+typed/config-file field, the `SeedName` transient candidate wave and its
+ordering against explicit and persisted peers, the domain `CONNECT` branch,
+the unspecified-receiver `version` advertisement, and the persistence rules.
+Current behaviour is unchanged: `--proxy` still refuses to run alongside DNS
+seeds.
+
 ## Recommended configuration model
 
 Add an explicit `--name-proxy IP:PORT` (and corresponding typed/config-file
