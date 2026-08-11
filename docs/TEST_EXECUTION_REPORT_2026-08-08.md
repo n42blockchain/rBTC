@@ -759,3 +759,32 @@ and no LeaseSet publication failure in a tested connection.
 **Current `a8573b0` conclusion:** the post-`rbtc.submitblock` macOS
 real-daemon gate is green `5/5` on its first complete run. The earlier statement
 that only a rerun could make the current-head gate green is now satisfied.
+
+### Mining round trip — 2026-08-11
+
+`getblocktemplate` and `rbtc.submitblock` had unit coverage on either side of
+the boundary but nothing exercised the loop between them. `tests/mining_round_trip.rs`
+drives both over the authenticated JSON-RPC route of a launched regtest node:
+it waits for a template, builds a block strictly from that template's own
+`height`, `curtime`, `bits`, and `version`, submits it, and requires the node
+to answer `connected=true`, its execution tip to reach height 1, the following
+template to build on the block just submitted, and a resubmission to answer
+`connected=false`.
+
+```bash
+cargo test --all-features --test mining_round_trip
+```
+
+Result: `1 passed; 0 failed` in `1.62s`.
+
+The peer in this harness answers `getheaders` with an empty set for the whole
+run rather than falling silent after the handshake. A silent peer ends a
+caught-up node's run at the first poll, which would have surfaced as a mining
+failure rather than a harness one.
+
+**Mutation check.** Removing the one line that hands the submitted block's body
+to the prefetch buffer — the handoff that lets the ordinary execution path
+connect it without asking a peer for bytes the node already holds — makes the
+submission never connect and the RPC never answer; the test fails on its
+response deadline in `11.63s`. The passing result therefore reflects the
+closed loop rather than the assertions being reachable by other means.
