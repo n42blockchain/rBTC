@@ -358,7 +358,11 @@ optional where appropriate, and host-runtime compatible.
   notification labeling, and bounded slow-subscriber drop policy.
 - [ ] Encrypted daemon-held keys and in-process signing only as a separately
   threat-modeled wallet product. The default node continues to prefer watch-only
-  descriptors and external signers.
+  descriptors and external signers. The assets, adversaries, trust boundaries,
+  non-negotiable invariants, candidate architecture, required product choices,
+  and implementation gates are defined in
+  [HOT_WALLET_THREAT_MODEL.md](HOT_WALLET_THREAT_MODEL.md); no private-key work
+  is authorized until those choices receive an explicit go decision.
 - [ ] Alternative atomic chainstate backends only after they include UTXO,
   execution metadata, undo, snapshot markers, and the complete crash matrix in
   one durability boundary. MDBX benchmark availability alone is insufficient.
@@ -371,7 +375,10 @@ optional where appropriate, and host-runtime compatible.
 - [ ] Name-proxy discovery. A SOCKS5 proxy currently refuses to run alongside
   DNS seeds rather than resolving seed hostnames through the proxy, which
   fails closed against resolver leaks but leaves an operator on explicit peers
-  or the persisted peer database for bootstrap.
+  or the persisted peer database for bootstrap. The portable domain-CONNECT
+  design, rejected alternatives, privacy invariants, required decisions, and
+  local/real-proxy acceptance matrix are mapped in
+  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md).
 - [x] Administrative peer mutation and a general bounded cursor chainstate
   scan. Authenticated `listbanned`/`setban` administer durable local peer
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks

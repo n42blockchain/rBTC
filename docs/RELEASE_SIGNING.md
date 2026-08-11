@@ -11,6 +11,21 @@ The local keychain currently exposes Apple Development identities and an
 `Developer ID Application` identity required to sign and notarize a standalone
 macOS command-line executable.
 
+The gate was rechecked on the macOS acceptance host on 2026-08-11. The keychain
+reported three valid code-signing identities and zero matching
+`Developer ID Application` identities for team `CFRXH38L48`. The release
+manifest positive/negative test passed, so the locally testable manifest
+machinery is ready; this check does not substitute for provisioning the Apple
+and Windows release identities or exercising the protected tagged workflow.
+
+At `b39f75d`, `cargo build --release --locked --bin rbtcd` completed locally,
+and `verify-release-binary.sh` accepted the resulting `rbtcd 0.1.0`
+`--version`/`--help` surface. Its local SHA-256 was
+`7c983039b736054c5b2ae6d371254451caaf4464b2d45c7ef54ccf52dd99f02f`.
+This is an unsigned macOS smoke artifact, not a supported release artifact and
+not evidence for notarization, Authenticode, reproducibility, or clean-host
+installation.
+
 The Android JKS key, Apple Developer ID key, and Windows Authenticode
 certificate are ecosystem-specific identities. Reusing one private key across
 all three formats is neither supported nor desirable. “Same developer” is

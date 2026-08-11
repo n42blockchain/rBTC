@@ -1,11 +1,28 @@
 # Public-network soak
 
-Status date: 2026-08-08.
+Status date: 2026-08-11.
 
 The minimum seven-day boundary has passed, but this repository does not contain
 an accepted output from the fail-closed finalizer. The release gate therefore
 remains open; wall-clock elapsed time is not evidence that the restart,
 fault-injection, peer-diversity, tip-consistency, and data-growth checks passed.
+
+On 2026-08-11, neither documented evidence directory
+(`/Users/jieliu/Documents/n42/rBTC-public-soak-20260726` or
+`/Users/jieliu/Documents/n42/rBTC-public-soak-20260728`) existed on the macOS
+acceptance host, and a broader search found no generated
+`public-network-soak-report.md` or frozen finalizer evidence. The existing run
+therefore cannot be finalized on this host. Completion requires either restoring
+the complete immutable evidence directory—including its baseline binary,
+metrics, events, and frozen helpers—or starting a new seven-day run. Metrics
+must not be reconstructed from prose or a later binary.
+
+The locally reproducible infrastructure remains green at `b39f75d`:
+`test-public-network-soak-monitor.sh`,
+`test-public-network-soak-exercise.sh`, and
+`test-public-network-soak-report.sh` all passed on 2026-08-11. These tests
+validate the collectors and fail-closed gates with fixtures; they do not replace
+the missing seven-day public-network evidence.
 
 ## Replacement acceptance run
 
