@@ -531,6 +531,19 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn submit_block(&self, _block: Block) -> Result<BlockSubmission, String> {
         Err("block submission is not available on this node".to_owned())
     }
+
+    /// Header chain and deployment parameters a block template is built from.
+    ///
+    /// Returns `None` for sources not backed by a node's execution loop, which
+    /// have no header chain to build a template against.
+    fn template_source(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<std::sync::RwLock<crate::headers::HeaderDag>>,
+        crate::deployments::DeploymentConfig,
+    )> {
+        None
+    }
     /// BIP158 basic filter data at one active height, when indexed.
     fn basic_filter(&self, height: u32) -> Result<Option<InboundBasicFilter>, String>;
     /// Diverse, already-vetted IPv4/IPv6 peers suitable for bounded address relay.

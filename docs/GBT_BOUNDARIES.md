@@ -27,10 +27,13 @@ Gaps 3 and 4 are closed as library surface on the same date, without an RPC:
   threshold state and the buried version floor, and reports which deployments
   are signalling or required.
 
-What remains for a real `getblocktemplate` is the RPC surface itself —
-`mutable`, `capabilities`, `longpollid`, `vbavailable`/`vbrequired` wiring,
-and the JSON encoding — plus the scope questions below. The async dispatch
-`longpollid` needs now exists. What the
+`getblocktemplate` itself landed on 2026-08-11, serving the BIP22/23 fields
+this node can state truthfully: `version`, `rules`, `vbavailable`,
+`vbrequired`, `previousblockhash`, `transactions` with per-entry `depends`,
+`fee`, `sigops` and `weight`, `coinbasevalue`, `target`, `bits`, `height`,
+`mintime`/`curtime`, `mutable`, `noncerange`, the three limits, and
+`default_witness_commitment`. What it does not do is listed under [What
+getblocktemplate does not do](#what-getblocktemplate-does-not-do). What the
 implementation does **not** do is listed under [What submitblock does
 not do](#what-submitblock-does-not-do).
 
@@ -173,6 +176,26 @@ mining interface.
   still buffered, staging is skipped for that iteration and the submission
   stays queued.
 
+## What `getblocktemplate` does not do
+
+- **It refuses any chainstate not independently validated from genesis.**
+  Settled on 2026-08-11 as the answer to scope question 2. A snapshot overlay
+  or an AssumeUTXO chain still completing its background sync has not verified
+  the history its UTXO set asserts, and a template built on one would ask a
+  miner to stake a block reward on that claim. The refusal is a distinct error
+  (`-32041`) checked before the generic not-ready path, so a policy refusal is
+  never mistaken for a transient one.
+- **`longpollid` is null.** The async dispatch a long poll needs now exists,
+  but nothing yet notifies a waiting template of a new tip.
+- **No proposal mode.** `capabilities` is not advertised and a submitted
+  proposal is not evaluated; blocks go to `rbtc.submitblock`.
+- **`previousblockhash` can lag.** The template reads the RPC-side header
+  snapshot, which is refreshed on resync and after a staged submission, not on
+  every peer-announced block. When caught up that bounds staleness by the poll
+  interval — fine for fixtures, not for production mining. Removing it means
+  sharing the live header DAG, which is option B above and still rejected.
+- **Selection is greedy**, as described under `submitblock` below.
+
 ## Two scope questions to settle first
 
 1. **Which target?** Settled on 2026-08-11: test-toolchain self-sufficiency.
@@ -180,11 +203,10 @@ mining interface.
    `mutable`, `capabilities`, `longpollid`, `vbavailable`, fee-optimal
    selection — which remains out of scope and roughly an order of magnitude
    more work.
-2. **Which chainstate modes?** The snapshot-overlay and AssumeUTXO-completion
-   paths use different `ExecutionChainStore` implementations
-   (`src/snapshot_overlay.rs:1775`, `src/snapshot_overlay_redb.rs:941`).
-   Supporting mining on them is a separate decision, and refusing them is a
-   legitimate answer.
+2. **Which chainstate modes?** Settled on 2026-08-11: only a chainstate
+   independently validated from genesis. The snapshot-overlay and
+   AssumeUTXO-completion paths (`src/snapshot_overlay.rs:1775`,
+   `src/snapshot_overlay_redb.rs:941`) are refused outright.
 
 ## Open questions this note does not answer
 

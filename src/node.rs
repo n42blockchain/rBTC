@@ -3234,6 +3234,7 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "rbtc.getblockchunk",
     "rbtc.submitrawtransaction",
     "rbtc.submitblock",
+    "getblocktemplate",
     "testmempoolaccept",
     "rbtc.scanchainstate",
     "listbanned",
@@ -3310,6 +3311,202 @@ impl NodeRpcOperator {
                 message: "Block submission is not available on this node",
             })?;
         Ok(QueuedSubmission { hash, submission })
+    }
+
+    /// Builds one block template for the current tip.
+    ///
+    /// Refuses on any chainstate that is not independently validated from
+    /// genesis. A snapshot-overlay or an AssumeUTXO chain still completing its
+    /// background sync has not verified the history its UTXO set claims, and a
+    /// template built on it would ask a miner to stake a block reward on that
+    /// claim. Refusing is the conservative answer and matches this node
+    /// declining to serve mining from a chainstate it cannot vouch for.
+    #[allow(clippy::too_many_lines)]
+    fn block_template(&self) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let unavailable = || LocalRpcOperatorError {
+            code: -28,
+            message: "Node data is not ready",
+        };
+        let progress = self
+            .status
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !progress.independently_validated {
+            return Err(LocalRpcOperatorError {
+                code: -32041,
+                message: "Block templates require a chainstate independently validated from genesis",
+            });
+        }
+        if !progress.minimum_chainwork_reached
+            || progress.header.height != progress.execution.height
+        {
+            return Err(LocalRpcOperatorError {
+                code: -10,
+                message: "Bitcoin is downloading blocks...",
+            });
+        }
+        let source = self.source.as_ref().ok_or_else(unavailable)?;
+        let (headers, deployments) = source.template_source().ok_or_else(unavailable)?;
+        let headers = headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tip = headers.active_tip();
+        let height = tip.height.checked_add(1).ok_or_else(unavailable)?;
+
+        // Core's rule: never below the median time past, never behind the clock.
+        let median_time_past = headers.median_time_past(tip.hash).ok_or_else(unavailable)?;
+        let minimum_time = median_time_past.checked_add(1).ok_or_else(unavailable)?;
+        let now = unix_time().map_err(|_| unavailable())?;
+        let current_time = now.max(minimum_time);
+
+        let version_bits = rbtc::deployments::template_version_bits(&headers, height, &deployments)
+            .map_err(|_| unavailable())?;
+        let candidate = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(version_bits.version),
+            prev_blockhash: tip.hash,
+            merkle_root: bitcoin::TxMerkleNode::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            time: current_time,
+            bits: tip.header.bits,
+            nonce: 0,
+        };
+        let bits = headers
+            .expected_next_bits(&candidate)
+            .map_err(|_| unavailable())?;
+        let taproot = rbtc::deployments::taproot_active(&headers, height, &deployments)
+            .map_err(|_| unavailable())?;
+        drop(headers);
+
+        let candidates: Vec<rbtc::block_template::TemplateCandidate> = self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relay_snapshot()
+            .into_iter()
+            .map(|entry| rbtc::block_template::TemplateCandidate {
+                transaction: entry.transaction,
+                fee_sats: entry.fee_sats,
+                sigop_cost: entry.sigop_cost,
+            })
+            .collect();
+        let limits = rbtc::block_template::TemplateLimits::default();
+        let selection = rbtc::block_template::select_template_transactions(&candidates, limits);
+
+        let template = rbtc::block_assembly::BlockTemplate {
+            parent: tip.hash,
+            height,
+            time: current_time,
+            target: bits.into(),
+            version: version_bits.version,
+            coinbase_script_pubkey: bitcoin::ScriptBuf::new(),
+            subsidy_halving_interval: rbtc::deployments::halving_interval(deployments.network()),
+            fee_sats: selection.fee_sats,
+            transactions: selection.transactions.clone(),
+        };
+        // Built rather than derived by hand so the witness commitment a miner
+        // is handed is exactly the one this node's assembler would produce.
+        let assembled =
+            rbtc::block_assembly::build_block(&template).map_err(|_| LocalRpcOperatorError {
+                code: -32603,
+                message: "Block template assembly failed",
+            })?;
+        let coinbase = assembled.txdata.first().ok_or_else(unavailable)?;
+        let witness_commitment = coinbase
+            .output
+            .iter()
+            .rev()
+            .find(|output| output.script_pubkey.is_op_return())
+            .map(|output| output.script_pubkey.to_hex_string());
+        let coinbase_value = coinbase
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .sum::<u64>();
+
+        let position: std::collections::HashMap<Txid, usize> = selection
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| (transaction.compute_txid(), index))
+            .collect();
+        // Looked up rather than zipped against the filtered candidate list:
+        // the two happen to share an order today, and a template that pairs a
+        // transaction with another's fee would be silently wrong.
+        let metadata: std::collections::HashMap<Txid, &rbtc::block_template::TemplateCandidate> =
+            candidates
+                .iter()
+                .map(|candidate| (candidate.transaction.compute_txid(), candidate))
+                .collect();
+        let transactions: Vec<serde_json::Value> = selection
+            .transactions
+            .iter()
+            .filter_map(|transaction| {
+                metadata
+                    .get(&transaction.compute_txid())
+                    .map(|candidate| (transaction, *candidate))
+            })
+            .map(|(transaction, candidate)| {
+                let mut depends: Vec<usize> = transaction
+                    .input
+                    .iter()
+                    .filter_map(|input| position.get(&input.previous_output.txid))
+                    // One-based, as BIP22 requires: index zero is the coinbase.
+                    .map(|index| index + 1)
+                    .collect();
+                depends.sort_unstable();
+                depends.dedup();
+                serde_json::json!({
+                    "data": serialize(transaction).to_lower_hex_string(),
+                    "txid": transaction.compute_txid().to_string(),
+                    "hash": transaction.compute_wtxid().to_string(),
+                    "depends": depends,
+                    "fee": candidate.fee_sats,
+                    "sigops": candidate.sigop_cost,
+                    "weight": transaction.weight().to_wu(),
+                })
+            })
+            .collect();
+
+        let mut rules = vec!["!segwit"];
+        if taproot {
+            rules.push("taproot");
+        }
+        let vbavailable: serde_json::Map<String, serde_json::Value> = version_bits
+            .deployments
+            .iter()
+            .filter(|deployment| !deployment.required)
+            .map(|deployment| {
+                (
+                    deployment.name.to_owned(),
+                    serde_json::Value::from(deployment.bit),
+                )
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "version": version_bits.version,
+            "rules": rules,
+            "vbavailable": vbavailable,
+            "vbrequired": version_bits.required_mask(),
+            "previousblockhash": tip.hash.to_string(),
+            "transactions": transactions,
+            "coinbaseaux": serde_json::json!({}),
+            "coinbasevalue": coinbase_value,
+            "longpollid": serde_json::Value::Null,
+            "target": bitcoin::Target::from(bits).to_be_bytes().to_lower_hex_string(),
+            "mintime": minimum_time,
+            "mutable": ["time", "transactions", "prevblock"],
+            "noncerange": "00000000ffffffff",
+            "sigoplimit": limits.max_sigop_cost,
+            "sizelimit": rbtc::blockchain::MAX_BLOCK_WEIGHT / 4,
+            "weightlimit": limits.max_weight,
+            "curtime": current_time,
+            "bits": bits.to_consensus().to_be_bytes().to_lower_hex_string(),
+            "height": height,
+            "default_witness_commitment": witness_commitment,
+            "rbtc_skipped_over_ceiling": selection.skipped_over_ceiling,
+        }))
     }
 
     /// Describes a submission that never entered the queue.
@@ -3414,6 +3611,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "rbtc.getblockchunk"
                 | "rbtc.submitrawtransaction"
                 | "rbtc.submitblock"
+                | "getblocktemplate"
                 | "testmempoolaccept"
                 | "rbtc.scanchainstate"
         ) {
@@ -4069,6 +4267,7 @@ impl NodeRpcOperator {
                 }
                 Ok(serde_json::json!({"txid": txid, "queued": true}))
             }
+            "getblocktemplate" => self.block_template(),
             "rbtc.submitblock" => {
                 // The synchronous dispatcher cannot wait for the execution
                 // loop, so it reports only that the block was queued. The
@@ -4844,6 +5043,10 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.submit_block(block)
     }
 
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+        self.current().ok()?.template_source()
+    }
+
     fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
         self.current()?.test_accept(transactions)
     }
@@ -5113,6 +5316,10 @@ impl InboundDataSource for NodeInboundSource {
                 Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
                 _ => false,
             }))
+    }
+
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+        Some((Arc::clone(&self.headers), self.deployments.clone()))
     }
 
     fn submit_block(&self, block: Block) -> Result<BlockSubmission, String> {
@@ -17852,6 +18059,101 @@ mod tests {
 
     /// Builds a regtest node data source whose chainstate holds one mature
     /// spendable coinbase output at the active tip.
+    /// Builds an operator whose status reports the given independence.
+    fn template_test_operator(
+        source: Option<Arc<SharedInboundSource>>,
+        independently_validated: bool,
+    ) -> NodeRpcOperator {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let status = ready_test_node_status(genesis);
+        status.progress.lock().unwrap().independently_validated = independently_validated;
+        NodeRpcOperator {
+            status,
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source,
+        }
+    }
+
+    #[test]
+    fn a_chainstate_that_is_not_independently_validated_serves_no_template() {
+        // The decision this encodes: a snapshot overlay or an AssumeUTXO chain
+        // still completing its background sync has not verified the history its
+        // UTXO set asserts. Handing a miner a template built on that asks them
+        // to stake a block reward on an unverified claim.
+        let operator = template_test_operator(None, false);
+
+        let error = operator
+            .block_template()
+            .expect_err("an unverified chainstate must not serve templates");
+
+        assert_eq!(error.code, -32041);
+        assert!(error.message.contains("independently validated"));
+    }
+
+    #[test]
+    fn the_independence_gate_is_checked_before_data_availability() {
+        // Both operators lack a source. The unverified one must still report
+        // why it refuses, rather than the generic not-ready error, or an
+        // operator could mistake a policy refusal for a transient one.
+        let unverified = template_test_operator(None, false);
+        let verified = template_test_operator(None, true);
+
+        assert_eq!(unverified.block_template().unwrap_err().code, -32041);
+        assert_eq!(verified.block_template().unwrap_err().code, -28);
+    }
+
+    #[test]
+    fn a_template_describes_the_next_block_on_the_active_chain() {
+        let directory = TempDir::new().unwrap();
+        let (inbound, _, _) = dry_run_test_source(directory.path());
+        let tip = inbound
+            .template_source()
+            .expect("a node-backed source offers a template context")
+            .0
+            .read()
+            .unwrap()
+            .active_tip();
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let _lease = shared.install(Arc::new(inbound));
+        let operator = template_test_operator(Some(Arc::clone(&shared)), true);
+
+        let template = operator.block_template().expect("a template is produced");
+
+        assert_eq!(template["height"], tip.height + 1);
+        assert_eq!(template["previousblockhash"], tip.hash.to_string());
+        assert_eq!(
+            template["version"],
+            i32::try_from(0x2000_0000_u32).unwrap(),
+            "the version is derived from deployment state, not assumed"
+        );
+        assert_eq!(
+            template["coinbasevalue"], 5_000_000_000_u64,
+            "an empty template pays exactly the height subsidy"
+        );
+        assert_eq!(template["transactions"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            template["mutable"],
+            serde_json::json!(["time", "transactions", "prevblock"])
+        );
+        assert!(
+            template["curtime"].as_u64().unwrap() >= template["mintime"].as_u64().unwrap(),
+            "a template must never propose a time the median-time-past rule rejects"
+        );
+        assert!(
+            template["default_witness_commitment"].is_string(),
+            "a segwit template must carry the commitment a miner has to copy"
+        );
+        assert_eq!(template["rules"], serde_json::json!(["!segwit", "taproot"]));
+        assert_eq!(template["rbtc_skipped_over_ceiling"], 0);
+    }
+
     fn dry_run_test_source(directory: &std::path::Path) -> (NodeInboundSource, OutPoint, Utxo) {
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let mut dag = HeaderDag::new(Network::Regtest);
