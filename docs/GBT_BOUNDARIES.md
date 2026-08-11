@@ -29,7 +29,8 @@ Gaps 3 and 4 are closed as library surface on the same date, without an RPC:
 
 What remains for a real `getblocktemplate` is the RPC surface itself —
 `mutable`, `capabilities`, `longpollid`, `vbavailable`/`vbrequired` wiring,
-and the JSON encoding — plus the scope questions below. What the
+and the JSON encoding — plus the scope questions below. The async dispatch
+`longpollid` needs now exists. What the
 implementation does **not** do is listed under [What submitblock does
 not do](#what-submitblock-does-not-do).
 
@@ -144,14 +145,16 @@ mining interface.
 
 ## What `submitblock` does not do
 
-- **It does not report whether the block connected.** `execute_data_query` is
-  synchronous (`src/node.rs:3657`), so the handler cannot await the execution
-  loop. It answers `queued` after context-free checks — proof of work against
-  the block's own target, and `validate_block_structure_with_deployments` for
-  the coinbase, Merkle root, weight, and witness commitment — and everything
-  needing chain context is decided later and only logged. Callers confirm with
-  `getbestblockhash`. Giving Core's verdict semantics means making the RPC
-  dispatch async, which is a larger change than the submission path itself.
+- ~~It does not report whether the block connected.~~ Resolved on 2026-08-11.
+  `LocalRpcOperator` gained `execute_async`, defaulting to the synchronous
+  `execute` so no other operator or method changed, and the HTTP route awaits
+  it. `rbtc.submitblock` answers `{"connected": true}` once execution has
+  passed the block's height, or `{"connected": false, "reason": …}` for a
+  rejected header, a header that does not extend the active chain, or a block
+  replaced before it connected. A closed channel means the node stopped before
+  deciding and is reported as such, never as a rejection. The synchronous
+  dispatcher still answers `queued`, because it genuinely cannot wait; both
+  paths queue through one helper so they cannot diverge on what they accept.
 - **It caps blocks at 32 KiB**, half the shared 64 KiB JSON-RPC body limit
   (`src/api.rs:139`), because the hex encoding doubles the payload. Regtest
   fixtures fit; real blocks do not.
