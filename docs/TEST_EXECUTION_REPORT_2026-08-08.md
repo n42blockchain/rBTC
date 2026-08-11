@@ -1,8 +1,9 @@
 # Test execution report — 2026-08-08
 
 - Branch: `audit/group-b-decisions`
-- Revision checked: `audit/group-b-decisions` at merge revision `22fbffe`,
-  which contains the `368bedd` I2P stream-closing change; the earlier
+- Executable revision checked: `audit/group-b-decisions` at `c951387`, which
+  contains the `368bedd` I2P stream-closing change. The later `5eca1a2` changes
+  only mining documentation and was incorporated after the run; the earlier
   `3fcf7c7`, `e3d99cc`, `cf87ee2`, `0f47054`, and `4f8084f` real-daemon
   results are retained below as historical baselines only.
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
@@ -10,7 +11,7 @@
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
   - `RBTC_BTCD=/Users/jieliu/tools/go/bin/btcd`
   - `cargo` profile: release for differential/interop suites, debug for unit suites
-- Wall time window: 2026-08-08—2026-08-09 (real daemon-backed acceptance checks)
+- Wall time window: 2026-08-08—2026-08-11 (real daemon-backed acceptance checks)
 
 ## Commands run
 
@@ -661,3 +662,57 @@ having a wider timing window. It does not support downgrading the shared-bridge
 case to an i2pd environment limitation: the same current code now passes that
 case on the same router. The `3fcf7c7` `4/5` result remains valid only as a
 historical pre-fix observation and does not describe the current revision.
+
+### `c951387` complete five-case gate — 2026-08-11
+
+The complete serialized suite was run on macOS against Tor on SOCKS/control
+ports 9050/9051 and i2pd 2.61.0 on SAM port 7656. No
+`RBTC_I2P_SAM_B` endpoint or `--test-threads=1` override was supplied.
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+#### First run: transient LeaseSet publication failure
+
+Result: `4 passed; 1 failed` in `166.50s`.
+
+- Passed: non-loopback SAM refusal, shared-bridge two-node I2P/`addrv2`, real
+  SAM destination replay/deadline, and the real Tor onion circuit.
+- `the_inbound_service_accepts_and_serves_a_real_i2p_peer` failed before the
+  Bitcoin handshake at `STREAM CONNECT` with
+  `CANT_REACH_PEER / LeaseSet not found`.
+- The matching i2pd log repeatedly reports
+  `Can't publish LeaseSet because destination is not ready`; after querying
+  seven floodfills it reports `Destination to connect not found`. This was a
+  real daemon publication/readiness failure, not the earlier final-frame EOF.
+
+The i2pd process was then restarted with the same data directory to remove
+temporary Destinations. Tor and every rBTC test input remained unchanged.
+
+#### Clean-daemon rerun: green gate
+
+The exact command above was run again. Result: `5 passed; 0 failed` in
+`150.06s`.
+
+- `sam_bridge_is_refused_on_a_non_loopback_address`: passed.
+- `two_nodes_exchange_i2p_destinations_over_addrv2`: passed on one shared
+  bridge, including both directions of I2P `addrv2` and the corrected close
+  sequence.
+- `sam_sessions_produce_stable_reusable_destinations`: passed.
+- `published_onion_service_is_reachable_through_the_real_tor_network`: passed,
+  with the onion connection established on its first attempt.
+- `the_inbound_service_accepts_and_serves_a_real_i2p_peer`: passed, including
+  the real SAM dial, Bitcoin handshake, served block, admission budgets, and
+  inbound statistics.
+
+**Current `c951387` conclusion:** the complete five-case real-daemon gate has
+a green `5/5` macOS run, and the shared-bridge close-order fix remains green
+inside the complete suite. The preceding first-attempt `4/5` is retained as
+evidence that a fresh Destination can still encounter transient i2pd LeaseSet
+publication failure; the green result is a clean-daemon rerun, not a claim that
+the external router gate is free of environmental variance.
