@@ -116,8 +116,7 @@ use rbtc::{
     ibd::IbdPolicy,
     inbound::{
         BlockSubmission, InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats,
-        InboundStatsSnapshot,
-        TestAcceptResult, run_listener_with_i2p,
+        InboundStatsSnapshot, TestAcceptResult, run_listener_with_i2p,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -3969,11 +3968,7 @@ impl NodeRpcOperator {
                 // loop's verdict, and it deliberately answers `queued` rather
                 // than implying the block connected. Callers confirm that with
                 // `getbestblockhash`.
-                if block
-                    .header
-                    .validate_pow(block.header.target())
-                    .is_err()
-                {
+                if block.header.validate_pow(block.header.target()).is_err() {
                     return Err(LocalRpcOperatorError {
                         code: -25,
                         message: "high-hash",
@@ -3988,16 +3983,18 @@ impl NodeRpcOperator {
                     code: -25,
                     message: "bad-block-structure",
                 })?;
-                match source.submit_block(block).map_err(|_| LocalRpcOperatorError {
-                    code: -32603,
-                    message: "Block submission is not available on this node",
-                })? {
+                match source
+                    .submit_block(block)
+                    .map_err(|_| LocalRpcOperatorError {
+                        code: -32603,
+                        message: "Block submission is not available on this node",
+                    })? {
                     BlockSubmission::Queued => {
                         Ok(serde_json::json!({"hash": hash, "queued": true}))
                     }
-                    BlockSubmission::Duplicate => {
-                        Ok(serde_json::json!({"hash": hash, "queued": false, "reason": "duplicate"}))
-                    }
+                    BlockSubmission::Duplicate => Ok(
+                        serde_json::json!({"hash": hash, "queued": false, "reason": "duplicate"}),
+                    ),
                     BlockSubmission::Full => Err(LocalRpcOperatorError {
                         code: -32040,
                         message: "Block submission queue is full",
@@ -17820,9 +17817,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers = HeaderDag::with_deployments(DeploymentConfig::for_network(
-            Network::Regtest,
-        ));
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
         let inbound_headers = RwLock::new(headers.clone());
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
 
@@ -17871,17 +17867,13 @@ mod tests {
     fn a_submitted_block_with_an_unknown_parent_leaves_the_chain_and_prefetch_untouched() {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
-        let mut headers = HeaderDag::with_deployments(DeploymentConfig::for_network(
-            Network::Regtest,
-        ));
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
         let tip_before = headers.active_tip().hash;
         let inbound_headers = RwLock::new(headers.clone());
         // Height 2 on a parent nothing has ever seen.
-        let orphan = submitted_regtest_block(
-            BlockHash::from_byte_array([7; 32]),
-            2,
-            unix_time().unwrap(),
-        );
+        let orphan =
+            submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
 
         let pending = Mutex::new(PendingBlockQueue::default());
         pending.lock().unwrap().push(orphan);
@@ -17908,9 +17900,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers = HeaderDag::with_deployments(DeploymentConfig::for_network(
-            Network::Regtest,
-        ));
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
         let inbound_headers = RwLock::new(headers.clone());
         let now = unix_time().unwrap();
         let first = submitted_regtest_block(genesis.block_hash(), 1, now);
@@ -17948,9 +17939,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers = HeaderDag::with_deployments(DeploymentConfig::for_network(
-            Network::Regtest,
-        ));
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
         let inbound_headers = RwLock::new(headers.clone());
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
         let pending = Mutex::new(PendingBlockQueue::default());
