@@ -747,6 +747,12 @@ pub struct NodeResourceConfig {
     pub only_net: NodeOnlyNet,
     /// Optional no-authentication SOCKS5 proxy for every outbound peer socket.
     pub proxy: Option<SocketAddr>,
+    /// Optional SOCKS5 endpoint authorised to resolve DNS seed names.
+    ///
+    /// Kept distinct from `proxy` because the two express different trust
+    /// choices: routing a peer socket through a proxy does not by itself
+    /// authorise handing that proxy the names this node is looking for.
+    pub name_proxy: Option<SocketAddr>,
     /// Prefer the BIP324 v2 encrypted transport on outbound connections,
     /// retrying each address once over v1 when the peer closes the v2
     /// handshake attempt.
@@ -890,6 +896,7 @@ impl Default for NodeResourceConfig {
             mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            name_proxy: None,
             v2_transport: false,
         }
     }
@@ -1406,17 +1413,36 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
             "automatic hot standbys cannot exceed {MAX_AUTOMATIC_HOT_STANDBYS}"
         ));
     }
+    if let Some(name_proxy) = options.resources.name_proxy {
+        if name_proxy.port() == 0 || name_proxy.ip().is_unspecified() {
+            return Err("name proxy must have a concrete IP and nonzero port".to_owned());
+        }
+        // Clearnet seed discovery cannot produce a permitted target under an
+        // anonymity-only restriction, so authorising it would only leak the
+        // names this node is looking for and return nothing usable.
+        if options.resources.only_net != NodeOnlyNet::Any {
+            return Err(
+                "--name-proxy cannot be combined with an anonymity-only --onlynet: clearnet seed discovery cannot produce a permitted peer"
+                    .to_owned(),
+            );
+        }
+    }
     if let Some(proxy) = options.resources.proxy {
         if proxy.port() == 0 || proxy.ip().is_unspecified() {
             return Err("SOCKS5 proxy must have a concrete IP and nonzero port".to_owned());
         }
-        if options
-            .dns_seeds
-            .as_ref()
-            .is_none_or(|seeds| !seeds.is_empty())
+        // `--name-proxy` is the explicit authorisation that lets seed names be
+        // resolved by a proxy instead of the host resolver. Without it the
+        // refusal stands: seeds and a proxy together would otherwise resolve
+        // locally and leak the lookup the proxy exists to hide.
+        if options.resources.name_proxy.is_none()
+            && options
+                .dns_seeds
+                .as_ref()
+                .is_none_or(|seeds| !seeds.is_empty())
         {
             return Err(
-                "SOCKS5 proxy requires DNS seeds to be disabled; use explicit IP peers or the persisted peer database to prevent resolver leaks"
+                "SOCKS5 proxy requires DNS seeds to be disabled, or --name-proxy to authorise resolving them through a proxy; otherwise use explicit IP peers or the persisted peer database to prevent resolver leaks"
                     .to_owned(),
             );
         }
@@ -15492,6 +15518,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut no_dns_seeds = false;
     let mut only_net_values = Vec::new();
     let mut outbound_proxy = None;
+    let mut name_proxy = None;
     let mut network = Network::Bitcoin;
     let mut fetch_block = None;
     let mut headers_db = None;
@@ -15632,6 +15659,17 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     value
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("invalid SOCKS5 proxy address: {value}"))?,
+                );
+            }
+            "--name-proxy" => {
+                if name_proxy.is_some() {
+                    return Err("--name-proxy cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--name-proxy")?;
+                name_proxy = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid name proxy address: {value}"))?,
                 );
             }
             "--network" => {
@@ -17517,6 +17555,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
             only_net: resolve_only_net(&only_net_values)?,
             proxy: outbound_proxy,
+            name_proxy,
             v2_transport,
         },
         logging: NodeLogConfig {
@@ -22004,6 +22043,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
             }
         );
@@ -22043,6 +22083,76 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    /// Parses one option set, returning the validation error if any.
+    fn name_proxy_options(extra: &[&str]) -> Result<(), String> {
+        let mut arguments = vec![
+            "--network",
+            "bitcoin",
+            "--data-dir",
+            "/tmp/rbtc-name-proxy-parser",
+        ];
+        arguments.extend_from_slice(extra);
+        parse_options(arguments.into_iter().map(str::to_owned)).map(|_| ())
+    }
+
+    #[test]
+    fn name_proxy_authorises_seed_names_that_a_bare_proxy_still_refuses() {
+        // Without the explicit authorisation the refusal stands: a proxy and
+        // DNS seeds together would resolve locally and leak exactly the lookup
+        // the proxy exists to hide.
+        let refused = name_proxy_options(&["--proxy", "127.0.0.1:9050"])
+            .expect_err("a bare proxy still conflicts with DNS seeds");
+        assert!(refused.contains("--name-proxy"), "{refused}");
+
+        name_proxy_options(&[
+            "--proxy",
+            "127.0.0.1:9050",
+            "--name-proxy",
+            "127.0.0.1:9050",
+        ])
+        .expect("naming the proxy explicitly authorises seed resolution");
+    }
+
+    #[test]
+    fn name_proxy_is_refused_for_anonymity_only_operation() {
+        // Clearnet seed discovery cannot produce a permitted target here, so
+        // authorising it would leak the names and return nothing usable.
+        for network in ["onion", "i2p"] {
+            let error = name_proxy_options(&[
+                "--name-proxy",
+                "127.0.0.1:9050",
+                "--onlynet",
+                network,
+                "--proxy",
+                "127.0.0.1:9050",
+            ])
+            .expect_err("anonymity-only operation must refuse a name proxy");
+            assert!(error.contains("--name-proxy"), "{network}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_name_proxy_needs_a_concrete_address() {
+        for candidate in ["0.0.0.0:9050", "127.0.0.1:0"] {
+            let error = name_proxy_options(&["--name-proxy", candidate])
+                .expect_err("an unusable endpoint must be refused at startup");
+            assert!(
+                error.contains("concrete IP and nonzero port"),
+                "{candidate}: {error}"
+            );
+        }
+        assert!(
+            name_proxy_options(&[
+                "--name-proxy",
+                "127.0.0.1:9050",
+                "--name-proxy",
+                "127.0.0.1:9051"
+            ])
+            .unwrap_err()
+            .contains("more than once")
+        );
     }
 
     #[test]
@@ -22217,6 +22327,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
             }
         );
@@ -22262,6 +22373,7 @@ mod tests {
             mempool_max_bytes: 300 * 1024 * 1024,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            name_proxy: None,
             v2_transport: false,
         };
         config.logging = NodeLogConfig {
@@ -22310,6 +22422,7 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
             }
         );
@@ -22401,6 +22514,7 @@ mod tests {
                 mempool_max_bytes: 64 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)

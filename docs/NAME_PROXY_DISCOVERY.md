@@ -100,12 +100,20 @@ one authority cannot reach the proxy as different names. Six unit tests cover
 those, including that every accepted name fits the single-byte SOCKS5 length
 prefix.
 
-Everything else below remains unimplemented: the `--name-proxy` flag and its
-typed/config-file field, the `SeedName` transient candidate wave and its
-ordering against explicit and persisted peers, the domain `CONNECT` branch,
-the unspecified-receiver `version` advertisement, and the persistence rules.
-Current behaviour is unchanged: `--proxy` still refuses to run alongside DNS
-seeds.
+The `--name-proxy` flag and its `NodeResourceConfig::name_proxy` field follow,
+with their refusal rules: a concrete IP and nonzero port, at most one
+occurrence, and refusal under any anonymity-only `--onlynet` because clearnet
+seed discovery cannot produce a permitted target there. Supplying it is the
+explicit authorisation that lets `--proxy` run alongside DNS seeds; without
+it that combination is still refused, and the message now names the flag that
+would allow it. Three unit tests cover those rules.
+
+Still unimplemented: the config-file key, the `SeedName` transient candidate
+wave and its ordering against explicit and persisted peers, the domain
+`CONNECT` branch itself, the unspecified-receiver `version` advertisement, and
+the persistence rules. Supplying `--name-proxy` therefore authorises a path
+that does not yet exist — it relaxes the startup refusal without adding
+discovery — so no bootstrap behaviour has changed.
 
 ## Recommended configuration model
 

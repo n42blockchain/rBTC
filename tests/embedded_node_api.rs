@@ -317,6 +317,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         mempool_max_bytes: 300 * 1024 * 1024,
         only_net: rbtc::node::NodeOnlyNet::Any,
         proxy: None,
+        name_proxy: None,
         v2_transport: false,
     };
     config.storage = NodeStorageConfig {
