@@ -297,12 +297,13 @@ const ADDRESS_ACK_NONCE: u64 = 0x4144_4452_5f41_434b;
 /// own I2P destination, and reports the destination the dialling side
 /// announced, so the caller can check both directions of `addrv2`.
 ///
-/// After answering it waits for the dialling side's ping rather than
-/// returning, because returning drops the SAM stream: an accepting side that
-/// closes immediately after its final write races the peer's read, and the
-/// dialler sees EOF instead of the response. Waiting for a protocol-level
-/// acknowledgement ties the lifetime to what the peer actually observed,
-/// which a fixed delay cannot do.
+/// After answering the ping it does not return either: it reads until the
+/// dialling side closes. I2P streaming is not TCP, and closing a stream
+/// cancels data it has not yet acknowledged — a live router reported the
+/// final frame retransmitted ten times and then dropped for want of an ACK,
+/// which reached the peer as an early EOF. Whichever side writes last must
+/// therefore let the other close first; a protocol-level acknowledgement
+/// alone is not enough, because the acknowledgement is itself a write.
 async fn serve_one_i2p_peer(
     accepted: rbtc::i2p_sam::AcceptedI2pPeer,
     own: I2pAddress,
@@ -312,13 +313,16 @@ async fn serve_one_i2p_peer(
         .await
         .map_err(|error| format!("inbound handshake over I2P failed: {error}"))?;
     let mut announced = Vec::new();
+    let mut acknowledged = false;
     loop {
-        match peer
-            .read_message()
-            .await
-            .map_err(|error| format!("read over I2P failed: {error}"))?
-            .into_payload()
-        {
+        let message = match peer.read_message().await {
+            Ok(message) => message.into_payload(),
+            // The dialling side closing after its acknowledgement is the
+            // expected end of this exchange.
+            Err(_) if acknowledged => return Ok(announced),
+            Err(error) => return Err(format!("read over I2P failed: {error}")),
+        };
+        match message {
             NetworkMessage::GetAddr => {
                 peer.write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
                     time: 1_800_000_000,
@@ -330,12 +334,13 @@ async fn serve_one_i2p_peer(
                 .map_err(|error| format!("address reply over I2P failed: {error}"))?;
             }
             NetworkMessage::Ping(nonce) if nonce == ADDRESS_ACK_NONCE => {
-                // The dialler only sends this after reading the response, so
-                // answering it and returning cannot truncate anything.
                 peer.write_message(NetworkMessage::Pong(nonce))
                     .await
                     .map_err(|error| format!("acknowledgement over I2P failed: {error}"))?;
-                return Ok(announced);
+                // Hold the stream open until the dialler closes, so the
+                // acknowledgement is delivered and acknowledged rather than
+                // cancelled by this side's own close.
+                acknowledged = true;
             }
             NetworkMessage::Ping(nonce) => {
                 peer.write_message(NetworkMessage::Pong(nonce))
@@ -463,12 +468,17 @@ async fn two_nodes_exchange_i2p_destinations_over_addrv2() {
         ServiceFlags::NETWORK | ServiceFlags::WITNESS
     );
 
-    // A round trip the accepting side must answer before it returns, so the
-    // stream stays open until this side has demonstrably read the response.
+    // A round trip the accepting side must answer, so the stream stays open
+    // until this side has demonstrably read the response.
     session
         .ping(ADDRESS_ACK_NONCE)
         .await
         .expect("the accepting side acknowledges the address response");
+
+    // Close from this side first. The accepting side wrote last, and on I2P
+    // streaming the writer closing first cancels data the peer has not yet
+    // acknowledged.
+    drop(session);
 
     let (observed_dialler, announced) = responder
         .await
