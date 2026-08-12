@@ -191,13 +191,14 @@ refusals, malformed-name rejection, and the absence of any fabricated IP peer
 all have tests, as do the wave's place in the candidate order and the restart
 that finds what it learned.
 
-The absence of a DNS query is observed rather than inferred, but by a process
-counter incremented before each lookup, not by a packet capture. It shows this
-process began no resolver request — including requests that would have timed
-out or failed — and it runs on every build, which a capture would not. It
-cannot speak for what a resolver library or sidecar does with a request that
-was never made here. That distinction is why the capture item below stays
-open.
+The absence of a DNS query is observed at two boundaries. A process counter
+incremented before each lookup shows this process began no resolver request —
+including requests that would have timed out or failed — and runs on every
+build. A privileged macOS packet capture taken during the external-Tor case
+also observed no traditional UDP/TCP port 53 query for either Testnet4 seed.
+The counter cannot speak for a resolver library or sidecar, while the capture
+cannot identify encrypted DNS hidden in unrelated HTTPS traffic; the two
+pieces of evidence are intentionally stated at their actual scope.
 
 The real-environment Testnet4 bootstrap has two layers. One `#[ignore]`d test
 completes a real handshake from `seed.testnet4.bitcoin.sprovoost.nl` through a
@@ -213,11 +214,18 @@ second proves the same product path interoperates with an external service.
 On 2026-08-12 both layers passed on macOS, with the external test using the Tor
 SOCKS endpoint at `127.0.0.1:9050`. The external service was a Homebrew Tor
 process with its own data directory and control port, not an in-test proxy.
+Because a resolving proxy may select a transient peer that closes or stalls,
+the external case now tries the two pinned Testnet4 authorities in their
+configured order and requires one real Bitcoin handshake, matching the
+bounded-wave behavior more closely than treating one selected peer as the
+whole network.
 
-Still open: a host packet capture asserting no DNS query leaves the machine.
-The capture tool cannot open the macOS BPF device without elevated privileges;
-the process counter therefore remains useful evidence but is deliberately not
-presented as a packet-capture substitute.
+The privileged capture was then completed during a clean external-Tor run.
+It decoded 192 lines of unrelated port 53 traffic, proving the capture was
+active, and contained no query for either pinned Testnet4 seed. Together with
+the unchanged in-process resolver counter, this closes the listed DNS-capture
+acceptance item for traditional DNS. It does not claim visibility into DoH or
+DoT used by unrelated software.
 
 ## Implemented configuration model
 
@@ -305,8 +313,9 @@ not include proxy credentials or unbounded replies.
 
 - [x] run through a real Tor SOCKS endpoint and complete a Bitcoin/Testnet4
   handshake from a seed name;
-- [ ] capture DNS traffic on the host and assert no query is emitted — blocked
-  on elevated BPF capture permission in the available macOS environment;
+- [x] capture traditional UDP/TCP port 53 traffic on the host and assert no
+  query for either pinned Testnet4 seed is emitted during the external-Tor
+  run;
 - [x] observe domain-target handling and confirm that an unresolvable name
   produces a bounded proxy failure rather than a direct fallback;
 - [x] restart using learned persisted IP peers and confirm name discovery is
@@ -326,7 +335,6 @@ The implementation embodies these decisions:
    peer-advertised IP entries;
 5. retain no-authentication proxy scope.
 
-The explicit/persisted-peer-only configuration remains supported. The sole
-open acceptance item is privileged host packet capture; it does not authorize
-weakening any of the resolver, fallback, `onlynet`, or persistence invariants
-above.
+The explicit/persisted-peer-only configuration remains supported. Completion
+of this acceptance matrix does not authorize weakening any of the resolver,
+fallback, `onlynet`, or persistence invariants above.

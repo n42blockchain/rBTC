@@ -19395,27 +19395,47 @@ mod tests {
             .expect("set RBTC_NAME_PROXY, for example to 127.0.0.1:9050")
             .parse::<SocketAddr>()
             .expect("RBTC_NAME_PROXY must be an IP:PORT socket address");
-        let authority = "seed.testnet4.bitcoin.sprovoost.nl";
-        let target = NodePeerTarget::SeedName {
-            name: SeedName::parse(authority).unwrap(),
-            port: default_p2p_port(Network::Testnet4),
-        };
-
         let before = dns_lookups_started();
-        let connected = timeout(
-            Duration::from_secs(60),
-            connect_peer(
-                DeploymentConfig::for_network(Network::Testnet4),
-                target,
-                Some(name_proxy),
-                0x5eed_0000_0000_0002,
-                false,
-                None,
-            ),
-        )
-        .await
-        .expect("the externally proxied handshake completes within a minute")
-        .expect("a real Testnet4 peer completes the handshake through the configured proxy");
+        let mut failures = Vec::new();
+        let mut connected = None;
+        for (index, authority) in pinned_dns_seed_hosts(Network::Testnet4).iter().enumerate() {
+            let target = NodePeerTarget::SeedName {
+                name: SeedName::parse(authority).unwrap(),
+                port: default_p2p_port(Network::Testnet4),
+            };
+            match timeout(
+                Duration::from_secs(60),
+                connect_peer(
+                    DeploymentConfig::for_network(Network::Testnet4),
+                    target,
+                    Some(name_proxy),
+                    0x5eed_0000_0000_0002 + u64::try_from(index).unwrap(),
+                    false,
+                    None,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(peer)) => {
+                    connected = Some(peer);
+                    break;
+                }
+                Ok(Err(error)) => failures.push(format!("{authority}: {error:?}")),
+                Err(_) => failures.push(format!("{authority}: timed out after 60 seconds")),
+            }
+        }
+
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the node handed every authority to the external proxy instead of resolving it"
+        );
+        let connected = connected.unwrap_or_else(|| {
+            panic!(
+                "no pinned Testnet4 authority completed a handshake through the configured proxy: {}",
+                failures.join("; ")
+            )
+        });
 
         let version = connected.session.remote_version();
         assert!(
@@ -19426,11 +19446,6 @@ mod tests {
             version.services.has(ServiceFlags::NETWORK),
             "the seed's answer serves blocks: {:?}",
             version.services
-        );
-        assert_eq!(
-            dns_lookups_started(),
-            before,
-            "the node handed the authority to the external proxy instead of resolving it"
         );
     }
 

@@ -379,9 +379,9 @@ optional where appropriate, and host-runtime compatible.
   share one conservative source-group quota. Deterministic coverage, a real
   Testnet4 handshake through a resolving endpoint, and a run through an
   independently running Tor SOCKS endpoint are recorded in
-  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md). A privileged host packet
-  capture remains an external acceptance-evidence gap, not an implementation
-  gap.
+  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md). A privileged host capture
+  also observed unrelated DNS traffic while observing no traditional port 53
+  query for either pinned Testnet4 seed during the external-Tor run.
 - [x] Administrative peer mutation and a general bounded cursor chainstate
   scan. Authenticated `listbanned`/`setban` administer durable local peer
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks

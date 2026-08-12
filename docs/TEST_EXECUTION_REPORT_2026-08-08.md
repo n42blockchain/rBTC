@@ -826,9 +826,39 @@ The ordinary library gate was green before and after adding the ignored test:
 `724 passed; 0 failed; 3 ignored` in `31.95s`. The added external test does not
 run unless explicitly selected.
 
-One item remains open. A host DNS capture was attempted with
+At that point one item remained open. A host DNS capture was attempted with
 `tcpdump -ni lo0 -c 1 'udp port 53 or tcp port 53'`, but macOS refused access
 to `/dev/bpf0` with `Permission denied`. The resolver-start counter proves that
 this process did not begin a lookup, including a failed or timed-out lookup;
 it cannot replace the requested host packet capture, so no wire-level no-DNS
 claim is made.
+
+#### Privileged DNS-capture completion
+
+Administrator access subsequently made a clean host capture possible. An
+initial capture was discarded because the test-owned resolving endpoint had
+also run during its interval and, by design, performed a local lookup. The
+accepted capture started from a new file and ran only across the external Tor
+case.
+
+The external test was first adjusted to try both pinned Testnet4 authorities
+in configured order. This reflects the real bounded name wave and avoids
+making acceptance depend on one proxy-selected public peer: immediately before
+the adjustment, one selected peer closed during the Bitcoin handshake and the
+other stalled. The adjusted test still requires a complete real handshake and
+asserts that the resolver-start counter remains unchanged over every attempt.
+
+```bash
+RBTC_NAME_PROXY=127.0.0.1:9050 cargo test --locked --lib \
+  configured_name_proxy -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `23.85s`.
+
+The clean `/tmp/rbtc-name-proxy-dns-clean.pcap` decoded 192 lines of UDP/TCP
+port 53 traffic, including unrelated host queries, so this was not an empty or
+inactive capture. Neither `seed.testnet4.bitcoin.sprovoost.nl` nor
+`seed.testnet4.wiz.biz` appeared in the decoded queries. This closes the
+traditional-DNS packet-capture item. It does not claim that a port 53 capture
+can identify encrypted DNS inside unrelated HTTPS or TLS traffic; the product
+path's stronger process-specific evidence remains the resolver-start counter.
