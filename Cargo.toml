@@ -29,8 +29,8 @@ bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
 axum = "0.8.9"
 # BIP324 v2 transport record ciphers (FSChaCha20 / FSChaCha20Poly1305 are
 # built on these primitives in `p2p_v2`).
-chacha20 = "0.9"
-chacha20poly1305 = "0.10"
+chacha20 = "0.10"
+chacha20poly1305 = "0.11"
 fs2 = "=0.4.3"
 redb = "2.6.3"
 libmdbx = { version = "0.6.6", optional = true }
@@ -38,7 +38,7 @@ rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
-sha3 = "0.11"
+sha3 = "0.12"
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
