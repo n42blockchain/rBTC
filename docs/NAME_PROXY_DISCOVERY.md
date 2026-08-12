@@ -181,12 +181,36 @@ bucket filters unchanged. Two tests cover the shared quota and the learned
 entries; a third holds onion sessions to sending no `getaddr` at all, since
 the decision about who learns moved into `discover_peer_addresses`.
 
-Still unimplemented: the rest of the acceptance matrix. Locally, the domain
-request, the proxied handshake, `getaddr` with learned-IP filtering, the
-anonymity-only refusals, malformed-name rejection, and the absence of any
-fabricated IP peer all have tests. What no test does is capture host DNS
-traffic to demonstrate the absence of a query rather than reason about it, and
-the real-environment items are untouched.
+## Acceptance status
+
+Status date: 2026-08-12. The local list is covered. The domain request, the
+proxied handshake, `getaddr` with learned-IP filtering, the anonymity-only
+refusals, malformed-name rejection, and the absence of any fabricated IP peer
+all have tests, as do the wave's place in the candidate order and the restart
+that finds what it learned.
+
+The absence of a DNS query is observed rather than inferred, but by a process
+counter incremented before each lookup, not by a packet capture. It shows this
+process began no resolver request — including requests that would have timed
+out or failed — and it runs on every build, which a capture would not. It
+cannot speak for what a resolver library or sidecar does with a request that
+was never made here. That distinction is why the capture item below stays
+open.
+
+Of the real-environment items, the Testnet4 bootstrap is done: an `#[ignore]`d
+test completes a real handshake from `seed.testnet4.bitcoin.sprovoost.nl`
+through a SOCKS5 endpoint that actually resolves the name, asserting the
+endpoint received `ATYP=DOMAIN` with that authority and port 48333 while the
+node's own resolution path never ran. Pointed at an unresolvable name it
+fails, which is what makes the passing run evidence. Two caveats: the endpoint
+is one this test brings rather than the deployment's Tor, and it runs in the
+test process because a test cannot conveniently fork one — a deployment's
+would be separate, as Tor is.
+
+Still open: a host packet capture asserting no query leaves the machine, and a
+run against the deployment's own Tor or SOCKS5 service. Both need an
+environment this work did not have — the first needs administrator rights for
+a capture, the second needs Tor installed.
 
 ## Recommended configuration model
 
