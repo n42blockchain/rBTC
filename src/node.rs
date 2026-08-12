@@ -10208,9 +10208,10 @@ async fn run_connected_peer(
         validated_header_height,
     } = connected;
     let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote.clone());
-    // Address-book maintenance, throughput ranking, and the socket-typed
-    // status view all key on a routable address, which an onion peer has
-    // none of; those steps are skipped rather than given a fabricated one.
+    // Throughput ranking and the socket-typed status view key on a routable
+    // address, which an onion peer has none of; those steps are skipped rather
+    // than given a fabricated one. Address-book maintenance decides for itself
+    // — see `discover_peer_addresses`.
     let routable = remote.socket();
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
@@ -10223,9 +10224,7 @@ async fn run_connected_peer(
 
     if let Some(path) = &options.data_dir {
         if let Some(store) = peer_store {
-            if let Some(routable) = routable {
-                discover_peer_addresses(&mut session, store, routable).await;
-            }
+            discover_peer_addresses(&mut session, store, &remote).await;
         }
         let transfer_before = session.block_transfer_stats();
         let result = if options.snapshot_overlay.is_some() {
@@ -10753,11 +10752,24 @@ fn block_throughput_bps(before: BlockTransferStats, after: BlockTransferStats) -
     Some(u32::try_from(bytes_per_second).unwrap_or(u32::MAX))
 }
 
+/// Requests one bounded address batch and persists what survives the filters.
+///
+/// Which peers this runs for is decided here rather than at the call site,
+/// because the answer follows from what each target can honestly claim as a
+/// source. A routable peer is its own source group. A name target has no
+/// address at all, yet it is the one peer type that otherwise leaves nothing
+/// behind, so learning from it is what stops the next start from having to
+/// contact the seed authorities again — its batch goes to a shared marker
+/// group instead of an invented one. Onion and I2P peers keep their existing
+/// behaviour of learning nothing rather than being given a fabricated source.
 async fn discover_peer_addresses(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     store: &RedbPeerStore,
-    source: SocketAddr,
+    source: &NodePeerTarget,
 ) {
+    if matches!(source, NodePeerTarget::Onion(_) | NodePeerTarget::I2p(_)) {
+        return;
+    }
     let discovery = timeout(PEER_DISCOVERY_TIMEOUT, async {
         session.request_addresses().await?;
         session.receive_addresses().await
@@ -10772,7 +10784,16 @@ async fn discover_peer_addresses(
                     return;
                 }
             };
-            match store.insert_discovered(source, &addresses, now) {
+            let inserted = match source {
+                NodePeerTarget::Socket(socket) => store.insert_discovered(*socket, &addresses, now),
+                // The proxy chose this peer and never said which address it
+                // picked, so the batch carries no source group of its own.
+                NodePeerTarget::SeedName { .. } => {
+                    store.insert_discovered_from_seed_name(&addresses, now)
+                }
+                NodePeerTarget::Onion(_) | NodePeerTarget::I2p(_) => return,
+            };
+            match inserted {
                 Ok(stats) if stats.accepted > 0 => rbtc_info!(
                     "persisted {} learned peer addresses from {source}; rejected {}",
                     stats.accepted,
@@ -19210,6 +19231,124 @@ mod tests {
                 .expect("an advertised receiver decodes")
                 .ip()
                 .is_unspecified()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_session_persists_the_addresses_its_peer_advertised() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let now = unix_time().unwrap();
+        let eligible: SocketAddr = "127.0.0.5:18444".parse().unwrap();
+        let ineligible: SocketAddr = "127.0.0.6:18444".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(717)).await;
+            assert!(
+                matches!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetAddr
+                ),
+                "a name bootstrap must ask for addresses; without them it leaves nothing behind"
+            );
+            peer.write_message(NetworkMessage::AddrV2(vec![
+                bitcoin::p2p::address::AddrV2Message {
+                    time: now,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.5".parse().unwrap()),
+                    port: 18_444,
+                },
+                // Missing the required services. A peer the proxy chose gets no
+                // relaxation of the filters an ordinary peer's addresses face.
+                bitcoin::p2p::address::AddrV2Message {
+                    time: now,
+                    services: ServiceFlags::NONE,
+                    addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.6".parse().unwrap()),
+                    port: 18_444,
+                },
+            ]))
+            .await
+            .unwrap();
+            while peer.read_message().await.is_ok() {}
+        });
+
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            707,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse("seed.example.com").unwrap(),
+            port: 8333,
+        };
+
+        discover_peer_addresses(&mut session, &store, &target).await;
+        drop(session);
+
+        let candidates = store.candidates(now, 10).unwrap();
+        assert!(
+            candidates.contains(&eligible),
+            "what a name bootstrap learns is what stops the next start from contacting the authorities again"
+        );
+        assert!(
+            !candidates.contains(&ineligible),
+            "the ordinary service filter still applies to a proxy-chosen peer's advertisements"
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the name target itself is never persisted as a candidate"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_onion_session_still_asks_for_no_addresses() {
+        // The decision about who learns addresses moved from the call site
+        // into `discover_peer_addresses`. An onion peer has no source this
+        // node could honestly record, so it must still send no getaddr at all
+        // — not send one and discard the answer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(818)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), peer.read_message())
+                    .await
+                    .is_err(),
+                "an onion session sends no getaddr"
+            );
+        });
+
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            808,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let onion = NodePeerTarget::Onion(OnionAddress::from_public_key([0x55; 32], 8333));
+
+        discover_peer_addresses(&mut session, &store, &onion).await;
+
+        server.await.unwrap();
+        assert!(
+            store
+                .candidates(unix_time().unwrap(), 10)
+                .unwrap()
+                .is_empty(),
+            "nothing is learned from a peer whose source cannot be recorded"
         );
     }
 

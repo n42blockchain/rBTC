@@ -65,6 +65,14 @@ const MAX_STORED_I2P_PEERS: usize = 1_024;
 const I2P_SOURCE_GROUP_FAMILY: &str = "i2p";
 /// Complete source-group value stored on every I2P record.
 const I2P_SOURCE_GROUP: &str = "i2p:0:0";
+/// Family marker for addresses learned through a name-proxy bootstrap.
+const SEED_NAME_SOURCE_GROUP_FAMILY: &str = "seed-name";
+/// Complete source-group value for every address a name proxy's peer taught.
+///
+/// One value for all of them: the proxy chose each peer and reported no
+/// address, so this node knows of no range to diversify across and must not
+/// imply one by splitting them into separate groups.
+const SEED_NAME_SOURCE_GROUP: &str = "seed-name:0:0";
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
@@ -232,10 +240,35 @@ impl RedbPeerStore {
     }
 
     /// Atomically filters and stores one peer-sourced address batch.
-    #[allow(clippy::too_many_lines)]
     pub fn insert_discovered(
         &self,
         source: std::net::SocketAddr,
+        addresses: &[PeerAddress],
+        now: u32,
+    ) -> Result<PeerInsertStats, PeerStoreError> {
+        self.insert_discovered_in_group(&source_group(source.ip()), addresses, now)
+    }
+
+    /// Stores addresses learned from a peer a name proxy selected.
+    ///
+    /// The proxy chose the peer and never reported its address, so there is no
+    /// IP range to diversify over and no honest per-source group to assign.
+    /// Every such batch shares one marker group, exactly as onion and I2P
+    /// records do. Sharing it is the conservative choice: one group carries
+    /// one group's quota however many authorities were contacted, so this path
+    /// can never claim more of the new table than an ordinary source.
+    pub fn insert_discovered_from_seed_name(
+        &self,
+        addresses: &[PeerAddress],
+        now: u32,
+    ) -> Result<PeerInsertStats, PeerStoreError> {
+        self.insert_discovered_in_group(SEED_NAME_SOURCE_GROUP, addresses, now)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn insert_discovered_in_group(
+        &self,
+        group: &str,
         addresses: &[PeerAddress],
         now: u32,
     ) -> Result<PeerInsertStats, PeerStoreError> {
@@ -249,7 +282,6 @@ impl RedbPeerStore {
                     && !is_terrible(record, now)
             })
         });
-        let group = source_group(source.ip());
         let mut group_count = records
             .values()
             .filter(|record| !record_is_tried(record) && record.source_group == group)
@@ -282,7 +314,7 @@ impl RedbPeerStore {
                 maybe_add_new_reference(
                     &updated.source_group,
                     !record_is_tried(&updated),
-                    &group,
+                    group,
                     &mut updated.new_source_groups,
                 );
                 if updated.new_source_groups.len() == before {
@@ -308,7 +340,7 @@ impl RedbPeerStore {
                 in_new_table,
                 mut new_source_groups,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0, 0, 0, false, Vec::new()),
+                || (group.to_owned(), 0, 0, 0, 0, 0, 0, 0, false, Vec::new()),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -327,7 +359,7 @@ impl RedbPeerStore {
             maybe_add_new_reference(
                 &source_group,
                 last_success == 0 || in_new_table,
-                &group,
+                group,
                 &mut new_source_groups,
             );
             records.insert(
@@ -1396,7 +1428,12 @@ fn valid_source_group(group: &str) -> bool {
         // The onion address book shares this record type but has no IP
         // range to diversify across, so its entries carry one fixed marker
         // group. `source_group` never produces it for a routable address.
-        ONION_SOURCE_GROUP_FAMILY | I2P_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
+        // A name-proxy bootstrap carries one for the opposite reason: the
+        // record is a routable address, but the peer that taught it had none
+        // this node could see.
+        ONION_SOURCE_GROUP_FAMILY | I2P_SOURCE_GROUP_FAMILY | SEED_NAME_SOURCE_GROUP_FAMILY => {
+            first == "0" && second == "0"
+        }
         _ => false,
     }
 }
@@ -2748,6 +2785,50 @@ mod tests {
             br#"{"services":9,"last_seen":1800000000,"source_group":"v4:8:8"}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_name_proxy_bootstrap_learns_under_one_shared_source_group() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+
+        let first = learned("127.0.0.1:18444", services, now);
+        let stats = store
+            .insert_discovered_from_seed_name(std::slice::from_ref(&first), now)
+            .unwrap();
+        assert_eq!(stats.accepted, 1);
+        let record = store.load_records().unwrap()[&first.socket.to_string()].clone();
+        assert_eq!(
+            record.source_group, SEED_NAME_SOURCE_GROUP,
+            "the peer had no address this node saw, so the group is the marker, not a guess"
+        );
+        assert!(
+            valid_source_group(&record.source_group),
+            "the marker must survive the record validator on reload"
+        );
+
+        // Contacting more authorities must not widen the quota. Every batch
+        // lands in the same group, so this path can claim one group's share of
+        // the new table however many authorities the wave reached.
+        let mut accepted = stats.accepted;
+        for index in 0..MAX_PEERS_PER_SOURCE_GROUP + 20 {
+            let address = learned(
+                &format!("127.{}.{}.2:18444", index / 256, index % 256),
+                services,
+                now,
+            );
+            accepted += store
+                .insert_discovered_from_seed_name(std::slice::from_ref(&address), now)
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted, MAX_PEERS_PER_SOURCE_GROUP,
+            "one marker group carries one group's quota"
+        );
     }
 
     #[test]
