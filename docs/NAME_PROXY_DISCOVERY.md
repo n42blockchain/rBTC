@@ -166,13 +166,27 @@ type it must see, so a name target reaching the ordinary peer proxy fails
 rather than passing because a real deployment usually points both fields at
 one service.
 
-Still unimplemented: the rest of the acceptance matrix. The local list is
-partly covered — the domain request, the proxied handshake, the anonymity-only
-refusals, malformed-name rejection, and the absence of any fabricated IP peer
-all have tests — but no test yet drives `getaddr` and learned-IP filtering
-over a proxied name session, and no run has captured host DNS traffic to
-demonstrate the absence of a query rather than reason about it. The
-real-environment items are untouched.
+Point 7 needed a decision the earlier pieces had deferred. Address discovery
+was gated on having a routable socket, so a name session asked for no
+addresses at all and a successful bootstrap left nothing behind — every
+restart would contact the authorities again, which is the repeated disclosure
+this path exists to reduce. The peer a proxy selected has no address this node
+saw, so its batch cannot claim an honest source group; it now carries a marker
+group, the same shape onion and I2P records already use, and every name-proxy
+batch shares that one group. Sharing is what keeps it conservative: one group
+carries one group's quota however many authorities a wave reached, so this
+path can never claim more of the new table than an ordinary source, and the
+learned addresses still face the existing service, routability, horizon, and
+bucket filters unchanged. Two tests cover the shared quota and the learned
+entries; a third holds onion sessions to sending no `getaddr` at all, since
+the decision about who learns moved into `discover_peer_addresses`.
+
+Still unimplemented: the rest of the acceptance matrix. Locally, the domain
+request, the proxied handshake, `getaddr` with learned-IP filtering, the
+anonymity-only refusals, malformed-name rejection, and the absence of any
+fabricated IP peer all have tests. What no test does is capture host DNS
+traffic to demonstrate the absence of a query rather than reason about it, and
+the real-environment items are untouched.
 
 ## Recommended configuration model
 
