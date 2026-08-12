@@ -128,11 +128,35 @@ discovery must not widen how many authorities this node contacts. No failure
 state is persisted: point 8 allows a durable schema only if justified, and
 nothing yet justifies one.
 
-Still unimplemented: the config-file key, and the call site that runs this
-wave after explicit and persisted peers have failed and pairs each name with
-the network port. Nothing constructs a `ProxyTarget::SeedName` yet, so no
-bootstrap behaviour has changed: the pieces exist and are tested, but nothing
-calls them.
+`NodePeerTarget::SeedName` makes a validated authority dialable by the
+existing connection path, so the ordinary handshake, service, protocol, and
+timeout rules apply to it unchanged. What it does not inherit is address
+identity: it records no attempt, earns no session-success promotion, enters
+no discouragement table, exposes no socket, and is the one target that never
+parses back from its textual form, because accepting it there would let
+`--connect` hand an arbitrary hostname to a proxy as though it were a peer.
+Dialing one uses `name_proxy`, never `proxy`, and a missing name proxy is a
+local fault rather than a degraded route. Two unit tests cover the refusal
+and the empty peer books.
+
+The call site follows, and it is the first change on this path that alters
+network behaviour. With `--name-proxy` configured, a bootstrap that has
+exhausted its explicit and persisted peers submits the wave to that proxy.
+`seed_bootstrap` states the source choice separately so it can be verified on
+its own: the two are exclusive, not ordered, because consulting the resolver
+as well — or falling back to it when the proxy fails — would send the lookup
+the authorisation exists to prevent. The wave runs once and contacts each
+authority once; a failed name is not retried within the run, since repeated
+spellings were already collapsed and dialing one again would repeat that
+disclosure to buy a retry the per-attempt deadline has already spent. Retry
+policy stays where it can be keyed by address: on the `addr` entries a
+successful name yields. Ports come from the configured entry that first names
+each authority, matching the wave's choice of the first spelling. Two unit
+tests cover the source choice and the port pairing.
+
+Still unimplemented: the config-file key, and the acceptance matrix below —
+in particular the mock-SOCKS5 and real-endpoint runs, which are what would
+demonstrate the path end to end rather than one piece at a time.
 
 ## Recommended configuration model
 
