@@ -19256,6 +19256,136 @@ mod tests {
         );
     }
 
+    /// A SOCKS5 endpoint that actually resolves the name it is given.
+    ///
+    /// Unlike the mock elsewhere in this file, this one does the resolving —
+    /// which is the whole division of labour being tested. It reports what it
+    /// was asked for before connecting, then joins the two streams.
+    async fn resolving_socks5_proxy(
+        listener: TcpListener,
+        observed: tokio::sync::oneshot::Sender<(u8, String, u16)>,
+    ) -> Result<(), String> {
+        let (mut client, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let mut greeting = [0_u8; 3];
+        client
+            .read_exact(&mut greeting)
+            .await
+            .map_err(|e| e.to_string())?;
+        client.write_all(&[5, 0]).await.map_err(|e| e.to_string())?;
+        let mut header = [0_u8; 4];
+        client
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| e.to_string())?;
+        let address_type = header[3];
+        let mut length = [0_u8; 1];
+        client
+            .read_exact(&mut length)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut name = vec![0_u8; usize::from(length[0])];
+        client
+            .read_exact(&mut name)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut port = [0_u8; 2];
+        client
+            .read_exact(&mut port)
+            .await
+            .map_err(|e| e.to_string())?;
+        let host = String::from_utf8(name).map_err(|e| e.to_string())?;
+        let port = u16::from_be_bytes(port);
+        let _ = observed.send((address_type, host.clone(), port));
+
+        let candidates = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("proxy could not resolve {host}: {e}"))?
+            .collect::<Vec<_>>();
+        let mut upstream = None;
+        for candidate in candidates {
+            if let Ok(stream) = timeout(Duration::from_secs(5), async move {
+                tokio::net::TcpStream::connect(candidate).await
+            })
+            .await
+            .map_err(|_| "connect timed out".to_owned())?
+            {
+                upstream = Some(stream);
+                break;
+            }
+        }
+        let mut upstream = upstream.ok_or_else(|| format!("no peer behind {host} accepted"))?;
+        client
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "reaches the public Testnet4 network through a resolving SOCKS5 endpoint"]
+    async fn a_real_seed_authority_bootstraps_testnet4_through_a_resolving_proxy() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = listener.local_addr().unwrap();
+        let (observed, was_observed) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(resolving_socks5_proxy(listener, observed));
+
+        let authority = "seed.testnet4.bitcoin.sprovoost.nl";
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse(authority).unwrap(),
+            port: default_p2p_port(Network::Testnet4),
+        };
+
+        let before = dns_lookups_started();
+        let connected = timeout(
+            Duration::from_secs(60),
+            connect_peer(
+                DeploymentConfig::for_network(Network::Testnet4),
+                target,
+                Some(name_proxy),
+                0x5eed_0000_0000_0001,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("the proxied handshake completes within a minute")
+        .expect("a real Testnet4 peer completes the handshake");
+
+        let version = connected.session.remote_version();
+        assert!(
+            version.version >= 70_001,
+            "a real peer negotiated: {version:?}"
+        );
+        assert!(
+            version.services.has(ServiceFlags::NETWORK),
+            "the seed's answer serves blocks: {:?}",
+            version.services
+        );
+
+        let (address_type, name, port) = was_observed.await.unwrap();
+        assert_eq!(
+            address_type, 3,
+            "the proxy was given a name, not an address"
+        );
+        assert_eq!(name, authority);
+        assert_eq!(port, default_p2p_port(Network::Testnet4));
+
+        // The proxy resolved, and it does so in this process only because a
+        // test cannot conveniently fork one. What this asserts is narrower and
+        // still the point: the node's own seed-resolution path never ran.
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the node handed over the name instead of resolving it"
+        );
+
+        drop(connected);
+        let _ = timeout(Duration::from_secs(5), proxy).await;
+    }
+
     #[tokio::test]
     async fn a_name_wave_waits_while_the_peers_a_restart_already_had_are_viable() {
         // A peer that accepts the connection and then says nothing, standing
@@ -19449,6 +19579,16 @@ mod tests {
             candidates.len(),
             1,
             "the name target itself is never persisted as a candidate"
+        );
+
+        // Across a restart, which is the point: the next start has a candidate
+        // and does not have to name an authority to anyone.
+        drop(store);
+        let reopened =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(
+            reopened.candidates(now, 10).unwrap().contains(&eligible),
+            "a restart finds what the name bootstrap learned"
         );
         server.abort();
     }
