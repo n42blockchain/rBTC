@@ -372,13 +372,16 @@ optional where appropriate, and host-runtime compatible.
   its ED25519 key owner-only and republishes it on every start, and a SAM
   session replays a stored destination key, so both addresses survive a
   restart.
-- [ ] Name-proxy discovery. A SOCKS5 proxy currently refuses to run alongside
-  DNS seeds rather than resolving seed hostnames through the proxy, which
-  fails closed against resolver leaks but leaves an operator on explicit peers
-  or the persisted peer database for bootstrap. The portable domain-CONNECT
-  design, rejected alternatives, privacy invariants, required decisions, and
-  local/real-proxy acceptance matrix are mapped in
-  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md).
+- [x] Name-proxy discovery. An explicit `--name-proxy` sends seed authorities
+  to a SOCKS5 endpoint as domain `CONNECT` requests only after explicit and
+  persisted candidates are exhausted, without falling back to the local
+  resolver. Learned peer addresses remain subject to the existing filters and
+  share one conservative source-group quota. Deterministic coverage, a real
+  Testnet4 handshake through a resolving endpoint, and a run through an
+  independently running Tor SOCKS endpoint are recorded in
+  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md). A privileged host packet
+  capture remains an external acceptance-evidence gap, not an implementation
+  gap.
 - [x] Administrative peer mutation and a general bounded cursor chainstate
   scan. Authenticated `listbanned`/`setban` administer durable local peer
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks

@@ -19387,6 +19387,54 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "set RBTC_NAME_PROXY to a deployment-selected resolving SOCKS5 endpoint"]
+    async fn a_real_seed_authority_bootstraps_testnet4_through_the_configured_name_proxy() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        let name_proxy = std::env::var("RBTC_NAME_PROXY")
+            .expect("set RBTC_NAME_PROXY, for example to 127.0.0.1:9050")
+            .parse::<SocketAddr>()
+            .expect("RBTC_NAME_PROXY must be an IP:PORT socket address");
+        let authority = "seed.testnet4.bitcoin.sprovoost.nl";
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse(authority).unwrap(),
+            port: default_p2p_port(Network::Testnet4),
+        };
+
+        let before = dns_lookups_started();
+        let connected = timeout(
+            Duration::from_secs(60),
+            connect_peer(
+                DeploymentConfig::for_network(Network::Testnet4),
+                target,
+                Some(name_proxy),
+                0x5eed_0000_0000_0002,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("the externally proxied handshake completes within a minute")
+        .expect("a real Testnet4 peer completes the handshake through the configured proxy");
+
+        let version = connected.session.remote_version();
+        assert!(
+            version.version >= 70_001,
+            "a real peer negotiated: {version:?}"
+        );
+        assert!(
+            version.services.has(ServiceFlags::NETWORK),
+            "the seed's answer serves blocks: {:?}",
+            version.services
+        );
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the node handed the authority to the external proxy instead of resolving it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_name_wave_waits_while_the_peers_a_restart_already_had_are_viable() {
         // A peer that accepts the connection and then says nothing, standing
         // in for a candidate a restart still considers viable: it has neither

@@ -788,3 +788,47 @@ connect it without asking a peer for bytes the node already holds — makes the
 submission never connect and the RPC never answer; the test fails on its
 response deadline in `11.63s`. The passing result therefore reflects the
 closed loop rather than the assertions being reachable by other means.
+
+### `78eb981` name-proxy external acceptance — 2026-08-12
+
+The branch was fast-forwarded to `78eb981`. Its in-process resolving SOCKS5
+acceptance was rerun against the public Testnet4 network:
+
+```bash
+cargo test --locked --lib \
+  node::tests::a_real_seed_authority_bootstraps_testnet4_through_a_resolving_proxy \
+  -- --ignored --exact --nocapture
+```
+
+Result: `1 passed; 0 failed` in `0.76s`. The test observed a SOCKS5
+`ATYP=DOMAIN` request for `seed.testnet4.bitcoin.sprovoost.nl:48333`, completed
+a Bitcoin handshake with a peer selected after proxy-side resolution, and
+observed no increment in the node's resolver-start counter.
+
+An additional ignored test makes the external implementation an explicit
+input instead of substituting the test-owned endpoint. It was run through an
+independent Homebrew Tor process listening on `127.0.0.1:9050`:
+
+```bash
+RBTC_NAME_PROXY=127.0.0.1:9050 cargo test --locked --lib \
+  node::tests::a_real_seed_authority_bootstraps_testnet4_through_the_configured_name_proxy \
+  -- --ignored --exact --nocapture
+```
+
+Result: `1 passed; 0 failed` in `11.92s`. The real Testnet4 handshake completed
+through Tor and the node's resolver-start counter remained unchanged. The
+wire-level domain assertion belongs to the first test; the second establishes
+interoperability with a separately running deployment-selected SOCKS5
+implementation and does not claim visibility into Tor's internal resolver.
+
+The ordinary library gate was green before and after adding the ignored test:
+`724 passed; 0 failed; 2 ignored` in `32.64s` at `78eb981`, then
+`724 passed; 0 failed; 3 ignored` in `31.95s`. The added external test does not
+run unless explicitly selected.
+
+One item remains open. A host DNS capture was attempted with
+`tcpdump -ni lo0 -c 1 'udp port 53 or tcp port 53'`, but macOS refused access
+to `/dev/bpf0` with `Permission denied`. The resolver-start counter proves that
+this process did not begin a lookup, including a failed or timed-out lookup;
+it cannot replace the requested host packet capture, so no wire-level no-DNS
+claim is made.

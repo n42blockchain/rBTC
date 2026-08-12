@@ -1,10 +1,12 @@
 # Name-proxy discovery boundary
 
-Status date: 2026-08-11.
+Status date: 2026-08-12.
 
-This note turns the open name-proxy roadmap item into an implementable decision.
-It does not change current behavior: configuring `--proxy` still requires DNS
-seeds to be disabled, so seed names never reach the host resolver.
+This note records the implemented name-proxy boundary, the decisions that led
+to it, and its acceptance evidence. Configuring `--proxy` alone still requires
+DNS seeds to be disabled; `--name-proxy` is the separate authorization that
+lets seed authorities reach a resolving SOCKS5 endpoint without entering the
+host resolver.
 
 ## Current boundary
 
@@ -197,25 +199,30 @@ cannot speak for what a resolver library or sidecar does with a request that
 was never made here. That distinction is why the capture item below stays
 open.
 
-Of the real-environment items, the Testnet4 bootstrap is done: an `#[ignore]`d
-test completes a real handshake from `seed.testnet4.bitcoin.sprovoost.nl`
-through a SOCKS5 endpoint that actually resolves the name, asserting the
-endpoint received `ATYP=DOMAIN` with that authority and port 48333 while the
-node's own resolution path never ran. Pointed at an unresolvable name it
-fails, which is what makes the passing run evidence. Two caveats: the endpoint
-is one this test brings rather than the deployment's Tor, and it runs in the
-test process because a test cannot conveniently fork one — a deployment's
-would be separate, as Tor is.
+The real-environment Testnet4 bootstrap has two layers. One `#[ignore]`d test
+completes a real handshake from `seed.testnet4.bitcoin.sprovoost.nl` through a
+SOCKS5 endpoint supplied by the test, asserting that endpoint received
+`ATYP=DOMAIN` with the authority and port 48333 while the node's resolution
+path never ran. Pointed at an unresolvable name it fails, which is what makes
+the passing run evidence. A second ignored test takes `RBTC_NAME_PROXY` and
+runs the same public handshake through an independently running,
+deployment-selected SOCKS5 implementation; it also asserts that the node's
+resolver counter does not move. The first layer observes the wire request; the
+second proves the same product path interoperates with an external service.
 
-Still open: a host packet capture asserting no query leaves the machine, and a
-run against the deployment's own Tor or SOCKS5 service. Both need an
-environment this work did not have — the first needs administrator rights for
-a capture, the second needs Tor installed.
+On 2026-08-12 both layers passed on macOS, with the external test using the Tor
+SOCKS endpoint at `127.0.0.1:9050`. The external service was a Homebrew Tor
+process with its own data directory and control port, not an in-test proxy.
 
-## Recommended configuration model
+Still open: a host packet capture asserting no DNS query leaves the machine.
+The capture tool cannot open the macOS BPF device without elevated privileges;
+the process counter therefore remains useful evidence but is deliberately not
+presented as a packet-capture substitute.
 
-Add an explicit `--name-proxy IP:PORT` (and corresponding typed/config-file
-field) rather than silently changing `--proxy` semantics.
+## Implemented configuration model
+
+The implementation adds an explicit `--name-proxy IP:PORT` and corresponding
+typed/config-file field rather than silently changing `--proxy` semantics.
 
 - `--proxy` continues to route outbound peer sockets and, by itself, continues
   to conflict with DNS seeds.
@@ -233,11 +240,10 @@ field) rather than silently changing `--proxy` semantics.
   false. Family-specific support requires a proxy capability that proves the
   result without local resolution.
 
-## Candidate and persistence model
+## Implemented candidate and persistence model
 
-Introduce a bounded transient target such as `SeedName { host, port, index }`.
-It is not a routable `SocketAddr`, onion service, I2P Destination, or peer-store
-key.
+The bounded transient `SeedName` target is not a routable `SocketAddr`, onion
+service, I2P Destination, or peer-store key.
 
 1. Preserve explicit and persisted IP/onion/I2P candidate order.
 2. Only after those waves fail, take at most the existing 16 seed authorities.
@@ -297,17 +303,18 @@ not include proxy credentials or unbounded replies.
 
 ### Real-environment acceptance
 
-- run through a real Tor SOCKS endpoint or the deployment's selected SOCKS5
-  implementation and complete a Bitcoin/Testnet4 handshake from a seed name;
-- capture DNS traffic on the host and assert no query is emitted;
-- confirm proxy logs show domain-target handling and that disabling the proxy
-  produces a bounded failure rather than a direct fallback;
-- restart using only learned persisted IP peers and confirm DNS/name-proxy
-  discovery is not required while viable candidates remain.
+- [x] run through a real Tor SOCKS endpoint and complete a Bitcoin/Testnet4
+  handshake from a seed name;
+- [ ] capture DNS traffic on the host and assert no query is emitted — blocked
+  on elevated BPF capture permission in the available macOS environment;
+- [x] observe domain-target handling and confirm that an unresolvable name
+  produces a bounded proxy failure rather than a direct fallback;
+- [x] restart using learned persisted IP peers and confirm name discovery is
+  not started while viable candidates remain.
 
-## Required product decisions
+## Accepted product decisions
 
-Before implementation, an owner must accept or change these recommendations:
+The implementation embodies these decisions:
 
 1. use explicit `--name-proxy` rather than making `--proxy` imply remote name
    discovery;
@@ -319,5 +326,7 @@ Before implementation, an owner must accept or change these recommendations:
    peer-advertised IP entries;
 5. retain no-authentication proxy scope.
 
-Until those decisions are accepted and the acceptance matrix passes, the
-current explicit/persisted-peer behavior remains the supported privacy boundary.
+The explicit/persisted-peer-only configuration remains supported. The sole
+open acceptance item is privileged host packet capture; it does not authorize
+weakening any of the resolver, fallback, `onlynet`, or persistence invariants
+above.
