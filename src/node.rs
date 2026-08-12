@@ -15548,6 +15548,22 @@ const fn default_p2p_port(network: Network) -> u16 {
     }
 }
 
+/// Counts the local resolver requests this process has begun.
+///
+/// A bootstrap that must not resolve is otherwise only checkable by reading
+/// the code. This makes it observable instead: take the count before and
+/// after, and any lookup this process started shows up whether it succeeded,
+/// failed, or timed out. It counts requests, not packets, so it cannot speak
+/// for what the host's resolver library or a sidecar does with a request that
+/// was never made here.
+static DNS_LOOKUPS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns how many local resolver requests this process has begun.
+#[cfg(test)]
+fn dns_lookups_started() -> usize {
+    DNS_LOOKUPS_STARTED.load(Ordering::Relaxed)
+}
+
 async fn resolve_dns_candidates(
     network: Network,
     only_net: NodeOnlyNet,
@@ -15571,6 +15587,9 @@ async fn resolve_dns_candidates(
         lookups.spawn(async move {
             let host = seed.host;
             let port = seed.port;
+            // Counted before the request, not after it resolves: a lookup that
+            // times out or fails still left this host.
+            DNS_LOOKUPS_STARTED.fetch_add(1, Ordering::Relaxed);
             let lookup = timeout(
                 DNS_SEED_TIMEOUT,
                 tokio::net::lookup_host((host.as_str(), port)),
@@ -17919,6 +17938,9 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    /// Serialises tests that read the process-wide resolver counter.
+    static DNS_OBSERVATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
 
@@ -19235,6 +19257,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_name_wave_waits_while_the_peers_a_restart_already_had_are_viable() {
+        // A peer that accepts the connection and then says nothing, standing
+        // in for a candidate a restart still considers viable: it has neither
+        // succeeded nor failed.
+        let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_remote = stalled.local_addr().unwrap();
+        let (dialed, was_dialed) = tokio::sync::oneshot::channel();
+        let stalled_server = tokio::spawn(async move {
+            let (stream, _) = stalled.accept().await.unwrap();
+            dialed.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let name_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_listener.local_addr().unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let observer = Arc::clone(&contacted);
+        let name_server = tokio::spawn(async move {
+            let _ = name_listener.accept().await;
+            observer.store(true, Ordering::Relaxed);
+        });
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.remotes = vec![stalled_remote];
+        options.resources.name_proxy = Some(name_proxy);
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+        let session = tokio::spawn(async move {
+            let _ = run_peer_pool_session(&options, 1, None, None).await;
+        });
+
+        timeout(Duration::from_secs(5), was_dialed)
+            .await
+            .expect("the existing candidate is dialed first")
+            .unwrap();
+        // The first wave is still outstanding — its per-attempt deadline is
+        // far from spent — so the authorities must not have been told anything
+        // yet. Every name submitted before that is a disclosure the node did
+        // not need to make.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !contacted.load(Ordering::Relaxed),
+            "no authority is named to the proxy while an existing candidate is still viable"
+        );
+
+        session.abort();
+        stalled_server.abort();
+        name_server.abort();
+
+        // The other half, without which the assertion above would also pass if
+        // the wave simply never ran: once nothing viable is left, the
+        // authorities are contacted.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = dead.local_addr().unwrap();
+        drop(dead);
+
+        let name_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_listener.local_addr().unwrap();
+        let (submitted, was_submitted) = tokio::sync::oneshot::channel();
+        let name_server = tokio::spawn(async move {
+            let _ = name_listener.accept().await;
+            submitted.send(()).unwrap();
+        });
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.remotes = vec![refused];
+        options.resources.name_proxy = Some(name_proxy);
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+        let session = tokio::spawn(async move {
+            let _ = run_peer_pool_session(&options, 1, None, None).await;
+        });
+
+        timeout(Duration::from_secs(5), was_submitted)
+            .await
+            .expect("an exhausted wave falls through to the authorities")
+            .unwrap();
+
+        session.abort();
+        name_server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_authorised_name_proxy_bootstrap_begins_no_local_lookup() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        // A port nothing listens on, so the wave fails at the proxy rather
+        // than anywhere that could disguise a fallback as success.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = dead.local_addr().unwrap();
+        drop(dead);
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.resources.name_proxy = Some(name_proxy);
+        // A name that cannot resolve, so a fallback would fail loudly instead
+        // of quietly succeeding — and no real authority is contacted either
+        // way.
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+
+        let before = dns_lookups_started();
+        let error = run_peer_pool_session(&options, 909, None, None)
+            .await
+            .expect_err("a dead name proxy exhausts the wave");
+        assert!(
+            error.starts_with(PEER_CANDIDATE_EXHAUSTED_PREFIX),
+            "{error}"
+        );
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "an authorised name proxy must submit the name to the proxy and never to the resolver"
+        );
+    }
+
+    #[tokio::test]
     async fn a_name_session_persists_the_addresses_its_peer_advertised() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
@@ -19420,6 +19565,7 @@ mod tests {
 
     #[tokio::test]
     async fn anonymity_only_restrictions_send_no_dns_query() {
+        let _observation = DNS_OBSERVATION.lock().await;
         // A hostname that would resolve if a query were actually issued. The
         // restriction must short-circuit before any query leaves the host,
         // because rejecting the answers afterwards still leaks which seeds a
@@ -19428,6 +19574,7 @@ mod tests {
             host: "localhost".to_owned(),
             port: 18_444,
         }];
+        let before = dns_lookups_started();
         for restricted in [NodeOnlyNet::Onion, NodeOnlyNet::I2p] {
             let (resolved, failures, rejected) =
                 resolve_dns_candidates(Network::Regtest, restricted, &seeds, &HashSet::new(), 16)
@@ -19442,8 +19589,14 @@ mod tests {
                 "{restricted:?} must reject nothing because it resolves nothing"
             );
         }
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the restriction must be observed as no request, not inferred from empty results"
+        );
 
-        // An unrestricted node still resolves.
+        // An unrestricted node still resolves — which is also what shows the
+        // counter above measures something rather than never moving.
         let (resolved, _, _) = resolve_dns_candidates(
             Network::Regtest,
             NodeOnlyNet::Any,
@@ -19456,6 +19609,7 @@ mod tests {
             !resolved.is_empty(),
             "an unrestricted node must still consult its seeds"
         );
+        assert!(dns_lookups_started() > before);
     }
 
     #[test]
