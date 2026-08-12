@@ -3,7 +3,7 @@
 mod config_file;
 
 use crate::i2p_sam::{I2pAddress, I2pSamSession};
-use crate::seed_name::SeedName;
+use crate::seed_name::{SeedName, SeedNameError, seed_name_wave};
 use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
@@ -8295,70 +8295,121 @@ async fn run_peer_pool_session(
     }
 
     let seeds = selected_dns_seeds(options);
-    if !seeds.is_empty() {
-        // The configured-peer cap bounds each connection wave, not the
-        // lifetime candidate set. A full persisted wave may consist entirely
-        // of stale addresses; still resolve one fresh, independently bounded
-        // DNS wave rather than exiting without consulting the bootstrap
-        // source. `attempted` remains excluded so no address is retried in the
-        // same run.
-        let remaining = MAX_CONFIGURED_PEERS;
-        let mut dns_excluded = attempted
-            .iter()
-            .filter_map(NodePeerTarget::socket)
-            .collect::<HashSet<_>>();
-        if let Some(store) = &peer_store {
-            for discouraged in store
-                .discouraged_addresses(unix_time()?)
-                .map_err(|error| error.to_string())?
-            {
-                dns_excluded.insert(discouraged);
+    match seed_bootstrap(options.resources.name_proxy, &seeds) {
+        SeedBootstrap::None => {}
+        SeedBootstrap::NameProxy(name_proxy) => {
+            let (wave, refused) = seed_name_wave_targets(&seeds);
+            for (candidate, error) in refused {
+                rbtc_warn!("seed authority {candidate} not submitted to the name proxy: {error}");
+            }
+            if !wave.is_empty() {
+                rbtc_info!(
+                    "submitting {} seed {} to the name proxy at {name_proxy}",
+                    wave.len(),
+                    if wave.len() == 1 {
+                        "authority"
+                    } else {
+                        "authorities"
+                    }
+                );
+                // Each authority appears once and the wave runs once. A failed
+                // name is not retried within this run: the wave already collapsed
+                // repeated spellings so one authority is contacted once, and
+                // dialing it again would repeat that disclosure to buy a retry
+                // the ordinary per-attempt deadline has already spent. What a
+                // successful name yields instead is `addr` data, which enters the
+                // normal address-keyed candidate path where retry policy lives.
+                attempted.extend(wave.iter().cloned());
+                if try_peer_candidates(
+                    options,
+                    &wave,
+                    local_nonce,
+                    peer_store.as_ref(),
+                    i2p_session.as_ref(),
+                    api_runtime.as_ref(),
+                    zmq_notifier.as_ref(),
+                    background_validation,
+                    validation_scheduler,
+                    &transaction_pool,
+                    &transaction_relay,
+                    &mempool_relay_source,
+                    inbound_source.as_ref(),
+                    &mut inbound_server,
+                    &manual_remotes,
+                    &mut failures,
+                    &network_time,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             }
         }
-        let (resolved, resolution_failures, rejected) = resolve_dns_candidates(
-            options.network,
-            options.resources.only_net,
-            &seeds,
-            &dns_excluded,
-            remaining,
-        )
-        .await;
-        for failure in resolution_failures {
-            rbtc_warn!("DNS seed failed: {failure}");
-        }
-        if !resolved.is_empty() || rejected > 0 {
-            rbtc_info!(
-                "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
-                resolved.len()
-            );
-        }
-        let resolved = resolved
-            .into_iter()
-            .map(NodePeerTarget::Socket)
-            .collect::<Vec<_>>();
-        attempted.extend(resolved.iter().cloned());
-        if try_peer_candidates(
-            options,
-            &resolved,
-            local_nonce,
-            peer_store.as_ref(),
-            i2p_session.as_ref(),
-            api_runtime.as_ref(),
-            zmq_notifier.as_ref(),
-            background_validation,
-            validation_scheduler,
-            &transaction_pool,
-            &transaction_relay,
-            &mempool_relay_source,
-            inbound_source.as_ref(),
-            &mut inbound_server,
-            &manual_remotes,
-            &mut failures,
-            &network_time,
-        )
-        .await?
-        {
-            return Ok(());
+        SeedBootstrap::LocalResolver => {
+            // The configured-peer cap bounds each connection wave, not the
+            // lifetime candidate set. A full persisted wave may consist entirely
+            // of stale addresses; still resolve one fresh, independently bounded
+            // DNS wave rather than exiting without consulting the bootstrap
+            // source. `attempted` remains excluded so no address is retried in the
+            // same run.
+            let remaining = MAX_CONFIGURED_PEERS;
+            let mut dns_excluded = attempted
+                .iter()
+                .filter_map(NodePeerTarget::socket)
+                .collect::<HashSet<_>>();
+            if let Some(store) = &peer_store {
+                for discouraged in store
+                    .discouraged_addresses(unix_time()?)
+                    .map_err(|error| error.to_string())?
+                {
+                    dns_excluded.insert(discouraged);
+                }
+            }
+            let (resolved, resolution_failures, rejected) = resolve_dns_candidates(
+                options.network,
+                options.resources.only_net,
+                &seeds,
+                &dns_excluded,
+                remaining,
+            )
+            .await;
+            for failure in resolution_failures {
+                rbtc_warn!("DNS seed failed: {failure}");
+            }
+            if !resolved.is_empty() || rejected > 0 {
+                rbtc_info!(
+                    "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
+                    resolved.len()
+                );
+            }
+            let resolved = resolved
+                .into_iter()
+                .map(NodePeerTarget::Socket)
+                .collect::<Vec<_>>();
+            attempted.extend(resolved.iter().cloned());
+            if try_peer_candidates(
+                options,
+                &resolved,
+                local_nonce,
+                peer_store.as_ref(),
+                i2p_session.as_ref(),
+                api_runtime.as_ref(),
+                zmq_notifier.as_ref(),
+                background_validation,
+                validation_scheduler,
+                &transaction_pool,
+                &transaction_relay,
+                &mempool_relay_source,
+                inbound_source.as_ref(),
+                &mut inbound_server,
+                &manual_remotes,
+                &mut failures,
+                &network_time,
+            )
+            .await?
+            {
+                return Ok(());
+            }
         }
     }
     if attempted.is_empty() {
@@ -15365,6 +15416,63 @@ fn elapsed_ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
+/// Which source may consult the configured seed authorities this run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeedBootstrap {
+    /// Submit each authority's name to the proxy authorised to resolve it.
+    NameProxy(SocketAddr),
+    /// Resolve each authority on this host.
+    LocalResolver,
+    /// No authority is configured, so neither source runs.
+    None,
+}
+
+/// Chooses the one source allowed to consult the seed authorities.
+///
+/// An authorised name proxy replaces the local resolver rather than preceding
+/// it. The two are mutually exclusive because running both would send the very
+/// lookup the proxy exists to prevent, and a fallback from one to the other
+/// would do the same the first time the proxy failed.
+const fn seed_bootstrap(name_proxy: Option<SocketAddr>, seeds: &[DnsSeed]) -> SeedBootstrap {
+    if seeds.is_empty() {
+        return SeedBootstrap::None;
+    }
+    match name_proxy {
+        Some(proxy) => SeedBootstrap::NameProxy(proxy),
+        None => SeedBootstrap::LocalResolver,
+    }
+}
+
+/// Pairs the authorities a proxied wave may contact with the port to request.
+///
+/// Selection belongs to [`seed_name_wave`]; this only supplies the port, taken
+/// from the configured entry that first names each authority. That matches the
+/// wave's own choice to keep the first spelling of an authority written twice,
+/// so the two cannot disagree about which entry an authority came from.
+fn seed_name_wave_targets(
+    seeds: &[DnsSeed],
+) -> (Vec<NodePeerTarget>, Vec<(String, SeedNameError)>) {
+    let hosts = seeds
+        .iter()
+        .map(|seed| seed.host.clone())
+        .collect::<Vec<_>>();
+    let (names, refused) = seed_name_wave(&hosts);
+    let mut ports: HashMap<SeedName, u16> = HashMap::new();
+    for seed in seeds {
+        if let Ok(name) = SeedName::parse(&seed.host) {
+            ports.entry(name).or_insert(seed.port);
+        }
+    }
+    let targets = names
+        .into_iter()
+        .filter_map(|name| {
+            let port = *ports.get(&name)?;
+            Some(NodePeerTarget::SeedName { name, port })
+        })
+        .collect();
+    (targets, refused)
+}
+
 fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {
     options.dns_seeds.clone().unwrap_or_else(|| {
         pinned_dns_seed_hosts(options.network)
@@ -18918,6 +19026,81 @@ mod tests {
             store.discouraged_addresses(now).unwrap().is_empty(),
             "a name failure has no address to discourage, so it discourages none"
         );
+    }
+
+    #[test]
+    fn an_authorised_name_proxy_replaces_the_local_seed_lookup() {
+        let seeds = vec![DnsSeed {
+            host: "seed.example.com".to_owned(),
+            port: 8333,
+        }];
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+
+        // The two sources are exclusive. Consulting the resolver as well, or
+        // falling back to it when the proxy fails, would send exactly the
+        // lookup the authorisation was given to prevent.
+        assert_eq!(
+            seed_bootstrap(Some(proxy), &seeds),
+            SeedBootstrap::NameProxy(proxy)
+        );
+        assert_eq!(seed_bootstrap(None, &seeds), SeedBootstrap::LocalResolver);
+
+        // With no authority configured neither source runs, so authorising a
+        // name proxy alone never invents a bootstrap the operator did not ask
+        // for.
+        assert_eq!(seed_bootstrap(Some(proxy), &[]), SeedBootstrap::None);
+        assert_eq!(seed_bootstrap(None, &[]), SeedBootstrap::None);
+    }
+
+    #[test]
+    fn a_name_wave_pairs_each_authority_with_the_port_of_its_first_entry() {
+        let seeds = vec![
+            DnsSeed {
+                host: "seed.example.com".to_owned(),
+                port: 8333,
+            },
+            DnsSeed {
+                host: "127.0.0.1".to_owned(),
+                port: 8333,
+            },
+            // The same authority again, under a spelling that normalises to
+            // the first. It must not become a second target, and must not
+            // change the port the first entry chose.
+            DnsSeed {
+                host: "SEED.EXAMPLE.COM.".to_owned(),
+                port: 48_333,
+            },
+            DnsSeed {
+                host: "other.example.org".to_owned(),
+                port: 48_333,
+            },
+        ];
+
+        let (wave, refused) = seed_name_wave_targets(&seeds);
+
+        assert_eq!(
+            wave,
+            vec![
+                NodePeerTarget::SeedName {
+                    name: SeedName::parse("seed.example.com").unwrap(),
+                    port: 8333,
+                },
+                NodePeerTarget::SeedName {
+                    name: SeedName::parse("other.example.org").unwrap(),
+                    port: 48_333,
+                },
+            ]
+        );
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(candidate, error)| (candidate.as_str(), *error))
+                .collect::<Vec<_>>(),
+            vec![("127.0.0.1", SeedNameError::IpLiteral)],
+            "the operator must be able to see which configured entry was unusable"
+        );
+
+        assert!(seed_name_wave_targets(&[]).0.is_empty());
     }
 
     #[tokio::test]
