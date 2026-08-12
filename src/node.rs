@@ -19103,6 +19103,182 @@ mod tests {
         assert!(seed_name_wave_targets(&[]).0.is_empty());
     }
 
+    /// Accepts one SOCKS5 request and reports the target it carried.
+    ///
+    /// Returns the address type byte and, for a domain request, the name and
+    /// port. Nothing is resolved here: the point is to observe exactly what
+    /// this node asked the proxy for.
+    async fn accept_socks5_request(
+        listener: TcpListener,
+        upstream: Option<SocketAddr>,
+    ) -> (u8, String, u16) {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut greeting = [0_u8; 3];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0], "no-authentication SOCKS5 only");
+        client.write_all(&[5, 0]).await.unwrap();
+        let mut header = [0_u8; 4];
+        client.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[..3], [5, 1, 0]);
+        let address_type = header[3];
+        let target = match address_type {
+            1 => {
+                let mut octets = [0_u8; 4];
+                client.read_exact(&mut octets).await.unwrap();
+                std::net::Ipv4Addr::from(octets).to_string()
+            }
+            3 => {
+                let mut length = [0_u8; 1];
+                client.read_exact(&mut length).await.unwrap();
+                let mut name = vec![0_u8; usize::from(length[0])];
+                client.read_exact(&mut name).await.unwrap();
+                String::from_utf8(name).unwrap()
+            }
+            other => panic!("unexpected SOCKS5 address type {other}"),
+        };
+        let mut port = [0_u8; 2];
+        client.read_exact(&mut port).await.unwrap();
+        client
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        if let Some(upstream) = upstream {
+            let mut peer = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut peer).await;
+        }
+        (address_type, target, u16::from_be_bytes(port))
+    }
+
+    #[tokio::test]
+    async fn a_seed_name_bootstraps_a_peer_the_proxy_chose_and_this_node_never_resolved() {
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = peer_listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut peer, local_version) = accept_peer(peer_listener, peer_version(909)).await;
+            // Hold the connection open so the handshake is not raced by a
+            // close, then report what this node claimed about itself.
+            while peer.read_message().await.is_ok() {}
+            local_version
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(accept_socks5_request(proxy_listener, Some(peer_address)));
+
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse("seed.example.com").unwrap(),
+            port: 8333,
+        };
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            Some(name_proxy),
+            808,
+            false,
+            None,
+        )
+        .await
+        .expect("the proxy resolves the authority and the handshake completes");
+        assert_eq!(connected.session.remote_version().nonce, 909);
+        assert_eq!(
+            connected.remote, target,
+            "the session is still identified by the name, not by an address this node invented"
+        );
+        drop(connected);
+
+        // Bounded, so a target that never reaches this endpoint fails the test
+        // instead of hanging it.
+        let (address_type, name, port) = tokio::time::timeout(Duration::from_secs(10), proxy)
+            .await
+            .expect("the name proxy is contacted")
+            .unwrap();
+        assert_eq!(
+            address_type, 3,
+            "the authority reaches the proxy as a name; resolving it here is the leak"
+        );
+        assert_eq!(name, "seed.example.com");
+        assert_eq!(port, 8333);
+
+        // The proxy picked the peer and never said which address it picked, so
+        // the receiver this node advertised must stay unspecified rather than
+        // carry a guess onward to whoever relays it.
+        let local_version = peer.await.unwrap();
+        assert!(
+            local_version
+                .receiver
+                .socket_addr()
+                .expect("an advertised receiver decodes")
+                .ip()
+                .is_unspecified()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_target_uses_the_name_proxy_and_a_socket_target_the_peer_proxy() {
+        // Two separate endpoints stand in for the two authorisations. Each
+        // asserts the address type it must see, so a target sent to the wrong
+        // one fails rather than quietly working because both happen to be the
+        // same service in ordinary deployments.
+        let peer_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_proxy = peer_proxy_listener.local_addr().unwrap();
+        let peer_proxy_task = tokio::spawn(accept_socks5_request(peer_proxy_listener, None));
+
+        let name_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_proxy_listener.local_addr().unwrap();
+        let name_proxy_task = tokio::spawn(accept_socks5_request(name_proxy_listener, None));
+
+        let mut options = peer_retry_test_options(false, Arc::new(RuntimeControl::default()));
+        options.resources.proxy = Some(peer_proxy);
+        options.resources.name_proxy = Some(name_proxy);
+
+        let routable: SocketAddr = "192.0.2.7:8333".parse().unwrap();
+        let remotes = vec![
+            NodePeerTarget::Socket(routable),
+            NodePeerTarget::SeedName {
+                name: SeedName::parse("seed.example.com").unwrap(),
+                port: 8333,
+            },
+        ];
+        let mut pending = spawn_peer_connections(
+            &options,
+            &remotes,
+            808,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Arc::new(NetworkTime::default()),
+        )
+        .unwrap();
+
+        // Bounded so a misrouted target fails the test rather than hanging it
+        // on an endpoint that is never contacted.
+        let (address_type, name, port) =
+            tokio::time::timeout(Duration::from_secs(10), name_proxy_task)
+                .await
+                .expect("the name proxy is contacted for the seed authority")
+                .unwrap();
+        assert_eq!(
+            (address_type, name.as_str(), port),
+            (3, "seed.example.com", 8333),
+            "the endpoint authorised to see seed names is the only one that sees them"
+        );
+        let (address_type, address, port) =
+            tokio::time::timeout(Duration::from_secs(10), peer_proxy_task)
+                .await
+                .expect("the peer proxy is contacted for the routable socket")
+                .unwrap();
+        assert_eq!(
+            (address_type, address.as_str(), port),
+            (1, "192.0.2.7", 8333),
+            "an ordinary peer socket still goes to the ordinary proxy"
+        );
+
+        abort_pending_connections(&mut pending).await;
+    }
+
     #[tokio::test]
     async fn anonymity_only_restrictions_send_no_dns_query() {
         // A hostname that would resolve if a query were actually issued. The
