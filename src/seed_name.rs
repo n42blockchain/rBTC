@@ -150,9 +150,105 @@ impl fmt::Display for SeedName {
     }
 }
 
+/// How many seed authorities one proxied bootstrap wave may try.
+///
+/// Matches the configuration ceiling on DNS seeds, so authorising proxied
+/// discovery cannot widen how many authorities this node contacts.
+pub const MAX_SEED_NAME_WAVE: usize = 16;
+
+/// Selects the seed authorities a proxied bootstrap wave may contact.
+///
+/// This wave exists only as a last resort: the caller runs it after explicit
+/// and persisted peers have failed, because every name submitted here tells
+/// the proxy something about what this node is looking for. Nothing is
+/// resolved, ordered by reputation, or persisted — a name target has no
+/// address to key any of that on.
+///
+/// Candidates that fail validation are dropped rather than rejected as a
+/// group, so one malformed entry in a configured list cannot disable
+/// bootstrap entirely; the caller learns which through the returned refusals.
+/// Order follows the configured list, and duplicates collapse so an authority
+/// repeated under two spellings is contacted once.
+#[must_use]
+pub fn seed_name_wave(configured: &[String]) -> (Vec<SeedName>, Vec<(String, SeedNameError)>) {
+    let mut accepted: Vec<SeedName> = Vec::new();
+    let mut refused = Vec::new();
+    for candidate in configured {
+        match SeedName::parse(candidate) {
+            Ok(name) => {
+                if accepted.len() >= MAX_SEED_NAME_WAVE {
+                    break;
+                }
+                if !accepted.contains(&name) {
+                    accepted.push(name);
+                }
+            }
+            Err(error) => refused.push((candidate.clone(), error)),
+        }
+    }
+    (accepted, refused)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wave_keeps_configured_order_and_collapses_repeated_authorities() {
+        let (accepted, refused) = seed_name_wave(&[
+            "seed.bitcoin.sipa.be".to_owned(),
+            "dnsseed.bluematt.me".to_owned(),
+            // The same authority in two spellings must be contacted once: each
+            // extra contact is another disclosure of what this node wants.
+            "SEED.BITCOIN.SIPA.BE.".to_owned(),
+        ]);
+
+        assert!(refused.is_empty());
+        assert_eq!(
+            accepted.iter().map(SeedName::as_str).collect::<Vec<_>>(),
+            vec!["seed.bitcoin.sipa.be", "dnsseed.bluematt.me"]
+        );
+    }
+
+    #[test]
+    fn one_malformed_entry_does_not_disable_the_whole_wave() {
+        let (accepted, refused) = seed_name_wave(&[
+            "seed.example.com ".to_owned(),
+            "good.example.com".to_owned(),
+            "127.0.0.1".to_owned(),
+        ]);
+
+        assert_eq!(
+            accepted.iter().map(SeedName::as_str).collect::<Vec<_>>(),
+            vec!["good.example.com"]
+        );
+        assert_eq!(
+            refused.iter().map(|(_, error)| *error).collect::<Vec<_>>(),
+            vec![SeedNameError::ForbiddenCharacter, SeedNameError::IpLiteral],
+            "the caller must be able to say which entry was wrong and why"
+        );
+    }
+
+    #[test]
+    fn a_wave_never_exceeds_the_configured_seed_ceiling() {
+        // Authorising proxied discovery must not widen how many authorities
+        // this node contacts compared with ordinary seed use.
+        let configured: Vec<String> = (0..MAX_SEED_NAME_WAVE + 4)
+            .map(|index| format!("seed{index}.example.com"))
+            .collect();
+
+        let (accepted, refused) = seed_name_wave(&configured);
+
+        assert_eq!(accepted.len(), MAX_SEED_NAME_WAVE);
+        assert!(refused.is_empty());
+    }
+
+    #[test]
+    fn an_empty_configuration_produces_no_wave() {
+        let (accepted, refused) = seed_name_wave(&[]);
+        assert!(accepted.is_empty());
+        assert!(refused.is_empty());
+    }
 
     #[test]
     fn ordinary_seed_authorities_are_accepted_and_normalised() {

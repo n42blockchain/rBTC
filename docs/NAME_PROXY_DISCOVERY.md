@@ -119,11 +119,20 @@ one would put an unverified address into a field peers may relay onward. Two
 unit tests cover the wire form — including that the normalised name is what
 reaches the proxy, so one authority is one name — and the advertisement.
 
-Still unimplemented: the config-file key, the candidate wave that decides when
-seed names are tried and in what order relative to explicit and persisted
-peers, and the persistence rules that keep a name target out of the IP tried
-table. Nothing yet constructs a `SeedName` target, so no bootstrap behaviour
-has changed: the pieces exist but nothing calls them.
+`seed_name_wave` selects which authorities a wave may contact. It preserves
+configured order, collapses an authority repeated under two spellings so it is
+contacted once, drops individually malformed entries while reporting each with
+its reason rather than failing the whole list, and caps the wave at the same
+16-authority ceiling configuration already imposes — authorising proxied
+discovery must not widen how many authorities this node contacts. No failure
+state is persisted: point 8 allows a durable schema only if justified, and
+nothing yet justifies one.
+
+Still unimplemented: the config-file key, and the call site that runs this
+wave after explicit and persisted peers have failed and pairs each name with
+the network port. Nothing constructs a `ProxyTarget::SeedName` yet, so no
+bootstrap behaviour has changed: the pieces exist and are tested, but nothing
+calls them.
 
 ## Recommended configuration model
 
