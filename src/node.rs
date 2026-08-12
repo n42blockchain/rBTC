@@ -9315,7 +9315,7 @@ async fn connect_i2p_peer(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn connect_peer_with_transport(
     deployments: DeploymentConfig,
     remote: NodePeerTarget,
@@ -9370,6 +9370,16 @@ async fn connect_peer_with_transport(
                     prefer_v2,
                 )
                 .await
+            }
+            // A seed name has no meaning without a proxy: resolving it here
+            // is exactly the local lookup this path exists to avoid.
+            (None, ProxyTarget::SeedName { name, .. }) => {
+                Err(rbtc::p2p::P2pError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "seed authority {name} needs --name-proxy; resolving it locally would leak the lookup"
+                    ),
+                )))
             }
             (None, ProxyTarget::Socket(socket)) => {
                 connect_outbound_with_transport(

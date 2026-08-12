@@ -553,6 +553,18 @@ pub enum ProxyTarget {
     Socket(SocketAddr),
     /// A v3 onion service encoded as a SOCKS5 domain name.
     Onion(OnionAddress),
+    /// A DNS seed authority the proxy resolves on this node's behalf.
+    ///
+    /// The only target whose address this node never learns. It exists so a
+    /// seed name can bootstrap a peer without any local resolver request; the
+    /// proxy chooses the address, so nothing here may be treated as a known
+    /// IP for grouping, reputation, or persistence.
+    SeedName {
+        /// Validated authority name.
+        name: crate::seed_name::SeedName,
+        /// Network P2P port to request.
+        port: u16,
+    },
 }
 
 impl ProxyTarget {
@@ -562,6 +574,7 @@ impl ProxyTarget {
         match self {
             Self::Socket(socket) => socket.port(),
             Self::Onion(onion) => onion.port(),
+            Self::SeedName { port, .. } => *port,
         }
     }
 }
@@ -2901,6 +2914,12 @@ fn proxy_version_address(remote: &ProxyTarget) -> SocketAddr {
         ProxyTarget::Onion(onion) => {
             SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), onion.port())
         }
+        // The proxy chose this peer's address and does not report it, so there
+        // is nothing truthful to advertise. Inventing one would put an address
+        // this node never verified into a field peers may relay onward.
+        ProxyTarget::SeedName { port, .. } => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), *port)
+        }
     }
 }
 
@@ -2930,6 +2949,16 @@ async fn open_socks5_stream(
                 u8::try_from(onion.name().len()).expect("a validated onion name is 62 bytes"),
             );
             request.extend_from_slice(onion.name().as_bytes());
+        }
+        ProxyTarget::SeedName { name, .. } => {
+            let domain = name.to_socks5_domain();
+            request.push(3);
+            // `SeedName` is the only constructor and bounds the name to 255
+            // bytes, which is exactly what this one-byte prefix can describe.
+            request.push(
+                u8::try_from(domain.len()).expect("a validated seed name fits the length prefix"),
+            );
+            request.extend_from_slice(&domain);
         }
         ProxyTarget::Socket(socket) => match socket.ip() {
             IpAddr::V4(ip) => {
@@ -6003,6 +6032,65 @@ mod tests {
             !P2pError::InvalidOnionAddress.is_protocol_violation(),
             "a local address mistake never discourages a peer"
         );
+    }
+
+    #[tokio::test]
+    async fn socks5_sends_a_seed_authority_as_a_domain_name_the_proxy_resolves() {
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[..3], [5, 1, 0]);
+            assert_eq!(
+                header[3], 3,
+                "a seed authority must reach the proxy as a name, not as an address this node resolved"
+            );
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut name = vec![0_u8; usize::from(length[0])];
+            stream.read_exact(&mut name).await.unwrap();
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            (String::from_utf8(name).unwrap(), u16::from_be_bytes(port))
+        });
+
+        let target = ProxyTarget::SeedName {
+            name: crate::seed_name::SeedName::parse("SEED.Bitcoin.Sipa.BE.").unwrap(),
+            port: 8333,
+        };
+        let stream = open_socks5_stream(proxy_address, &target).await.unwrap();
+        drop(stream);
+        let (name, port) = proxy.await.unwrap();
+        assert_eq!(
+            name, "seed.bitcoin.sipa.be",
+            "the normalised form is what goes on the wire, so one authority is one name"
+        );
+        assert_eq!(port, 8333);
+    }
+
+    #[test]
+    fn a_seed_name_target_advertises_no_address_it_did_not_learn() {
+        // The proxy chose the peer and does not report which address it picked,
+        // so the version receiver field must stay unspecified. Inventing one
+        // would put an unverified address into a field peers may relay onward.
+        let target = ProxyTarget::SeedName {
+            name: crate::seed_name::SeedName::parse("seed.example.com").unwrap(),
+            port: 8333,
+        };
+        let advertised = proxy_version_address(&target);
+        assert!(advertised.ip().is_unspecified());
+        assert_eq!(advertised.port(), 8333);
+        assert_eq!(target.port(), 8333);
     }
 
     #[tokio::test]

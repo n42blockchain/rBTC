@@ -108,12 +108,22 @@ explicit authorisation that lets `--proxy` run alongside DNS seeds; without
 it that combination is still refused, and the message now names the flag that
 would allow it. Three unit tests cover those rules.
 
-Still unimplemented: the config-file key, the `SeedName` transient candidate
-wave and its ordering against explicit and persisted peers, the domain
-`CONNECT` branch itself, the unspecified-receiver `version` advertisement, and
-the persistence rules. Supplying `--name-proxy` therefore authorises a path
-that does not yet exist — it relaxes the startup refusal without adding
-discovery — so no bootstrap behaviour has changed.
+The transient target and its wire encoding follow. `ProxyTarget::SeedName`
+carries a validated `SeedName` and a port; `open_socks5_stream` sends it as a
+SOCKS5 `ATYP=DOMAIN` request, so the proxy resolves it and this node performs
+no lookup. Without a proxy the target is refused outright rather than falling
+back to the host resolver, which is the leak the whole path exists to avoid.
+`proxy_version_address` advertises an unspecified receiver for it, because the
+proxy chose the peer and does not report which address it picked; inventing
+one would put an unverified address into a field peers may relay onward. Two
+unit tests cover the wire form — including that the normalised name is what
+reaches the proxy, so one authority is one name — and the advertisement.
+
+Still unimplemented: the config-file key, the candidate wave that decides when
+seed names are tried and in what order relative to explicit and persisted
+peers, and the persistence rules that keep a name target out of the IP tried
+table. Nothing yet constructs a `SeedName` target, so no bootstrap behaviour
+has changed: the pieces exist but nothing calls them.
 
 ## Recommended configuration model
 
