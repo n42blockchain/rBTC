@@ -3,6 +3,7 @@
 mod config_file;
 
 use crate::i2p_sam::{I2pAddress, I2pSamSession};
+use crate::seed_name::SeedName;
 use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
@@ -773,6 +774,18 @@ pub enum NodePeerTarget {
     Onion(OnionAddress),
     /// An I2P destination reached through the configured SAM bridge.
     I2p(I2pAddress),
+    /// A DNS seed authority the name proxy resolves on this node's behalf.
+    ///
+    /// Transient, and the only target whose address this node never learns.
+    /// The proxy chooses the peer, so nothing about this target may be keyed
+    /// as an address: it is never a peer-store entry, never a manual peer,
+    /// never persisted, and it is discarded once the wave that built it ends.
+    SeedName {
+        /// Validated authority name submitted to the proxy.
+        name: SeedName,
+        /// Network P2P port requested from the proxy.
+        port: u16,
+    },
 }
 
 impl NodePeerTarget {
@@ -781,8 +794,17 @@ impl NodePeerTarget {
     pub const fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Socket(socket) => Some(*socket),
-            Self::Onion(_) | Self::I2p(_) => None,
+            Self::Onion(_) | Self::I2p(_) | Self::SeedName { .. } => None,
         }
+    }
+
+    /// Returns whether this destination is reached by submitting a name to a proxy.
+    ///
+    /// Callers use this to keep a name target out of every address-keyed book:
+    /// the proxy resolved it, so this node has no address to record against.
+    #[must_use]
+    pub const fn is_seed_name(&self) -> bool {
+        matches!(self, Self::SeedName { .. })
     }
 }
 
@@ -790,6 +812,12 @@ impl std::str::FromStr for NodePeerTarget {
     type Err = String;
 
     /// Parses `IP:PORT` or `<service>.onion:PORT`.
+    ///
+    /// Deliberately never produces a seed-name target. Those exist only inside
+    /// a bootstrap wave the node builds from its own seed list; accepting one
+    /// here would let `--connect` hand an arbitrary hostname to the proxy as a
+    /// peer, which is neither a peer nor something the operator asked to
+    /// disclose.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if let Ok(socket) = SocketAddr::from_str(value) {
             return Ok(Self::Socket(socket));
@@ -809,6 +837,9 @@ impl std::fmt::Display for NodePeerTarget {
             Self::Socket(socket) => write!(f, "{socket}"),
             Self::Onion(onion) => write!(f, "{onion}"),
             Self::I2p(i2p) => write!(f, "{i2p}"),
+            // The name and port are what this node knows; the address the
+            // proxy picked is deliberately absent rather than guessed.
+            Self::SeedName { name, port } => write!(f, "{name}:{port}"),
         }
     }
 }
@@ -825,6 +856,10 @@ impl TryFrom<&NodePeerTarget> for ProxyTarget {
         match target {
             NodePeerTarget::Socket(socket) => Ok(Self::Socket(*socket)),
             NodePeerTarget::Onion(onion) => Ok(Self::Onion(onion.clone())),
+            NodePeerTarget::SeedName { name, port } => Ok(Self::SeedName {
+                name: name.clone(),
+                port: *port,
+            }),
             NodePeerTarget::I2p(_) => Err(()),
         }
     }
@@ -9333,6 +9368,16 @@ async fn connect_peer_with_transport(
             "onion peer {remote} requires a configured SOCKS5 proxy"
         )));
     }
+    // A seed name is likewise unreachable without the proxy that resolves it,
+    // and here the missing proxy must fail rather than degrade: the only other
+    // way to reach the name is the local lookup this whole path exists to
+    // avoid. Reported as a local fault so it is not counted against a peer
+    // that was never contacted.
+    if remote.is_seed_name() && proxy.is_none() {
+        return Err(PeerRunError::local(format!(
+            "seed authority {remote} requires --name-proxy; resolving it locally would leak the lookup"
+        )));
+    }
     let handshake_started = Instant::now();
     // I2P destinations are reached through the SAM bridge, never through a
     // SOCKS5 proxy: substituting one would connect to the wrong network.
@@ -9768,7 +9813,15 @@ fn spawn_peer_connections(
                     inbound_service_flags(options.indexes.basic_filter),
                 )
             });
-            let proxy = options.resources.proxy;
+            // A name target goes to the endpoint explicitly authorised to see
+            // seed names, never to the ordinary peer proxy: routing a socket
+            // and disclosing what this node is looking for are two separate
+            // permissions, so one is not silently borrowed for the other.
+            let proxy = if remote.is_seed_name() {
+                options.resources.name_proxy
+            } else {
+                options.resources.proxy
+            };
             let i2p_session = i2p_session.cloned();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
@@ -10517,6 +10570,10 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
         NodePeerTarget::Socket(socket) => store.record_attempt(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_attempt(onion, now).map(|_| ()),
         NodePeerTarget::I2p(i2p) => store.record_i2p_attempt(i2p, now).map(|_| ()),
+        // A name target has no address, so there is no entry to age, promote,
+        // or discourage. Recording it under the authority name would create a
+        // peer-store key for something that is not a peer.
+        NodePeerTarget::SeedName { .. } => return,
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer attempt history for {remote} failed: {error}");
@@ -10577,6 +10634,10 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: &NodePeerT
         NodePeerTarget::Socket(socket) => store.record_session_success(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_success(onion, now).map(|_| ()),
         NodePeerTarget::I2p(i2p) => store.record_i2p_success(i2p, now).map(|_| ()),
+        // A successful name target is not promoted: what succeeded was a proxy
+        // connection to an address this node never learned. Only the IP
+        // entries that peer advertises, after the ordinary checks, persist.
+        NodePeerTarget::SeedName { .. } => return,
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer session success for {remote} failed: {error}");
@@ -18790,6 +18851,72 @@ mod tests {
         assert!(
             store.onion_candidates(now, 10).unwrap().contains(&onion),
             "a completed session clears the onion backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_name_peers_need_a_name_proxy_and_enter_no_address_book() {
+        let name = SeedName::parse("seed.bitcoin.sipa.be").expect("a seed authority parses");
+        let target = NodePeerTarget::SeedName {
+            name: name.clone(),
+            port: 8333,
+        };
+        assert_eq!(target.socket(), None);
+        assert!(target.is_seed_name());
+        assert_eq!(target.to_string(), "seed.bitcoin.sipa.be:8333");
+        assert_eq!(
+            ProxyTarget::try_from(&target).expect("a name target converts"),
+            ProxyTarget::SeedName { name, port: 8333 }
+        );
+        // Unlike every other target, this one must not round-trip through its
+        // textual form: parsing it back would let `--connect` hand an
+        // arbitrary hostname to the proxy as though it were a peer.
+        assert!(
+            target.to_string().parse::<NodePeerTarget>().is_err(),
+            "a seed name is never a configurable peer address"
+        );
+
+        // Without the proxy authorised to see seed names there is no route at
+        // all. Failing here is the point: the only alternative route is the
+        // local lookup this path exists to avoid.
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            None,
+            700,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("a seed name cannot be dialed without a name proxy");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("--name-proxy"));
+
+        // The proxy chose the address and never reported it, so no book keyed
+        // by an address may gain an entry from any outcome of this target.
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = unix_time().unwrap();
+        record_peer_attempt(Some(&store), &target);
+        record_peer_failure(
+            Some(&store),
+            &target,
+            PeerFailureKind::ProtocolViolation,
+            false,
+        );
+        record_peer_session_success(Some(&store), &target);
+        assert!(
+            store.candidates(now, 10).unwrap().is_empty(),
+            "a name target is never written as a routable peer"
+        );
+        assert!(store.onion_candidates(now, 10).unwrap().is_empty());
+        assert!(store.i2p_candidates(now, 10).unwrap().is_empty());
+        assert!(
+            store.discouraged_addresses(now).unwrap().is_empty(),
+            "a name failure has no address to discourage, so it discourages none"
         );
     }
 
