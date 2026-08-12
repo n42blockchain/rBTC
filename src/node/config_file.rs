@@ -32,7 +32,7 @@ const BOOL_KEYS: [&str; 10] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 37] = [
+const VALUE_KEYS: [&str; 38] = [
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -56,6 +56,7 @@ const VALUE_KEYS: [&str; 37] = [
     "max_inbound_peers_per_ip",
     "max_upload_bytes_per_day",
     "minimum_free_bytes",
+    "name_proxy",
     "network",
     "prune_blocks",
     "prune_max_bytes",
@@ -385,6 +386,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "max_inbound_peers_per_ip" => "--max-inbound-peers-per-ip",
         "max_upload_bytes_per_day" => "--max-upload-bytes-per-day",
         "minimum_free_bytes" => "--minimum-free-bytes",
+        "name_proxy" => "--name-proxy",
         "network" => "--network",
         "onlynet" => "--onlynet",
         "prune_blocks" => "--prune-blocks",
@@ -449,6 +451,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--max-upload-bytes-per-day"
             | "--minimum-free-bytes"
             | "--minimum-chainwork"
+            | "--name-proxy"
             | "--network"
             | "--no-cleanup-validation-dir"
             | "--no-block-filter-index"
@@ -522,6 +525,7 @@ fn option_group(flag: &str) -> &'static str {
         "--mempool-max-bytes" => "mempool-max-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",
         "--minimum-free-bytes" => "minimum-free-bytes",
+        "--name-proxy" => "name-proxy",
         "--network" => "network",
         "--prune-blocks" => "prune-blocks",
         "--prune-max-bytes" => "prune-max-bytes",
@@ -603,6 +607,46 @@ mod tests {
         let dns_conflict = parse_config("dns_seeds=false\ndns_seed=seed.example:8333").unwrap();
         assert!(selected_arguments(&dns_conflict, Network::Bitcoin).is_err());
         assert!(parse_config("once=yes").is_err());
+    }
+
+    #[test]
+    fn the_name_proxy_key_stays_independent_of_the_peer_proxy() {
+        let entries = parse_config("name_proxy=127.0.0.1:9050\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(selected.iter().any(|entry| {
+            entry.flag == "--name-proxy" && entry.value.as_deref() == Some("127.0.0.1:9050")
+        }));
+
+        // Overriding one on the command line must not suppress the other.
+        // They express two different permissions — routing peer sockets, and
+        // disclosing which authorities this node is looking for — so an
+        // operator who changes where names go has not said anything about
+        // where peer traffic goes.
+        let directory = TempDir::new().unwrap();
+        let config = directory.path().join("rbtc.conf");
+        fs::write(&config, "proxy=127.0.0.1:9050\nname_proxy=127.0.0.1:9050\n").unwrap();
+        let merged = merge_config_arguments(vec![
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--name-proxy".to_owned(),
+            "127.0.0.1:9150".to_owned(),
+        ])
+        .unwrap();
+        assert!(
+            merged
+                .windows(2)
+                .any(|pair| pair[0] == "--proxy" && pair[1] == "127.0.0.1:9050"),
+            "the configured peer proxy survives a name-proxy override"
+        );
+        assert_eq!(
+            merged
+                .windows(2)
+                .filter(|pair| pair[0] == "--name-proxy")
+                .count(),
+            1,
+            "--name-proxy is refused more than once, so the file entry must be dropped"
+        );
+        assert!(merged.ends_with(&["--name-proxy".to_owned(), "127.0.0.1:9150".to_owned()]));
     }
 
     #[test]

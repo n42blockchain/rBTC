@@ -154,9 +154,25 @@ successful name yields. Ports come from the configured entry that first names
 each authority, matching the wave's choice of the first spelling. Two unit
 tests cover the source choice and the port pairing.
 
-Still unimplemented: the config-file key, and the acceptance matrix below —
-in particular the mock-SOCKS5 and real-endpoint runs, which are what would
-demonstrate the path end to end rather than one piece at a time.
+The `name_proxy` config-file key follows the flag, in its own override group
+so that changing where names go says nothing about where peer traffic goes.
+
+Two tests now exercise the path end to end against a mock SOCKS5 server. One
+dials a name target through it and completes the Bitcoin handshake, asserting
+the request carried `ATYP=DOMAIN` with the normalised authority and the
+network port, and that the advertised receiver stayed unspecified. The other
+gives the two authorisations separate endpoints, each asserting the address
+type it must see, so a name target reaching the ordinary peer proxy fails
+rather than passing because a real deployment usually points both fields at
+one service.
+
+Still unimplemented: the rest of the acceptance matrix. The local list is
+partly covered — the domain request, the proxied handshake, the anonymity-only
+refusals, malformed-name rejection, and the absence of any fabricated IP peer
+all have tests — but no test yet drives `getaddr` and learned-IP filtering
+over a proxied name session, and no run has captured host DNS traffic to
+demonstrate the absence of a query rather than reason about it. The
+real-environment items are untouched.
 
 ## Recommended configuration model
 

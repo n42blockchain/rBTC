@@ -66,6 +66,14 @@ The supported scalar keys are:
   `torcontrol_cookie` (loopback Tor control port publishing an inbound onion
   service; both are required together and need `listen`), and `i2psam`
   (loopback I2P SAM bridge)
+- `proxy` (SOCKS5 endpoint for outbound peer sockets) and `name_proxy` (the
+  endpoint authorised to resolve DNS seed authorities). They are separate
+  permissions and are overridden separately: `proxy` alone still requires DNS
+  seeds to be disabled, and `name_proxy` is what permits the two together, by
+  submitting each authority's name to that proxy instead of the host resolver.
+  Pointing both at one service is the usual deployment. Neither accepts
+  credentials, and `name_proxy` is refused under an anonymity-only `onlynet`,
+  where clearnet seed discovery could not produce a permitted peer anyway
 - `minimum_chainwork`, `assumevalid`, `signetchallenge`
 - `complete_assumeutxo`, `background_assumeutxo`,
   `validation_batch_size`, `validation_pause_ms`
