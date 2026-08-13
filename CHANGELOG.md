@@ -8,6 +8,14 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Added
 
+- ASN-based peer-address diversity (asmap). A Core-compatible asmap
+  interpreter with a real 2026-08 `bitcoin-core/asmap-data` map embedded in
+  the binary groups addresses by announcing autonomous system for source
+  quotas, bucketing, and candidate diversification; `--asmap
+  <path>|embedded|off` (config key `asmap`) selects an operator file or
+  disables the derivation. Data provenance and the update procedure are in
+  `docs/ASMAP.md`.
+
 - Inbound I2P peers are accepted through the configured SAM session and
   served by the existing inbound service, sharing its capacity and budgets.
 

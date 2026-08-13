@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-08-08.
+Status date: 2026-08-13.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -387,8 +387,41 @@ optional where appropriate, and host-runtime compatible.
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks
   the active UTXO set in bounded cursor pages over the chainstate's
   fixed-memory pager. An offline scan without a running node remains open.
+- [x] ASN-based address diversity (asmap). `src/asmap.rs` ports Core's asmap
+  interpreter, the IPv4-in-IPv6 lookup form, and the complete structural
+  sanity check; the 2026-08-06 `bitcoin-core/asmap-data` map is embedded in
+  the binary and validated fail-closed at first use, and
+  `--asmap <path>|embedded|off` (config key `asmap`) selects an operator file
+  or disables the derivation. The peer store derives `as:<asn>:0` groups
+  shared across IPv4 and IPv6 for source quotas, new/tried bucketing, and
+  candidate diversification, falls back to prefix groups outside the map,
+  and leaves the onion/I2P/name-proxy marker groups untouched. Pinned
+  real-address assignments verify the embedded data, a 32-prefix single-ASN
+  flood is capped at one group quota where prefix grouping accepted all 256
+  candidates, and the `asmap_interpret` fuzz target holds the interpreter's
+  no-panic/bounded-termination guarantee on unvalidated bytes. Provenance
+  and the update procedure are recorded in [ASMAP.md](ASMAP.md).
+- [ ] CJDNS reachability alongside onion/I2P, converging with the existing
+  per-network isolation. Acceptance: handshake and address isolation over
+  CJDNS, with leak tests that fail closed.
+- [ ] Private transaction broadcast: a per-transaction
+  anonymity-network-exclusive broadcast path reusing the existing
+  proxy/`onlynet`/name-proxy isolation. Acceptance: a broadcast under the
+  option emits no clearnet transaction relay, and failure is bounded rather
+  than a clearnet fallback.
+- [ ] Operator RPC remainder: `addnode`, `gettxoutsetinfo` as a
+  bounded/interruptible full-set scan, and `getmempoolcluster` exposing the
+  existing cluster closure — each in the bounded-stable-contract style with
+  explicit ceilings and auth auditing. `getmempoolfeeratediagram` is tracked
+  with the feerate-diagram item below because it depends on linearization.
 - [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
-  the supported conservative replacement subset remains interoperable.
+  the supported conservative replacement subset remains interoperable. This
+  runs as its own track: first pure linearization/chunking/diagram-comparison
+  functions with fuzz targets and differential coverage against Core's
+  `cluster_linearize`, because a wrong diagram comparison silently changes
+  acceptance decisions rather than failing; the admission-path replacement
+  rule and the `getmempoolfeeratediagram` RPC land only after that layer is
+  proven.
 
 ## Performance work policy
 
@@ -417,4 +450,11 @@ correctness or security work.
 1. Finish the sustained Bitcoin/Testnet4 public-network soak.
 2. Exercise and publish the signed supported-platform release once the native
    signing identities are provisioned.
-3. Select P2 work only from an actual deployment need.
+3. Capability rounds, one completed and verified item per round: asmap
+   shipped 2026-08-13; next CJDNS, then private broadcast, then the operator
+   RPC remainder. The feerate-diagram track's pure-function and fuzz layer
+   starts in parallel with these rounds; its admission-path change lands
+   only after that layer is proven, per the rationale in
+   [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
+4. Select the remaining P2 work (GBT remainder, hot wallet, GUI, MDBX
+   promotion) only from an actual deployment need.
