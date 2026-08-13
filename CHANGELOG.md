@@ -16,6 +16,15 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   disables the derivation. Data provenance and the update procedure are in
   `docs/ASMAP.md`.
 
+- Private transaction broadcast. `--private-broadcast` (config key
+  `private_broadcast`) makes locally originated wallet transactions travel
+  exclusively over anonymity networks — onion peers through the Tor SOCKS5
+  proxy, I2P peers through a fresh keyless SAM session — never over a
+  clearnet peer session or the hot-standby relay fan-out. It requires at
+  least one anonymity path and is refused at startup otherwise; an
+  undeliverable transaction stays queued rather than falling back to
+  clearnet. Semantics are documented in `docs/PRIVATE_BROADCAST.md`.
+
 - CJDNS overlay reachability. `--cjdns-reachable` (config key
   `cjdns_reachable`) declares a local `cjdroute` interface, making
   `fc00::/8` peers storable, dialable, and advertisable; `--onlynet cjdns`

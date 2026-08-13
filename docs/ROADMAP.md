@@ -414,9 +414,16 @@ optional where appropriate, and host-runtime compatible.
   `cjdroute`, recorded like the name-proxy external-Tor run.
 - [ ] Private transaction broadcast: a per-transaction
   anonymity-network-exclusive broadcast path reusing the existing
-  proxy/`onlynet`/name-proxy isolation. Acceptance: a broadcast under the
-  option emits no clearnet transaction relay, and failure is bounded rather
-  than a clearnet fallback.
+  proxy/`onlynet`/name-proxy isolation. Implemented 2026-08-13:
+  `--private-broadcast` replaces the wallet broadcast path with short-lived
+  onion (proxied) and I2P (fresh keyless SAM session) waves to up to four
+  peers, records success in the durable rebroadcast store, and on zero
+  reachable peers keeps the transaction queued rather than ever writing it
+  to a clearnet session or the hot-standby fan-out; it is refused at startup
+  without an anonymity path. The clearnet leak gate and the in-process
+  proxied-delivery path pass in-suite; semantics are in
+  [PRIVATE_BROADCAST.md](PRIVATE_BROADCAST.md). Open acceptance residue: one
+  end-to-end run over live Tor/I2P daemons recording no clearnet relay.
 - [ ] Operator RPC remainder: `addnode`, `gettxoutsetinfo` as a
   bounded/interruptible full-set scan, and `getmempoolcluster` exposing the
   existing cluster closure — each in the bounded-stable-contract style with
@@ -458,11 +465,12 @@ correctness or security work.
 1. Finish the sustained Bitcoin/Testnet4 public-network soak.
 2. Exercise and publish the signed supported-platform release once the native
    signing identities are provisioned.
-3. Capability rounds, one completed and verified item per round: asmap
-   shipped 2026-08-13; next CJDNS, then private broadcast, then the operator
-   RPC remainder. The feerate-diagram track's pure-function and fuzz layer
-   starts in parallel with these rounds; its admission-path change lands
-   only after that layer is proven, per the rationale in
+3. Capability rounds, one completed and verified item per round: asmap,
+   CJDNS, and private broadcast all shipped 2026-08-13 (CJDNS and private
+   broadcast each with one live-daemon operational residue); next is the
+   operator RPC remainder. The feerate-diagram track's pure-function and
+   fuzz layer starts in parallel with these rounds; its admission-path
+   change lands only after that layer is proven, per the rationale in
    [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
 4. Select the remaining P2 work (GBT remainder, hot wallet, GUI, MDBX
    promotion) only from an actual deployment need.
