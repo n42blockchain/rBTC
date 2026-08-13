@@ -113,6 +113,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "feerate_diagram"
+path = "fuzz_targets/feerate_diagram.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 

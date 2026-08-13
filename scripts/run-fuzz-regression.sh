@@ -42,3 +42,5 @@ cargo +"$toolchain" fuzz run persisted_metadata fuzz/corpus/persisted_metadata -
     -runs="$runs" -max_len=8193
 cargo +"$toolchain" fuzz run asmap_interpret fuzz/corpus/asmap_interpret -- \
     -runs="$runs" -max_len=65552
+cargo +"$toolchain" fuzz run feerate_diagram fuzz/corpus/feerate_diagram -- \
+    -runs="$runs" -max_len=2048
