@@ -5,7 +5,7 @@ use std::{
     net::IpAddr,
     path::Path,
     str::FromStr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{
@@ -17,6 +17,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::asmap::Asmap;
 use crate::i2p_sam::I2pAddress;
 use crate::p2p::{I2pPeerAddress, OnionAddress, OnionPeerAddress, PeerAddress};
 
@@ -65,6 +66,12 @@ const MAX_STORED_I2P_PEERS: usize = 1_024;
 const I2P_SOURCE_GROUP_FAMILY: &str = "i2p";
 /// Complete source-group value stored on every I2P record.
 const I2P_SOURCE_GROUP: &str = "i2p:0:0";
+/// Family marker for ASN-derived groups when an asmap is configured.
+///
+/// One family for IPv4 and IPv6: the group is the autonomous system, and an
+/// operator announcing both address families is still one operator, exactly
+/// as Core buckets them.
+const ASN_SOURCE_GROUP_FAMILY: &str = "as";
 /// Family marker for addresses learned through a name-proxy bootstrap.
 const SEED_NAME_SOURCE_GROUP_FAMILY: &str = "seed-name";
 /// Complete source-group value for every address a name proxy's peer taught.
@@ -189,17 +196,61 @@ pub struct PeerInsertStats {
     pub rejected: usize,
 }
 
+/// Bucket-placement identity: the persistent hash key plus the optional
+/// ASN map that widens address groups from IP prefixes to autonomous
+/// systems.
+struct BucketKeys {
+    hash_key: [u8; BUCKET_KEY_LEN],
+    asmap: Option<Arc<Asmap>>,
+}
+
+impl BucketKeys {
+    /// Derives the diversity group for one routable address.
+    ///
+    /// With an asmap configured and the address inside a known autonomous
+    /// system, the group is that ASN, shared across IPv4 and IPv6. Outside
+    /// the map, or without one, the group falls back to the IP-prefix
+    /// derivation, so a lookup miss keeps unrelated prefixes in separate
+    /// groups instead of collapsing them into one "unknown" group.
+    fn address_group(&self, ip: IpAddr) -> String {
+        if let Some(map) = &self.asmap {
+            let asn = map.map_asn(ip);
+            if asn != 0 {
+                return format!("{ASN_SOURCE_GROUP_FAMILY}:{asn}:0");
+            }
+        }
+        source_group(ip)
+    }
+}
+
 /// Redb-backed bounded peer-address pool.
 pub struct RedbPeerStore {
     db: Database,
     network: Network,
-    bucket_key: [u8; BUCKET_KEY_LEN],
+    buckets: BucketKeys,
     write_guard: Mutex<()>,
 }
 
 impl RedbPeerStore {
-    /// Opens or creates a peer database bound to `network`.
+    /// Opens or creates a peer database bound to `network`, deriving
+    /// address-diversity groups from IP prefixes only.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, PeerStoreError> {
+        Self::open_with_asmap(path, network, None)
+    }
+
+    /// Opens or creates a peer database bound to `network`, deriving
+    /// address-diversity groups through `asmap` where it knows the
+    /// announcing autonomous system.
+    ///
+    /// The map affects bucket placement and quotas only from this process
+    /// on; records persisted under another derivation keep their stored
+    /// source groups, which remain valid, so upgrading or replacing the
+    /// map never invalidates the store.
+    pub fn open_with_asmap(
+        path: impl AsRef<Path>,
+        network: Network,
+        asmap: Option<Arc<Asmap>>,
+    ) -> Result<Self, PeerStoreError> {
         let genesis = bitcoin::blockdata::constants::genesis_block(network)
             .block_hash()
             .to_byte_array();
@@ -234,7 +285,10 @@ impl RedbPeerStore {
         Ok(Self {
             db,
             network,
-            bucket_key,
+            buckets: BucketKeys {
+                hash_key: bucket_key,
+                asmap,
+            },
             write_guard: Mutex::new(()),
         })
     }
@@ -246,7 +300,7 @@ impl RedbPeerStore {
         addresses: &[PeerAddress],
         now: u32,
     ) -> Result<PeerInsertStats, PeerStoreError> {
-        self.insert_discovered_in_group(&source_group(source.ip()), addresses, now)
+        self.insert_discovered_in_group(&self.buckets.address_group(source.ip()), addresses, now)
     }
 
     /// Stores addresses learned from a peer a name proxy selected.
@@ -382,7 +436,7 @@ impl RedbPeerStore {
             stats.accepted += 1;
         }
 
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         self.replace_all(&ordered)?;
         Ok(stats)
     }
@@ -416,7 +470,7 @@ impl RedbPeerStore {
         let mut record = existing.unwrap_or_else(|| StoredPeer {
             services: services.to_u64(),
             last_seen: normalize_last_seen(now, now),
-            source_group: source_group(address.ip()),
+            source_group: self.buckets.address_group(address.ip()),
             last_attempt: 0,
             last_success: 0,
             consecutive_failures: 0,
@@ -437,13 +491,12 @@ impl RedbPeerStore {
             record.in_new_table = false;
             record.new_source_groups.clear();
         } else {
-            let position = tried_position(&self.bucket_key, address);
+            let position = tried_position(&self.buckets, address);
             let incumbent = records
                 .iter()
                 .filter_map(|(stored_address, stored)| {
                     let socket = std::net::SocketAddr::from_str(stored_address).ok()?;
-                    (record_is_tried(stored)
-                        && tried_position(&self.bucket_key, socket) == position)
+                    (record_is_tried(stored) && tried_position(&self.buckets, socket) == position)
                         .then_some((peer_priority(stored), stored_address))
                 })
                 .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
@@ -468,10 +521,10 @@ impl RedbPeerStore {
             }
         }
         records.insert(key.clone(), record);
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         let retained = ordered.iter().any(|(stored, _)| stored == &key);
         let retained_records = ordered.iter().cloned().collect::<HashMap<_, _>>();
-        let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.bucket_key);
+        let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.buckets);
         self.replace_all_and_collisions(&ordered, &collisions)?;
         Ok(retained)
     }
@@ -827,7 +880,7 @@ impl RedbPeerStore {
                 .map(|(record, socket)| {
                     (
                         peer_priority(&record),
-                        peer_bucket(&self.bucket_key, socket, &record),
+                        peer_bucket(&self.buckets, socket, &record),
                         socket,
                     )
                 })
@@ -837,6 +890,7 @@ impl RedbPeerStore {
             left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2))
         });
         Ok(diversify_candidates(
+            &self.buckets,
             candidates,
             limit.min(MAX_STORED_PEERS),
         ))
@@ -854,7 +908,7 @@ impl RedbPeerStore {
         records.retain(|_, record| !is_terrible(record, now));
         let removed = before.saturating_sub(records.len());
         if removed > 0 {
-            let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+            let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
             self.replace_all(&ordered)?;
         }
         Ok(removed)
@@ -864,7 +918,7 @@ impl RedbPeerStore {
     pub fn tried_collisions(&self) -> Result<Vec<TriedCollision>, PeerStoreError> {
         let records = self.load_records()?;
         Ok(
-            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key)
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.buckets)
                 .into_iter()
                 .map(|collision| TriedCollision {
                     challenger: collision
@@ -896,7 +950,7 @@ impl RedbPeerStore {
         let mut records = self.load_records()?;
         let incumbent_key = incumbent.to_string();
         let collisions =
-            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key);
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.buckets);
         let (matching, remaining): (Vec<_>, Vec<_>) = collisions
             .into_iter()
             .partition(|collision| collision.incumbent == incumbent_key);
@@ -931,9 +985,9 @@ impl RedbPeerStore {
                 }
             }
         }
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         let retained = ordered.iter().cloned().collect::<HashMap<_, _>>();
-        let remaining = sanitize_tried_collisions(remaining, &retained, &self.bucket_key);
+        let remaining = sanitize_tried_collisions(remaining, &retained, &self.buckets);
         self.replace_all_and_collisions(&ordered, &remaining)?;
         Ok(true)
     }
@@ -1189,7 +1243,7 @@ impl RedbPeerStore {
             return Ok(false);
         };
         update(record);
-        let records = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let records = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         self.replace_all(&records)?;
         Ok(records.iter().any(|(stored, _)| stored == &key))
     }
@@ -1249,7 +1303,7 @@ impl RedbPeerStore {
         let collisions = sanitize_tried_collisions(
             self.load_tried_collisions()?,
             &records_by_key,
-            &self.bucket_key,
+            &self.buckets,
         );
         self.replace_all_and_collisions(records, &collisions)
     }
@@ -1425,6 +1479,17 @@ fn valid_source_group(group: &str) -> bool {
             u16::from_str_radix(first, 16).is_ok_and(|value| format!("{value:x}") == first)
                 && u16::from_str_radix(second, 16).is_ok_and(|value| format!("{value:x}") == second)
         }
+        // ASN groups exist only when an asmap derivation produced them, but
+        // records persisted under one map stay valid after the map is
+        // replaced or removed, so the family is always accepted. ASN 0 is
+        // reserved (RFC 7607) and doubles as the derivation's "unknown", so
+        // it can never be a group.
+        ASN_SOURCE_GROUP_FAMILY => {
+            first
+                .parse::<u32>()
+                .is_ok_and(|value| value != 0 && value.to_string() == first)
+                && second == "0"
+        }
         // The onion address book shares this record type but has no IP
         // range to diversify across, so its entries carry one fixed marker
         // group. `source_group` never produces it for a routable address.
@@ -1530,33 +1595,28 @@ fn address_bucket_key(address: std::net::SocketAddr) -> Vec<u8> {
     encoded
 }
 
-fn new_bucket(
-    key: &[u8; BUCKET_KEY_LEN],
-    address: std::net::SocketAddr,
-    learned_from: &str,
-) -> u16 {
-    let address_group = source_group(address.ip());
+fn new_bucket(keys: &BucketKeys, address: std::net::SocketAddr, learned_from: &str) -> u16 {
+    let address_group = keys.address_group(address.ip());
     let selector = bucket_hash(
-        key,
+        &keys.hash_key,
         b"new-source",
         &[learned_from.as_bytes(), address_group.as_bytes()],
     ) % NEW_BUCKETS_PER_SOURCE_GROUP;
     let selector = selector.to_le_bytes();
     u16::try_from(
-        bucket_hash(key, b"new-bucket", &[learned_from.as_bytes(), &selector])
-            % u64::from(NEW_BUCKET_COUNT),
+        bucket_hash(
+            &keys.hash_key,
+            b"new-bucket",
+            &[learned_from.as_bytes(), &selector],
+        ) % u64::from(NEW_BUCKET_COUNT),
     )
     .expect("new bucket index fits u16")
 }
 
-fn new_buckets(
-    key: &[u8; BUCKET_KEY_LEN],
-    address: std::net::SocketAddr,
-    record: &StoredPeer,
-) -> Vec<u16> {
+fn new_buckets(keys: &BucketKeys, address: std::net::SocketAddr, record: &StoredPeer) -> Vec<u16> {
     std::iter::once(record.source_group.as_str())
         .chain(record.new_source_groups.iter().map(String::as_str))
-        .map(|source| new_bucket(key, address, source))
+        .map(|source| new_bucket(keys, address, source))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect()
@@ -1587,24 +1647,30 @@ fn accept_new_reference_roll(reference_count: usize, roll: u64) -> bool {
     roll % denominator == 0
 }
 
-fn tried_bucket(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> u16 {
+fn tried_bucket(keys: &BucketKeys, address: std::net::SocketAddr) -> u16 {
     let address_key = address_bucket_key(address);
-    let address_group = source_group(address.ip());
-    let selector =
-        bucket_hash(key, b"tried-address", &[&address_key]) % TRIED_BUCKETS_PER_ADDRESS_GROUP;
+    let address_group = keys.address_group(address.ip());
+    let selector = bucket_hash(&keys.hash_key, b"tried-address", &[&address_key])
+        % TRIED_BUCKETS_PER_ADDRESS_GROUP;
     let selector = selector.to_le_bytes();
     u16::try_from(
-        bucket_hash(key, b"tried-bucket", &[address_group.as_bytes(), &selector])
-            % u64::from(TRIED_BUCKET_COUNT),
+        bucket_hash(
+            &keys.hash_key,
+            b"tried-bucket",
+            &[address_group.as_bytes(), &selector],
+        ) % u64::from(TRIED_BUCKET_COUNT),
     )
     .expect("tried bucket index fits u16")
 }
 
-fn tried_position(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> (u16, u8) {
-    let bucket = tried_bucket(key, address);
+fn tried_position(keys: &BucketKeys, address: std::net::SocketAddr) -> (u16, u8) {
+    let bucket = tried_bucket(keys, address);
     let address_key = address_bucket_key(address);
-    let slot = bucket_hash(key, b"tried-slot", &[&bucket.to_le_bytes(), &address_key])
-        % u64::try_from(BUCKET_CAPACITY).expect("bucket capacity fits u64");
+    let slot = bucket_hash(
+        &keys.hash_key,
+        b"tried-slot",
+        &[&bucket.to_le_bytes(), &address_key],
+    ) % u64::try_from(BUCKET_CAPACITY).expect("bucket capacity fits u64");
     (
         bucket,
         u8::try_from(slot).expect("tried slot index fits u8"),
@@ -1612,14 +1678,14 @@ fn tried_position(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> 
 }
 
 fn peer_bucket(
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
     address: std::net::SocketAddr,
     record: &StoredPeer,
 ) -> PeerBucket {
     if record_is_tried(record) {
-        (true, tried_bucket(key, address))
+        (true, tried_bucket(keys, address))
     } else {
-        (false, new_bucket(key, address, &record.source_group))
+        (false, new_bucket(keys, address, &record.source_group))
     }
 }
 
@@ -1630,7 +1696,7 @@ fn record_is_tried(record: &StoredPeer) -> bool {
 fn sanitize_tried_collisions(
     collisions: Vec<StoredTriedCollision>,
     records: &HashMap<String, StoredPeer>,
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
 ) -> Vec<StoredTriedCollision> {
     collisions
         .into_iter()
@@ -1650,7 +1716,8 @@ fn sanitize_tried_collisions(
             };
             !record_is_tried(challenger)
                 && record_is_tried(incumbent)
-                && tried_position(key, challenger_address) == tried_position(key, incumbent_address)
+                && tried_position(keys, challenger_address)
+                    == tried_position(keys, incumbent_address)
         })
         .collect()
 }
@@ -1658,7 +1725,7 @@ fn sanitize_tried_collisions(
 fn retain_bucketed(
     records: HashMap<String, StoredPeer>,
     limit: usize,
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
 ) -> Vec<(String, StoredPeer)> {
     let mut ordered = records.into_iter().collect::<Vec<_>>();
     ordered.sort_unstable_by(|(left_address, left), (right_address, right)| {
@@ -1673,11 +1740,11 @@ fn retain_bucketed(
         let socket = std::net::SocketAddr::from_str(&address)
             .expect("stored peer address was validated before retention");
         if record_is_tried(&record) {
-            if !tried_positions.insert(tried_position(key, socket)) {
+            if !tried_positions.insert(tried_position(keys, socket)) {
                 continue;
             }
         } else {
-            let available = new_buckets(key, socket, &record)
+            let available = new_buckets(keys, socket, &record)
                 .into_iter()
                 .filter(|bucket| {
                     new_bucket_counts.get(bucket).copied().unwrap_or(0) < BUCKET_CAPACITY
@@ -1698,11 +1765,15 @@ fn retain_bucketed(
     retained
 }
 
-fn diversify_candidates(ordered: Vec<PrioritizedPeer>, limit: usize) -> Vec<std::net::SocketAddr> {
+fn diversify_candidates(
+    keys: &BucketKeys,
+    ordered: Vec<PrioritizedPeer>,
+    limit: usize,
+) -> Vec<std::net::SocketAddr> {
     let mut group_indexes = HashMap::new();
     let mut groups: Vec<Vec<(PeerBucket, std::net::SocketAddr)>> = Vec::new();
     for (_, bucket, address) in ordered {
-        let group = source_group(address.ip());
+        let group = keys.address_group(address.ip());
         let index = *group_indexes.entry(group).or_insert_with(|| {
             groups.push(Vec::new());
             groups.len() - 1
@@ -1833,8 +1904,15 @@ mod tests {
         }
     }
 
+    fn plain_keys(hash_key: [u8; BUCKET_KEY_LEN]) -> BucketKeys {
+        BucketKeys {
+            hash_key,
+            asmap: None,
+        }
+    }
+
     fn tried_collision_pairs(
-        key: &[u8; BUCKET_KEY_LEN],
+        keys: &BucketKeys,
         count: usize,
     ) -> Vec<(std::net::SocketAddr, std::net::SocketAddr)> {
         let mut incumbents = HashMap::new();
@@ -1843,7 +1921,7 @@ mod tests {
         for third in 0_u8..=u8::MAX {
             for fourth in 1_u8..=u8::MAX {
                 let address = format!("1.1.{third}.{fourth}:8333").parse().unwrap();
-                let position = tried_position(key, address);
+                let position = tried_position(keys, address);
                 if used_positions.contains(&position) {
                     continue;
                 }
@@ -1919,16 +1997,16 @@ mod tests {
         drop(database);
 
         let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
-        let key = store.bucket_key;
+        let key = store.buckets.hash_key;
         let address = "1.2.3.4:38333".parse().unwrap();
-        let new = new_bucket(&key, address, "v4:8:8");
-        let tried = tried_bucket(&key, address);
+        let new = new_bucket(&store.buckets, address, "v4:8:8");
+        let tried = tried_bucket(&store.buckets, address);
         drop(store);
 
         let reopened = RedbPeerStore::open(&path, Network::Signet).unwrap();
-        assert_eq!(reopened.bucket_key, key);
-        assert_eq!(new_bucket(&reopened.bucket_key, address, "v4:8:8"), new);
-        assert_eq!(tried_bucket(&reopened.bucket_key, address), tried);
+        assert_eq!(reopened.buckets.hash_key, key);
+        assert_eq!(new_bucket(&reopened.buckets, address, "v4:8:8"), new);
+        assert_eq!(tried_bucket(&reopened.buckets, address), tried);
         let transaction = reopened.db.begin_write().unwrap();
         {
             let mut meta = transaction.open_table(META).unwrap();
@@ -2555,7 +2633,7 @@ mod tests {
             ("3.3.3.3:8333".to_owned(), record(120, 100, 1)),
         ]);
 
-        let retained = retain_bucketed(records, 2, &[7; BUCKET_KEY_LEN])
+        let retained = retain_bucketed(records, 2, &plain_keys([7; BUCKET_KEY_LEN]))
             .into_iter()
             .map(|(address, _)| address)
             .collect::<Vec<_>>();
@@ -2569,7 +2647,7 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let (incumbent, challenger) = tried_collision_pairs(&store.bucket_key, 1)[0];
+        let (incumbent, challenger) = tried_collision_pairs(&store.buckets, 1)[0];
         assert!(store.insert_verified(incumbent, services, now).unwrap());
         assert!(
             store
@@ -2617,8 +2695,8 @@ mod tests {
             .filter(|(address, record)| {
                 record_is_tried(record)
                     && std::net::SocketAddr::from_str(address).is_ok_and(|address| {
-                        tried_position(&reopened.bucket_key, address)
-                            == tried_position(&reopened.bucket_key, challenger)
+                        tried_position(&reopened.buckets, address)
+                            == tried_position(&reopened.buckets, challenger)
                     })
             })
             .count();
@@ -2632,7 +2710,7 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let pairs = tried_collision_pairs(&store.bucket_key, MAX_TRIED_COLLISIONS + 1);
+        let pairs = tried_collision_pairs(&store.buckets, MAX_TRIED_COLLISIONS + 1);
         for (incumbent, _) in &pairs {
             store.insert_verified(*incumbent, services, now).unwrap();
         }
@@ -2668,7 +2746,7 @@ mod tests {
 
     #[test]
     fn keyed_new_capacity_and_exact_tried_slots_are_independent() {
-        let key = [11; BUCKET_KEY_LEN];
+        let keys = plain_keys([11; BUCKET_KEY_LEN]);
         let services = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
         let make_record = |last_success| StoredPeer {
             services,
@@ -2685,17 +2763,17 @@ mod tests {
             new_source_groups: Vec::new(),
         };
 
-        let (incumbent, challenger) = tried_collision_pairs(&key, 1)[0];
+        let (incumbent, challenger) = tried_collision_pairs(&keys, 1)[0];
         assert_eq!(
-            tried_position(&key, incumbent),
-            tried_position(&key, challenger)
+            tried_position(&keys, incumbent),
+            tried_position(&keys, challenger)
         );
         let tried_records = [incumbent, challenger]
             .into_iter()
             .map(|address| (address.to_string(), make_record(1_799_999_999)))
             .collect();
         assert_eq!(
-            retain_bucketed(tried_records, MAX_STORED_PEERS, &key).len(),
+            retain_bucketed(tried_records, MAX_STORED_PEERS, &keys).len(),
             1
         );
 
@@ -2703,7 +2781,7 @@ mod tests {
         for third in 0_u8..=u8::MAX {
             for fourth in 1_u8..=u8::MAX {
                 let address = format!("2.2.{third}.{fourth}:8333").parse().unwrap();
-                let bucket = new_bucket(&key, address, "v4:8:8");
+                let bucket = new_bucket(&keys, address, "v4:8:8");
                 let addresses = new_by_bucket.entry(bucket).or_default();
                 addresses.push(address);
                 if addresses.len() > BUCKET_CAPACITY {
@@ -2726,14 +2804,14 @@ mod tests {
             .map(|address| (address.to_string(), make_record(0)))
             .collect();
         assert_eq!(
-            retain_bucketed(new_records, MAX_STORED_PEERS, &key).len(),
+            retain_bucketed(new_records, MAX_STORED_PEERS, &keys).len(),
             BUCKET_CAPACITY
         );
     }
 
     #[test]
     fn new_table_references_are_stochastic_bounded_and_backward_compatible() {
-        let key = [12; BUCKET_KEY_LEN];
+        let keys = plain_keys([12; BUCKET_KEY_LEN]);
         let address = "2.2.2.2:8333".parse().unwrap();
         let mut record = StoredPeer {
             services: (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64(),
@@ -2749,10 +2827,10 @@ mod tests {
             in_new_table: false,
             new_source_groups: Vec::new(),
         };
-        let mut buckets = HashSet::from([new_bucket(&key, address, &record.source_group)]);
+        let mut buckets = HashSet::from([new_bucket(&keys, address, &record.source_group)]);
         for first in 9_u8..=u8::MAX {
             let group = format!("v4:{first}:1");
-            let bucket = new_bucket(&key, address, &group);
+            let bucket = new_bucket(&keys, address, &group);
             if buckets.insert(bucket) {
                 record.new_source_groups.push(group);
                 if record.new_source_groups.len() == 2 {
@@ -2760,7 +2838,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(new_buckets(&key, address, &record).len(), 3);
+        assert_eq!(new_buckets(&keys, address, &record).len(), 3);
         assert!(accept_new_reference_roll(1, 0));
         assert!(!accept_new_reference_roll(1, 1));
         assert!(accept_new_reference_roll(3, 8));
@@ -2785,6 +2863,123 @@ mod tests {
             br#"{"services":9,"last_seen":1800000000,"source_group":"v4:8:8"}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn asn_groups_unite_address_families_and_fall_back_outside_the_map() {
+        let map = Asmap::from_bytes(crate::asmap::test_encoder::encode(&[
+            crate::asmap::test_encoder::v4_prefix16(8, 8, 15169),
+            crate::asmap::test_encoder::v6_prefix32(0x2001, 0x4860, 15169),
+        ]))
+        .unwrap();
+        let keys = BucketKeys {
+            hash_key: [1; BUCKET_KEY_LEN],
+            asmap: Some(Arc::new(map)),
+        };
+        assert_eq!(keys.address_group("8.8.8.8".parse().unwrap()), "as:15169:0");
+        assert_eq!(
+            keys.address_group("2001:4860:4860::8888".parse().unwrap()),
+            "as:15169:0",
+            "one operator's v4 and v6 space is one diversity group"
+        );
+        assert_eq!(
+            keys.address_group("9.9.9.9".parse().unwrap()),
+            "v4:9:9",
+            "an address outside the map keeps its prefix group"
+        );
+        assert!(valid_source_group("as:15169:0"));
+        assert!(
+            !valid_source_group("as:0:0"),
+            "reserved AS0 is never a group"
+        );
+        assert!(!valid_source_group("as:15169:1"));
+        assert!(!valid_source_group("as:015169:0"));
+    }
+
+    #[test]
+    fn a_single_asn_flood_is_capped_by_one_group_quota() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        // One autonomous system announcing 32 distinct /16 prefixes: the
+        // shape of an eclipse attempt whose addresses look diverse to a
+        // prefix-derived grouping.
+        let entries = (0_u8..32)
+            .map(|offset| crate::asmap::test_encoder::v4_prefix16(20 + offset, 20, 64500))
+            .collect::<Vec<_>>();
+        let map =
+            Arc::new(Asmap::from_bytes(crate::asmap::test_encoder::encode(&entries)).unwrap());
+        let grouped_by_asn = RedbPeerStore::open_with_asmap(
+            directory.path().join("asn.redb"),
+            Network::Signet,
+            Some(map),
+        )
+        .unwrap();
+        let grouped_by_prefix =
+            RedbPeerStore::open(directory.path().join("prefix.redb"), Network::Signet).unwrap();
+
+        let mut accepted_by_asn = 0;
+        let mut accepted_by_prefix = 0;
+        for prefix in 0_u8..32 {
+            let source = format!("{}.20.1.1:8333", 20 + prefix).parse().unwrap();
+            let addresses = (0_u8..8)
+                .map(|host| {
+                    learned(
+                        &format!("{}.20.2.{}:8333", 20 + prefix, host + 1),
+                        services,
+                        now,
+                    )
+                })
+                .collect::<Vec<_>>();
+            accepted_by_asn += grouped_by_asn
+                .insert_discovered(source, &addresses, now)
+                .unwrap()
+                .accepted;
+            accepted_by_prefix += grouped_by_prefix
+                .insert_discovered(source, &addresses, now)
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted_by_prefix, 256,
+            "prefix grouping grants every /16 its own quota"
+        );
+        assert_eq!(
+            accepted_by_asn, MAX_PEERS_PER_SOURCE_GROUP,
+            "ASN grouping caps the whole autonomous system at one group quota"
+        );
+        let records = grouped_by_asn.load_records().unwrap();
+        assert!(
+            records
+                .values()
+                .all(|record| record.source_group == "as:64500:0"),
+            "every flood record was learned under the attacker's one ASN group"
+        );
+    }
+
+    #[test]
+    fn the_embedded_map_groups_a_real_source_by_its_asn() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open_with_asmap(
+            directory.path().join("peers.redb"),
+            Network::Signet,
+            Some(Asmap::embedded().unwrap()),
+        )
+        .unwrap();
+        store
+            .insert_discovered(
+                "8.8.4.4:8333".parse().unwrap(),
+                &[learned("1.0.0.1:8333", services, now)],
+                now,
+            )
+            .unwrap();
+        let records = store.load_records().unwrap();
+        assert_eq!(
+            records["1.0.0.1:8333"].source_group, "as:15169:0",
+            "a real-world source address is grouped by its announcing ASN"
+        );
     }
 
     #[test]
