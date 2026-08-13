@@ -146,8 +146,9 @@ use rbtc::{
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
         MAX_CONFIGURED_MEMPOOL_BYTES, MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
-        TransactionAdmissionContext, TransactionAdmissionPool, TransactionRequestId,
-        dependency_packages, transaction_descendant_closure,
+        MAX_MEMPOOL_CLUSTER_TRANSACTIONS, MAX_MEMPOOL_CLUSTER_VBYTES, TransactionAdmissionContext,
+        TransactionAdmissionPool, TransactionRequestId, dependency_packages,
+        transaction_descendant_closure,
     },
     transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
     utxo::{DEFAULT_HOT_WINDOW_SECS, OutPointKey, Utxo, UtxoStore},
@@ -3507,8 +3508,11 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "getblocktemplate",
     "testmempoolaccept",
     "rbtc.scanchainstate",
+    "gettxoutsetinfo",
+    "getmempoolcluster",
     "listbanned",
     "setban",
+    "addnode",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -3866,7 +3870,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 Ok(serde_json::json!({"level": level.as_str()}))
             }));
         }
-        if matches!(method, "listbanned" | "setban") {
+        if matches!(method, "listbanned" | "setban" | "addnode") {
             return Some(self.execute_peer_administration(method, params));
         }
         if matches!(
@@ -3884,6 +3888,8 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "getblocktemplate"
                 | "testmempoolaccept"
                 | "rbtc.scanchainstate"
+                | "gettxoutsetinfo"
+                | "getmempoolcluster"
         ) {
             return Some(
                 if matches!(
@@ -4158,6 +4164,57 @@ impl NodeRpcOperator {
         }
     }
 
+    /// Seeds or forgets one operator-supplied routable dial candidate.
+    ///
+    /// `add` and `onetry` both seed a candidate; the bounded pool keeps no
+    /// persistent manual list distinct from its candidate table, so the two
+    /// collapse to the same effect rather than pretending to a distinction
+    /// this node does not keep. `remove` forgets the stored candidate but
+    /// does not ban it — use `setban` to keep an address from being dialed.
+    fn execute_add_node(
+        peer_store: &RedbPeerStore,
+        params: &serde_json::Value,
+        now: u32,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Node storage failure",
+        };
+        let values = params.as_array().ok_or_else(invalid)?;
+        if values.len() != 2 {
+            return Err(invalid());
+        }
+        let address = values[0]
+            .as_str()
+            .and_then(|value| SocketAddr::from_str(value).ok())
+            .ok_or_else(invalid)?;
+        match values[1].as_str().ok_or_else(invalid)? {
+            command @ ("add" | "onetry") => {
+                let added = peer_store
+                    .insert_manual(address, now)
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "command": command,
+                    "added": added,
+                }))
+            }
+            "remove" => {
+                let removed = peer_store.forget_peer(address).map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "command": "remove",
+                    "removed": removed,
+                }))
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     /// Serves the bounded administrative peer-cooldown surface.
     ///
     /// This mutates local peer policy only: a cooldown makes an address an
@@ -4186,6 +4243,9 @@ impl NodeRpcOperator {
                 message: "Node data is not ready",
             })?;
         let now = unix_time().map_err(|_| storage())?;
+        if method == "addnode" {
+            return Self::execute_add_node(&peer_store, params, now);
+        }
         if method == "listbanned" {
             if !rpc_has_no_params(params) {
                 return Err(invalid());
@@ -4287,6 +4347,36 @@ impl NodeRpcOperator {
                 "transactions": transactions,
                 "total": total,
                 "next_offset": next_offset,
+            }));
+        }
+        if method == "getmempoolcluster" {
+            let values = params.as_array().ok_or_else(invalid)?;
+            if values.len() != 1 {
+                return Err(invalid());
+            }
+            let txid = values[0]
+                .as_str()
+                .and_then(|value| Txid::from_str(value).ok())
+                .ok_or_else(invalid)?;
+            let cluster = self
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cluster_of(txid);
+            let (members, vbytes) = cluster.ok_or(LocalRpcOperatorError {
+                code: -5,
+                message: "Transaction not in mempool",
+            })?;
+            return Ok(serde_json::json!({
+                "txid": txid.to_string(),
+                "cluster": members
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "count": members.len(),
+                "vbytes": vbytes,
+                "max_count": MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
+                "max_vbytes": MAX_MEMPOOL_CLUSTER_VBYTES,
             }));
         }
         let source = self.source.as_ref().ok_or_else(unavailable)?;
@@ -4464,6 +4554,61 @@ impl NodeRpcOperator {
                         })
                         .collect(),
                 ))
+            }
+            "gettxoutsetinfo" => {
+                // A resumable, bounded aggregation over the fixed-memory
+                // pager. Each call scans one window from `cursor` and reports
+                // that window's partial totals plus a `next_cursor`; the
+                // operator sums the windows until `complete` is true. This
+                // never walks the whole set in one unbounded pass — the
+                // explicit ceiling is the contract, exactly as
+                // `rbtc.scanchainstate` bounds its page.
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.len() > 2 {
+                    return Err(invalid());
+                }
+                let after = match values.first() {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(cursor)) => {
+                        Some(rpc_outpoint_cursor(cursor).ok_or_else(invalid)?)
+                    }
+                    Some(_) => return Err(invalid()),
+                };
+                let limit = match values.get(1) {
+                    None | Some(serde_json::Value::Null) => MAX_RPC_CHAINSTATE_PAGE,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|limit| (1..=MAX_RPC_CHAINSTATE_PAGE).contains(limit))
+                        .ok_or_else(invalid)?,
+                };
+                let page = source
+                    .chainstate_page(after, limit)
+                    .map_err(|_| unavailable())?;
+                let mut total_amount_sats = 0_u64;
+                // Core's "bogosize" is a serialization-independent size proxy:
+                // 32 bytes of overhead per output plus its scriptPubKey.
+                let mut bogosize = 0_u64;
+                for (_, utxo) in &page {
+                    total_amount_sats = total_amount_sats.saturating_add(utxo.value_sats);
+                    bogosize = bogosize
+                        .saturating_add(32)
+                        .saturating_add(utxo.script_pubkey.len() as u64);
+                }
+                let next_cursor = (page.len() == limit)
+                    .then(|| page.last().map(|(outpoint, _)| outpoint.to_string()))
+                    .flatten();
+                let complete = next_cursor.is_none();
+                let status = self.status.response();
+                Ok(serde_json::json!({
+                    "height": status.execution.height,
+                    "bestblock": status.execution.hash,
+                    "window_txouts": page.len(),
+                    "window_total_amount_sats": total_amount_sats,
+                    "window_bogosize": bogosize,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                }))
             }
             "rbtc.scanchainstate" => {
                 let values = params.as_array().ok_or_else(invalid)?;
@@ -19247,6 +19392,217 @@ mod tests {
             .unwrap();
         assert!(past_end["entries"].as_array().unwrap().is_empty());
         assert!(past_end["next_cursor"].is_null());
+    }
+
+    #[test]
+    fn gettxoutsetinfo_aggregates_the_utxo_set_in_bounded_windows() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, funding, funded) = dry_run_test_source(directory.path());
+        let extra = (1..4u32)
+            .map(|vout| OutPoint::new(funding.txid, vout))
+            .collect::<Vec<_>>();
+        node_source
+            .chainstate
+            .apply(
+                &[],
+                &extra
+                    .iter()
+                    .map(|outpoint| (OutPointKey::from(*outpoint), funded.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let total_outputs = 1 + extra.len();
+
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+
+        // Windowed aggregation summed across pages must equal the whole set.
+        let mut cursor = serde_json::Value::Null;
+        let mut txouts = 0_u64;
+        let mut total_amount = 0_u64;
+        let mut windows = 0;
+        loop {
+            let window = operator
+                .execute("gettxoutsetinfo", &serde_json::json!([cursor.clone(), 2]))
+                .unwrap()
+                .unwrap();
+            txouts += window["window_txouts"].as_u64().unwrap();
+            total_amount += window["window_total_amount_sats"].as_u64().unwrap();
+            windows += 1;
+            cursor = window["next_cursor"].clone();
+            if window["complete"].as_bool().unwrap() {
+                assert!(cursor.is_null());
+                break;
+            }
+            assert!(windows < 100, "windowed scan must terminate");
+        }
+        assert_eq!(txouts, total_outputs as u64);
+        assert_eq!(total_amount, funded.value_sats * total_outputs as u64);
+        assert!(windows > 1, "a 2-entry window paged the 4-entry set");
+
+        // The default (no cursor, no limit) completes small sets in one call.
+        let whole = operator
+            .execute("gettxoutsetinfo", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        assert!(whole["complete"].as_bool().unwrap());
+        assert_eq!(
+            whole["window_txouts"].as_u64().unwrap(),
+            total_outputs as u64
+        );
+        assert_eq!(whole["height"], 0);
+
+        for invalid in [
+            serde_json::json!(["not-a-cursor", 2]),
+            serde_json::json!([null, 0]),
+            serde_json::json!([null, 2, 3]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("gettxoutsetinfo", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn getmempoolcluster_rpc_reports_a_miss_and_validates_params() {
+        // Closure correctness is covered where the admission helpers live
+        // (`cluster_of_reports_the_dependency_connected_closure`); this
+        // exercises the RPC dispatch and error surface against an empty pool.
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: None,
+        };
+
+        // An absent transaction is a clear miss, not an empty cluster.
+        let absent = operator
+            .execute(
+                "getmempoolcluster",
+                &serde_json::json!([Txid::from_byte_array([0x33; 32]).to_string()]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent.code, -5);
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!(["not-a-txid"]),
+            serde_json::json!([Txid::from_byte_array([0x33; 32]).to_string(), 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("getmempoolcluster", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn addnode_seeds_and_forgets_a_dial_candidate() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(Arc::clone(&peer_store)));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+        let now = unix_time().unwrap();
+
+        let added = operator
+            .execute("addnode", &serde_json::json!([address, "add"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(added["added"], true);
+        assert!(
+            peer_store
+                .candidates(now, 16)
+                .unwrap()
+                .contains(&address.parse().unwrap()),
+            "an added node becomes a dial candidate"
+        );
+
+        // onetry seeds the same candidate table.
+        assert_eq!(
+            operator
+                .execute("addnode", &serde_json::json!([address, "onetry"]))
+                .unwrap()
+                .unwrap()["command"],
+            "onetry"
+        );
+
+        let removed = operator
+            .execute("addnode", &serde_json::json!([address, "remove"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        assert!(
+            !peer_store
+                .candidates(now, 16)
+                .unwrap()
+                .contains(&address.parse().unwrap()),
+            "a removed node is no longer a candidate"
+        );
+        assert_eq!(
+            operator
+                .execute("addnode", &serde_json::json!([address, "remove"]))
+                .unwrap()
+                .unwrap()["removed"],
+            false
+        );
+
+        for invalid in [
+            serde_json::json!([address]),
+            serde_json::json!(["not-an-address", "add"]),
+            serde_json::json!([address, "sometimes"]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("addnode", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
     }
 
     #[tokio::test]
