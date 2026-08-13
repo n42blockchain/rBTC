@@ -8,6 +8,7 @@ extern crate self as rbtc;
 
 pub mod api;
 pub mod archive;
+pub mod asmap;
 pub mod auxiliary_index;
 pub mod block_assembly;
 pub mod block_execution;
