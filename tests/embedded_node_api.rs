@@ -319,6 +319,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         proxy: None,
         name_proxy: None,
         v2_transport: false,
+        asmap: rbtc::node::NodeAsmapSource::Embedded,
     };
     config.storage = NodeStorageConfig {
         prune_blocks: 576,

@@ -32,7 +32,8 @@ const BOOL_KEYS: [&str; 10] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 38] = [
+const VALUE_KEYS: [&str; 39] = [
+    "asmap",
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -361,6 +362,7 @@ fn known_key(key: &str) -> bool {
 
 fn flag_for_key(key: &str) -> &'static str {
     match key {
+        "asmap" => "--asmap",
         "assumevalid" => "--assumevalid",
         "automatic_hot_standbys" => "--automatic-hot-standbys",
         "background_assumeutxo" => "--background-assumeutxo",
@@ -421,7 +423,8 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
     let group = option_group(argument);
     matches!(
         argument,
-        "--assumevalid"
+        "--asmap"
+            | "--assumevalid"
             | "--assume-valid"
             | "--automatic-hot-standbys"
             | "--background-assumeutxo"
@@ -492,6 +495,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
 
 fn option_group(flag: &str) -> &'static str {
     match flag {
+        "--asmap" => "asmap",
         "--assume-valid" | "--assumevalid" => "assumevalid",
         "--automatic-hot-standbys" => "automatic-hot-standbys",
         "--cleanup-validation-dir" | "--no-cleanup-validation-dir" => "cleanup-validation-dir",
@@ -607,6 +611,39 @@ mod tests {
         let dns_conflict = parse_config("dns_seeds=false\ndns_seed=seed.example:8333").unwrap();
         assert!(selected_arguments(&dns_conflict, Network::Bitcoin).is_err());
         assert!(parse_config("once=yes").is_err());
+    }
+
+    #[test]
+    fn the_asmap_key_maps_to_the_asmap_flag() {
+        let entries = parse_config("asmap=off\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| { entry.flag == "--asmap" && entry.value.as_deref() == Some("off") })
+        );
+
+        // A command-line --asmap must displace the file entry, exactly as
+        // every other single-valued option is merged.
+        let directory = TempDir::new().unwrap();
+        let config = directory.path().join("rbtc.conf");
+        fs::write(&config, "asmap=/etc/rbtc/operator.map\n").unwrap();
+        let merged = merge_config_arguments(vec![
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--asmap".to_owned(),
+            "off".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            merged
+                .windows(2)
+                .filter(|pair| pair[0] == "--asmap")
+                .count(),
+            1,
+            "the file entry must be dropped in favour of the command line"
+        );
+        assert!(merged.ends_with(&["--asmap".to_owned(), "off".to_owned()]));
     }
 
     #[test]

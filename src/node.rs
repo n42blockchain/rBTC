@@ -88,6 +88,7 @@ use rbtc::{
         explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
     archive::bounded_archive_prefix_len,
+    asmap::Asmap,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
         BlockDeploymentContext, BlockExecutionError,
@@ -736,7 +737,7 @@ impl Default for NodeStorageConfig {
 }
 
 /// Bounded peer and transaction-pool resources for one node instance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeResourceConfig {
     /// Maximum automatically discovered hot standby sessions.
     pub automatic_hot_standbys: usize,
@@ -758,6 +759,22 @@ pub struct NodeResourceConfig {
     /// retrying each address once over v1 when the peer closes the v2
     /// handshake attempt.
     pub v2_transport: bool,
+    /// Origin of the ASN map that widens peer-address diversity groups
+    /// from IP prefixes to autonomous systems.
+    pub asmap: NodeAsmapSource,
+}
+
+/// Origin of the ASN map used for peer-address diversity bucketing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NodeAsmapSource {
+    /// The map compiled into this binary; the default, matching Core 31's
+    /// embedded-asmap posture.
+    #[default]
+    Embedded,
+    /// An operator-supplied asmap file, validated fail-closed at startup.
+    File(PathBuf),
+    /// No ASN mapping; diversity groups stay IP-prefix derived.
+    Off,
 }
 
 /// One peer destination in an address family the node can dial.
@@ -933,6 +950,7 @@ impl Default for NodeResourceConfig {
             proxy: None,
             name_proxy: None,
             v2_transport: false,
+            asmap: NodeAsmapSource::Embedded,
         }
     }
 }
@@ -1098,7 +1116,7 @@ impl NodeBuilder {
 
     /// Sets bounded hot-standby and transaction-pool resources.
     #[must_use]
-    pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
+    pub fn resources(mut self, resources: NodeResourceConfig) -> Self {
         self.config.resources = resources;
         self
     }
@@ -7696,7 +7714,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7710,6 +7728,11 @@ fn startup_configuration_summary(options: &Options) -> String {
             .proxy
             .map_or_else(|| "direct".to_owned(), |proxy| proxy.to_string()),
         options.resources.v2_transport,
+        match &options.resources.asmap {
+            NodeAsmapSource::Embedded => "embedded".to_owned(),
+            NodeAsmapSource::File(path) => path.display().to_string(),
+            NodeAsmapSource::Off => "off".to_owned(),
+        },
         options
             .zmq_listen
             .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
@@ -8168,9 +8191,21 @@ async fn run_peer_pool_session(
         }
         _ => None,
     };
+    // The map is resolved before asking whether a peer store exists, so a
+    // broken --asmap file refuses startup instead of being silently unused
+    // on a store-less node.
+    let asmap = match &options.resources.asmap {
+        NodeAsmapSource::Off => None,
+        NodeAsmapSource::Embedded => Some(Asmap::embedded().map_err(|error| error.to_string())?),
+        NodeAsmapSource::File(path) => {
+            Some(Arc::new(Asmap::from_file(path).map_err(|error| {
+                format!("--asmap {}: {error}", path.display())
+            })?))
+        }
+    };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
-            RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
+            RedbPeerStore::open_with_asmap(data_dir.join("peers.redb"), options.network, asmap)
                 .map_err(|error| error.to_string())?,
         ))
     } else {
@@ -15773,6 +15808,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = true;
     let mut v2_transport = false;
+    let mut asmap_source = None;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -15889,6 +15925,20 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     value
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("invalid name proxy address: {value}"))?,
+                );
+            }
+            "--asmap" => {
+                if asmap_source.is_some() {
+                    return Err("--asmap cannot be supplied more than once".to_owned());
+                }
+                // The literals win over paths, so a file spelled exactly
+                // `embedded` or `off` must be addressed as `./embedded`.
+                asmap_source = Some(
+                    match required_option_value(&mut args, "--asmap")?.as_str() {
+                        "embedded" => NodeAsmapSource::Embedded,
+                        "off" => NodeAsmapSource::Off,
+                        path => NodeAsmapSource::File(PathBuf::from(path)),
+                    },
                 );
             }
             "--network" => {
@@ -17776,6 +17826,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             proxy: outbound_proxy,
             name_proxy,
             v2_transport,
+            asmap: asmap_source.unwrap_or_default(),
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -23008,6 +23059,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_asmap_source_and_refuses_duplicates() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-asmap-parser",
+            ];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert_eq!(default.resources.asmap, NodeAsmapSource::Embedded);
+        let embedded = parse(vec!["--asmap", "embedded"]).unwrap().unwrap();
+        assert_eq!(embedded.resources.asmap, NodeAsmapSource::Embedded);
+        let off = parse(vec!["--asmap", "off"]).unwrap().unwrap();
+        assert_eq!(off.resources.asmap, NodeAsmapSource::Off);
+        let file = parse(vec!["--asmap", "/tmp/operator.map"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file.resources.asmap,
+            NodeAsmapSource::File(PathBuf::from("/tmp/operator.map"))
+        );
+        // The keywords win over file names, so the escape hatch is a path.
+        let keyword_shadowed = parse(vec!["--asmap", "./off"]).unwrap().unwrap();
+        assert_eq!(
+            keyword_shadowed.resources.asmap,
+            NodeAsmapSource::File(PathBuf::from("./off"))
+        );
+        let Err(duplicated) = parse(vec!["--asmap", "off", "--asmap", "embedded"]) else {
+            panic!("a duplicated --asmap must be refused");
+        };
+        assert!(duplicated.contains("--asmap"));
+        assert!(parse(vec!["--asmap"]).is_err());
+    }
+
+    #[test]
     fn parses_and_bounds_peer_and_mempool_resource_budgets() {
         let options = parse_options(
             [
@@ -23037,6 +23126,7 @@ mod tests {
                 proxy: None,
                 name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
             }
         );
 
@@ -23321,6 +23411,7 @@ mod tests {
                 proxy: None,
                 name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -23367,6 +23458,7 @@ mod tests {
             proxy: None,
             name_proxy: None,
             v2_transport: false,
+            asmap: NodeAsmapSource::Embedded,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -23416,6 +23508,7 @@ mod tests {
                 proxy: None,
                 name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -23508,6 +23601,7 @@ mod tests {
                 proxy: None,
                 name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()
