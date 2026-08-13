@@ -402,8 +402,16 @@ optional where appropriate, and host-runtime compatible.
   no-panic/bounded-termination guarantee on unvalidated bytes. Provenance
   and the update procedure are recorded in [ASMAP.md](ASMAP.md).
 - [ ] CJDNS reachability alongside onion/I2P, converging with the existing
-  per-network isolation. Acceptance: handshake and address isolation over
-  CJDNS, with leak tests that fail closed.
+  per-network isolation. Implemented 2026-08-13: `fc00::/8` classification
+  with `fd00::/8` permanently unroutable, BIP155 CJDNS-ID-only encoding
+  (nothing on legacy `addr`), an explicit `--cjdns-reachable` policy gating
+  storage/dialing/advertising fail-closed, `--onlynet cjdns` isolation, the
+  shared `cjdns:0:0` marker group giving the whole overlay one quota, and
+  refusals for every unsound combination (`--proxy`, onlynet-without-
+  interface, overlay `--connect` without the declaration); semantics and
+  tests are recorded in [CJDNS.md](CJDNS.md). Open acceptance residue: one
+  live handshake with a real overlay peer through an independently running
+  `cjdroute`, recorded like the name-proxy external-Tor run.
 - [ ] Private transaction broadcast: a per-transaction
   anonymity-network-exclusive broadcast path reusing the existing
   proxy/`onlynet`/name-proxy isolation. Acceptance: a broadcast under the

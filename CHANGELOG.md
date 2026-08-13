@@ -16,6 +16,14 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   disables the derivation. Data provenance and the update procedure are in
   `docs/ASMAP.md`.
 
+- CJDNS overlay reachability. `--cjdns-reachable` (config key
+  `cjdns_reachable`) declares a local `cjdroute` interface, making
+  `fc00::/8` peers storable, dialable, and advertisable; `--onlynet cjdns`
+  restricts outbound peers to the overlay. Overlay addresses travel only as
+  the BIP155 CJDNS network ID, share one diversity marker group, and every
+  unsound configuration combination is refused at startup. Semantics are
+  documented in `docs/CJDNS.md`.
+
 - Inbound I2P peers are accepted through the configured SAM session and
   served by the existing inbound service, sharing its capacity and budgets.
 
