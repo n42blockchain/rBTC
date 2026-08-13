@@ -1197,6 +1197,53 @@ impl RedbPeerStore {
         Ok(true)
     }
 
+    /// Seeds one operator-supplied routable address as an untried dial
+    /// candidate, returning whether it was retained.
+    ///
+    /// This enters the new table exactly like a peer-learned address, so it
+    /// is subject to the same acceptability, source-group quota, and bucket
+    /// bounds — an operator cannot use it to exceed the pool's limits. It
+    /// does not claim a handshake that never happened; the address is tried
+    /// on the ordinary schedule. The backing store for the `addnode add`
+    /// operator RPC.
+    pub fn insert_manual(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        if !self.acceptable(address) {
+            return Ok(false);
+        }
+        let stats = self.insert_discovered(
+            address,
+            &[PeerAddress {
+                socket: address,
+                services,
+                last_seen: now,
+            }],
+            now,
+        )?;
+        Ok(stats.accepted > 0)
+    }
+
+    /// Removes one routable address from the candidate pool, returning
+    /// whether a record existed. The backing store for `addnode remove`.
+    ///
+    /// It clears only the stored candidate; it does not ban the address, so
+    /// the node may learn it again from a peer. To keep an address from
+    /// being dialed, use the cooldown surface (`setban`) instead.
+    pub fn forget_peer(&self, address: std::net::SocketAddr) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_records()?;
+        if records.remove(&address.to_string()).is_none() {
+            return Ok(false);
+        }
+        let records = records.into_iter().collect::<Vec<_>>();
+        self.replace_all(&records)?;
+        Ok(true)
+    }
+
     /// Returns every stored cooldown with its deadline, newest deadline first.
     pub fn discouragements(
         &self,
