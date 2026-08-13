@@ -762,6 +762,14 @@ pub struct NodeResourceConfig {
     /// Origin of the ASN map that widens peer-address diversity groups
     /// from IP prefixes to autonomous systems.
     pub asmap: NodeAsmapSource,
+    /// Whether a local `cjdroute` interface makes `fc00::/8` CJDNS overlay
+    /// destinations dialable and their addresses storable.
+    ///
+    /// Off by default: without the interface, overlay addresses are
+    /// unroutable and are refused everywhere. Incompatible with `proxy`,
+    /// because CJDNS traffic never traverses a SOCKS5 proxy and a proxied
+    /// deployment must not be surprised by direct dials.
+    pub cjdns_reachable: bool,
 }
 
 /// Origin of the ASN map used for peer-address diversity bucketing.
@@ -912,18 +920,25 @@ pub enum NodeOnlyNet {
     Onion,
     /// Permit only I2P destinations, which require a SAM bridge.
     I2p,
+    /// Permit only CJDNS overlay destinations, which require a local
+    /// `cjdroute` interface declared with `--cjdns-reachable`.
+    Cjdns,
 }
 
 impl NodeOnlyNet {
     /// Returns whether a routable destination is permitted.
     ///
     /// An onion-only restriction permits no IP destination at all, which is
-    /// what makes it a leak guard rather than a preference.
+    /// what makes it a leak guard rather than a preference. CJDNS is its
+    /// own network: an IPv6-only restriction excludes `fc00::/8`, and a
+    /// CJDNS-only restriction excludes everything else.
     const fn permits(self, ip: IpAddr) -> bool {
-        matches!(
-            (self, ip),
-            (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
-        )
+        match (self, ip) {
+            (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) => true,
+            (Self::Ipv6, IpAddr::V6(_)) => !crate::p2p::is_cjdns_address(ip),
+            (Self::Cjdns, IpAddr::V6(_)) => crate::p2p::is_cjdns_address(ip),
+            _ => false,
+        }
     }
 
     /// Returns whether v3 onion destinations are permitted.
@@ -951,6 +966,7 @@ impl Default for NodeResourceConfig {
             name_proxy: None,
             v2_transport: false,
             asmap: NodeAsmapSource::Embedded,
+            cjdns_reachable: false,
         }
     }
 }
@@ -1313,7 +1329,11 @@ fn validate_inbound_options(options: &Options) -> Result<(), String> {
         if options.inbound_listen.is_none() {
             return Err("an advertised inbound address requires --listen ADDRESS".to_owned());
         }
-        if !is_acceptable_peer_address(address, options.network) {
+        if !crate::peer_store::is_acceptable_peer_address_with_cjdns(
+            address,
+            options.network,
+            options.resources.cjdns_reachable,
+        ) {
             return Err(format!(
                 "advertised inbound address {address} is not routable on {}",
                 options.network
@@ -1411,7 +1431,7 @@ fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
             Ok(NodeOnlyNet::Any)
         }
         _ => Err(
-            "--onlynet accepts one network, or both IP families; onion and i2p cannot be combined with another network"
+            "--onlynet accepts one network, or both IP families; onion, i2p, and cjdns cannot be combined with another network"
                 .to_owned(),
         ),
     }
@@ -1479,6 +1499,33 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
                     .to_owned(),
             );
         }
+    }
+    if options.resources.only_net == NodeOnlyNet::Cjdns && !options.resources.cjdns_reachable {
+        return Err(
+            "--onlynet cjdns requires --cjdns-reachable: without a local cjdroute interface no permitted destination exists"
+                .to_owned(),
+        );
+    }
+    if options.resources.cjdns_reachable {
+        // CJDNS traffic never traverses a SOCKS5 proxy: the overlay is
+        // reached through a local interface. Permitting both would either
+        // surprise a proxied deployment with direct dials or silently hand
+        // overlay sockets to a proxy that cannot carry them, so the
+        // combination is refused outright.
+        if options.resources.proxy.is_some() {
+            return Err(
+                "--cjdns-reachable cannot be combined with --proxy: overlay sockets are dialed through the local cjdroute interface, never a SOCKS5 proxy"
+                    .to_owned(),
+            );
+        }
+    } else if let Some(remote) = options
+        .remotes
+        .iter()
+        .find(|remote| crate::p2p::is_cjdns_address(remote.ip()))
+    {
+        return Err(format!(
+            "preferred peer {remote} is a CJDNS overlay address and requires --cjdns-reachable"
+        ));
     }
     if let Some(proxy) = options.resources.proxy {
         if proxy.port() == 0 || proxy.ip().is_unspecified() {
@@ -7714,7 +7761,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7733,6 +7780,7 @@ fn startup_configuration_summary(options: &Options) -> String {
             NodeAsmapSource::File(path) => path.display().to_string(),
             NodeAsmapSource::Off => "off".to_owned(),
         },
+        options.resources.cjdns_reachable,
         options
             .zmq_listen
             .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
@@ -8205,8 +8253,13 @@ async fn run_peer_pool_session(
     };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
-            RedbPeerStore::open_with_asmap(data_dir.join("peers.redb"), options.network, asmap)
-                .map_err(|error| error.to_string())?,
+            RedbPeerStore::open_with_policy(
+                data_dir.join("peers.redb"),
+                options.network,
+                asmap,
+                options.resources.cjdns_reachable,
+            )
+            .map_err(|error| error.to_string())?,
         ))
     } else {
         None
@@ -15809,6 +15862,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut mempool_full_rbf = true;
     let mut v2_transport = false;
     let mut asmap_source = None;
+    let mut cjdns_reachable = false;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -15899,6 +15953,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     "ipv6" => NodeOnlyNet::Ipv6,
                     "onion" => NodeOnlyNet::Onion,
                     "i2p" => NodeOnlyNet::I2p,
+                    "cjdns" => NodeOnlyNet::Cjdns,
                     _ => return Err(format!("unsupported --onlynet value: {value}")),
                 };
                 if !only_net_values.contains(&family) {
@@ -16148,6 +16203,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-mempool-full-rbf" => mempool_full_rbf = false,
             "--v2-transport" => v2_transport = true,
             "--no-v2-transport" => v2_transport = false,
+            "--cjdns-reachable" => cjdns_reachable = true,
+            "--no-cjdns-reachable" => cjdns_reachable = false,
             "--txindex" => transaction_index = true,
             "--no-txindex" => transaction_index = false,
             "--spent-output-index" => spent_output_index = true,
@@ -17827,6 +17884,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             name_proxy,
             v2_transport,
             asmap: asmap_source.unwrap_or_default(),
+            cjdns_reachable,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -23097,6 +23155,68 @@ mod tests {
     }
 
     #[test]
+    fn cjdns_reachability_is_explicit_and_fails_closed() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-cjdns-parser",
+            ];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert!(!default.resources.cjdns_reachable);
+        let enabled = parse(vec!["--cjdns-reachable"]).unwrap().unwrap();
+        assert!(enabled.resources.cjdns_reachable);
+        let only = parse(vec!["--cjdns-reachable", "--onlynet", "cjdns"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(only.resources.only_net, NodeOnlyNet::Cjdns);
+
+        // Without the local interface no permitted destination exists.
+        let Err(refused) = parse(vec!["--onlynet", "cjdns"]) else {
+            panic!("--onlynet cjdns without --cjdns-reachable must be refused");
+        };
+        assert!(refused.contains("--cjdns-reachable"));
+
+        // The overlay never rides a SOCKS5 proxy.
+        let Err(proxied) = parse(vec!["--cjdns-reachable", "--proxy", "127.0.0.1:9050"]) else {
+            panic!("--cjdns-reachable combined with --proxy must be refused");
+        };
+        assert!(proxied.contains("--proxy"));
+
+        // A preferred overlay peer requires the interface declaration.
+        let overlay = "[fc32:17ea:e415:c3bf::1]:18444";
+        let Err(remote) = parse(vec!["--connect", overlay]) else {
+            panic!("an overlay --connect without --cjdns-reachable must be refused");
+        };
+        assert!(remote.contains("--cjdns-reachable"));
+        let connected = parse(vec!["--cjdns-reachable", "--connect", overlay])
+            .unwrap()
+            .unwrap();
+        assert!(connected.remotes.contains(&overlay.parse().unwrap()));
+    }
+
+    #[test]
+    fn onlynet_treats_the_overlay_as_its_own_network() {
+        let overlay: IpAddr = "fc32:17ea:e415:c3bf::1".parse().unwrap();
+        let global: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(NodeOnlyNet::Any.permits(overlay));
+        assert!(
+            !NodeOnlyNet::Ipv6.permits(overlay),
+            "an IPv6-only restriction excludes the overlay"
+        );
+        assert!(NodeOnlyNet::Ipv6.permits(global));
+        assert!(NodeOnlyNet::Cjdns.permits(overlay));
+        assert!(!NodeOnlyNet::Cjdns.permits(global));
+        assert!(!NodeOnlyNet::Cjdns.permits("1.2.3.4".parse().unwrap()));
+        assert!(!NodeOnlyNet::Cjdns.permits_onion());
+        assert!(!NodeOnlyNet::Cjdns.permits_i2p());
+    }
+
+    #[test]
     fn parses_and_bounds_peer_and_mempool_resource_budgets() {
         let options = parse_options(
             [
@@ -23127,6 +23247,7 @@ mod tests {
                 name_proxy: None,
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
             }
         );
 
@@ -23412,6 +23533,7 @@ mod tests {
                 name_proxy: None,
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -23459,6 +23581,7 @@ mod tests {
             name_proxy: None,
             v2_transport: false,
             asmap: NodeAsmapSource::Embedded,
+            cjdns_reachable: false,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -23509,6 +23632,7 @@ mod tests {
                 name_proxy: None,
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -23602,6 +23726,7 @@ mod tests {
                 name_proxy: None,
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()

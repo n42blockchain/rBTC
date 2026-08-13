@@ -66,6 +66,16 @@ const MAX_STORED_I2P_PEERS: usize = 1_024;
 const I2P_SOURCE_GROUP_FAMILY: &str = "i2p";
 /// Complete source-group value stored on every I2P record.
 const I2P_SOURCE_GROUP: &str = "i2p:0:0";
+/// Family marker for CJDNS overlay addresses.
+const CJDNS_SOURCE_GROUP_FAMILY: &str = "cjdns";
+/// Complete source-group value for every CJDNS record.
+///
+/// One marker group for the whole overlay: CJDNS addresses are derived from
+/// node public keys, so their bit patterns carry no prefix or ASN structure
+/// to diversify over, and generating fresh ones is free. Sharing one group
+/// gives the entire overlay one group's quota and one address-group's tried
+/// slots, exactly as the onion and I2P books are bounded.
+const CJDNS_SOURCE_GROUP: &str = "cjdns:0:0";
 /// Family marker for ASN-derived groups when an asmap is configured.
 ///
 /// One family for IPv4 and IPv6: the group is the autonomous system, and an
@@ -213,6 +223,12 @@ impl BucketKeys {
     /// derivation, so a lookup miss keeps unrelated prefixes in separate
     /// groups instead of collapsing them into one "unknown" group.
     fn address_group(&self, ip: IpAddr) -> String {
+        // The overlay marker outranks every other derivation: a CJDNS
+        // address is key-derived, so neither its bit prefix nor an asmap
+        // lookup says anything true about who operates it.
+        if crate::p2p::is_cjdns_address(ip) {
+            return CJDNS_SOURCE_GROUP.to_owned();
+        }
         if let Some(map) = &self.asmap {
             let asn = map.map_asn(ip);
             if asn != 0 {
@@ -227,29 +243,36 @@ impl BucketKeys {
 pub struct RedbPeerStore {
     db: Database,
     network: Network,
+    cjdns_reachable: bool,
     buckets: BucketKeys,
     write_guard: Mutex<()>,
 }
 
 impl RedbPeerStore {
     /// Opens or creates a peer database bound to `network`, deriving
-    /// address-diversity groups from IP prefixes only.
+    /// address-diversity groups from IP prefixes only and refusing CJDNS
+    /// overlay addresses.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, PeerStoreError> {
-        Self::open_with_asmap(path, network, None)
+        Self::open_with_policy(path, network, None, false)
     }
 
-    /// Opens or creates a peer database bound to `network`, deriving
-    /// address-diversity groups through `asmap` where it knows the
-    /// announcing autonomous system.
+    /// Opens or creates a peer database bound to `network` under an
+    /// explicit network policy: `asmap` widens address-diversity groups to
+    /// announcing autonomous systems where it knows them, and
+    /// `cjdns_reachable` admits `fc00::/8` overlay addresses under one
+    /// shared marker group.
     ///
-    /// The map affects bucket placement and quotas only from this process
-    /// on; records persisted under another derivation keep their stored
-    /// source groups, which remain valid, so upgrading or replacing the
-    /// map never invalidates the store.
-    pub fn open_with_asmap(
+    /// Policy affects acceptance, bucket placement, and quotas only from
+    /// this process on; records persisted under another policy keep their
+    /// stored source groups, which remain valid, so changing either input
+    /// never invalidates the store. CJDNS records persisted while the
+    /// overlay was reachable are pruned on the first mutation after it
+    /// stops being so, exactly as any other no-longer-acceptable address.
+    pub fn open_with_policy(
         path: impl AsRef<Path>,
         network: Network,
         asmap: Option<Arc<Asmap>>,
+        cjdns_reachable: bool,
     ) -> Result<Self, PeerStoreError> {
         let genesis = bitcoin::blockdata::constants::genesis_block(network)
             .block_hash()
@@ -285,12 +308,19 @@ impl RedbPeerStore {
         Ok(Self {
             db,
             network,
+            cjdns_reachable,
             buckets: BucketKeys {
                 hash_key: bucket_key,
                 asmap,
             },
             write_guard: Mutex::new(()),
         })
+    }
+
+    /// Returns whether `address` is eligible for this store under its
+    /// network policy.
+    fn acceptable(&self, address: std::net::SocketAddr) -> bool {
+        is_acceptable_peer_address_with_cjdns(address, self.network, self.cjdns_reachable)
     }
 
     /// Atomically filters and stores one peer-sourced address batch.
@@ -332,7 +362,7 @@ impl RedbPeerStore {
         records.retain(|address, record| {
             std::net::SocketAddr::from_str(address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(record, now)
             })
         });
@@ -347,9 +377,7 @@ impl RedbPeerStore {
         for address in incoming {
             let key = address.socket.to_string();
             let existing = records.get(&key);
-            if !address.services.has(required)
-                || !is_acceptable_peer_address(address.socket, self.network)
-            {
+            if !address.services.has(required) || !self.acceptable(address.socket) {
                 stats.rejected += 1;
                 continue;
             }
@@ -452,7 +480,7 @@ impl RedbPeerStore {
         now: u32,
     ) -> Result<bool, PeerStoreError> {
         let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        if !services.has(required) || !is_acceptable_peer_address(address, self.network) {
+        if !services.has(required) || !self.acceptable(address) {
             return Ok(false);
         }
         let _guard = self.write_guard.lock().expect("peer lock not poisoned");
@@ -460,7 +488,7 @@ impl RedbPeerStore {
         records.retain(|stored_address, record| {
             std::net::SocketAddr::from_str(stored_address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(record, now)
             })
         });
@@ -868,7 +896,7 @@ impl RedbPeerStore {
                 let socket = std::net::SocketAddr::from_str(&address).ok()?;
                 let services = ServiceFlags::from(record.services);
                 (services.has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(&record, now)
                     && retry_ready(&record, now))
                 .then_some((record, socket))
@@ -1496,9 +1524,10 @@ fn valid_source_group(group: &str) -> bool {
         // A name-proxy bootstrap carries one for the opposite reason: the
         // record is a routable address, but the peer that taught it had none
         // this node could see.
-        ONION_SOURCE_GROUP_FAMILY | I2P_SOURCE_GROUP_FAMILY | SEED_NAME_SOURCE_GROUP_FAMILY => {
-            first == "0" && second == "0"
-        }
+        ONION_SOURCE_GROUP_FAMILY
+        | I2P_SOURCE_GROUP_FAMILY
+        | SEED_NAME_SOURCE_GROUP_FAMILY
+        | CJDNS_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
         _ => false,
     }
 }
@@ -1847,7 +1876,7 @@ fn source_group(ip: IpAddr) -> String {
     }
 }
 
-fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
+fn acceptable_ip(ip: IpAddr, network: Network, cjdns_reachable: bool) -> bool {
     if network == Network::Regtest {
         return !ip.is_unspecified() && !ip.is_multicast();
     }
@@ -1869,13 +1898,22 @@ fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
-                return acceptable_ip(IpAddr::V4(mapped), network);
+                return acceptable_ip(IpAddr::V4(mapped), network, cjdns_reachable);
             }
             let segments = ip.segments();
+            // Within the RFC 4193 unique-local block, `fc00::/8` is the
+            // CJDNS overlay and becomes eligible exactly when a local
+            // `cjdroute` interface is declared reachable; `fd00::/8` stays
+            // unroutable unconditionally.
+            let unique_local_excluded = if crate::p2p::is_cjdns_address(IpAddr::V6(ip)) {
+                !cjdns_reachable
+            } else {
+                segments[0] & 0xfe00 == 0xfc00
+            };
             !(ip.is_unspecified()
                 || ip.is_loopback()
                 || ip.is_multicast()
-                || segments[0] & 0xfe00 == 0xfc00
+                || unique_local_excluded
                 || segments[0] & 0xffc0 == 0xfe80
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)
                 || (segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020)))
@@ -1886,9 +1924,20 @@ fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
 /// Returns whether a resolved socket is eligible for outbound use on `network`.
 ///
 /// Public networks exclude local, private, documentation, transition, multicast, and other
-/// reserved ranges. Regtest deliberately permits local addresses for isolated test networks.
+/// reserved ranges, including the whole `fc00::/7` unique-local block. Regtest deliberately
+/// permits local addresses for isolated test networks.
 pub fn is_acceptable_peer_address(address: std::net::SocketAddr, network: Network) -> bool {
-    address.port() != 0 && acceptable_ip(address.ip(), network)
+    is_acceptable_peer_address_with_cjdns(address, network, false)
+}
+
+/// Returns whether a resolved socket is eligible for outbound use on `network`,
+/// admitting `fc00::/8` CJDNS overlay addresses when `cjdns_reachable`.
+pub fn is_acceptable_peer_address_with_cjdns(
+    address: std::net::SocketAddr,
+    network: Network,
+    cjdns_reachable: bool,
+) -> bool {
+    address.port() != 0 && acceptable_ip(address.ip(), network, cjdns_reachable)
 }
 
 #[cfg(test)]
@@ -2121,10 +2170,30 @@ mod tests {
             "2001:20::1".parse().unwrap(),
             "::ffff:10.0.0.1".parse().unwrap(),
         ] {
-            assert!(!acceptable_ip(IpAddr::V6(address), Network::Bitcoin));
+            assert!(!acceptable_ip(IpAddr::V6(address), Network::Bitcoin, false));
         }
         assert!(acceptable_ip(
             IpAddr::V6("::ffff:1.1.1.1".parse().unwrap()),
+            Network::Bitcoin,
+            false
+        ));
+    }
+
+    #[test]
+    fn cjdns_acceptability_is_a_policy_decision_and_fd00_never_qualifies() {
+        let cjdns: IpAddr = "fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa".parse().unwrap();
+        let unique_local: IpAddr = "fd00::1".parse().unwrap();
+        assert!(!acceptable_ip(cjdns, Network::Bitcoin, false));
+        assert!(acceptable_ip(cjdns, Network::Bitcoin, true));
+        assert!(!acceptable_ip(unique_local, Network::Bitcoin, false));
+        assert!(
+            !acceptable_ip(unique_local, Network::Bitcoin, true),
+            "fd00::/8 is not CJDNS and stays unroutable under every policy"
+        );
+        assert!(!is_acceptable_peer_address(
+            "[fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa]:8333"
+                .parse()
+                .unwrap(),
             Network::Bitcoin
         ));
     }
@@ -2909,10 +2978,11 @@ mod tests {
             .collect::<Vec<_>>();
         let map =
             Arc::new(Asmap::from_bytes(crate::asmap::test_encoder::encode(&entries)).unwrap());
-        let grouped_by_asn = RedbPeerStore::open_with_asmap(
+        let grouped_by_asn = RedbPeerStore::open_with_policy(
             directory.path().join("asn.redb"),
             Network::Signet,
             Some(map),
+            false,
         )
         .unwrap();
         let grouped_by_prefix =
@@ -2962,10 +3032,11 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let now: u32 = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        let store = RedbPeerStore::open_with_asmap(
+        let store = RedbPeerStore::open_with_policy(
             directory.path().join("peers.redb"),
             Network::Signet,
             Some(Asmap::embedded().unwrap()),
+            false,
         )
         .unwrap();
         store
@@ -2979,6 +3050,124 @@ mod tests {
         assert_eq!(
             records["1.0.0.1:8333"].source_group, "as:15169:0",
             "a real-world source address is grouped by its announcing ASN"
+        );
+    }
+
+    #[test]
+    fn cjdns_records_are_policy_gated_and_share_one_marker_group() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let source: std::net::SocketAddr = "8.8.4.4:8333".parse().unwrap();
+        let overlay = |tail: u8| {
+            learned(
+                &format!("[fc32:17ea:e415:c3bf::{tail:x}]:8333"),
+                services,
+                now,
+            )
+        };
+
+        // Default policy: the overlay is unreachable and nothing enters.
+        let closed =
+            RedbPeerStore::open(directory.path().join("closed.redb"), Network::Signet).unwrap();
+        let stats = closed
+            .insert_discovered(source, &[overlay(1), overlay(2)], now)
+            .unwrap();
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.rejected, 2);
+        assert!(
+            !closed
+                .insert_verified(
+                    "[fc32:17ea:e415:c3bf::1]:8333".parse().unwrap(),
+                    services,
+                    now
+                )
+                .unwrap(),
+            "a verified handshake does not override the reachability policy"
+        );
+        assert!(closed.candidates(now, 16).unwrap().is_empty());
+
+        // Reachable policy: accepted, and the whole overlay is one group.
+        let open = RedbPeerStore::open_with_policy(
+            directory.path().join("open.redb"),
+            Network::Signet,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            open.buckets
+                .address_group("fc32:17ea:e415:c3bf::1".parse().unwrap()),
+            CJDNS_SOURCE_GROUP
+        );
+        let stats = open
+            .insert_discovered(source, &[overlay(1), overlay(2)], now)
+            .unwrap();
+        assert_eq!(stats.accepted, 2);
+        let stats = open
+            .insert_discovered(
+                "[fc32:17ea:e415:c3bf::9]:8333".parse().unwrap(),
+                &[learned("2.2.2.2:8333", services, now)],
+                now,
+            )
+            .unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(
+            open.load_records().unwrap()["2.2.2.2:8333"].source_group,
+            CJDNS_SOURCE_GROUP,
+            "an overlay source teaches under the shared marker group"
+        );
+        assert!(
+            open.candidates(now, 16)
+                .unwrap()
+                .iter()
+                .any(|address| crate::p2p::is_cjdns_address(address.ip())),
+            "stored overlay peers become dial candidates under the policy"
+        );
+        assert!(valid_source_group(CJDNS_SOURCE_GROUP));
+    }
+
+    #[test]
+    fn an_overlay_flood_from_many_fabricated_sources_shares_one_quota() {
+        // Overlay addresses are key-derived and free to fabricate, so a
+        // flood arrives from many "distinct" sources. Every one of them
+        // shares the single overlay marker group, so the whole flood gets
+        // one group's quota.
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open_with_policy(
+            directory.path().join("peers.redb"),
+            Network::Signet,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut accepted = 0;
+        for source in 0_u8..8 {
+            let addresses = (0_u8..16)
+                .map(|host| {
+                    learned(
+                        &format!("[fc32:17ea:e415:{source:x}::{:x}]:8333", host + 1),
+                        services,
+                        now,
+                    )
+                })
+                .collect::<Vec<_>>();
+            accepted += store
+                .insert_discovered(
+                    format!("[fc32:17ea:ffff::{:x}]:8333", source + 1)
+                        .parse()
+                        .unwrap(),
+                    &addresses,
+                    now,
+                )
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted, MAX_PEERS_PER_SOURCE_GROUP,
+            "128 fabricated overlay candidates collapse into one group quota"
         );
     }
 
