@@ -16,6 +16,13 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   disables the derivation. Data provenance and the update procedure are in
   `docs/ASMAP.md`.
 
+- Operator RPCs `addnode`, `gettxoutsetinfo`, and `getmempoolcluster`, all
+  authenticated and bounded. `addnode <ip:port> add|onetry|remove` seeds or
+  forgets a routable dial candidate; `gettxoutsetinfo [cursor,max]`
+  aggregates the UTXO set in resumable bounded windows; `getmempoolcluster
+  <txid>` reports a transaction's dependency-connected cluster with its
+  count, vsize, and the enforced cluster bounds.
+
 - Private transaction broadcast. `--private-broadcast` (config key
   `private_broadcast`) makes locally originated wallet transactions travel
   exclusively over anonymity networks — onion peers through the Tor SOCKS5

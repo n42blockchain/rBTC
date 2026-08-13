@@ -424,11 +424,18 @@ optional where appropriate, and host-runtime compatible.
   proxied-delivery path pass in-suite; semantics are in
   [PRIVATE_BROADCAST.md](PRIVATE_BROADCAST.md). Open acceptance residue: one
   end-to-end run over live Tor/I2P daemons recording no clearnet relay.
-- [ ] Operator RPC remainder: `addnode`, `gettxoutsetinfo` as a
-  bounded/interruptible full-set scan, and `getmempoolcluster` exposing the
-  existing cluster closure — each in the bounded-stable-contract style with
-  explicit ceilings and auth auditing. `getmempoolfeeratediagram` is tracked
-  with the feerate-diagram item below because it depends on linearization.
+- [x] Operator RPC remainder. Implemented 2026-08-13, all authenticated and
+  in the bounded-stable-contract style: `addnode <ip:port> add|onetry|remove`
+  seeds or forgets a routable dial candidate through the peer store (subject
+  to the same acceptability and source-group quotas, never a claimed
+  handshake); `gettxoutsetinfo [cursor,max]` aggregates the UTXO set in
+  bounded resumable windows over the fixed-memory pager, reporting each
+  window's txout count, amount, and bogosize with a continuation cursor and
+  a `complete` flag — never an unbounded pass; `getmempoolcluster <txid>`
+  exposes the existing dependency-connected cluster closure with its count,
+  vbytes, and the enforced 64-tx/101-kvB bounds, and reports a clear miss
+  for a transaction not in the pool. `getmempoolfeeratediagram` remains with
+  the feerate-diagram item below because it depends on linearization.
 - [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
   the supported conservative replacement subset remains interoperable. This
   runs as its own track: first pure linearization/chunking/diagram-comparison
@@ -466,11 +473,11 @@ correctness or security work.
 2. Exercise and publish the signed supported-platform release once the native
    signing identities are provisioned.
 3. Capability rounds, one completed and verified item per round: asmap,
-   CJDNS, and private broadcast all shipped 2026-08-13 (CJDNS and private
-   broadcast each with one live-daemon operational residue); next is the
-   operator RPC remainder. The feerate-diagram track's pure-function and
-   fuzz layer starts in parallel with these rounds; its admission-path
-   change lands only after that layer is proven, per the rationale in
-   [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
+   CJDNS, private broadcast, and the operator RPC remainder all shipped
+   2026-08-13 (CJDNS and private broadcast each with one live-daemon
+   operational residue). The remaining capability work is the feerate-diagram
+   track, whose pure-function and fuzz layer leads; its admission-path change
+   and the `getmempoolfeeratediagram` RPC land only after that layer is
+   proven, per the rationale in [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
 4. Select the remaining P2 work (GBT remainder, hot wallet, GUI, MDBX
    promotion) only from an actual deployment need.
