@@ -622,6 +622,34 @@ pub struct I2pPeerAddress {
     pub last_seen: u32,
 }
 
+/// Returns whether an address lies in the CJDNS overlay range `fc00::/8`.
+///
+/// CJDNS addresses are derived from node public keys and always start with
+/// the byte `0xfc`; they are reachable only through a local `cjdroute`
+/// interface, never over the public internet. `fd00::/8`, the other half of
+/// the RFC 4193 unique-local block, is not CJDNS and stays unroutable.
+#[must_use]
+pub const fn is_cjdns_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => false,
+        IpAddr::V6(v6) => v6.octets()[0] == 0xfc,
+    }
+}
+
+/// Encodes one routable or CJDNS socket address for a BIP155 message.
+///
+/// `fc00::/8` must travel as the dedicated CJDNS network ID: encoding it as
+/// plain IPv6 would teach peers an address they would misclassify as
+/// globally routable.
+#[must_use]
+pub fn addrv2_for_ip(ip: IpAddr) -> AddrV2 {
+    match ip {
+        IpAddr::V4(address) => AddrV2::Ipv4(address),
+        IpAddr::V6(address) if is_cjdns_address(ip) => AddrV2::Cjdns(address),
+        IpAddr::V6(address) => AddrV2::Ipv6(address),
+    }
+}
+
 /// A directly connectable IPv4 or IPv6 address learned from `addr`/`addrv2`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerAddress {
@@ -2090,19 +2118,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
             return Ok(());
         }
         if self.transport.peer_addrv2() {
-            let addr = match address.ip() {
-                IpAddr::V4(address) => AddrV2::Ipv4(address),
-                IpAddr::V6(address) => AddrV2::Ipv6(address),
-            };
             return self
                 .transport
                 .write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
                     time: last_seen,
                     services,
-                    addr,
+                    addr: addrv2_for_ip(address.ip()),
                     port: address.port(),
                 }]))
                 .await;
+        }
+        // A CJDNS address has no legacy `addr` encoding, so a peer that did
+        // not negotiate BIP155 receives nothing rather than a misclassified
+        // IPv6 entry.
+        if is_cjdns_address(address.ip()) {
+            return Ok(());
         }
         self.transport
             .write_message(NetworkMessage::Addr(vec![(
@@ -2188,11 +2218,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                     return Ok(deduplicate_addresses(addresses.into_iter().filter_map(
                         |(last_seen, address)| {
                             let socket = address.socket_addr().ok()?;
-                            (socket.port() != 0).then_some(PeerAddress {
-                                socket,
-                                services: address.services,
-                                last_seen,
-                            })
+                            // The legacy encoding has no CJDNS network ID,
+                            // so an `fc00::/8` entry here is a plain-IPv6
+                            // misclassification and is dropped; the overlay
+                            // is learned through `addrv2` only.
+                            (socket.port() != 0 && !is_cjdns_address(socket.ip())).then_some(
+                                PeerAddress {
+                                    socket,
+                                    services: address.services,
+                                    last_seen,
+                                },
+                            )
                         },
                     )));
                 }
@@ -2231,6 +2267,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
                                     last_seen: address.time,
                                 });
                                 return None;
+                            }
+                            if let AddrV2::Cjdns(overlay) = address.addr {
+                                // A CJDNS entry outside `fc00::/8` is
+                                // malformed and dropped: accepting it as
+                                // IPv6 would launder an unroutable address
+                                // into the routable pool. Whether this node
+                                // can actually dial the overlay is the peer
+                                // store's policy decision, not this parser's.
+                                let socket = SocketAddr::new(IpAddr::V6(overlay), address.port);
+                                return (address.port != 0 && is_cjdns_address(socket.ip()))
+                                    .then_some(PeerAddress {
+                                        socket,
+                                        services: address.services,
+                                        last_seen: address.time,
+                                    });
                             }
                             let socket = address.socket_addr().ok()?;
                             (socket.port() != 0).then_some(PeerAddress {
@@ -3185,7 +3236,7 @@ mod tests {
         },
     };
     use proptest::prelude::*;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::{
         io::{AsyncWriteExt, duplex},
         net::TcpListener,
@@ -3754,6 +3805,159 @@ mod tests {
             }]
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn addrv2_learns_cjdns_entries_and_refuses_their_impostors() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let overlay: Ipv6Addr = "fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa".parse().unwrap();
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+                version(1),
+            );
+            session.request_addresses().await.unwrap();
+            session.receive_addresses().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            let full_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+            transport
+                .write_message(NetworkMessage::AddrV2(vec![
+                    AddrV2Message {
+                        time: 100,
+                        services: full_services,
+                        addr: AddrV2::Cjdns(overlay),
+                        port: 8333,
+                    },
+                    AddrV2Message {
+                        time: 102,
+                        services: full_services,
+                        addr: AddrV2::Cjdns(overlay),
+                        port: 0,
+                    },
+                ]))
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            client.await.unwrap(),
+            vec![PeerAddress {
+                socket: SocketAddr::new(IpAddr::V6(overlay), 8333),
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                last_seen: 100,
+            }]
+        );
+        server.await.unwrap();
+
+        // A CJDNS network ID carrying an address outside fc00::/8 fails
+        // consensus decoding, so the whole message is a protocol error
+        // rather than a laundered IPv6 entry. The in-process guard in
+        // `receive_addresses` covers the same invariant for any payload
+        // constructed without that decoder.
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+                version(1),
+            );
+            session.request_addresses().await.unwrap();
+            session.receive_addresses().await
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            transport
+                .write_message(NetworkMessage::AddrV2(vec![AddrV2Message {
+                    time: 101,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr: AddrV2::Cjdns("fd00::1".parse().unwrap()),
+                    port: 8333,
+                }]))
+                .await
+                .unwrap();
+        });
+        assert!(
+            client.await.unwrap().is_err(),
+            "an impostor CJDNS entry is a decode failure, not an address"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_addr_entry_in_the_overlay_range_is_dropped() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let client = tokio::spawn(async move {
+            let mut session = PeerSession::new(
+                PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+                version(1),
+            );
+            session.request_addresses().await.unwrap();
+            session.receive_addresses().await.unwrap()
+        });
+        let server = tokio::spawn(async move {
+            let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+            assert!(matches!(
+                transport.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetAddr
+            ));
+            let full_services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+            let overlay: SocketAddr = "[fc32:17ea:e415:c3bf::1]:8333".parse().unwrap();
+            let routable: SocketAddr = "[2001:4860:4860::8888]:8333".parse().unwrap();
+            transport
+                .write_message(NetworkMessage::Addr(vec![
+                    (100, Address::new(&overlay, full_services)),
+                    (101, Address::new(&routable, full_services)),
+                ]))
+                .await
+                .unwrap();
+        });
+        let learned = client.await.unwrap();
+        assert_eq!(learned.len(), 1, "the legacy encoding cannot carry CJDNS");
+        assert_eq!(
+            learned[0].socket,
+            "[2001:4860:4860::8888]:8333".parse().unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cjdns_advertisement_is_bip155_only() {
+        let overlay: SocketAddr = "[fc32:17ea:e415:c3bf::1]:8333".parse().unwrap();
+        assert_eq!(
+            addrv2_for_ip(overlay.ip()),
+            AddrV2::Cjdns("fc32:17ea:e415:c3bf::1".parse().unwrap())
+        );
+        assert_eq!(
+            addrv2_for_ip("2001:4860:4860::8888".parse().unwrap()),
+            AddrV2::Ipv6("2001:4860:4860::8888".parse().unwrap()),
+            "non-overlay IPv6 keeps its own network ID"
+        );
+
+        // A peer that never negotiated BIP155 receives nothing for an
+        // overlay address rather than a misclassified IPv6 entry.
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let mut session = PeerSession::new(
+            PeerTransport::V1(V1Transport::new(client_stream, Network::Regtest.magic())),
+            version(1),
+        );
+        session
+            .advertise_address(overlay, ServiceFlags::NETWORK | ServiceFlags::WITNESS, 100)
+            .await
+            .unwrap();
+        drop(session);
+        let mut transport = V1Transport::new(server_stream, Network::Regtest.magic());
+        assert!(
+            transport.read_message().await.is_err(),
+            "the channel closes without an addr message having been written"
+        );
     }
 
     #[tokio::test]

@@ -1554,10 +1554,7 @@ async fn serve_addresses(
                     AddrV2Message {
                         time,
                         services: address.services,
-                        addr: match socket.ip() {
-                            IpAddr::V4(address) => AddrV2::Ipv4(address),
-                            IpAddr::V6(address) => AddrV2::Ipv6(address),
-                        },
+                        addr: crate::p2p::addrv2_for_ip(socket.ip()),
                         port: socket.port(),
                     }
                 })
@@ -1578,7 +1575,19 @@ async fn serve_addresses(
                 .collect(),
         )
     } else {
-        NetworkMessage::Addr(addresses)
+        // The legacy encoding has no CJDNS network ID; a stored overlay
+        // address is withheld from a non-BIP155 peer rather than served as
+        // a misclassified IPv6 entry.
+        NetworkMessage::Addr(
+            addresses
+                .into_iter()
+                .filter(|(_, address)| {
+                    address
+                        .socket_addr()
+                        .is_ok_and(|socket| !crate::p2p::is_cjdns_address(socket.ip()))
+                })
+                .collect(),
+        )
     };
     send_accounted(peer, message, upload, account, false).await
 }
