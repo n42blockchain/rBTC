@@ -106,6 +106,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "asmap_interpret"
+path = "fuzz_targets/asmap_interpret.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 
