@@ -30,7 +30,7 @@ axum = "0.8.9"
 # BIP324 v2 transport record ciphers (FSChaCha20 / FSChaCha20Poly1305 are
 # built on these primitives in `p2p_v2`).
 chacha20 = "0.9"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 fs2 = "=0.4.3"
 redb = "2.6.3"
 libmdbx = { version = "0.6.6", optional = true }
