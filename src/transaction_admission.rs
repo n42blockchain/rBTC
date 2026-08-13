@@ -1106,6 +1106,28 @@ impl TransactionAdmissionPool {
             .collect()
     }
 
+    /// Reports the dependency-connected cluster a pooled transaction belongs to.
+    ///
+    /// Returns the sorted cluster txids and their aggregate policy virtual
+    /// size, or `None` when the transaction is not in the pool. This is the
+    /// same closure the cluster-limit check computes, exposed read-only for
+    /// the `getmempoolcluster` operator RPC; the reported bounds are the
+    /// enforced [`MAX_MEMPOOL_CLUSTER_TRANSACTIONS`] and
+    /// [`MAX_MEMPOOL_CLUSTER_VBYTES`].
+    #[must_use]
+    pub fn cluster_of(&self, txid: Txid) -> Option<(Vec<Txid>, usize)> {
+        let in_pool = self
+            .entries
+            .iter()
+            .any(|entry| entry.transaction.compute_txid() == txid);
+        if !in_pool {
+            return None;
+        }
+        let cluster = self.cluster_closure(txid);
+        let vbytes = self.closure_vbytes(&cluster);
+        Some((cluster.into_iter().collect(), vbytes))
+    }
+
     /// Clones the active pool with exact fee and policy-vsize relay metadata.
     #[must_use]
     pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
@@ -3088,6 +3110,47 @@ mod tests {
             }) if txid == sixty_fifth_txid
         ));
         assert_eq!(chain_pool.snapshot(), before);
+    }
+
+    #[test]
+    fn cluster_of_reports_the_dependency_connected_closure() {
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut previous) = spend(88);
+        utxo.value_sats = 1_000_000;
+        previous.output[0].value = Amount::from_sat(990_000);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, previous.clone(), context()).unwrap();
+        let child = child(&previous, 980_000);
+        pool.admit(&store, child.clone(), context()).unwrap();
+
+        // An independent funded transaction forms its own cluster.
+        let (solo_outpoint, mut solo_utxo, solo) = spend(89);
+        solo_utxo.value_sats = 500_000;
+        store
+            .apply(&[], &[(solo_outpoint.into(), solo_utxo)])
+            .unwrap();
+        pool.admit(&store, solo.clone(), context()).unwrap();
+
+        let (members, vbytes) = pool.cluster_of(previous.compute_txid()).unwrap();
+        assert_eq!(
+            members.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([previous.compute_txid(), child.compute_txid()]),
+            "the cluster is the parent and its child, not the unrelated transaction"
+        );
+        assert_eq!(
+            vbytes,
+            pool.closure_vbytes(&pool.cluster_closure(previous.compute_txid()))
+        );
+        assert!(vbytes > 0);
+
+        let (solo_members, _) = pool.cluster_of(solo.compute_txid()).unwrap();
+        assert_eq!(solo_members, vec![solo.compute_txid()]);
+
+        assert!(
+            pool.cluster_of(Txid::from_byte_array([0x7c; 32])).is_none(),
+            "a transaction not in the pool has no cluster"
+        );
     }
 
     #[test]
