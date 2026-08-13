@@ -20,10 +20,11 @@ const LIST_KEYS: [&str; 7] = [
     "whitelist",
     "onlynet",
 ];
-const BOOL_KEYS: [&str; 11] = [
+const BOOL_KEYS: [&str; 12] = [
     "block_filter_index",
     "cjdns_reachable",
     "cleanup_validation_dir",
+    "private_broadcast",
     "dns_seeds",
     "mempool_full_rbf",
     "listen",
@@ -320,6 +321,8 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
             ("block_filter_index", false) => "--no-block-filter-index",
             ("cjdns_reachable", true) => "--cjdns-reachable",
             ("cjdns_reachable", false) => "--no-cjdns-reachable",
+            ("private_broadcast", true) => "--private-broadcast",
+            ("private_broadcast", false) => "--no-private-broadcast",
             ("cleanup_validation_dir", true) => "--cleanup-validation-dir",
             ("cleanup_validation_dir", false) => "--no-cleanup-validation-dir",
             ("dns_seeds", true) => "--dns-seeds",
@@ -431,6 +434,8 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--assume-valid"
             | "--cjdns-reachable"
             | "--no-cjdns-reachable"
+            | "--private-broadcast"
+            | "--no-private-broadcast"
             | "--automatic-hot-standbys"
             | "--background-assumeutxo"
             | "--background-chainstate-cache-bytes"
@@ -503,6 +508,7 @@ fn option_group(flag: &str) -> &'static str {
         "--asmap" => "asmap",
         "--assume-valid" | "--assumevalid" => "assumevalid",
         "--cjdns-reachable" | "--no-cjdns-reachable" => "cjdns-reachable",
+        "--private-broadcast" | "--no-private-broadcast" => "private-broadcast",
         "--automatic-hot-standbys" => "automatic-hot-standbys",
         "--cleanup-validation-dir" | "--no-cleanup-validation-dir" => "cleanup-validation-dir",
         "--block-filter-index" | "--no-block-filter-index" => "block-filter-index",
@@ -669,6 +675,18 @@ mod tests {
                 .any(|entry| entry.flag == "--no-cjdns-reachable")
         );
         assert!(parse_config("cjdns_reachable=maybe\n").is_err());
+    }
+
+    #[test]
+    fn the_private_broadcast_key_is_a_strict_bool() {
+        let entries = parse_config("private_broadcast=true\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--private-broadcast" && entry.value.is_none())
+        );
+        assert!(parse_config("private_broadcast=maybe\n").is_err());
     }
 
     #[test]

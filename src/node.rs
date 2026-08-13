@@ -770,6 +770,14 @@ pub struct NodeResourceConfig {
     /// because CJDNS traffic never traverses a SOCKS5 proxy and a proxied
     /// deployment must not be surprised by direct dials.
     pub cjdns_reachable: bool,
+    /// Whether locally originated transactions are broadcast exclusively
+    /// over anonymity networks (onion via the SOCKS5 proxy, I2P via the
+    /// SAM bridge), unlinking them from this node's routable address.
+    ///
+    /// Off by default. Requires at least one anonymity path to be
+    /// configured; a broadcast that cannot reach one fails, bounded — it
+    /// never falls back to clearnet relay.
+    pub private_broadcast: bool,
 }
 
 /// Origin of the ASN map used for peer-address diversity bucketing.
@@ -967,6 +975,7 @@ impl Default for NodeResourceConfig {
             v2_transport: false,
             asmap: NodeAsmapSource::Embedded,
             cjdns_reachable: false,
+            private_broadcast: false,
         }
     }
 }
@@ -1437,6 +1446,23 @@ fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
     }
 }
 
+fn validate_private_broadcast_options(options: &Options) -> Result<(), String> {
+    if options.resources.private_broadcast
+        && options.resources.proxy.is_none()
+        && options.i2p_sam.is_none()
+    {
+        // The option's whole promise is that a transaction never leaves
+        // over clearnet. Without a Tor SOCKS5 proxy or an I2P SAM bridge
+        // there is no anonymity path to keep that promise on, so the
+        // configuration is refused rather than silently degraded.
+        return Err(
+            "--private-broadcast requires an anonymity path: configure --proxy (Tor SOCKS5, for onion peers) or --i2psam (I2P SAM bridge), or both"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_peer_options(options: &Options) -> Result<(), String> {
     if options
         .data_dir
@@ -1500,6 +1526,7 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
             );
         }
     }
+    validate_private_broadcast_options(options)?;
     if options.resources.only_net == NodeOnlyNet::Cjdns && !options.resources.cjdns_reachable {
         return Err(
             "--onlynet cjdns requires --cjdns-reachable: without a local cjdroute interface no permitted destination exists"
@@ -3174,6 +3201,123 @@ struct WalletApiRuntime {
     pending_broadcast: Arc<tokio::sync::Mutex<Option<WalletBroadcastRequest>>>,
     compact_candidates: CompactTransactionCandidates,
     rebroadcast: Arc<RedbRebroadcastStore>,
+    /// Set exactly once, after the peer store and network resources exist,
+    /// when `--private-broadcast` is on. While set, no locally originated
+    /// transaction is ever written to a clearnet peer session or handed to
+    /// the hot-standby relay fan-out.
+    private_broadcast: std::sync::OnceLock<PrivateBroadcastContext>,
+}
+
+/// The only paths a privately broadcast transaction may travel.
+struct PrivateBroadcastContext {
+    /// Tor SOCKS5 proxy carrying onion-peer waves.
+    proxy: Option<SocketAddr>,
+    /// I2P SAM bridge; each wave creates a transient session on it, because
+    /// the node's persistent I2P destination is public identity and linking
+    /// the transaction to it would defeat the option.
+    i2p_sam: Option<SocketAddr>,
+    /// Source of onion and I2P wave targets.
+    peer_store: Option<Arc<RedbPeerStore>>,
+    message_start: bitcoin::p2p::Magic,
+}
+
+/// Distinct anonymity-network peers one private-broadcast wave contacts.
+const MAX_PRIVATE_BROADCAST_TARGETS: usize = 4;
+
+/// Sends one transaction over short-lived anonymity-network sessions.
+///
+/// Returns how many peers accepted the write. Zero is a bounded failure the
+/// caller retries later; under no circumstance does the transaction fall
+/// back to clearnet relay. Wave sessions deliberately use the v1 transport:
+/// both carriers already encrypt end to end, and a deterministic handshake
+/// beats a v2-with-retry dance on connections that live for one message.
+async fn private_broadcast_wave(
+    context: &PrivateBroadcastContext,
+    transaction: &Transaction,
+) -> usize {
+    let Some(store) = context.peer_store.as_ref() else {
+        return 0;
+    };
+    let Ok(now) = unix_time() else {
+        return 0;
+    };
+    let mut delivered = 0_usize;
+    let mut budget = MAX_PRIVATE_BROADCAST_TARGETS;
+    if let Some(proxy) = context.proxy {
+        for onion in store.onion_candidates(now, budget).unwrap_or_default() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let target = ProxyTarget::Onion(onion);
+            let sent = timeout(PEER_TIMEOUT, async {
+                let mut session = connect_proxied_target(
+                    proxy,
+                    &target,
+                    context.message_start,
+                    rand::random(),
+                    USER_AGENT.to_owned(),
+                    0,
+                    false,
+                )
+                .await?;
+                session.broadcast_transaction(transaction).await
+            })
+            .await;
+            if matches!(sent, Ok(Ok(()))) {
+                delivered += 1;
+            }
+        }
+    }
+    if let Some(bridge) = context.i2p_sam {
+        if budget > 0 {
+            let destinations = store.i2p_candidates(now, budget).unwrap_or_default();
+            if !destinations.is_empty() {
+                let session_id = format!("rbtc-private-{:016x}", rand::random::<u64>());
+                if let Ok(Ok(sam)) = timeout(
+                    PEER_TIMEOUT,
+                    I2pSamSession::create(
+                        bridge,
+                        &session_id,
+                        None,
+                        crate::i2p_sam::I2pSamConfig::default(),
+                    ),
+                )
+                .await
+                {
+                    for destination in destinations {
+                        if budget == 0 {
+                            break;
+                        }
+                        budget -= 1;
+                        let sent = timeout(PEER_TIMEOUT, async {
+                            let stream =
+                                sam.connect_stream(&destination).await.map_err(|error| {
+                                    rbtc::p2p::P2pError::Io(std::io::Error::other(
+                                        error.to_string(),
+                                    ))
+                                })?;
+                            let mut session = rbtc::p2p::complete_outbound_handshake_on_stream(
+                                stream,
+                                context.message_start,
+                                rand::random(),
+                                USER_AGENT.to_owned(),
+                                0,
+                                false,
+                            )
+                            .await?;
+                            session.broadcast_transaction(transaction).await
+                        })
+                        .await;
+                        if matches!(sent, Ok(Ok(()))) {
+                            delivered += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    delivered
 }
 
 #[derive(Default)]
@@ -6220,6 +6364,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
                 compact_candidates,
                 rebroadcast,
+                private_broadcast: std::sync::OnceLock::new(),
             })
         })
         .transpose()?;
@@ -7761,7 +7906,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} private_broadcast={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7781,6 +7926,7 @@ fn startup_configuration_summary(options: &Options) -> String {
             NodeAsmapSource::Off => "off".to_owned(),
         },
         options.resources.cjdns_reachable,
+        options.resources.private_broadcast,
         options
             .zmq_listen
             .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
@@ -8266,6 +8412,23 @@ async fn run_peer_pool_session(
     };
     if let Some(source) = &inbound_source {
         source.install_peer_store(peer_store.as_ref().map(Arc::clone));
+    }
+    if options.resources.private_broadcast {
+        if let Some(wallet) = api_runtime.as_ref().and_then(|api| api.wallet.as_ref()) {
+            let context = PrivateBroadcastContext {
+                proxy: options.resources.proxy,
+                i2p_sam: options.i2p_sam,
+                peer_store: peer_store.as_ref().map(Arc::clone),
+                message_start: options.deployments.message_start(),
+            };
+            wallet
+                .private_broadcast
+                .set(context)
+                .unwrap_or_else(|_| unreachable!("private broadcast context is set once"));
+            rbtc_info!(
+                "private broadcast active: wallet transactions travel only over anonymity networks"
+            );
+        }
     }
     let manual_remotes = options
         .remotes
@@ -11749,6 +11912,47 @@ async fn wait_for_peer_poll(
             .is_some_and(tokio::sync::oneshot::Sender::is_closed)
         {
             continue;
+        }
+        if let Some(context) = wallet.private_broadcast.get() {
+            // The clearnet session drives scheduling only. The transaction
+            // itself travels exclusively over the anonymity wave, and the
+            // hot-standby relay fan-out is deliberately skipped: standbys
+            // are clearnet sessions and not part of the anonymity path.
+            let delivered = private_broadcast_wave(context, &work.transaction).await;
+            if delivered > 0 {
+                wallet
+                    .rebroadcast
+                    .record_broadcast(work.transaction.compute_wtxid(), u64::from(unix_time()?))
+                    .map_err(|error| PeerRunError::transient(error.to_string()))?;
+                wallet.compact_candidates.insert(work.transaction.clone());
+                rbtc_info!(
+                    "privately broadcast {} to {delivered} anonymity-network peer(s)",
+                    work.transaction.compute_txid()
+                );
+                if let Some(result) = work.result {
+                    let _ = result.send(Ok(()));
+                }
+                continue;
+            }
+            rbtc_warn!(
+                "private broadcast of {} reached no anonymity-network peer; it stays queued and never falls back to clearnet",
+                work.transaction.compute_txid()
+            );
+            if let Some(result) = work.result {
+                retain_wallet_broadcast(
+                    wallet,
+                    WalletBroadcastRequest {
+                        transaction: work.transaction,
+                        fee_sats: work.fee_sats.expect("live request retains validated fee"),
+                        result,
+                    },
+                )
+                .await;
+            }
+            // Ending the poll instead of looping keeps a persistently
+            // unreachable wave from busy-spinning on the same due entry.
+            sleep.await;
+            return Ok(());
         }
         match timeout(
             PEER_TIMEOUT,
@@ -15863,6 +16067,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut v2_transport = false;
     let mut asmap_source = None;
     let mut cjdns_reachable = false;
+    let mut private_broadcast = false;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -16205,6 +16410,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-v2-transport" => v2_transport = false,
             "--cjdns-reachable" => cjdns_reachable = true,
             "--no-cjdns-reachable" => cjdns_reachable = false,
+            "--private-broadcast" => private_broadcast = true,
+            "--no-private-broadcast" => private_broadcast = false,
             "--txindex" => transaction_index = true,
             "--no-txindex" => transaction_index = false,
             "--spent-output-index" => spent_output_index = true,
@@ -17885,6 +18092,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             v2_transport,
             asmap: asmap_source.unwrap_or_default(),
             cjdns_reachable,
+            private_broadcast,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -22478,6 +22686,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            private_broadcast: std::sync::OnceLock::new(),
         };
         let (result, mut completion) = tokio::sync::oneshot::channel();
         let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
@@ -22549,6 +22758,230 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn private_broadcast_never_writes_the_transaction_to_a_clearnet_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        // The clearnet peer must observe only handshake keepalives, never a
+        // Tx. It answers pings so the poll's own liveness path is exercised
+        // rather than dying on the wire.
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(2)).await;
+            // Drain until the client hangs up, asserting no Tx ever arrives.
+            while let Ok(Ok(message)) =
+                tokio::time::timeout(Duration::from_millis(200), peer.read_message()).await
+            {
+                assert!(
+                    !matches!(message.into_payload(), NetworkMessage::Tx(_)),
+                    "a privately broadcast transaction must never reach a clearnet peer"
+                );
+            }
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            1,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let (standby_relay, mut standby_receiver) =
+            broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let transaction = wallet_broadcast_transaction();
+        // A peer store with no reachable onion/I2P candidates: the wave has
+        // nowhere to deliver, so it must report zero and keep the promise
+        // by leaving the transaction queued, not by using the session.
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let private_broadcast = std::sync::OnceLock::new();
+        private_broadcast
+            .set(PrivateBroadcastContext {
+                proxy: Some("127.0.0.1:1".parse().unwrap()),
+                i2p_sam: None,
+                peer_store: Some(peer_store),
+                message_start: Network::Regtest.magic(),
+            })
+            .unwrap_or_else(|_| unreachable!());
+        let wallet = WalletApiRuntime {
+            wallet: Arc::new(
+                EmbeddedWallet::open_or_create(
+                    directory.path().join("wallet.sqlite"),
+                    RECEIVE_DESCRIPTOR,
+                    CHANGE_DESCRIPTOR,
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            token: LocalAuthToken::new("a".repeat(32)).unwrap(),
+            token_path: directory.path().join("wallet.token"),
+            audit: AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap(),
+            scan: WalletScanConfig {
+                gap_limit: DEFAULT_WALLET_GAP_LIMIT,
+                birthday_height: 0,
+            },
+            broadcast_sender: broadcast_sender.clone(),
+            broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+            pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
+            compact_candidates: CompactTransactionCandidates::default(),
+            rebroadcast: Arc::new(
+                RedbRebroadcastStore::open(
+                    directory.path().join("rebroadcast.redb"),
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            private_broadcast,
+        };
+        let (result, mut completion) = tokio::sync::oneshot::channel();
+        assert!(
+            broadcast_sender
+                .try_send(WalletBroadcastRequest {
+                    transaction: transaction.clone(),
+                    fee_sats: 1_000,
+                    result,
+                })
+                .is_ok()
+        );
+
+        // The wave fails (no reachable target), so the poll returns without
+        // erroring the clearnet session and without completing the request.
+        wait_for_peer_poll(
+            &mut session,
+            Duration::from_millis(10),
+            Some(&wallet),
+            &standby_relay,
+            &Notify::new(),
+        )
+        .await
+        .unwrap();
+
+        // The transaction is retained for a later wave, not delivered.
+        assert!(matches!(
+            completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            wallet
+                .pending_broadcast
+                .lock()
+                .await
+                .as_ref()
+                .map(|request| request.transaction.compute_txid()),
+            Some(transaction.compute_txid()),
+            "the undeliverable transaction stays queued"
+        );
+        // Nothing was handed to the hot-standby (clearnet) relay fan-out.
+        assert!(matches!(
+            standby_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            wallet.compact_candidates.snapshot().is_empty(),
+            "an undelivered transaction is not a compact-block candidate"
+        );
+        // Closing the client lets the draining server observe end-of-stream
+        // and confirm it never read a Tx.
+        drop(session);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn private_broadcast_delivers_over_the_proxied_onion_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let onion = OnionAddress::parse(
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:8333",
+        )
+        .unwrap();
+        let transaction = wallet_broadcast_transaction();
+        let expected = transaction.clone();
+        let expected_name = onion.name().to_owned();
+
+        // One socket plays both roles: it answers the SOCKS5 CONNECT that
+        // connect_proxied_target issues, then — on that same stream, exactly
+        // as a proxy that dialed the onion service would — completes the
+        // Bitcoin inbound handshake and reads the transaction. That is the
+        // real proxied path end to end, minus the Tor circuit.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[..3], [5, 1, 0]);
+            assert_eq!(header[3], 3, "an onion destination uses the domain form");
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut name = vec![0_u8; usize::from(length[0])];
+            stream.read_exact(&mut name).await.unwrap();
+            assert_eq!(String::from_utf8(name).unwrap(), expected_name);
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            let NetworkMessage::Version(_) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected version");
+            };
+            peer.write_message(NetworkMessage::Version(peer_version(11)))
+                .await
+                .unwrap();
+            receive_client_negotiation(&mut peer).await;
+            peer.write_message(NetworkMessage::WtxidRelay)
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected),
+                "the transaction arrives over the proxied onion session"
+            );
+        });
+
+        let directory = TempDir::new().unwrap();
+        let now = unix_time().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        peer_store
+            .insert_discovered_onion(
+                &[rbtc::p2p::OnionPeerAddress {
+                    onion: onion.clone(),
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    last_seen: now - 5,
+                }],
+                now,
+            )
+            .unwrap();
+
+        let context = PrivateBroadcastContext {
+            proxy: Some(proxy_address),
+            i2p_sam: None,
+            peer_store: Some(peer_store),
+            message_start: Network::Regtest.magic(),
+        };
+        let delivered = private_broadcast_wave(&context, &transaction).await;
+        assert_eq!(
+            delivered, 1,
+            "the wave delivered to the one onion candidate"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn durable_wallet_transaction_is_rebroadcast_after_reopen() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
@@ -22604,6 +23037,7 @@ mod tests {
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
             compact_candidates: CompactTransactionCandidates::default(),
             rebroadcast: Arc::clone(&rebroadcast),
+            private_broadcast: std::sync::OnceLock::new(),
         };
 
         wait_for_peer_poll(
@@ -23200,6 +23634,39 @@ mod tests {
     }
 
     #[test]
+    fn private_broadcast_requires_an_anonymity_path() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec!["--network", "regtest", "--data-dir", "/tmp/rbtc-pb-parser"];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert!(!default.resources.private_broadcast);
+
+        // Without a single anonymity path the promise cannot be kept.
+        let Err(refused) = parse(vec!["--private-broadcast"]) else {
+            panic!("--private-broadcast without an anonymity path must be refused");
+        };
+        assert!(refused.contains("--private-broadcast"));
+
+        // A Tor SOCKS5 proxy (with seeds disabled, per the existing proxy
+        // rule) or an I2P SAM bridge each satisfy the requirement.
+        let with_proxy = parse(vec![
+            "--private-broadcast",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--no-dns-seeds",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(with_proxy.resources.private_broadcast);
+        let with_i2p = parse(vec!["--private-broadcast", "--i2psam", "127.0.0.1:7656"])
+            .unwrap()
+            .unwrap();
+        assert!(with_i2p.resources.private_broadcast);
+    }
+
+    #[test]
     fn onlynet_treats_the_overlay_as_its_own_network() {
         let overlay: IpAddr = "fc32:17ea:e415:c3bf::1".parse().unwrap();
         let global: IpAddr = "2001:4860:4860::8888".parse().unwrap();
@@ -23248,6 +23715,7 @@ mod tests {
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
 
@@ -23534,6 +24002,7 @@ mod tests {
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -23582,6 +24051,7 @@ mod tests {
             v2_transport: false,
             asmap: NodeAsmapSource::Embedded,
             cjdns_reachable: false,
+            private_broadcast: false,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -23633,6 +24103,7 @@ mod tests {
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -23727,6 +24198,7 @@ mod tests {
                 v2_transport: false,
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
+                private_broadcast: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()
@@ -27319,6 +27791,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            private_broadcast: std::sync::OnceLock::new(),
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),
