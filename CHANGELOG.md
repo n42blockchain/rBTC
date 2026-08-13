@@ -16,6 +16,13 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   disables the derivation. Data provenance and the update procedure are in
   `docs/ASMAP.md`.
 
+- Pure feerate-diagram primitives (`rbtc::feerate_diagram`): overflow-free
+  fee/size feerate comparison, validated cluster DAGs, ancestor-set greedy
+  linearization, Core-shaped chunking, and feerate-diagram comparison, with
+  property tests and a fuzz target. Groundwork for Core 31's
+  diagram-replacement rule; the admission path still runs the documented
+  conservative replacement subset until the differential gate passes.
+
 - Operator RPCs `addnode`, `gettxoutsetinfo`, and `getmempoolcluster`, all
   authenticated and bounded. `addnode <ip:port> add|onetry|remove` seeds or
   forgets a routable dial candidate; `gettxoutsetinfo [cursor,max]`

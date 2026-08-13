@@ -439,11 +439,18 @@ optional where appropriate, and host-runtime compatible.
 - [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
   the supported conservative replacement subset remains interoperable. This
   runs as its own track: first pure linearization/chunking/diagram-comparison
-  functions with fuzz targets and differential coverage against Core's
-  `cluster_linearize`, because a wrong diagram comparison silently changes
-  acceptance decisions rather than failing; the admission-path replacement
-  rule and the `getmempoolfeeratediagram` RPC land only after that layer is
-  proven.
+  functions with fuzz targets, because a wrong diagram comparison silently
+  changes acceptance decisions rather than failing; the admission-path
+  replacement rule and the `getmempoolfeeratediagram` RPC land only after
+  that layer is proven. The pure layer shipped 2026-08-13 in
+  `src/feerate_diagram.rs` — overflow-free `FeeFrac` comparison, validated
+  cluster DAGs, the ancestor-set greedy lineariser, Core-shaped chunking,
+  and piecewise-linear diagram comparison — with property tests and the
+  `feerate_diagram` fuzz target holding permutation/topology, non-increasing
+  chunk feerates, exact total preservation, concavity, and comparison
+  antisymmetry; scope, the deliberate greedy-versus-optimal gap, and the
+  live-Core differential gate for the integration phase are recorded in
+  [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md).
 
 ## Performance work policy
 
