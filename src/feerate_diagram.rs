@@ -106,22 +106,38 @@ pub enum ClusterError {
     Cycle,
     /// A transaction has non-positive virtual size.
     NonPositiveSize,
+    /// A transaction has a negative fee, which cannot enter the mempool.
+    NegativeFee,
+    /// Aggregate fee or size cannot be represented by [`FeeFrac`].
+    AggregateOutOfRange,
 }
 
 impl Cluster {
     /// Builds a cluster from per-transaction `(fee, size)` fractions and the
     /// direct-parent adjacency list.
     ///
-    /// Rejects out-of-range or self parents, non-positive sizes, and cycles,
-    /// so every later operation can assume a valid DAG with positive sizes.
+    /// Rejects out-of-range or self parents, non-positive sizes, negative fees,
+    /// aggregate values that cannot be represented by [`FeeFrac`], and cycles,
+    /// so every later operation can assume a valid mempool DAG whose ancestor
+    /// sets combine without saturation.
     pub fn new(entries: Vec<FeeFrac>, parents: Vec<Vec<usize>>) -> Result<Self, ClusterError> {
         if entries.len() != parents.len() {
             return Err(ClusterError::ParentOutOfRange);
         }
+        let mut total_fee = 0_i128;
+        let mut total_size = 0_i128;
         for entry in &entries {
             if entry.size <= 0 {
                 return Err(ClusterError::NonPositiveSize);
             }
+            if entry.fee < 0 {
+                return Err(ClusterError::NegativeFee);
+            }
+            total_fee += i128::from(entry.fee);
+            total_size += i128::from(entry.size);
+        }
+        if total_fee > i128::from(i64::MAX) || total_size > i128::from(i32::MAX) {
+            return Err(ClusterError::AggregateOutOfRange);
         }
         for (child, list) in parents.iter().enumerate() {
             for &parent in list {
@@ -589,6 +605,18 @@ mod tests {
         assert_eq!(
             Cluster::new(vec![frac(1, 0)], vec![vec![]]),
             Err(ClusterError::NonPositiveSize)
+        );
+        assert_eq!(
+            Cluster::new(vec![frac(-1, 1)], vec![vec![]]),
+            Err(ClusterError::NegativeFee)
+        );
+        assert_eq!(
+            Cluster::new(vec![frac(i64::MAX, 1), frac(1, 1)], vec![vec![], vec![]]),
+            Err(ClusterError::AggregateOutOfRange)
+        );
+        assert_eq!(
+            Cluster::new(vec![frac(1, i32::MAX), frac(1, 1)], vec![vec![], vec![]]),
+            Err(ClusterError::AggregateOutOfRange)
         );
         // 0 → 1 → 0 is a cycle.
         assert_eq!(

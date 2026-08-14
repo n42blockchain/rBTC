@@ -19,7 +19,7 @@ property tests and fuzzing *before* any admission path depends on it.
 | Piece | Core counterpart | Notes |
 | --- | --- | --- |
 | `FeeFrac` | `FeeFrac` | Fee/size fraction; feerate comparison by `i128` cross-multiplication, no division, overflow-free for all `i64`/`i32` inputs |
-| `Cluster` | cluster DAG | Validated construction: rejects out-of-range/self parents, non-positive sizes, and cycles (iterative DFS, no recursion) |
+| `Cluster` | cluster DAG | Validated construction: rejects out-of-range/self parents, non-positive sizes, negative fees, unrepresentable aggregate fee/size, and cycles (iterative DFS, no recursion) |
 | `Cluster::linearize` | ancestor-set greedy lineariser | Deterministic tie-breaks; topologically valid by construction; O(n³) worst case, microseconds at the enforced 64-transaction cluster bound, total (just slower) beyond it |
 | `chunk_linearization` | `ChunkLinearization` | Merges a strictly-higher-feerate later chunk into its predecessor; equal feerates stay separate, exactly as Core chunks |
 | `diagram_points` / `compare_diagrams` | feerate-diagram comparison | Piecewise-linear evaluation at every breakpoint of either diagram, `i128` interpolation; shorter diagrams extend flat; returns Equal / Better / Worse / Incomparable |
@@ -57,3 +57,26 @@ and GBT work already uses — with any deltas recorded in
 boundaries from the greedy-versus-optimal gap must either be closed (by
 implementing the search) or shown not to change any accept/reject decision
 Core makes on the tested corpus.
+
+## macOS fuzz acceptance
+
+On 2026-08-14, the first requested 50,000-execution smoke run found a real
+constructor-boundary defect after 4,650 executions. An input containing two
+individually representable fees whose sum exceeded `i64::MAX` was accepted as
+a `Cluster`; later chunk combination saturated that sum and violated exact
+total preservation. Replaying the saved artifact reproduced the assertion.
+
+`Cluster::new` now rejects negative fees and aggregate fee/size values that
+cannot be represented by `FeeFrac`. The saved artifact then completed without
+a crash, the constructor boundary has direct unit coverage, and a fresh run
+completed all 50,000 executions with no crash:
+
+```bash
+cd fuzz
+cargo +nightly-2026-07-13 fuzz run feerate_diagram \
+  corpus/feerate_diagram -- -runs=50000 -max_len=2048
+```
+
+This establishes the requested bounded smoke gate and demonstrates why the
+fuzz target remains part of the integration gate; it is not an exhaustion
+claim for arbitrary cluster graphs.
