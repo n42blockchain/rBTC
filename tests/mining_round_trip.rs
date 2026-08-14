@@ -90,7 +90,22 @@ async fn rpc(address: SocketAddr, method: &str, params: serde_json::Value) -> se
         "POST /rpc HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {RPC_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut stream = timeout(Duration::from_secs(10), async {
+        loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // `NodeBuilder::launch` returns before the API task has
+                    // necessarily bound its socket. Treat that startup window
+                    // as readiness, not as an RPC failure.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("connect to the RPC route: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the RPC route starts listening");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
@@ -118,6 +133,11 @@ async fn a_block_built_from_a_template_is_accepted_and_reported_as_connected() {
     let directory = TempDir::new().unwrap();
     let token_path = directory.path().join("rpc.token");
     std::fs::write(&token_path, RPC_TOKEN).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let handle = NodeBuilder::new(Network::Regtest, directory.path())
         .connect(remote)
         .api(NodeApiConfig {

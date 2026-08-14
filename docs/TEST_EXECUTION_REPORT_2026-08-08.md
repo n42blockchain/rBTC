@@ -862,3 +862,54 @@ inactive capture. Neither `seed.testnet4.bitcoin.sprovoost.nl` nor
 traditional-DNS packet-capture item. It does not claim that a port 53 capture
 can identify encrypted DNS inside unrelated HTTPS or TLS traffic; the product
 path's stronger process-specific evidence remains the resolver-start counter.
+
+### `afbcc1e` Mac task rerun and fuzz gate — 2026-08-14
+
+The branch was fast-forwarded from `99c3e4d` to `afbcc1e`, bringing in the
+asmap, CJDNS, private-broadcast, operator-RPC, and pure feerate-diagram rounds.
+The locked library baseline was green: `761 passed; 0 failed; 3 ignored` in
+`30.61s`.
+
+The two new fuzz targets were run with `cargo-fuzz` 0.13.2 and
+`nightly-2026-07-13`, each with the task-book limits. `asmap_interpret`
+completed 50,000 executions with no crash. The initial `feerate_diagram` run
+found a reproducible assertion after 4,650 executions: a cluster whose
+individually representable positive fees summed above `i64::MAX` was accepted,
+then chunk combination saturated the aggregate and failed exact-total
+preservation. This was a product invariant defect, not an environment failure.
+The cluster constructor was tightened to reject negative fees and aggregate
+fee/size values outside `FeeFrac`'s representation. The saved input then
+passed, and a new 50,000-execution run completed with no crash.
+
+The complete live-daemon anonymity gate was also rerun on the new head:
+
+```bash
+RBTC_TOR_CONTROL=127.0.0.1:9051 \
+RBTC_TOR_COOKIE=/tmp/rbtc-nettest/tor/data/control_auth_cookie \
+RBTC_TOR_SOCKS=127.0.0.1:9050 RBTC_I2P_SAM=127.0.0.1:7656 \
+  cargo test --release --all-features --test anonymity_network_interop \
+  -- --ignored --nocapture
+```
+
+Result: `5 passed; 0 failed` in `162.67s`. This covers the real Tor onion
+round trip, stable/reusable SAM destinations, non-loopback SAM refusal, the
+real `run_listener_with_i2p` inbound branch, and shared-bridge two-node I2P
+`addrv2` exchange in both directions. Tor 0.4.9.11 and i2pd 2.61.0 were the
+external daemons. The live funded-wallet private-broadcast capture is a
+separate task and is not claimed by this gate.
+
+The first all-features integration run then exposed two setup defects in
+`mining_round_trip`. The test created its RPC token with the caller's umask;
+under the Mac's `022` umask this produced mode `0644`, so the node correctly
+failed closed before binding its API. The test now explicitly sets mode `0600`
+on Unix. Its RPC helper also waits up to ten seconds for socket readiness after
+`NodeBuilder::launch`, while still failing immediately on connect errors other
+than the expected pre-bind `ConnectionRefused`. Both changes are confined to
+the integration harness; node startup and RPC behaviour are unchanged.
+
+After both fixes, `cargo test --locked --all-features` completed successfully.
+Its library portion reported `791 passed; 0 failed; 5 ignored`; every
+non-ignored integration and doc test also passed, including the repaired
+mining round trip (`1/1` in `2.16s`). The ignored groups remained explicitly
+environment-gated; the five anonymity cases among them are covered by the
+separate real-daemon command and result above.

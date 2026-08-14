@@ -84,3 +84,16 @@ removing the map never invalidates the peer store.
   or operator-supplied.
 - ASN 0 is reserved (RFC 7607) and is this module's "unknown"; it is
   unencodable in the format's ASN operand and never becomes a group.
+
+## macOS fuzz acceptance
+
+On 2026-08-14, the `asmap_interpret` target completed 50,000 executions under
+`cargo-fuzz` 0.13.2 and `nightly-2026-07-13` with no crash:
+
+```bash
+cd fuzz
+cargo +nightly-2026-07-13 fuzz run asmap_interpret \
+  corpus/asmap_interpret -- -runs=50000 -max_len=65552
+```
+
+This is a bounded smoke run, not a replacement for continuous fuzzing.
