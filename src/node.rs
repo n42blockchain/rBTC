@@ -3510,6 +3510,7 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "rbtc.scanchainstate",
     "gettxoutsetinfo",
     "getmempoolcluster",
+    "getmempoolfeeratediagram",
     "listbanned",
     "setban",
     "addnode",
@@ -3890,6 +3891,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "rbtc.scanchainstate"
                 | "gettxoutsetinfo"
                 | "getmempoolcluster"
+                | "getmempoolfeeratediagram"
         ) {
             return Some(
                 if matches!(
@@ -4377,6 +4379,51 @@ impl NodeRpcOperator {
                 "vbytes": vbytes,
                 "max_count": MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
                 "max_vbytes": MAX_MEMPOOL_CLUSTER_VBYTES,
+            }));
+        }
+        if method == "getmempoolfeeratediagram" {
+            let values = params.as_array().ok_or_else(invalid)?;
+            if values.len() != 1 {
+                return Err(invalid());
+            }
+            let txid = values[0]
+                .as_str()
+                .and_then(|value| Txid::from_str(value).ok())
+                .ok_or_else(invalid)?;
+            let chunks = self
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cluster_feerate_diagram(txid)
+                .ok_or(LocalRpcOperatorError {
+                    code: -5,
+                    message: "Transaction not in mempool",
+                })?;
+            // The same chunks the replacement rule compares: non-increasing
+            // feerate, with the cumulative (size, fee) points tracing the
+            // concave diagram.
+            let mut cumulative_size = 0_i128;
+            let mut cumulative_fee = 0_i128;
+            let mut points = vec![serde_json::json!({"size": 0, "fee": 0})];
+            let chunk_values = chunks
+                .iter()
+                .map(|chunk| {
+                    cumulative_size += i128::from(chunk.size);
+                    cumulative_fee += i128::from(chunk.fee);
+                    points.push(serde_json::json!({
+                        "size": cumulative_size,
+                        "fee": cumulative_fee,
+                    }));
+                    serde_json::json!({
+                        "vbytes": chunk.size,
+                        "fee_sats": chunk.fee,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(serde_json::json!({
+                "txid": txid.to_string(),
+                "chunks": chunk_values,
+                "diagram": points,
             }));
         }
         let source = self.source.as_ref().ok_or_else(unavailable)?;
@@ -19516,6 +19563,46 @@ mod tests {
             assert_eq!(
                 operator
                     .execute("getmempoolcluster", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn getmempoolfeeratediagram_rpc_reports_a_miss_and_validates_params() {
+        // Diagram correctness lives with the admission and pure-layer
+        // tests; this exercises the RPC dispatch and error surface.
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: None,
+        };
+        let absent = operator
+            .execute(
+                "getmempoolfeeratediagram",
+                &serde_json::json!([Txid::from_byte_array([0x35; 32]).to_string()]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent.code, -5);
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!(["not-a-txid"]),
+            serde_json::json!([Txid::from_byte_array([0x35; 32]).to_string(), 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("getmempoolfeeratediagram", &invalid)
                     .unwrap()
                     .unwrap_err()
                     .code,
