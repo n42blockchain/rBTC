@@ -261,9 +261,10 @@ optional where appropriate, and host-runtime compatible.
   one-parent/one-child package fee bumping, ephemeral dust, bounded orphan work,
   rolling minimum fee, persistence/reorg recovery, full-RBF default, and
   estimator bounds are implemented with atomic adversarial tests. Replacement
-  remains a documented conservative subset: exact Core feerate-diagram and
-  sibling-eviction ordering are P2 policy-fidelity work, not a consensus or
-  network-interoperability requirement.
+  adopted Core 31's feerate-diagram rule on 2026-08-14 and passed a live
+  replacement differential; TRUC sibling-eviction ordering remains P2
+  policy-fidelity work, not a consensus or network-interoperability
+  requirement.
 - [x] **Operator configuration and diagnostics.** The library/CLI now share
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
@@ -436,21 +437,20 @@ optional where appropriate, and host-runtime compatible.
   vbytes, and the enforced 64-tx/101-kvB bounds, and reports a clear miss
   for a transaction not in the pool. `getmempoolfeeratediagram` remains with
   the feerate-diagram item below because it depends on linearization.
-- [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
-  the supported conservative replacement subset remains interoperable. This
-  runs as its own track: first pure linearization/chunking/diagram-comparison
-  functions with fuzz targets, because a wrong diagram comparison silently
-  changes acceptance decisions rather than failing; the admission-path
-  replacement rule and the `getmempoolfeeratediagram` RPC land only after
-  that layer is proven. The pure layer shipped 2026-08-13 in
-  `src/feerate_diagram.rs` — overflow-free `FeeFrac` comparison, validated
-  cluster DAGs, the ancestor-set greedy lineariser, Core-shaped chunking,
-  and piecewise-linear diagram comparison — with property tests and the
-  `feerate_diagram` fuzz target holding permutation/topology, non-increasing
-  chunk feerates, exact total preservation, concavity, and comparison
-  antisymmetry; scope, the deliberate greedy-versus-optimal gap, and the
-  live-Core differential gate for the integration phase are recorded in
-  [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md).
+- [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering.
+  The pure layer shipped 2026-08-13 in `src/feerate_diagram.rs` with property
+  tests and a fuzz target (which caught a real constructor-boundary overflow
+  on its first 50,000-run smoke). The admission integration landed
+  2026-08-14: replacement now requires the affected clusters' diagram to be
+  strictly better, with signaling, absolute-fee, incremental-fee, and
+  eviction-bound rules retained and the per-direct-conflict feerate
+  heuristic retired; `getmempoolfeeratediagram` serves the compared chunks.
+  A live differential against Bitcoin Core v31.0.0 agreed on all fourteen
+  verdicts across six scenarios, including the case the retired heuristic
+  decided wrongly; evidence in [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md)
+  and [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md). Open remainder: TRUC
+  sibling-eviction ordering, and a rolling-minimum pressure harness for the
+  rich-parent package-feerate differential.
 
 ## Performance work policy
 

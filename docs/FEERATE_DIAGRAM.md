@@ -33,30 +33,45 @@ Invariants held by tests and the `feerate_diagram` fuzz target:
 - malformed inputs (bad orders, bad graphs) are rejected or ignored,
   never a panic, at and beyond the enforced cluster bound.
 
-## What is deliberately not yet implemented
+## Admission integration (completed 2026-08-14)
 
-- **Admission integration.** The replacement rule in
-  `transaction_admission.rs` still runs the conservative subset. Swapping
-  it to diagram comparison is the next phase of this track and lands only
-  with the differential gate below.
+The replacement rule in `transaction_admission.rs` now runs the diagram
+comparison. `prepare_replacement` captures the affected clusters — the
+conflicts' clusters and the clusters of the package's in-pool parents —
+and their chunked diagram *before* any mutation; after the package is
+appended and the cluster bounds validated, the survivors plus the accepted
+transactions are re-clustered and the replacement is accepted only when
+`compare_diagrams(new, old)` is strictly `Better`. The BIP125 signaling
+requirement, the absolute-fee rule, the incremental-fee rule, and the
+100-eviction bound stay as independent gates; the retired rule is only the
+per-direct-conflict feerate heuristic, whose feerate question the diagram
+now answers exactly. `getmempoolfeeratediagram <txid>` serves the same
+chunks the rule compares, beside `getmempoolcluster`.
+
+### Differential gate — passed
+
+The live gate ran on 2026-08-14 against the official Bitcoin Core v31.0.0
+binary (`tests/core_replacement_differential.rs`): fourteen verdicts over
+six scenarios, all agreeing, including the flagship divergence the old
+heuristic decided wrongly (a replacement out-rating its direct conflict
+while evicting a rich CPFP descendant — both implementations reject on the
+feerate question, where the retired rule accepted). The full scenario list
+and residues are recorded in
+[CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
+
+## What deliberately remains open
+
 - **Optimal linearization.** Core refines the ancestor-set greedy result
-  with a bounded search and post-linearization passes. The greedy baseline
-  is a valid linearization (Core itself falls back to it under its search
-  budget), but chunk boundaries can differ from Core's on some clusters.
-  This matters exactly when the admission path starts comparing diagrams,
-  which is why the differential gate is part of that phase, not this one.
-- **`getmempoolfeeratediagram`.** The RPC serves what the admission path
-  computes; it lands with the integration.
-
-## Acceptance gate for the integration phase
-
-Differential replacement decisions against a live Bitcoin Core 31 daemon on
-an identical mempool — the same regtest differential harness the consensus
-and GBT work already uses — with any deltas recorded in
-[CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md). Divergent chunk
-boundaries from the greedy-versus-optimal gap must either be closed (by
-implementing the search) or shown not to change any accept/reject decision
-Core makes on the tested corpus.
+  with a bounded search. On the differential corpus the greedy baseline
+  produced no accept/reject divergence; a corpus that splits them would
+  reopen this item, and the differential test is the instrument that would
+  catch it.
+- **TRUC sibling-eviction ordering** — not implemented; tracked on the
+  roadmap item.
+- **Rich-parent package-feerate differential under pressure** — the
+  exclusion rule itself is implemented and unit-tested; comparing it
+  against Core needs a rolling-minimum pressure harness, recorded in
+  [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
 
 ## macOS fuzz acceptance
 

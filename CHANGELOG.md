@@ -6,6 +6,18 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ## [Unreleased]
 
+### Changed
+
+- Mempool replacement now follows Bitcoin Core 31's cluster rule: a
+  replacement is accepted only when the affected clusters' feerate diagram
+  is strictly better afterwards. The BIP125 signaling, absolute-fee,
+  incremental-fee, and eviction-bound rules are unchanged; retired is only
+  the former "feerate must exceed each direct conflict" heuristic, whose
+  question the diagram answers exactly. A live differential against Bitcoin
+  Core v31.0.0 agreed on every verdict, including the rich-descendant
+  eviction the old heuristic accepted wrongly. The new authenticated
+  `getmempoolfeeratediagram` RPC reports the chunks the rule compares.
+
 ### Added
 
 - ASN-based peer-address diversity (asmap). A Core-compatible asmap
