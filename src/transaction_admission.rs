@@ -191,18 +191,19 @@ pub enum TransactionAdmissionError {
     /// A replacement package added an input from an unrelated unconfirmed transaction.
     #[error("replacement adds unconfirmed input {0}")]
     ReplacementAddsUnconfirmedInput(OutPoint),
-    /// A replacement's feerate did not strictly exceed one direct conflict.
-    #[error(
-        "replacement feerate {replacement_fee_rate_sat_kvb} sat/kvB does not exceed direct conflict {conflict_txid} at {conflict_fee_rate_sat_kvb} sat/kvB"
-    )]
-    InsufficientReplacementFeerate {
-        /// Replacement transaction or package feerate.
-        replacement_fee_rate_sat_kvb: u64,
-        /// Directly conflicting transaction.
-        conflict_txid: Txid,
-        /// Direct conflict's individual feerate.
-        conflict_fee_rate_sat_kvb: u64,
+    /// A replacement would not leave the affected clusters' feerate diagram
+    /// strictly better than before, which is Core 31's acceptance rule.
+    #[error("replacement does not strictly improve the affected feerate diagram ({comparison:?})")]
+    ReplacementDiagramNotImproved {
+        /// How the post-replacement diagram compared to the original.
+        comparison: crate::feerate_diagram::DiagramComparison,
     },
+    /// The affected clusters could not be expressed as a feerate diagram.
+    ///
+    /// Unreachable for any pool state within the enforced cluster bounds;
+    /// kept as a fail-closed rejection rather than a panic.
+    #[error("replacement feerate diagram could not be built: {0}")]
+    ReplacementDiagramUnavailable(&'static str),
     /// A replacement did not pay more than all transactions it would remove.
     #[error(
         "replacement fee {replacement_fee_sats} sat does not exceed conflicting fee {conflicts_fee_sats} sat"
@@ -428,6 +429,11 @@ struct ReplacementPlan {
     txids: BTreeSet<Txid>,
     conflicts_fee_sats: u64,
     direct_conflicts: BTreeMap<Txid, (u64, usize)>,
+    /// Chunked feerate diagram of every affected cluster before mutation.
+    old_chunks: Vec<crate::feerate_diagram::FeeFrac>,
+    /// Affected transactions that survive the eviction, to be re-clustered
+    /// with the accepted package for the post-replacement diagram.
+    affected_survivors: BTreeSet<Txid>,
 }
 
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
@@ -1128,6 +1134,27 @@ impl TransactionAdmissionPool {
         Some((cluster.into_iter().collect(), vbytes))
     }
 
+    /// Reports the chunked feerate diagram of the cluster containing `txid`,
+    /// or `None` when the transaction is not pooled.
+    ///
+    /// The chunks are the same ones the replacement rule compares, exposed
+    /// read-only for the `getmempoolfeeratediagram` operator RPC.
+    #[must_use]
+    pub fn cluster_feerate_diagram(
+        &self,
+        txid: Txid,
+    ) -> Option<Vec<crate::feerate_diagram::FeeFrac>> {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.transaction.compute_txid() == txid)
+        {
+            return None;
+        }
+        let affected = self.cluster_closure(txid);
+        self.diagram_chunks_for(&affected).ok()
+    }
+
     /// Clones the active pool with exact fee and policy-vsize relay metadata.
     #[must_use]
     pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
@@ -1259,6 +1286,22 @@ impl TransactionAdmissionPool {
             replacement_vbytes,
             &replacement.direct_conflicts,
         )?;
+        if !replacement.txids.is_empty() {
+            // Core 31's cluster-mempool acceptance rule: the affected
+            // clusters' feerate diagram must be strictly better after the
+            // replacement. The anti-DoS fee rules above stay as cheap
+            // gates; this is the semantic decision.
+            let mut new_affected = replacement.affected_survivors.clone();
+            new_affected.extend(accepted.iter().copied());
+            let new_chunks = self.diagram_chunks_for(&new_affected)?;
+            let comparison =
+                crate::feerate_diagram::compare_diagrams(&new_chunks, &replacement.old_chunks);
+            if comparison != crate::feerate_diagram::DiagramComparison::Better {
+                return Err(TransactionAdmissionError::ReplacementDiagramNotImproved {
+                    comparison,
+                });
+            }
+        }
         let protected = accepted.iter().copied().collect::<BTreeSet<_>>();
         let evicted = self.evict_to_capacity(&protected)?;
         Ok(PackageAdmissionOutcome {
@@ -1354,6 +1397,32 @@ impl TransactionAdmissionPool {
             .iter()
             .filter(|entry| txids.contains(&entry.transaction.compute_txid()))
             .fold(0_u64, |total, entry| total.saturating_add(entry.fee_sats));
+        // Capture the affected diagram before any mutation. The affected set
+        // spans every cluster the replacement touches: the conflicts'
+        // clusters and the clusters of the package's in-pool parents, whose
+        // shape the accepted package will change.
+        let mut affected = BTreeSet::new();
+        for txid in &direct_conflicts {
+            affected.extend(self.cluster_closure(*txid));
+        }
+        for transaction in ordered {
+            for input in &transaction.input {
+                let parent = input.previous_output.txid;
+                if !affected.contains(&parent)
+                    && self
+                        .entries
+                        .iter()
+                        .any(|entry| entry.transaction.compute_txid() == parent)
+                {
+                    affected.extend(self.cluster_closure(parent));
+                }
+            }
+        }
+        let old_chunks = self.diagram_chunks_for(&affected)?;
+        let affected_survivors = affected
+            .difference(&txids)
+            .copied()
+            .collect::<BTreeSet<_>>();
         self.entries
             .retain(|entry| !txids.contains(&entry.transaction.compute_txid()));
         self.rebuild_indexes();
@@ -1361,6 +1430,8 @@ impl TransactionAdmissionPool {
             txids,
             conflicts_fee_sats,
             direct_conflicts: direct_conflict_fees_and_sizes,
+            old_chunks,
+            affected_survivors,
         })
     }
 
@@ -1716,6 +1787,69 @@ impl TransactionAdmissionPool {
         cluster
     }
 
+    /// Builds the combined chunked feerate diagram of the clusters covering
+    /// `affected`, which must be closed under clustering in the current pool.
+    ///
+    /// Each cluster is linearized and chunked independently; chunks of
+    /// independent clusters merge into one diagram in non-increasing feerate
+    /// order, exactly as Core aggregates affected clusters for its
+    /// replacement comparison.
+    fn diagram_chunks_for(
+        &self,
+        affected: &BTreeSet<Txid>,
+    ) -> Result<Vec<crate::feerate_diagram::FeeFrac>, TransactionAdmissionError> {
+        use crate::feerate_diagram::{Cluster, FeeFrac, chunk_linearization};
+        let unavailable = TransactionAdmissionError::ReplacementDiagramUnavailable;
+        let mut chunks: Vec<FeeFrac> = Vec::new();
+        let mut visited: BTreeSet<Txid> = BTreeSet::new();
+        for txid in affected {
+            if visited.contains(txid) {
+                continue;
+            }
+            let members = self.cluster_closure(*txid);
+            if !members.iter().all(|member| affected.contains(member)) {
+                return Err(unavailable("affected transactions must be cluster-closed"));
+            }
+            visited.extend(members.iter().copied());
+            let ordered_members = members.iter().copied().collect::<Vec<_>>();
+            let index_of = ordered_members
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, member)| (member, index))
+                .collect::<BTreeMap<_, _>>();
+            let mut fractions = Vec::with_capacity(ordered_members.len());
+            let mut parents: Vec<Vec<usize>> = Vec::with_capacity(ordered_members.len());
+            for member in &ordered_members {
+                let entry = self
+                    .entries
+                    .iter()
+                    .find(|entry| entry.transaction.compute_txid() == *member)
+                    .ok_or(unavailable("affected transaction left the pool"))?;
+                let fee = i64::try_from(entry.fee_sats)
+                    .map_err(|_| unavailable("fee exceeds the diagram range"))?;
+                let size = i32::try_from(entry.policy_vsize)
+                    .map_err(|_| unavailable("size exceeds the diagram range"))?;
+                fractions.push(FeeFrac::new(fee, size));
+                let mut direct = entry
+                    .transaction
+                    .input
+                    .iter()
+                    .filter_map(|input| index_of.get(&input.previous_output.txid).copied())
+                    .collect::<Vec<_>>();
+                direct.sort_unstable();
+                direct.dedup();
+                parents.push(direct);
+            }
+            let cluster = Cluster::new(fractions, parents)
+                .map_err(|_| unavailable("affected cluster is not representable"))?;
+            let order = cluster.linearize();
+            chunks.extend(chunk_linearization(cluster.fractions(), &order));
+        }
+        chunks.sort_by(|left, right| right.feerate_cmp(*left));
+        Ok(chunks)
+    }
+
     fn validate_cluster_limits(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
         let mut validated = BTreeSet::new();
         for txid in accepted {
@@ -1978,22 +2112,11 @@ fn validate_replacement_fees(
     if direct_conflicts.is_empty() {
         return Ok(());
     }
-    let replacement_fee_rate_sat_kvb = fee_rate_sat_kvb(replacement_fee_sats, replacement_vbytes);
-    if let Some((conflict_txid, conflict_fee_rate_sat_kvb)) =
-        direct_conflicts
-            .iter()
-            .find_map(|(txid, (fee_sats, vbytes))| {
-                let conflict_fee_rate_sat_kvb = fee_rate_sat_kvb(*fee_sats, *vbytes);
-                (replacement_fee_rate_sat_kvb <= conflict_fee_rate_sat_kvb)
-                    .then_some((*txid, conflict_fee_rate_sat_kvb))
-            })
-    {
-        return Err(TransactionAdmissionError::InsufficientReplacementFeerate {
-            replacement_fee_rate_sat_kvb,
-            conflict_txid,
-            conflict_fee_rate_sat_kvb,
-        });
-    }
+    // The former "feerate must exceed each direct conflict" heuristic is
+    // gone: the feerate-diagram comparison decides the feerate question
+    // exactly, over the whole affected clusters. What remains here are
+    // Core's anti-DoS fee rules, which the diagram deliberately does not
+    // subsume.
     if replacement_fee_sats <= conflicts_fee_sats {
         return Err(TransactionAdmissionError::InsufficientReplacementFee {
             replacement_fee_sats,
@@ -2011,6 +2134,9 @@ fn validate_replacement_fees(
     Ok(())
 }
 
+/// Retained for tests: production feerate decisions now go through the
+/// feerate-diagram comparison rather than scalar rates.
+#[cfg(test)]
 fn fee_rate_sat_kvb(fee_sats: u64, vbytes: usize) -> u64 {
     u64::try_from(
         u128::from(fee_sats).saturating_mul(u128::from(SATOSHIS_PER_KVB))
@@ -3154,6 +3280,39 @@ mod tests {
     }
 
     #[test]
+    fn cluster_feerate_diagram_merges_a_cpfp_pair_into_one_chunk() {
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut parent) = spend(151);
+        utxo.value_sats = 1_000_000;
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        // A low-rate parent and a high-fee child chunk together.
+        parent.output[0].value = Amount::from_sat(1_000_000 - 300);
+        let bumped = child(&parent, 1_000_000 - 300 - 40_000);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent.clone(), context()).unwrap();
+        pool.admit(&store, bumped.clone(), context()).unwrap();
+
+        let chunks = pool
+            .cluster_feerate_diagram(parent.compute_txid())
+            .expect("the parent is pooled");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the child's fee lifts its parent into one chunk"
+        );
+        assert_eq!(chunks[0].fee, 300 + 40_000);
+        assert_eq!(
+            chunks,
+            pool.cluster_feerate_diagram(bumped.compute_txid()).unwrap(),
+            "every cluster member reports the same diagram"
+        );
+        assert!(
+            pool.cluster_feerate_diagram(Txid::from_byte_array([0x7d; 32]))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn cluster_virtual_size_limit_rejects_atomically() {
         fn pad(transaction: &mut Transaction) {
             let mut script = vec![opcodes::all::OP_RETURN.to_u8()];
@@ -3396,7 +3555,13 @@ mod tests {
     }
 
     #[test]
-    fn replacement_must_strictly_raise_each_direct_conflict_feerate() {
+    fn replacement_must_strictly_improve_the_feerate_diagram() {
+        // A larger replacement that raises the absolute fee but lowers the
+        // feerate makes the diagram incomparable (ahead in total fee, behind
+        // at the original's size), so it is refused; paying a strictly
+        // higher rate over the larger size improves the diagram everywhere
+        // and is accepted. The pre-diagram rule reached the same two
+        // verdicts here through the per-conflict feerate heuristic.
         let (_directory, store) = store();
         let (first_outpoint, first_utxo, mut original) = spend(107);
         let (second_outpoint, second_utxo, second_spend) = spend(108);
@@ -3410,7 +3575,6 @@ mod tests {
             )
             .unwrap();
         signal_rbf(&mut original);
-        let original_txid = original.compute_txid();
         let original_fee = 10_000;
         let original_rate = fee_rate_sat_kvb(original_fee, original.vsize());
         let mut replacement = original.clone();
@@ -3420,23 +3584,15 @@ mod tests {
         replacement.output[0].value = Amount::from_sat(200_000 - lower_rate_fee);
         let lower_rate = fee_rate_sat_kvb(lower_rate_fee, replacement_vbytes);
         assert!(lower_rate <= original_rate);
-        assert_eq!(
-            lower_rate_fee - original_fee,
-            u64::try_from(replacement_vbytes).unwrap()
-        );
 
         let mut pool = TransactionAdmissionPool::default();
         pool.admit(&store, original, context()).unwrap();
         let before = pool.snapshot();
         assert!(matches!(
             pool.admit(&store, replacement.clone(), context()),
-            Err(TransactionAdmissionError::InsufficientReplacementFeerate {
-                replacement_fee_rate_sat_kvb,
-                conflict_txid,
-                conflict_fee_rate_sat_kvb,
-            }) if replacement_fee_rate_sat_kvb == lower_rate
-                && conflict_txid == original_txid
-                && conflict_fee_rate_sat_kvb == original_rate
+            Err(TransactionAdmissionError::ReplacementDiagramNotImproved {
+                comparison: crate::feerate_diagram::DiagramComparison::Incomparable,
+            })
         ));
         assert_eq!(pool.snapshot(), before);
         assert!(store.get(second_outpoint.into()).unwrap().is_some());
@@ -3459,6 +3615,70 @@ mod tests {
             } if txid == replacement_txid
         ));
         assert_eq!(txids(&pool), vec![replacement_txid]);
+    }
+
+    #[test]
+    fn a_replacement_evicting_a_rich_descendant_must_beat_its_chunk() {
+        // The flagship divergence from the pre-diagram rule. Original: a
+        // low-rate parent whose high-fee child forms one high-feerate chunk
+        // with it. A big replacement can out-pay the pair in *absolute* fee
+        // and out-rate the *direct conflict* alone — the old heuristic's
+        // whole test — while its own single chunk sits far below the pair's
+        // chunk feerate early in the diagram. The diagram rule sees the
+        // crossing and refuses.
+        let (_directory, store) = store();
+        let (outpoint, mut utxo, mut parent) = spend(150);
+        utxo.value_sats = 1_000_000;
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        signal_rbf(&mut parent);
+        // Parent pays a token rate; its child bumps the pair hard.
+        parent.output[0].value = Amount::from_sat(1_000_000 - 200);
+        let bumped = child(&parent, 1_000_000 - 200 - 50_000);
+        let parent_vsize = parent.vsize();
+        let pair_fee = 200 + 50_000;
+
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent.clone(), context()).unwrap();
+        pool.admit(&store, bumped, context()).unwrap();
+
+        // The replacement conflicts with the parent, evicting the pair. Pad
+        // it well past the pair's size and pay more than their combined fee
+        // plus the incremental floor, at a feerate above the tiny parent's
+        // own rate — every pre-diagram check passes.
+        let mut replacement = parent.clone();
+        let mut padding = vec![opcodes::all::OP_RETURN.to_u8()];
+        padding.extend(vec![opcodes::OP_0.to_u8(); 4_000]);
+        replacement.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(padding),
+        });
+        let replacement_fee = pair_fee + 10_000;
+        replacement.output[0].value = Amount::from_sat(1_000_000 - replacement_fee);
+        let replacement_vsize = replacement.vsize();
+        assert!(replacement_vsize > parent_vsize + 4_000);
+        assert!(
+            fee_rate_sat_kvb(replacement_fee, replacement_vsize)
+                > fee_rate_sat_kvb(200, parent_vsize),
+            "the old per-direct-conflict heuristic would have passed"
+        );
+        assert!(
+            replacement_fee - pair_fee
+                >= fee_for_rate(INCREMENTAL_RELAY_FEE_SAT_KVB, replacement_vsize),
+            "the incremental anti-DoS floor passes"
+        );
+
+        let before = pool.snapshot();
+        assert!(matches!(
+            pool.admit(&store, replacement, context()),
+            Err(TransactionAdmissionError::ReplacementDiagramNotImproved {
+                comparison: crate::feerate_diagram::DiagramComparison::Incomparable,
+            })
+        ));
+        assert_eq!(
+            pool.snapshot(),
+            before,
+            "the refusal leaves the pool intact"
+        );
     }
 
     #[test]
