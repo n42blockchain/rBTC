@@ -122,11 +122,27 @@ matching. The replacement gate therefore has native Windows and macOS
 evidence, not only two runs against one host platform.
 
 The greedy ancestor-set linearization produced no accept/reject divergence
-from Core's linearizer on this corpus. Two policy residues stay recorded
-rather than claimed: TRUC sibling-eviction ordering is not implemented, and
-the rich-parent package-feerate exclusion still lacks a differential under
-mempool pressure (a rolling-minimum harness is required to make the two
-implementations' decisions observable).
+from Core's linearizer on this corpus.
+
+Both residues recorded here closed on 2026-08-15:
+
+- **TRUC sibling eviction** (scenario S7): a second v3 child of a
+  one-child v3 parent displaces its sibling through the full replacement
+  rules or is refused; all four verdicts (parent, first child, worse
+  second child, better second child) agreed with live Core 31, and the
+  evicted sibling left both mempools.
+- **Rich-parent package feerate under pressure**
+  (`core_31_and_rbtc_agree_on_package_feerate_under_pressure`): both
+  mempools were pressured with one ascending-feerate filler stream
+  (Core under `-maxmempool=5`, rBTC under an equivalent byte ceiling)
+  until both rolling minimums rose; scenario fees derive from the
+  measured minimums so the verdicts do not depend on the two
+  implementations raising identical values. An above-minimum parent did
+  not subsidise a below-minimum child on either side — rBTC's
+  deliberately atomic package refusal plus individual resubmission pins
+  the same per-transaction outcome as Core's per-transaction package
+  evaluation — and a rich child lifted a below-minimum parent on both.
+  This confirms the rich-parent exclusion draws the same line Core draws.
 
 Run the maintained gate with:
 

@@ -262,9 +262,8 @@ optional where appropriate, and host-runtime compatible.
   rolling minimum fee, persistence/reorg recovery, full-RBF default, and
   estimator bounds are implemented with atomic adversarial tests. Replacement
   adopted Core 31's feerate-diagram rule on 2026-08-14 and passed a live
-  replacement differential; TRUC sibling-eviction ordering remains P2
-  policy-fidelity work, not a consensus or network-interoperability
-  requirement.
+  replacement differential; TRUC sibling eviction followed on 2026-08-15,
+  so exact replacement ordering is no longer open P2 work.
 - [x] **Operator configuration and diagnostics.** The library/CLI now share
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
@@ -437,7 +436,7 @@ optional where appropriate, and host-runtime compatible.
   vbytes, and the enforced 64-tx/101-kvB bounds, and reports a clear miss
   for a transaction not in the pool. `getmempoolfeeratediagram` remains with
   the feerate-diagram item below because it depends on linearization.
-- [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering.
+- [x] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering.
   The pure layer shipped 2026-08-13 in `src/feerate_diagram.rs` with property
   tests and a fuzz target (which caught a real constructor-boundary overflow
   on its first 50,000-run smoke). The admission integration landed
@@ -448,9 +447,16 @@ optional where appropriate, and host-runtime compatible.
   A live differential against Bitcoin Core v31.0.0 agreed on all fourteen
   verdicts across six scenarios, including the case the retired heuristic
   decided wrongly; evidence in [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md)
-  and [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md). Open remainder: TRUC
-  sibling-eviction ordering, and a rolling-minimum pressure harness for the
-  rich-parent package-feerate differential.
+  and [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md). Both former remainders
+  closed 2026-08-15: TRUC sibling eviction runs a second v3 child through
+  the full replacement rules (v3 implicitly replaceable, single
+  transactions only, with a previously missing parent-descendant topology
+  check), and a rolling-minimum pressure harness confirmed the rich-parent
+  package-feerate exclusion draws Core's line — an above-minimum parent
+  does not subsidise a below-minimum child, while a rich child lifts a
+  poor parent — per transaction on both implementations. The one watch
+  item is optimal linearization, reopened only if a differential corpus
+  ever splits the greedy baseline from Core's search.
 
 ## Performance work policy
 

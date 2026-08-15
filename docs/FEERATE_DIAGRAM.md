@@ -66,6 +66,25 @@ Core 31.0 Darwin artifact: `1 passed; 0 failed` in `12.76s`, with the same
 fourteen matching verdicts. This supplies a second native platform for the
 closed behavior-divergence gate.
 
+## Residues closed on 2026-08-15
+
+- **TRUC sibling eviction.** A single incoming v3 transaction whose pooled
+  v3 parent already has one unconfirmed child now treats that sibling as a
+  direct conflict and must win under the full replacement rules — diagram
+  comparison included — with v3 implicitly replaceable, exactly as Core
+  scopes it (single transactions only; packages still refuse on topology,
+  including through a previously missing parent-descendant check).
+  Differential scenario S7 holds all four verdicts against live Core 31.
+- **Rich-parent package feerate under pressure.** The pressure harness
+  fills both mempools with one ascending-feerate filler stream until both
+  rolling minimums rise, then derives scenario fees from the measured
+  values. Verdicts agree per transaction: an above-minimum parent does not
+  subsidise a below-minimum child on either implementation (rBTC's atomic
+  package refusal plus individual resubmission pins the same outcome as
+  Core's per-transaction package evaluation), and a rich child lifts a
+  below-minimum parent on both. Evidence in
+  [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
+
 ## What deliberately remains open
 
 - **Optimal linearization.** Core refines the ancestor-set greedy result
@@ -73,12 +92,6 @@ closed behavior-divergence gate.
   produced no accept/reject divergence; a corpus that splits them would
   reopen this item, and the differential test is the instrument that would
   catch it.
-- **TRUC sibling-eviction ordering** — not implemented; tracked on the
-  roadmap item.
-- **Rich-parent package-feerate differential under pressure** — the
-  exclusion rule itself is implemented and unit-tested; comparing it
-  against Core needs a rolling-minimum pressure harness, recorded in
-  [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
 
 ## macOS fuzz acceptance
 

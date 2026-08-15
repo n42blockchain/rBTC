@@ -8,6 +8,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Changed
 
+- TRUC (v3) transactions are implicitly replaceable, and a second v3 child
+  of a one-child v3 parent now displaces its sibling through the full
+  replacement rules (feerate diagram included) instead of failing the
+  topology outright — Core's sibling eviction, single transactions only.
+  A package can no longer slip a second child past the one-child topology.
+
 - Mempool replacement now follows Bitcoin Core 31's cluster rule: a
   replacement is accepted only when the affected clusters' feerate diagram
   is strictly better afterwards. The BIP125 signaling, absolute-fee,
@@ -31,9 +37,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - Pure feerate-diagram primitives (`rbtc::feerate_diagram`): overflow-free
   fee/size feerate comparison, validated cluster DAGs, ancestor-set greedy
   linearization, Core-shaped chunking, and feerate-diagram comparison, with
-  property tests and a fuzz target. Groundwork for Core 31's
-  diagram-replacement rule; the admission path still runs the documented
-  conservative replacement subset until the differential gate passes.
+  property tests and a fuzz target. The groundwork the
+  diagram-replacement rule above is built on.
 
 - Operator RPCs `addnode`, `gettxoutsetinfo`, and `getmempoolcluster`, all
   authenticated and bounded. `addnode <ip:port> add|onetry|remove` seeds or
