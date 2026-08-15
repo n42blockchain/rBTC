@@ -51,6 +51,10 @@ struct CoreNode {
 
 impl CoreNode {
     fn start(bitcoind: &Path) -> Self {
+        Self::start_with_args(bitcoind, &[])
+    }
+
+    fn start_with_args(bitcoind: &Path, extra_args: &[&str]) -> Self {
         let serial_guard = CORE_NODE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -79,6 +83,7 @@ impl CoreNode {
                 "-rpcallowip=127.0.0.1",
                 "-fallbackfee=0.0001",
             ])
+            .args(extra_args)
             .arg(format!("-datadir={}", data_dir.display()))
             .arg(format!("-rpcport={rpc_port}"))
             .stdout(Stdio::null())
@@ -102,6 +107,40 @@ impl CoreNode {
                 "Bitcoin Core exited during startup"
             );
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Like [`Self::rpc`], but passes `lines` as arguments through
+    /// `bitcoin-cli -stdin`, sidestepping the platform command-line length
+    /// limit for large transaction payloads.
+    fn rpc_with_stdin(&self, arguments: &[&str], lines: &[&str]) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = Command::new(&self.cli)
+            .args(["-regtest", "-rpcclienttimeout=15", "-stdin"])
+            .arg(format!("-datadir={}", self.data_dir.display()))
+            .arg(format!("-rpcport={}", self.rpc_port))
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(format!("{}\n", lines.join("\n")).as_bytes())
+            .map_err(|error| error.to_string())?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8(output.stdout)
+                .map_err(|error| error.to_string())?
+                .trim()
+                .to_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
         }
     }
 
@@ -205,6 +244,28 @@ fn build_spend(previous: OutPoint, input_sats: u64, fee_sats: u64, pad: usize) -
         lock_time: LockTime::ZERO,
         input: vec![rbf_input(previous)],
         output,
+    }
+}
+
+/// Builds a v3 (TRUC) spend splitting the change across `outputs` equal
+/// anyone-can-spend outputs.
+fn build_spend_v3(
+    previous: OutPoint,
+    input_sats: u64,
+    fee_sats: u64,
+    outputs: usize,
+) -> Transaction {
+    let share = (input_sats - fee_sats) / u64::try_from(outputs).unwrap();
+    Transaction {
+        version: Version(3),
+        lock_time: LockTime::ZERO,
+        input: vec![rbf_input(previous)],
+        output: (0..outputs)
+            .map(|_| TxOut {
+                value: Amount::from_sat(share),
+                script_pubkey: op_true_script(),
+            })
+            .collect(),
     }
 }
 
@@ -351,7 +412,7 @@ impl Differential {
 #[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
 #[allow(clippy::too_many_lines)]
 fn core_31_and_rbtc_agree_on_replacement_decisions() {
-    let mut differential = Differential::set_up(6);
+    let mut differential = Differential::set_up(7);
     let fundings = differential.fundings.clone();
 
     // S1 — a same-shape fee bump strictly improves the diagram.
@@ -416,4 +477,257 @@ fn core_31_and_rbtc_agree_on_replacement_decisions() {
     assert!(differential.agree("S6 original", &original));
     let trickle = build_spend(fundings[5], FUNDING_SATS - 1, 10_001, 0);
     assert!(!differential.agree("S6 sub-incremental bump", &trickle));
+
+    // S7 — TRUC sibling eviction: a second v3 child of a one-child v3
+    // parent must displace its sibling through the full replacement rules,
+    // with no BIP125 signaling anywhere (v3 is implicitly replaceable), or
+    // be refused.
+    let parent = build_spend_v3(fundings[6], FUNDING_SATS, 10_000, 2);
+    assert!(differential.agree("S7 v3 parent", &parent));
+    let share = parent.output[0].value.to_sat();
+    let sibling = build_spend_v3(OutPoint::new(parent.compute_txid(), 0), share, 5_000, 1);
+    assert!(differential.agree("S7 first child", &sibling));
+    let cheap = build_spend_v3(OutPoint::new(parent.compute_txid(), 1), share, 3_000, 1);
+    assert!(
+        !differential.agree("S7 worse second child", &cheap),
+        "a worse-paying sibling never displaces the incumbent"
+    );
+    let rich = build_spend_v3(OutPoint::new(parent.compute_txid(), 1), share, 12_000, 1);
+    assert!(differential.agree("S7 better second child", &rich));
+    assert!(
+        !differential.in_core_mempool(sibling.compute_txid()),
+        "S7: the evicted sibling leaves Core's mempool"
+    );
+    assert!(
+        !differential
+            .pool
+            .snapshot()
+            .iter()
+            .any(|transaction| transaction.compute_txid() == sibling.compute_txid()),
+        "S7: the evicted sibling leaves rBTC's pool"
+    );
+}
+
+/// Distinguishes the rich-parent package-feerate question under real
+/// rolling-minimum pressure: with the mempool minimum raised above the
+/// child's own feerate, an above-minimum parent must not subsidise a
+/// below-minimum child, while a below-minimum parent may be lifted by a
+/// rich child. Both mempools are pressured with the same ascending-feerate
+/// filler stream; the scenario fees sit far from either implementation's
+/// exact minimum so the verdicts do not depend on the minimums matching
+/// numerically.
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+#[allow(clippy::too_many_lines)]
+fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
+    const FILLERS: usize = 90;
+    const FILLER_INPUT_SATS: u64 = 20_000_000;
+    let core = CoreNode::start_with_args(&core_31_bitcoind(), &["-maxmempool=5"]);
+    core.rpc(&["createwallet", "pressure"]).unwrap();
+    let miner = core.rpc(&["getnewaddress"]).unwrap();
+    core.rpc(&["generatetoaddress", "101", &miner]).unwrap();
+
+    let script = op_true_script();
+    let address = bitcoin::Address::from_script(&script, Network::Regtest).unwrap();
+    // The wallet funds one large anyone-can-spend seed; a hand-built
+    // fan-out then creates every scenario output in a single transaction,
+    // sidestepping wallet ancestor-depth and duplicate-address limits.
+    let seed_txid = core
+        .rpc(&["sendtoaddress", &address.to_string(), "20"])
+        .unwrap();
+    let raw = core.rpc(&["getrawtransaction", &seed_txid]).unwrap();
+    let seed: Transaction = deserialize(&Vec::<u8>::from_hex(&raw).unwrap()).unwrap();
+    let seed_vout = seed
+        .output
+        .iter()
+        .position(|output| output.script_pubkey == script)
+        .unwrap();
+    let fan = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![rbf_input(OutPoint::new(
+            seed.compute_txid(),
+            u32::try_from(seed_vout).unwrap(),
+        ))],
+        output: (0..FILLERS + 4)
+            .map(|_| TxOut {
+                value: Amount::from_sat(FILLER_INPUT_SATS),
+                script_pubkey: script.clone(),
+            })
+            .collect(),
+    };
+    core.rpc(&["sendrawtransaction", &serialize_hex(&fan), "0"])
+        .unwrap();
+    let fundings = (0..FILLERS + 4)
+        .map(|vout| OutPoint::new(fan.compute_txid(), u32::try_from(vout).unwrap()))
+        .collect::<Vec<_>>();
+    core.rpc(&["generatetoaddress", "1", &miner]).unwrap();
+
+    let store_dir = TempDir::new().unwrap();
+    let store = RedbUtxoStore::open(store_dir.path().join("chainstate.redb")).unwrap();
+    let seeded = fundings
+        .iter()
+        .map(|outpoint| {
+            (
+                OutPointKey::from(*outpoint),
+                Utxo {
+                    value_sats: FILLER_INPUT_SATS,
+                    height: 102,
+                    is_coinbase: false,
+                    last_touched: 0,
+                    creation_mtp: 0,
+                    script_pubkey: script.to_bytes(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    store.apply(&[], &seeded).unwrap();
+    // A pool small enough that the identical filler stream forces
+    // evictions and raises the rolling minimum, as Core's 5 MB cap does.
+    let mut pool = TransactionAdmissionPool::with_capacity(10_000, 4_500_000);
+
+    // Fill both mempools with identical ~95 kvB fillers at ascending
+    // feerates until both minimums clear 2 sat/vB.
+    let mut raised = false;
+    for (index, funding) in fundings.iter().take(FILLERS).enumerate() {
+        let rate = 2 + 2 * u64::try_from(index).unwrap();
+        let filler = build_spend(*funding, FILLER_INPUT_SATS, 60_500 * rate, 60_000);
+        core.rpc_with_stdin(&["sendrawtransaction"], &[&serialize_hex(&filler), "0"])
+            .unwrap();
+        pool.admit(&store, filler, context()).unwrap();
+        let info = core.rpc(&["getmempoolinfo"]).unwrap();
+        let core_min_btc_kvb = info
+            .split("\"mempoolminfee\":")
+            .nth(1)
+            .and_then(|tail| tail.split(',').next())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .unwrap();
+        let rbtc_min_sat_kvb = pool.rolling_minimum_fee_sat_kvb(0);
+        if index % 10 == 9 {
+            println!(
+                "filler {}: core {core_min_btc_kvb} BTC/kvB, rbtc {rbtc_min_sat_kvb} sat/kvB",
+                index + 1
+            );
+        }
+        if core_min_btc_kvb > 0.000_02 && rbtc_min_sat_kvb > 2_000 {
+            println!(
+                "pressure reached after {} fillers: core {core_min_btc_kvb} BTC/kvB, rbtc {rbtc_min_sat_kvb} sat/kvB",
+                index + 1
+            );
+            raised = true;
+            break;
+        }
+    }
+    assert!(raised, "the filler stream must raise both rolling minimums");
+    // Scenario fees derive from the measured minimums, so the verdicts do
+    // not depend on the two implementations raising identical values: the
+    // rich transactions pay four times the higher minimum, and the poor
+    // ones ~1 sat/vB, below both.
+    let info = core.rpc(&["getmempoolinfo"]).unwrap();
+    let core_min_btc_kvb = info
+        .split("\"mempoolminfee\":")
+        .nth(1)
+        .and_then(|tail| tail.split(',').next())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap();
+    // The float is Core's own JSON rendering of an integer satoshi rate;
+    // the product is far below 2^53, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let core_min_sat_kvb = (core_min_btc_kvb * 100_000_000.0).round() as u64;
+    let ceiling_sat_kvb = core_min_sat_kvb.max(pool.rolling_minimum_fee_sat_kvb(0));
+    assert!(
+        (2_000..1_000_000).contains(&ceiling_sat_kvb),
+        "the raised minimums stay in a range the funding can outbid: {ceiling_sat_kvb}"
+    );
+    let rich_fee = |vsize: usize| ceiling_sat_kvb * 4 * u64::try_from(vsize).unwrap() / 1_000;
+    let probe = build_spend(fundings[FILLERS], FILLER_INPUT_SATS, 10_000, 0);
+    let scenario_vsize = probe.vsize();
+
+    // Scenario A — rich parent (four times the higher minimum), poor
+    // child (~1 sat/vB, below both minimums). The parent must not subsidise the
+    // child: the child stays out of both mempools. Core admits the parent
+    // individually inside package evaluation, while rBTC's package
+    // admission is deliberately atomic and refuses the pair; resubmitting
+    // the parent alone must then succeed, which pins the same per-
+    // transaction outcome (parent in, child out) on both sides.
+    let rich_parent = build_spend(
+        fundings[FILLERS],
+        FILLER_INPUT_SATS,
+        rich_fee(scenario_vsize),
+        0,
+    );
+    let poor_child = build_spend(
+        OutPoint::new(rich_parent.compute_txid(), 0),
+        rich_parent.output[0].value.to_sat(),
+        120,
+        0,
+    );
+    let package = format!(
+        "[\"{}\",\"{}\"]",
+        serialize_hex(&rich_parent),
+        serialize_hex(&poor_child)
+    );
+    core.rpc(&["submitpackage", &package]).ok();
+    assert!(
+        core.rpc(&["getmempoolentry", &rich_parent.compute_txid().to_string()])
+            .is_ok(),
+        "A: Core admits the above-minimum parent"
+    );
+    assert!(
+        core.rpc(&["getmempoolentry", &poor_child.compute_txid().to_string()])
+            .is_err(),
+        "A: Core refuses the below-minimum child despite its rich parent"
+    );
+    let package_verdict = pool.admit_package(
+        &store,
+        vec![rich_parent.clone(), poor_child.clone()],
+        context(),
+    );
+    assert!(
+        package_verdict.is_err(),
+        "A: rBTC's atomic package refuses the pair because the rich parent \
+         cannot subsidise the child"
+    );
+    pool.admit(&store, rich_parent.clone(), context())
+        .expect("A: the above-minimum parent stands alone in rBTC too");
+    assert!(
+        pool.admit(&store, poor_child, context()).is_err(),
+        "A: the below-minimum child stays out of rBTC"
+    );
+
+    // Scenario B — poor parent (~1 sat/vB, below both minimums), rich
+    // child paying eight times the higher minimum, lifting the pair: the 1p1c bump admits both,
+    // on both sides.
+    let poor_parent = build_spend(fundings[FILLERS + 1], FILLER_INPUT_SATS, 120, 0);
+    let rich_child = build_spend(
+        OutPoint::new(poor_parent.compute_txid(), 0),
+        poor_parent.output[0].value.to_sat(),
+        rich_fee(scenario_vsize) * 2,
+        0,
+    );
+    let package = format!(
+        "[\"{}\",\"{}\"]",
+        serialize_hex(&poor_parent),
+        serialize_hex(&rich_child)
+    );
+    core.rpc(&["submitpackage", &package]).unwrap();
+    assert!(
+        core.rpc(&["getmempoolentry", &poor_parent.compute_txid().to_string()])
+            .is_ok(),
+        "B: Core admits the lifted parent"
+    );
+    assert!(
+        core.rpc(&["getmempoolentry", &rich_child.compute_txid().to_string()])
+            .is_ok(),
+        "B: Core admits the lifting child"
+    );
+    let outcome = pool
+        .admit_package(
+            &store,
+            vec![poor_parent.clone(), rich_child.clone()],
+            context(),
+        )
+        .expect("B: rBTC's 1p1c package feerate lifts the poor parent");
+    assert_eq!(outcome.accepted.len(), 2);
+    println!("pressure differential: A (no subsidy) and B (1p1c lift) agree per transaction");
 }
