@@ -490,7 +490,10 @@ impl Default for TransactionAdmissionPool {
 
 impl TransactionAdmissionPool {
     /// Creates an empty pool with node-validated resource ceilings.
-    pub(crate) fn with_capacity(max_transactions: usize, max_bytes: usize) -> Self {
+    ///
+    /// Public for the live differential harness, which needs a pool small
+    /// enough that a bounded filler stream raises the rolling minimum.
+    pub fn with_capacity(max_transactions: usize, max_bytes: usize) -> Self {
         Self {
             max_transactions,
             max_bytes,
@@ -1349,16 +1352,65 @@ impl TransactionAdmissionPool {
         Ok((already_present, package))
     }
 
+    /// TRUC sibling eviction, exactly as Core scopes it: a *single* incoming
+    /// v3 transaction whose pooled v3 parent already has one unconfirmed
+    /// child treats that sibling as a direct conflict and must win under
+    /// every replacement rule, instead of failing the one-child topology
+    /// outright. Packages never evict siblings, and a parent with more than
+    /// one existing child (impossible while the topology holds) is left for
+    /// the topology check to refuse.
+    fn truc_sibling_conflicts(
+        &self,
+        ordered: &[Transaction],
+        direct_conflicts: &BTreeSet<Txid>,
+    ) -> BTreeSet<Txid> {
+        let mut evictable = BTreeSet::new();
+        let [candidate] = ordered else {
+            return evictable;
+        };
+        if candidate.version.0 != TRUC_VERSION {
+            return evictable;
+        }
+        for input in &candidate.input {
+            let parent_txid = input.previous_output.txid;
+            let parent_is_truc = self.entries.iter().any(|entry| {
+                entry.transaction.compute_txid() == parent_txid
+                    && entry.transaction.version.0 == TRUC_VERSION
+            });
+            if !parent_is_truc {
+                continue;
+            }
+            let siblings = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .transaction
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output.txid == parent_txid)
+                })
+                .map(|entry| entry.transaction.compute_txid())
+                .filter(|sibling| !direct_conflicts.contains(sibling))
+                .collect::<BTreeSet<_>>();
+            if siblings.len() == 1 {
+                evictable.extend(siblings);
+            }
+        }
+        evictable
+    }
+
     fn prepare_replacement(
         &mut self,
         ordered: &[Transaction],
         full_rbf: bool,
     ) -> Result<ReplacementPlan, TransactionAdmissionError> {
-        let direct_conflicts = ordered
+        let mut direct_conflicts = ordered
             .iter()
             .flat_map(|transaction| transaction.input.iter())
             .filter_map(|input| self.spent.get(&input.previous_output).copied())
             .collect::<BTreeSet<_>>();
+        direct_conflicts.extend(self.truc_sibling_conflicts(ordered, &direct_conflicts));
         if direct_conflicts.is_empty() {
             return Ok(ReplacementPlan::default());
         }
@@ -1877,6 +1929,28 @@ impl TransactionAdmissionPool {
         Ok(())
     }
 
+    /// The parent's own descendant bound must hold too: a newly accepted
+    /// child whose closures stay small can still make its already-pooled
+    /// parent exceed one child, which checks keyed on the accepted set
+    /// alone would miss.
+    fn validate_truc_parent_descendants(
+        &self,
+        parents: &BTreeSet<Txid>,
+    ) -> Result<(), TransactionAdmissionError> {
+        for parent in parents {
+            let parent_descendants = self.descendant_closure(*parent);
+            if parent_descendants.len() > MAX_TRUC_CONNECTED_TRANSACTIONS {
+                return Err(TransactionAdmissionError::TrucTopology {
+                    txid: *parent,
+                    direction: "descendants",
+                    count: parent_descendants.len(),
+                    limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate_truc_policy(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
         let versions = self
             .entries
@@ -1951,6 +2025,7 @@ impl TransactionAdmissionPool {
                     limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
                 });
             }
+            self.validate_truc_parent_descendants(&parents)?;
             if !parents.is_empty() && policy_vsize > MAX_TRUC_CHILD_VBYTES {
                 return Err(TransactionAdmissionError::TrucChildTooLarge {
                     txid: *txid,
@@ -2070,6 +2145,11 @@ impl TransactionAdmissionPool {
             else {
                 continue;
             };
+            // TRUC transactions signal replaceability by version alone,
+            // exactly as Core treats v3.
+            if transaction.version.0 == TRUC_VERSION {
+                return true;
+            }
             if transaction
                 .input
                 .iter()
@@ -3977,6 +4057,101 @@ mod tests {
             })
         ));
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn truc_sibling_eviction_replaces_the_existing_child_under_full_rules() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(213);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        parent.version = Version(TRUC_VERSION);
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+        ];
+        let mut first = child_at(&parent, 0, 40_000);
+        first.version = Version(TRUC_VERSION);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent.clone(), context()).unwrap();
+        pool.admit(&store, first.clone(), context()).unwrap();
+
+        // A worse-paying second child loses to its sibling and changes
+        // nothing; the topology is not the refusal, the replacement rules
+        // are.
+        let mut cheap = child_at(&parent, 1, 43_000);
+        cheap.version = Version(TRUC_VERSION);
+        let before = pool.snapshot();
+        assert!(matches!(
+            pool.admit(&store, cheap, context()),
+            Err(TransactionAdmissionError::InsufficientReplacementFee { .. })
+        ));
+        assert_eq!(pool.snapshot(), before);
+
+        // A strictly better-paying second child evicts the sibling through
+        // the ordinary replacement path -- diagram rule included -- with no
+        // BIP125 signaling anywhere: v3 is implicitly replaceable.
+        let mut better = child_at(&parent, 1, 35_000);
+        better.version = Version(TRUC_VERSION);
+        let better_txid = better.compute_txid();
+        let outcome = pool.admit(&store, better, context()).unwrap();
+        assert!(matches!(
+            outcome,
+            TransactionAdmissionOutcome::Accepted {
+                txid,
+                replaced: 1,
+                ..
+            } if txid == better_txid
+        ));
+        let pooled = txids(&pool);
+        assert!(pooled.contains(&parent.compute_txid()));
+        assert!(pooled.contains(&better_txid));
+        assert!(!pooled.contains(&first.compute_txid()));
+    }
+
+    #[test]
+    fn a_second_truc_child_arriving_in_a_package_is_refused_by_topology() {
+        // Sibling eviction is scoped to single transactions, exactly as
+        // Core scopes it. Two children arriving as one package must trip
+        // the pooled parent's descendant bound -- which the checks keyed
+        // on `accepted` alone would miss, because each child's own
+        // closures stay small.
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut parent) = spend(214);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        parent.version = Version(TRUC_VERSION);
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(45_000),
+                script_pubkey: parent.output[0].script_pubkey.clone(),
+            },
+        ];
+        let mut first = child_at(&parent, 0, 40_000);
+        first.version = Version(TRUC_VERSION);
+        let mut second = child_at(&parent, 1, 40_000);
+        second.version = Version(TRUC_VERSION);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent.clone(), context()).unwrap();
+        let before = pool.snapshot();
+        assert!(matches!(
+            pool.admit_package(&store, vec![first, second], context()),
+            Err(TransactionAdmissionError::TrucTopology {
+                direction: "descendants",
+                count: 3,
+                limit: MAX_TRUC_CONNECTED_TRANSACTIONS,
+                txid,
+            }) if txid == parent.compute_txid()
+        ));
+        assert_eq!(pool.snapshot(), before);
     }
 
     #[test]
