@@ -941,3 +941,32 @@ eviction on the feerate question. Together with the earlier win64 run, this
 closes the requested dual-platform evidence for replacement decisions. It
 does not close the separately recorded TRUC sibling-ordering or rolling-floor
 rich-parent differential residues.
+
+### `4605979` closed-residue macOS differential rerun — 2026-08-15
+
+The branch was fast-forwarded to `4605979`, which implements TRUC sibling
+eviction and adds the rolling-minimum package-feerate differential. The
+complete local gate passed. `cargo test --locked --all-features` had no
+non-ignored failure; its library portion was confirmed separately as
+`796 passed; 0 failed; 5 ignored` in `31.71s`.
+
+Both live Core 31 differentials used the previously verified native Darwin
+binary at `/Users/jieliu/Applications/bitcoin-core-31.0/bin/bitcoind`:
+
+```bash
+RBTC_BITCOIND=/Users/jieliu/Applications/bitcoin-core-31.0/bin/bitcoind \
+  cargo test --release --test core_block_differential \
+  -- --ignored --nocapture
+
+RBTC_BITCOIND=/Users/jieliu/Applications/bitcoin-core-31.0/bin/bitcoind \
+  cargo test --release --test core_replacement_differential \
+  -- --ignored --nocapture
+```
+
+The block/activation gate passed `9/9` in `18.10s`. The extended replacement
+gate passed `2/2` in `38.98s`: the original scenarios remained green; S7
+agreed on its v3 parent, first child, rejected worse sibling, accepted better
+sibling, and removal of the displaced child; the pressure case raised both
+rolling minimums after 82 fillers and agreed per transaction for both the
+no-subsidy and 1p1c-lift cases. This is the requested macOS counterpart to the
+existing Windows evidence for the now-closed residues.

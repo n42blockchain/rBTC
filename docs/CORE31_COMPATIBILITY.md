@@ -53,7 +53,7 @@ Primary references:
 | Testnet4/BIP94 | Core 28 introduced Testnet4 behavior; Core 29 removed BIP94 from regtest. | Implemented for Testnet4 only, including retarget base and timewarp boundary; regtest retains its independent rules. |
 | AssumeUTXO | Chainparams identities, minimum work, assume-valid data, and snapshot tooling evolved. | Core 31 identities are pinned; v2 parsing, exact `hash_serialized`, maximum-work membership, base-to-live execution, and independent genesis replay are implemented. |
 | P2P transport | BIP324 became Core's default in 27. | Bounded v1 remains interoperable and secure; BIP324 is P2 because it does not alter validation trust. |
-| Mempool policy | TRUC, full-RBF defaults, ephemeral dust, 1p1c package relay, orphan accounting, 0.1 sat/vB defaults, multiple data carriers, and the 2,500 legacy-sigop standard limit changed across 27–31. | Implemented as a separate policy layer with Core 31 cluster/TRUC/standardness bounds and atomic adversarial coverage. Replacement adopted Core 31's feerate-diagram rule on 2026-08-14 and passed a live replacement differential (below); TRUC sibling-eviction ordering remains open P2 work. |
+| Mempool policy | TRUC, full-RBF defaults, ephemeral dust, 1p1c package relay, orphan accounting, 0.1 sat/vB defaults, multiple data carriers, and the 2,500 legacy-sigop standard limit changed across 27–31. | Implemented as a separate policy layer with Core 31 cluster/TRUC/standardness bounds and atomic adversarial coverage. Replacement adopted Core 31's feerate-diagram rule on 2026-08-14; the live differential below also closed TRUC sibling eviction and rich-parent package feerate under pressure on 2026-08-15. |
 | Storage/indexes | Pruning cadence, dbcache defaults, coinstats index format, and tx-output-spender index changed. | rBTC's freezer/cache retain independent bounded invariants; configurable pruning, both full reindex paths, and optional tx/spent-output/BIP158 indexes are complete. |
 | RPC/wallet/mining | JSON-RPC, wallet, descriptor, fee, mining IPC, and response fields changed. | rBTC's documented bounded authenticated API and watch-only external-signer wallet are supported; exact Core RPC, hot-wallet, and mining parity is not a validating-node requirement. |
 
@@ -143,6 +143,18 @@ Both residues recorded here closed on 2026-08-15:
   the same per-transaction outcome as Core's per-transaction package
   evaluation — and a rich child lifted a below-minimum parent on both.
   This confirms the rich-parent exclusion draws the same line Core draws.
+
+The complete extended gate was rerun on macOS 26.5.1 arm64 on 2026-08-15
+against the same verified official Core 31.0 Darwin binary. Both test functions
+passed (`2 passed; 0 failed` in `38.98s`): the original six replacement
+scenarios, S7's four TRUC sibling verdicts and eviction residue, and both
+per-transaction pressure outcomes all agreed. This extends the existing
+Windows/macOS evidence to the two formerly recorded residues rather than
+leaving their closure supported by only one platform.
+
+The broader Core gate was rerun at the same revision and passed `9/9` in
+`18.10s`, covering activation boundaries, end-to-end valid/invalid block
+results, BIP324 interoperability, and v1 fallback.
 
 Run the maintained gate with:
 

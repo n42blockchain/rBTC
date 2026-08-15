@@ -85,6 +85,12 @@ closed behavior-divergence gate.
   below-minimum parent on both. Evidence in
   [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
 
+The full extended differential was repeated on macOS 26.5.1 arm64 at
+`4605979`: `2 passed; 0 failed` in `38.98s`. This Mac run covers S7 and the
+rolling-minimum pressure test as well as the original scenarios, so the two
+closed residues now carry the same dual-platform evidence as the original
+feerate-diagram gate.
+
 ## What deliberately remains open
 
 - **Optimal linearization.** Core refines the ancestor-set greedy result
