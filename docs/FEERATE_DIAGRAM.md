@@ -59,6 +59,11 @@ feerate question, where the retired rule accepted). The full scenario list
 and residues are recorded in
 [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md).
 
+The gate was then repeated on macOS 26.5.1 arm64 against the verified official
+Core 31.0 Darwin artifact: `1 passed; 0 failed` in `12.76s`, with the same
+fourteen matching verdicts. This supplies a second native platform for the
+closed behavior-divergence gate.
+
 ## What deliberately remains open
 
 - **Optimal linearization.** Core refines the ancestor-set greedy result

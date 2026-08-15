@@ -913,3 +913,31 @@ non-ignored integration and doc test also passed, including the repaired
 mining round trip (`1/1` in `2.16s`). The ignored groups remained explicitly
 environment-gated; the five anonymity cases among them are covered by the
 separate real-daemon command and result above.
+
+### `3d321d0` feerate integration macOS rerun — 2026-08-14
+
+The branch was fast-forwarded to `3d321d0`, including feerate-diagram
+replacement admission, `getmempoolfeeratediagram`, and the maintained live
+Core 31 replacement differential. The complete local gate passed:
+`cargo test --locked --all-features` reported `794 passed; 0 failed; 5 ignored`
+for the library, and every non-ignored integration and doc test passed.
+
+Bitcoin Core v31.0.0 was installed from the official
+`bitcoin-31.0-arm64-apple-darwin.tar.gz` artifact. The downloaded SHA-256
+matched both the release `SHA256SUMS` and the repository pin:
+`a2d7a13b4da53d4a3e4c517f3a0269e2429813417bb320d3b268993cfdc545d0`.
+`codesign --verify --deep --strict` also passed. The persistent executable is
+`/Users/jieliu/Applications/bitcoin-core-31.0/bin/bitcoind`.
+
+```bash
+RBTC_BITCOIND=/Users/jieliu/Applications/bitcoin-core-31.0/bin/bitcoind \
+  cargo test --release --test core_replacement_differential \
+  -- --ignored --nocapture
+```
+
+Result: `1 passed; 0 failed` in `12.76s`. All fourteen rBTC/Core verdicts
+matched across the six scenarios, including rejection of the rich-descendant
+eviction on the feerate question. Together with the earlier win64 run, this
+closes the requested dual-platform evidence for replacement decisions. It
+does not close the separately recorded TRUC sibling-ordering or rolling-floor
+rich-parent differential residues.

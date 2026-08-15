@@ -113,6 +113,14 @@ all fourteen verdicts across six scenarios:
 - equal-total-fee replacement — rejected by both (absolute-fee rule);
 - sub-incremental bump — rejected by both (incremental-fee rule).
 
+The same gate was rerun on macOS 26.5.1 arm64 on 2026-08-14 against the
+official `bitcoin-31.0-arm64-apple-darwin.tar.gz` artifact. Its SHA-256 was
+verified as `a2d7a13b4da53d4a3e4c517f3a0269e2429813417bb320d3b268993cfdc545d0`,
+`bitcoind` reported v31.0.0, and macOS strict code-signature verification
+passed. Result: `1 passed; 0 failed` in `12.76s`, with all fourteen verdicts
+matching. The replacement gate therefore has native Windows and macOS
+evidence, not only two runs against one host platform.
+
 The greedy ancestor-set linearization produced no accept/reject divergence
 from Core's linearizer on this corpus. Two policy residues stay recorded
 rather than claimed: TRUC sibling-eviction ordering is not implemented, and
