@@ -1,13 +1,15 @@
 # Feerate-diagram replacement track
 
-Status date: 2026-08-13.
+Status date: 2026-08-15.
 
 Core 31 accepts a mempool replacement only when the resulting mempool's
 *feerate diagram* is strictly better than the original's, with the CPFP
-carveout removed. rBTC's replacement today is the documented conservative
-subset (BIP125 signaling plus a feerate strictly above one direct
-conflict), so the same mempool can accept a replacement here that Core 31
-rejects, and vice versa. Closing that divergence is this track.
+carveout removed. When this track opened, rBTC's replacement was a
+documented conservative subset (BIP125 signaling plus a feerate strictly
+above one direct conflict), so the same mempool could accept a replacement
+here that Core 31 rejects, and vice versa. That divergence is now closed:
+the admission integration below adopted the diagram rule and its live
+differential gate passed on two native platforms.
 
 The plan deliberately leads with the pure-function layer: a wrong diagram
 comparison does not fail — it silently changes which replacements are
