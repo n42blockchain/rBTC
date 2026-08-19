@@ -137,7 +137,41 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 ## UTXO layout
 
-Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier and `utxo_cold` is the inactive tier. Moving tiers never changes consensus data. The legacy in-process aging interface uses a 60-day wall-clock window, but it is not a production boundary: historical snapshot import necessarily observes old coins as newly loaded. The operational replacement uses complete-replay consensus coin age in blocks. After the report selects a boundary, offline `--retier-utxos-window-blocks BLOCKS` scans the merged tiers in key order, classifies by creation height relative to the fixed execution tip, and commits at most 65,536 records per transaction. Its cursor and counters share the same transaction as every move, so a restart resumes without a giant transaction or ambiguous partial result; selecting a different tip/window safely starts a fresh idempotent scan. Tier metadata remains excluded from snapshot finalization and consensus identity.
+The default redb store retains its established key and row encoding for on-disk
+compatibility. The new MDBX chainstate has a separately versioned physical
+format: every key is exactly 36 bytes, the txid in wire order followed by a
+big-endian `vout`. Bytewise cursor order therefore makes the outputs of one
+transaction contiguous and numerically ordered, enabling one txid-range cursor
+delete and naturally ordered snapshot paging. Its coin value is the Bitcoin
+Core/btcd chainstate encoding: canonical VLQ `height << 1 | coinbase`, VLQ
+amount after Core's amount transform, and compressed standard script (or a
+length-coded raw script). The pinned btcd P2PKH fixture is exactly 26 bytes,
+versus roughly 54 bytes for the legacy rBTC row. Neither `last_touched` nor
+`creation_mtp` is repeated per coin: MTP is recovered by creation height from
+`meta`, while `last_touched` is absent from the MDBX format. Compact undo rows
+use the same coin and big-endian outpoint encodings.
+
+One MDBX environment contains exactly `utxo_hot`, `utxo_cold`, `undo`, and
+`meta`. A successful connect commits both UTXO tiers, per-block undo, creation
+MTP/tip metadata, and the new execution tip in one durable MDBX write
+transaction; a validation or commit failure exposes none of them. IBD folds at
+most 256 contiguous blocks into that transaction, retains one undo row per
+block, and removes an output created and spent within the checkpoint from the
+net disk mutation. MDBX refuses a 257-block checkpoint instead of silently
+changing this memory/durability boundary. This atomic chainstore implementation
+is present behind the feature, but the daemon still selects redb by default;
+node-level MDBX selection and migration remain a separate gate.
+
+`utxo_hot` is the active tier and `utxo_cold` the inactive tier. MDBX placement
+uses only `tip_height - creation_height`, never wall time, and its wall-clock
+aging entry point fails explicitly. The selected boundary is 157,680 blocks
+(approximately three years): the completed replay measured P50 42 and P99
+122,194 blocks, 99.38467% hot hits, 65.95593% of UTXOs in hot, and about 1.006
+hot-first probes per spend. The legacy redb in-process aging interface still
+exists for compatibility, but it is not a production boundary. Offline
+`--retier-utxos-window-blocks BLOCKS` scans merged redb tiers by creation height
+relative to a fixed execution tip. Tier metadata remains excluded from snapshot
+finalization and consensus identity.
 
 Spent-output coin age is now accumulated as exact block-age/count rows in the
 network-bound chainstate. A checkpoint aggregates ages before sorted writes;
@@ -538,7 +572,14 @@ stalled-handshake process test exits successfully after logging that durable
 stores are closing, avoiding the allocator-repair cost caused by the operating
 system's default abrupt termination.
 
-The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
+The `mdbx` Cargo feature provides the experimental four-table chainstate
+described above. Compact UTXOs, compact undo, and execution-tip metadata now do
+share each write transaction; what remains experimental is node selection,
+migration, crash testing, and full-workload measurement. The older bare-UTXO
+100-block fixture (about 39 ms versus redb's 733 ms without quick repair and
+1.43 s with quick repair) omitted the now-implemented undo/tip work and is only
+a historical direction signal. It must not be presented as the performance of
+the complete MDBX chainstore.
 
 Recovery gates cover transaction-stage failure, simulated disk-full writes, repeated process SIGKILL followed by reopen, and truncated database copies. A damaged file must either reopen to a complete committed state or be rejected explicitly; it must never be served as partially current chainstate.
 

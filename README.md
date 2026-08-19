@@ -258,7 +258,7 @@ Findings and per-platform verification status are recorded in [docs/AUDIT.md](do
 | Bitcoin types and v1 P2P encoding | `rust-bitcoin` | Maintained Rust Bitcoin primitives and consensus serialization. |
 | Script interpreter | `bitcoinconsensus` | Repository-owned Core v26.0 boundary, the last release line shipping `libbitcoinconsensus`; includes the Taproot spent-output API. |
 | Consensus rules | tracked through Core v31.1 | Public-network rules include Testnet4/BIP94; Core's default regtest keeps BIP94 disabled and uses its 144-block interval. The interpreter pin and tracked rules are separate decisions. |
-| UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust; `--features mdbx` enables a durable hot/cold UTXO comparison backend, not yet a production chainstate selector. |
+| UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust. `--features mdbx` adds a versioned four-table chainstore with 36-byte BE-vout keys, Core/btcd compact coins and undo, height-only hot/cold placement, and atomic UTXO/undo/tip commits; daemon selection and migration are not enabled yet. |
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |
 

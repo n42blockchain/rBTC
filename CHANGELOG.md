@@ -8,6 +8,15 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Changed
 
+- The feature-gated MDBX chainstate now uses exactly four tables (`utxo_hot`,
+  `utxo_cold`, `undo`, and `meta`). Its 36-byte physical outpoint keys use a
+  wire-order txid plus big-endian vout; coin and undo values use Bitcoin
+  Core/btcd VLQ amount/script compression, omitting obsolete per-coin wall-clock
+  state. Hot/cold placement is height-only, and UTXOs, per-block undo, and tip
+  commit atomically. A 256-block IBD transaction folds outputs created and
+  spent inside the batch and rejects larger batches. The daemon continues to
+  select redb until MDBX migration and operational gates are completed.
+
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full
   replacement rules (feerate diagram included) instead of failing the
