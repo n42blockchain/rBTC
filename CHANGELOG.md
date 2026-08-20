@@ -38,6 +38,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   64/256 lanes; full-scale and real-mainnet replay evidence remain required
   before selecting MDBX by default.
 
+- The root data-format manifest now records the chainstate backend explicitly
+  and advances to schema 4. Existing schema-3 redb directories migrate
+  atomically, while a manifest naming MDBX is rejected by the redb-only node
+  before either backend is opened; this prevents a rollback binary from
+  silently creating or serving the wrong chainstate during the staged switch.
+
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full
   replacement rules (feerate diagram included) instead of failing the

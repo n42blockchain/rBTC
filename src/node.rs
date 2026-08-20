@@ -259,7 +259,7 @@ const DATA_DIRECTORY_LOCK_OWNER_FILE: &str = ".rbtc.lock.owner";
 const DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE: &str = ".rbtc.lock.owner.tmp";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
-const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
+const DATA_FORMAT_SCHEMA_VERSION: u32 = 4;
 const MAX_DATA_FORMAT_MANIFEST_BYTES: u64 = 4 * 1024;
 const NODE_EVENT_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
@@ -2850,15 +2850,34 @@ struct DataFormatManifest {
     schema_version: u32,
     minimum_reader_version: u32,
     network: String,
+    #[serde(default = "default_chainstate_backend")]
+    chainstate_backend: ChainstateBackend,
     stores: DataStoreSchemaVersions,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ChainstateBackend {
+    #[default]
+    Redb,
+    Mdbx,
+}
+
+const fn default_chainstate_backend() -> ChainstateBackend {
+    ChainstateBackend::Redb
 }
 
 impl DataFormatManifest {
     fn current(network: Network) -> Self {
+        Self::current_for_backend(network, ChainstateBackend::Redb)
+    }
+
+    fn current_for_backend(network: Network, chainstate_backend: ChainstateBackend) -> Self {
         Self {
             schema_version: DATA_FORMAT_SCHEMA_VERSION,
             minimum_reader_version: DATA_FORMAT_SCHEMA_VERSION,
             network: network.to_string(),
+            chainstate_backend,
             stores: DataStoreSchemaVersions {
                 headers: 1,
                 chainstate: 1,
@@ -2881,6 +2900,13 @@ impl DataFormatManifest {
         manifest.schema_version = 2;
         manifest.minimum_reader_version = 2;
         manifest.stores.basic_filter_index = 1;
+        manifest
+    }
+
+    fn version3(network: Network) -> Self {
+        let mut manifest = Self::current(network);
+        manifest.schema_version = 3;
+        manifest.minimum_reader_version = 3;
         manifest
     }
 }
@@ -3021,6 +3047,14 @@ fn validate_data_format_manifest(
                 "version-1 basic-filter index omitted the genesis filter; rebuild it with a complete freezer or --reindex-chainstate"
                     .to_owned(),
             );
+        }
+        return Ok(true);
+    }
+    if actual.schema_version == 3 && actual.minimum_reader_version == 3 {
+        if actual != DataFormatManifest::version3(network) {
+            return Err(format!(
+                "data-format manifest does not match the {network} version-3 schema inventory"
+            ));
         }
         return Ok(true);
     }
@@ -27107,7 +27141,7 @@ mod tests {
         assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["schema_version"],
-            3
+            4
         );
 
         let version2 = serde_json::to_vec(&DataFormatManifest::version2(Network::Regtest)).unwrap();
@@ -27127,8 +27161,8 @@ mod tests {
         assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
 
         let future = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 4,
-            "minimum_reader_version": 4,
+            "schema_version": 5,
+            "minimum_reader_version": 5,
             "network": "regtest",
             "stores": {
                 "headers": 1,
@@ -27152,6 +27186,43 @@ mod tests {
                 .contains("unsupported data-format schema version")
         );
         assert_eq!(fs::read(path).unwrap(), future);
+    }
+
+    #[test]
+    fn data_format_manifest_binds_chainstate_backend_and_migrates_version_three() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(DATA_FORMAT_MANIFEST_FILE);
+        let mut version3 =
+            serde_json::to_value(DataFormatManifest::version3(Network::Regtest)).unwrap();
+        version3
+            .as_object_mut()
+            .unwrap()
+            .remove("chainstate_backend");
+        fs::write(&path, serde_json::to_vec(&version3).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(migrated["schema_version"], 4);
+        assert_eq!(migrated["chainstate_backend"], "redb");
+
+        let wrong_backend = serde_json::to_vec(&DataFormatManifest::current_for_backend(
+            Network::Regtest,
+            ChainstateBackend::Mdbx,
+        ))
+        .unwrap();
+        fs::write(&path, &wrong_backend).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("does not match the regtest schema inventory")
+        );
+        assert_eq!(fs::read(&path).unwrap(), wrong_backend);
     }
 
     #[cfg(unix)]

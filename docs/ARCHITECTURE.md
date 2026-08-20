@@ -578,8 +578,11 @@ system's default abrupt termination.
 
 The `mdbx` Cargo feature provides the experimental four-table chainstate
 described above. Compact UTXOs, compact undo, and execution-tip metadata now do
-share each write transaction; what remains experimental is node selection,
-migration, crash testing, and full-workload measurement. The older bare-UTXO
+share each write transaction. Data-format schema 4 explicitly binds the root
+manifest to `redb` or `mdbx`; the current redb node rejects an MDBX-marked
+directory before opening either engine, and schema-3 redb manifests migrate
+atomically. What remains experimental is node selection, content migration,
+and full-workload measurement. The older bare-UTXO
 100-block fixture (about 39 ms versus redb's 733 ms without quick repair and
 1.43 s with quick repair) omitted the now-implemented undo/tip work and is only
 a historical direction signal. It must not be presented as the performance of

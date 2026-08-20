@@ -340,9 +340,11 @@ default-engine decision are recorded in
 [docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md).
 MDBX replacement preparation now includes verified four-table compact-copy,
 an abrupt-process recovery matrix, free-space and anti-thrashing policy, and a
-resumable 160M/900,000 churn/RSS runner. The completed and still-external gates
-are separated in [docs/MDBX_REPLACEMENT_GATE.md](docs/MDBX_REPLACEMENT_GATE.md);
-MDBX remains opt-in until the full-scale and real-block evidence passes.
+resumable 160M/900,000 churn/RSS runner. The root format manifest also binds a
+data directory to `redb` or `mdbx`, so a mismatched binary fails before opening
+either chainstate. The completed and still-external gates are separated in
+[docs/MDBX_REPLACEMENT_GATE.md](docs/MDBX_REPLACEMENT_GATE.md); MDBX remains
+opt-in until the full-scale and real-block evidence passes.
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character

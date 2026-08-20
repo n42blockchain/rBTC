@@ -51,6 +51,10 @@ the copy if that space is unavailable.
   spend/create pairs per transition, 256-transition commits, 288 retained undo
   rows, a 128 GiB ceiling, and periodic physical metrics. It never calls these
   synthetic transitions mainnet blocks.
+- Root data-format schema 4 names the chainstate backend. A schema-3 redb
+  directory migrates to `chainstate_backend: "redb"`; the current node rejects
+  an `mdbx` manifest without rewriting it. This establishes a fail-closed
+  rollback boundary before the future content migrator publishes MDBX.
 
 ## Run the full 64/256 gate
 
@@ -107,9 +111,10 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    redb and MDBX with identical cache, validation, retention, batch, and start
    state. Final tip and canonical UTXO identity must match. That corpus is not
    on this Mac, so this remains an external gate.
-5. The daemon must gain an explicit backend manifest/migration path and cover
-   AssumeUTXO metadata, consensus binding, background validation, offline
-   repair, observability, and rollback. The current candidate implements the
+5. The explicit backend manifest is complete. The daemon must still gain an
+   authenticated content migration/publish path and cover AssumeUTXO metadata,
+   consensus binding, background validation, offline repair, observability,
+   and operational rollback. The current candidate implements the
    UTXO/undo/tip trait but is not yet a drop-in replacement for every redb-only
    node surface.
 
