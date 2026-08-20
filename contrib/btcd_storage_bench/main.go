@@ -585,8 +585,11 @@ func run(w workload, s scenario, keyKind, engineName string, timeLimit time.Dura
 	if err != nil {
 		panic(err)
 	}
+	dbOpen := true
 	defer func() {
-		_ = db.close()
+		if dbOpen {
+			_ = db.close()
+		}
 	}()
 	live := newLiveSet(w, keyKind)
 	seedElapsed := seed(db, live)
@@ -595,20 +598,24 @@ func run(w workload, s scenario, keyKind, engineName string, timeLimit time.Dura
 	if err := db.close(); err != nil {
 		panic(err)
 	}
+	dbOpen = false
 	db, err = openEngine(engineName, dir)
 	if err != nil {
 		panic(err)
 	}
+	dbOpen = true
 	quiesceElapsed := time.Since(quiesceStarted)
 	lookupElapsed := lookup(db, w, live)
 	if err := db.close(); err != nil {
 		panic(err)
 	}
+	dbOpen = false
 	beforeLogical, beforeAllocated := dirSizes(dir)
 	db, err = openEngine(engineName, dir)
 	if err != nil {
 		panic(err)
 	}
+	dbOpen = true
 	compactStarted := time.Now()
 	if err := db.compact(); err != nil {
 		panic(err)
@@ -617,6 +624,7 @@ func run(w workload, s scenario, keyKind, engineName string, timeLimit time.Dura
 	if err := db.close(); err != nil {
 		panic(err)
 	}
+	dbOpen = false
 	afterLogical, afterAllocated := dirSizes(dir)
 	seconds := mutationElapsed.Seconds()
 	return result{

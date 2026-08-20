@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestSelectedEnginesShareAtomicBatchSemantics(t *testing.T) {
@@ -114,6 +115,21 @@ func TestBadgerUsesAtomicTransactionsOnlyForMeasuredMutation(t *testing.T) {
 	defer prefill.close()
 	if _, bulk := prefill.(*badgerBatch); !bulk {
 		t.Fatal("Badger bulk loader must remain confined to unmeasured prefill")
+	}
+}
+
+func TestSafeRunClosesEachEngineExactlyOnce(t *testing.T) {
+	w := workload{UTXOs: 1_000, Blocks: 2, UpdatesPerBlock: 10, Lookups: 100}
+	for _, name := range []string{"leveldb", "pebble", "badger", "bbolt"} {
+		t.Run(name, func(t *testing.T) {
+			got := safeRun(w, scenario{Name: "serving", BlocksPerCommit: 1}, "btcd-vlq", name, time.Second)
+			if got.Error != "" {
+				t.Fatalf("engine run failed during cleanup: %s", got.Error)
+			}
+			if !got.ReachedTarget || got.CompletedBlocks != w.Blocks {
+				t.Fatalf("unexpected completion: %+v", got)
+			}
+		})
 	}
 }
 
