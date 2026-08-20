@@ -331,9 +331,12 @@ synchronous atomic UTXO/undo/tip transaction; engines that cannot fit the
 256-block transaction are reported as rejected rather than silently split.
 Its serial one-hour matrix targets 900,000 deterministic transitions and
 records the actually completed count per lane. It explicitly does not call
-that storage-only lane a btcd IBD or a height-900,000 mainnet replay result.
-Method, three-round Mac medians, limitations, and the default-engine decision
-are recorded in
+that storage-only lane a btcd IBD or a height-900,000 mainnet replay result. In
+the 56.2-minute Mac run no lane reached the target: bbolt led successful
+serving and IBD-256 throughput, Badger rejected the required atomic IBD
+checkpoint, and Pebble's sustained IBD result reversed its short-run lead.
+Method, three-round Mac medians, timebox results, limitations, and the
+default-engine decision are recorded in
 [docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md).
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized

@@ -23,7 +23,10 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   UTXO/undo/tip mutation. It records oversized-transaction rejection,
   quiescence, compaction, allocated bytes, target/completed transitions, and a
   serial approximately one-hour 900,000-transition timebox without labelling
-  the synthetic workload as btcd IBD or a mainnet height replay.
+  the synthetic workload as btcd IBD or a mainnet height replay. The first
+  clean Mac timebox records 3,108–12,033 completed serving transitions,
+  sustained Pebble IBD falling behind LevelDB, and Badger rejecting the first
+  required atomic IBD checkpoint; the default database decision is unchanged.
 
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full

@@ -145,6 +145,49 @@ The corrected LevelDB reports are
 `995dbb3b69259bc61aad11e9fb820b39a62a561464420d4c568846768e8d1282`,
 and `e668d9ff9e6874c1f77b1b82850a9ed6a0e48922078d1d2f968f453d26cfaf6f`.
 
+## One-hour storage-only timebox
+
+A second run tested whether the short-run ranking survived sustained churn.
+It used the same 2M-live-UTXO btcd codec workload, targeted 900,000 synthetic
+transitions per lane, and gave each engine/scenario a 450-second mutation
+budget. The eight lanes ran serially. A 256-block atomic transaction may finish
+after the budget boundary, so the table uses measured mutation time and actual
+completed blocks. The complete matrix took 3,372 seconds (56.2 minutes):
+
+| engine | mode | completed / 900,000 | blocks/s | peak RSS | post-compact allocation | compaction | result |
+|---|---|---:|---:|---:|---:|---:|---|
+| Go LevelDB | serving | 3,108 | 6.90 | 1.87 GiB | 1.69 GiB | 22.57 s | completed timebox |
+| Go LevelDB | IBD-256 | 7,168 | 15.69 | 5.66 GiB | 3.74 GiB | 39.31 s | completed timebox |
+| Pebble | serving | 4,128 | 9.17 | **0.86 GiB** | 2.20 GiB | 15.71 s | completed timebox |
+| Pebble | IBD-256 | 4,608 | 9.96 | 3.34 GiB | 2.44 GiB | 19.26 s | completed timebox |
+| Badger | serving | 11,585 | 25.74 | 12.03 GiB | 5.98 GiB | 13.80 s | completed timebox |
+| Badger | IBD-256 | 0 | 0 | 2.35 GiB | — | — | rejected: transaction too large |
+| bbolt | serving | **12,033** | **26.74** | 7.20 GiB | 6.29 GiB | **9.68 s** | completed timebox |
+| bbolt | IBD-256 | **8,704** | **18.63** | 5.85 GiB | 4.56 GiB | 10.15 s | completed timebox |
+
+No lane reached 900,000. These are deterministic storage transitions, not
+Bitcoin blocks, so the run is neither a btcd IBD benchmark nor evidence of a
+mainnet replay through height 900,000. The fastest lanes also retain undo for
+more completed transitions. Their larger final allocation therefore contains
+more logical data and cannot be compared as a fixed-cardinality space result;
+the 256-block three-round table remains the controlled footprint comparison.
+
+The longer run materially changed one conclusion from the short table. Pebble
+IBD-256 fell from a 51.02 blocks/s short median to 9.96 blocks/s under sustained
+churn, below LevelDB's 15.69 blocks/s. Its serving lane remained 1.33 times
+LevelDB with 54% lower peak RSS. bbolt retained the best successful throughput
+on this Mac, but used the most post-compact space and the supplied Windows
+non-completion remains unexplained. Badger's serving rate was high but its
+first atomic IBD checkpoint still failed. The evidence therefore supports an
+LSM prototype and further bbolt diagnosis, not changing rBTC's default.
+
+The run used source revision
+`416b97db7b7446193d7fad21e49a891cda3fc13e` with `source_dirty=false` and
+binary SHA-256
+`9ea955ac6f3d5c1b205e12ea84a8cb2e33d9dfd3894aceca96fa6f997118ea2f`.
+The combined `matrix.json` SHA-256 is
+`83bcf1328c969cad02978697b912094cf09da7fa21a6d3595fbc4e8c55416754`.
+
 ## Key-format A/B
 
 The key decision was measured separately on the same Go LevelDB lane so engine,
@@ -246,9 +289,9 @@ better physical family at full scale even when a short B-tree benchmark wins.
 |---|---|---|---|
 | redb | current production integration, recovery and crash gates | slowest/largest complete rBTC lane | keep as default until a replacement passes the full gate |
 | MDBX | fastest complete rBTC lane; compact copy and atomic four-table store exist | supplied 169M-coin run shows severe long-churn amplification | leading feature-gated replacement candidate |
-| Pebble | smallest Go compacted footprint; 3.15x LevelDB IBD rate here and strong supplied bulk result | serving fsync rate, Go-only evidence, no rBTC crash/migration integration | use as evidence to prototype a Rust LSM, not as a selected backend |
+| Pebble | smallest controlled Go compacted footprint; low serving RSS and strong supplied bulk result | sustained IBD reversed the short-run result; Go-only evidence; no rBTC crash/migration integration | use as evidence to prototype a Rust LSM, not as a selected backend |
 | Badger | high serving mutation rate | cannot atomically commit the measured 256-block transaction | reject for this checkpoint contract |
-| bbolt | best/near-best Mac Go rates and valid large atomic transaction | supplied Windows result reverses by orders of magnitude; no rBTC integration | reject pending an explained cross-platform result; not a default candidate |
+| bbolt | best successful Mac timebox rates and valid large atomic transaction | largest successful serving allocation; supplied Windows result reverses by orders of magnitude; no rBTC integration | reject pending an explained cross-platform result; not a default candidate |
 | Go LevelDB | exact btcd revision/codec reference and stable compacted size | materially slower mutation than the leading lanes | retain as reference, not an rBTC replacement |
 | SQLite | already deployed for wallet metadata and has an engine size ceiling | existing 2M UTXO point lookup and p99 are materially worse | retain for wallet metadata; reject for chainstate hot path |
 
