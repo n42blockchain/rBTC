@@ -7,7 +7,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
@@ -29,33 +30,95 @@ const UNDO: &str = "undo";
 const META: &str = "meta";
 const FORMAT_KEY: &[u8] = b"format";
 const TIP_KEY: &[u8] = b"tip";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const UNDO_FORMAT_VERSION: u32 = 1;
 /// The IBD checkpoint size whose net UTXO effect is folded into one write.
 pub const MAX_ATOMIC_IBD_BATCH_BLOCKS: usize = 256;
 type FoldedBatchChanges = (Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>);
 /// Three years at Bitcoin's target ten-minute spacing.
 pub const DEFAULT_HOT_WINDOW_BLOCKS: u32 = 3 * 365 * 24 * 6;
+/// Default hard geometry ceiling for a complete MDBX chainstate.
+pub const DEFAULT_CHAINSTATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
-/// Encodes the MDBX physical key as wire-order txid plus a big-endian vout.
+/// MDBX high-water allocation against its hard geometry ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MdbxChainstateCapacity {
+    /// Bytes covered by the highest allocated page.
+    pub used_bytes: u64,
+    /// Configured hard geometry ceiling.
+    pub capacity_bytes: u64,
+}
+
+/// Result of rewriting only live MDBX pages into a fresh environment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MdbxCompactionReport {
+    /// High-water bytes before compaction.
+    pub before_bytes: u64,
+    /// High-water bytes after compaction and reopen.
+    pub after_bytes: u64,
+}
+
+impl MdbxCompactionReport {
+    /// Bytes of high-water allocation reclaimed by the compact copy.
+    #[must_use]
+    pub const fn released_bytes(self) -> u64 {
+        self.before_bytes.saturating_sub(self.after_bytes)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EncodedMdbxKey {
+    bytes: [u8; 37],
+    len: u8,
+}
+
+impl EncodedMdbxKey {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    #[cfg(test)]
+    fn len(self) -> usize {
+        usize::from(self.len)
+    }
+}
+
+/// Encodes wire-order txid plus a length-tagged minimal big-endian vout.
 ///
-/// This differs deliberately from the legacy rBTC/redb `OutPointKey`. MDBX's
-/// bytewise cursor therefore keeps all outputs of a transaction contiguous and
-/// orders their vouts numerically, without changing existing redb/snapshot data.
-fn encode_mdbx_key(key: OutPointKey) -> [u8; 36] {
+/// The 34–37-byte format is globally bytewise ordered by numeric vout, unlike
+/// btcd's slightly smaller MSB-VLQ at its length boundaries. It also saves two
+/// bytes for the overwhelmingly common 0–255 vouts versus a fixed u32.
+fn encode_mdbx_key(key: OutPointKey) -> EncodedMdbxKey {
     let outpoint = key.to_outpoint();
-    let mut encoded = [0_u8; 36];
-    encoded[..32].copy_from_slice(&outpoint.txid.to_byte_array());
-    encoded[32..].copy_from_slice(&outpoint.vout.to_be_bytes());
-    encoded
+    let width = usize::try_from(
+        (u32::BITS - outpoint.vout.leading_zeros())
+            .div_ceil(8)
+            .max(1),
+    )
+    .expect("vout byte width fits usize");
+    let len = 33 + width;
+    let mut bytes = [0_u8; 37];
+    bytes[..32].copy_from_slice(&outpoint.txid.to_byte_array());
+    bytes[32] = u8::try_from(width - 1).expect("vout width tag fits u8");
+    bytes[33..len].copy_from_slice(&outpoint.vout.to_be_bytes()[4 - width..]);
+    EncodedMdbxKey {
+        bytes,
+        len: u8::try_from(len).expect("MDBX key length fits u8"),
+    }
 }
 
 fn decode_mdbx_key(bytes: &[u8]) -> Result<OutPointKey, UtxoError> {
-    let bytes: [u8; 36] = bytes
-        .try_into()
-        .map_err(|_| UtxoError::Malformed("MDBX outpoint key"))?;
+    let Some(tag) = bytes.get(32).copied() else {
+        return Err(UtxoError::Malformed("MDBX outpoint key"));
+    };
+    let width = usize::from(tag) + 1;
+    if width > 4 || bytes.len() != 33 + width || (width > 1 && bytes[33] == 0) {
+        return Err(UtxoError::Malformed("MDBX outpoint key"));
+    }
     let txid = Txid::from_byte_array(bytes[..32].try_into().expect("fixed key length"));
-    let vout = u32::from_be_bytes(bytes[32..].try_into().expect("fixed key length"));
+    let mut vout = [0_u8; 4];
+    vout[4 - width..].copy_from_slice(&bytes[33..]);
+    let vout = u32::from_be_bytes(vout);
     Ok(OutPointKey::from(OutPoint::new(txid, vout)))
 }
 
@@ -73,7 +136,7 @@ fn encode_mdbx_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UtxoError> {
             let coin = coin.encode_compact()?;
             let coin_len = u32::try_from(coin.len())
                 .map_err(|_| UtxoError::Malformed("MDBX undo coin length"))?;
-            bytes.extend_from_slice(&encode_mdbx_key(*key));
+            bytes.extend_from_slice(encode_mdbx_key(*key).as_slice());
             bytes.extend_from_slice(&coin_len.to_be_bytes());
             bytes.extend_from_slice(&coin);
         }
@@ -81,7 +144,7 @@ fn encode_mdbx_block_undo(undos: &[UtxoUndo]) -> Result<Vec<u8>, UtxoError> {
             .map_err(|_| UtxoError::Malformed("MDBX undo created count"))?;
         bytes.extend_from_slice(&created_count.to_be_bytes());
         for key in undo.created() {
-            bytes.extend_from_slice(&encode_mdbx_key(*key));
+            bytes.extend_from_slice(encode_mdbx_key(*key).as_slice());
         }
     }
     Ok(bytes)
@@ -117,10 +180,9 @@ fn decode_mdbx_block_undo<K: TransactionKind, E: DatabaseKind>(
         }
         let mut spent = Vec::with_capacity(spent_count);
         for _ in 0..spent_count {
-            let key = decode_mdbx_key(take_mdbx(
+            let key = decode_mdbx_key(take_mdbx_key(
                 bytes,
                 &mut cursor,
-                36,
                 "MDBX undo spent outpoint",
             )?)?;
             let coin_len =
@@ -139,17 +201,16 @@ fn decode_mdbx_block_undo<K: TransactionKind, E: DatabaseKind>(
             "MDBX undo created count",
         )?)
         .expect("u32 fits usize");
-        if created_count > bytes.len().saturating_sub(cursor) / 36 {
+        if created_count > bytes.len().saturating_sub(cursor) / 34 {
             return Err(UtxoError::Malformed(
                 "MDBX undo created count exceeds record",
             ));
         }
         let mut created = Vec::with_capacity(created_count);
         for _ in 0..created_count {
-            created.push(decode_mdbx_key(take_mdbx(
+            created.push(decode_mdbx_key(take_mdbx_key(
                 bytes,
                 &mut cursor,
-                36,
                 "MDBX undo created outpoint",
             )?)?);
         }
@@ -175,6 +236,19 @@ fn take_mdbx<'a>(
     Ok(value)
 }
 
+fn take_mdbx_key<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    field: &'static str,
+) -> Result<&'a [u8], UtxoError> {
+    let tag_at = cursor.checked_add(32).ok_or(UtxoError::Malformed(field))?;
+    let width = usize::from(*bytes.get(tag_at).ok_or(UtxoError::Malformed(field))?) + 1;
+    if width > 4 {
+        return Err(UtxoError::Malformed(field));
+    }
+    take_mdbx(bytes, cursor, 33 + width, field)
+}
+
 fn take_mdbx_u32(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<u32, UtxoError> {
     Ok(u32::from_be_bytes(
         take_mdbx(bytes, cursor, 4, field)?
@@ -190,25 +264,29 @@ fn take_mdbx_u32(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Resul
 /// creation MTP, and execution tip. Keeping these in one environment lets each
 /// block (or 256-block IBD checkpoint) commit UTXOs, undo, and tip atomically.
 pub struct MdbxUtxoStore {
-    db: Database<NoWriteMap>,
+    db: Option<Database<NoWriteMap>>,
+    database_dir: PathBuf,
+    capacity_bytes: u64,
     write_guard: Mutex<()>,
 }
 
 impl MdbxUtxoStore {
     /// Opens or creates a durable MDBX environment directory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtxoError> {
-        std::fs::create_dir_all(path.as_ref())?;
-        let db = Database::open_with_options(
-            path,
-            DatabaseOptions {
-                max_tables: Some(4),
-                mode: Mode::ReadWrite(ReadWriteOptions {
-                    sync_mode: SyncMode::Durable,
-                    ..ReadWriteOptions::default()
-                }),
-                ..DatabaseOptions::default()
-            },
-        )?;
+        Self::open_with_capacity(path, DEFAULT_CHAINSTATE_CAPACITY_BYTES)
+    }
+
+    /// Opens with an engine-enforced maximum allocation high-water mark.
+    pub fn open_with_capacity(
+        path: impl AsRef<Path>,
+        capacity_bytes: u64,
+    ) -> Result<Self, UtxoError> {
+        let database_dir = path.as_ref().to_path_buf();
+        if database_dir.file_name().is_none() {
+            return Err(UtxoError::Malformed("MDBX chainstate directory name"));
+        }
+        recover_compaction_swap(&database_dir)?;
+        let db = open_environment(&database_dir, capacity_bytes)?;
         let transaction = db.begin_rw_txn()?;
         let hot = transaction.create_table(Some(HOT), TableFlags::empty())?;
         let cold = transaction.create_table(Some(COLD), TableFlags::empty())?;
@@ -234,10 +312,19 @@ impl MdbxUtxoStore {
             }
         }
         transaction.commit()?;
+        remove_stale_compaction_paths(&database_dir)?;
         Ok(Self {
-            db,
+            db: Some(db),
+            database_dir,
+            capacity_bytes,
             write_guard: Mutex::new(()),
         })
+    }
+
+    fn db(&self) -> &Database<NoWriteMap> {
+        self.db
+            .as_ref()
+            .expect("MDBX handle is absent only during an exclusive compact swap")
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -246,13 +333,89 @@ impl MdbxUtxoStore {
             .expect("MDBX write lock not poisoned")
     }
 
+    /// Reports allocation high-water usage against the hard geometry ceiling.
+    pub fn capacity(&self) -> Result<MdbxChainstateCapacity, UtxoError> {
+        let info = self.db().info()?;
+        let page_size = u64::from(self.db().stat()?.page_size());
+        let last_page = u64::try_from(info.last_pgno())
+            .map_err(|_| UtxoError::Malformed("MDBX page number exceeds u64"))?;
+        Ok(MdbxChainstateCapacity {
+            used_bytes: last_page.saturating_add(1).saturating_mul(page_size),
+            capacity_bytes: self.capacity_bytes,
+        })
+    }
+
+    /// Reclaims unreachable pages through `MDBX_CP_COMPACT` and a recoverable
+    /// directory swap. This is a space operation; it does not promise faster
+    /// lookups or mutation of the unchanged live tree.
+    pub fn compact(&mut self) -> Result<MdbxCompactionReport, UtxoError> {
+        let before_bytes = self.capacity()?.used_bytes;
+        let fresh_dir = compaction_path(&self.database_dir);
+        let old_dir = compacted_out_path(&self.database_dir);
+        remove_path_if_exists(&fresh_dir)?;
+        remove_path_if_exists(&old_dir)?;
+        fs::create_dir_all(&fresh_dir)?;
+        self.db().copy_compact(&fresh_dir.join("mdbx.dat"))?;
+        sync_directory(&fresh_dir)?;
+
+        drop(self.db.take());
+        if let Err(error) = fs::rename(&self.database_dir, &old_dir) {
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error.into());
+        }
+        if let Err(error) = sync_database_parent(&self.database_dir) {
+            fs::rename(&old_dir, &self.database_dir)?;
+            sync_database_parent(&self.database_dir)?;
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&fresh_dir, &self.database_dir) {
+            fs::rename(&old_dir, &self.database_dir)?;
+            sync_database_parent(&self.database_dir)?;
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error.into());
+        }
+        if let Err(error) = sync_database_parent(&self.database_dir) {
+            restore_compaction_old(&self.database_dir, &fresh_dir, &old_dir)?;
+            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            return Err(error);
+        }
+        match open_environment(&self.database_dir, self.capacity_bytes).and_then(|db| {
+            validate_compacted_environment(&db)?;
+            Ok(db)
+        }) {
+            Ok(db) => self.db = Some(db),
+            Err(open_error) => {
+                restore_compaction_old(&self.database_dir, &fresh_dir, &old_dir)?;
+                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                return Err(open_error);
+            }
+        }
+        remove_path_if_exists(&old_dir)?;
+        sync_database_parent(&self.database_dir)?;
+        let after_bytes = self.capacity()?.used_bytes;
+        Ok(MdbxCompactionReport {
+            before_bytes,
+            after_bytes,
+        })
+    }
+
     fn decode_coin<K: TransactionKind, E: DatabaseKind>(
         transaction: &Transaction<'_, K, E>,
         meta: &Table<'_>,
         bytes: &[u8],
     ) -> Result<Utxo, UtxoError> {
-        let coin = Utxo::decode_compact_with_creation_mtp(bytes, 0)?;
-        let key = creation_mtp_key(coin.height);
+        let mut coin = Utxo::decode_compact_with_creation_mtp(bytes, 0)?;
+        coin.creation_mtp = Self::read_creation_mtp(transaction, meta, coin.height)?;
+        Ok(coin)
+    }
+
+    fn read_creation_mtp<K: TransactionKind, E: DatabaseKind>(
+        transaction: &Transaction<'_, K, E>,
+        meta: &Table<'_>,
+        height: u32,
+    ) -> Result<u32, UtxoError> {
+        let key = creation_mtp_key(height);
         let mtp = transaction
             .get::<Vec<u8>>(meta, &key)?
             .ok_or(UtxoError::Malformed(
@@ -262,7 +425,24 @@ impl MdbxUtxoStore {
             .as_slice()
             .try_into()
             .map_err(|_| UtxoError::Malformed("creation MTP metadata"))?;
-        Utxo::decode_compact_with_creation_mtp(bytes, u32::from_be_bytes(mtp))
+        Ok(u32::from_be_bytes(mtp))
+    }
+
+    fn decode_coin_cached<K: TransactionKind, E: DatabaseKind>(
+        transaction: &Transaction<'_, K, E>,
+        meta: &Table<'_>,
+        mtp_by_height: &mut BTreeMap<u32, u32>,
+        bytes: &[u8],
+    ) -> Result<Utxo, UtxoError> {
+        let mut coin = Utxo::decode_compact_with_creation_mtp(bytes, 0)?;
+        coin.creation_mtp = if let Some(mtp) = mtp_by_height.get(&coin.height) {
+            *mtp
+        } else {
+            let mtp = Self::read_creation_mtp(transaction, meta, coin.height)?;
+            mtp_by_height.insert(coin.height, mtp);
+            mtp
+        };
+        Ok(coin)
     }
 
     fn register_creation_mtp(
@@ -331,7 +511,7 @@ impl MdbxUtxoStore {
     /// Initializes an empty MDBX chainstate at a trusted execution tip.
     pub fn initialize_execution_tip(&self, tip: ExecutionTip) -> Result<(), ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
         let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
         let cold = transaction
             .open_table(Some(COLD))
@@ -404,8 +584,8 @@ impl MdbxUtxoStore {
             }
             let storage_key = encode_mdbx_key(*key);
             let value = transaction
-                .get::<Vec<u8>>(hot, &storage_key)?
-                .or(transaction.get::<Vec<u8>>(cold, &storage_key)?)
+                .get::<Vec<u8>>(hot, storage_key.as_slice())?
+                .or(transaction.get::<Vec<u8>>(cold, storage_key.as_slice())?)
                 .ok_or(UtxoError::Missing(*key))?;
             undo_spent.push((*key, Self::decode_coin(transaction, meta, &value)?));
         }
@@ -417,8 +597,12 @@ impl MdbxUtxoStore {
             }
             let storage_key = encode_mdbx_key(*key);
             if !seen_spent.contains(key)
-                && (transaction.get::<()>(hot, &storage_key)?.is_some()
-                    || transaction.get::<()>(cold, &storage_key)?.is_some())
+                && (transaction
+                    .get::<()>(hot, storage_key.as_slice())?
+                    .is_some()
+                    || transaction
+                        .get::<()>(cold, storage_key.as_slice())?
+                        .is_some())
             {
                 return Err(UtxoError::Duplicate(*key));
             }
@@ -435,8 +619,8 @@ impl MdbxUtxoStore {
         }
         for key in spent {
             let storage_key = encode_mdbx_key(*key);
-            transaction.del(hot, storage_key, None)?;
-            transaction.del(cold, storage_key, None)?;
+            transaction.del(hot, storage_key.as_slice(), None)?;
+            transaction.del(cold, storage_key.as_slice(), None)?;
         }
         for (key, coin) in created {
             Self::register_creation_mtp(transaction, meta, coin)?;
@@ -446,9 +630,10 @@ impl MdbxUtxoStore {
                     "UTXO creation height exceeds execution tip",
                 ))?;
             let target = if age <= hot_window_blocks { hot } else { cold };
+            let storage_key = encode_mdbx_key(*key);
             transaction.put(
                 target,
-                encode_mdbx_key(*key),
+                storage_key.as_slice(),
                 coin.encode_compact()?,
                 WriteFlags::empty(),
             )?;
@@ -490,7 +675,7 @@ impl MdbxUtxoStore {
             return Ok(Vec::new());
         }
         let _guard = self.lock();
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         let meta = transaction.open_table(Some(META))?;
@@ -498,12 +683,12 @@ impl MdbxUtxoStore {
 
         let mut hot_cursor = transaction.cursor(&hot)?;
         let mut cold_cursor = transaction.cursor(&cold)?;
-        let mut hot_rows = match after_bytes {
-            Some(after) => hot_cursor.iter_from::<Vec<u8>, Vec<u8>>(&after),
+        let mut hot_rows = match after_bytes.as_ref() {
+            Some(after) => hot_cursor.iter_from::<Vec<u8>, Vec<u8>>(after.as_slice()),
             None => hot_cursor.iter_start::<Vec<u8>, Vec<u8>>(),
         };
-        let mut cold_rows = match after_bytes {
-            Some(after) => cold_cursor.iter_from::<Vec<u8>, Vec<u8>>(&after),
+        let mut cold_rows = match after_bytes.as_ref() {
+            Some(after) => cold_cursor.iter_from::<Vec<u8>, Vec<u8>>(after.as_slice()),
             None => cold_cursor.iter_start::<Vec<u8>, Vec<u8>>(),
         };
 
@@ -530,7 +715,7 @@ impl MdbxUtxoStore {
             }
         }
 
-        let after_bytes = after_bytes.as_ref().map(<[u8; 36]>::as_slice);
+        let after_bytes = after_bytes.as_ref().map(EncodedMdbxKey::as_slice);
         let mut hot_next = next_row(&mut hot_rows, after_bytes, &transaction, &meta)?;
         let mut cold_next = next_row(&mut cold_rows, after_bytes, &transaction, &meta)?;
         let mut page = Vec::with_capacity(limit);
@@ -572,7 +757,7 @@ impl MdbxUtxoStore {
         hot_window_blocks: u32,
     ) -> Result<u64, UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         let mut moves = Vec::new();
@@ -614,20 +799,165 @@ fn creation_mtp_key(height: u32) -> [u8; 5] {
     key
 }
 
+fn open_environment(
+    database_dir: &Path,
+    capacity_bytes: u64,
+) -> Result<Database<NoWriteMap>, UtxoError> {
+    fs::create_dir_all(database_dir)?;
+    let capacity = isize::try_from(capacity_bytes)
+        .map_err(|_| UtxoError::Malformed("MDBX capacity exceeds platform limit"))?;
+    Ok(Database::open_with_options(
+        database_dir,
+        DatabaseOptions {
+            max_tables: Some(4),
+            mode: Mode::ReadWrite(ReadWriteOptions {
+                sync_mode: SyncMode::Durable,
+                max_size: Some(capacity),
+                ..ReadWriteOptions::default()
+            }),
+            ..DatabaseOptions::default()
+        },
+    )?)
+}
+
+fn validate_compacted_environment(db: &Database<NoWriteMap>) -> Result<(), UtxoError> {
+    let transaction = db.begin_ro_txn()?;
+    transaction.open_table(Some(HOT))?;
+    transaction.open_table(Some(COLD))?;
+    transaction.open_table(Some(UNDO))?;
+    let meta = transaction.open_table(Some(META))?;
+    match transaction.get::<Vec<u8>>(&meta, FORMAT_KEY)? {
+        Some(version) if version.as_slice() == FORMAT_VERSION.to_be_bytes() => Ok(()),
+        _ => Err(UtxoError::Malformed("compacted MDBX format marker")),
+    }
+}
+
+fn compaction_path(database_dir: &Path) -> PathBuf {
+    database_dir.with_file_name({
+        let mut name = database_dir.file_name().unwrap_or_default().to_owned();
+        name.push(".compacting");
+        name
+    })
+}
+
+fn compacted_out_path(database_dir: &Path) -> PathBuf {
+    database_dir.with_file_name({
+        let mut name = database_dir.file_name().unwrap_or_default().to_owned();
+        name.push(".compacted-out");
+        name
+    })
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), UtxoError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)?;
+            Ok(())
+        }
+        Ok(_) => {
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recover_compaction_swap(database_dir: &Path) -> Result<(), UtxoError> {
+    let old_dir = compacted_out_path(database_dir);
+    let fresh_dir = compaction_path(database_dir);
+    if !database_dir.exists() {
+        if old_dir.exists() {
+            fs::rename(&old_dir, database_dir)?;
+            remove_path_if_exists(&fresh_dir)?;
+            sync_database_parent(database_dir)?;
+        } else if fresh_dir.exists() {
+            return Err(UtxoError::Malformed(
+                "orphan MDBX compact copy without prior environment",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_stale_compaction_paths(database_dir: &Path) -> Result<(), UtxoError> {
+    remove_path_if_exists(&compaction_path(database_dir))?;
+    remove_path_if_exists(&compacted_out_path(database_dir))?;
+    sync_database_parent(database_dir)
+}
+
+fn restore_compaction_old(
+    database_dir: &Path,
+    fresh_dir: &Path,
+    old_dir: &Path,
+) -> Result<(), UtxoError> {
+    if database_dir.exists() {
+        fs::rename(database_dir, fresh_dir)?;
+    }
+    fs::rename(old_dir, database_dir)?;
+    sync_database_parent(database_dir)
+}
+
+fn sync_database_parent(database_dir: &Path) -> Result<(), UtxoError> {
+    let parent = database_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    sync_directory(parent)
+}
+
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+fn sync_directory(path: &Path) -> Result<(), UtxoError> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 impl UtxoStore for MdbxUtxoStore {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let meta = transaction.open_table(Some(META))?;
         let storage_key = encode_mdbx_key(outpoint);
-        if let Some(value) = transaction.get::<Vec<u8>>(&hot, &storage_key)? {
+        if let Some(value) = transaction.get::<Vec<u8>>(&hot, storage_key.as_slice())? {
             return Self::decode_coin(&transaction, &meta, &value).map(Some);
         }
         let cold = transaction.open_table(Some(COLD))?;
         transaction
-            .get::<Vec<u8>>(&cold, &storage_key)?
+            .get::<Vec<u8>>(&cold, storage_key.as_slice())?
             .map(|value| Self::decode_coin(&transaction, &meta, &value))
             .transpose()
+    }
+
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let transaction = self.db().begin_ro_txn()?;
+        let hot = transaction.open_table(Some(HOT))?;
+        let cold = transaction.open_table(Some(COLD))?;
+        let meta = transaction.open_table(Some(META))?;
+        let mut mtp_by_height = BTreeMap::new();
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                let storage_key = encode_mdbx_key(*outpoint);
+                let coin = transaction
+                    .get::<Vec<u8>>(&hot, storage_key.as_slice())?
+                    .or(transaction.get::<Vec<u8>>(&cold, storage_key.as_slice())?)
+                    .map(|value| {
+                        Self::decode_coin_cached(&transaction, &meta, &mut mtp_by_height, &value)
+                    })
+                    .transpose()?;
+                Ok((*outpoint, coin))
+            })
+            .collect()
     }
 
     fn apply(
@@ -644,7 +974,7 @@ impl UtxoStore for MdbxUtxoStore {
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         let meta = transaction.open_table(Some(META))?;
@@ -656,8 +986,8 @@ impl UtxoStore for MdbxUtxoStore {
             }
             let storage_key = encode_mdbx_key(*key);
             let value = transaction
-                .get::<Vec<u8>>(&hot, &storage_key)?
-                .or(transaction.get::<Vec<u8>>(&cold, &storage_key)?)
+                .get::<Vec<u8>>(&hot, storage_key.as_slice())?
+                .or(transaction.get::<Vec<u8>>(&cold, storage_key.as_slice())?)
                 .ok_or(UtxoError::Missing(*key))?;
             undo_spent.push((*key, Self::decode_coin(&transaction, &meta, &value)?));
         }
@@ -668,22 +998,27 @@ impl UtxoStore for MdbxUtxoStore {
             }
             let storage_key = encode_mdbx_key(*key);
             if !seen_spent.contains(key)
-                && (transaction.get::<()>(&hot, &storage_key)?.is_some()
-                    || transaction.get::<()>(&cold, &storage_key)?.is_some())
+                && (transaction
+                    .get::<()>(&hot, storage_key.as_slice())?
+                    .is_some()
+                    || transaction
+                        .get::<()>(&cold, storage_key.as_slice())?
+                        .is_some())
             {
                 return Err(UtxoError::Duplicate(*key));
             }
         }
         for key in spent {
             let storage_key = encode_mdbx_key(*key);
-            transaction.del(&hot, storage_key, None)?;
-            transaction.del(&cold, storage_key, None)?;
+            transaction.del(&hot, storage_key.as_slice(), None)?;
+            transaction.del(&cold, storage_key.as_slice(), None)?;
         }
         for (key, utxo) in created {
             Self::register_creation_mtp(&transaction, &meta, utxo)?;
+            let storage_key = encode_mdbx_key(*key);
             transaction.put(
                 &hot,
-                encode_mdbx_key(*key),
+                storage_key.as_slice(),
                 utxo.encode_compact()?,
                 WriteFlags::empty(),
             )?;
@@ -697,7 +1032,7 @@ impl UtxoStore for MdbxUtxoStore {
 
     fn undo(&self, undo: &UtxoUndo, _now: u64, _hot_window_secs: u64) -> Result<(), UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         let meta = transaction.open_table(Some(META))?;
@@ -705,24 +1040,29 @@ impl UtxoStore for MdbxUtxoStore {
         for (key, _) in undo.spent() {
             let storage_key = encode_mdbx_key(*key);
             if !recreated.contains(key)
-                && (transaction.get::<()>(&hot, &storage_key)?.is_some()
-                    || transaction.get::<()>(&cold, &storage_key)?.is_some())
+                && (transaction
+                    .get::<()>(&hot, storage_key.as_slice())?
+                    .is_some()
+                    || transaction
+                        .get::<()>(&cold, storage_key.as_slice())?
+                        .is_some())
             {
                 return Err(UtxoError::Duplicate(*key));
             }
         }
         for key in undo.created() {
             let storage_key = encode_mdbx_key(*key);
-            transaction.del(&hot, storage_key, None)?;
-            transaction.del(&cold, storage_key, None)?;
+            transaction.del(&hot, storage_key.as_slice(), None)?;
+            transaction.del(&cold, storage_key.as_slice(), None)?;
         }
         for (key, utxo) in undo.spent() {
             Self::register_creation_mtp(&transaction, &meta, utxo)?;
             // A restored coin is hot until the height-based re-tier pass places
             // it. Wall-clock timestamps are deliberately not persisted.
+            let storage_key = encode_mdbx_key(*key);
             transaction.put(
                 &hot,
-                encode_mdbx_key(*key),
+                storage_key.as_slice(),
                 utxo.encode_compact()?,
                 WriteFlags::empty(),
             )?;
@@ -738,7 +1078,7 @@ impl UtxoStore for MdbxUtxoStore {
     }
 
     fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let meta = transaction.open_table(Some(META))?;
         let mut entries = BTreeMap::new();
         for name in [HOT, COLD] {
@@ -765,7 +1105,7 @@ impl UtxoStore for MdbxUtxoStore {
         _hot_window_secs: u64,
     ) -> Result<(), UtxoError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn()?;
+        let transaction = self.db().begin_rw_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         let meta = transaction.open_table(Some(META))?;
@@ -773,9 +1113,10 @@ impl UtxoStore for MdbxUtxoStore {
         transaction.clear_table(&cold)?;
         for (key, utxo) in entries {
             Self::register_creation_mtp(&transaction, &meta, utxo)?;
+            let storage_key = encode_mdbx_key(*key);
             transaction.put(
                 &hot,
-                encode_mdbx_key(*key),
+                storage_key.as_slice(),
                 utxo.encode_compact()?,
                 WriteFlags::empty(),
             )?;
@@ -785,7 +1126,7 @@ impl UtxoStore for MdbxUtxoStore {
     }
 
     fn tier_stats(&self) -> Result<TierStats, UtxoError> {
-        let transaction = self.db.begin_ro_txn()?;
+        let transaction = self.db().begin_ro_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
         Ok(TierStats {
@@ -799,7 +1140,7 @@ impl UtxoStore for MdbxUtxoStore {
 
 impl ExecutionChainStore for MdbxUtxoStore {
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
-        let transaction = self.db.begin_ro_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_ro_txn().map_err(UtxoError::from)?;
         let meta = transaction
             .open_table(Some(META))
             .map_err(UtxoError::from)?;
@@ -812,7 +1153,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
     }
 
     fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError> {
-        let transaction = self.db.begin_ro_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_ro_txn().map_err(UtxoError::from)?;
         let undo = transaction
             .open_table(Some(UNDO))
             .map_err(UtxoError::from)?;
@@ -840,7 +1181,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
         transaction_undos: &[UtxoUndo],
     ) -> Result<UtxoUndo, ChainStoreError> {
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
         let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
         let cold = transaction
             .open_table(Some(COLD))
@@ -894,7 +1235,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
         }
         let (spent, created) = Self::fold_batch_changes(transitions)?;
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
         let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
         let cold = transaction
             .open_table(Some(COLD))
@@ -953,7 +1294,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
             return Err(UtxoError::Malformed("MDBX disconnect height is not contiguous").into());
         }
         let _guard = self.lock();
-        let transaction = self.db.begin_rw_txn().map_err(UtxoError::from)?;
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
         let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
         let cold = transaction
             .open_table(Some(COLD))
@@ -1039,7 +1380,36 @@ mod tests {
     }
 
     #[test]
-    fn physical_schema_uses_four_tables_be_keys_and_btcd_coin_values() {
+    fn ordered_variable_keys_roundtrip_numeric_vout_boundaries() {
+        let txid = Txid::from_byte_array([0x42; 32]);
+        let vouts = [0, 1, 127, 128, 255, 256, 16_384, 65_535, 65_536, u32::MAX];
+        let encoded = vouts
+            .into_iter()
+            .map(|vout| encode_mdbx_key(OutPointKey::from(OutPoint::new(txid, vout))))
+            .collect::<Vec<_>>();
+        assert!(encoded.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(encoded.iter().all(|key| (34..=37).contains(&key.len())));
+        assert_eq!(
+            encoded
+                .iter()
+                .map(|key| decode_mdbx_key(key.as_slice()).unwrap().to_outpoint().vout)
+                .collect::<Vec<_>>(),
+            vouts
+        );
+
+        let mut noncanonical = encode_mdbx_key(OutPointKey::from(OutPoint::new(txid, 255)))
+            .as_slice()
+            .to_vec();
+        noncanonical[32] = 1;
+        noncanonical.insert(33, 0);
+        assert!(matches!(
+            decode_mdbx_key(&noncanonical),
+            Err(UtxoError::Malformed("MDBX outpoint key"))
+        ));
+    }
+
+    #[test]
+    fn physical_schema_uses_four_tables_ordered_keys_and_btcd_coin_values() {
         let directory = TempDir::new().unwrap();
         let store = MdbxUtxoStore::open(directory.path().join("mdbx")).unwrap();
         let txid = Txid::from_byte_array([7; 32]);
@@ -1049,7 +1419,7 @@ mod tests {
             .apply(&[], &keys.map(|key| (key, coin.clone())))
             .unwrap();
 
-        let transaction = store.db.begin_ro_txn().unwrap();
+        let transaction = store.db().begin_ro_txn().unwrap();
         let hot = transaction.open_table(Some(HOT)).unwrap();
         transaction.open_table(Some(COLD)).unwrap();
         transaction.open_table(Some(UNDO)).unwrap();
@@ -1062,13 +1432,16 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             rows.iter()
-                .map(|(key, _)| u32::from_be_bytes(key[32..].try_into().unwrap()))
+                .map(|(key, _)| decode_mdbx_key(key).unwrap().to_outpoint().vout)
                 .collect::<Vec<_>>(),
             vec![1, 2, 256]
         );
+        assert_eq!(
+            rows.iter().map(|(key, _)| key.len()).collect::<Vec<_>>(),
+            vec![34, 34, 35]
+        );
         assert!(rows.iter().all(|(key, value)| {
-            key.len() == 36
-                && key[..32] == txid.to_byte_array()
+            key[..32] == txid.to_byte_array()
                 && value
                     == &Vec::<u8>::from_hex("8cf316800900b8025be1b3efc63b0ad48e7f9f10e87544528d58")
                         .unwrap()
@@ -1107,6 +1480,26 @@ mod tests {
         assert_eq!(reopened.get(key(1)).unwrap(), Some(coin(1)));
         assert_eq!(reopened.get(key(2)).unwrap(), Some(coin(100)));
         assert!(reopened.get(key(3)).unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_lookup_reuses_one_view_and_preserves_duplicates_and_misses() {
+        let directory = TempDir::new().unwrap();
+        let store = MdbxUtxoStore::open(directory.path().join("mdbx")).unwrap();
+        store
+            .apply(&[], &[(key(1), coin(1)), (key(2), coin(2))])
+            .unwrap();
+        store.retier_by_height(2, 0).unwrap();
+
+        assert_eq!(
+            store.get_many(&[key(2), key(9), key(1), key(2)]).unwrap(),
+            vec![
+                (key(2), Some(coin(2))),
+                (key(9), None),
+                (key(1), Some(coin(1))),
+                (key(2), Some(coin(2))),
+            ]
+        );
     }
 
     #[test]
@@ -1219,15 +1612,15 @@ mod tests {
             .commit_connect(genesis.hash, next, &[], &[], std::slice::from_ref(&logical))
             .unwrap();
 
-        let transaction = store.db.begin_ro_txn().unwrap();
+        let transaction = store.db().begin_ro_txn().unwrap();
         let undo = transaction.open_table(Some(UNDO)).unwrap();
         let raw = transaction
             .get::<Vec<u8>>(&undo, &next.hash.to_byte_array())
             .unwrap()
             .unwrap();
-        // version + tx count + spent count + key + coin length + 26-byte
-        // compact coin + created count.
-        assert_eq!(raw.len(), 82);
+        // version + tx count + spent count + 34-byte key + coin length +
+        // 26-byte compact coin + created count.
+        assert_eq!(raw.len(), 80);
         let expected = UtxoUndo::from_parts(
             vec![(
                 key(42),
@@ -1273,5 +1666,71 @@ mod tests {
             .unwrap();
         assert_eq!(store.execution_tip().unwrap().height, 256);
         assert!(store.block_undo(block_hash_at(256)).unwrap().is_some());
+    }
+
+    #[test]
+    fn compact_copy_reclaims_churn_and_preserves_all_four_tables() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mdbx");
+        let mut store = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+        let genesis = ExecutionTip {
+            height: 0,
+            hash: block_hash_at(0),
+        };
+        store.initialize_execution_tip(genesis).unwrap();
+        let mut live = (0..512_u32)
+            .map(|index| {
+                let outpoint =
+                    OutPoint::new(Txid::from_byte_array([index.to_le_bytes()[0]; 32]), index);
+                (OutPointKey::from(outpoint), coin(0))
+            })
+            .collect::<Vec<_>>();
+        store.apply(&[], &live).unwrap();
+        for generation in 1..=32_u32 {
+            let spent = live.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+            live = (0..512_u32)
+                .map(|index| {
+                    let mut txid = [0_u8; 32];
+                    txid[..4].copy_from_slice(&generation.to_be_bytes());
+                    txid[4..8].copy_from_slice(&index.to_be_bytes());
+                    (
+                        OutPointKey::from(OutPoint::new(Txid::from_byte_array(txid), index)),
+                        coin(generation),
+                    )
+                })
+                .collect();
+            store.apply(&spent, &live).unwrap();
+        }
+        let before = store.capacity().unwrap();
+        assert_eq!(before.capacity_bytes, 64 * 1024 * 1024);
+        let report = store.compact().unwrap();
+        assert_eq!(report.before_bytes, before.used_bytes);
+        assert!(report.after_bytes <= report.before_bytes);
+        assert!(store.get(live[0].0).unwrap().is_some());
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        drop(store);
+
+        let reopened = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+        assert_eq!(reopened.tier_stats().unwrap().hot, 512);
+        assert!(reopened.get(live[511].0).unwrap().is_some());
+        assert_eq!(reopened.execution_tip().unwrap(), genesis);
+    }
+
+    #[test]
+    fn open_recovers_old_environment_left_mid_compaction_swap() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mdbx");
+        let store = MdbxUtxoStore::open(&path).unwrap();
+        store.apply(&[], &[(key(1), coin(1))]).unwrap();
+        drop(store);
+
+        let old = compacted_out_path(&path);
+        let fresh = compaction_path(&path);
+        fs::rename(&path, &old).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        let recovered = MdbxUtxoStore::open(&path).unwrap();
+        assert_eq!(recovered.get(key(1)).unwrap(), Some(coin(1)));
+        assert!(!old.exists());
+        assert!(!fresh.exists());
     }
 }

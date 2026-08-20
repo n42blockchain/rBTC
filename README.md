@@ -258,7 +258,7 @@ Findings and per-platform verification status are recorded in [docs/AUDIT.md](do
 | Bitcoin types and v1 P2P encoding | `rust-bitcoin` | Maintained Rust Bitcoin primitives and consensus serialization. |
 | Script interpreter | `bitcoinconsensus` | Repository-owned Core v26.0 boundary, the last release line shipping `libbitcoinconsensus`; includes the Taproot spent-output API. |
 | Consensus rules | tracked through Core v31.1 | Public-network rules include Testnet4/BIP94; Core's default regtest keeps BIP94 disabled and uses its 144-block interval. The interpreter pin and tracked rules are separate decisions. |
-| UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust. `--features mdbx` adds a versioned four-table chainstore with 36-byte BE-vout keys, Core/btcd compact coins and undo, height-only hot/cold placement, and atomic UTXO/undo/tip commits; daemon selection and migration are not enabled yet. |
+| UTXO persistence | redb default; MDBX is the leading gated replacement candidate | redb remains the recovery-proven daemon default. `--features mdbx` adds a versioned four-table chainstore with 34–37-byte order-preserving vout keys, Core/btcd compact coins and undo, height-only hot/cold placement, one-view batch reads, atomic UTXO/undo/tip commits, a 128 GiB hard geometry ceiling, and recoverable compact copy. The [2026-08-20 evaluation](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md) measured substantially faster writes and lower space at 2M coins, but requires mainnet-scale churn/crash evidence before daemon selection or migration is enabled. |
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |
 
@@ -301,6 +301,7 @@ RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind cargo test --release --test 
 RBTC_TOR_CONTROL=127.0.0.1:9051 RBTC_TOR_COOKIE=/path/to/control_auth_cookie RBTC_TOR_SOCKS=127.0.0.1:9050 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
 RBTC_I2P_SAM=127.0.0.1:7656 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
+cargo test --release --all-features --test storage_engine_comparison -- --ignored --nocapture
 ```
 
 The storage benchmark generates its block-shaped UTXO population at runtime and
@@ -322,6 +323,13 @@ chainstate to verify the execution tip before accepting the result. The same
 workflow runs `RBTC_BENCH_IBD_BLOCKS` generated regtest blocks through the
 production v1 handshake, headers-first download, script execution, atomic
 chainstate, ledger, and explorer path and retains a separate JSON report.
+The matched `storage_engine_comparison` gate instead compares the complete
+redb and MDBX UTXO/undo/tip transaction and includes a separate
+`contrib/btcd_storage_bench` lane for btcd's key/coin codec plus its pinned Go
+LevelDB. It explicitly does not call that storage-only lane a btcd IBD result.
+Method, three-round Mac medians, limitations, and the default-engine decision
+are recorded in
+[docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md).
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character

@@ -139,14 +139,18 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 The default redb store retains its established key and row encoding for on-disk
 compatibility. The new MDBX chainstate has a separately versioned physical
-format: every key is exactly 36 bytes, the txid in wire order followed by a
-big-endian `vout`. Bytewise cursor order therefore makes the outputs of one
-transaction contiguous and numerically ordered, enabling one txid-range cursor
-delete and naturally ordered snapshot paging. Its coin value is the Bitcoin
+format: every key is 34–37 bytes, the txid in wire order followed by a
+one-byte width tag and the shortest big-endian `vout`. Bytewise cursor order
+therefore makes the outputs of one transaction contiguous and numerically
+ordered, enabling one txid-range cursor delete and naturally ordered snapshot
+paging. This costs about 1.7% more complete-state space than btcd's MSB-VLQ in
+the controlled 2M-coin test, but saves about 3.2% versus fixed 36-byte keys and
+does not inherit the VLQ's non-monotonic length boundary. Its coin value is the Bitcoin
 Core/btcd chainstate encoding: canonical VLQ `height << 1 | coinbase`, VLQ
 amount after Core's amount transform, and compressed standard script (or a
-length-coded raw script). The pinned btcd P2PKH fixture is exactly 26 bytes,
-versus roughly 54 bytes for the legacy rBTC row. Neither `last_touched` nor
+length-coded raw script). Typical P2PKH coins at contemporary heights occupy
+roughly 25–26 bytes depending on the header and amount VLQs, versus roughly 54
+bytes for the legacy rBTC row. Neither `last_touched` nor
 `creation_mtp` is repeated per coin: MTP is recovered by creation height from
 `meta`, while `last_touched` is absent from the MDBX format. Compact undo rows
 use the same coin and big-endian outpoint encodings.
@@ -894,11 +898,12 @@ compaction defers a rebase cheaply, and MDBX's rebase does more work for
 twice the write cost — which of those is better depends on whether the run
 ends or continues.
 
-SQLite was then benchmarked as a third candidate, since it is the only
-surveyed engine offering both capabilities the other two each lack — an
-engine-enforced ceiling through `PRAGMA max_page_count`, which redb has no
-equivalent for, and in-place compaction through `VACUUM`, which the MDBX
-binding does not expose — and it is already linked into every build through
+SQLite was then benchmarked as a third candidate, since it was the only
+surveyed engine offering both capabilities the other two originally each
+lacked — an engine-enforced ceiling through `PRAGMA max_page_count`, which
+redb has no equivalent for, and in-place compaction through `VACUUM`. The MDBX
+binding now exposes compact copy rather than in-place compaction. SQLite is
+already linked into every build through
 `bdk_wallet`'s rusqlite feature, so adopting it would add no dependency. The
 benchmark drives it through the same `UtxoStore` harness as the other two,
 with a `WITHOUT ROWID` table keyed by the same 36-byte outpoint so a lookup
@@ -927,6 +932,20 @@ Two cautions about these numbers. MDBX scaled best across the two sizes
 comparison at all: the redb entry drives the full `RedbChainStore`, committing
 tip and undo alongside the UTXO mutation, while the MDBX and SQLite entries
 drive a bare UTXO store. Only the lookup column compares like with like.
+
+A later matched complete-chainstate benchmark closes that commit-comparison
+gap for the current redb and candidate MDBX physical designs and adds a
+strictly labelled btcd-codec/Go-LevelDB storage lane. On a 64 GiB M1 Max Mac,
+three order-alternated 2M-coin rounds measured median MDBX/redb mutation ratios
+of 3.60x for per-block durable serving commits and 2.69x for 256-block IBD
+commits. MDBX warm batch lookup throughput was 1.53x and 1.55x redb after
+height-MTP caching inside each read view. After compaction, complete MDBX state
+occupied 271 MB versus redb's 678 MB serving / 931 MB IBD and the
+storage-only btcd lane's 269–271 MB. These are not cold reads or complete-node
+IBD results. The controlled boundary, raw-report hashes, supplied 169M-coin
+mainnet evidence, and the decision to retain redb pending a mainnet MDBX churn
+gate are in
+[`STORAGE_ENGINE_EVALUATION_2026-08-20.md`](STORAGE_ENGINE_EVALUATION_2026-08-20.md).
 
 The latest cold-base MDBX rerun makes the same-budget comparison closer:
 MDBX covered 935,000→960,313 in 90.29 process minutes (83.07 execution
