@@ -9,13 +9,21 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 ### Changed
 
 - The feature-gated MDBX chainstate now uses exactly four tables (`utxo_hot`,
-  `utxo_cold`, `undo`, and `meta`). Its 36-byte physical outpoint keys use a
-  wire-order txid plus big-endian vout; coin and undo values use Bitcoin
-  Core/btcd VLQ amount/script compression, omitting obsolete per-coin wall-clock
-  state. Hot/cold placement is height-only, and UTXOs, per-block undo, and tip
-  commit atomically. A 256-block IBD transaction folds outputs created and
-  spent inside the batch and rejects larger batches. The daemon continues to
-  select redb until MDBX migration and operational gates are completed.
+  `utxo_cold`, `undo`, and `meta`). Its 34–37-byte physical outpoint keys use a
+  wire-order txid plus an order-preserving width-tagged big-endian vout; coin and
+  undo values use Bitcoin Core/btcd VLQ amount/script compression, omitting
+  obsolete per-coin wall-clock state. Hot/cold placement is height-only, and
+  UTXOs, per-block undo, and tip commit atomically. A 256-block IBD transaction
+  folds outputs created and spent inside the batch and rejects larger batches.
+  The daemon continues to select redb until MDBX migration and operational
+  gates are completed.
+
+- The btcd-codec storage comparison now drives pinned LevelDB, Pebble,
+  Badger, and bbolt versions through the same synchronous atomic
+  UTXO/undo/tip mutation. It records oversized-transaction rejection,
+  quiescence, compaction, allocated bytes, target/completed transitions, and a
+  serial approximately one-hour 900,000-transition timebox without labelling
+  the synthetic workload as btcd IBD or a mainnet height replay.
 
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full

@@ -325,8 +325,13 @@ production v1 handshake, headers-first download, script execution, atomic
 chainstate, ledger, and explorer path and retains a separate JSON report.
 The matched `storage_engine_comparison` gate instead compares the complete
 redb and MDBX UTXO/undo/tip transaction and includes a separate
-`contrib/btcd_storage_bench` lane for btcd's key/coin codec plus its pinned Go
-LevelDB. It explicitly does not call that storage-only lane a btcd IBD result.
+`contrib/btcd_storage_bench` lane for btcd's key/coin codec over pinned Go
+LevelDB, Pebble, Badger, and bbolt versions. The mutation path requires one
+synchronous atomic UTXO/undo/tip transaction; engines that cannot fit the
+256-block transaction are reported as rejected rather than silently split.
+Its serial one-hour matrix targets 900,000 deterministic transitions and
+records the actually completed count per lane. It explicitly does not call
+that storage-only lane a btcd IBD or a height-900,000 mainnet replay result.
 Method, three-round Mac medians, limitations, and the default-engine decision
 are recorded in
 [docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md).

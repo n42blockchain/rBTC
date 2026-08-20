@@ -31,14 +31,14 @@ The repository now has two deliberately separate reproducible lanes:
   current redb legacy row format versus the new compact MDBX format; it is not
   a codec-normalized engine microbenchmark.
 - `contrib/btcd_storage_bench` pins the Go LevelDB revision used by btcd
-  v0.26.2 and mirrors btcd's outpoint key, MSB-VLQ header/amount, compressed
-  P2PKH coin, no-compression option, and Bloom-10 filter. It applies the same
-  logical UTXO/undo/tip workload with `Sync=true`. It deliberately excludes
+  v0.26.2 and mirrors btcd's outpoint key, MSB-VLQ header/amount, and
+  compressed P2PKH coin. The same synchronous atomic UTXO/undo/tip mutation
+  now runs over LevelDB, Pebble, Badger, and bbolt. It deliberately excludes
   btcd's UTXO cache, immutable-treap write cache, block files, block index,
-  scripts, and validation. It is therefore labelled “btcd codec + pinned Go
-  LevelDB”, never “btcd IBD”.
+  scripts, and validation. It is therefore labelled “btcd codec + selected Go
+  engine”, never “btcd IBD”.
 
-Official btcd does **not** use rBTC's proposed fixed 36-byte physical key. At
+Official btcd does **not** use the evaluated fixed 36-byte physical key. At
 btcd commit `05585e037ba0690572208dbc46d121a49cc0c4c9`, `outpointKey` is the
 32-byte wire-order txid followed by an MSB-VLQ vout, hence 33–37 bytes. That
 VLQ is compact but is not globally bytewise-monotonic when its encoded length
@@ -61,6 +61,14 @@ block, and 500,000 lookups. Each number is the median of three fresh-database
 rounds. The Rust backend order was redb→MDBX, MDBX→redb, redb→MDBX to expose
 fixed-order bias.
 
+The repository's seven-day Bitcoin/Testnet4 public soak remained active on the
+same SSD; stopping it would invalidate that separate gate. During a spot check
+the Bitcoin process used about 10.5% CPU and 3.3 GiB RSS while Testnet4 was
+idle. These are therefore co-resident workstation results, not idle-machine
+maximums. Serial execution and alternating the three short-run engine orders
+limit systematic bias, but the absolute rates should not be compared with an
+otherwise idle host without rerunning there.
+
 | complete chainstate / storage lane | serving blocks/s | IBD-256 blocks/s | serving warm lookups/s | IBD warm lookups/s |
 |---|---:|---:|---:|---:|
 | rBTC redb | 24.74 | 32.15 | 2.057M | 2.134M |
@@ -74,6 +82,68 @@ slower than MDBX in serving mutation and 5.68x slower in IBD mutation under
 this stricter direct-to-LevelDB durability boundary. That is not a prediction
 of btcd node speed because actual btcd places two caches in front of these
 writes.
+
+## Codec-normalized Go-engine results
+
+The cross-language lane was then widened without changing its btcd codec or
+logical transaction. LevelDB and Pebble use Bloom-10 and no compression;
+Badger also disables compression; bbolt uses its map freelist. Every measured
+serving block and every 256-block IBD group must put UTXOs, retained undo, and
+tip in one synchronous atomic transaction. Initial population is outside the
+mutation measurement and may use an engine's bulk loader. After mutation each
+engine is closed and reopened before lookup; `quiesce_ns` records that drain so
+deferred LSM work is visible rather than contaminating an unlabelled lookup.
+The engines retain their native internal cache/mmap policies and share the OS
+page cache; no btcd-style UTXO cache sits in front. This is a transaction- and
+codec-normalized comparison, not a claim that unlike engine caches can be made
+byte-for-byte identical. Lookup rates therefore remain diagnostic only.
+
+The workload and host match the preceding 2M table. Three new databases were
+created per lane and multi-engine order was alternated. LevelDB was rerun
+three more times after review caught an existence-only `Has` probe where the
+other adapters fetched the value; the table uses the corrected `Get` runs.
+These are medians:
+
+| btcd-codec storage engine | serving blocks/s | IBD-256 blocks/s | serving warm lookups/s | IBD warm lookups/s | post-compact allocation |
+|---|---:|---:|---:|---:|---:|
+| Go LevelDB | 8.07 | 16.21 | 0.506M | 0.659M | 269.0–269.4 MB |
+| Pebble | 6.56 | **51.02** | 0.516M | 0.755M | **267.6–267.7 MB** |
+| Badger | 30.26 | **rejected** | 0.356M | — | 284.3 MB |
+| bbolt | **36.03** | **51.31** | **2.692M** | **2.768M** | 293.1 MB |
+
+Badger's IBD row is not a timeout: its atomic transaction returned `Txn is too
+big to fit into one request`. Using Badger `WriteBatch` made the earlier smoke
+number look successful, but that API splits work across transactions and
+would violate rBTC's atomic checkpoint requirement. The corrected harness
+uses it only for unmeasured prefill and records the production mutation as a
+failure. This is a selection constraint, not a benchmark loss.
+
+The bbolt result is equally important in the other direction. On this APFS
+host it completed the approximately 1.28M UTXO replacements plus retained
+undo in one IBD transaction in about five seconds and compacted to 293.1 MB;
+the supplied Windows run reported that its corresponding transaction did not
+finish in twenty minutes. The Mac result is real, but the cross-platform
+reversal is too large to treat bbolt as a safe default without explaining the
+OS/filesystem and version sensitivity.
+
+Pebble gives the most useful family signal: it is near bbolt on IBD and has
+the smallest compacted allocation, but per-block synchronous serving is
+slower than LevelDB in this short run. It is a Go engine, not direct evidence
+for any Rust binding. The result justifies a Rust LSM prototype under the same
+atomic and recovery contract; it does not justify changing rBTC's daemon
+backend today. Warm lookup rankings are also not selection evidence because
+the 2M dataset fits memory and the supplied cold-disk run put all five engines
+within 8%.
+
+The three multi-engine raw reports used for Pebble, Badger, and bbolt are not
+versioned; their SHA-256 digests are
+`47ca06ea281e1a8a49435b139209e8b156143ecdcc129308fca95d5a092d5baf`,
+`733dd4fb9465ec141014055d0e7ca3aef51312a91eafe9529ad743cd47cdc60b`,
+and `b2e298f0311da60704d531bcf249d950d8f8b817b57f2fe57ccddfd8f803210f`.
+The corrected LevelDB reports are
+`eb4246fbcf3f590e87ab25ec2f906fb72c3a0c85cf85da03794083106cafd5ab`,
+`995dbb3b69259bc61aad11e9fb820b39a62a561464420d4c568846768e8d1282`,
+and `e668d9ff9e6874c1f77b1b82850a9ed6a0e48922078d1d2f968f453d26cfaf6f`.
 
 ## Key-format A/B
 
@@ -170,6 +240,24 @@ large improvement at 2M live coins. The mainnet run proves long-lived B-tree
 delete churn remains the dominant deployment risk, and that an LSM can be a
 better physical family at full scale even when a short B-tree benchmark wins.
 
+## Selection matrix
+
+| option | strongest evidence | unresolved cost or failure | disposition |
+|---|---|---|---|
+| redb | current production integration, recovery and crash gates | slowest/largest complete rBTC lane | keep as default until a replacement passes the full gate |
+| MDBX | fastest complete rBTC lane; compact copy and atomic four-table store exist | supplied 169M-coin run shows severe long-churn amplification | leading feature-gated replacement candidate |
+| Pebble | smallest Go compacted footprint; 3.15x LevelDB IBD rate here and strong supplied bulk result | serving fsync rate, Go-only evidence, no rBTC crash/migration integration | use as evidence to prototype a Rust LSM, not as a selected backend |
+| Badger | high serving mutation rate | cannot atomically commit the measured 256-block transaction | reject for this checkpoint contract |
+| bbolt | best/near-best Mac Go rates and valid large atomic transaction | supplied Windows result reverses by orders of magnitude; no rBTC integration | reject pending an explained cross-platform result; not a default candidate |
+| Go LevelDB | exact btcd revision/codec reference and stable compacted size | materially slower mutation than the leading lanes | retain as reference, not an rBTC replacement |
+| SQLite | already deployed for wallet metadata and has an engine size ceiling | existing 2M UTXO point lookup and p99 are materially worse | retain for wallet metadata; reject for chainstate hot path |
+
+This ordering is based on node requirements rather than implementation
+familiarity. A fast short run cannot override atomicity, recovery,
+deployability, or long-lived disk amplification. Equally, the supplied MDBX
+amplification data prevents the integrated implementation from winning merely
+because it is already written.
+
 ## Required gate before changing the default
 
 1. Replay a common mainnet block corpus into current redb and the complete
@@ -212,8 +300,15 @@ RBTC_ENGINE_BENCH_UPDATES=5000 \
 RBTC_ENGINE_BENCH_LOOKUPS=500000 \
 RBTC_ENGINE_BENCH_REPORT=/tmp/rbtc-storage-btcd.json \
 go run .
+
+# Serial storage-only timebox: 900,000-transition target, about one hour wall.
+./run_one_hour_matrix.sh
 ```
 
 Set `RBTC_ENGINE_BENCH_REVERSE=1` on alternating Rust rounds. A genuine cold
 read comparison needs either a dataset larger than memory or a controlled
-cache purge; neither condition was present in this run.
+cache purge; neither condition was present in this run. The timeboxed matrix
+is also synthetic storage evidence, not a real mainnet replay. Closing the
+height-900,000 replay gate requires the same immutable flat block corpus and
+the exact custom `cmd/replayblocks` btcd revision; neither is present on this
+Mac or in upstream btcd v0.26.2.

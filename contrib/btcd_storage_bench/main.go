@@ -10,13 +10,9 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
-
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/filter"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 const (
@@ -42,9 +38,15 @@ type scenario struct {
 type result struct {
 	Backend                        string  `json:"backend"`
 	Scenario                       string  `json:"scenario"`
+	Error                          string  `json:"error,omitempty"`
 	BlocksPerCommit                uint32  `json:"blocks_per_commit"`
+	TargetBlocks                   uint32  `json:"target_blocks"`
+	CompletedBlocks                uint32  `json:"completed_blocks"`
+	ReachedTarget                  bool    `json:"reached_target"`
+	MutationTimeLimitNS            int64   `json:"mutation_time_limit_ns"`
 	SeedNS                         int64   `json:"seed_ns"`
 	MutationNS                     int64   `json:"mutation_ns"`
+	QuiesceNS                      int64   `json:"quiesce_ns"`
 	BlocksPerSecond                float64 `json:"blocks_per_second"`
 	UTXOChangesPerSecond           float64 `json:"utxo_changes_per_second"`
 	LookupNS                       int64   `json:"lookup_ns"`
@@ -64,6 +66,8 @@ type report struct {
 	Durability    string   `json:"durability"`
 	LookupView    string   `json:"lookup_view"`
 	KeyFormat     string   `json:"key_format"`
+	Engines       []string `json:"engines"`
+	EngineBuilds  []string `json:"engine_builds"`
 	Workload      workload `json:"workload"`
 	Results       []result `json:"results"`
 }
@@ -118,12 +122,17 @@ func loadWorkload() workload {
 		UpdatesPerBlock: envUint32("RBTC_ENGINE_BENCH_UPDATES", defaultUpdates),
 		Lookups:         envUint32("RBTC_ENGINE_BENCH_LOOKUPS", defaultLookups),
 	}
-	if w.UTXOs == 0 || w.UTXOs > 10_000_000 || w.Blocks == 0 || w.Blocks > 10_000 ||
+	if w.UTXOs == 0 || w.UTXOs > 10_000_000 || w.Blocks == 0 || w.Blocks > 1_000_000 ||
 		w.UpdatesPerBlock == 0 || w.UpdatesPerBlock > w.UTXOs ||
-		w.Lookups == 0 || w.Lookups > 10_000_000 || w.Blocks%256 != 0 {
-		panic("invalid or non-256-aligned workload")
+		w.Lookups == 0 || w.Lookups > 10_000_000 {
+		panic("invalid workload")
 	}
 	return w
+}
+
+func loadMutationTimeLimit() time.Duration {
+	seconds := envUint32("RBTC_ENGINE_BENCH_MAX_SECONDS", 0)
+	return time.Duration(seconds) * time.Second
 }
 
 func loadKeyFormat() string {
@@ -135,6 +144,62 @@ func loadKeyFormat() string {
 		panic("RBTC_BTCD_KEY_FORMAT must be btcd-vlq, ordered-varint, or fixed36-be")
 	}
 	return format
+}
+
+func loadEngines() []string {
+	value := os.Getenv("RBTC_BTCD_ENGINES")
+	if value == "" {
+		value = "leveldb,pebble,badger,bbolt"
+	}
+	seen := make(map[string]struct{})
+	engines := make([]string, 0, 4)
+	for _, engine := range strings.Split(value, ",") {
+		engine = strings.TrimSpace(engine)
+		switch engine {
+		case "leveldb", "pebble", "badger", "bbolt":
+		default:
+			panic("RBTC_BTCD_ENGINES must contain only leveldb, pebble, badger, or bbolt")
+		}
+		if _, duplicate := seen[engine]; duplicate {
+			continue
+		}
+		seen[engine] = struct{}{}
+		engines = append(engines, engine)
+	}
+	if len(engines) == 0 {
+		panic("RBTC_BTCD_ENGINES must select at least one engine")
+	}
+	return engines
+}
+
+func loadScenarios() []scenario {
+	value := os.Getenv("RBTC_BTCD_SCENARIOS")
+	if value == "" {
+		value = "serving,ibd-256"
+	}
+	seen := make(map[string]struct{})
+	scenarios := make([]scenario, 0, 2)
+	for _, name := range strings.Split(value, ",") {
+		name = strings.TrimSpace(name)
+		var selected scenario
+		switch name {
+		case "serving":
+			selected = scenario{Name: "serving", BlocksPerCommit: 1}
+		case "ibd-256":
+			selected = scenario{Name: "ibd-256", BlocksPerCommit: 256}
+		default:
+			panic("RBTC_BTCD_SCENARIOS must contain only serving or ibd-256")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		scenarios = append(scenarios, selected)
+	}
+	if len(scenarios) == 0 {
+		panic("RBTC_BTCD_SCENARIOS must select at least one scenario")
+	}
+	return scenarios
 }
 
 // putVLQ is btcd's canonical MSB VLQ with the continuation offset.
@@ -327,19 +392,25 @@ func encodeUndo(undos []undo) []byte {
 	return encoded
 }
 
-func seed(db *leveldb.DB, live *liveSet) time.Duration {
+func seed(db kvEngine, live *liveSet) time.Duration {
 	started := time.Now()
-	batch := new(leveldb.Batch)
-	for i, key := range live.keys {
-		batch.Put(utxoDBKey(key), encodeCoin(live.coins[i]))
+	batch, err := db.newSeedBatch()
+	if err != nil {
+		panic(err)
 	}
-	if err := db.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
+	defer batch.close()
+	for i, key := range live.keys {
+		if err := batch.put(utxoDBKey(key), encodeCoin(live.coins[i])); err != nil {
+			panic(err)
+		}
+	}
+	if err := batch.commit(); err != nil {
 		panic(err)
 	}
 	return time.Since(started)
 }
 
-func commit(db *leveldb.DB, transitions []transition) {
+func commit(db kvEngine, transitions []transition) {
 	created := make(map[string]createdCoin)
 	spent := make(map[string][]byte)
 	for _, transition := range transitions {
@@ -355,7 +426,7 @@ func commit(db *leveldb.DB, transitions []transition) {
 			created[string(output.key)] = output
 		}
 	}
-	snapshot, err := db.GetSnapshot()
+	snapshot, err := db.newSnapshot()
 	if err != nil {
 		panic(err)
 	}
@@ -372,35 +443,63 @@ func commit(db *leveldb.DB, transitions []transition) {
 
 	for _, encoded := range spentKeys {
 		key := spent[encoded]
-		if _, err := snapshot.Get(utxoDBKey(key), nil); err != nil {
+		found, err := snapshot.has(utxoDBKey(key))
+		if err != nil {
 			panic(fmt.Sprintf("read spent UTXO: %v", err))
 		}
+		if !found {
+			panic("read spent UTXO: not found")
+		}
 	}
-	snapshot.Release()
+	if err := snapshot.close(); err != nil {
+		panic(err)
+	}
 
-	batch := new(leveldb.Batch)
+	batch, err := db.newBatch()
+	if err != nil {
+		panic(err)
+	}
+	defer batch.close()
 	for _, encoded := range spentKeys {
 		key := spent[encoded]
-		batch.Delete(utxoDBKey(key))
+		if err := batch.delete(utxoDBKey(key)); err != nil {
+			panic(err)
+		}
 	}
 	for _, encoded := range createdKeys {
 		output := created[encoded]
-		batch.Put(utxoDBKey(output.key), encodeCoin(output.coin))
+		if err := batch.put(utxoDBKey(output.key), encodeCoin(output.coin)); err != nil {
+			panic(err)
+		}
 	}
 	for _, transition := range transitions {
-		batch.Put(undoDBKey(transition.height), encodeUndo(transition.undos))
+		if err := batch.put(undoDBKey(transition.height), encodeUndo(transition.undos)); err != nil {
+			panic(err)
+		}
 	}
 	var tip [4]byte
 	binary.BigEndian.PutUint32(tip[:], transitions[len(transitions)-1].height)
-	batch.Put([]byte{0x03}, tip[:])
-	if err := db.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
+	if err := batch.put([]byte{0x03}, tip[:]); err != nil {
+		panic(err)
+	}
+	if err := batch.commit(); err != nil {
 		panic(err)
 	}
 }
 
-func mutate(db *leveldb.DB, w workload, s scenario, live *liveSet) time.Duration {
+func mutate(
+	db kvEngine,
+	w workload,
+	s scenario,
+	live *liveSet,
+	timeLimit time.Duration,
+) (time.Duration, uint32) {
 	started := time.Now()
+	completed := uint32(0)
 	for height := uint32(1); height <= w.Blocks; {
+		if timeLimit > 0 && completed > 0 && time.Since(started) >= timeLimit {
+			break
+		}
 		end := height + s.BlocksPerCommit - 1
 		if end > w.Blocks {
 			end = w.Blocks
@@ -410,12 +509,13 @@ func mutate(db *leveldb.DB, w workload, s scenario, live *liveSet) time.Duration
 			transitions = append(transitions, live.transition(next))
 		}
 		commit(db, transitions)
+		completed = end
 		height = end + 1
 	}
-	return time.Since(started)
+	return time.Since(started), completed
 }
 
-func lookup(db *leveldb.DB, w workload, live *liveSet) time.Duration {
+func lookup(db kvEngine, w workload, live *liveSet) time.Duration {
 	started := time.Now()
 	hits := uint32(0)
 	for base := uint32(0); base < w.Lookups; base += lookupBatch {
@@ -423,7 +523,7 @@ func lookup(db *leveldb.DB, w workload, live *liveSet) time.Duration {
 		if end > w.Lookups {
 			end = w.Lookups
 		}
-		snapshot, err := db.GetSnapshot()
+		snapshot, err := db.newSnapshot()
 		if err != nil {
 			panic(err)
 		}
@@ -434,14 +534,17 @@ func lookup(db *leveldb.DB, w workload, live *liveSet) time.Duration {
 			} else {
 				key = live.keys[ordinal%w.UTXOs]
 			}
-			_, err := snapshot.Get(utxoDBKey(key), nil)
-			if err == nil {
-				hits++
-			} else if err != leveldb.ErrNotFound {
+			found, err := snapshot.has(utxoDBKey(key))
+			if err != nil {
 				panic(err)
 			}
+			if found {
+				hits++
+			}
 		}
-		snapshot.Release()
+		if err := snapshot.close(); err != nil {
+			panic(err)
+		}
 	}
 	expected := w.Lookups - (w.Lookups+3)/4
 	if hits != expected {
@@ -472,52 +575,63 @@ func dirSizes(path string) (uint64, uint64) {
 	return logical, allocated
 }
 
-func run(w workload, s scenario, keyKind string) result {
-	dir, err := os.MkdirTemp("", "btcd-leveldb-bench-")
+func run(w workload, s scenario, keyKind, engineName string, timeLimit time.Duration) result {
+	dir, err := os.MkdirTemp("", "btcd-"+engineName+"-bench-")
 	if err != nil {
 		panic(err)
 	}
 	defer os.RemoveAll(dir)
-	db, err := leveldb.OpenFile(dir, &opt.Options{
-		Compression: opt.NoCompression,
-		Filter:      filter.NewBloomFilter(10),
-	})
+	db, err := openEngine(engineName, dir)
 	if err != nil {
 		panic(err)
 	}
+	defer func() {
+		_ = db.close()
+	}()
 	live := newLiveSet(w, keyKind)
 	seedElapsed := seed(db, live)
-	mutationElapsed := mutate(db, w, s, live)
+	mutationElapsed, completedBlocks := mutate(db, w, s, live, timeLimit)
+	quiesceStarted := time.Now()
+	if err := db.close(); err != nil {
+		panic(err)
+	}
+	db, err = openEngine(engineName, dir)
+	if err != nil {
+		panic(err)
+	}
+	quiesceElapsed := time.Since(quiesceStarted)
 	lookupElapsed := lookup(db, w, live)
-	if err := db.Close(); err != nil {
+	if err := db.close(); err != nil {
 		panic(err)
 	}
 	beforeLogical, beforeAllocated := dirSizes(dir)
-	db, err = leveldb.OpenFile(dir, &opt.Options{
-		Compression: opt.NoCompression,
-		Filter:      filter.NewBloomFilter(10),
-	})
+	db, err = openEngine(engineName, dir)
 	if err != nil {
 		panic(err)
 	}
 	compactStarted := time.Now()
-	if err := db.CompactRange(util.Range{}); err != nil {
+	if err := db.compact(); err != nil {
 		panic(err)
 	}
 	compactElapsed := time.Since(compactStarted)
-	if err := db.Close(); err != nil {
+	if err := db.close(); err != nil {
 		panic(err)
 	}
 	afterLogical, afterAllocated := dirSizes(dir)
 	seconds := mutationElapsed.Seconds()
 	return result{
-		Backend:                        "btcd-codec-goleveldb-" + keyKind + "-matched-chainstate",
+		Backend:                        "btcd-codec-" + engineName + "-" + keyKind + "-matched-chainstate",
 		Scenario:                       s.Name,
 		BlocksPerCommit:                s.BlocksPerCommit,
+		TargetBlocks:                   w.Blocks,
+		CompletedBlocks:                completedBlocks,
+		ReachedTarget:                  completedBlocks == w.Blocks,
+		MutationTimeLimitNS:            timeLimit.Nanoseconds(),
 		SeedNS:                         seedElapsed.Nanoseconds(),
 		MutationNS:                     mutationElapsed.Nanoseconds(),
-		BlocksPerSecond:                float64(w.Blocks) / seconds,
-		UTXOChangesPerSecond:           float64(w.Blocks*w.UpdatesPerBlock*2) / seconds,
+		QuiesceNS:                      quiesceElapsed.Nanoseconds(),
+		BlocksPerSecond:                float64(completedBlocks) / seconds,
+		UTXOChangesPerSecond:           float64(completedBlocks) * float64(w.UpdatesPerBlock) * 2 / seconds,
 		LookupNS:                       lookupElapsed.Nanoseconds(),
 		LookupsPerSecond:               float64(w.Lookups) / lookupElapsed.Seconds(),
 		LogicalBytesBeforeCompaction:   beforeLogical,
@@ -528,22 +642,56 @@ func run(w workload, s scenario, keyKind string) result {
 	}
 }
 
+func safeRun(
+	w workload,
+	s scenario,
+	keyKind, engineName string,
+	timeLimit time.Duration,
+) (output result) {
+	output = result{
+		Backend:             "btcd-codec-" + engineName + "-" + keyKind + "-matched-chainstate",
+		Scenario:            s.Name,
+		BlocksPerCommit:     s.BlocksPerCommit,
+		TargetBlocks:        w.Blocks,
+		MutationTimeLimitNS: timeLimit.Nanoseconds(),
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			output.Error = fmt.Sprint(recovered)
+		}
+	}()
+	return run(w, s, keyKind, engineName, timeLimit)
+}
+
 func main() {
 	w := loadWorkload()
 	keyFormat := loadKeyFormat()
+	engines := loadEngines()
+	scenarios := loadScenarios()
+	timeLimit := loadMutationTimeLimit()
+	results := make([]result, 0, len(engines)*len(scenarios))
+	for _, engine := range engines {
+		for _, selected := range scenarios {
+			results = append(results, safeRun(w, selected, keyFormat, engine, timeLimit))
+		}
+	}
 	report := report{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		BtcdReference: "btcd v0.26.2 / 05585e037ba0690572208dbc46d121a49cc0c4c9; chainio codec mirrored",
 		Host:          runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version(),
-		Boundary:      "storage-only: btcd key/coin codec plus its pinned Go LevelDB; not block or script validation and not btcd UTXO cache",
-		Durability:    "LevelDB Sync=true; UTXO+per-block undo+tip in one WriteBatch",
-		LookupView:    "one LevelDB snapshot per 4096 caller-ordered lookups",
+		Boundary:      "storage-only: btcd key/coin codec over selected Go engines; not block or script validation and not btcd UTXO cache",
+		Durability:    "engine synchronous durability; UTXO+per-block undo+tip in one atomic batch/transaction",
+		LookupView:    "one engine snapshot/read transaction per 4096 caller-ordered lookups",
 		KeyFormat:     keyFormat,
-		Workload:      w,
-		Results: []result{
-			run(w, scenario{Name: "serving", BlocksPerCommit: 1}, keyFormat),
-			run(w, scenario{Name: "ibd-256", BlocksPerCommit: 256}, keyFormat),
+		Engines:       engines,
+		EngineBuilds: []string{
+			"goleveldb 2ae1ddf74ef7: no compression, Bloom-10",
+			"pebble v1.1.5: no compression, Bloom-10",
+			"badger v4.9.6: no compression, SyncWrites=true, atomic Txn for mutation",
+			"bbolt v1.5.0: map freelist",
 		},
+		Workload: w,
+		Results:  results,
 	}
 	encoded, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
