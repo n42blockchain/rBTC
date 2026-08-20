@@ -1,5 +1,10 @@
 # MDBX replacement gate
 
+The external full-mainnet replay assignment, including exact transaction-rate
+definitions, comparable btcdmdbx revisions, evidence retention, and rules for
+avoiding a 771 GB corpus copy on the Mac, is maintained in
+[`BTCDMDBX_FULL_REPLAY_TASK.md`](BTCDMDBX_FULL_REPLAY_TASK.md).
+
 MDBX is the leading complete-chainstate replacement candidate, but this
 revision does **not** select it as the daemon default. The implementation now
 has the machinery needed to run the remaining scale gate without weakening
