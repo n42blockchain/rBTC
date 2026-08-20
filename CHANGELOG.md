@@ -31,7 +31,8 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 - MDBX replacement preparation now audits and hashes all four chainstate
   tables before and after compact-copy, carries that identity through a
   recoverable directory-swap manifest, preflights copy space with a 16 GiB
-  reserve, applies a 55%-capacity/50%-growth anti-thrashing policy, and prunes
+  reserve, applies a 55%-capacity/10%-reclaim/50%-growth maintenance policy,
+  and prunes
   undo through authenticated header heights. Abrupt subprocess exits cover all
   five copy/rename/fsync boundaries. A resumable ignored gate drives 160M live
   coins and up to 900,000 synthetic churn transitions in separately measured
@@ -43,6 +44,13 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   atomically, while a manifest naming MDBX is rejected by the redb-only node
   before either backend is opened; this prevents a rollback binary from
   silently creating or serving the wrong chainstate during the staged switch.
+
+- MDBX evaluation text now incorporates the corrected btcd full scans. The
+  long-running pruned-undo store held 33.42 GB raw rather than the biased
+  11.7 GB estimate (1.50x live, 2.27x file), while a sequential stock-btcd
+  replay measured 1.155x live amplification with almost no freelist. The 34%
+  churn freelist and compact-copy requirement remain real, but the former
+  claim of intrinsic 4.3x MDBX live amplification is withdrawn.
 
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full

@@ -63,7 +63,7 @@ run_lane() {
 run_lane 64
 run_lane 256
 
-jq -s '{schema: 1, lanes: .}' \
+jq -s '{schema: 2, lanes: .}' \
     "$output/batch-64/report-with-rss.json" \
     "$output/batch-256/report-with-rss.json" >"$output/matrix.json"
 df -k "$output" >"$output/filesystem-after.txt"

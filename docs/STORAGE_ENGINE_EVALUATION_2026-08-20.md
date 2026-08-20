@@ -259,6 +259,11 @@ policy. The six reports used here had these SHA-256 digests:
 
 ## Mainnet evidence supplied with this review
 
+The corrected full scans and completed replay are recorded by btcdmdbx
+revision `56cc436d` in `docs/storage_engine_findings_correction.md`; they
+supersede the biased raw-record estimate used by the first version of this
+section.
+
 The accompanying Windows 11 report used 32 logical cores, 125 GiB RAM and an
 existing 771 GiB mainnet block corpus. Its deterministic 2M-UTXO workload used
 the same 5,000-created/4,700-spent block rate, real Bitcoin spend-age sampling,
@@ -271,25 +276,37 @@ fsync commits, one read view per block, and forced LSM compaction. It found:
 - MDBX serving and IBD write rates of 24,315 and 32,988 inserts/s, versus
   LevelDB's 67,842 and 30,663; batching helped MDBX but raised its synthetic
   IBD footprint to 800 MiB versus LevelDB's 159 MiB;
-- a real 169,337,275-entry MDBX chainstate containing 11.7 GB of raw records
-  occupied 50.26 GB of live B-tree pages and a 76.01 GB file, including 25.75
-  GB of unreclaimable free pages before compact copy;
+- the original 11.7 GB raw-record estimate for a 169,337,275-entry MDBX
+  chainstate was biased toward small UTXOs. A later full scan found 33.42 GB
+  raw, 50.26 GB live B-tree pages (1.50x), and the same 76.01 GB file (2.27x),
+  including 25.75 GB/34% reusable free pages before compact copy;
+- that production store pruned old undo and therefore was not stock btcd.
+  Replaying stock semantics retained 670,893 large undo rows and produced
+  106.08 GB raw in 122.52 GB live pages (1.155x) with approximately zero
+  freelist overhead;
 - Pebble matched LevelDB's roughly 77 B/UTXO synthetic footprint and increased
-  bulk insert rate from 233,945 to 744,477 inserts/s in that Go implementation.
+  bulk insert rate from 233,945 to 744,477 inserts/s in that Go implementation;
+- the completed real-block replay made Pebble and MDBX write throughput a tie
+  over 200,000 blocks (5,776 vs 5,653 blocks/s). MDBX completed all 951,225
+  blocks and loaded a 200,000-block chain state in 728 ms; Pebble reached
+  height 828,851 but its 56,000 SST files made chain-state loading exceed one
+  hour. Pebble then crashed in the Go 1.26.5 garbage collector, not in Pebble.
 
-Those measurements explain why the Mac result is not enough to select MDBX
-unconditionally. The Mac run proves rBTC's compact complete MDBX design is a
-large improvement at 2M live coins. The mainnet run proves long-lived B-tree
-delete churn remains the dominant deployment risk, and that an LSM can be a
-better physical family at full scale even when a short B-tree benchmark wins.
+Those measurements still do not select MDBX for rBTC unconditionally: the
+btcd adapter, record mix, undo policy, language runtime, and startup access
+pattern differ. They do correct the family-level conclusion. Long-lived
+delete churn is a compact-copy maintenance risk, not evidence of intrinsic
+4.3x B-tree amplification; on sequential complete data MDBX measured 1.155x.
+The completed replay also shows why an LSM's short-run write result cannot
+stand in for startup behaviour once file fan-out reaches tens of thousands.
 
 ## Selection matrix
 
 | option | strongest evidence | unresolved cost or failure | disposition |
 |---|---|---|---|
 | redb | current production integration, recovery and crash gates | slowest/largest complete rBTC lane | keep as default until a replacement passes the full gate |
-| MDBX | fastest complete rBTC lane; compact copy and atomic four-table store exist | supplied 169M-coin run shows severe long-churn amplification | leading feature-gated replacement candidate |
-| Pebble | smallest controlled Go compacted footprint; low serving RSS and strong supplied bulk result | sustained IBD reversed the short-run result; Go-only evidence; no rBTC crash/migration integration | use as evidence to prototype a Rust LSM, not as a selected backend |
+| MDBX | fastest complete rBTC lane; stock-btcd replay completed 951,225 blocks with 1.155x live amplification and near-zero freelist; compact copy and atomic four-table store exist | rBTC's bounded-undo 160M churn, real-block differential, migration, and startup gates remain open; a long-running pruned store still accumulated a 34% freelist | leading feature-gated replacement candidate |
+| Pebble | marginally smaller than MDBX at the same supplied ~830k height and tied its 200k write rate | 56,000 SST files made chain-state loading exceed one hour; Go-only evidence, a separate Go-runtime crash, and no rBTC recovery/migration integration | retain as structural comparison; do not prioritize an rBTC prototype before MDBX's gate finishes |
 | Badger | high serving mutation rate | cannot atomically commit the measured 256-block transaction | reject for this checkpoint contract |
 | bbolt | best successful Mac timebox rates and valid large atomic transaction | largest successful serving allocation; supplied Windows result reverses by orders of magnitude; no rBTC integration | reject pending an explained cross-platform result; not a default candidate |
 | Go LevelDB | exact btcd revision/codec reference and stable compacted size | materially slower mutation than the leading lanes | retain as reference, not an rBTC replacement |
@@ -297,17 +314,19 @@ better physical family at full scale even when a short B-tree benchmark wins.
 
 This ordering is based on node requirements rather than implementation
 familiarity. A fast short run cannot override atomicity, recovery,
-deployability, or long-lived disk amplification. Equally, the supplied MDBX
-amplification data prevents the integrated implementation from winning merely
-because it is already written.
+deployability, or long-lived lifecycle behaviour. The corrected data removes
+the earlier claim of severe intrinsic MDBX amplification, but the integrated
+implementation still cannot win merely because it is already written:
+rBTC's full-scale lifecycle and real-block gates remain open.
 
 ## Required gate before changing the default
 
 The executable procedure and current status are maintained in
 [`MDBX_REPLACEMENT_GATE.md`](MDBX_REPLACEMENT_GATE.md). This revision adds a
 resumable 160M/900,000 churn driver, physical amplification checkpoints,
-precompiled 64/256 peak-RSS lanes, verified four-table compact-copy, a 55%/50%
-trigger/growth policy, free-space preflight, bounded undo pruning, and abrupt
+precompiled 64/256 peak-RSS lanes, verified four-table compact-copy, a
+55%/10%/50% capacity/reclaim/growth policy, free-space preflight, bounded undo
+pruning, and abrupt
 subprocess exits at all five copy/rename/fsync boundaries. The small local
 smoke and crash matrix pass; the full-scale and real-block rows below remain
 open evidence gates.

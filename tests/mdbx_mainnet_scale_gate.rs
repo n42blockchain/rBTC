@@ -20,9 +20,9 @@ use rbtc::{
     chain_store::{ConnectTransition, ExecutionChainStore},
     execution_store::ExecutionTip,
     mdbx_utxo::{
-        DEFAULT_CHAINSTATE_CAPACITY_BYTES, DEFAULT_COMPACTION_TRIGGER_PERCENT,
-        DEFAULT_RECOMPACT_GROWTH_PERCENT, MdbxChainstateAudit, MdbxChainstateMetrics,
-        MdbxCompactionReport, MdbxUtxoStore,
+        DEFAULT_CHAINSTATE_CAPACITY_BYTES, DEFAULT_COMPACTION_MIN_RECLAIM_PERCENT,
+        DEFAULT_COMPACTION_TRIGGER_PERCENT, DEFAULT_RECOMPACT_GROWTH_PERCENT, MdbxChainstateAudit,
+        MdbxChainstateMetrics, MdbxCompactionReport, MdbxUtxoStore,
     },
     utxo::{UtxoStore, UtxoUndo},
 };
@@ -47,6 +47,7 @@ struct WorkloadReport {
     capacity_bytes: u64,
     compact_enabled: bool,
     compact_trigger_percent: u8,
+    compact_min_reclaim_percent: u8,
     recompact_growth_percent: u8,
 }
 
@@ -354,6 +355,10 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
         "RBTC_MDBX_GATE_RECOMPACT_GROWTH_PERCENT",
         DEFAULT_RECOMPACT_GROWTH_PERCENT,
     );
+    let compact_min_reclaim_percent = env_u8(
+        "RBTC_MDBX_GATE_MIN_RECLAIM_PERCENT",
+        DEFAULT_COMPACTION_MIN_RECLAIM_PERCENT,
+    );
     assert!(live_utxos > 0);
     assert!(updates_per_block > 0 && u64::from(updates_per_block) <= live_utxos);
     assert!((1..=256).contains(&commit_batch));
@@ -371,7 +376,7 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
     let started_epoch = epoch();
     let started = Instant::now();
     let mut report = GateReport {
-        schema: 1,
+        schema: 2,
         boundary: "synthetic storage churn; not real Bitcoin blocks or validation",
         revision: revision(),
         started_epoch,
@@ -387,6 +392,7 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
             capacity_bytes,
             compact_enabled,
             compact_trigger_percent,
+            compact_min_reclaim_percent,
             recompact_growth_percent,
         },
         checkpoints: Vec::new(),
@@ -471,9 +477,10 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
         }
         if compact_enabled
             && store
-                .compaction_is_worthwhile(
+                .compaction_is_worthwhile_with_policy(
                     compact_trigger_percent,
                     recompact_growth_percent,
+                    compact_min_reclaim_percent,
                     last_compacted_bytes,
                 )
                 .unwrap()

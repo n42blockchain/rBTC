@@ -49,10 +49,19 @@ pub const DEFAULT_HOT_WINDOW_BLOCKS: u32 = 3 * 365 * 24 * 6;
 pub const DEFAULT_CHAINSTATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Start considering compact-copy at 55% of the 128 GiB geometry ceiling.
 ///
-/// The supplied 169M-entry chainstate occupied 76.01 GB before compaction,
-/// about 55% of this ceiling, while its live pages occupied 50.26 GB. This
-/// leaves ample headroom for one checkpoint and the verified copy/swap.
+/// The corrected full scan of the supplied long-running, pruned-undo,
+/// 169M-entry chainstate found a 76.01 GB file (about 55% of this ceiling),
+/// 50.26 GB of live pages, and 25.75 GB of freelist. The threshold is a
+/// lifecycle-maintenance signal; it is not derived from the superseded 4.3x
+/// raw-record amplification estimate.
 pub const DEFAULT_COMPACTION_TRIGGER_PERCENT: u8 = 55;
+/// Require at least 10% of the high-water allocation to be on the freelist.
+///
+/// The corrected btcd evidence brackets this policy: a sequential replay had
+/// approximately no freelist, while a long-running churned store had 34%.
+/// Ten percent is a conservative first-copy guard, not a measured optimum;
+/// the full rBTC lifecycle gate may tune it.
+pub const DEFAULT_COMPACTION_MIN_RECLAIM_PERCENT: u8 = 10;
 /// Require 50% growth over the last post-compaction high-water mark.
 ///
 /// A percentage trigger alone would immediately recompact a live set whose
@@ -539,16 +548,48 @@ impl MdbxUtxoStore {
         recompact_growth_percent: u8,
         last_compacted_bytes: Option<u64>,
     ) -> Result<bool, UtxoError> {
-        if trigger_percent == 0 || trigger_percent > 100 || recompact_growth_percent > 100 {
+        self.compaction_is_worthwhile_with_policy(
+            trigger_percent,
+            recompact_growth_percent,
+            DEFAULT_COMPACTION_MIN_RECLAIM_PERCENT,
+            last_compacted_bytes,
+        )
+    }
+
+    /// Applies the capacity, reclaimable-page, and repeat-growth policy.
+    ///
+    /// `min_reclaim_percent` is the minimum fraction of the current high-water
+    /// allocation that MDBX reports on its freelist. Requiring it prevents a
+    /// sequentially built, mostly-live tree from paying for a futile first
+    /// compact copy merely because it crossed the capacity trigger.
+    pub fn compaction_is_worthwhile_with_policy(
+        &self,
+        trigger_percent: u8,
+        recompact_growth_percent: u8,
+        min_reclaim_percent: u8,
+        last_compacted_bytes: Option<u64>,
+    ) -> Result<bool, UtxoError> {
+        if trigger_percent == 0
+            || trigger_percent > 100
+            || recompact_growth_percent > 100
+            || min_reclaim_percent > 100
+        {
             return Err(UtxoError::Malformed("MDBX compaction policy percentage"));
         }
-        let capacity = self.capacity()?;
-        if capacity.used_percent() < trigger_percent {
+        let metrics = self.metrics()?;
+        if u128::from(metrics.high_water_bytes) * 100
+            < u128::from(metrics.capacity_bytes) * u128::from(trigger_percent)
+        {
+            return Ok(false);
+        }
+        if u128::from(metrics.free_page_bytes) * 100
+            < u128::from(metrics.high_water_bytes) * u128::from(min_reclaim_percent)
+        {
             return Ok(false);
         }
         let last_compacted_bytes = last_compacted_bytes.or(self.last_compacted_bytes()?);
         Ok(last_compacted_bytes.is_none_or(|last| {
-            capacity.used_bytes.saturating_sub(last)
+            metrics.high_water_bytes.saturating_sub(last)
                 >= last.saturating_mul(u64::from(recompact_growth_percent)) / 100
         }))
     }
@@ -2441,16 +2482,29 @@ mod tests {
     }
 
     #[test]
-    fn compaction_policy_requires_pressure_and_growth() {
+    fn compaction_policy_requires_pressure_reclaimable_pages_and_growth() {
         let directory = TempDir::new().unwrap();
         let mut store =
             MdbxUtxoStore::open_with_capacity(directory.path().join("mdbx"), 1024 * 1024).unwrap();
         let used = store.capacity().unwrap().used_bytes;
         assert!(!store.compaction_is_worthwhile(100, 50, None).unwrap());
-        assert!(store.compaction_is_worthwhile(1, 50, None).unwrap());
-        assert!(!store.compaction_is_worthwhile(1, 50, Some(used)).unwrap());
+        assert!(!store.compaction_is_worthwhile(1, 50, None).unwrap());
+        assert!(
+            store
+                .compaction_is_worthwhile_with_policy(1, 50, 0, None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .compaction_is_worthwhile_with_policy(1, 50, 0, Some(used))
+                .unwrap()
+        );
         assert!(matches!(
             store.compaction_is_worthwhile(0, 50, None),
+            Err(UtxoError::Malformed("MDBX compaction policy percentage"))
+        ));
+        assert!(matches!(
+            store.compaction_is_worthwhile_with_policy(1, 50, 101, None),
             Err(UtxoError::Malformed("MDBX compaction policy percentage"))
         ));
         let identity = store.audit().unwrap().content_sha256;
