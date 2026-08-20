@@ -354,7 +354,9 @@ fn mdbx_result(workload: Workload, scenario: Scenario) -> BackendResult {
     let lookup = run_lookups(&store, workload, &live);
     let before = path_sizes(&path);
     let compact_started = Instant::now();
-    store.compact().unwrap();
+    // A disposable benchmark directory needs no post-copy operator reserve;
+    // production `compact()` preserves 16 GiB after its verified copy.
+    store.compact_with_reserve(0).unwrap();
     let compact = compact_started.elapsed();
     let after = path_sizes(&path);
     assert_eq!(store.execution_tip().unwrap().height, workload.blocks);

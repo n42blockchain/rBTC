@@ -7,7 +7,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
@@ -17,10 +18,13 @@ use libmdbx::{
     Database, DatabaseKind, DatabaseOptions, Mode, NoWriteMap, RO, ReadWriteOptions, SyncMode,
     Table, TableFlags, Transaction, TransactionKind, WriteFlags,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     execution_store::ExecutionTip,
+    headers::HeaderDag,
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -30,6 +34,10 @@ const UNDO: &str = "undo";
 const META: &str = "meta";
 const FORMAT_KEY: &[u8] = b"format";
 const TIP_KEY: &[u8] = b"tip";
+const COMPACTION_MANIFEST_FILE: &str = ".rbtc-mdbx-compaction.json";
+const COMPACTION_MANIFEST_SCHEMA: u32 = 1;
+const MAINTENANCE_STATE_FILE: &str = ".rbtc-mdbx-maintenance.json";
+const MAINTENANCE_STATE_SCHEMA: u32 = 1;
 const FORMAT_VERSION: u32 = 2;
 const UNDO_FORMAT_VERSION: u32 = 1;
 /// The IBD checkpoint size whose net UTXO effect is folded into one write.
@@ -39,6 +47,20 @@ type FoldedBatchChanges = (Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>);
 pub const DEFAULT_HOT_WINDOW_BLOCKS: u32 = 3 * 365 * 24 * 6;
 /// Default hard geometry ceiling for a complete MDBX chainstate.
 pub const DEFAULT_CHAINSTATE_CAPACITY_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+/// Start considering compact-copy at 55% of the 128 GiB geometry ceiling.
+///
+/// The supplied 169M-entry chainstate occupied 76.01 GB before compaction,
+/// about 55% of this ceiling, while its live pages occupied 50.26 GB. This
+/// leaves ample headroom for one checkpoint and the verified copy/swap.
+pub const DEFAULT_COMPACTION_TRIGGER_PERCENT: u8 = 55;
+/// Require 50% growth over the last post-compaction high-water mark.
+///
+/// A percentage trigger alone would immediately recompact a live set whose
+/// irreducible size exceeds the trigger. The growth guard turns compaction
+/// frequency into a function of newly accumulated garbage instead.
+pub const DEFAULT_RECOMPACT_GROWTH_PERCENT: u8 = 50;
+/// Free space preserved after writing a verified compact copy.
+pub const DEFAULT_COMPACTION_FREE_SPACE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// MDBX high-water allocation against its hard geometry ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +71,74 @@ pub struct MdbxChainstateCapacity {
     pub capacity_bytes: u64,
 }
 
+impl MdbxChainstateCapacity {
+    /// Returns high-water use as a whole percentage of the geometry ceiling.
+    #[must_use]
+    pub fn used_percent(self) -> u8 {
+        if self.capacity_bytes == 0 {
+            return 100;
+        }
+        u8::try_from((u128::from(self.used_bytes) * 100 / u128::from(self.capacity_bytes)).min(100))
+            .expect("bounded percentage fits u8")
+    }
+}
+
+/// Deep storage accounting for one complete four-table MDBX chainstate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MdbxChainstateAudit {
+    /// Highest allocated page boundary; this is what approaches `MDBX_MAP_FULL`.
+    pub high_water_bytes: u64,
+    /// Pages reachable from the four named tables.
+    pub live_page_bytes: u64,
+    /// Pages currently recorded on MDBX's freelist.
+    pub free_page_bytes: u64,
+    /// Sum of encoded keys and values in the four named tables.
+    pub record_bytes: u64,
+    /// Logical length of `mdbx.dat`.
+    pub file_bytes: u64,
+    /// Filesystem blocks allocated to `mdbx.dat`.
+    pub allocated_bytes: u64,
+    /// Configured hard geometry ceiling.
+    pub capacity_bytes: u64,
+    /// Entries in `utxo_hot`.
+    pub hot_entries: u64,
+    /// Entries in `utxo_cold`.
+    pub cold_entries: u64,
+    /// Entries in `undo`.
+    pub undo_entries: u64,
+    /// Entries in `meta`.
+    pub meta_entries: u64,
+    /// Execution tip included in the audited snapshot.
+    pub tip: Option<ExecutionTip>,
+    /// SHA-256 over table names and every ordered key/value pair.
+    pub content_sha256: [u8; 32],
+}
+
+/// Cheap physical accounting that does not hash every chainstate record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MdbxChainstateMetrics {
+    /// Highest allocated page boundary.
+    pub high_water_bytes: u64,
+    /// Pages reachable from the four named tables.
+    pub live_page_bytes: u64,
+    /// Pages recorded on the freelist.
+    pub free_page_bytes: u64,
+    /// Logical length of `mdbx.dat`.
+    pub file_bytes: u64,
+    /// Filesystem blocks allocated to `mdbx.dat`.
+    pub allocated_bytes: u64,
+    /// Configured geometry ceiling.
+    pub capacity_bytes: u64,
+    /// Entries in `utxo_hot`.
+    pub hot_entries: u64,
+    /// Entries in `utxo_cold`.
+    pub cold_entries: u64,
+    /// Entries in `undo`.
+    pub undo_entries: u64,
+    /// Entries in `meta`.
+    pub meta_entries: u64,
+}
+
 /// Result of rewriting only live MDBX pages into a fresh environment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MdbxCompactionReport {
@@ -56,6 +146,40 @@ pub struct MdbxCompactionReport {
     pub before_bytes: u64,
     /// High-water bytes after compaction and reopen.
     pub after_bytes: u64,
+    /// Reachable table pages before the copy.
+    pub before_live_page_bytes: u64,
+    /// Reachable table pages after the copy.
+    pub after_live_page_bytes: u64,
+    /// Freelist bytes before the copy.
+    pub before_free_page_bytes: u64,
+    /// Freelist bytes after the copy.
+    pub after_free_page_bytes: u64,
+    /// Filesystem allocation of the source environment before the copy.
+    pub before_allocated_bytes: u64,
+    /// Filesystem allocation of the active compacted environment.
+    pub after_allocated_bytes: u64,
+    /// Canonical encoded key/value bytes copied without change.
+    pub record_bytes: u64,
+    /// Verified identity shared by the source and compacted environments.
+    pub content_sha256: [u8; 32],
+}
+
+/// Durable boundary reached by a compact-copy directory swap.
+///
+/// Exposed so the crash gate can terminate a child process at every boundary;
+/// ordinary callers should use [`MdbxUtxoStore::compact`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MdbxCompactionPhase {
+    /// Verified copy and manifest are durable; the source is still active.
+    CopySynced,
+    /// Source was renamed aside, before syncing the parent directory.
+    SourceRenamed,
+    /// The first rename is durable, before promoting the verified copy.
+    SourceRenameSynced,
+    /// Verified copy was promoted, before syncing the parent directory.
+    CopyPromoted,
+    /// Promotion is durable; the old source remains available for rollback.
+    CopyPromotionSynced,
 }
 
 impl MdbxCompactionReport {
@@ -63,6 +187,45 @@ impl MdbxCompactionReport {
     #[must_use]
     pub const fn released_bytes(self) -> u64 {
         self.before_bytes.saturating_sub(self.after_bytes)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CompactionManifest {
+    schema: u32,
+    content_sha256: [u8; 32],
+    record_bytes: u64,
+    hot_entries: u64,
+    cold_entries: u64,
+    undo_entries: u64,
+    meta_entries: u64,
+    tip_height: Option<u32>,
+    tip_hash: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MaintenanceState {
+    schema: u32,
+    last_compacted_bytes: u64,
+}
+
+impl CompactionManifest {
+    fn from_audit(audit: MdbxChainstateAudit) -> Self {
+        Self {
+            schema: COMPACTION_MANIFEST_SCHEMA,
+            content_sha256: audit.content_sha256,
+            record_bytes: audit.record_bytes,
+            hot_entries: audit.hot_entries,
+            cold_entries: audit.cold_entries,
+            undo_entries: audit.undo_entries,
+            meta_entries: audit.meta_entries,
+            tip_height: audit.tip.map(|tip| tip.height),
+            tip_hash: audit.tip.map(|tip| tip.hash.to_byte_array()),
+        }
+    }
+
+    fn matches(&self, audit: MdbxChainstateAudit) -> bool {
+        self == &Self::from_audit(audit)
     }
 }
 
@@ -287,6 +450,10 @@ impl MdbxUtxoStore {
         }
         recover_compaction_swap(&database_dir)?;
         let db = open_environment(&database_dir, capacity_bytes)?;
+        if compaction_manifest_path(&database_dir).exists() {
+            validate_compacted_environment(&db)?;
+            validate_compaction_manifest(&db, &database_dir, capacity_bytes)?;
+        }
         let transaction = db.begin_rw_txn()?;
         let hot = transaction.create_table(Some(HOT), TableFlags::empty())?;
         let cold = transaction.create_table(Some(COLD), TableFlags::empty())?;
@@ -312,6 +479,7 @@ impl MdbxUtxoStore {
             }
         }
         transaction.commit()?;
+        remove_compaction_manifest(&database_dir)?;
         remove_stale_compaction_paths(&database_dir)?;
         Ok(Self {
             db: Some(db),
@@ -345,43 +513,151 @@ impl MdbxUtxoStore {
         })
     }
 
+    /// Scans all four tables and reports physical amplification plus a stable
+    /// content identity. This is intentionally more expensive than
+    /// [`Self::capacity`] and is intended for replacement gates, maintenance,
+    /// and compact-copy verification rather than the per-block hot path.
+    pub fn audit(&self) -> Result<MdbxChainstateAudit, UtxoError> {
+        audit_environment(self.db(), &self.database_dir, self.capacity_bytes)
+    }
+
+    /// Reports page/file amplification and table counts without reading every
+    /// record. Suitable for periodic checkpoints in a long churn run.
+    pub fn metrics(&self) -> Result<MdbxChainstateMetrics, UtxoError> {
+        metrics_environment(self.db(), &self.database_dir, self.capacity_bytes)
+    }
+
+    /// Returns whether a compact copy is justified by both geometry pressure
+    /// and growth since the previous successful copy.
+    ///
+    /// `last_compacted_bytes` is the high-water mark reported immediately
+    /// after the prior compaction. Supplying it prevents a large irreducible
+    /// live set from being recopied after every checkpoint.
+    pub fn compaction_is_worthwhile(
+        &self,
+        trigger_percent: u8,
+        recompact_growth_percent: u8,
+        last_compacted_bytes: Option<u64>,
+    ) -> Result<bool, UtxoError> {
+        if trigger_percent == 0 || trigger_percent > 100 || recompact_growth_percent > 100 {
+            return Err(UtxoError::Malformed("MDBX compaction policy percentage"));
+        }
+        let capacity = self.capacity()?;
+        if capacity.used_percent() < trigger_percent {
+            return Ok(false);
+        }
+        let last_compacted_bytes = last_compacted_bytes.or(self.last_compacted_bytes()?);
+        Ok(last_compacted_bytes.is_none_or(|last| {
+            capacity.used_bytes.saturating_sub(last)
+                >= last.saturating_mul(u64::from(recompact_growth_percent)) / 100
+        }))
+    }
+
+    /// Returns the durable post-copy high-water baseline, when one exists.
+    pub fn last_compacted_bytes(&self) -> Result<Option<u64>, UtxoError> {
+        read_maintenance_state(&self.database_dir)
+            .map(|state| state.map(|state| state.last_compacted_bytes))
+    }
+
     /// Reclaims unreachable pages through `MDBX_CP_COMPACT` and a recoverable
     /// directory swap. This is a space operation; it does not promise faster
     /// lookups or mutation of the unchanged live tree.
     pub fn compact(&mut self) -> Result<MdbxCompactionReport, UtxoError> {
-        let before_bytes = self.capacity()?.used_bytes;
+        self.compact_with_reserve(DEFAULT_COMPACTION_FREE_SPACE_RESERVE_BYTES)
+    }
+
+    /// Runs compact-copy only when the filesystem can hold the estimated live
+    /// copy plus `reserve_bytes` without consuming the operator reserve.
+    pub fn compact_with_reserve(
+        &mut self,
+        reserve_bytes: u64,
+    ) -> Result<MdbxCompactionReport, UtxoError> {
+        self.compact_inner(reserve_bytes, |_| {})
+    }
+
+    /// Runs verified compact-copy while reporting each crash-test boundary.
+    ///
+    /// The hook must not mutate the environment. The repository's ignored
+    /// subprocess gate uses it only to terminate the child without unwinding.
+    pub fn compact_with_phase_hook(
+        &mut self,
+        phase_hook: impl FnMut(MdbxCompactionPhase),
+    ) -> Result<MdbxCompactionReport, UtxoError> {
+        self.compact_inner(0, phase_hook)
+    }
+
+    fn compact_inner(
+        &mut self,
+        reserve_bytes: u64,
+        mut phase_hook: impl FnMut(MdbxCompactionPhase),
+    ) -> Result<MdbxCompactionReport, UtxoError> {
+        let metrics = self.metrics()?;
+        let copy_margin = (metrics.live_page_bytes / 10).max(64 * 1024 * 1024);
+        let required_free = metrics
+            .live_page_bytes
+            .saturating_add(copy_margin)
+            .saturating_add(reserve_bytes);
+        let available = fs2::available_space(
+            self.database_dir
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        if available < required_free {
+            return Err(std::io::Error::other(
+                "insufficient free space for verified MDBX compact copy",
+            )
+            .into());
+        }
+        let before = self.audit()?;
+        let before_bytes = before.high_water_bytes;
         let fresh_dir = compaction_path(&self.database_dir);
         let old_dir = compacted_out_path(&self.database_dir);
         remove_path_if_exists(&fresh_dir)?;
         remove_path_if_exists(&old_dir)?;
         fs::create_dir_all(&fresh_dir)?;
         self.db().copy_compact(&fresh_dir.join("mdbx.dat"))?;
+        let copied = open_environment(&fresh_dir, self.capacity_bytes)?;
+        validate_compacted_environment(&copied)?;
+        let copied_audit = audit_environment(&copied, &fresh_dir, self.capacity_bytes)?;
+        if CompactionManifest::from_audit(before) != CompactionManifest::from_audit(copied_audit) {
+            return Err(UtxoError::Malformed("compacted MDBX content identity"));
+        }
+        drop(copied);
+        write_maintenance_state(&fresh_dir, copied_audit.high_water_bytes)?;
+        write_compaction_manifest(&fresh_dir, before)?;
         sync_directory(&fresh_dir)?;
+        phase_hook(MdbxCompactionPhase::CopySynced);
 
         drop(self.db.take());
         if let Err(error) = fs::rename(&self.database_dir, &old_dir) {
             self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
             return Err(error.into());
         }
+        phase_hook(MdbxCompactionPhase::SourceRenamed);
         if let Err(error) = sync_database_parent(&self.database_dir) {
             fs::rename(&old_dir, &self.database_dir)?;
             sync_database_parent(&self.database_dir)?;
             self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
             return Err(error);
         }
+        phase_hook(MdbxCompactionPhase::SourceRenameSynced);
         if let Err(error) = fs::rename(&fresh_dir, &self.database_dir) {
             fs::rename(&old_dir, &self.database_dir)?;
             sync_database_parent(&self.database_dir)?;
             self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
             return Err(error.into());
         }
+        phase_hook(MdbxCompactionPhase::CopyPromoted);
         if let Err(error) = sync_database_parent(&self.database_dir) {
             restore_compaction_old(&self.database_dir, &fresh_dir, &old_dir)?;
             self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
             return Err(error);
         }
+        phase_hook(MdbxCompactionPhase::CopyPromotionSynced);
         match open_environment(&self.database_dir, self.capacity_bytes).and_then(|db| {
             validate_compacted_environment(&db)?;
+            validate_compaction_manifest(&db, &self.database_dir, self.capacity_bytes)?;
             Ok(db)
         }) {
             Ok(db) => self.db = Some(db),
@@ -391,12 +667,26 @@ impl MdbxUtxoStore {
                 return Err(open_error);
             }
         }
+        remove_compaction_manifest(&self.database_dir)?;
         remove_path_if_exists(&old_dir)?;
         sync_database_parent(&self.database_dir)?;
-        let after_bytes = self.capacity()?.used_bytes;
+        let after = self.audit()?;
+        if CompactionManifest::from_audit(before) != CompactionManifest::from_audit(after) {
+            return Err(UtxoError::Malformed(
+                "active compacted MDBX content identity",
+            ));
+        }
         Ok(MdbxCompactionReport {
             before_bytes,
-            after_bytes,
+            after_bytes: after.high_water_bytes,
+            before_live_page_bytes: before.live_page_bytes,
+            after_live_page_bytes: after.live_page_bytes,
+            before_free_page_bytes: before.free_page_bytes,
+            after_free_page_bytes: after.free_page_bytes,
+            before_allocated_bytes: before.allocated_bytes,
+            after_allocated_bytes: after.allocated_bytes,
+            record_bytes: before.record_bytes,
+            content_sha256: before.content_sha256,
         })
     }
 
@@ -547,6 +837,81 @@ impl MdbxUtxoStore {
         Self::write_tip(&transaction, &meta, tip)?;
         transaction.commit().map_err(UtxoError::from)?;
         Ok(())
+    }
+
+    /// Removes disconnect records below an authenticated active-chain height.
+    ///
+    /// Every stored undo hash is resolved before the write starts. An unknown
+    /// or malformed hash fails closed, so pruning cannot silently discard a
+    /// record whose chain position was never established.
+    pub fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        let transaction = self.db().begin_ro_txn().map_err(UtxoError::from)?;
+        let undo = transaction
+            .open_table(Some(UNDO))
+            .map_err(UtxoError::from)?;
+        let mut cursor = transaction.cursor(&undo).map_err(UtxoError::from)?;
+        let mut expired = Vec::new();
+        for row in cursor.iter_start::<Vec<u8>, Vec<u8>>() {
+            let (key, _) = row.map_err(UtxoError::from)?;
+            let hash = BlockHash::from_byte_array(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| UtxoError::Malformed("MDBX undo block hash"))?,
+            );
+            let height =
+                headers
+                    .get(&hash)
+                    .map(|header| header.height)
+                    .ok_or(UtxoError::Malformed(
+                        "MDBX block undo references an unknown header",
+                    ))?;
+            if height < retain_from_height {
+                expired.push((height, hash));
+            }
+        }
+        drop(cursor);
+        drop(transaction);
+        expired.sort_unstable_by_key(|(height, hash)| (*height, hash.to_byte_array()));
+        self.remove_block_undos(
+            &expired
+                .into_iter()
+                .map(|(_, hash)| hash)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Removes exact block-undo hashes in one durable transaction.
+    ///
+    /// Production callers should normally use [`Self::prune_block_undos_before`],
+    /// which authenticates heights through the header DAG. This lower-level
+    /// surface exists for deterministic replay tools that derive every hash
+    /// from their own persisted execution tip.
+    pub fn remove_block_undos(&self, hashes: &[BlockHash]) -> Result<u64, ChainStoreError> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let mut hashes = hashes.to_vec();
+        hashes.sort_unstable_by_key(|hash| hash.to_byte_array());
+        hashes.dedup();
+        let _guard = self.lock();
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
+        let undo = transaction
+            .open_table(Some(UNDO))
+            .map_err(UtxoError::from)?;
+        let mut removed = 0_u64;
+        for hash in hashes {
+            removed += u64::from(
+                transaction
+                    .del(&undo, hash.to_byte_array(), None)
+                    .map_err(UtxoError::from)?,
+            );
+        }
+        transaction.commit().map_err(UtxoError::from)?;
+        Ok(removed)
     }
 
     fn validate_tip_advance(
@@ -820,6 +1185,203 @@ fn open_environment(
     )?)
 }
 
+fn metrics_environment(
+    db: &Database<NoWriteMap>,
+    database_dir: &Path,
+    capacity_bytes: u64,
+) -> Result<MdbxChainstateMetrics, UtxoError> {
+    let info = db.info()?;
+    let page_size = u64::from(db.stat()?.page_size());
+    let high_water_pages = u64::try_from(info.last_pgno())
+        .map_err(|_| UtxoError::Malformed("MDBX page number exceeds u64"))?
+        .saturating_add(1);
+    let free_pages = u64::try_from(db.freelist()?)
+        .map_err(|_| UtxoError::Malformed("MDBX freelist exceeds u64"))?;
+    let transaction = db.begin_ro_txn()?;
+    let mut live_page_bytes = 0_u64;
+    let mut counts = [0_u64; 4];
+    for (index, name) in [HOT, COLD, UNDO, META].into_iter().enumerate() {
+        let table = transaction.open_table(Some(name))?;
+        let stats = transaction.table_stat(&table)?;
+        live_page_bytes = live_page_bytes.saturating_add(stats.total_size());
+        counts[index] = u64::try_from(stats.entries())
+            .map_err(|_| UtxoError::Malformed("MDBX table entries exceed u64"))?;
+    }
+    let (file_bytes, allocated_bytes) = database_file_sizes(database_dir)?;
+    Ok(MdbxChainstateMetrics {
+        high_water_bytes: high_water_pages.saturating_mul(page_size),
+        live_page_bytes,
+        free_page_bytes: free_pages.saturating_mul(page_size),
+        file_bytes,
+        allocated_bytes,
+        capacity_bytes,
+        hot_entries: counts[0],
+        cold_entries: counts[1],
+        undo_entries: counts[2],
+        meta_entries: counts[3],
+    })
+}
+
+fn audit_environment(
+    db: &Database<NoWriteMap>,
+    database_dir: &Path,
+    capacity_bytes: u64,
+) -> Result<MdbxChainstateAudit, UtxoError> {
+    let metrics = metrics_environment(db, database_dir, capacity_bytes)?;
+    let transaction = db.begin_ro_txn()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"rbtc-mdbx-four-table-audit-v1");
+    let mut record_bytes = 0_u64;
+    for name in [HOT, COLD, UNDO, META] {
+        let table = transaction.open_table(Some(name))?;
+        hasher.update(
+            u64::try_from(name.len())
+                .expect("table name fits u64")
+                .to_be_bytes(),
+        );
+        hasher.update(name.as_bytes());
+        let mut cursor = transaction.cursor(&table)?;
+        for row in cursor.iter_start::<Vec<u8>, Vec<u8>>() {
+            let (key, value) = row?;
+            let key_len = u64::try_from(key.len()).expect("key length fits u64");
+            let value_len = u64::try_from(value.len()).expect("value length fits u64");
+            record_bytes = record_bytes
+                .saturating_add(key_len)
+                .saturating_add(value_len);
+            hasher.update(key_len.to_be_bytes());
+            hasher.update(&key);
+            hasher.update(value_len.to_be_bytes());
+            hasher.update(&value);
+        }
+    }
+    let meta = transaction.open_table(Some(META))?;
+    let tip = MdbxUtxoStore::read_tip(&transaction, &meta)?;
+    Ok(MdbxChainstateAudit {
+        high_water_bytes: metrics.high_water_bytes,
+        live_page_bytes: metrics.live_page_bytes,
+        free_page_bytes: metrics.free_page_bytes,
+        record_bytes,
+        file_bytes: metrics.file_bytes,
+        allocated_bytes: metrics.allocated_bytes,
+        capacity_bytes,
+        hot_entries: metrics.hot_entries,
+        cold_entries: metrics.cold_entries,
+        undo_entries: metrics.undo_entries,
+        meta_entries: metrics.meta_entries,
+        tip,
+        content_sha256: hasher.finalize().into(),
+    })
+}
+
+fn database_file_sizes(database_dir: &Path) -> Result<(u64, u64), UtxoError> {
+    let metadata = fs::metadata(database_dir.join("mdbx.dat"))?;
+    let logical = metadata.len();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((logical, metadata.blocks().saturating_mul(512)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok((logical, logical))
+    }
+}
+
+fn compaction_manifest_path(database_dir: &Path) -> PathBuf {
+    database_dir.join(COMPACTION_MANIFEST_FILE)
+}
+
+fn maintenance_state_path(database_dir: &Path) -> PathBuf {
+    database_dir.join(MAINTENANCE_STATE_FILE)
+}
+
+fn write_maintenance_state(
+    database_dir: &Path,
+    last_compacted_bytes: u64,
+) -> Result<(), UtxoError> {
+    let state = MaintenanceState {
+        schema: MAINTENANCE_STATE_SCHEMA,
+        last_compacted_bytes,
+    };
+    let encoded =
+        serde_json::to_vec(&state).map_err(|_| UtxoError::Malformed("MDBX maintenance state"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(maintenance_state_path(database_dir))?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_maintenance_state(database_dir: &Path) -> Result<Option<MaintenanceState>, UtxoError> {
+    let encoded = match fs::read(maintenance_state_path(database_dir)) {
+        Ok(encoded) => encoded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if encoded.len() > 1024 {
+        return Err(UtxoError::Malformed("MDBX maintenance state"));
+    }
+    let state: MaintenanceState = serde_json::from_slice(&encoded)
+        .map_err(|_| UtxoError::Malformed("MDBX maintenance state"))?;
+    if state.schema != MAINTENANCE_STATE_SCHEMA || state.last_compacted_bytes == 0 {
+        return Err(UtxoError::Malformed("MDBX maintenance state"));
+    }
+    Ok(Some(state))
+}
+
+fn write_compaction_manifest(
+    database_dir: &Path,
+    audit: MdbxChainstateAudit,
+) -> Result<(), UtxoError> {
+    let encoded = serde_json::to_vec(&CompactionManifest::from_audit(audit))
+        .map_err(|_| UtxoError::Malformed("MDBX compaction manifest"))?;
+    let path = compaction_manifest_path(database_dir);
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_compaction_manifest(database_dir: &Path) -> Result<CompactionManifest, UtxoError> {
+    let encoded = fs::read(compaction_manifest_path(database_dir))?;
+    if encoded.len() > 4 * 1024 {
+        return Err(UtxoError::Malformed("MDBX compaction manifest"));
+    }
+    let manifest: CompactionManifest = serde_json::from_slice(&encoded)
+        .map_err(|_| UtxoError::Malformed("MDBX compaction manifest"))?;
+    if manifest.schema != COMPACTION_MANIFEST_SCHEMA {
+        return Err(UtxoError::Malformed("MDBX compaction manifest schema"));
+    }
+    Ok(manifest)
+}
+
+fn validate_compaction_manifest(
+    db: &Database<NoWriteMap>,
+    database_dir: &Path,
+    capacity_bytes: u64,
+) -> Result<(), UtxoError> {
+    let manifest = read_compaction_manifest(database_dir)?;
+    let audit = audit_environment(db, database_dir, capacity_bytes)?;
+    if !manifest.matches(audit) {
+        return Err(UtxoError::Malformed("MDBX compaction manifest identity"));
+    }
+    Ok(())
+}
+
+fn remove_compaction_manifest(database_dir: &Path) -> Result<(), UtxoError> {
+    let path = compaction_manifest_path(database_dir);
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_directory(database_dir)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn validate_compacted_environment(db: &Database<NoWriteMap>) -> Result<(), UtxoError> {
     let transaction = db.begin_ro_txn()?;
     transaction.open_table(Some(HOT))?;
@@ -872,9 +1434,11 @@ fn recover_compaction_swap(database_dir: &Path) -> Result<(), UtxoError> {
             remove_path_if_exists(&fresh_dir)?;
             sync_database_parent(database_dir)?;
         } else if fresh_dir.exists() {
-            return Err(UtxoError::Malformed(
-                "orphan MDBX compact copy without prior environment",
-            ));
+            if !compaction_manifest_path(&fresh_dir).is_file() {
+                return Err(UtxoError::Malformed("unverified orphan MDBX compact copy"));
+            }
+            fs::rename(&fresh_dir, database_dir)?;
+            sync_database_parent(database_dir)?;
         }
     }
     Ok(())
@@ -1170,6 +1734,14 @@ impl ExecutionChainStore for MdbxUtxoStore {
 
     fn retains_block_undo(&self) -> bool {
         true
+    }
+
+    fn prune_block_undos_before(
+        &self,
+        headers: &HeaderDag,
+        retain_from_height: u32,
+    ) -> Result<u64, ChainStoreError> {
+        MdbxUtxoStore::prune_block_undos_before(self, headers, retain_from_height)
     }
 
     fn commit_connect(
@@ -1701,19 +2273,54 @@ mod tests {
                 .collect();
             store.apply(&spent, &live).unwrap();
         }
+        let replacement = (key(250), coin(1));
+        let logical_undo =
+            UtxoUndo::from_parts(vec![(live[0].0, live[0].1.clone())], vec![replacement.0]);
+        let next = ExecutionTip {
+            height: 1,
+            hash: block_hash_at(1),
+        };
+        store
+            .commit_connect(
+                genesis.hash,
+                next,
+                &[live[0].0],
+                std::slice::from_ref(&replacement),
+                std::slice::from_ref(&logical_undo),
+            )
+            .unwrap();
+        live[0] = replacement;
         let before = store.capacity().unwrap();
+        let before_audit = store.audit().unwrap();
+        assert_eq!(before_audit.hot_entries, 512);
+        assert_eq!(before_audit.undo_entries, 1);
+        assert!(before_audit.meta_entries >= 3);
         assert_eq!(before.capacity_bytes, 64 * 1024 * 1024);
-        let report = store.compact().unwrap();
+        let report = store.compact_with_reserve(0).unwrap();
         assert_eq!(report.before_bytes, before.used_bytes);
         assert!(report.after_bytes <= report.before_bytes);
+        assert_eq!(report.content_sha256, before_audit.content_sha256);
+        assert_eq!(report.record_bytes, before_audit.record_bytes);
+        assert_eq!(
+            store.last_compacted_bytes().unwrap(),
+            Some(report.after_bytes)
+        );
         assert!(store.get(live[0].0).unwrap().is_some());
-        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert_eq!(store.execution_tip().unwrap(), next);
+        assert_eq!(
+            store.block_undo(next.hash).unwrap(),
+            Some(vec![logical_undo])
+        );
         drop(store);
 
         let reopened = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
         assert_eq!(reopened.tier_stats().unwrap().hot, 512);
         assert!(reopened.get(live[511].0).unwrap().is_some());
-        assert_eq!(reopened.execution_tip().unwrap(), genesis);
+        assert_eq!(reopened.execution_tip().unwrap(), next);
+        assert_eq!(
+            reopened.audit().unwrap().content_sha256,
+            report.content_sha256
+        );
     }
 
     #[test]
@@ -1732,5 +2339,127 @@ mod tests {
         assert_eq!(recovered.get(key(1)).unwrap(), Some(coin(1)));
         assert!(!old.exists());
         assert!(!fresh.exists());
+    }
+
+    fn prepare_verified_compaction_candidate(path: &Path) -> [u8; 32] {
+        let store = MdbxUtxoStore::open(path).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: block_hash_at(0),
+            })
+            .unwrap();
+        store.apply(&[], &[(key(7), coin(0))]).unwrap();
+        let next = ExecutionTip {
+            height: 1,
+            hash: block_hash_at(1),
+        };
+        store
+            .commit_connect(
+                block_hash_at(0),
+                next,
+                &[key(7)],
+                &[(key(8), coin(1))],
+                &[UtxoUndo::from_parts(vec![(key(7), coin(0))], vec![key(8)])],
+            )
+            .unwrap();
+        let audit = store.audit().unwrap();
+        let fresh = compaction_path(path);
+        fs::create_dir_all(&fresh).unwrap();
+        store.db().copy_compact(&fresh.join("mdbx.dat")).unwrap();
+        let copied = open_environment(&fresh, DEFAULT_CHAINSTATE_CAPACITY_BYTES).unwrap();
+        let copied_audit =
+            audit_environment(&copied, &fresh, DEFAULT_CHAINSTATE_CAPACITY_BYTES).unwrap();
+        assert_eq!(audit.content_sha256, copied_audit.content_sha256);
+        drop(copied);
+        write_compaction_manifest(&fresh, audit).unwrap();
+        drop(store);
+        audit.content_sha256
+    }
+
+    fn assert_recovered_candidate(path: &Path, expected: [u8; 32]) {
+        let recovered = MdbxUtxoStore::open(path).unwrap();
+        let audit = recovered.audit().unwrap();
+        assert_eq!(audit.content_sha256, expected);
+        assert_eq!(audit.hot_entries, 1);
+        assert_eq!(audit.undo_entries, 1);
+        assert_eq!(audit.tip.unwrap().height, 1);
+        assert!(!compaction_path(path).exists());
+        assert!(!compacted_out_path(path).exists());
+        assert!(!compaction_manifest_path(path).exists());
+    }
+
+    #[test]
+    fn compaction_recovery_covers_every_durable_swap_topology() {
+        // Copy complete, before the first rename (and its preceding fsync).
+        let before_first = TempDir::new().unwrap();
+        let path = before_first.path().join("mdbx");
+        let expected = prepare_verified_compaction_candidate(&path);
+        assert_recovered_candidate(&path, expected);
+
+        // After source -> compacted-out, on either side of the parent fsync.
+        let between_renames = TempDir::new().unwrap();
+        let path = between_renames.path().join("mdbx");
+        let expected = prepare_verified_compaction_candidate(&path);
+        fs::rename(&path, compacted_out_path(&path)).unwrap();
+        assert_recovered_candidate(&path, expected);
+
+        // After compacting -> source, on either side of the parent fsync.
+        let after_second = TempDir::new().unwrap();
+        let path = after_second.path().join("mdbx");
+        let expected = prepare_verified_compaction_candidate(&path);
+        fs::rename(&path, compacted_out_path(&path)).unwrap();
+        fs::rename(compaction_path(&path), &path).unwrap();
+        assert_recovered_candidate(&path, expected);
+
+        // A verified copy can be salvaged if it is the only durable survivor.
+        let orphan = TempDir::new().unwrap();
+        let path = orphan.path().join("mdbx");
+        let expected = prepare_verified_compaction_candidate(&path);
+        fs::remove_dir_all(&path).unwrap();
+        assert_recovered_candidate(&path, expected);
+    }
+
+    #[test]
+    fn compaction_recovery_rejects_a_tampered_verified_copy_and_keeps_old() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("mdbx");
+        prepare_verified_compaction_candidate(&path);
+        fs::rename(&path, compacted_out_path(&path)).unwrap();
+        fs::rename(compaction_path(&path), &path).unwrap();
+        let manifest_path = compaction_manifest_path(&path);
+        let mut manifest = read_compaction_manifest(&path).unwrap();
+        manifest.content_sha256[0] ^= 0xff;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert!(matches!(
+            MdbxUtxoStore::open(&path),
+            Err(UtxoError::Malformed("MDBX compaction manifest identity"))
+        ));
+        assert!(compacted_out_path(&path).exists());
+        assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn compaction_policy_requires_pressure_and_growth() {
+        let directory = TempDir::new().unwrap();
+        let mut store =
+            MdbxUtxoStore::open_with_capacity(directory.path().join("mdbx"), 1024 * 1024).unwrap();
+        let used = store.capacity().unwrap().used_bytes;
+        assert!(!store.compaction_is_worthwhile(100, 50, None).unwrap());
+        assert!(store.compaction_is_worthwhile(1, 50, None).unwrap());
+        assert!(!store.compaction_is_worthwhile(1, 50, Some(used)).unwrap());
+        assert!(matches!(
+            store.compaction_is_worthwhile(0, 50, None),
+            Err(UtxoError::Malformed("MDBX compaction policy percentage"))
+        ));
+        let identity = store.audit().unwrap().content_sha256;
+        assert!(matches!(
+            store.compact_with_reserve(u64::MAX),
+            Err(UtxoError::Io(_))
+        ));
+        assert_eq!(store.audit().unwrap().content_sha256, identity);
+        assert!(!compaction_path(&store.database_dir).exists());
+        assert!(!compacted_out_path(&store.database_dir).exists());
     }
 }

@@ -26,6 +26,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: bash -n scripts/*.sh
+      - run: sh -n contrib/run_mdbx_replacement_gate.sh
       - run: scripts/test-release-manifest.sh
       - run: scripts/test-public-network-soak-monitor.sh
       - run: scripts/test-public-network-soak-report.sh
