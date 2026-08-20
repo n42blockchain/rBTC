@@ -303,15 +303,26 @@ because it is already written.
 
 ## Required gate before changing the default
 
+The executable procedure and current status are maintained in
+[`MDBX_REPLACEMENT_GATE.md`](MDBX_REPLACEMENT_GATE.md). This revision adds a
+resumable 160M/900,000 churn driver, physical amplification checkpoints,
+precompiled 64/256 peak-RSS lanes, verified four-table compact-copy, a 55%/50%
+trigger/growth policy, free-space preflight, bounded undo pruning, and abrupt
+subprocess exits at all five copy/rename/fsync boundaries. The small local
+smoke and crash matrix pass; the full-scale and real-block rows below remain
+open evidence gates.
+
 1. Replay a common mainnet block corpus into current redb and the complete
    four-table MDBX store, with the same UTXO cache budget, validation flags,
    undo retention, batch size, and starting state.
 2. Continue MDBX past 160M live coins and through enough spend churn to measure
    high-water growth, freelist reuse, and compact-copy frequency. Report raw,
    live-page, allocated, and copied bytes separately.
-3. Inject process kills before/after the two directory renames and parent
-   directory syncs, then verify reopen exposes either the old or fully compacted
-   chainstate with the same tip and all four tables.
+3. **Mechanism and small-scale gate complete:** inject process exits
+   before/after the two directory renames and parent directory syncs, then
+   verify reopen exposes either the old or fully compacted chainstate with the
+   same tip and all four tables. Repeat alongside the full-scale run before
+   selection.
 4. Hold a 128 GiB hard geometry ceiling and demonstrate an operator threshold
    that compacts before `MDBX_MAP_FULL` without repeated compaction.
 5. Measure peak RSS for 64- and 256-block batches. The supplied replay already

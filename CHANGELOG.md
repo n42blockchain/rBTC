@@ -28,6 +28,16 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   sustained Pebble IBD falling behind LevelDB, and Badger rejecting the first
   required atomic IBD checkpoint; the default database decision is unchanged.
 
+- MDBX replacement preparation now audits and hashes all four chainstate
+  tables before and after compact-copy, carries that identity through a
+  recoverable directory-swap manifest, preflights copy space with a 16 GiB
+  reserve, applies a 55%-capacity/50%-growth anti-thrashing policy, and prunes
+  undo through authenticated header heights. Abrupt subprocess exits cover all
+  five copy/rename/fsync boundaries. A resumable ignored gate drives 160M live
+  coins and up to 900,000 synthetic churn transitions in separately measured
+  64/256 lanes; full-scale and real-mainnet replay evidence remain required
+  before selecting MDBX by default.
+
 - TRUC (v3) transactions are implicitly replaceable, and a second v3 child
   of a one-child v3 parent now displaces its sibling through the full
   replacement rules (feerate diagram included) instead of failing the
