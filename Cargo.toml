@@ -21,6 +21,14 @@ path = "src/lib.rs"
 name = "rbtcd"
 path = "src/bin/rbtcd.rs"
 
+[[bin]]
+name = "fdb_ledger_import"
+path = "src/bin/fdb_ledger_import.rs"
+
+[[bin]]
+name = "utxo_locality"
+path = "src/bin/utxo_locality.rs"
+
 [dependencies]
 ahash = "0.8"
 bitcoin = { version = "=0.32.102", default-features = true }
