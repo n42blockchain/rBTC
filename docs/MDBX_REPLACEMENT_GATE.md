@@ -27,6 +27,8 @@ raw-record estimate previously copied into this document.
 | Supplied IBD batch comparison | MDBX reached 32,988 inserts/s, slightly above LevelDB's 30,663 | 800 MiB footprint vs LevelDB's 159 MiB; supplied 256-block peak RSS was about 35% above 64-block |
 | New 20k deterministic smoke | Verified copy kept the exact four-table SHA; one copy reduced high-water 3.49→2.18 MB and allocated bytes 4.72→2.18 MB; freelist 1.29 MB→0 | Tiny memory-resident evidence only; copy pauses writes, scans all records for verification, and temporarily needs source plus live copy |
 | New clean 64/256 runner smoke | 256 batching reached 1,415 vs 737 synthetic blocks/s; precompiled peak RSS was 64.5 vs 64.3 MiB | Too small to validate the production RSS ratio; full-scale run remains required |
+| Real-block overlay catch-up, mainnet 935,001–963,350 (28,350 blocks, 116.5M transactions, full validation, identical settings; [2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)) | Same final tip as redb; exit 0 | MDBX was **slower**: 3,823 s vs redb 3,289 s (7.41 vs 8.62 blocks/s, 30,462 vs 35,415 tx/s), peak working set 10.3 vs 6.0 GiB, 480 vs 299 GB written, 19 compact-copies vs 2; its copy-on-write B-tree rewrote ~4.3 GB per 256-block batch for ~100 MB of net change |
+| Spent-output age over the same window (`utxo_locality`) | 33.5% of inputs spend same-block outputs, 80.7% outputs ≤ 256 blocks old, 91.5% ≤ 4,096 | Neither engine exploits this beyond intra-batch folding; a cross-batch write-back cache would cut durable writes about 5× before any engine choice matters |
 
 The production-size copy-space implication is explicit: keeping the existing
 76.01 GB file while writing approximately 50.26 GB of live pages requires
@@ -137,8 +139,14 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    memory-budget design; the supplied observation was already about 1.35.
 4. A common immutable real mainnet block corpus must still be replayed through
    redb and MDBX with identical cache, validation, retention, batch, and start
-   state. Final tip and canonical UTXO identity must match. That corpus is not
-   on this Mac, so this remains an external gate.
+   state. Final tip and canonical UTXO identity must match. **Run once on the
+   Windows corpus host on 2026-08-21** ([report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)):
+   28,350 real blocks from the 935,000 snapshot, same tip on both engines,
+   redb 14% faster with 42% less memory and 38% fewer bytes written. The
+   canonical UTXO-identity comparison is still open — no CLI audits an
+   overlay yet — and the write-back-cache work the report recommends changes
+   the write volume both engines see, so the selection decision waits for
+   both.
 5. The explicit backend manifest is complete. The daemon must still gain an
    authenticated content migration/publish path and cover AssumeUTXO metadata,
    consensus binding, background validation, offline repair, observability,

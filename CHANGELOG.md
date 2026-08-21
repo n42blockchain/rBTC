@@ -6,6 +6,18 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ## [Unreleased]
 
+### Added
+
+- `fdb_ledger_import` imports a btcd flat block file set into a
+  `PrunedBlockLedger` (read-only source, chain selection from a base hash,
+  CRC-32C checks, ranged re-verification), and `utxo_locality` reports the
+  spent-output age histogram of a ledger. Using them, a real-block overlay
+  catch-up over mainnet 935,001–963,350 compared the MDBX and redb overlays
+  under identical settings: redb finished in 3,289 s against MDBX's 3,823 s
+  with 42% less memory and 38% fewer bytes written, both reaching the same
+  tip. Over that window 80.7% of inputs spend outputs at most 256 blocks old.
+  See `docs/REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md`.
+
 ### Changed
 
 - The feature-gated MDBX chainstate now uses exactly four tables (`utxo_hot`,

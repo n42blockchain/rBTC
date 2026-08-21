@@ -6,6 +6,20 @@
 功能候选：`fa64adfa76fb7163a4aa5d5cfeac8ccfca36eb01`  
 可比基线：`2d036b154a28a863abcb22d946f22853758506f4`
 
+## 0. 2026-08-21 执行结果（Windows 证据机）
+
+lane 按第 4 节准备完毕（两 lane 字节一致的 `--json` 测量补丁、只读 `census` /
+`corpusmanifest` 工具、固定参数、串行执行），但 lane B（`fa64adfa`）三次尝试均在
+主机内存耗尽时失败：attempt 1（go1.26.5，与 41 GiB 无关进程并存）12 分钟后 GC
+访问违例；attempt 2（`GOEXPERIMENT=nogreenteagc`，主机空闲）25.6 分钟后源文件读取
+报 `ERROR_NO_SYSTEM_RESOURCES`，工作集 114.8 GiB；attempt 3（go1.27.0、依赖全部更新、
+`--memlimit` 降为 80）**24m01s 到达 checkpoint 810,071**，随后在第二个回放进程占满
+内存时于 ~821k 崩溃。固定的 `--gogc=400 --memlimit=112` 在 125.6 GiB 主机上没有余量，
+这是参数本身的问题。用户以"fast-add 到 810k 约 24 分钟"关闭本轨道；全量耗时、
+交易总数与 durable TPS 仍未取得。lane A 未运行。证据与偏差记录见证据机
+`D:\rbtc-bench\btcdmdbx-full-replay-20260820\artifacts`；rBTC 侧随后的真实块
+A/B 见 [REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)。
+
 ## 1. 当前结论
 
 更新有借鉴意义，但不能把提交说明里的局部速率当作全量结论，也不能把
