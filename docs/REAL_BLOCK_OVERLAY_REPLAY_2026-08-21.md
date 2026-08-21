@@ -117,11 +117,22 @@ write traffic. This window is a 2025–26 Ordinals/Runes-era sample; the
 ## 5. Conclusions recorded for the gate
 
 1. Acceptance item 4 (real-block replay through redb and MDBX with identical
-   settings) has been run once on the Windows host: same final tip, full
-   validation, identical batch/capacity/compaction/rebase settings. A
-   canonical UTXO-identity comparison between the two overlays was **not**
-   run because no CLI path audits an overlay; adding one and re-running the
-   read-only check is the remaining step for that item.
+   settings) has been run on the Windows host: same final tip, full
+   validation, identical batch/capacity/compaction/rebase settings, and —
+   with the new read-only `overlay_audit` tool — the same canonical UTXO
+   content. All four overlays (MDBX, redb, and both with the write-back
+   layer) hold 14,554,294 post-base coins (523,954,584 key bytes,
+   798,755,918 value bytes) and 13,000,529 tombstones over the same base
+   (`hash_serialized e4b90ef9…025050`) at tip 963,350; their consensus-field
+   digest is identical:
+   `content_sha256 = aadd289f6edf154e55aec63c9b4c22cd46e2d7836dc55382d0036523247f2819`
+   (overlay `1bc8b65d…f61f72`, tombstones `dafe85f5…f05f6`). The tombstone
+   count equals the 13,000,529 inputs the locality scan classified as
+   spending pre-window coins. Only the raw value bytes differ between lanes,
+   because the stored `last_touched` wall-clock field differs per run; the
+   audit hashes value, height, coinbase flag, creation MTP and script, and
+   reports the raw digest separately. Undo rows (958 / 2,494 / 958 / 3,774)
+   depend on when the last prune ran and are excluded from the digest.
 2. On this evidence MDBX is not faster than redb for the catch-up write path;
    its advantage in the earlier micro-benchmarks does not carry over to the
    compaction lifecycle. With the write-back layer (section 6) both engines
@@ -196,3 +207,6 @@ ran alone on the host (a user-run Go replay variant overlapped parts of the
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.
 - `src/bin/utxo_locality.rs` — spent-output age histogram over a ledger.
+- `src/bin/overlay_audit.rs` (`--features mdbx`) — read-only consensus-content
+  digest of an MDBX or redb overlay (`SnapshotOverlayChainstate::audit_content`,
+  `SnapshotOverlayRedbChainstate::audit_content`); scans 14.5M coins in ~5 s.

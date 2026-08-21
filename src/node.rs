@@ -26384,6 +26384,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn parses_snapshot_overlay_write_back_limits() {
         let options = parse_options(
             [

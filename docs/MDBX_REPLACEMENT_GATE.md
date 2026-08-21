@@ -30,6 +30,7 @@ raw-record estimate previously copied into this document.
 | Real-block overlay catch-up, mainnet 935,001–963,350 (28,350 blocks, 116.5M transactions, full validation, identical settings; [2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)) | Same final tip as redb; exit 0 | MDBX was **slower**: 3,823 s vs redb 3,289 s (7.41 vs 8.62 blocks/s, 30,462 vs 35,415 tx/s), peak working set 10.3 vs 6.0 GiB, 480 vs 299 GB written, 19 compact-copies vs 2; its copy-on-write B-tree rewrote ~4.3 GB per 256-block batch for ~100 MB of net change |
 | Spent-output age over the same window (`utxo_locality`) | 33.5% of inputs spend same-block outputs, 80.7% outputs ≤ 256 blocks old, 91.5% ≤ 4,096 | Neither engine exploits this beyond intra-batch folding; a cross-batch write-back cache would cut durable writes about 5× before any engine choice matters |
 | Same catch-up with the cross-batch write-back layer (`--snapshot-overlay-flush-batches 16`, commit a1ed228) | MDBX 3,823 → 3,057 s; 81.1% of created coins cancelled in memory; MDBX commit work halved (sync 832 → 163 s) | redb gained more: 3,289 → 2,606 s, 44,689 tx/s, 120 GB written; MDBX + layer still trails redb + layer by 15%. Peak working set +12–13 GiB at the default 8M-coin buffer |
+| `overlay_audit` over all four overlays | Identical consensus content: 14,554,294 coins, 13,000,529 tombstones, digest `aadd289f…7f2819` on MDBX, redb, and both write-back lanes | Raw stored bytes differ only by the per-run `last_touched` field; undo row counts differ by prune timing and are excluded |
 
 The production-size copy-space implication is explicit: keeping the existing
 76.01 GB file while writing approximately 50.26 GB of live pages requires
@@ -144,12 +145,15 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    Windows corpus host on 2026-08-21** ([report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)):
    28,350 real blocks from the 935,000 snapshot, same tip on both engines,
    redb 14% faster with 42% less memory and 38% fewer bytes written. The
-   canonical UTXO-identity comparison is still open — no CLI audits an
-   overlay yet. The write-back layer the report recommended was then built
-   and measured the same day: with 16 buffered batches redb finished in
-   2,606 s and MDBX in 3,057 s, both at the same tip, so the layer does not
-   change the engine ordering. The selection decision waits on the identity
-   audit and the remaining items below.
+   canonical UTXO content was then compared with the read-only
+   `overlay_audit` tool: all four overlays (both engines, with and without
+   the write-back layer) hold the same 14,554,294 coins and 13,000,529
+   tombstones with consensus digest `aadd289f…7f2819`. The write-back layer
+   the report recommended was built and measured the same day: with 16
+   buffered batches redb finished in 2,606 s and MDBX in 3,057 s, so the
+   layer does not change the engine ordering. **Item 4 is met for this
+   corpus window**; what it does not cover is a genesis-to-tip replay or the
+   2015–2019 churn profile.
 5. The explicit backend manifest is complete. The daemon must still gain an
    authenticated content migration/publish path and cover AssumeUTXO metadata,
    consensus binding, background validation, offline repair, observability,

@@ -225,6 +225,46 @@ impl SnapshotOverlayRedbChainstate {
             .transpose()
     }
 
+    /// Hashes the logical content of an existing redb overlay without
+    /// touching the base snapshot; same digest definition as the MDBX engine.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the database cannot be opened, a table or the identity or tip
+    /// is missing, or a record does not decode.
+    pub fn audit_content(
+        database_path: &Path,
+    ) -> Result<crate::snapshot_overlay::OverlayContentAudit, SnapshotOverlayError> {
+        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let transaction = db.begin_read().map_err(overlay_redb)?;
+        let meta = transaction.open_table(META).map_err(overlay_redb)?;
+        let identity = meta
+            .get(META_IDENTITY)
+            .map_err(overlay_redb)?
+            .ok_or(SnapshotOverlayError::Invalid("overlay has no identity"))?;
+        let identity = decode_identity(identity.value())?;
+        let tip = meta
+            .get(META_TIP)
+            .map_err(overlay_redb)?
+            .ok_or(SnapshotOverlayError::Invalid("overlay has no tip"))?;
+        let tip = crate::snapshot_overlay::decode_tip(tip.value())
+            .map_err(|_| SnapshotOverlayError::Invalid("overlay tip does not decode"))?;
+        let mut hasher = crate::snapshot_overlay::OverlayContentHasher::new();
+        let overlay = transaction.open_table(OVERLAY).map_err(overlay_redb)?;
+        for row in overlay.iter().map_err(overlay_redb)? {
+            let (key, value) = row.map_err(overlay_redb)?;
+            hasher.overlay_entry(key.value(), value.value())?;
+        }
+        let tombstone = transaction.open_table(TOMBSTONE).map_err(overlay_redb)?;
+        for row in tombstone.iter().map_err(overlay_redb)? {
+            let (key, _unit) = row.map_err(overlay_redb)?;
+            hasher.tombstone_entry(key.value());
+        }
+        let undo = transaction.open_table(UNDO).map_err(overlay_redb)?;
+        hasher.undo_entries = undo.len().map_err(overlay_redb)?;
+        Ok(hasher.finish("redb", identity, tip))
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard
             .lock()

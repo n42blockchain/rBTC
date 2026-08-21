@@ -755,7 +755,15 @@ ceiling. At the default of one batch the bare engine runs unchanged. Over
 the first 1,024 real blocks above the 935,000 snapshot with four buffered
 batches, both engines wrote 1,795,392 coins and 1,549,874 spends and
 cancelled 3,833,838 coins in memory — 68% of the coins those blocks created
-never reached disk — and reached the same tip as the unbuffered runs.
+never reached disk — and reached the same tip as the unbuffered runs. Over
+the full 28,350-block window with 16 buffered batches, 81% of created coins
+cancelled in memory and the read-only `overlay_audit` binary
+(`SnapshotOverlayChainstate::audit_content` /
+`SnapshotOverlayRedbChainstate::audit_content`) produced the same
+consensus-content digest for both engines with and without the layer; it
+hashes base identity, tip, every coin's value, height, coinbase flag,
+creation MTP and script, and every tombstone, leaving out the per-run
+`last_touched` bookkeeping and the prune-dependent undo rows.
 
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror

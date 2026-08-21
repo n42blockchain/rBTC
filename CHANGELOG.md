@@ -19,6 +19,13 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   3,289 s to 2,606 s (44,689 tx/s, 120 GB written instead of 299 GB) and
   MDBX from 3,823 s to 3,057 s, all lanes at the same final tip; peak
   working set rose by 12–13 GiB at the default 8M-coin buffer.
+- `overlay_audit` (`--features mdbx`) hashes the consensus content of an
+  MDBX or redb snapshot overlay read-only — base identity, tip, every
+  post-base coin's value/height/coinbase flag/creation MTP/script in key
+  order, and every tombstone — so overlays built by different engines or
+  commit strategies compare as one digest. The four 2026-08-21 lanes all
+  hashed to `aadd289f…7f2819` with 14,554,294 coins and 13,000,529
+  tombstones.
 - `fdb_ledger_import` imports a btcd flat block file set into a
   `PrunedBlockLedger` (read-only source, chain selection from a base hash,
   CRC-32C checks, ranged re-verification), and `utxo_locality` reports the

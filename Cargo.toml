@@ -29,6 +29,11 @@ path = "src/bin/fdb_ledger_import.rs"
 name = "utxo_locality"
 path = "src/bin/utxo_locality.rs"
 
+[[bin]]
+name = "overlay_audit"
+path = "src/bin/overlay_audit.rs"
+required-features = ["mdbx"]
+
 [dependencies]
 ahash = "0.8"
 bitcoin = { version = "=0.32.102", default-features = true }
