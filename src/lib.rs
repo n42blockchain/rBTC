@@ -57,6 +57,7 @@ pub mod undo_store;
 pub mod utxo;
 pub mod validation_owner;
 pub mod wallet;
+pub mod write_back_chainstate;
 pub mod zmq_publisher;
 
 pub use utxo::{OutPointKey, Utxo, UtxoStore};

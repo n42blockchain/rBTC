@@ -2280,6 +2280,23 @@ const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
 /// mechanism.
 const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
 
+/// Batches the write-back layer buffers before one durable overlay commit.
+///
+/// One keeps the engine's own commit-per-batch behaviour and bypasses the
+/// layer entirely, so existing measurements stay comparable. Over mainnet
+/// 935,001–963,350, 80.7% of inputs spend an output at most 256 blocks old and
+/// 91.5% one at most 4,096 blocks old, so buffering 16 batches lets most coins
+/// cancel in memory instead of being written and deleted.
+const DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES: u32 = 1;
+/// Upper bound on buffered batches: 64 batches of 256 blocks is over a week of
+/// mainnet blocks and the most any crash should have to re-execute.
+const MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES: u32 = 64;
+/// Net-created coins that force a flush regardless of batch count; roughly
+/// 128 bytes each in memory, so the default bounds the buffer near 1 GiB.
+const DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 8_000_000;
+const MIN_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 100_000;
+const MAX_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 200_000_000;
+
 /// Growth over the last post-compaction size required before compacting
 /// again, as a percentage of that size.
 ///
@@ -2341,6 +2358,11 @@ struct NodeSnapshotOverlayConfig {
     /// so a storage change can be compared without network variance, which a
     /// networked soak cannot resolve.
     replay_blocks: Option<PathBuf>,
+    /// Batches buffered in memory before one durable engine commit; `1`
+    /// commits every batch as before.
+    flush_batches: u32,
+    /// Net-created coins that force a flush before `flush_batches` is reached.
+    flush_coins: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11561,15 +11583,33 @@ async fn sync_snapshot_overlay_node(
         mtp_by_height: creation_mtp_range(&headers, 0, identity.height)?,
     };
 
-    match overlay.engine {
-        SnapshotOverlayEngine::Mdbx => {
+    // With a flush interval of one batch the bare engine is run as before, so
+    // the baseline measurement stays byte-for-byte the same code path.
+    let write_back = (overlay.flush_batches > 1).then_some(WriteBackLimits {
+        max_batches: overlay.flush_batches,
+        max_created: overlay.flush_coins,
+    });
+    match (overlay.engine, write_back) {
+        (SnapshotOverlayEngine::Mdbx, None) => {
             let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
                 .map_err(|error| PeerRunError::transient(error.to_string()))?;
             run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
         }
-        SnapshotOverlayEngine::Redb => {
+        (SnapshotOverlayEngine::Mdbx, Some(limits)) => {
+            let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            let chainstate = WriteBackChainstate::new(chainstate, limits);
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        (SnapshotOverlayEngine::Redb, None) => {
             let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
                 .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        (SnapshotOverlayEngine::Redb, Some(limits)) => {
+            let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            let chainstate = WriteBackChainstate::new(chainstate, limits);
             run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
         }
     }
@@ -11581,6 +11621,9 @@ struct OverlayCompaction {
     before_bytes: u64,
     after_bytes: u64,
 }
+
+#[cfg(feature = "mdbx")]
+use crate::write_back_chainstate::{WriteBackChainstate, WriteBackFlush, WriteBackLimits};
 
 /// The engine-specific capabilities the catch-up loop needs beyond ordinary
 /// block execution, so the loop itself can be written once for both stores.
@@ -11600,6 +11643,64 @@ trait OverlayCatchupStore: ExecutionChainStore {
     /// call this is the catch-up loop's policy decision, not the store's.
     fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String>;
     fn engine_name(&self) -> &'static str;
+    /// Commits anything a write-back layer still holds in memory.
+    ///
+    /// Stores that commit every batch durably have nothing to do.
+    fn flush_pending(&self) -> Result<Option<WriteBackFlush>, String> {
+        Ok(None)
+    }
+    /// Takes the record of the most recent write-back flush, if any.
+    fn take_write_back_flush(&self) -> Option<WriteBackFlush> {
+        None
+    }
+}
+
+/// The write-back layer forwards the overlay surface to the engine it wraps,
+/// flushing before any operation that must see the durable state.
+#[cfg(feature = "mdbx")]
+impl<C: OverlayCatchupStore> OverlayCatchupStore for WriteBackChainstate<C> {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.inner().overlay_base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        // Count what the buffer will add at the next flush, so compaction
+        // and rebase trigger before the flush itself could hit the ceiling.
+        let mut capacity = self.inner().overlay_capacity()?;
+        capacity.used_bytes = capacity
+            .used_bytes
+            .saturating_add(self.pending_estimated_bytes());
+        Ok(capacity)
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.inner_mut_flushed()
+            .map_err(|error| error.to_string())?
+            .overlay_rebase(snapshot, index, mtp_extension)
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        self.inner_mut_flushed()
+            .map_err(|error| error.to_string())?
+            .overlay_compact()
+    }
+
+    fn engine_name(&self) -> &'static str {
+        self.inner().engine_name()
+    }
+
+    fn flush_pending(&self) -> Result<Option<WriteBackFlush>, String> {
+        self.flush().map_err(|error| error.to_string())
+    }
+
+    fn take_write_back_flush(&self) -> Option<WriteBackFlush> {
+        self.take_last_flush()
+    }
 }
 
 #[cfg(feature = "mdbx")]
@@ -11914,6 +12015,18 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             None,
         )
         .await?;
+        if let Some(flush) = chainstate.take_write_back_flush() {
+            log_write_back_flush(&flush);
+        }
+    }
+    // Whatever the write-back layer still holds becomes durable before the
+    // run reports its tip; a run that errored out above re-executes the
+    // unflushed blocks from the ledger on its next start.
+    if let Some(flush) = chainstate
+        .flush_pending()
+        .map_err(PeerRunError::transient)?
+    {
+        log_write_back_flush(&flush);
     }
     let tip = chainstate
         .execution_tip()
@@ -11942,6 +12055,19 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
 /// always names them `utxo-<height>.dat`/`.rbtcidx` beside the original
 /// snapshot — reusing that convention here is what lets a restart find the
 /// current base without persisting a file path anywhere.
+#[cfg(feature = "mdbx")]
+fn log_write_back_flush(flush: &WriteBackFlush) {
+    rbtc_info!(
+        "write-back flushed {} batches / {} blocks to the overlay in {} ms: wrote {} coins and {} spends, cancelled {} coins in memory",
+        flush.batches,
+        flush.blocks,
+        flush.elapsed.as_millis(),
+        flush.created,
+        flush.spent,
+        flush.cancelled,
+    );
+}
+
 #[cfg(feature = "mdbx")]
 fn overlay_base_paths_for_height(
     cli_snapshot: &std::path::Path,
@@ -16330,6 +16456,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_overlay_replay_blocks: Option<PathBuf> = None;
     let mut snapshot_overlay_rebase_percent = None;
     let mut snapshot_overlay_compact_percent = None;
+    let mut snapshot_overlay_flush_batches: Option<u32> = None;
+    let mut snapshot_overlay_flush_coins: Option<u64> = None;
     let mut snapshot_overlay_engine = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
@@ -17030,6 +17158,44 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 }
                 snapshot_overlay_compact_percent = Some(percent);
             }
+            "--snapshot-overlay-flush-batches" => {
+                if snapshot_overlay_flush_batches.is_some() {
+                    return Err(
+                        "--snapshot-overlay-flush-batches cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-flush-batches")?;
+                let batches = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid overlay flush batch count: {value}"))?;
+                if !(1..=MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES).contains(&batches) {
+                    return Err(format!(
+                        "overlay flush batch count must be between 1 and {MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES}"
+                    ));
+                }
+                snapshot_overlay_flush_batches = Some(batches);
+            }
+            "--snapshot-overlay-flush-coins" => {
+                if snapshot_overlay_flush_coins.is_some() {
+                    return Err(
+                        "--snapshot-overlay-flush-coins cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-flush-coins")?;
+                let coins = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid overlay flush coin count: {value}"))?;
+                if !(MIN_SNAPSHOT_OVERLAY_FLUSH_COINS..=MAX_SNAPSHOT_OVERLAY_FLUSH_COINS)
+                    .contains(&coins)
+                {
+                    return Err(format!(
+                        "overlay flush coin count must be between {MIN_SNAPSHOT_OVERLAY_FLUSH_COINS} and {MAX_SNAPSHOT_OVERLAY_FLUSH_COINS}"
+                    ));
+                }
+                snapshot_overlay_flush_coins = Some(coins);
+            }
             "--snapshot-overlay-rebase-percent" => {
                 if snapshot_overlay_rebase_percent.is_some() {
                     return Err(
@@ -17576,6 +17742,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 || snapshot_overlay_compact_percent.is_some()
                 || snapshot_overlay_engine.is_some()
                 || snapshot_overlay_replay_blocks.is_some()
+                || snapshot_overlay_flush_batches.is_some()
+                || snapshot_overlay_flush_coins.is_some()
             {
                 return Err(
                     "overlay capacity, engine, replay, and rebase options require --snapshot-overlay-catchup"
@@ -17595,6 +17763,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
             engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
             replay_blocks: snapshot_overlay_replay_blocks,
+            flush_batches: snapshot_overlay_flush_batches
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES),
+            flush_coins: snapshot_overlay_flush_coins
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS),
         }),
         _ => {
             return Err(
@@ -18430,7 +18602,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd --build-core-snapshot-index CORE_DUMPTXOUTSET_FILE --snapshot-index-output FILE\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99] [--snapshot-overlay-flush-batches 1..64] [--snapshot-overlay-flush-coins N]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
             "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
@@ -26066,6 +26238,8 @@ mod tests {
                 compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
                 engine: SnapshotOverlayEngine::Mdbx,
                 replay_blocks: None,
+                flush_batches: DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES,
+                flush_coins: DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS,
             })
         );
 
@@ -26203,6 +26377,128 @@ mod tests {
                 "/srv/snapshots/utxo-935000.rbtcidx",
                 "--snapshot-overlay-rebase-percent",
                 "100",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_snapshot_overlay_write_back_limits() {
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "16",
+                "--snapshot-overlay-flush-coins",
+                "4000000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        let overlay = options.snapshot_overlay.expect("overlay configuration");
+        assert_eq!(overlay.flush_batches, 16);
+        assert_eq!(overlay.flush_coins, 4_000_000);
+
+        // Defaults keep the engine's commit-per-batch behaviour.
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        let overlay = options.snapshot_overlay.expect("overlay configuration");
+        assert_eq!(
+            overlay.flush_batches,
+            DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES
+        );
+        assert_eq!(overlay.flush_coins, DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS);
+
+        // Bounds, repeats, and use outside the overlay mode are rejected.
+        for arguments in [
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "0",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "65",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-coins",
+                "1",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "4",
+                "--snapshot-overlay-flush-batches",
+                "8",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-flush-batches",
+                "4",
             ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());

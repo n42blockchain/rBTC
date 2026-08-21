@@ -420,6 +420,7 @@ fn validation_bloom_hashes(outpoint: OutPointKey) -> (u64, u64) {
 }
 
 /// One already-validated active-chain transition in an atomic IBD checkpoint.
+#[derive(Clone)]
 pub struct ConnectTransition {
     /// Hash the durable tip must currently have.
     pub expected_parent: BlockHash,
