@@ -8,6 +8,17 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Added
 
+- `--snapshot-overlay-flush-batches N` (1–64) and
+  `--snapshot-overlay-flush-coins` put an engine-agnostic write-back layer in
+  front of the MDBX or redb overlay during snapshot catch-up: the last N
+  batches stay in memory, reads consult the buffer first, and one engine
+  commit folds away every coin created and spent inside the window. At the
+  default of one batch the engine runs unchanged. Over mainnet
+  935,001–963,350 with 16 buffered batches, 81% of the created coins
+  (113M) cancelled in memory on both engines: redb catch-up fell from
+  3,289 s to 2,606 s (44,689 tx/s, 120 GB written instead of 299 GB) and
+  MDBX from 3,823 s to 3,057 s, all lanes at the same final tip; peak
+  working set rose by 12–13 GiB at the default 8M-coin buffer.
 - `fdb_ledger_import` imports a btcd flat block file set into a
   `PrunedBlockLedger` (read-only source, chain selection from a base hash,
   CRC-32C checks, ranged re-verification), and `utxo_locality` reports the

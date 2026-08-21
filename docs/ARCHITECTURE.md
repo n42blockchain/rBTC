@@ -732,6 +732,31 @@ comparison:
   50, below the 85 rebase threshold) controls how early either engine tries
   reclaiming garbage before a full fold/rebase.
 
+`--snapshot-overlay-flush-batches N` (1–64, default 1) puts an engine-agnostic
+write-back layer (`write_back_chainstate::WriteBackChainstate`) in front of
+either overlay. It buffers the validated transitions of the last N batches,
+answers reads from the buffer before the engine (a buffered creation hits, a
+buffered spend misses, anything else falls through), and hands the engine one
+batch whose existing intra-batch fold cancels every coin created and spent
+inside the window. `--snapshot-overlay-flush-coins` (default 8,000,000)
+bounds the buffer by net-created coins. The layer exists because of the
+measured spend-age distribution of mainnet 935,001–963,350: 33.5% of inputs
+spend an output created in the same block and 80.7% one at most 256 blocks
+old ([2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)), so a
+store that commits every batch writes most coins only to delete them a batch
+later. Disconnect, rebase, compaction, direct UTXO mutation and snapshot
+export flush first, and the catch-up loop flushes before reporting its tip;
+the engine's durable tip therefore lags the reported tip by at most N
+batches, and a crash re-executes only those blocks because the overlay
+start-up path already truncates the retained ledger to the durable tip. The
+reported overlay capacity includes the buffer's estimated bytes so
+compaction and rebase still trigger before a flush could hit the geometry
+ceiling. At the default of one batch the bare engine runs unchanged. Over
+the first 1,024 real blocks above the 935,000 snapshot with four buffered
+batches, both engines wrote 1,795,392 coins and 1,549,874 spends and
+cancelled 3,833,838 coins in memory — 68% of the coins those blocks created
+never reached disk — and reached the same tip as the unbuffered runs.
+
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror
 (`bitcoin-snapshots.jaonoctus.dev`, `files-vps02.jaonoctus.dev/utxo-935000.dat`)

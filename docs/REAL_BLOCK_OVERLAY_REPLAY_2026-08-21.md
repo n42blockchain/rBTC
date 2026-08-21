@@ -124,9 +124,11 @@ write traffic. This window is a 2025–26 Ordinals/Runes-era sample; the
    read-only check is the remaining step for that item.
 2. On this evidence MDBX is not faster than redb for the catch-up write path;
    its advantage in the earlier micro-benchmarks does not carry over to the
-   compaction lifecycle. The selection decision should wait for the
-   write-back-cache work below, which changes the write volume both engines
-   see by roughly 5×.
+   compaction lifecycle. With the write-back layer (section 6) both engines
+   see a fifth of the write traffic and redb remains ahead (2,606 s vs
+   3,057 s). Nothing measured here argues for switching the daemon default
+   to MDBX; the gate's remaining items (UTXO-identity audit, 160M synthetic
+   run, migration surface) stand.
 3. A btcd-style fast-add (skip scripts and spend checks below a checkpoint) is
    not wanted. A Core-style assume-valid script skip would save little wall
    clock on 32 threads (script waits ≈ 0.2% of batch time) and is a
@@ -139,7 +141,57 @@ write traffic. This window is a 2025–26 Ordinals/Runes-era sample; the
    consider an append-only overlay folded periodically into the base only if
    sync/mutate still dominate afterwards.
 
-## 6. Tools added
+## 6. Write-back layer: the recommended step, measured the same day
+
+`WriteBackChainstate` (`src/write_back_chainstate.rs`, commit a1ed228) buffers
+the validated transitions of the last N batches in front of either engine,
+serves reads from the buffer first, and hands the engine one batch whose
+existing fold cancels every coin created and spent inside the window
+(`--snapshot-overlay-flush-batches N`, default 1 = unchanged engine). Same
+ledger, snapshot, index and overlay settings as section 3; N = 16; both lanes
+ran alone on the host (a user-run Go replay variant overlapped parts of the
+`mdbx-wb16` lane — see the caveat below).
+
+| metric | MDBX | redb | **MDBX + write-back 16** | **redb + write-back 16** |
+|---|---|---|---|---|
+| catch-up (chainstate open → tip) | 3,823 s | 3,289 s | **3,057 s (0.80×)** | **2,606 s (0.68×)** |
+| blocks/s · tx/s | 7.41 · 30,462 | 8.62 · 35,415 | 9.27 · 38,098 | **10.88 · 44,689** |
+| core-commit (sum) | 1,960 s | 1,762 s | 967 s (0.49×) | 814 s (0.42×) |
+| MDBX mutate / sync / base-lookup (sum) | 898 / 832 / 485 s | — | 314 / 163 / 233 s | — |
+| flushes · time in flushes | — | — | 8 · 842 s | 7 · 644 s |
+| coins written · spends written | — | — | 26.3M · 24.8M | 25.7M · 24.2M |
+| coins cancelled in memory | 0 (intra-batch fold only) | 0 | **113.3M (81.1% of created)** | **113.9M (81.6%)** |
+| core-validate · utxo-prefetch (sum) | 574 · 327 s | 503 · 228 s | 567 · 448 s | 529 · 264 s |
+| compactions | 19 | 2 | 4 | 5 |
+| peak working set | 10.3 GiB | 6.0 GiB | 23.4 GiB | 17.9 GiB |
+| bytes written to the destination volume | 480 GB | 299 GB | not attributable (see caveat) | **120 GB** |
+| final tip | 963,350 `…d66ec69a8f5e611a` | same | same | same |
+
+- The locality prediction held exactly: 81% of created coins never reached
+  either engine. The engines' own commit work fell by half or more; what is
+  left is validation (≈ 530–570 s), the snapshot-index reads behind
+  `utxo-prefetch` and the flush's duplicate-creation probe against the base
+  (233 s on MDBX), and the flushes themselves.
+- redb with the write-back layer is the fastest configuration measured:
+  32% less catch-up time than the MDBX baseline and 21% less than the redb
+  baseline, writing a quarter of the baseline's bytes. MDBX with the layer
+  beats both baselines but still trails redb + layer by 15%.
+- Cost: peak working set rises by 12–13 GiB at the default
+  `--snapshot-overlay-flush-coins 8000000` (buffered coins, their undo
+  pre-images and the larger engine transaction); the coin limit trades that
+  memory for flush frequency.
+- Caveat: a user-run Go replay variant (`D:\N42\replay\variants\rb_base.exe`,
+  up to 63 GiB working set) was on the host during parts of the `mdbx-wb16`
+  lane, so that lane's volume-level byte counts are not attributable and its
+  timings may include some contention; `redb-wb16` was started by a waiter
+  only after the host was idle and its samples show no other heavy process.
+  The lane wrapper now refuses to start beside any `rb_*`, `replayblocks*`,
+  `rbtcd*`, `n42-*` process or any process above 8 GiB working set.
+- Flush counts differ (8 vs 7) because compaction flushes the buffer first
+  and the two engines compact at different moments; the cancelled totals
+  differ by the same mechanism.
+
+## 7. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.
