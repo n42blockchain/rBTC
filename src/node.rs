@@ -11554,12 +11554,25 @@ async fn sync_snapshot_overlay_node(
             (path, stored)
         }
     };
+    let cli_identity = compiled_overlay_identity(&overlay.snapshot, options.network)?;
     let (identity, snapshot_path, index_path) = match stored_identity {
         None => (
-            compiled_overlay_identity(&overlay.snapshot, options.network)?,
+            cli_identity,
             overlay.snapshot.clone(),
             overlay.index.clone(),
         ),
+        // A store that is still on the operator-supplied base keeps using the
+        // operator-supplied files: only a rebase moves the base to a derived
+        // `utxo-<height>.dat`/`.rbtcidx` pair beside the original snapshot.
+        // Deriving the pair unconditionally sent a resumed run (for example
+        // after a peer failover) to whatever index happened to sit next to
+        // the snapshot, not the one `--snapshot-overlay-index` named.
+        Some(identity)
+            if identity.height == cli_identity.height
+                && identity.block_hash == cli_identity.block_hash =>
+        {
+            (identity, overlay.snapshot.clone(), overlay.index.clone())
+        }
         Some(identity) => {
             let (snapshot_path, index_path) =
                 overlay_base_paths_for_height(&overlay.snapshot, identity.height);
