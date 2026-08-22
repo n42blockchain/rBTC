@@ -32,7 +32,7 @@
 use std::{
     fs::File,
     io::{BufReader, Cursor, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use bitcoin::{BlockHash, Network, OutPoint, hashes::Hash as _, hashes::sha256d, p2p::Magic};
@@ -63,6 +63,96 @@ const INDEX_READ_WINDOW_BYTES: usize = 1024 * 1024;
 /// is authenticated against a release-pinned UTXO-set hash, so an adversary
 /// cannot select keys against the fixed SipHash keys.
 const INDEX_SEED: u64 = 0x7262_7463_2d69_6478;
+
+/// Sidecar beside the index holding one 16-bit txid fingerprint per slot.
+///
+/// A lookup whose key maps to a slot with a different fingerprint is proved
+/// absent without reading the offset table or the snapshot. Created coins
+/// are probed this way at every overlay commit to prove they do not collide
+/// with a base coin, and almost all of them are absent, so the two random
+/// reads each probe used to cost vanish. Members pay one extra in-memory
+/// compare; a false match happens once in 65,536 probes and merely falls
+/// through to the full read.
+const FINGERPRINT_MAGIC: &[u8; 8] = b"RBTCFP16";
+const FINGERPRINT_VERSION: u16 = 1;
+const FINGERPRINT_HEADER_BYTES: usize = 8 + 2 + INDEX_DIGEST_BYTES + 8;
+const FINGERPRINT_SUFFIX: &str = "fp";
+
+/// Path of the fingerprint sidecar for an index file.
+#[must_use]
+pub fn fingerprint_sidecar_path(index_path: &Path) -> PathBuf {
+    let mut name = index_path.as_os_str().to_os_string();
+    name.push(".");
+    name.push(FINGERPRINT_SUFFIX);
+    PathBuf::from(name)
+}
+
+fn fingerprint_of(txid: &[u8]) -> u16 {
+    u16::from_le_bytes([txid[0], txid[1]])
+}
+
+fn encode_fingerprint_sidecar(
+    index_digest: &[u8; INDEX_DIGEST_BYTES],
+    fingerprints: &[u16],
+) -> Vec<u8> {
+    let mut bytes =
+        Vec::with_capacity(FINGERPRINT_HEADER_BYTES + fingerprints.len() * 2 + INDEX_DIGEST_BYTES);
+    bytes.extend_from_slice(FINGERPRINT_MAGIC);
+    bytes.extend_from_slice(&FINGERPRINT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(index_digest);
+    bytes.extend_from_slice(
+        &u64::try_from(fingerprints.len())
+            .expect("slot count fits u64")
+            .to_le_bytes(),
+    );
+    for fingerprint in fingerprints {
+        bytes.extend_from_slice(&fingerprint.to_le_bytes());
+    }
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    bytes.extend_from_slice(&digest);
+    bytes
+}
+
+/// Loads the sidecar if it exists and belongs to exactly this index.
+///
+/// Any mismatch or damage yields `None`: lookups then take the slow path,
+/// which is always correct, and the caller may rebuild the sidecar.
+fn load_fingerprint_sidecar(
+    path: &Path,
+    index_digest: &[u8; INDEX_DIGEST_BYTES],
+    groups: u64,
+) -> Option<Vec<u16>> {
+    let bytes = std::fs::read(path).ok()?;
+    let expected_len = FINGERPRINT_HEADER_BYTES
+        .checked_add(usize::try_from(groups).ok()?.checked_mul(2)?)?
+        .checked_add(INDEX_DIGEST_BYTES)?;
+    if bytes.len() != expected_len {
+        return None;
+    }
+    let (body, stored) = bytes.split_at(bytes.len() - INDEX_DIGEST_BYTES);
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    if digest != stored {
+        return None;
+    }
+    let groups_field = 10 + INDEX_DIGEST_BYTES;
+    if &body[..8] != FINGERPRINT_MAGIC
+        || u16::from_le_bytes(body[8..10].try_into().ok()?) != FINGERPRINT_VERSION
+        || &body[10..groups_field] != index_digest
+        || u64::from_le_bytes(
+            body[groups_field..FINGERPRINT_HEADER_BYTES]
+                .try_into()
+                .ok()?,
+        ) != groups
+    {
+        return None;
+    }
+    Some(
+        body[FINGERPRINT_HEADER_BYTES..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect(),
+    )
+}
 /// First-attempt read width for one txid group: its 32-byte header, the
 /// coin count, and a coin of standard shape. Groups needing more are re-read
 /// four times wider until they fit.
@@ -266,6 +356,7 @@ pub fn build_core_snapshot_index_with_identity(
     )
     .expect("table words fit usize");
     let mut table = vec![0_u64; table_words];
+    let mut fingerprints = vec![0_u16; usize::try_from(groups).expect("group count fits usize")];
     let mut occupied =
         vec![0_u64; usize::try_from(groups.div_ceil(64)).expect("bitmap fits usize")];
     for location in &locations {
@@ -282,6 +373,8 @@ pub fn build_core_snapshot_index_with_identity(
         }
         occupied[word] |= bit;
         write_bits(&mut table, slot * entry_bits, offset_bits, location.offset);
+        fingerprints[usize::try_from(slot).expect("slot fits usize")] =
+            fingerprint_of(&location.txid);
     }
 
     let mut bytes = Vec::new();
@@ -305,6 +398,10 @@ pub fn build_core_snapshot_index_with_identity(
     bytes.extend_from_slice(&digest);
 
     publish_atomically(index_path, &bytes)?;
+    publish_atomically(
+        &fingerprint_sidecar_path(index_path),
+        &encode_fingerprint_sidecar(&digest, &fingerprints),
+    )?;
     Ok(CoreSnapshotIndexReport {
         coins,
         snapshot_bytes,
@@ -457,6 +554,10 @@ pub struct CoreSnapshotUtxoIndex {
     /// Byte offset of the packed offset table within [`Self::index`].
     table_start: u64,
     snapshot: File,
+    /// Digest the container carried; names the sidecar that belongs to it.
+    container_digest: [u8; INDEX_DIGEST_BYTES],
+    /// One 16-bit txid fingerprint per slot when the sidecar is present.
+    fingerprints: Option<Vec<u16>>,
 }
 
 impl CoreSnapshotUtxoIndex {
@@ -607,6 +708,11 @@ impl CoreSnapshotUtxoIndex {
         if <[u8; 32]>::from(container_digest.finalize()) != stored_digest {
             return Err(CoreSnapshotIndexError::Invalid("container digest mismatch"));
         }
+        let fingerprints = load_fingerprint_sidecar(
+            &fingerprint_sidecar_path(index_path.as_ref()),
+            &stored_digest,
+            groups,
+        );
         let index = reader.into_inner();
 
         let snapshot = File::open(snapshot_path.as_ref())?;
@@ -640,7 +746,68 @@ impl CoreSnapshotUtxoIndex {
             index,
             table_start,
             snapshot,
+            container_digest: stored_digest,
+            fingerprints,
         })
+    }
+
+    /// Whether absent keys can be rejected from the in-memory fingerprints.
+    #[must_use]
+    pub fn has_fingerprints(&self) -> bool {
+        self.fingerprints.is_some()
+    }
+
+    /// Rejects a key whose slot fingerprint differs; `false` means "maybe".
+    fn fingerprint_excludes(&self, slot: u64, key: &[u8]) -> bool {
+        self.fingerprints.as_ref().is_some_and(|fingerprints| {
+            usize::try_from(slot)
+                .ok()
+                .and_then(|slot| fingerprints.get(slot))
+                .is_some_and(|stored| *stored != fingerprint_of(key))
+        })
+    }
+
+    /// Builds the fingerprint sidecar for an index that was written without
+    /// one, by re-scanning the snapshot. Returns the number of slots.
+    ///
+    /// # Errors
+    ///
+    /// Fails on I/O errors, a snapshot that does not match the index, or a
+    /// sidecar path that already exists.
+    pub fn build_fingerprints(
+        index_path: impl AsRef<Path>,
+        snapshot_path: impl AsRef<Path>,
+        identity: &SnapshotBaseIdentity,
+    ) -> Result<u64, CoreSnapshotIndexError> {
+        let index_path = index_path.as_ref();
+        let sidecar = fingerprint_sidecar_path(index_path);
+        if sidecar.exists() {
+            return Err(CoreSnapshotIndexError::Invalid(
+                "fingerprint sidecar already exists",
+            ));
+        }
+        let opened = Self::open(index_path, snapshot_path.as_ref())?;
+        let scanned = scan_snapshot(snapshot_path.as_ref(), identity)?;
+        if u64::try_from(scanned.groups.len()).ok() != Some(opened.groups) {
+            return Err(CoreSnapshotIndexError::IdentityMismatch(
+                "snapshot group count does not match the index",
+            ));
+        }
+        let mut fingerprints =
+            vec![0_u16; usize::try_from(opened.groups).expect("group count fits usize")];
+        for location in &scanned.groups {
+            let slot = opened
+                .mphf
+                .index(&location.txid)
+                .ok_or(CoreSnapshotIndexError::Invalid("unmapped snapshot key"))?;
+            fingerprints[usize::try_from(slot).expect("slot fits usize")] =
+                fingerprint_of(&location.txid);
+        }
+        publish_atomically(
+            &sidecar,
+            &encode_fingerprint_sidecar(&opened.container_digest, &fingerprints),
+        )?;
+        Ok(opened.groups)
     }
 
     /// Reads one packed `(coin_offset, backref)` entry from the index file.
@@ -702,6 +869,9 @@ impl CoreSnapshotUtxoIndex {
         let Some(slot) = self.mphf.index(&key.as_bytes()[..32]) else {
             return Ok(None);
         };
+        if self.fingerprint_excludes(slot, &key.as_bytes()[..32]) {
+            return Ok(None);
+        }
         let group_offset = self.read_table_entry(slot)?;
         let mut buffer = Vec::new();
         self.decode_located_coin(&key, outpoint.vout, group_offset, &mut buffer)
@@ -734,7 +904,12 @@ impl CoreSnapshotUtxoIndex {
         let keys: Vec<OutPointKey> = outpoints.iter().copied().map(OutPointKey::from).collect();
         let slots: Vec<Option<u64>> = keys
             .iter()
-            .map(|key| self.mphf.index(&key.as_bytes()[..32]))
+            .map(|key| {
+                let txid = &key.as_bytes()[..32];
+                self.mphf
+                    .index(txid)
+                    .filter(|slot| !self.fingerprint_excludes(*slot, txid))
+            })
             .collect();
 
         // Slot order is byte order: an entry's position is `slot * entry_bits`.
@@ -1280,6 +1455,73 @@ mod tests {
         assert_eq!(index.get(&absent_txid).unwrap(), None);
     }
 
+    /// The fingerprint sidecar is an accelerator, never an authority: lookups
+    /// answer identically with it, without it, with a rebuilt one, and with a
+    /// damaged one that the opener must ignore.
+    #[test]
+    fn fingerprint_sidecar_accelerates_without_changing_answers() {
+        let directory = TempDir::new().unwrap();
+        let base_hash = [7_u8; 32];
+        let (bytes, expected) = synthetic_snapshot(base_hash, &test_groups());
+        let snapshot = directory.path().join("utxo.dat");
+        fs::write(&snapshot, &bytes).unwrap();
+        let identity = authenticated_identity(&snapshot, base_hash, directory.path());
+        let index_path = directory.path().join("utxo.rbtcidx");
+        build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
+        let sidecar = fingerprint_sidecar_path(&index_path);
+        assert!(sidecar.exists(), "the builder writes the sidecar");
+        let original = fs::read(&sidecar).unwrap();
+
+        let absent_txid = OutPoint::new(Txid::from_byte_array([8_u8; 32]), 0);
+        let absent_vout = OutPoint::new(Txid::from_byte_array([1_u8; 32]), 1);
+        let check = |index: &CoreSnapshotUtxoIndex| {
+            for (outpoint, coin) in &expected {
+                assert_eq!(index.get(outpoint).unwrap().as_ref(), Some(coin));
+            }
+            assert_eq!(index.get(&absent_txid).unwrap(), None);
+            assert_eq!(index.get(&absent_vout).unwrap(), None);
+            let batch: Vec<OutPoint> = expected
+                .keys()
+                .copied()
+                .chain([absent_txid, absent_vout])
+                .collect();
+            let batched = index.get_many(&batch).unwrap();
+            for (outpoint, coin) in batch.iter().zip(&batched) {
+                assert_eq!(coin, &index.get(outpoint).unwrap());
+            }
+        };
+
+        let with = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
+        assert!(with.has_fingerprints());
+        check(&with);
+
+        fs::remove_file(&sidecar).unwrap();
+        let without = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
+        assert!(!without.has_fingerprints());
+        check(&without);
+
+        let slots =
+            CoreSnapshotUtxoIndex::build_fingerprints(&index_path, &snapshot, &identity).unwrap();
+        assert_eq!(slots, u64::try_from(test_groups().len()).unwrap());
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            original,
+            "rebuild is byte-identical"
+        );
+        assert!(
+            CoreSnapshotUtxoIndex::build_fingerprints(&index_path, &snapshot, &identity).is_err(),
+            "an existing sidecar is never overwritten"
+        );
+
+        let mut damaged = original.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0x01;
+        fs::write(&sidecar, &damaged).unwrap();
+        let ignored = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
+        assert!(!ignored.has_fingerprints(), "a damaged sidecar is ignored");
+        check(&ignored);
+    }
+
     /// The batched path reorders its reads internally, so the contract worth
     /// pinning is that it is indistinguishable from calling `get` in a loop:
     /// same answers, same positions, for hits, misses, and repeats alike.
@@ -1405,6 +1647,8 @@ mod tests {
             max_group_bytes: 1 << 20,
             offset_bits: OFFSET_BITS,
             mphf: Mphf::build(1, |_| [0_u8; 32], INDEX_SEED).unwrap(),
+            container_digest: [0_u8; INDEX_DIGEST_BYTES],
+            fingerprints: None,
             index: File::open(&container_path).unwrap(),
             table_start: TABLE_START,
             snapshot: File::open(&container_path).unwrap(),

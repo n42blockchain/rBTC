@@ -11574,6 +11574,27 @@ async fn sync_snapshot_overlay_node(
             "snapshot base is not on the synchronized active header chain",
         ));
     }
+    // Indexes written before the fingerprint sidecar existed get one now, so
+    // every commit's duplicate-creation probe can reject absent keys without
+    // touching the snapshot.  One sequential scan of the snapshot, once.
+    let fingerprint_sidecar = crate::core_snapshot_index::fingerprint_sidecar_path(&index_path);
+    if !fingerprint_sidecar.exists() {
+        let started = Instant::now();
+        let slots = crate::core_snapshot_index::CoreSnapshotUtxoIndex::build_fingerprints(
+            &index_path,
+            &snapshot_path,
+            &identity,
+        )
+        .map_err(|error| {
+            PeerRunError::transient(format!("build snapshot index fingerprints: {error}"))
+        })?;
+        rbtc_info!(
+            "built snapshot index fingerprints for {} slots at {} in {} ms",
+            slots,
+            fingerprint_sidecar.display(),
+            started.elapsed().as_millis()
+        );
+    }
     let store_config = SnapshotOverlayConfig {
         database_dir: database_path,
         snapshot_path,
