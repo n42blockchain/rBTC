@@ -535,6 +535,43 @@ the engine. Measured as v10.
 −6% against `redb-wb16-v8` (1,583 s); seven flushes, the loop waited only
 for the final one (69 s); publish 285 s for the same reason as on MDBX.
 
+### v10: no more waiting on the engine — and a crash (2026-08-22 evening)
+
+Commit 83c44e9 skips the undo prune while a commit is in flight.
+`redb-wb16-v10` (host perturbed by tool builds): 1,508 s, digest
+`aadd289f…`, publish 285 → 33 s — the prune was indeed the stall — but the
+loop then waited in `start_flush` for 10–36 s per flush (193 s in total),
+because sixteen batches now validate faster than one commit lands. Commit
+289ebc1 therefore lets the buffer keep accepting up to twice the batch
+limit while a commit runs (coin limit unchanged; durable tip lags ≤ 2N).
+
+`mdbx-wb16-v10` crashed after 564 s at block ≈948,312 with an access
+violation. The minidump (kept as `mdbx-wb16-v10-crash.dmp`, unwound with
+`minidump-stackwalk`, the build's PDB and Microsoft's ntdll symbols) shows
+the libmdbx crate's transaction-manager thread inside `mdbx_txn_abort` →
+`txn_end` → `pnl_shrink` → `realloc` → `RtlFreeHeap` reading an invalid
+page-list pointer, while the flush thread was in `commit_connect_batch`
+dropping an uncommitted write transaction. So a step between
+`begin_rw_txn` and `commit` failed first, and the abort that followed
+crashed inside the engine. The binary did not log the failing step;
+commit d257e57 now does, before the transaction drops. Relevant facts:
+the crate opens the environment with `MDBX_NOTLS`, begins and ends every
+write transaction on one manager thread, and builds libmdbx with
+`MDBX_TXN_CHECKOWNER=0`; on Windows the writer lock is a recursive
+critical section; every write transaction in this code base is taken
+under the overlay's own mutex. v7–v9 each ran a single MDBX lane, so a
+latent race that the longer loop/commit overlap of v10 merely exposed is
+not excluded. Reproduction queue: `mdbx-wb16-v11a`/`v11b` (v10 plus the
+logging) and `mdbx-wb16-v10d`, a build with `MDBX_FORCE_ASSERTIONS` and
+mimalloc's `MI_DEBUG=3`.
+
+`mdbx-wb16-v11a` (21:26Z, idle host): **1,170 s** (24.2 blocks/s,
+**99,528 tx/s**), digest `aadd289f…`, no crash, no logged commit failure;
+publish 26 s, seven flushes of which only the final one was waited for
+(86 s); peak working set 30.8 GiB. That is −18% against v8/v9 and, for the
+first time, faster than the btcdmdbx pipeline's 1,318 s (1,400 s durable)
+on the same window and host.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
