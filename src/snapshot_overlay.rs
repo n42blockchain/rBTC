@@ -599,6 +599,33 @@ impl SnapshotOverlayChainstate {
         CommitProfile::add(&self.commit_profile.fold, fold_started);
         let _guard = self.lock();
         let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
+        // A failure below aborts the write transaction when it drops; the
+        // stage and error are logged first so an abort that goes wrong
+        // inside the engine still leaves a trace of what preceded it.
+        let result = Self::write_transitions(self, &transaction, transitions, &spent, &created);
+        if let Err(error) = &result {
+            crate::rbtc_warn!(
+                "overlay batch commit of {} blocks ({} spent, {} created) failed before commit, aborting: {}",
+                transitions.len(),
+                spent.len(),
+                created.len(),
+                error
+            );
+        }
+        result?;
+        let sync_started = Instant::now();
+        transaction.commit().map_err(utxo_mdbx)?;
+        CommitProfile::add(&self.commit_profile.sync, sync_started);
+        Ok(())
+    }
+
+    fn write_transitions(
+        &self,
+        transaction: &Transaction<'_, RW, NoWriteMap>,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
@@ -606,7 +633,7 @@ impl SnapshotOverlayChainstate {
         let undo_started = Instant::now();
         for transition in transitions {
             Self::advance_tip(
-                &transaction,
+                transaction,
                 &meta,
                 transition.expected_parent,
                 transition.next,
@@ -623,11 +650,8 @@ impl SnapshotOverlayChainstate {
         }
         CommitProfile::add(&self.commit_profile.undo, undo_started);
         let mutate_started = Instant::now();
-        self.connect_mutation(&transaction, &overlay, &tombstone, &spent, &created)?;
+        self.connect_mutation(transaction, &overlay, &tombstone, spent, created)?;
         CommitProfile::add(&self.commit_profile.mutate, mutate_started);
-        let sync_started = Instant::now();
-        transaction.commit().map_err(utxo_mdbx)?;
-        CommitProfile::add(&self.commit_profile.sync, sync_started);
         Ok(())
     }
 
