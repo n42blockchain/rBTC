@@ -63,7 +63,7 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   mimalloc the same MDBX lane finished in 1,435 s (81,159 tx/s, −42%
   against the system-heap build, −62% against the 3,823 s baseline) with
   the same overlay content digest and every stage faster, validation
-  included.
+  included; redb finished in 1,583 s (73,564 tx/s, −35%).
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key

@@ -475,7 +475,37 @@ Windows system heap was charging for every concurrent allocation and the
 cost landed on whichever thread happened to be on the critical path. With
 per-thread heaps validation alone is back below its pre-pipeline cost
 (430 s against 521–560 s) while the fold, net_changes and the engine commit
-run beside it. The `redb-wb16-v8` lane follows automatically.
+run beside it.
+
+### Full-window result, redb with mimalloc (`redb-wb16-v8`, idle host, 13:19Z)
+
+Catch-up **1,583 s** (17.9 blocks/s, **73,564 tx/s**), tip 963,350, digest
+`aadd289f…` — the thirteenth identical overlay. −35% against
+`redb-wb16-v7` (2,444 s), −34% against `redb-wb16-fp` (2,407 s), −52%
+against the 3,289 s redb baseline. The stage picture matches MDBX: validate
+684 → 424 s, apply 346 → 258 s, submit 108 → 51 s, download 125 → 88 s,
+publish 415 → 301 s, twelve flushes with 119 s of forced waiting; peak
+working set 22.4 GiB, unchanged from v7. MDBX is now the faster engine on
+this window (1,435 s vs 1,583 s), because its flush thread finishes
+sooner and the loop waits less for the forced synchronous flushes.
+
+### Where the window stands after two days
+
+| build | MDBX | redb |
+|---|---|---|
+| 2026-08-21 baseline (engine per batch) | 3,823 s | 3,289 s |
+| + write-back (16 batches) | 3,057 s | 2,606 s |
+| + fingerprint sidecar | 2,314 s | 2,407 s |
+| + overlay read cache, owned commit (v3) | 2,366 s | 2,562 s |
+| + async flush, pipeline, sharded overlay (v7) | 2,465 s | 2,444 s |
+| + mimalloc (v8) | **1,435 s** | **1,583 s** |
+
+All thirteen overlays carry the digest `aadd289f…7f2819`. Remaining cost
+on v8 (MDBX): validation 430 s (30% of the catch-up, single thread),
+publish 304 s (five compactions, each forcing a synchronous flush — the
+forced waits alone are 107 s), apply 258 s of tail-thread time, prefetch
+141 s. The obvious next items are letting compaction proceed without
+draining the write-back layer, and a second validation thread per batch.
 
 ## 11. Tools added
 

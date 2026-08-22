@@ -32,6 +32,7 @@ raw-record estimate previously copied into this document.
 | Same catch-up with the cross-batch write-back layer (`--snapshot-overlay-flush-batches 16`, commit a1ed228) | MDBX 3,823 → 3,057 s; 81.1% of created coins cancelled in memory; MDBX commit work halved (sync 832 → 163 s) | redb gained more: 3,289 → 2,606 s, 44,689 tx/s, 120 GB written; MDBX + layer still trails redb + layer by 15%. Peak working set +12–13 GiB at the default 8M-coin buffer |
 | `overlay_audit` over all four overlays | Identical consensus content: 14,554,294 coins, 13,000,529 tombstones, digest `aadd289f…7f2819` on MDBX, redb, and both write-back lanes | Raw stored bytes differ only by the per-run `last_touched` field; undo row counts differ by prune timing and are excluded |
 | Same catch-up with write-back 16 plus the txid fingerprint sidecar (commit 0b8b3ae) | MDBX 2,314 s (0.61× its baseline, 50,340 tx/s), base probes 485 → 72 s, 93 GB written; same content digest | redb 2,407 s (0.63× the MDBX baseline); the engines are within 4% once neither pays for absent-key snapshot reads — catch-up is now bounded by validation, member base reads and flushes, not the engine |
+| Same catch-up with the asynchronous write-back flush, the block pipeline, the sharded batch overlay and the mimalloc allocator (commits e9aa0dc, 83b001d, 6156c00; 2026-08-22) | MDBX 1,435 s (0.38× its baseline, 81,159 tx/s); same content digest (thirteen overlays now) | redb 1,583 s (0.41× the MDBX baseline, 73,564 tx/s). Without mimalloc the same code was neutral on both engines (2,465 s / 2,444 s): the Windows system heap serialised the threads the pipeline and the flush had added. MDBX is now the faster engine on this window because its flush thread finishes sooner |
 
 The production-size copy-space implication is explicit: keeping the existing
 76.01 GB file while writing approximately 50.26 GB of live pages requires
@@ -152,8 +153,10 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    tombstones with consensus digest `aadd289f…7f2819`. The write-back layer
    the report recommended was built and measured the same day: with 16
    buffered batches redb finished in 2,606 s and MDBX in 3,057 s; with the
-   txid fingerprint sidecar added, 2,407 s and 2,314 s, all six overlays
-   hashing to the same content digest. **Item 4 is met for this corpus
+   txid fingerprint sidecar added, 2,407 s and 2,314 s; with the
+   asynchronous flush, the block pipeline, the sharded overlay and the
+   mimalloc allocator (2026-08-22), 1,583 s and 1,435 s — all thirteen
+   overlays hashing to the same content digest. **Item 4 is met for this corpus
    window**; what it does not cover is a genesis-to-tip replay or the
    2015–2019 churn profile.
 5. The explicit backend manifest is complete. The daemon must still gain an
