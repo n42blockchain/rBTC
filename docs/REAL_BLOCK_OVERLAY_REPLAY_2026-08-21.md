@@ -411,7 +411,20 @@ once. The three changes are therefore kept as verified-correct (same
 digest, same tip, crash contract unchanged) but not yet as a speed-up; the
 next step is an allocator with per-thread heaps (opt-in `mimalloc`
 feature), measured as v8 against v7 on the same smoke and then the same
-window. The `redb-wb16-v7` lane follows automatically.
+window.
+
+### Full-window result, redb (`redb-wb16-v7`, idle host, 2026-08-22 11:52Z)
+
+Catch-up 2,444 s (47,664 tx/s), tip 963,350, digest `aadd289f…` — the
+eleventh overlay with the same content. Between `redb-wb16-fp` (2,407 s)
+and `redb-wb16-v3` (2,562 s): neutral. The same redistribution as on MDBX:
+core-commit 780 → 130 s, core-validate 539 → 684 s, core-apply 176 → 346 s
+of tail-thread time, publish 111 → 415 s, twelve flushes of which the
+forced synchronous ones made the loop wait 169 s; peak working set 19.8 →
+22.5 GiB (the in-flight set holds one extra buffer). Both engines confirm
+the same reading: the asynchronous flush and the pipeline remove the engine
+commit from the loop's critical path, and something shared gives the time
+straight back to validation.
 
 ## 11. Tools added
 
