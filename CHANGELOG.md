@@ -71,6 +71,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   content. The catch-up loop defers a compaction that would have to wait
   for that commit unless the overlay is near its rebase threshold. On the
   v8 lanes the forced flushes before compaction cost 107–119 s of waiting.
+  Undo pruning, which needs the engine's writer, is skipped while a
+  background commit holds it, and the write-back buffer keeps accepting
+  batches past its batch limit (up to twice the limit, coin limit
+  unchanged) while a commit is still running, so the loop no longer waits
+  for the engine at all on a healthy host; the durable tip may now lag by
+  up to 2N batches instead of N.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key

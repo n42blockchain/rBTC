@@ -750,8 +750,9 @@ file, so it waits for a running background commit and keeps the buffer in
 memory, and the catch-up loop defers a compaction that would have to wait
 unless the overlay is already near its rebase threshold — and the catch-up
 loop flushes before reporting its tip;
-the engine's durable tip therefore lags the reported tip by at most N
-batches, and a crash re-executes only those blocks because the overlay
+the engine's durable tip therefore lags the reported tip by at most 2N
+batches (N buffered plus up to N more accepted while the previous commit is
+still running), and a crash re-executes only those blocks because the overlay
 start-up path already truncates the retained ledger to the durable tip. The
 reported overlay capacity includes the buffer's estimated bytes so
 compaction and rebase still trigger before a flush could hit the geometry
@@ -777,7 +778,11 @@ engine, so no coin is ever invisible; a second flush waits for the first;
 every synchronous flush point (disconnect, rebase, compaction, export, the
 final tip report) and the drop of the layer join the helper first; and a
 failed commit is reported on the next call instead of being lost. The
-crash contract is unchanged — the durable tip lags by at most N batches.
+batch limit is a target rather than a wall: while a commit is running the
+buffer keeps accepting up to twice the limit (the coin limit still forces a
+flush), so the loop waits for the engine only when the engine is slower
+than two whole windows of validation. The crash contract is unchanged
+except for that bound — the durable tip lags by at most 2N batches.
 
 Block execution inside a batch is a two-stage pipeline. Validating block N
 produces its overlay shards (`BlockDelta`); a helper thread then derives the

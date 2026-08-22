@@ -523,10 +523,20 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             pending.transitions.extend(transitions);
             pending.tip = Some(tip);
             pending.batches = pending.batches.saturating_add(1);
-            let limit_hit = pending.batches >= self.limits.max_batches
-                || u64::try_from(pending.created.len()).unwrap_or(u64::MAX)
-                    >= self.limits.max_created;
+            let created = u64::try_from(pending.created.len()).unwrap_or(u64::MAX);
+            let limit_hit =
+                pending.batches >= self.limits.max_batches || created >= self.limits.max_created;
             if !limit_hit {
+                return Ok(());
+            }
+            // The batch limit is a target, not a wall: while the previous
+            // commit is still running the buffer keeps accepting, up to twice
+            // the batch limit, so the loop never waits for the engine unless
+            // the coin limit or that ceiling is reached. The next batch
+            // retries the start, by which time the commit has usually landed.
+            let must_flush = pending.batches >= self.limits.max_batches.saturating_mul(2)
+                || created >= self.limits.max_created;
+            if !must_flush && self.commit_in_progress() {
                 return Ok(());
             }
         }
@@ -1095,9 +1105,11 @@ mod tests {
                 assert_eq!(buffered.get(key(k)).unwrap(), direct.get(key(k)).unwrap());
             }
         }
-        // The last batch is in flight: re-creating a coin it created, or
-        // spending a coin it spent, is rejected from the in-flight buffer
-        // without waiting for the engine.
+        // The last batches are in flight or still accepting: re-creating a
+        // coin they created, or spending a coin they spent, is rejected from
+        // the buffers without waiting for the engine. (key(3) was created and
+        // spent inside the window, so it cancelled and is unknown here;
+        // key(1) is a durable coin the window spent.)
         assert!(matches!(
             buffered.commit_connect_batch(&[transition(
                 tip(3),
@@ -1108,7 +1120,7 @@ mod tests {
             Err(ChainStoreError::Utxo(UtxoError::Duplicate(_)))
         ));
         assert!(matches!(
-            buffered.commit_connect_batch(&[transition(tip(3), tip(4), vec![key(3)], vec![])]),
+            buffered.commit_connect_batch(&[transition(tip(3), tip(4), vec![key(1)], vec![])]),
             Err(ChainStoreError::Utxo(UtxoError::DuplicateSpend(_)))
         ));
         buffered.flush().unwrap();
@@ -1116,7 +1128,14 @@ mod tests {
         while let Some(record) = buffered.take_last_flush() {
             records.push(record);
         }
-        assert_eq!(records.len(), 3);
+        // A batch that arrives while a commit is running stays in the buffer
+        // and lands with the next one, so two or three commits cover the
+        // three blocks.
+        assert!(
+            (2..=3).contains(&records.len()),
+            "{} commits",
+            records.len()
+        );
         assert_eq!(records.iter().map(|record| record.blocks).sum::<u32>(), 3);
         assert_eq!(buffered.inner().execution_tip().unwrap(), tip(3));
         assert_eq!(
