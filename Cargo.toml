@@ -12,6 +12,7 @@ categories = ["cryptography::cryptocurrencies"]
 [features]
 default = []
 mdbx = ["dep:libmdbx"]
+mimalloc = ["dep:mimalloc"]
 
 [lib]
 name = "rbtc"
@@ -36,6 +37,7 @@ required-features = ["mdbx"]
 
 [dependencies]
 ahash = "0.8"
+mimalloc = { version = "0.1", optional = true, default-features = false }
 bitcoin = { version = "=0.32.102", default-features = true }
 bitcoinconsensus = "0.106"
 bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
