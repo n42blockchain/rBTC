@@ -9,16 +9,24 @@
 //! inner store one larger batch whose intra-batch fold cancels the pairs that
 //! never needed to exist on disk.
 //!
+//! The engine commit of a full buffer takes tens of seconds, so it runs on a
+//! background thread: the buffer being committed stays readable behind the
+//! fresh buffer that keeps accepting batches, reads consult pending → in
+//! flight → engine, and the next flush waits for the previous commit before
+//! starting its own. Commits therefore stay sequential and the engine tip
+//! still only ever lags the reported tip.
+//!
 //! Durability is deliberately coarser: the inner store's tip lags the tip this
-//! layer reports by at most the configured number of batches. A crash loses
-//! only work that the catch-up loop re-executes from its retained ledger —
-//! the overlay start-up path already truncates the ledger to the durable tip.
-//! Every operation that must observe the durable state (disconnect, rebase,
-//! compaction, direct UTXO mutation, snapshot export) flushes first.
+//! layer reports by at most two buffers. A crash loses only work that the
+//! catch-up loop re-executes from its retained ledger — the overlay start-up
+//! path already truncates the ledger to the durable tip. Every operation that
+//! must observe the durable state (disconnect, rebase, compaction, direct
+//! UTXO mutation, snapshot export) flushes and waits first.
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::RwLock,
+    sync::{Arc, Mutex, RwLock},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -64,8 +72,11 @@ pub struct WriteBackFlush {
     pub spent: u64,
     /// Coins created and spent inside the buffer that never reached disk.
     pub cancelled: u64,
-    /// Wall time of the inner commit.
+    /// Wall time of the inner commit, on whichever thread ran it.
     pub elapsed: Duration,
+    /// Time the caller blocked on this commit: zero when it finished in the
+    /// background before anyone needed it, the whole commit when it did not.
+    pub waited: Duration,
 }
 
 #[derive(Default)]
@@ -73,23 +84,46 @@ struct Pending {
     transitions: Vec<ConnectTransition>,
     /// Net-created coins: created in the buffer and not yet spent.
     created: HashMap<OutPointKey, Utxo>,
-    /// Spends of coins the inner store holds; applied at flush.
+    /// Spends of coins the inner store (or the in-flight buffer) holds.
     spent: HashSet<OutPointKey>,
     /// Tip after the last buffered transition; `None` when empty.
     tip: Option<ExecutionTip>,
     batches: u32,
     cancelled: u64,
-    last_flush: Option<WriteBackFlush>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.transitions.is_empty()
+    }
+}
+
+/// A buffer handed to the engine: still answers reads until the commit lands.
+struct Committed {
+    transitions: Vec<ConnectTransition>,
+    created: HashMap<OutPointKey, Utxo>,
+    spent: HashSet<OutPointKey>,
+    tip: ExecutionTip,
+}
+
+struct InFlight {
+    state: Arc<Committed>,
+    handle: JoinHandle<Result<WriteBackFlush, ChainStoreError>>,
 }
 
 /// Write-back buffer over any execution chain store.
 pub struct WriteBackChainstate<C> {
-    inner: C,
+    inner: Arc<C>,
     limits: WriteBackLimits,
     pending: RwLock<Pending>,
+    in_flight: Mutex<Option<InFlight>>,
+    finished: Mutex<Vec<WriteBackFlush>>,
+    /// Set once a background commit has failed; every later mutation
+    /// refuses, since the in-memory view no longer has a durable ancestor.
+    failed: Mutex<Option<String>>,
 }
 
-impl<C: ExecutionChainStore> WriteBackChainstate<C> {
+impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
     /// Wraps `inner`; nothing is buffered until the first commit.
     #[must_use]
     pub fn new(inner: C, limits: WriteBackLimits) -> Self {
@@ -98,9 +132,12 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
             max_created: limits.max_created.max(1),
         };
         Self {
-            inner,
+            inner: Arc::new(inner),
             limits,
             pending: RwLock::new(Pending::default()),
+            in_flight: Mutex::new(None),
+            finished: Mutex::new(Vec::new()),
+            failed: Mutex::new(None),
         }
     }
 
@@ -109,77 +146,231 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
         &self.inner
     }
 
-    /// Mutable access to the wrapped store, flushing first so the store's
-    /// durable state is current for whatever the caller does with it.
+    /// Mutable access to the wrapped store, flushing and waiting first so the
+    /// store's durable state is current for whatever the caller does with it.
     ///
     /// # Errors
     ///
     /// Fails if the flush fails; the buffer is kept.
     pub fn inner_mut_flushed(&mut self) -> Result<&mut C, ChainStoreError> {
         self.flush()?;
-        Ok(&mut self.inner)
+        Arc::get_mut(&mut self.inner).ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
+            "write-back store is still shared with a background commit",
+        )))
     }
 
-    /// Blocks buffered but not yet committed to the inner store.
+    /// Blocks buffered but not yet handed to the inner store.
     #[must_use]
     pub fn pending_blocks(&self) -> u32 {
         u32::try_from(self.read().transitions.len()).unwrap_or(u32::MAX)
     }
 
-    /// Net-created coins currently held in memory.
+    /// Net-created coins currently held in the accepting buffer.
     #[must_use]
     pub fn pending_created(&self) -> u64 {
         u64::try_from(self.read().created.len()).unwrap_or(u64::MAX)
     }
 
-    /// Approximate bytes the buffer holds, for capacity accounting.
+    /// Blocks whose commit is running in the background right now.
+    #[must_use]
+    pub fn in_flight_blocks(&self) -> u32 {
+        self.in_flight_state().map_or(0, |state| {
+            u32::try_from(state.transitions.len()).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// Approximate bytes the buffers hold, for capacity accounting.
     #[must_use]
     pub fn pending_estimated_bytes(&self) -> u64 {
         let pending = self.read();
-        let coins = u64::try_from(pending.created.len()).unwrap_or(u64::MAX);
-        let spends = u64::try_from(pending.spent.len()).unwrap_or(u64::MAX);
+        let mut coins = u64::try_from(pending.created.len()).unwrap_or(u64::MAX);
+        let mut spends = u64::try_from(pending.spent.len()).unwrap_or(u64::MAX);
+        drop(pending);
+        if let Some(state) = self.in_flight_state() {
+            coins = coins.saturating_add(u64::try_from(state.created.len()).unwrap_or(u64::MAX));
+            spends = spends.saturating_add(u64::try_from(state.spent.len()).unwrap_or(u64::MAX));
+        }
         coins
             .saturating_mul(ESTIMATED_COIN_BYTES)
             .saturating_add(spends.saturating_mul(ESTIMATED_SPEND_BYTES))
     }
 
-    /// Takes the record of the most recent flush, if one happened since the
-    /// last call.
+    /// Takes the record of the oldest finished flush not yet reported.
+    ///
+    /// A commit still running is not reported; call again later.
     pub fn take_last_flush(&self) -> Option<WriteBackFlush> {
-        self.write().last_flush.take()
+        // Harvest a background commit that finished on its own, without
+        // blocking on one that is still running.
+        let finished_now = {
+            let mut slot = self.lock_in_flight();
+            match slot.as_ref() {
+                Some(in_flight) if in_flight.handle.is_finished() => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(in_flight) = finished_now {
+            // A failure is recorded and surfaces on the next mutation.
+            let _ = self.settle(in_flight, Instant::now());
+        }
+        let mut finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if finished.is_empty() {
+            None
+        } else {
+            Some(finished.remove(0))
+        }
     }
 
-    /// Commits everything buffered to the inner store in one batch.
+    /// Commits everything buffered to the inner store and waits for it.
     ///
-    /// Returns `None` when nothing was buffered.
+    /// Returns the record of the commit this call made, or `None` when
+    /// nothing was buffered (a commit that was already in flight is waited
+    /// for either way and reported through [`Self::take_last_flush`]).
     ///
     /// # Errors
     ///
-    /// Propagates the inner commit error; the buffer is left intact so a
-    /// caller can retry or abandon the run with a consistent in-memory view.
+    /// Propagates a commit error, this call's or an earlier background one;
+    /// the buffers are left intact so the in-memory view stays consistent
+    /// for a caller that abandons the run.
     pub fn flush(&self) -> Result<Option<WriteBackFlush>, ChainStoreError> {
-        let mut pending = self.write();
-        if pending.transitions.is_empty() {
-            return Ok(None);
-        }
-        let started = Instant::now();
-        self.inner.commit_connect_batch(&pending.transitions)?;
-        let flush = WriteBackFlush {
-            batches: pending.batches,
-            blocks: u32::try_from(pending.transitions.len()).unwrap_or(u32::MAX),
-            created: u64::try_from(pending.created.len()).unwrap_or(u64::MAX),
-            spent: u64::try_from(pending.spent.len()).unwrap_or(u64::MAX),
-            cancelled: pending.cancelled,
-            elapsed: started.elapsed(),
+        let started_one = self.start_flush()?;
+        let waited_started = Instant::now();
+        let settled = self.wait_in_flight(waited_started)?;
+        Ok(if started_one { settled } else { None })
+    }
+
+    /// Hands the accepting buffer to a background commit without waiting.
+    ///
+    /// Waits for a previous commit first so engine commits stay sequential.
+    /// Returns whether a new commit was started.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failed earlier commit.
+    pub fn start_flush(&self) -> Result<bool, ChainStoreError> {
+        self.check_failed()?;
+        // Only one commit at a time: the tips must advance in order.
+        self.wait_in_flight(Instant::now())?;
+        let (state, batches, cancelled) = {
+            let mut pending = self.write();
+            if pending.is_empty() {
+                return Ok(false);
+            }
+            let taken = std::mem::take(&mut *pending);
+            let tip = taken.tip.expect("non-empty buffer has a tip");
+            (
+                Arc::new(Committed {
+                    transitions: taken.transitions,
+                    created: taken.created,
+                    spent: taken.spent,
+                    tip,
+                }),
+                taken.batches,
+                taken.cancelled,
+            )
         };
-        pending.transitions.clear();
-        pending.created.clear();
-        pending.spent.clear();
-        pending.tip = None;
-        pending.batches = 0;
-        pending.cancelled = 0;
-        pending.last_flush = Some(flush);
-        Ok(Some(flush))
+        let inner = Arc::clone(&self.inner);
+        let thread_state = Arc::clone(&state);
+        let handle = std::thread::Builder::new()
+            .name("write-back-flush".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                inner.commit_connect_batch(&thread_state.transitions)?;
+                Ok(WriteBackFlush {
+                    batches,
+                    blocks: u32::try_from(thread_state.transitions.len()).unwrap_or(u32::MAX),
+                    created: u64::try_from(thread_state.created.len()).unwrap_or(u64::MAX),
+                    spent: u64::try_from(thread_state.spent.len()).unwrap_or(u64::MAX),
+                    cancelled,
+                    elapsed: started.elapsed(),
+                    waited: Duration::ZERO,
+                })
+            })
+            .map_err(|_| {
+                ChainStoreError::Utxo(UtxoError::Malformed(
+                    "could not spawn the write-back commit thread",
+                ))
+            })?;
+        *self.lock_in_flight() = Some(InFlight { state, handle });
+        Ok(true)
+    }
+
+    /// Waits for the background commit, if any, and records its outcome.
+    fn wait_in_flight(
+        &self,
+        waited_started: Instant,
+    ) -> Result<Option<WriteBackFlush>, ChainStoreError> {
+        let in_flight = self.lock_in_flight().take();
+        match in_flight {
+            Some(in_flight) => {
+                let already_done = in_flight.handle.is_finished();
+                let flush = self.settle(in_flight, waited_started)?;
+                let _ = already_done;
+                Ok(Some(flush))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Joins a commit thread and records success or failure.
+    fn settle(
+        &self,
+        in_flight: InFlight,
+        waited_started: Instant,
+    ) -> Result<WriteBackFlush, ChainStoreError> {
+        let was_finished = in_flight.handle.is_finished();
+        let outcome = in_flight.handle.join().unwrap_or_else(|_| {
+            Err(ChainStoreError::Utxo(UtxoError::Malformed(
+                "write-back commit thread panicked",
+            )))
+        });
+        match outcome {
+            Ok(mut flush) => {
+                flush.waited = if was_finished {
+                    Duration::ZERO
+                } else {
+                    waited_started.elapsed()
+                };
+                self.finished
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(flush);
+                Ok(flush)
+            }
+            Err(error) => {
+                // Keep the committed buffer readable so the in-memory view
+                // stays consistent, and refuse further mutation.
+                *self
+                    .failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+                *self.lock_in_flight() = Some(InFlight {
+                    state: in_flight.state,
+                    handle: std::thread::spawn(|| {
+                        Err(ChainStoreError::Utxo(UtxoError::Malformed(
+                            "write-back commit already failed",
+                        )))
+                    }),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    fn check_failed(&self) -> Result<(), ChainStoreError> {
+        if self
+            .failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return Err(ChainStoreError::Utxo(UtxoError::Malformed(
+                "write-back commit failed earlier; the store must be reopened",
+            )));
+        }
+        Ok(())
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Pending> {
@@ -194,21 +385,45 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn current_tip(&self, pending: &Pending) -> Result<ExecutionTip, ChainStoreError> {
-        match pending.tip {
-            Some(tip) => Ok(tip),
-            None => self.inner.execution_tip(),
-        }
+    fn lock_in_flight(&self) -> std::sync::MutexGuard<'_, Option<InFlight>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Buffers one contiguous batch, flushing afterwards if a limit is hit.
+    fn in_flight_state(&self) -> Option<Arc<Committed>> {
+        self.lock_in_flight()
+            .as_ref()
+            .map(|in_flight| Arc::clone(&in_flight.state))
+    }
+
+    /// The newest tip this layer knows: accepting buffer, in-flight buffer,
+    /// then the engine.
+    fn current_tip(
+        &self,
+        pending: &Pending,
+        in_flight: Option<&Committed>,
+    ) -> Result<ExecutionTip, ChainStoreError> {
+        if let Some(tip) = pending.tip {
+            return Ok(tip);
+        }
+        if let Some(state) = in_flight {
+            return Ok(state.tip);
+        }
+        self.inner.execution_tip()
+    }
+
+    /// Buffers one contiguous batch, starting a background flush afterwards
+    /// if a limit is hit.
     fn buffer(&self, transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
         if transitions.is_empty() {
             return Ok(());
         }
+        self.check_failed()?;
+        let in_flight = self.in_flight_state();
         {
             let mut pending = self.write();
-            let mut tip = self.current_tip(&pending)?;
+            let mut tip = self.current_tip(&pending, in_flight.as_deref())?;
             // Validate the whole batch against the in-memory view before
             // touching it, so a rejected batch leaves the buffer unchanged.
             let mut staged_created: Vec<(OutPointKey, Utxo)> = Vec::new();
@@ -216,6 +431,18 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
             let mut staged_cancelled: Vec<OutPointKey> = Vec::new();
             let mut batch_created: HashSet<OutPointKey> = HashSet::new();
             let mut batch_spent: HashSet<OutPointKey> = HashSet::new();
+            let known_created = |key: &OutPointKey| {
+                pending.created.contains_key(key)
+                    || in_flight
+                        .as_ref()
+                        .is_some_and(|state| state.created.contains_key(key))
+            };
+            let known_spent = |key: &OutPointKey| {
+                pending.spent.contains(key)
+                    || in_flight
+                        .as_ref()
+                        .is_some_and(|state| state.spent.contains(key))
+            };
             for transition in &transitions {
                 if transition.expected_parent != tip.hash
                     || tip.height.checked_add(1) != Some(transition.next.height)
@@ -228,17 +455,20 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
                     ));
                 }
                 for key in &transition.spent {
-                    if !batch_spent.insert(*key) || pending.spent.contains(key) {
+                    if !batch_spent.insert(*key) || known_spent(key) {
                         return Err(ChainStoreError::Utxo(UtxoError::DuplicateSpend(*key)));
                     }
                     if batch_created.remove(key) || pending.created.contains_key(key) {
                         staged_cancelled.push(*key);
                     } else {
+                        // Spends of coins the in-flight buffer created go to
+                        // the engine as ordinary spends: by the time this
+                        // buffer is committed those coins are durable.
                         staged_spent.push(*key);
                     }
                 }
                 for (key, utxo) in &transition.created {
-                    if batch_created.contains(key) || pending.created.contains_key(key) {
+                    if batch_created.contains(key) || known_created(key) {
                         return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
                     }
                     batch_created.insert(*key);
@@ -273,8 +503,55 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
                 return Ok(());
             }
         }
-        self.flush().map(|_| ())
+        self.start_flush().map(|_| ())
     }
+
+    /// Looks a key up in the accepting buffer, then the in-flight one.
+    fn lookup_buffers(
+        pending: &Pending,
+        in_flight: Option<&Committed>,
+        outpoint: &OutPointKey,
+    ) -> BufferAnswer {
+        if let Some(utxo) = pending.created.get(outpoint) {
+            return BufferAnswer::Coin(utxo.clone());
+        }
+        if pending.spent.contains(outpoint) {
+            return BufferAnswer::Spent;
+        }
+        if let Some(state) = in_flight {
+            if let Some(utxo) = state.created.get(outpoint) {
+                return BufferAnswer::Coin(utxo.clone());
+            }
+            if state.spent.contains(outpoint) {
+                return BufferAnswer::Spent;
+            }
+        }
+        BufferAnswer::Unknown
+    }
+}
+
+impl<C> Drop for WriteBackChainstate<C> {
+    fn drop(&mut self) {
+        // Never leave a commit thread running past the store it writes to.
+        let in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(in_flight) = in_flight {
+            let _ = in_flight.handle.join();
+        }
+    }
+}
+
+/// What the in-memory buffers know about a key.
+enum BufferAnswer {
+    /// Created in a buffer and still unspent.
+    Coin(Utxo),
+    /// Spent by a buffer; the engine's copy, if any, is stale.
+    Spent,
+    /// Not touched by any buffer: ask the engine.
+    Unknown,
 }
 
 /// Rough in-memory footprint of one buffered coin (key, value, map slot).
@@ -282,15 +559,15 @@ const ESTIMATED_COIN_BYTES: u64 = 128;
 /// Rough in-memory footprint of one buffered spend.
 const ESTIMATED_SPEND_BYTES: u64 = 64;
 
-impl<C: ExecutionChainStore> UtxoStore for WriteBackChainstate<C> {
+impl<C: ExecutionChainStore + 'static> UtxoStore for WriteBackChainstate<C> {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let in_flight = self.in_flight_state();
         {
             let pending = self.read();
-            if let Some(utxo) = pending.created.get(&outpoint) {
-                return Ok(Some(utxo.clone()));
-            }
-            if pending.spent.contains(&outpoint) {
-                return Ok(None);
+            match Self::lookup_buffers(&pending, in_flight.as_deref(), &outpoint) {
+                BufferAnswer::Coin(utxo) => return Ok(Some(utxo)),
+                BufferAnswer::Spent => return Ok(None),
+                BufferAnswer::Unknown => {}
             }
         }
         self.inner.get(outpoint)
@@ -303,17 +580,18 @@ impl<C: ExecutionChainStore> UtxoStore for WriteBackChainstate<C> {
         let mut results: Vec<(OutPointKey, Option<Utxo>)> = Vec::with_capacity(outpoints.len());
         let mut inner_wanted: Vec<OutPointKey> = Vec::new();
         let mut inner_positions: Vec<usize> = Vec::new();
+        let in_flight = self.in_flight_state();
         {
             let pending = self.read();
             for outpoint in outpoints {
-                if let Some(utxo) = pending.created.get(outpoint) {
-                    results.push((*outpoint, Some(utxo.clone())));
-                } else if pending.spent.contains(outpoint) {
-                    results.push((*outpoint, None));
-                } else {
-                    inner_positions.push(results.len());
-                    inner_wanted.push(*outpoint);
-                    results.push((*outpoint, None));
+                match Self::lookup_buffers(&pending, in_flight.as_deref(), outpoint) {
+                    BufferAnswer::Coin(utxo) => results.push((*outpoint, Some(utxo))),
+                    BufferAnswer::Spent => results.push((*outpoint, None)),
+                    BufferAnswer::Unknown => {
+                        inner_positions.push(results.len());
+                        inner_wanted.push(*outpoint);
+                        results.push((*outpoint, None));
+                    }
                 }
             }
         }
@@ -387,14 +665,20 @@ impl<C: ExecutionChainStore> UtxoStore for WriteBackChainstate<C> {
         stats.hot = stats
             .hot
             .saturating_add(u64::try_from(self.read().created.len()).unwrap_or(u64::MAX));
+        if let Some(state) = self.in_flight_state() {
+            stats.hot = stats
+                .hot
+                .saturating_add(u64::try_from(state.created.len()).unwrap_or(u64::MAX));
+        }
         Ok(stats)
     }
 }
 
-impl<C: ExecutionChainStore> ExecutionChainStore for WriteBackChainstate<C> {
+impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainstate<C> {
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
+        let in_flight = self.in_flight_state();
         let pending = self.read();
-        self.current_tip(&pending)
+        self.current_tip(&pending, in_flight.as_deref())
     }
 
     fn assumed_snapshot_base(&self) -> Result<Option<ExecutionTip>, ChainStoreError> {
@@ -405,6 +689,16 @@ impl<C: ExecutionChainStore> ExecutionChainStore for WriteBackChainstate<C> {
         {
             let pending = self.read();
             if let Some(transition) = pending
+                .transitions
+                .iter()
+                .rev()
+                .find(|transition| transition.next.hash == hash)
+            {
+                return Ok(Some(transition.transaction_undos.clone()));
+            }
+        }
+        if let Some(state) = self.in_flight_state() {
+            if let Some(transition) = state
                 .transitions
                 .iter()
                 .rev()
@@ -596,20 +890,25 @@ mod tests {
                 vec![(key(3), coin(7))],
             )])
             .unwrap();
-        // Second batch hit the limit: one engine commit with the pair
-        // key(1) create/spend cancelled in memory.
+        // Second batch hit the limit: a background commit is running or
+        // done; the layer answers from the in-flight buffer meanwhile.
+        assert_eq!(store.pending_blocks(), 0);
+        assert_eq!(store.execution_tip().unwrap(), tip(2));
+        assert_eq!(store.get(key(2)).unwrap(), Some(coin(6)));
+        assert_eq!(store.get(key(1)).unwrap(), None);
+        // Waiting for it yields the record with the pair key(1) cancelled.
+        assert!(store.flush().unwrap().is_none(), "nothing new to commit");
         let flush = store.take_last_flush().expect("limit reached");
         assert_eq!(flush.batches, 2);
         assert_eq!(flush.blocks, 2);
         assert_eq!(flush.created, 2);
         assert_eq!(flush.spent, 0);
         assert_eq!(flush.cancelled, 1);
-        assert_eq!(store.pending_blocks(), 0);
+        assert!(store.take_last_flush().is_none());
         assert_eq!(store.inner().execution_tip().unwrap(), tip(2));
         assert_eq!(store.inner().get(key(1)).unwrap(), None);
         assert_eq!(store.inner().get(key(2)).unwrap(), Some(coin(6)));
         assert_eq!(store.inner().get(key(3)).unwrap(), Some(coin(7)));
-        assert_eq!(store.get(key(2)).unwrap(), Some(coin(6)));
         assert_eq!(
             store
                 .get_many(&[key(1), key(2), key(3), key(9)])
@@ -676,6 +975,81 @@ mod tests {
     }
 
     #[test]
+    fn batches_accepted_while_a_commit_is_in_flight_land_after_it() {
+        let directory = TempDir::new().unwrap();
+        let direct = open(&directory, "direct.redb");
+        let buffered = WriteBackChainstate::new(
+            open(&directory, "buffered.redb"),
+            WriteBackLimits {
+                max_batches: 1,
+                max_created: u64::MAX,
+            },
+        );
+        let genesis = direct.execution_tip().unwrap();
+        // Every batch starts a background commit; the next batch is accepted
+        // against the in-flight buffer and spends a coin it created.
+        let batches = vec![
+            vec![transition(
+                genesis,
+                tip(1),
+                vec![],
+                vec![(key(1), coin(1)), (key(2), coin(2))],
+            )],
+            vec![transition(
+                tip(1),
+                tip(2),
+                vec![key(1)],
+                vec![(key(3), coin(3))],
+            )],
+            vec![transition(
+                tip(2),
+                tip(3),
+                vec![key(3)],
+                vec![(key(4), coin(4))],
+            )],
+        ];
+        for batch in &batches {
+            direct.commit_connect_batch(batch).unwrap();
+            buffered.commit_connect_batch(batch).unwrap();
+            assert_eq!(
+                buffered.execution_tip().unwrap(),
+                batch.last().unwrap().next
+            );
+            for k in 1..=4 {
+                assert_eq!(buffered.get(key(k)).unwrap(), direct.get(key(k)).unwrap());
+            }
+        }
+        // The last batch is in flight: re-creating a coin it created, or
+        // spending a coin it spent, is rejected from the in-flight buffer
+        // without waiting for the engine.
+        assert!(matches!(
+            buffered.commit_connect_batch(&[transition(
+                tip(3),
+                tip(4),
+                vec![],
+                vec![(key(4), coin(9))]
+            )]),
+            Err(ChainStoreError::Utxo(UtxoError::Duplicate(_)))
+        ));
+        assert!(matches!(
+            buffered.commit_connect_batch(&[transition(tip(3), tip(4), vec![key(3)], vec![])]),
+            Err(ChainStoreError::Utxo(UtxoError::DuplicateSpend(_)))
+        ));
+        buffered.flush().unwrap();
+        let mut records = Vec::new();
+        while let Some(record) = buffered.take_last_flush() {
+            records.push(record);
+        }
+        assert_eq!(records.len(), 3);
+        assert_eq!(records.iter().map(|record| record.blocks).sum::<u32>(), 3);
+        assert_eq!(buffered.inner().execution_tip().unwrap(), tip(3));
+        assert_eq!(
+            buffered.inner().snapshot_entries().unwrap(),
+            direct.snapshot_entries().unwrap()
+        );
+    }
+
+    #[test]
     fn rejects_out_of_order_and_duplicate_transitions_without_touching_the_buffer() {
         let directory = TempDir::new().unwrap();
         let store = WriteBackChainstate::new(
@@ -736,6 +1110,7 @@ mod tests {
             .commit_connect_batch(&[transition(tip(1), tip(2), vec![], vec![(key(2), coin(2))])])
             .unwrap();
         assert_eq!(store.pending_blocks(), 0);
+        store.flush().unwrap();
         assert_eq!(store.inner().execution_tip().unwrap(), tip(2));
         assert_eq!(store.take_last_flush().unwrap().created, 2);
     }

@@ -11692,7 +11692,7 @@ trait OverlayCatchupStore: ExecutionChainStore {
 /// The write-back layer forwards the overlay surface to the engine it wraps,
 /// flushing before any operation that must see the durable state.
 #[cfg(feature = "mdbx")]
-impl<C: OverlayCatchupStore> OverlayCatchupStore for WriteBackChainstate<C> {
+impl<C: OverlayCatchupStore + 'static> OverlayCatchupStore for WriteBackChainstate<C> {
     fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
         self.inner().overlay_base_identity()
     }
@@ -12049,7 +12049,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             None,
         )
         .await?;
-        if let Some(flush) = chainstate.take_write_back_flush() {
+        while let Some(flush) = chainstate.take_write_back_flush() {
             log_write_back_flush(&flush);
         }
     }
@@ -12092,10 +12092,11 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
 #[cfg(feature = "mdbx")]
 fn log_write_back_flush(flush: &WriteBackFlush) {
     rbtc_info!(
-        "write-back flushed {} batches / {} blocks to the overlay in {} ms: wrote {} coins and {} spends, cancelled {} coins in memory",
+        "write-back flushed {} batches / {} blocks to the overlay in {} ms (caller waited {} ms): wrote {} coins and {} spends, cancelled {} coins in memory",
         flush.batches,
         flush.blocks,
         flush.elapsed.as_millis(),
+        flush.waited.as_millis(),
         flush.created,
         flush.spent,
         flush.cancelled,
