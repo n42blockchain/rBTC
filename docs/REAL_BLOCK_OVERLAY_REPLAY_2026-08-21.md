@@ -531,6 +531,10 @@ that only the ledger window retires; the next batch without a running
 commit prunes them), which removes the last place where the loop waits on
 the engine. Measured as v10.
 
+`redb-wb16-v9` (20:09Z): 1,490 s (78,145 tx/s), digest `aadd289f…`,
+−6% against `redb-wb16-v8` (1,583 s); seven flushes, the loop waited only
+for the final one (69 s); publish 285 s for the same reason as on MDBX.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
