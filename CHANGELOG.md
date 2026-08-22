@@ -60,7 +60,10 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   them: over mainnet 935,001–963,350 every stage with a new concurrent
   neighbour slowed by 25–50%, so both v7 lanes (MDBX 2,465 s, redb
   2,444 s) stayed within run-to-run variance of the earlier builds. With
-  mimalloc the smoke's execution time fell 8% with the same overlay digest.
+  mimalloc the same MDBX lane finished in 1,435 s (81,159 tx/s, −42%
+  against the system-heap build, −62% against the 3,823 s baseline) with
+  the same overlay content digest and every stage faster, validation
+  included.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key

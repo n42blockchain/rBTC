@@ -447,6 +447,36 @@ full-window lanes `mdbx-wb16-v8` and `redb-wb16-v8` are queued; their
 result decides whether the feature becomes the default for the release
 binaries.
 
+### Full-window result, MDBX with mimalloc (`mdbx-wb16-v8`, idle host, 12:51Z)
+
+Catch-up **1,435 s** (19.76 blocks/s, **81,159 tx/s**), tip 963,350, digest
+`aadd289f…` — the twelfth identical overlay. That is −42% against
+`mdbx-wb16-v7` (2,465 s), −38% against `mdbx-wb16-fp` (2,314 s) and −62%
+against the 3,823 s MDBX baseline of the previous day. The only difference
+between v7 and v8 is the allocator. Every stage moved, including the
+single-threaded ones (sums over 111 batches, v7 → v8):
+
+| stage | v7 | v8 |
+|---|---|---|
+| download (ledger read + decode) | 133 s | 90 s |
+| structure | 54 s | 29 s |
+| core-validate | 776 s | 430 s |
+| core-apply (tail thread) | 351 s | 258 s |
+| core-submit | 117 s | 54 s |
+| utxo-prefetch | 209 s | 141 s |
+| publish (compactions, forced flushes) | 389 s | 304 s |
+| flush thread: fold / undo / mutate / sync | 157 / 190 / 196 / 171 s | 149 / 85 / 152 / 156 s |
+| caller waited for flushes | 167 s | 107 s |
+| sum of batch totals | 1,954 s | 1,300 s |
+| peak working set | 27.9 GiB | 28.6 GiB |
+
+So the pipeline and the asynchronous flush were working all along; the
+Windows system heap was charging for every concurrent allocation and the
+cost landed on whichever thread happened to be on the critical path. With
+per-thread heaps validation alone is back below its pre-pipeline cost
+(430 s against 521–560 s) while the fold, net_changes and the engine commit
+run beside it. The `redb-wb16-v8` lane follows automatically.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
