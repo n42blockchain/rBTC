@@ -251,7 +251,43 @@ the resume-path fix 3ba224d); both ran on an idle host.
   already shown base-lookup 18.8 s vs 52.4 s without fingerprints on the same
   blocks.
 
-## 8. Tools added
+## 8. Executor clone reduction and run-to-run variance (2026-08-22)
+
+Commit 040d3bb makes the per-block and per-batch `UtxoOverlay` cache each
+base read once (one clone and one insert instead of two), lets the executor
+hand its transitions to the store by value so the write-back buffer stops
+cloning every batch, and times the fold/transition step as `core-apply`.
+Lanes `mdbx-wb16-v3` / `redb-wb16-v3` are the fingerprint lanes with that
+binary; `mdbx-wb16-fp2` repeats `mdbx-wb16-fp` with the unchanged binary to
+measure variance. All ran alone on the host.
+
+| MDBX lane | catch-up | core-validate | core-apply | utxo-prefetch | core-commit | of which engine undo | buffered-batch commit mean |
+|---|---|---|---|---|---|---|---|
+| wb16 + fp (first run) | 2,314 s | 560 s | — | 149 s | 711 s | 86 s | 1,620 ms |
+| wb16 + fp (repeat) | 2,434 s | 591 s | — | 158 s | 742 s | 89 s | — |
+| wb16 + fp + v3 | 2,366 s | **521 s** | 170 s | 155 s | 818 s | 122 s | **1,228 ms** |
+
+redb: wb16 + fp 2,407 s → wb16 + fp + v3 2,562 s (core-commit 709 → 780 s).
+
+- Run-to-run variance on the same binary and an idle host is about 5%
+  (2,314 vs 2,434 s), so neither v3 lane is distinguishable from its
+  predecessor on wall clock. Inside the batch, v3 is consistently faster
+  where it changed code paths (validation −7…−12%, buffered-batch commit
+  −24%) and consistently slower in the engine flush's undo compression
+  (+33 s on MDBX, beyond the 3 s spread between the two fp runs), which is
+  attributed to heap locality: the buffer now keeps the executor's own
+  per-block allocations instead of compact clones. The change is kept for
+  its validation gain and simpler overlay; the flush-side cost is a lead,
+  not a measured fix.
+- `core-apply` (fold into the batch overlay plus building the transition,
+  including a full clone of each block's undo records) is 170–176 s, about
+  7% of the catch-up, and is the next bounded target; `core-validate`
+  (~520–590 s, serial per block) is the largest remaining item and needs a
+  profile before any parallel design.
+- All eight overlays (four engines × configurations × two v3 lanes) hash to
+  the same consensus content digest.
+
+## 9. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.

@@ -19,6 +19,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   3,289 s to 2,606 s (44,689 tx/s, 120 GB written instead of 299 GB) and
   MDBX from 3,823 s to 3,057 s, all lanes at the same final tip; peak
   working set rose by 12–13 GiB at the default 8M-coin buffer.
+- Block execution caches each base coin once per overlay and hands its
+  transitions to the chain store by value (`commit_connect_batch_owned`), so
+  the write-back buffer no longer clones every batch; the batch log gains
+  `core-apply`. Over the same mainnet window validation time fell 7–12% and
+  the buffered-batch commit 24%, while wall clock stayed within the ~5%
+  run-to-run variance measured by repeating an unchanged lane.
 - The Core snapshot index gains a `<index>.fp` sidecar with one 16-bit txid
   fingerprint per slot, written by the builder and created once on first
   open for older indexes. Lookups reject a key whose slot fingerprint
