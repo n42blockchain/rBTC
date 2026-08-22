@@ -380,6 +380,39 @@ the full-window lanes `mdbx-wb16-v7` and `redb-wb16-v7` are queued behind
 the idle-host waiter regardless, because a 5% change on a 40 s smoke is
 inside the measured run-to-run variance.
 
+### Full-window result, MDBX (`mdbx-wb16-v7`, idle host, 2026-08-22 11:07Z)
+
+Catch-up 2,465 s (11.50 blocks/s, 47,253 tx/s), tip 963,350, overlay
+digest `aadd289f…` identical to the nine earlier overlays. Against
+`mdbx-wb16-v3` (2,366 s) and `mdbx-wb16-fp` (2,314 s) this is +4–6%: no
+gain, at the edge of the ≈5% run-to-run variance. Where the time moved
+(sums over the 111 batches, v3 → v7):
+
+| stage | v3 | v7 |
+|---|---|---|
+| core-commit (now just the buffer hand-off) | 818 s | 132 s |
+| core-validate | 521 s | 776 s |
+| core-apply (tail thread time) | 170 s | 351 s |
+| utxo-prefetch | 155 s | 209 s |
+| publish (includes the five compactions) | 28 s | 389 s |
+| sum of batch totals | 2,091 s | 1,954 s |
+| caller waited for flushes | — | 167 s |
+
+Eleven flushes ran; the six asynchronous ones took 78–136 s each (v3's
+synchronous flushes averaged 74 s) and the five that compaction forced
+synchronously made the loop wait 16–58 s each. The flush thread's own
+stages grew in proportion (fold 126 → 157 s, undo 122 → 190 s, mutate
+144 → 196 s, sync 144 → 171 s). Every stage that now runs beside another
+thread got slower by 25–50%, including single-threaded validation, which
+is the signature of a shared resource rather than of the algorithms: the
+binary allocates through the Windows system heap from the validation
+thread, the pipeline tail, the flush thread and the 32 script threads at
+once. The three changes are therefore kept as verified-correct (same
+digest, same tip, crash contract unchanged) but not yet as a speed-up; the
+next step is an allocator with per-thread heaps (opt-in `mimalloc`
+feature), measured as v8 against v7 on the same smoke and then the same
+window. The `redb-wb16-v7` lane follows automatically.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
