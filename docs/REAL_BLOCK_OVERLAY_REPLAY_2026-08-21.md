@@ -287,7 +287,51 @@ redb: wb16 + fp 2,407 s → wb16 + fp + v3 2,562 s (core-commit 709 → 780 s).
 - All eight overlays (four engines × configurations × two v3 lanes) hash to
   the same consensus content digest.
 
-## 9. Tools added
+## 9. Where the serial validation time goes (2026-08-22)
+
+Commit 6dd1005 adds thread-local timers to the per-transaction path and
+logs them per batch (`core-validate-prepare/utxo/net/checks`). Measured on
+the 1,024-block smoke ledger (four 256-block batches; the host was shared
+with a user-run Go replay, so only the proportions are reliable):
+
+| part of `core-validate` | share | what it is |
+|---|---|---|
+| prepare | ≈ 48% | per input: `get` through the block overlay (mutex, up to three map lookups, one clone), amount/maturity/lock checks, script-check construction |
+| utxo apply | ≈ 30% | per transaction: write spends and creations into the block overlay (before 6dd1005 it re-read every spent coin to build undo) |
+| net_changes | ≈ 14% | fold the block overlay into spent/created/undo vectors (clones again) |
+| header / tip / BIP30 checks | ≈ 0% | BIP30 is off at these heights under the BIP34 anchor |
+| loop overhead | ≈ 8% | fee and sigop accounting, deferred-script bookkeeping |
+
+Two trims followed from the profile and are in the same commit: undo
+records move into the store transition instead of being cloned when no
+explorer or auxiliary index reads them from the applied block
+(`AppliedUndos::Drop`), and the block overlay builds undo from the coins
+`prepare` already loaded (`apply_with_undo_fresh_outputs_from_prevouts`).
+On the smoke ledger they took the utxo-apply step down 10% and the fold
+(`core-apply`) down 20% with the content digest unchanged.
+
+What the profile says about the rest: the serial path is bound by hashing
+and allocation, not by any single check — each coin passes through three
+in-memory overlays (block → batch → write-back) and is cloned about four
+times on the way. Trimming one clone at a time yields 5–15% of `validate`
+each; a step change needs one of these designs, none of which is a small
+patch:
+
+1. Reference-counted coins (`Arc<Utxo>` or borrowed views) through the
+   overlays and transitions, removing the clones outright.
+2. One batch-scoped map in place of the block/batch/write-back overlay
+   chain, so an input costs one lookup instead of up to three mutex-guarded
+   ones; `net_changes` then disappears because the map records changes as
+   they happen.
+3. Resolving the next block's inputs on another thread while the current
+   block is checked (the prefetch already runs ahead per batch; this moves
+   the per-block map work off the serial path).
+
+A realistic target for the three together is validation at roughly half of
+today's 520–590 s, i.e. about 10–12% of the catch-up; after that the lanes
+are bounded by the engine flushes and the base's member reads.
+
+## 10. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.

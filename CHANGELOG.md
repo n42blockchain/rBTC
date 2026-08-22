@@ -19,6 +19,14 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   3,289 s to 2,606 s (44,689 tx/s, 120 GB written instead of 299 GB) and
   MDBX from 3,823 s to 3,057 s, all lanes at the same final tip; peak
   working set rose by 12–13 GiB at the default 8M-coin buffer.
+- The batch log now splits `core-validate` into prepare, utxo-apply, fold
+  and pre-loop checks (thread-local timers drained per block); on real
+  mainnet blocks the split is about 48/30/14/0%. Following that profile,
+  undo records move into the store transition instead of being cloned when
+  no explorer or auxiliary index reads them (`AppliedUndos`), and the block
+  overlay builds undo from the coins validation already loaded
+  (`UtxoStore::apply_with_undo_fresh_outputs_from_prevouts`, default
+  unchanged for durable stores).
 - Block execution caches each base coin once per overlay and hands its
   transitions to the chain store by value (`commit_connect_batch_owned`), so
   the write-back buffer no longer clones every batch; the batch log gains
