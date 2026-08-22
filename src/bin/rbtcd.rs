@@ -2,9 +2,10 @@
 
 use std::{env, process};
 
-// Opt-in allocator: block execution, the script threads and the pipeline
-// tail all allocate a script buffer per coin, and the system heap serialises
-// them; mimalloc keeps per-thread heaps.
+// Default allocator (disable with `--no-default-features`): block execution,
+// the script threads, the pipeline tail and the flush thread all allocate a
+// script buffer per coin, and the system heap serialises them; mimalloc keeps
+// per-thread heaps.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

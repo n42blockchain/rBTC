@@ -10,7 +10,7 @@ keywords = ["bitcoin", "utxo", "node", "zstd"]
 categories = ["cryptography::cryptocurrencies"]
 
 [features]
-default = []
+default = ["mimalloc"]
 mdbx = ["dep:libmdbx"]
 mimalloc = ["dep:mimalloc"]
 
