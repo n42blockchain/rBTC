@@ -507,6 +507,30 @@ forced waits alone are 107 s), apply 258 s of tail-thread time, prefetch
 141 s. The obvious next items are letting compaction proceed without
 draining the write-back layer, and a second validation thread per batch.
 
+### Compaction without draining the write-back layer (`mdbx-wb16-v9`, 19:42Z)
+
+Commits ad62653 (mimalloc default) and ea8dd3e (compaction keeps the
+buffer; the loop defers a compaction that would wait for a running
+commit). Catch-up 1,434 s, digest `aadd289f…` (fourteenth identical
+overlay) — the same wall clock as v8 (1,435 s). What the change did do:
+seven flushes instead of eleven, none of them waited on by the loop
+except the final one at the tip (86 s, inherent to flushing the last
+sixteen batches), four compactions all taken between commits; the flush
+thread's own stages fell (undo 85 → 73 s, mutate 152 → 116 s, sync
+156 → 134 s) and validation fell 430 → 386 s. What it did not do: the
+`publish` stage stayed at 317 s (304 s on v8, 27 s before the
+asynchronous flush). Reading that stage's code explains it. Publish is the
+ledger commit plus `prune_block_undos_before`, and the latter opens a
+read-write transaction on the engine — which on both MDBX and redb means
+taking the overlay's writer lock, held by the background flush thread for
+the whole 60–90 s commit. Each flush therefore stalled the loop once, for
+the remainder of the commit, from inside a stage the flush accounting
+does not see: seven flushes × ~45 s ≈ 317 s. The write-back layer now
+skips the prune while a commit is in progress (it is housekeeping on rows
+that only the ledger window retires; the next batch without a running
+commit prunes them), which removes the last place where the loop waits on
+the engine. Measured as v10.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with

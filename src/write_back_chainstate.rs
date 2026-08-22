@@ -807,7 +807,13 @@ impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainsta
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         // Buffered undo belongs to the newest blocks, which sit above any
-        // retention floor the ledger window can produce.
+        // retention floor the ledger window can produce. Pruning needs the
+        // engine's writer, which a background commit holds for its whole
+        // duration; housekeeping is not worth stalling the loop for, so it
+        // waits for a batch on which no commit is running.
+        if self.commit_in_progress() {
+            return Ok(0);
+        }
         self.inner
             .prune_block_undos_before(headers, retain_from_height)
     }
