@@ -43,6 +43,16 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   (50,340 tx/s, 93 GB written) and redb from 2,606 s to 2,407 s, all with
   the same overlay content digest; a resumed catch-up on the original base
   now keeps the operator-supplied index path instead of deriving one.
+- Three structural changes borrowed from the btcdmdbx replay work: the
+  write-back flush runs on a helper thread while validation continues into
+  a fresh buffer (reads check pending, then in-flight, then the engine; the
+  flush log reports how long the caller actually waited), block validation
+  inside a batch is pipelined so block N's fold into the batch overlay and
+  transition build overlap block N+1's input resolution and checks (block
+  N+1 reads N's overlay shards through a `DeltaView`), and the batch overlay
+  is split into 64 independently locked shards that are seeded from the
+  prefetch in parallel. Crash semantics and the overlay content digest are
+  unchanged.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key

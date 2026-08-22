@@ -331,7 +331,56 @@ A realistic target for the three together is validation at roughly half of
 today's 520–590 s, i.e. about 10–12% of the catch-up; after that the lanes
 are bounded by the engine flushes and the base's member reads.
 
-## 10. Tools added
+## 10. Three structural changes borrowed from btcdmdbx (2026-08-22)
+
+The Go replay's later commits doubled its rate with an asynchronous flush,
+a cross-block prepare/connect pipeline and parallel input fetching. The same
+three were implemented here (commits e9aa0dc and 83b001d) and first checked
+on the 1,024-block smoke ledger with a 2-batch flush interval, on a host
+shared with the user's `rb_pipe8` (47 GiB). Every smoke reached 936,024 with
+the overlay digest `92989dbf…`.
+
+1. **Asynchronous write-back flush.** The buffered transitions move into an
+   in-flight set and a helper thread commits them while validation continues
+   into a fresh buffer; reads go pending → in-flight → engine. The flush log
+   now prints how long the caller waited: `caller waited 0 ms` in every
+   smoke, against a 16–31 s commit that used to stall the loop.
+2. **Block pipeline.** Block N's overlay shards become a `BlockDelta`; a
+   helper thread derives its net changes, folds them into the batch overlay
+   and builds the transition while block N+1 validates through a
+   `DeltaView` (N's shards first, batch overlay otherwise).
+3. **Sharded batch overlay.** 64 independently locked shards, prefetched
+   coins seeded by eight workers when the batch is large.
+
+Back-to-back smokes with the same page-cache state (v6c = async flush only,
+v7b = all three; four 256-block batches):
+
+| timer (sum of 4 batches) | v6c | v7b | change |
+|---|---|---|---|
+| execute (critical path) | 38.65 s | 36.51 s | −5.5% |
+| core-validate | 16.76 s | 16.37 s | −2% |
+| – prepare | 8.17 s | 9.49 s | +16% |
+| – utxo-apply | 5.17 s | 5.43 s | +5% |
+| – net_changes | 2.16 s | 0 (moved to the tail) | |
+| core-apply (tail thread, overlapped) | 4.89 s | 11.80 s | thread time, off the path |
+| utxo-prefetch | 8.30 s | 9.34 s | within noise |
+
+An earlier pair (v6b/v7b) showed a far larger gap (execute 114 s vs 36 s),
+but v6b ran straight after the test suite had evicted the snapshot from the
+page cache — its first-batch prefetch was 34 s — so only the v6c/v7b pair is
+comparable. Read honestly: the pipeline does take net_changes and the fold
+off the validation thread, but prepare grows by about the same amount while
+the tail runs beside it. The thread time of the tail more than doubles for
+the same work, which points at contention rather than at the extra
+`DeltaView` lookups (one mutex and one hash probe per input, ≈0.15 s per
+batch). The binary uses the Windows system heap; both threads allocate a
+`Vec` per coin script while cloning, and the 32 script threads share that
+heap. An allocator experiment is the next step before judging the pipeline;
+the full-window lanes `mdbx-wb16-v7` and `redb-wb16-v7` are queued behind
+the idle-host waiter regardless, because a 5% change on a 40 s smoke is
+inside the measured run-to-run variance.
+
+## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.

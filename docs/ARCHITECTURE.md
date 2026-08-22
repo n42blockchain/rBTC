@@ -765,6 +765,29 @@ hashes base identity, tip, every coin's value, height, coinbase flag,
 creation MTP and script, and every tombstone, leaving out the per-run
 `last_touched` bookkeeping and the prune-dependent undo rows.
 
+The write-back flush is asynchronous: when the buffer reaches its limit the
+buffered transitions move into an in-flight set and a helper thread hands
+them to the engine while the catch-up loop keeps validating into a fresh
+buffer. Reads consult the pending buffer, then the in-flight set, then the
+engine, so no coin is ever invisible; a second flush waits for the first;
+every synchronous flush point (disconnect, rebase, compaction, export, the
+final tip report) and the drop of the layer join the helper first; and a
+failed commit is reported on the next call instead of being lost. The
+crash contract is unchanged — the durable tip lags by at most N batches.
+
+Block execution inside a batch is a two-stage pipeline. Validating block N
+produces its overlay shards (`BlockDelta`); a helper thread then derives the
+net changes from them, folds those into the sharded batch overlay and
+builds the store transition, while the main thread validates block N+1
+through a `DeltaView` that answers from N's shards first and from the batch
+overlay otherwise. A key in N's delta is therefore read from the delta and
+any other key is untouched by the concurrent fold, so block N+1 sees
+exactly the state block N left; transitions are joined in order and a
+failed fold surfaces as the batch's error. The batch overlay itself is
+split into 64 independently locked shards so the fold, the validation
+reads and the parallel seeding of prefetched coins proceed without a single
+lock.
+
 The base index also carries a fingerprint sidecar, `<index>.fp`: one 16-bit
 txid fingerprint per MPHF slot behind a header naming the index container
 digest, with a trailing SHA-256. `build_core_snapshot_index` writes it, an
