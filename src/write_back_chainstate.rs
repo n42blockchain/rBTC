@@ -202,7 +202,7 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
     }
 
     /// Buffers one contiguous batch, flushing afterwards if a limit is hit.
-    fn buffer(&self, transitions: &[ConnectTransition]) -> Result<(), ChainStoreError> {
+    fn buffer(&self, transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
         if transitions.is_empty() {
             return Ok(());
         }
@@ -216,7 +216,7 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
             let mut staged_cancelled: Vec<OutPointKey> = Vec::new();
             let mut batch_created: HashSet<OutPointKey> = HashSet::new();
             let mut batch_spent: HashSet<OutPointKey> = HashSet::new();
-            for transition in transitions {
+            for transition in &transitions {
                 if transition.expected_parent != tip.hash
                     || tip.height.checked_add(1) != Some(transition.next.height)
                 {
@@ -263,7 +263,7 @@ impl<C: ExecutionChainStore> WriteBackChainstate<C> {
                 .cancelled
                 .saturating_add(u64::try_from(staged_cancelled.len()).unwrap_or(u64::MAX));
             pending.spent.extend(staged_spent);
-            pending.transitions.extend(transitions.iter().cloned());
+            pending.transitions.extend(transitions);
             pending.tip = Some(tip);
             pending.batches = pending.batches.saturating_add(1);
             let limit_hit = pending.batches >= self.limits.max_batches
@@ -440,7 +440,7 @@ impl<C: ExecutionChainStore> ExecutionChainStore for WriteBackChainstate<C> {
         for undo in transaction_undos {
             undo_spent.extend(undo.spent().iter().cloned());
         }
-        self.buffer(&[ConnectTransition {
+        self.buffer(vec![ConnectTransition {
             expected_parent,
             next,
             spent: spent.to_vec(),
@@ -456,6 +456,13 @@ impl<C: ExecutionChainStore> ExecutionChainStore for WriteBackChainstate<C> {
     fn commit_connect_batch(
         &self,
         transitions: &[ConnectTransition],
+    ) -> Result<(), ChainStoreError> {
+        self.buffer(transitions.to_vec())
+    }
+
+    fn commit_connect_batch_owned(
+        &self,
+        transitions: Vec<ConnectTransition>,
     ) -> Result<(), ChainStoreError> {
         self.buffer(transitions)
     }

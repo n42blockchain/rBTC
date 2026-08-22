@@ -15639,7 +15639,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-apply={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -15653,6 +15653,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         executed_at.duration_since(staged_at).as_millis(),
         execution_core_at.duration_since(staged_at).as_millis(),
         breakdown.validate.as_millis(),
+        breakdown.apply.as_millis(),
         breakdown.submit.as_millis(),
         breakdown.script_wait.as_millis(),
         breakdown.commit.as_millis(),

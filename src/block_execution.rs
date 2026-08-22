@@ -522,6 +522,9 @@ pub struct ExecutionBreakdown {
     pub script_wait: Duration,
     /// The batch's storage commit.
     pub commit: Duration,
+    /// Folding each validated block into the batch overlay and building its
+    /// transition.
+    pub apply: Duration,
 }
 
 fn external_batch_input_outpoints(
@@ -680,6 +683,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                 .ok_or(BlockExecutionError::NoNextHeader(current.height))?,
             hash: applied.hash,
         };
+        let apply_started = Instant::now();
         cumulative.apply_validated_changes(&changes);
         transitions.push(ConnectTransition {
             expected_parent: current.hash,
@@ -693,6 +697,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             },
         });
         applied_blocks.push(applied);
+        breakdown.apply += apply_started.elapsed();
         let submit_started = Instant::now();
         if let Some(batch) = &mut script_batch {
             batch.submit(block_scripts);
@@ -716,7 +721,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }));
     }
     let commit_started = Instant::now();
-    chainstate.commit_connect_batch(&transitions)?;
+    chainstate.commit_connect_batch_owned(transitions)?;
     breakdown.commit = commit_started.elapsed();
     Ok((applied_blocks, breakdown))
 }
@@ -866,10 +871,26 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     Ok((applied, transition, scripts))
 }
 
+/// Per-overlay view of the coins a block or batch touched.
+///
+/// `original` caches every coin read from the base exactly as it was first
+/// seen; `current` holds only keys this overlay modified. A read therefore
+/// costs one clone and one insert on first touch instead of two, and the net
+/// change of the overlay is the set of `current` keys whose value differs
+/// from `original`.
 #[derive(Default)]
 struct OverlayState {
     original: AHashMap<OutPointKey, Option<Utxo>>,
     current: AHashMap<OutPointKey, Option<Utxo>>,
+}
+
+impl OverlayState {
+    /// The overlay's view of a key, without touching the base.
+    fn cached(&self, outpoint: &OutPointKey) -> Option<&Option<Utxo>> {
+        self.current
+            .get(outpoint)
+            .or_else(|| self.original.get(outpoint))
+    }
 }
 
 struct UtxoChanges {
@@ -904,12 +925,11 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
         state: &mut OverlayState,
         outpoint: OutPointKey,
     ) -> Result<Option<Utxo>, UtxoError> {
-        if let Some(value) = state.current.get(&outpoint) {
+        if let Some(value) = state.cached(&outpoint) {
             return Ok(value.clone());
         }
         let value = self.base.get(outpoint)?;
         state.original.insert(outpoint, value.clone());
-        state.current.insert(outpoint, value.clone());
         Ok(value)
     }
 
@@ -918,11 +938,11 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
         let mut spent = Vec::new();
         let mut created = Vec::new();
         let mut undo_spent = Vec::new();
-        for (outpoint, original) in &state.original {
-            let current = state
-                .current
+        for (outpoint, current) in &state.current {
+            let original = state
+                .original
                 .get(outpoint)
-                .ok_or(UtxoError::Malformed("overlay current value"))?;
+                .ok_or(UtxoError::Malformed("overlay original value"))?;
             if original == current {
                 continue;
             }
@@ -951,9 +971,11 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     fn apply_validated_changes(&self, changes: &UtxoChanges) {
         let mut state = self.state.lock().expect("overlay lock not poisoned");
         for outpoint in &changes.spent {
+            state.original.entry(*outpoint).or_insert(None);
             state.current.insert(*outpoint, None);
         }
         for (outpoint, utxo) in &changes.created {
+            state.original.entry(*outpoint).or_insert(None);
             state.current.insert(*outpoint, Some(utxo.clone()));
         }
     }
@@ -967,8 +989,7 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     fn seed_prefetched(&self, prefetched: Vec<(OutPointKey, Option<Utxo>)>) {
         let mut state = self.state.lock().expect("overlay lock not poisoned");
         for (outpoint, value) in prefetched {
-            state.original.insert(outpoint, value.clone());
-            state.current.insert(outpoint, value);
+            state.original.insert(outpoint, value);
         }
     }
 }
@@ -1016,6 +1037,7 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             state.current.insert(*outpoint, None);
         }
         for (outpoint, utxo) in created {
+            state.original.entry(*outpoint).or_insert(None);
             state.current.insert(*outpoint, Some(utxo.clone()));
         }
         Ok(UtxoUndo::new(
@@ -1045,7 +1067,7 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         for (outpoint, _) in created {
             if !seen_created.insert(*outpoint)
                 || (!seen_spent.contains(outpoint)
-                    && state.current.get(outpoint).is_some_and(Option::is_some))
+                    && state.cached(outpoint).is_some_and(Option::is_some))
             {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
@@ -1090,6 +1112,7 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             state.current.insert(*outpoint, None);
         }
         for (outpoint, utxo) in undo.spent() {
+            state.original.entry(*outpoint).or_insert(None);
             state.current.insert(*outpoint, Some(utxo.clone()));
         }
         Ok(())

@@ -478,6 +478,16 @@ pub trait ExecutionChainStore: UtxoStore {
         &self,
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError>;
+    /// Commits a batch the caller no longer needs.
+    ///
+    /// Stores that keep transitions past the call (a write-back buffer) take
+    /// them by value instead of cloning; the default borrows and commits.
+    fn commit_connect_batch_owned(
+        &self,
+        transitions: Vec<ConnectTransition>,
+    ) -> Result<(), ChainStoreError> {
+        self.commit_connect_batch(&transitions)
+    }
     /// Reverses the tip block and removes its undo in one transaction.
     fn commit_disconnect(
         &self,
