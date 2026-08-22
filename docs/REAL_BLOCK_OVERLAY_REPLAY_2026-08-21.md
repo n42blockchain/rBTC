@@ -426,6 +426,27 @@ the same reading: the asynchronous flush and the pipeline remove the engine
 commit from the loop's critical path, and something shared gives the time
 straight back to validation.
 
+### Allocator experiment (`rbtcd-v8` = v7 + `--features mimalloc`)
+
+Commit 6156c00 adds an opt-in global allocator to the `rbtcd` binary;
+nothing else changed. Two alternating pairs of smokes on the idle host
+(v7c/v8, v7d/v8b, four batches each, digest `92989dbf…` throughout):
+
+| sum of 4 batches | v7c | v8 | v7d | v8b |
+|---|---|---|---|---|
+| execute | 34.25 s | 31.02 s | 33.15 s | 30.93 s |
+| core-validate | 16.96 s | 14.63 s | 15.19 s | 14.78 s |
+| core-submit | 2.21 s | 1.45 s | 2.22 s | 1.33 s |
+| core-commit (buffer hand-off) | 4.04 s | 3.53 s | 4.05 s | 3.50 s |
+| utxo-prefetch | 8.53 s | 8.02 s | 8.42 s | 7.93 s |
+
+Execute −8% on average with the direction the same in both pairs and in
+every stage, which is the first change since the fingerprint sidecar that
+moved the critical path on the smoke by more than the noise. The
+full-window lanes `mdbx-wb16-v8` and `redb-wb16-v8` are queued; their
+result decides whether the feature becomes the default for the release
+binaries.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with

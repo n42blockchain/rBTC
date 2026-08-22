@@ -53,6 +53,14 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   is split into 64 independently locked shards that are seeded from the
   prefetch in parallel. Crash semantics and the overlay content digest are
   unchanged.
+- `--features mimalloc` builds `rbtcd` with mimalloc as the global
+  allocator. The asynchronous flush and the block pipeline put the
+  validation thread, the pipeline tail, the flush thread and the script
+  threads on the system heap at once, and on Windows that heap serialised
+  them: over mainnet 935,001–963,350 every stage with a new concurrent
+  neighbour slowed by 25–50%, so both v7 lanes (MDBX 2,465 s, redb
+  2,444 s) stayed within run-to-run variance of the earlier builds. With
+  mimalloc the smoke's execution time fell 8% with the same overlay digest.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key
