@@ -137,9 +137,11 @@ write traffic. This window is a 2025–26 Ordinals/Runes-era sample; the
    its advantage in the earlier micro-benchmarks does not carry over to the
    compaction lifecycle. With the write-back layer (section 6) both engines
    see a fifth of the write traffic and redb remains ahead (2,606 s vs
-   3,057 s). Nothing measured here argues for switching the daemon default
-   to MDBX; the gate's remaining items (UTXO-identity audit, 160M synthetic
-   run, migration surface) stand.
+   3,057 s); with the fingerprint sidecar as well (section 7) the engines
+   are within 4% (MDBX 2,314 s, redb 2,407 s) and the catch-up is no longer
+   bounded by either engine's write path. Nothing measured here argues for
+   switching the daemon default to MDBX on performance grounds; the gate's
+   remaining items (160M synthetic run, migration surface) stand.
 3. A btcd-style fast-add (skip scripts and spend checks below a checkpoint) is
    not wanted. A Core-style assume-valid script skip would save little wall
    clock on 32 threads (script waits ≈ 0.2% of batch time) and is a
@@ -202,7 +204,54 @@ ran alone on the host (a user-run Go replay variant overlapped parts of the
   and the two engines compact at different moments; the cancelled totals
   differ by the same mechanism.
 
-## 7. Tools added
+## 7. Fingerprint sidecar: removing the base probes (2026-08-22)
+
+What the write-back lanes left on the table was dominated by reads of the
+base snapshot: the flush's duplicate-creation probe (`commit-base-lookup`)
+and the absent-key share of `utxo-prefetch`. Each absent key cost a packed
+offset-table read plus a 192-byte snapshot read at a random offset. The
+index builder now also writes `<index>.fp` — one 16-bit txid fingerprint per
+MPHF slot (commit 0b8b3ae; 113,879,165 slots, 227,758,412 bytes, built on
+first open in 54 s for an index written before the sidecar existed) — and a
+lookup whose slot fingerprint differs is answered absent without any read.
+Same lanes as section 6 with `rbtcd-fp.exe` (write-back 16 + fingerprints +
+the resume-path fix 3ba224d); both ran on an idle host.
+
+| metric | MDBX + wb16 | **MDBX + wb16 + fp** | redb + wb16 | **redb + wb16 + fp** |
+|---|---|---|---|---|
+| catch-up (chainstate open → tip) | 3,057 s | **2,314 s (0.61× baseline)** | 2,606 s | **2,407 s (0.63× baseline)** |
+| blocks/s · tx/s | 9.27 · 38,098 | **12.59 · 50,340** | 10.88 · 44,689 | 11.78 · 48,396 |
+| core-commit (sum) | 967 s | **711 s** | 814 s | **709 s** |
+| MDBX base-lookup / mutate / sync (sum) | 233 / 314 / 163 s | **72 / 135 / 141 s** | — | — |
+| utxo-prefetch (sum) | 448 s | **149 s** | 264 s | 197 s |
+| core-validate (sum) | 567 s | 560 s | 529 s | 531 s |
+| time in flushes | 842 s | 560 s | 644 s | 518 s |
+| coins cancelled in memory | 113.3M (81.1%) | 113.3M (81.1%) | 113.9M (81.6%) | 113.9M (81.6%) |
+| peak working set | 23.4 GiB | 24.0 GiB | 17.9 GiB | 18.2 GiB |
+| bytes written to the destination volume | n/a (shared host) | **93 GB** | 120 GB | 109 GB |
+| final tip · overlay content digest | same · `aadd289f…` | same · `aadd289f…` | same · `aadd289f…` | same · `aadd289f…` |
+
+- Fingerprints removed 161 s of base probes and 299 s of prefetch from the
+  MDBX lane and 67 s of prefetch from the redb lane; the residual
+  `commit-base-lookup` (72 s) is MPHF hashing of ~26M created keys plus the
+  one-in-65,536 false matches, with no snapshot reads behind it.
+- With both optimisations the engines are within 4% of each other
+  (MDBX 2,314 s vs redb 2,407 s), the reverse of the baseline ordering;
+  at this point the catch-up is bounded by validation (~530–560 s), the
+  remaining member reads of the base, and the flushes themselves rather than
+  by either engine's write path. All six overlays hash to the same consensus
+  content digest (`overlay_audit`).
+- The first fingerprint attempt (`mdbx-wb16-fp-attempt1`) failed at height
+  961,624 after 37 min when its first peer — a Knots 29.3 node reporting
+  tip 961,637 and "no more headers" — turned out to be on a stale branch and
+  the ledger block at 961,632 did not match that header chain; the failover
+  then hit a pre-existing resume bug that derived the index path from the
+  CLI snapshot directory instead of `--snapshot-overlay-index` (fixed in
+  3ba224d). That attempt's partial data was discarded; its first flush had
+  already shown base-lookup 18.8 s vs 52.4 s without fingerprints on the same
+  blocks.
+
+## 8. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
   chain selection from a base hash, CRC-32C checks and ranged re-verification.

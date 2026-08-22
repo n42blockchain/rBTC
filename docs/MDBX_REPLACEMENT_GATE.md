@@ -31,6 +31,7 @@ raw-record estimate previously copied into this document.
 | Spent-output age over the same window (`utxo_locality`) | 33.5% of inputs spend same-block outputs, 80.7% outputs ≤ 256 blocks old, 91.5% ≤ 4,096 | Neither engine exploits this beyond intra-batch folding; a cross-batch write-back cache would cut durable writes about 5× before any engine choice matters |
 | Same catch-up with the cross-batch write-back layer (`--snapshot-overlay-flush-batches 16`, commit a1ed228) | MDBX 3,823 → 3,057 s; 81.1% of created coins cancelled in memory; MDBX commit work halved (sync 832 → 163 s) | redb gained more: 3,289 → 2,606 s, 44,689 tx/s, 120 GB written; MDBX + layer still trails redb + layer by 15%. Peak working set +12–13 GiB at the default 8M-coin buffer |
 | `overlay_audit` over all four overlays | Identical consensus content: 14,554,294 coins, 13,000,529 tombstones, digest `aadd289f…7f2819` on MDBX, redb, and both write-back lanes | Raw stored bytes differ only by the per-run `last_touched` field; undo row counts differ by prune timing and are excluded |
+| Same catch-up with write-back 16 plus the txid fingerprint sidecar (commit 0b8b3ae) | MDBX 2,314 s (0.61× its baseline, 50,340 tx/s), base probes 485 → 72 s, 93 GB written; same content digest | redb 2,407 s (0.63× the MDBX baseline); the engines are within 4% once neither pays for absent-key snapshot reads — catch-up is now bounded by validation, member base reads and flushes, not the engine |
 
 The production-size copy-space implication is explicit: keeping the existing
 76.01 GB file while writing approximately 50.26 GB of live pages requires
@@ -150,9 +151,10 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    the write-back layer) hold the same 14,554,294 coins and 13,000,529
    tombstones with consensus digest `aadd289f…7f2819`. The write-back layer
    the report recommended was built and measured the same day: with 16
-   buffered batches redb finished in 2,606 s and MDBX in 3,057 s, so the
-   layer does not change the engine ordering. **Item 4 is met for this
-   corpus window**; what it does not cover is a genesis-to-tip replay or the
+   buffered batches redb finished in 2,606 s and MDBX in 3,057 s; with the
+   txid fingerprint sidecar added, 2,407 s and 2,314 s, all six overlays
+   hashing to the same content digest. **Item 4 is met for this corpus
+   window**; what it does not cover is a genesis-to-tip replay or the
    2015–2019 churn profile.
 5. The explicit backend manifest is complete. The daemon must still gain an
    authenticated content migration/publish path and cover AssumeUTXO metadata,

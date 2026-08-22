@@ -765,6 +765,23 @@ hashes base identity, tip, every coin's value, height, coinbase flag,
 creation MTP and script, and every tombstone, leaving out the per-run
 `last_touched` bookkeeping and the prune-dependent undo rows.
 
+The base index also carries a fingerprint sidecar, `<index>.fp`: one 16-bit
+txid fingerprint per MPHF slot behind a header naming the index container
+digest, with a trailing SHA-256. `build_core_snapshot_index` writes it, an
+index written before it existed gets one on the first overlay open (one
+sequential scan of the snapshot, 54 s for 113.9M slots, logged), and a
+sidecar that is missing, damaged or belongs to another index is ignored. A
+lookup whose slot fingerprint differs from the key's is answered absent
+without reading the offset table or the snapshot; a match (one in 65,536
+for an absent key) falls through to the ordinary verified read. Almost
+every key the overlay probes at commit time is absent — created coins are
+checked against the base to prove they collide with nothing — so the probe
+cost on mainnet 935,001–963,350 fell from 485 s (233 s with the write-back
+layer) to 72 s and `utxo-prefetch` from 448 s to 149 s on the MDBX lane;
+with both the write-back layer and fingerprints MDBX finished in 2,314 s and
+redb in 2,407 s against baselines of 3,823 s and 3,289 s, with identical
+overlay content.
+
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror
 (`bitcoin-snapshots.jaonoctus.dev`, `files-vps02.jaonoctus.dev/utxo-935000.dat`)

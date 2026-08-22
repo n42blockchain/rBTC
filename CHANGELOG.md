@@ -19,6 +19,16 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   3,289 s to 2,606 s (44,689 tx/s, 120 GB written instead of 299 GB) and
   MDBX from 3,823 s to 3,057 s, all lanes at the same final tip; peak
   working set rose by 12–13 GiB at the default 8M-coin buffer.
+- The Core snapshot index gains a `<index>.fp` sidecar with one 16-bit txid
+  fingerprint per slot, written by the builder and created once on first
+  open for older indexes. Lookups reject a key whose slot fingerprint
+  differs without touching the offset table or the snapshot, which removes
+  nearly every base read behind the overlay commit's duplicate-creation
+  probe and the prefetch's absent keys. Over mainnet 935,001–963,350 with
+  16 buffered batches, MDBX catch-up fell from 3,057 s to 2,314 s
+  (50,340 tx/s, 93 GB written) and redb from 2,606 s to 2,407 s, all with
+  the same overlay content digest; a resumed catch-up on the original base
+  now keeps the operator-supplied index path instead of deriving one.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key
