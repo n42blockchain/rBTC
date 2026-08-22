@@ -11676,6 +11676,12 @@ trait OverlayCatchupStore: ExecutionChainStore {
     /// Returns `None` when the engine offers no in-place compaction. When to
     /// call this is the catch-up loop's policy decision, not the store's.
     fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String>;
+    /// Whether `overlay_compact` would first have to wait for a background
+    /// commit. The loop defers compaction while that is true, unless the
+    /// overlay is close to its rebase threshold.
+    fn overlay_compact_would_wait(&self) -> bool {
+        false
+    }
     fn engine_name(&self) -> &'static str;
     /// Commits anything a write-back layer still holds in memory.
     ///
@@ -11719,9 +11725,15 @@ impl<C: OverlayCatchupStore + 'static> OverlayCatchupStore for WriteBackChainsta
     }
 
     fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
-        self.inner_mut_flushed()
+        // Compaction reshapes the engine's file, not its content, so the
+        // buffer stays in memory; only a running commit has to land first.
+        self.inner_mut_settled()
             .map_err(|error| error.to_string())?
             .overlay_compact()
+    }
+
+    fn overlay_compact_would_wait(&self) -> bool {
+        self.commit_in_progress()
     }
 
     fn engine_name(&self) -> &'static str {
@@ -11936,6 +11948,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     // accumulates slowly. Gating on growth since this point covers both the
     // fruitless case and the merely uneconomical one.
     let mut last_compacted_bytes: Option<u64> = None;
+    let mut compaction_deferred = false;
     loop {
         loop {
             let tip = chainstate
@@ -11989,7 +12002,17 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             overlay.compact_percent,
             last_compacted_bytes,
         );
-        if worth_compacting {
+        let compaction_can_wait = chainstate.overlay_compact_would_wait()
+            && usage.used_percent() < overlay.rebase_percent;
+        if worth_compacting && compaction_can_wait {
+            if !compaction_deferred {
+                rbtc_info!(
+                    "deferring overlay compaction until the background write-back commit lands"
+                );
+            }
+            compaction_deferred = true;
+        } else if worth_compacting {
+            compaction_deferred = false;
             if let Some(compaction) = chainstate
                 .overlay_compact()
                 .map_err(PeerRunError::transient)?

@@ -745,7 +745,11 @@ spend an output created in the same block and 80.7% one at most 256 blocks
 old ([2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)), so a
 store that commits every batch writes most coins only to delete them a batch
 later. Disconnect, rebase, compaction, direct UTXO mutation and snapshot
-export flush first, and the catch-up loop flushes before reporting its tip;
+export flush first — compaction does not: it only reshapes the engine's
+file, so it waits for a running background commit and keeps the buffer in
+memory, and the catch-up loop defers a compaction that would have to wait
+unless the overlay is already near its rebase threshold — and the catch-up
+loop flushes before reporting its tip;
 the engine's durable tip therefore lags the reported tip by at most N
 batches, and a crash re-executes only those blocks because the overlay
 start-up path already truncates the retained ledger to the durable tip. The
@@ -787,6 +791,12 @@ failed fold surfaces as the batch's error. The batch overlay itself is
 split into 64 independently locked shards so the fold, the validation
 reads and the parallel seeding of prefetched coins proceed without a single
 lock.
+
+The `rbtcd` binary installs mimalloc as its global allocator by default
+(`--no-default-features` restores the system allocator): on Windows the
+system heap serialised the validation thread, the pipeline tail, the flush
+thread and the script threads, and with per-thread heaps the same mainnet
+window ran 35–42% faster on both engines with the same overlay digest.
 
 The base index also carries a fingerprint sidecar, `<index>.fp`: one 16-bit
 txid fingerprint per MPHF slot behind a header naming the index container

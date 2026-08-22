@@ -159,6 +159,33 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
         )))
     }
 
+    /// Mutable access to the wrapped store for work that only reshapes the
+    /// engine's storage — compaction — and needs none of the buffered state.
+    ///
+    /// Waits for a background commit so the engine is quiescent, but keeps
+    /// the accepting buffer in memory: the engine's logical content is the
+    /// same before and after such work, so the buffer stays valid over it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the background commit failed.
+    pub fn inner_mut_settled(&mut self) -> Result<&mut C, ChainStoreError> {
+        self.check_failed()?;
+        // A settled commit is recorded for the caller's log by `settle`.
+        self.wait_in_flight(Instant::now())?;
+        Arc::get_mut(&mut self.inner).ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
+            "write-back store is still shared with a background commit",
+        )))
+    }
+
+    /// Whether a background commit is still running.
+    #[must_use]
+    pub fn commit_in_progress(&self) -> bool {
+        self.lock_in_flight()
+            .as_ref()
+            .is_some_and(|in_flight| !in_flight.handle.is_finished())
+    }
+
     /// Blocks buffered but not yet handed to the inner store.
     #[must_use]
     pub fn pending_blocks(&self) -> u32 {
@@ -851,6 +878,49 @@ mod tests {
 
     fn open(directory: &TempDir, name: &str) -> RedbChainStore {
         RedbChainStore::open(directory.path().join(name), Network::Regtest).unwrap()
+    }
+
+    #[test]
+    fn settled_access_keeps_the_buffer_while_flushed_access_drains_it() {
+        let directory = TempDir::new().unwrap();
+        let inner = open(&directory, "settled.redb");
+        let genesis = inner.execution_tip().unwrap();
+        let mut store = WriteBackChainstate::new(
+            inner,
+            WriteBackLimits {
+                max_batches: 2,
+                max_created: u64::MAX,
+            },
+        );
+        store
+            .commit_connect_batch(&[transition(genesis, tip(1), vec![], vec![(key(1), coin(5))])])
+            .unwrap();
+        store
+            .commit_connect_batch(&[transition(tip(1), tip(2), vec![], vec![(key(2), coin(6))])])
+            .unwrap();
+        store
+            .commit_connect_batch(&[transition(tip(2), tip(3), vec![], vec![(key(3), coin(7))])])
+            .unwrap();
+        // Batches 1-2 hit the limit and are committing in the background;
+        // batch 3 waits in the accepting buffer.
+
+        // Compaction-style access waits for the running commit only.
+        let engine = store.inner_mut_settled().unwrap();
+        assert_eq!(engine.execution_tip().unwrap(), tip(2));
+        assert_eq!(engine.get(key(2)).unwrap(), Some(coin(6)));
+        assert_eq!(engine.get(key(3)).unwrap(), None);
+        assert!(!store.commit_in_progress());
+        assert_eq!(store.pending_blocks(), 1);
+        assert_eq!(store.execution_tip().unwrap(), tip(3));
+        assert_eq!(store.get(key(3)).unwrap(), Some(coin(7)));
+        assert_eq!(store.take_last_flush().map(|flush| flush.blocks), Some(2));
+
+        // Flushed access drains the buffer as before.
+        let engine = store.inner_mut_flushed().unwrap();
+        assert_eq!(engine.execution_tip().unwrap(), tip(3));
+        assert_eq!(engine.get(key(3)).unwrap(), Some(coin(7)));
+        assert_eq!(store.pending_blocks(), 0);
+        assert_eq!(store.take_last_flush().map(|flush| flush.blocks), Some(1));
     }
 
     #[test]

@@ -53,8 +53,9 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   is split into 64 independently locked shards that are seeded from the
   prefetch in parallel. Crash semantics and the overlay content digest are
   unchanged.
-- `--features mimalloc` builds `rbtcd` with mimalloc as the global
-  allocator. The asynchronous flush and the block pipeline put the
+- `rbtcd` uses mimalloc as its global allocator by default (feature
+  `mimalloc`, on by default; `--no-default-features` restores the system
+  allocator). The asynchronous flush and the block pipeline put the
   validation thread, the pipeline tail, the flush thread and the script
   threads on the system heap at once, and on Windows that heap serialised
   them: over mainnet 935,001–963,350 every stage with a new concurrent
@@ -64,6 +65,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   against the system-heap build, −62% against the 3,823 s baseline) with
   the same overlay content digest and every stage faster, validation
   included; redb finished in 1,583 s (73,564 tx/s, −35%).
+- Overlay compaction no longer drains the write-back layer: it waits for a
+  running background commit and keeps the buffered batches in memory,
+  because compaction reshapes the engine's file without changing its
+  content. The catch-up loop defers a compaction that would have to wait
+  for that commit unless the overlay is near its rebase threshold. On the
+  v8 lanes the forced flushes before compaction cost 107–119 s of waiting.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key
