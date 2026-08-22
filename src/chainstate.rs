@@ -254,6 +254,7 @@ pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
     script_flags: u32,
     csv_active: bool,
 ) -> Result<(AppliedTransaction, Vec<Utxo>), ChainstateError> {
+    let prepare_started = std::time::Instant::now();
     let prepared = prepare_transaction_with_context(
         store,
         transaction,
@@ -266,7 +267,20 @@ pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
         csv_active,
         false,
     )?;
-    let undo = store.apply_with_undo_fresh_outputs(&prepared.spent, &prepared.created)?;
+    crate::validation_profile::add(
+        crate::validation_profile::PREPARE,
+        prepare_started.elapsed(),
+    );
+    let apply_started = std::time::Instant::now();
+    let undo = store.apply_with_undo_fresh_outputs_from_prevouts(
+        &prepared.spent,
+        &prepared.prevouts,
+        &prepared.created,
+    )?;
+    crate::validation_profile::add(
+        crate::validation_profile::APPLY_UTXO,
+        apply_started.elapsed(),
+    );
     Ok((
         AppliedTransaction {
             txid: prepared.validated.txid,

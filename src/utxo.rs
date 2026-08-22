@@ -690,6 +690,22 @@ pub trait UtxoStore: Send + Sync {
     ) -> Result<UtxoUndo, UtxoError> {
         self.apply_with_undo(spent, created)
     }
+    /// Like [`Self::apply_with_undo_fresh_outputs`], for a caller that has
+    /// already loaded every spent coin and passes them in `spent` order.
+    ///
+    /// Validation loads each input once to check it and once more inside the
+    /// store to build undo; an in-memory overlay can take the loaded values
+    /// instead of looking them up again. The default ignores `prevouts` and
+    /// behaves exactly like the plain call, so durable stores are unaffected.
+    fn apply_with_undo_fresh_outputs_from_prevouts(
+        &self,
+        spent: &[OutPointKey],
+        prevouts: &[Utxo],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        let _ = prevouts;
+        self.apply_with_undo_fresh_outputs(spent, created)
+    }
     /// Reverses one prior mutation using its undo data.
     fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError>;
     /// Moves aged records from hot to cold without changing their consensus content.

@@ -351,6 +351,7 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
         false,
         None,
         None,
+        AppliedUndos::Keep,
     )
     .map(|(applied, _)| applied)
 }
@@ -378,6 +379,7 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
         true,
         None,
         None,
+        AppliedUndos::Keep,
     )
     .map(|(applied, _)| applied)
 }
@@ -404,6 +406,7 @@ pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
         true,
         Some(transaction_ids),
         None,
+        AppliedUndos::Keep,
     )
     .map(|(applied, _)| applied)
 }
@@ -457,6 +460,7 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
         now,
         hot_window_secs,
         deployments,
+        AppliedUndos::Keep,
     )
     .map(|(applied, _)| applied)
 }
@@ -481,6 +485,7 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
     now: u64,
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
+    applied_undos: AppliedUndos,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     connect_active_blocks_inner(
         chainstate,
@@ -492,6 +497,7 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
         true,
         Some(transaction_ids),
         Some(prefetched_utxos),
+        applied_undos,
     )
 }
 
@@ -525,6 +531,28 @@ pub struct ExecutionBreakdown {
     /// Folding each validated block into the batch overlay and building its
     /// transition.
     pub apply: Duration,
+    /// Inside `validate`: input loading and consensus checks per transaction.
+    pub validate_prepare: Duration,
+    /// Inside `validate`: writing each transaction into the block overlay.
+    pub validate_utxo: Duration,
+    /// Inside `validate`: folding the block overlay into its net change.
+    pub validate_net: Duration,
+    /// Inside `validate`: header, tip and BIP30 checks before the loop.
+    pub validate_checks: Duration,
+}
+
+/// Whether the executor must leave each block's undo records in its
+/// [`AppliedBlock`] as well as in the store transition.
+///
+/// Explorer and auxiliary indexes read them from the applied block; a bare
+/// catch-up does not, and cloning ~7,000 spent coins per block for nobody is
+/// a measurable share of `core-apply`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppliedUndos {
+    /// Keep a copy on the applied block (clone into the transition).
+    Keep,
+    /// Move the records into the transition; the applied block keeps none.
+    Drop,
 }
 
 fn external_batch_input_outpoints(
@@ -585,8 +613,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     structure_prevalidated: bool,
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
     prefetched_utxos: Option<ActiveBlockUtxoPrefetch>,
+    applied_undos: AppliedUndos,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     let mut breakdown = ExecutionBreakdown::default();
+    // Stale accumulators from an earlier failed batch on this thread must not
+    // leak into this batch's figures.
+    let _ = crate::validation_profile::take();
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
             blocks: blocks.len(),
@@ -656,7 +688,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             transaction_ids.map(|ids| ids[block_order].as_slice()),
         );
         breakdown.validate += validate_started.elapsed();
-        let (applied, changes, mut block_scripts) = match validated {
+        let [prepare, utxo, net_change, checks] = crate::validation_profile::take();
+        breakdown.validate_prepare += prepare;
+        breakdown.validate_utxo += utxo;
+        breakdown.validate_net += net_change;
+        breakdown.validate_checks += checks;
+        let (mut applied, changes, mut block_scripts) = match validated {
             Ok(validated) => validated,
             Err(error) => {
                 let script_failure = if let Some(batch) = script_batch.take() {
@@ -690,10 +727,10 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             next,
             spent: changes.spent,
             created: changes.created,
-            transaction_undos: if chainstate.retains_block_undo() {
-                applied.transaction_undos.clone()
-            } else {
-                Vec::new()
+            transaction_undos: match (chainstate.retains_block_undo(), applied_undos) {
+                (false, _) => Vec::new(),
+                (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                (true, AppliedUndos::Drop) => std::mem::take(&mut applied.transaction_undos),
             },
         });
         applied_blocks.push(applied);
@@ -765,6 +802,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     defer_scripts: bool,
     transaction_ids: Option<&[Txid]>,
 ) -> Result<(AppliedBlock, UtxoChanges, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
+    let checks_started = Instant::now();
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
@@ -791,6 +829,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let overlay = UtxoOverlay::new(chainstate);
     let exception_undo = apply_bip30_rules(&overlay, block, deployments)?;
+    crate::validation_profile::add(crate::validation_profile::CHECKS, checks_started.elapsed());
     let (mut applied, scripts) = if defer_scripts {
         if !structure_prevalidated {
             validate_block_structure_with_deployments(
@@ -867,7 +906,9 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     if let Some(undo) = exception_undo {
         applied.transaction_undos.insert(0, undo);
     }
+    let net_started = Instant::now();
     let transition = overlay.net_changes()?;
+    crate::validation_profile::add(crate::validation_profile::NET, net_started.elapsed());
     Ok((applied, transition, scripts))
 }
 
@@ -1085,6 +1126,59 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
                     self.load(&mut state, *outpoint)?.is_none(),
                     "fresh-output fast path was given an outpoint that already exists: {outpoint}"
                 );
+            }
+        }
+        for outpoint in spent {
+            state.current.insert(*outpoint, None);
+        }
+        for (outpoint, utxo) in created {
+            state.original.entry(*outpoint).or_insert(None);
+            state.current.insert(*outpoint, Some(utxo.clone()));
+        }
+        Ok(UtxoUndo::new(
+            undo_spent,
+            created.iter().map(|(outpoint, _)| *outpoint).collect(),
+        ))
+    }
+
+    fn apply_with_undo_fresh_outputs_from_prevouts(
+        &self,
+        spent: &[OutPointKey],
+        prevouts: &[Utxo],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        if prevouts.len() != spent.len() {
+            return Err(UtxoError::Malformed(
+                "prevout count does not match spent count",
+            ));
+        }
+        let mut state = self.state.lock().expect("overlay lock not poisoned");
+        let mut seen_spent = BTreeSet::new();
+        let mut undo_spent = Vec::with_capacity(spent.len());
+        for (outpoint, prevout) in spent.iter().zip(prevouts) {
+            if !seen_spent.insert(*outpoint) {
+                return Err(UtxoError::DuplicateSpend(*outpoint));
+            }
+            // The caller read this coin through `get` moments ago, so the
+            // overlay already caches its original; in a debug build make
+            // sure the handed-in value is that coin.
+            debug_assert_eq!(
+                state.cached(outpoint).cloned().flatten().as_ref(),
+                Some(prevout),
+                "prevout handed to the overlay differs from its cached coin: {outpoint}"
+            );
+            if state.cached(outpoint).is_none_or(Option::is_none) {
+                return Err(UtxoError::Missing(*outpoint));
+            }
+            undo_spent.push((*outpoint, prevout.clone()));
+        }
+        let mut seen_created = BTreeSet::new();
+        for (outpoint, _) in created {
+            if !seen_created.insert(*outpoint)
+                || (!seen_spent.contains(outpoint)
+                    && state.cached(outpoint).is_some_and(Option::is_some))
+            {
+                return Err(UtxoError::Duplicate(*outpoint));
             }
         }
         for outpoint in spent {
