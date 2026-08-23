@@ -731,6 +731,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     std::thread::scope(|scope| -> Result<(), BlockExecutionError> {
         let mut previous_delta: Option<Arc<PreparedDelta>> = None;
         let mut pending_tail: Option<std::thread::ScopedJoinHandle<'_, PipelineTail>> = None;
+        let mut pending_side: Option<std::thread::ScopedJoinHandle<'_, PipelineSide>> = None;
         for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
             let validate_started = Instant::now();
             let validated = {
@@ -755,8 +756,18 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             // The previous block's tail must land before its delta is
             // replaced, and its outputs go in first so the order holds.
             if let Some(tail) = pending_tail.take() {
-                let (transition, applied, [apply_elapsed, net, fold, submit]) =
+                let (mut transition, [apply_elapsed, net, fold]) =
                     tail.join().expect("pipeline tail thread must not panic")?;
+                let (mut applied, submit) = pending_side
+                    .take()
+                    .expect("the side helper is spawned with the tail")
+                    .join()
+                    .expect("pipeline side thread must not panic");
+                transition.transaction_undos = match (retains_undo, applied_undos) {
+                    (false, _) => Vec::new(),
+                    (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                    (true, AppliedUndos::Drop) => std::mem::take(&mut applied.transaction_undos),
+                };
                 transitions.push(transition);
                 applied_blocks.push(applied);
                 breakdown.apply += apply_elapsed;
@@ -799,6 +810,11 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let cumulative_ref = &cumulative;
             let script_sink = &script_sink;
             let parent_hash = current.hash;
+            // Two helpers per block, so that neither outlasts the next
+            // block's preparation: one derives the net change, folds it in
+            // and builds the transition; the other builds the undo records
+            // and hands the scripts to the pool. The undo records join the
+            // transition when both are collected.
             pending_tail = Some(scope.spawn(move || {
                 let started = Instant::now();
                 let changes = delta.net_changes();
@@ -806,20 +822,17 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                 let fold_started = Instant::now();
                 cumulative_ref.apply_validated_changes(&changes);
                 let fold_elapsed = fold_started.elapsed();
-                let mut applied = prepared.into_applied(retains_undo);
                 let transition = ConnectTransition {
                     expected_parent: parent_hash,
                     next,
                     spent: changes.spent,
                     created: changes.created,
-                    transaction_undos: match (retains_undo, applied_undos) {
-                        (false, _) => Vec::new(),
-                        (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
-                        (true, AppliedUndos::Drop) => {
-                            std::mem::take(&mut applied.transaction_undos)
-                        }
-                    },
+                    transaction_undos: Vec::new(),
                 };
+                Ok((transition, [started.elapsed(), net_elapsed, fold_elapsed]))
+            }));
+            pending_side = Some(scope.spawn(move || {
+                let applied = prepared.into_applied(retains_undo);
                 let submit_started = Instant::now();
                 {
                     let mut sink = script_sink.lock().expect("script sink lock not poisoned");
@@ -829,22 +842,23 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         sink.1.extend(block_scripts);
                     }
                 }
-                Ok((
-                    transition,
-                    applied,
-                    [
-                        started.elapsed(),
-                        net_elapsed,
-                        fold_elapsed,
-                        submit_started.elapsed(),
-                    ],
-                ))
+                (applied, submit_started.elapsed())
             }));
             current = next;
         }
         if let Some(tail) = pending_tail.take() {
-            let (transition, applied, [apply_elapsed, net, fold, submit]) =
+            let (mut transition, [apply_elapsed, net, fold]) =
                 tail.join().expect("pipeline tail thread must not panic")?;
+            let (mut applied, submit) = pending_side
+                .take()
+                .expect("the side helper is spawned with the tail")
+                .join()
+                .expect("pipeline side thread must not panic");
+            transition.transaction_undos = match (retains_undo, applied_undos) {
+                (false, _) => Vec::new(),
+                (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                (true, AppliedUndos::Drop) => std::mem::take(&mut applied.transaction_undos),
+            };
             transitions.push(transition);
             applied_blocks.push(applied);
             breakdown.apply += apply_elapsed;
@@ -1523,7 +1537,10 @@ impl<S: UtxoStore> UtxoStore for DeltaView<'_, S> {
 }
 
 /// What the pipeline tail hands back for one block.
-type PipelineTail = Result<(ConnectTransition, AppliedBlock, [Duration; 4]), UtxoError>;
+type PipelineTail = Result<(ConnectTransition, [Duration; 3]), UtxoError>;
+/// What the pipeline's second helper hands back: the applied block and the
+/// time spent handing its scripts to the pool.
+type PipelineSide = (AppliedBlock, Duration);
 
 /// A validated block's overlay shards, detached from their base.
 ///
