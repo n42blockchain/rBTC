@@ -2511,7 +2511,21 @@ struct ValidationLimits {
 
 #[derive(Default)]
 struct PrefetchedBlocks {
+    /// Blocks fetched ahead as bytes; decoded and validated by the next batch.
     serialized: Vec<Vec<u8>>,
+    /// Blocks a replay read-ahead already decoded and structure-validated,
+    /// in height order after `serialized`.
+    validated: Vec<PrevalidatedBlock>,
+}
+
+/// A block the read-ahead thread decoded, matched against the active chain
+/// and structure-validated, with the bytes it came from.
+struct PrevalidatedBlock {
+    block: Block,
+    hash: BlockHash,
+    deployments: BlockDeploymentContext,
+    transaction_ids: ValidatedBlockTransactionIds,
+    bytes: Vec<u8>,
 }
 
 impl Default for ValidationLimits {
@@ -15216,6 +15230,23 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         ));
     }
     blocks.extend(decoded_prefetch);
+    // Blocks the read-ahead validated skip structure validation below; they
+    // still have to be the blocks the active chain names at their heights.
+    let mut prevalidated = Vec::with_capacity(prefetched.validated.len());
+    for (index, prevalidated_block) in prefetched.validated.into_iter().enumerate() {
+        let position = blocks.len();
+        if position >= hashes.len() || prevalidated_block.hash != hashes[position] {
+            return Err(PeerRunError::transient(format!(
+                "prevalidated block {index} does not match the next active-chain batch"
+            )));
+        }
+        blocks.push(prevalidated_block.block);
+        prevalidated.push((
+            prevalidated_block.deployments,
+            prevalidated_block.transaction_ids,
+            prevalidated_block.bytes,
+        ));
+    }
     let mut offset = blocks.len();
     // The read-ahead may already have filled the whole batch.
     if let Some(replay) = replay.filter(|_| offset < hashes.len()) {
@@ -15302,8 +15333,18 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         }
     }
     let downloaded_at = Instant::now();
-    let validated_blocks =
-        validate_downloaded_blocks(deployment_config, headers, &expected, &blocks)?;
+    let validated_blocks = if prevalidated.len() == blocks.len() {
+        prevalidated
+    } else {
+        let rest = validate_downloaded_blocks(
+            deployment_config,
+            headers,
+            &expected[prevalidated.len()..],
+            &blocks[prevalidated.len()..],
+        )?;
+        prevalidated.extend(rest);
+        prevalidated
+    };
     let mut deployment_contexts = Vec::with_capacity(validated_blocks.len());
     let mut transaction_ids = Vec::with_capacity(validated_blocks.len());
     let mut serialized = Vec::with_capacity(validated_blocks.len());
@@ -15471,11 +15512,23 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             let ahead = read_ahead.map(|(replay, first, wanted)| {
                 scope.spawn(move || {
                     let started = Instant::now();
-                    let result = replay.read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES);
-                    (
-                        result.map(|batch| (batch.first_height, batch.blocks)),
-                        started.elapsed(),
-                    )
+                    let result = replay
+                        .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
+                        .map_err(|error| error.to_string())
+                        .and_then(|batch| {
+                            if batch.first_height != first {
+                                return Err(
+                                    "read-ahead batch starts at the wrong height".to_owned()
+                                );
+                            }
+                            prevalidate_replay_blocks(
+                                deployment_config,
+                                headers,
+                                first,
+                                batch.blocks,
+                            )
+                        });
+                    (result, started.elapsed())
                 })
             });
             let execution_result = connect_prevalidated_active_blocks_with_breakdown(
@@ -15504,17 +15557,20 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             execution_result.map_err(|error| PeerRunError::block(&error))?;
         // A failed read-ahead is not an error here: the next batch reads the
         // ledger itself and reports the failure where it can be acted on.
-        let downloaded_prefetch = match read_ahead_result {
-            Some(Ok((first_height, bytes)))
-                if read_ahead.is_some_and(|(_, first, _)| first == first_height) =>
-            {
-                bytes
+        let validated_prefetch = match read_ahead_result {
+            Some(Ok(blocks)) => blocks,
+            Some(Err(error)) => {
+                crate::rbtc_debug!("replay read-ahead dropped: {error}");
+                Vec::new()
             }
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         (
             applied_blocks,
-            downloaded_prefetch,
+            PrefetchedBlocks {
+                serialized: Vec::new(),
+                validated: validated_prefetch,
+            },
             Instant::now(),
             prefetch_elapsed,
             utxo_elapsed,
@@ -15620,7 +15676,10 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         };
         (
             applied_blocks,
-            downloaded_prefetch,
+            PrefetchedBlocks {
+                serialized: downloaded_prefetch,
+                validated: Vec::new(),
+            },
             execution_core_at,
             prefetch_elapsed,
             utxo_prefetch_elapsed,
@@ -15698,7 +15757,10 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         };
         (
             applied_blocks,
-            downloaded_prefetch,
+            PrefetchedBlocks {
+                serialized: downloaded_prefetch,
+                validated: Vec::new(),
+            },
             execution_core_at,
             prefetch_started.elapsed(),
             utxo_elapsed,
@@ -15706,9 +15768,12 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         )
     };
     let commit_profile = chainstate.take_commit_profile();
-    let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
-    carried_prefetch.extend(downloaded_prefetch);
+    let execution_prefetch_count = carried_prefetch.len()
+        + downloaded_prefetch.serialized.len()
+        + downloaded_prefetch.validated.len();
+    carried_prefetch.extend(downloaded_prefetch.serialized);
     prefetched_blocks.serialized = carried_prefetch;
+    prefetched_blocks.validated = downloaded_prefetch.validated;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
@@ -15933,6 +15998,52 @@ fn validate_downloaded_block(
         ))
     })?;
     Ok((deployments, transaction_ids, serialize(block)))
+}
+
+/// Decodes and structure-validates blocks a replay read ahead of execution,
+/// keeping the bytes they came from for staging.
+fn prevalidate_replay_blocks(
+    deployment_config: &DeploymentConfig,
+    headers: &HeaderDag,
+    first_height: u32,
+    serialized: Vec<Vec<u8>>,
+) -> Result<Vec<PrevalidatedBlock>, String> {
+    let mut validated = Vec::with_capacity(serialized.len());
+    for (offset, bytes) in serialized.into_iter().enumerate() {
+        let height = first_height
+            .checked_add(u32::try_from(offset).map_err(|_| "read-ahead offset".to_owned())?)
+            .ok_or_else(|| "read-ahead height overflow".to_owned())?;
+        let expected_hash = headers
+            .active_header_at(height)
+            .map(|header| header.hash)
+            .ok_or_else(|| format!("missing active header at height {height}"))?;
+        let block = deserialize::<Block>(&bytes).map_err(|error| error.to_string())?;
+        let hash = block.block_hash();
+        if hash != expected_hash {
+            return Err(format!(
+                "read-ahead block at height {height} is not on the active chain"
+            ));
+        }
+        let deployments =
+            block_deployment_context_for_headers(deployment_config, headers, height, hash)
+                .map_err(|error| error.to_string())?;
+        let transaction_ids = validate_block_structure_with_deployments_and_txids(
+            &block,
+            height,
+            deployments.bip34_active,
+            deployments.segwit_active,
+            deployments.signet_challenge.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        validated.push(PrevalidatedBlock {
+            block,
+            hash,
+            deployments,
+            transaction_ids,
+            bytes,
+        });
+    }
+    Ok(validated)
 }
 
 fn validate_downloaded_blocks(
@@ -19610,6 +19721,7 @@ mod tests {
         // Carried-over prefetch from an earlier batch. Appending behind it would
         // break the contiguous ascending run the execution path requires.
         let mut prefetched = PrefetchedBlocks {
+            validated: Vec::new(),
             serialized: vec![serialize(&genesis)],
         };
         stage_submitted_blocks(
