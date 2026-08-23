@@ -83,6 +83,11 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   the net change and the store transition from the prepared transactions.
   The per-block write into a block overlay, about a third of validation
   time, leaves the critical path; the single-block paths are unchanged.
+- Inside the last flush window before the catch-up ceiling the loop hands
+  the write-back buffer to the engine whenever no commit is running, so the
+  final flush it must wait for covers a batch or two instead of the whole
+  window (22 s instead of 87 s on the mainnet lanes). The batch log splits
+  `core-apply` into `core-apply-net` and `core-apply-fold`.
 - The MDBX capacity query (snapshot overlay and the MDBX chainstore) reads
   environment info and statistics through its own read transaction. The
   environment-level calls pass no transaction, and because the libmdbx

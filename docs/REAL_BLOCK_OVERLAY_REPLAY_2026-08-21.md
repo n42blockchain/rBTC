@@ -725,6 +725,14 @@ commit 02c5fb0 separately tapers the write-back flushes inside the last
 window before the ceiling so the final waited-for flush (85–87 s on every
 lane so far) covers a batch or two. Both are measured as v18.
 
+`mdbx-wb16-v18` (12:48Z, commits 564b766 + 02c5fb0): **1,062 s**
+(109,624 tx/s), digest `aadd289f…`. The taper did what it was meant to:
+the final waited-for flush covered 5 batches and 22 s instead of 15
+batches and 87 s. The burst fold left the stage split where v16 had it
+(prepare 205 s, fold 105 s), so v15's lower prepare was variance rather
+than lock contention. Against the btcdmdbx pipeline's 1,318 s (1,400 s
+durable) on the same window and host, MDBX is now 19% faster.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
