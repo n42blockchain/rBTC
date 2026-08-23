@@ -186,7 +186,7 @@ fn script_validation_pool() -> &'static ScriptValidationPool {
 
 /// A checkpoint-wide producer/consumer session that overlaps sequential UTXO
 /// construction with immutable script validation.
-pub(crate) struct DeferredScriptBatch {
+pub struct DeferredScriptBatch {
     result: mpsc::Sender<ScriptValidationResult>,
     results: mpsc::Receiver<ScriptValidationResult>,
     work_items: usize,

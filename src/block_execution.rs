@@ -362,6 +362,7 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
         None,
         None,
         AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -390,6 +391,7 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
         None,
         None,
         AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -417,6 +419,7 @@ pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
         Some(transaction_ids),
         None,
         AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -498,6 +501,7 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
         hot_window_secs,
         deployments,
         AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -523,6 +527,7 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
     applied_undos: AppliedUndos,
+    script_carry: Option<&mut Vec<DeferredScriptBatch>>,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     connect_active_blocks_inner(
         chainstate,
@@ -535,6 +540,7 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
         Some(transaction_ids),
         Some(prefetched_utxos),
         applied_undos,
+        script_carry,
     )
 }
 
@@ -668,6 +674,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
     prefetched_utxos: Option<ActiveBlockUtxoPrefetch>,
     applied_undos: AppliedUndos,
+    mut script_carry: Option<&mut Vec<DeferredScriptBatch>>,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     let mut breakdown = ExecutionBreakdown::default();
     // Stale accumulators from an earlier failed batch on this thread must not
@@ -968,9 +975,26 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }
     }
     if let Some((failed_index, error)) = failure {
-        if let Some((block_order, index, source)) =
-            drain_script_batches(script_batches, serial_scripts)
-        {
+        // Carried batches belong to blocks before this whole batch, so their
+        // failure always outranks the validation error; this batch's own
+        // scripts outrank it only when they belong to an earlier block.
+        let carried = script_carry
+            .as_deref_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if let Some((_, index, source)) = drain_script_batches(carried, Vec::new()) {
+            return Err(BlockExecutionError::Block(BlockError::Transaction {
+                index,
+                source: source.into(),
+            }));
+        }
+        let own = script_batches
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = serial_scripts
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((block_order, index, source)) = drain_script_batches(own, serial) {
             if block_order < failed_index {
                 return Err(BlockExecutionError::Block(BlockError::Transaction {
                     index,
@@ -1046,7 +1070,23 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let _ = current;
 
     let wait_started = Instant::now();
-    let script_failure = drain_script_batches(script_batches, serial_scripts);
+    let own_batches = script_batches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let serial = serial_scripts
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let script_failure = if let Some(carry) = script_carry {
+        // The scripts of the previous batch had this whole batch to verify
+        // in the background; settle their verdict now and leave this batch's
+        // to the next call. Nothing here becomes durable before the verdict:
+        // the write-back flush trails by many batches.
+        let previous = std::mem::take(carry);
+        *carry = own_batches;
+        drain_script_batches(previous, serial)
+    } else {
+        drain_script_batches(own_batches, serial)
+    };
     breakdown.script_wait = wait_started.elapsed();
     if let Some((_, index, source)) = script_failure {
         return Err(BlockExecutionError::Block(BlockError::Transaction {
@@ -1384,15 +1424,12 @@ type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
 /// Every version each key takes across a batch, tagged by the block index
 /// that wrote it, in block order.
 type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
-/// Waits for every worker's script batch and returns the first failure by
-/// batch order, verifying any serially collected checks as block zero.
-fn drain_script_batches(
-    batches: Mutex<Vec<DeferredScriptBatch>>,
-    serial: Mutex<Vec<DeferredScriptCheck<'_>>>,
+/// Waits for every script batch and returns the first failure by batch
+/// order, verifying any serially collected checks as block zero.
+pub(crate) fn drain_script_batches(
+    batches: Vec<DeferredScriptBatch>,
+    serial: Vec<DeferredScriptCheck<'_>>,
 ) -> Option<(usize, usize, ConsensusError)> {
-    let batches = batches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut first = None;
     for batch in batches {
         if let Some(failure) = batch.finish_with_order() {
@@ -1404,9 +1441,6 @@ fn drain_script_batches(
             }
         }
     }
-    let serial = serial
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((index, source)) = verify_deferred_scripts(serial) {
         if first
             .as_ref()

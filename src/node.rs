@@ -94,10 +94,12 @@ use rbtc::{
         ActiveBlockUtxoPrefetch, BlockDeploymentContext, BlockExecutionError,
         connect_prevalidated_active_blocks_with_breakdown,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
-        prefetch_active_block_utxos_from, prefetch_prevalidated_active_block_utxos,
+        drain_script_batches, prefetch_active_block_utxos_from,
+        prefetch_prevalidated_active_block_utxos,
     },
     blockchain::{
-        AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
+        AppliedBlock, BlockError, DeferredScriptBatch, ValidatedBlockTransactionIds,
+        validate_block_structure_with_deployments,
         validate_block_structure_with_deployments_and_txids,
     },
     chain_store::{
@@ -11972,6 +11974,8 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
     let mut auxiliary_session = None;
     let mut prefetched_blocks = PrefetchedBlocks::default();
+    // Script batches whose verdict the replay path deferred by one batch.
+    let mut script_carry = Vec::new();
     // File size immediately after the last compaction, whatever it released.
     // Compaction rewrites every surviving byte, so repeating it before
     // meaningful garbage has re-accumulated costs far more than it returns —
@@ -12112,6 +12116,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             options.validation_limits.max_blocks_per_batch,
             &mut auxiliary_session,
             &mut prefetched_blocks,
+            &mut script_carry,
             replay.is_none(),
             replay.as_ref(),
             None,
@@ -12120,6 +12125,18 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         while let Some(flush) = chainstate.take_write_back_flush() {
             log_write_back_flush(&flush);
         }
+    }
+    // The last batch's script verdict is still outstanding on the replay
+    // path; settle it before anything becomes durable.
+    if let Some((_, index, source)) =
+        drain_script_batches(std::mem::take(&mut script_carry), Vec::new())
+    {
+        return Err(PeerRunError::block(&BlockExecutionError::Block(
+            BlockError::Transaction {
+                index,
+                source: source.into(),
+            },
+        )));
     }
     // Whatever the write-back layer still holds becomes durable before the
     // run reports its tip; a run that errored out above re-executes the
@@ -13514,6 +13531,7 @@ async fn sync_validating_node(
             server.ensure_running().await?;
         }
         let mut prefetched_blocks = PrefetchedBlocks::default();
+        let mut script_carry = Vec::new();
         let mut awaiting_submissions = Vec::new();
         loop {
             if let Some(server) = &mut api_server {
@@ -13995,6 +14013,7 @@ async fn sync_validating_node(
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
                 &mut prefetched_blocks,
+                &mut script_carry,
                 overlap_next_download,
                 None,
                 zmq_notifier,
@@ -15162,6 +15181,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     maximum_batch_size: usize,
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     prefetched_blocks: &mut PrefetchedBlocks,
+    script_carry: &mut Vec<DeferredScriptBatch>,
     prefetch_next_batch: bool,
     replay: Option<&PrunedBlockLedger>,
     zmq_notifier: Option<&ZmqNotifier>,
@@ -15578,6 +15598,10 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                 DEFAULT_HOT_WINDOW_SECS,
                 &deployment_contexts,
                 applied_undos,
+                // The replay path settles each batch's script verdict one
+                // batch later, giving the pool a whole batch of background
+                // time; nothing is durable before the verdict.
+                replay.and(Some(&mut *script_carry)),
             );
             let (read_ahead_result, prefetch_elapsed) = match ahead {
                 Some(handle) => {
@@ -15672,6 +15696,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                             DEFAULT_HOT_WINDOW_SECS,
                             &deployment_contexts,
                             applied_undos,
+                            None,
                         ))
                     }
                     (Ok(()), Err(error)) => Some(Err(error)),
@@ -15776,6 +15801,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             DEFAULT_HOT_WINDOW_SECS,
             &deployment_contexts,
             applied_undos,
+            None,
         )
         .map_err(|error| PeerRunError::block(&error))?;
         let execution_core_at = Instant::now();
