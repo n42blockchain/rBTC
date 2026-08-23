@@ -265,7 +265,19 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
         let started_one = self.start_flush()?;
         let waited_started = Instant::now();
         let settled = self.wait_in_flight(waited_started)?;
-        Ok(if started_one { settled } else { None })
+        if !started_one {
+            // Nothing new was committed; a commit that was still running is
+            // now recorded for `take_last_flush` like any other.
+            return Ok(None);
+        }
+        // The record is handed to the caller rather than left for
+        // `take_last_flush`, so it is reported once.
+        let _ = self
+            .finished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        Ok(settled)
     }
 
     /// Hands the accepting buffer to a background commit without waiting.
