@@ -12105,14 +12105,11 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     // Whatever the write-back layer still holds becomes durable before the
     // run reports its tip; a run that errored out above re-executes the
     // unflushed blocks from the ledger on its next start.
-    if let Some(flush) = chainstate
+    chainstate
         .flush_pending()
-        .map_err(PeerRunError::transient)?
-    {
-        log_write_back_flush(&flush);
-    }
-    // A commit that landed while the final flush was being started is
-    // recorded but not yet reported.
+        .map_err(PeerRunError::transient)?;
+    // Every commit is reported from the finished list, including the one
+    // the final flush waited for and one that landed while it was started.
     while let Some(flush) = chainstate.take_write_back_flush() {
         log_write_back_flush(&flush);
     }

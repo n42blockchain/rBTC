@@ -153,13 +153,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
     ///
     /// Fails if the flush fails; the buffer is kept.
     pub fn inner_mut_flushed(&mut self) -> Result<&mut C, ChainStoreError> {
-        if let Some(flush) = self.flush()? {
-            // Nobody logs the record here; leave it for `take_last_flush`.
-            self.finished
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(flush);
-        }
+        self.flush()?;
         Arc::get_mut(&mut self.inner).ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
             "write-back store is still shared with a background commit",
         )))
@@ -271,19 +265,9 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
         let started_one = self.start_flush()?;
         let waited_started = Instant::now();
         let settled = self.wait_in_flight(waited_started)?;
-        if !started_one {
-            // Nothing new was committed; a commit that was still running is
-            // now recorded for `take_last_flush` like any other.
-            return Ok(None);
-        }
-        // The record is handed to the caller rather than left for
-        // `take_last_flush`, so it is reported once.
-        let _ = self
-            .finished
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
-        Ok(settled)
+        // The record stays in the finished list as well: callers that do not
+        // report it themselves harvest it with `take_last_flush`.
+        Ok(if started_one { settled } else { None })
     }
 
     /// Hands the accepting buffer to a background commit without waiting.
