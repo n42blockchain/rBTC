@@ -782,6 +782,36 @@ MDBX lane is now 30% faster; against the 3,823 s of the first MDBX lane
 two days earlier it is 4.2× faster, with the same overlay content every
 time.
 
+### v24: one fold, owned by the buffer (2026-08-23 20:38Z)
+
+Commit 644593f. Coins entering the write-back buffer were cloned into
+its created map while the transitions kept their own copies, and the
+flush re-folded the whole window from those transitions. The buffer now
+drains each transition's coins as it folds and the flush hands the
+engine the net change it already holds, sorted, through a new
+`commit_connect_folded`. `mdbx-wb16-v24`: **895 s** (130,143 tx/s),
+digest `aadd289f…`, peak working set 31.8 → 25.9 GiB, the flush
+thread's fold stage gone. `redb-wb16-v24`: 1,232 s, working set
+28.5 → 21.4 GiB. Reworking the in-flight test deterministically along
+the way documented a real property: a coin created and spent inside one
+buffered window cancels and is unknown to the buffers by design.
+
+### v25: the batch prepared in parallel (2026-08-23 21:2xZ)
+
+Commit e5e5c45. What a block does to the coin set — the coins it
+creates, with their final values and scripts, and the keys it spends —
+follows from its raw transactions alone. A batch is now prepared in
+three phases: workers derive every block's transaction-level delta and
+the main thread merges them, in block order, into one versioned view of
+the batch; eight workers then prepare all 256 blocks at once, each
+resolving a key from the latest version an earlier block left (never a
+later one) or from the prefetched batch overlay; workers finally build
+transitions, undo records and script hand-offs, collected in order. The
+sequential prepare pipeline, its delta hand-off and the batch-overlay
+fold are gone. On the smoke ledger `core-validate` fell 2.4 → 0.9 s per
+256-block batch with the digest unchanged; the full-window lanes are
+running.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
