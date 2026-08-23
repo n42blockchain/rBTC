@@ -716,6 +716,15 @@ inputs and checking transactions). The two stages are still close to
 balanced, so the fold is the next target; commit 623470a groups a block's
 keys by shard and takes each shard lock once per block (v16).
 
+`mdbx-wb16-v16` (11:47Z, commit 623470a — one shard lock per block):
+**1,118 s** (104,133 tx/s), digest `aadd289f…`. The fold fell 130 → 103 s,
+but `core-validate-prepare` rose 167 → 206 s: a shard lock held for a
+block's whole share of inserts makes the validation thread's reads on that
+shard wait. Commit 564b766 takes each shard for at most 64 keys at a time;
+commit 02c5fb0 separately tapers the write-back flushes inside the last
+window before the ceiling so the final waited-for flush (85–87 s on every
+lane so far) covers a batch or two. Both are measured as v18.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
