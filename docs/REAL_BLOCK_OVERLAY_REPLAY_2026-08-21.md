@@ -654,6 +654,29 @@ both capacity queries open a read transaction for them) is measured as
 v13. Nothing else in the code base calls the environment-level
 `info()`/`stat()`.
 
+### v13 measured, with a control (2026-08-23 05:44Z–07:55Z)
+
+Four MDBX lanes with the fix and one control, all digest `aadd289f…`, no
+crash, no logged commit failure, the debug-output listener armed:
+
+| lane | binary | catch-up | note |
+|---|---|---|---|
+| mdbx-wb16-v13 | v13 | 1,392 s | cold page cache after the 16 GiB redb lane |
+| mdbx-wb16-v13b | v13 | 1,363 s | |
+| mdbx-wb16-v13c | v13 | 1,359 s | warm, back-to-back with v13b |
+| mdbx-wb16-v11c | v11 (pre-fix) | 1,285 s | control, same host state |
+| redb-wb16-v13 | v13 | 1,585 s | redb, same as v12's 1,570 s |
+
+The control settles the question the slower v13 numbers raised: the same
+v11 binary that ran 1,165 s and 1,170 s before the power cut takes 1,285 s
+after it, with single-threaded validation 402 → 473 s, so the host itself
+is about 10% slower since the reboot (the active power plan reads
+"Balanced"; nothing was recorded before). Against that control v13 is 6%
+slower, inside the run-to-run variance measured earlier; the fix costs one
+read transaction per batch and nothing visible. With the root cause fixed,
+the 1,165–1,170 s of v11 stands as the window's best MDBX time on the
+pre-reboot host, and v13 is the build to carry forward.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
