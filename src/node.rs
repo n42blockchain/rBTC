@@ -15448,23 +15448,77 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
-            chainstate,
-            headers,
-            &blocks,
-            &transaction_ids,
-            prefetched_utxos,
-            now,
-            DEFAULT_HOT_WINDOW_SECS,
-            &deployment_contexts,
-            applied_undos,
-        )
-        .map_err(|error| PeerRunError::block(&error))?;
+        // A replay reads the next batch from the ledger while this one
+        // executes, the way the networked path downloads it: the bytes land
+        // in the prefetch buffer and the next batch starts from them.
+        let read_ahead = replay.and_then(|replay| {
+            let last_height = expected
+                .last()
+                .expect("non-empty block batch has a last header")
+                .height;
+            let carried_len =
+                u32::try_from(carried_prefetch.len()).expect("validation prefetch length fits u32");
+            let carried_height = last_height.checked_add(carried_len)?;
+            let remaining = execution_ceiling.checked_sub(carried_height)?;
+            let wanted = u32::try_from(
+                validation_prefetch_limit(maximum_batch_size)
+                    .saturating_sub(carried_prefetch.len()),
+            )
+            .unwrap_or(u32::MAX)
+            .min(remaining);
+            let first = carried_height.checked_add(1)?;
+            (wanted > 0).then_some((replay, first, wanted))
+        });
+        let (execution_result, read_ahead_result, prefetch_elapsed) = std::thread::scope(|scope| {
+            let ahead = read_ahead.map(|(replay, first, wanted)| {
+                scope.spawn(move || {
+                    let started = Instant::now();
+                    let result = replay.read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES);
+                    (
+                        result.map(|batch| (batch.first_height, batch.blocks)),
+                        started.elapsed(),
+                    )
+                })
+            });
+            let execution_result = connect_prevalidated_active_blocks_with_breakdown(
+                chainstate,
+                headers,
+                &blocks,
+                &transaction_ids,
+                prefetched_utxos,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                &deployment_contexts,
+                applied_undos,
+            );
+            let (read_ahead_result, prefetch_elapsed) = match ahead {
+                Some(handle) => {
+                    let (result, elapsed) = handle
+                        .join()
+                        .expect("scoped replay read-ahead thread must not panic");
+                    (Some(result), elapsed)
+                }
+                None => (None, Duration::ZERO),
+            };
+            (execution_result, read_ahead_result, prefetch_elapsed)
+        });
+        let (applied_blocks, breakdown) =
+            execution_result.map_err(|error| PeerRunError::block(&error))?;
+        // A failed read-ahead is not an error here: the next batch reads the
+        // ledger itself and reports the failure where it can be acted on.
+        let downloaded_prefetch = match read_ahead_result {
+            Some(Ok((first_height, bytes)))
+                if read_ahead.is_some_and(|(_, first, _)| first == first_height) =>
+            {
+                bytes
+            }
+            _ => Vec::new(),
+        };
         (
             applied_blocks,
-            Vec::new(),
+            downloaded_prefetch,
             Instant::now(),
-            Duration::ZERO,
+            prefetch_elapsed,
             utxo_elapsed,
             breakdown,
         )
