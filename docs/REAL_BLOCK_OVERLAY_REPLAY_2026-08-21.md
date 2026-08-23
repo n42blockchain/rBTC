@@ -613,6 +613,14 @@ v10e (assertion build), the power-loss resume and v12b all completed with
 the same digest and without a logged commit failure — five clean runs,
 zero reproductions, the DBWIN listener armed throughout.
 
+`redb-wb16-v12-cap16` (05:01Z, the same binary with a 16 GiB overlay
+budget): 1,557 s (74,815 tx/s), digest `aadd289f…`, one compaction instead
+of six and no waits apart from the final flush — yet no faster than the
+10 GiB run (1,570 s), because `utxo-prefetch` rose from 187 s to 347 s: the
+larger, rarely compacted redb file answers the per-batch overlay reads more
+slowly than the smaller one did. redb's remaining cost on this window is
+its own file, not the loop; MDBX finishes the same work in 1,165–1,249 s.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
