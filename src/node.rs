@@ -12111,6 +12111,11 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     {
         log_write_back_flush(&flush);
     }
+    // A commit that landed while the final flush was being started is
+    // recorded but not yet reported.
+    while let Some(flush) = chainstate.take_write_back_flush() {
+        log_write_back_flush(&flush);
+    }
     let tip = chainstate
         .execution_tip()
         .map_err(|error| error.to_string())?;
