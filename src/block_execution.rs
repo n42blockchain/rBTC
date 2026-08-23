@@ -1125,6 +1125,8 @@ const OVERLAY_SHARDS: usize = 64;
 /// than fanning out.
 const PARALLEL_SEED_THRESHOLD: usize = 65_536;
 
+/// Keys folded into a batch-overlay shard per lock acquisition.
+const FOLD_BURST: usize = 64;
 /// Threads used to seed a large prefetch; each owns a contiguous shard range.
 const SEED_WORKERS: usize = 8;
 
@@ -1599,20 +1601,25 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
         for entry in &changes.created {
             created_by_shard[overlay_shard(&entry.0)].push(entry);
         }
+        // Each shard is taken in short bursts: a reader on the validation
+        // thread that needs the same shard waits for a burst, not for the
+        // whole block's worth of inserts.
         for (shard, (spent, created)) in self
             .shards
             .iter()
             .zip(spent_by_shard.into_iter().zip(created_by_shard))
         {
-            if spent.is_empty() && created.is_empty() {
-                continue;
+            for burst in spent.chunks(FOLD_BURST) {
+                let mut state = shard.lock().expect("overlay lock not poisoned");
+                for outpoint in burst {
+                    state.current.insert(*outpoint, None);
+                }
             }
-            let mut state = shard.lock().expect("overlay lock not poisoned");
-            for outpoint in spent {
-                state.current.insert(outpoint, None);
-            }
-            for (outpoint, utxo) in created {
-                state.current.insert(*outpoint, Some(utxo.clone()));
+            for burst in created.chunks(FOLD_BURST) {
+                let mut state = shard.lock().expect("overlay lock not poisoned");
+                for (outpoint, utxo) in burst {
+                    state.current.insert(*outpoint, Some(utxo.clone()));
+                }
             }
         }
     }
