@@ -540,6 +540,11 @@ pub struct ExecutionBreakdown {
     pub validate_net: Duration,
     /// Inside `validate`: header, tip and BIP30 checks before the loop.
     pub validate_checks: Duration,
+    /// Inside `apply`: deriving the block's net change from its prepared
+    /// transactions.
+    pub apply_net: Duration,
+    /// Inside `apply`: folding the net change into the batch overlay.
+    pub apply_fold: Duration,
 }
 
 /// Whether the executor must leave each block's undo records in its
@@ -700,11 +705,13 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             // The previous block's tail must land before its delta is
             // replaced, and its outputs go in first so the order holds.
             if let Some(tail) = pending_tail.take() {
-                let (transition, applied, apply_elapsed) =
+                let (transition, applied, [apply_elapsed, net, fold]) =
                     tail.join().expect("pipeline tail thread must not panic")?;
                 transitions.push(transition);
                 applied_blocks.push(applied);
                 breakdown.apply += apply_elapsed;
+                breakdown.apply_net += net;
+                breakdown.apply_fold += fold;
             }
             let (prepared, delta, mut block_scripts) = match validated {
                 Ok(validated) => validated,
@@ -740,7 +747,10 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             pending_tail = Some(scope.spawn(move || {
                 let started = Instant::now();
                 let changes = delta.net_changes();
+                let net_elapsed = started.elapsed();
+                let fold_started = Instant::now();
                 cumulative_ref.apply_validated_changes(&changes);
+                let fold_elapsed = fold_started.elapsed();
                 let mut applied = prepared.into_applied(retains_undo);
                 let transition = ConnectTransition {
                     expected_parent: parent_hash,
@@ -755,7 +765,11 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         }
                     },
                 };
-                Ok((transition, applied, started.elapsed()))
+                Ok((
+                    transition,
+                    applied,
+                    [started.elapsed(), net_elapsed, fold_elapsed],
+                ))
             }));
             let submit_started = Instant::now();
             if let Some(batch) = &mut script_batch {
@@ -767,11 +781,13 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             current = next;
         }
         if let Some(tail) = pending_tail.take() {
-            let (transition, applied, apply_elapsed) =
+            let (transition, applied, [apply_elapsed, net, fold]) =
                 tail.join().expect("pipeline tail thread must not panic")?;
             transitions.push(transition);
             applied_blocks.push(applied);
             breakdown.apply += apply_elapsed;
+            breakdown.apply_net += net;
+            breakdown.apply_fold += fold;
         }
         Ok(())
     })?;
@@ -1442,7 +1458,7 @@ impl<S: UtxoStore> UtxoStore for DeltaView<'_, S> {
 }
 
 /// What the pipeline tail hands back for one block.
-type PipelineTail = Result<(ConnectTransition, AppliedBlock, Duration), UtxoError>;
+type PipelineTail = Result<(ConnectTransition, AppliedBlock, [Duration; 3]), UtxoError>;
 
 /// A validated block's overlay shards, detached from their base.
 ///
@@ -1567,16 +1583,18 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
         }
     }
 
+    /// Folds a block's net change in. The batch overlay's own net change is
+    /// never read on the pipelined path — the blocks carry their transitions
+    /// — so only `current` is maintained: reads consult it first, and a key
+    /// the block wrote needs no `original` entry to be answered correctly.
     fn apply_validated_changes(&self, changes: &UtxoChanges) {
         for outpoint in &changes.spent {
-            let mut state = self.shard(outpoint);
-            state.original.entry(*outpoint).or_insert(None);
-            state.current.insert(*outpoint, None);
+            self.shard(outpoint).current.insert(*outpoint, None);
         }
         for (outpoint, utxo) in &changes.created {
-            let mut state = self.shard(outpoint);
-            state.original.entry(*outpoint).or_insert(None);
-            state.current.insert(*outpoint, Some(utxo.clone()));
+            self.shard(outpoint)
+                .current
+                .insert(*outpoint, Some(utxo.clone()));
         }
     }
 

@@ -15674,7 +15674,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-validate-prepare={}ms core-validate-utxo={}ms core-validate-net={}ms core-validate-checks={}ms core-apply={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-validate-prepare={}ms core-validate-utxo={}ms core-validate-net={}ms core-validate-checks={}ms core-apply={}ms core-apply-net={}ms core-apply-fold={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -15693,6 +15693,8 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         breakdown.validate_net.as_millis(),
         breakdown.validate_checks.as_millis(),
         breakdown.apply.as_millis(),
+        breakdown.apply_net.as_millis(),
+        breakdown.apply_fold.as_millis(),
         breakdown.submit.as_millis(),
         breakdown.script_wait.as_millis(),
         breakdown.commit.as_millis(),
