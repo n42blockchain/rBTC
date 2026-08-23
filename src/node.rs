@@ -11682,6 +11682,12 @@ trait OverlayCatchupStore: ExecutionChainStore {
     fn overlay_compact_would_wait(&self) -> bool {
         false
     }
+    /// Hands the write-back buffer to the engine now if no commit is
+    /// running, without waiting. The loop uses this inside the last flush
+    /// window before the ceiling so the final, waited-for flush stays small.
+    fn start_write_back_flush_if_idle(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     fn engine_name(&self) -> &'static str;
     /// Commits anything a write-back layer still holds in memory.
     ///
@@ -11734,6 +11740,13 @@ impl<C: OverlayCatchupStore + 'static> OverlayCatchupStore for WriteBackChainsta
 
     fn overlay_compact_would_wait(&self) -> bool {
         self.commit_in_progress()
+    }
+
+    fn start_write_back_flush_if_idle(&self) -> Result<bool, String> {
+        if self.commit_in_progress() || self.pending_blocks() == 0 {
+            return Ok(false);
+        }
+        self.start_flush().map_err(|error| error.to_string())
     }
 
     fn engine_name(&self) -> &'static str {
@@ -11988,6 +12001,19 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         };
         if tip.height >= ceiling {
             break;
+        }
+        // Inside the last flush window before the ceiling, hand each batch
+        // to the engine as soon as the previous commit has landed: the loop
+        // never waits here, and the flush it must wait for at the end then
+        // covers a batch or two instead of the whole window.
+        let taper_blocks = u64::from(overlay.flush_batches)
+            .saturating_mul(options.validation_limits.max_blocks_per_batch as u64);
+        if u64::from(ceiling.saturating_sub(tip.height)) <= taper_blocks
+            && chainstate
+                .start_write_back_flush_if_idle()
+                .map_err(PeerRunError::transient)?
+        {
+            crate::rbtc_debug!("tapering write-back flushes towards the ceiling");
         }
         let base_height = chainstate.overlay_base_identity().height;
         // Reclaiming space in place is far cheaper than folding the overlay
