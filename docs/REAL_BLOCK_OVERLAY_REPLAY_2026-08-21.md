@@ -588,6 +588,31 @@ write-back layer's crash contract exercised by an actual power cut, with
 the asynchronous flush, the pipeline and the non-blocking buffer all in
 place.
 
+### v12: the non-blocking buffer, measured (2026-08-23 00:24Z–01:17Z, first lanes after the reboot)
+
+`mdbx-wb16-v12b`: 1,249 s (93,242 tx/s), digest `aadd289f…`. Every flush
+stayed at sixteen batches with no waiting — on MDBX each commit already
+lands inside the next sixteen-batch window, so 289ebc1 changes nothing
+there; the +7% against v11a is the cold page cache after the reboot
+(prefetch 145 → 169 s) plus ordinary variance. `redb-wb16-v12`: 1,570 s
+(74,208 tx/s), digest `aadd289f…`. Its flushes also stayed at sixteen
+batches, and the loop still waited 10–30 s at five of the seven — but not
+in `start_flush`: every one of those waits sits next to a compaction. redb
+reclaims far less than MDBX (8.6 → 5.4–6.3 GB against MDBX's 7.5 → 3–4.9 GB
+for the same content), so the overlay hovers at 80–86% of the 10 GiB
+budget, and with the in-flight buffer counted in `used_bytes` the loop's
+"compaction may not be deferred at or above the rebase threshold" guard
+fires and compaction waits for the running commit. The wait is therefore
+the engine's space efficiency, not the buffer. Two ways out, both
+configuration rather than code: a larger redb budget (its ceiling is
+policy, unlike MDBX's geometry) or a lower compaction trigger so redb
+compacts earlier; neither was run tonight.
+
+Crash accounting for the MDBX write path since the v10 crash: v11a, v11b,
+v10e (assertion build), the power-loss resume and v12b all completed with
+the same digest and without a logged commit failure — five clean runs,
+zero reproductions, the DBWIN listener armed throughout.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
