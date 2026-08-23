@@ -725,6 +725,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // over the batch overlay while a helper thread folds N's delta into that
     // overlay and builds N's transition. Each block still sees exactly the
     // state its predecessor left, and the transitions are collected in order.
+    // The tail hands each block's scripts to the pool as well; the sink is
+    // shared with the loop's error path, which drains it in place.
+    let script_sink = Mutex::new((&mut script_batch, &mut deferred_scripts));
     std::thread::scope(|scope| -> Result<(), BlockExecutionError> {
         let mut previous_delta: Option<Arc<PreparedDelta>> = None;
         let mut pending_tail: Option<std::thread::ScopedJoinHandle<'_, PipelineTail>> = None;
@@ -752,21 +755,25 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             // The previous block's tail must land before its delta is
             // replaced, and its outputs go in first so the order holds.
             if let Some(tail) = pending_tail.take() {
-                let (transition, applied, [apply_elapsed, net, fold]) =
+                let (transition, applied, [apply_elapsed, net, fold, submit]) =
                     tail.join().expect("pipeline tail thread must not panic")?;
                 transitions.push(transition);
                 applied_blocks.push(applied);
                 breakdown.apply += apply_elapsed;
                 breakdown.apply_net += net;
                 breakdown.apply_fold += fold;
+                breakdown.submit += submit;
             }
             let (prepared, delta, mut block_scripts) = match validated {
                 Ok(validated) => validated,
                 Err(error) => {
-                    let script_failure = if let Some(batch) = script_batch.take() {
-                        batch.finish()
-                    } else {
-                        verify_deferred_scripts(std::mem::take(&mut deferred_scripts))
+                    let script_failure = {
+                        let mut sink = script_sink.lock().expect("script sink lock not poisoned");
+                        if let Some(batch) = sink.0.take() {
+                            batch.finish()
+                        } else {
+                            verify_deferred_scripts(std::mem::take(sink.1))
+                        }
                     };
                     if let Some((index, source)) = script_failure {
                         return Err(BlockExecutionError::Block(BlockError::Transaction {
@@ -790,6 +797,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let delta = Arc::new(delta);
             previous_delta = Some(Arc::clone(&delta));
             let cumulative_ref = &cumulative;
+            let script_sink = &script_sink;
             let parent_hash = current.hash;
             pending_tail = Some(scope.spawn(move || {
                 let started = Instant::now();
@@ -812,29 +820,37 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         }
                     },
                 };
+                let submit_started = Instant::now();
+                {
+                    let mut sink = script_sink.lock().expect("script sink lock not poisoned");
+                    if let Some(batch) = sink.0.as_mut() {
+                        batch.submit(block_scripts);
+                    } else {
+                        sink.1.extend(block_scripts);
+                    }
+                }
                 Ok((
                     transition,
                     applied,
-                    [started.elapsed(), net_elapsed, fold_elapsed],
+                    [
+                        started.elapsed(),
+                        net_elapsed,
+                        fold_elapsed,
+                        submit_started.elapsed(),
+                    ],
                 ))
             }));
-            let submit_started = Instant::now();
-            if let Some(batch) = &mut script_batch {
-                batch.submit(block_scripts);
-            } else {
-                deferred_scripts.extend(block_scripts);
-            }
-            breakdown.submit += submit_started.elapsed();
             current = next;
         }
         if let Some(tail) = pending_tail.take() {
-            let (transition, applied, [apply_elapsed, net, fold]) =
+            let (transition, applied, [apply_elapsed, net, fold, submit]) =
                 tail.join().expect("pipeline tail thread must not panic")?;
             transitions.push(transition);
             applied_blocks.push(applied);
             breakdown.apply += apply_elapsed;
             breakdown.apply_net += net;
             breakdown.apply_fold += fold;
+            breakdown.submit += submit;
         }
         Ok(())
     })?;
@@ -1507,7 +1523,7 @@ impl<S: UtxoStore> UtxoStore for DeltaView<'_, S> {
 }
 
 /// What the pipeline tail hands back for one block.
-type PipelineTail = Result<(ConnectTransition, AppliedBlock, [Duration; 3]), UtxoError>;
+type PipelineTail = Result<(ConnectTransition, AppliedBlock, [Duration; 4]), UtxoError>;
 
 /// A validated block's overlay shards, detached from their base.
 ///
