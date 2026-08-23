@@ -1836,6 +1836,34 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         self.commit_transitions(transitions)
     }
 
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock();
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
+        let result = Self::write_transitions(self, &transaction, transitions, spent, created);
+        if let Err(error) = &result {
+            crate::rbtc_warn!(
+                "overlay folded commit of {} blocks ({} spent, {} created) failed before commit, aborting: {}",
+                transitions.len(),
+                spent.len(),
+                created.len(),
+                error
+            );
+        }
+        result?;
+        let sync_started = Instant::now();
+        transaction.commit().map_err(utxo_mdbx)?;
+        CommitProfile::add(&self.commit_profile.sync, sync_started);
+        Ok(())
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,

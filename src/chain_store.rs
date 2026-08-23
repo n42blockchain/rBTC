@@ -492,6 +492,41 @@ pub trait ExecutionChainStore: UtxoStore {
     ) -> Result<(), ChainStoreError> {
         self.commit_connect_batch(&transitions)
     }
+    /// Commits a batch whose net coin change the caller already folded.
+    ///
+    /// `transitions` carry the per-block tips and undo records; their own
+    /// coin lists are ignored (a write-back buffer drains them as it folds).
+    /// `spent` and `created` are the batch's net change in key order. The
+    /// default walks the blocks with [`Self::commit_connect`], landing the
+    /// coins with the final block — correct but not atomic across blocks;
+    /// engines with an atomic batch commit override it.
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        let Some((last, rest)) = transitions.split_last() else {
+            return Ok(());
+        };
+        for transition in rest {
+            self.commit_connect(
+                transition.expected_parent,
+                transition.next,
+                &[],
+                &[],
+                &transition.transaction_undos,
+            )?;
+        }
+        self.commit_connect(
+            last.expected_parent,
+            last.next,
+            spent,
+            created,
+            &last.transaction_undos,
+        )?;
+        Ok(())
+    }
     /// Reverses the tip block and removes its undo in one transaction.
     fn commit_disconnect(
         &self,

@@ -947,6 +947,31 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
     }
 }
 
+impl SnapshotOverlayRedbChainstate {
+    /// One durable transaction: per-block tips and undo records, then the
+    /// batch's folded net change in a single mutation pass.
+    fn commit_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        let _guard = self.lock();
+        let transaction = self.begin_durable_write()?;
+        for transition in transitions {
+            Self::advance_tip(&transaction, transition.expected_parent, transition.next)?;
+            let mut undo_table = transaction.open_table(UNDO)?;
+            undo_table.insert(
+                transition.next.hash.to_byte_array().as_slice(),
+                compress_block_undo(&transition.transaction_undos)?.as_slice(),
+            )?;
+        }
+        self.connect_mutation(&transaction, spent, created)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db.begin_read()?;
@@ -1009,19 +1034,19 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
             return Ok(());
         }
         let (spent, created) = crate::snapshot_overlay::fold_connect_batch(transitions)?;
-        let _guard = self.lock();
-        let transaction = self.begin_durable_write()?;
-        for transition in transitions {
-            Self::advance_tip(&transaction, transition.expected_parent, transition.next)?;
-            let mut undo_table = transaction.open_table(UNDO)?;
-            undo_table.insert(
-                transition.next.hash.to_byte_array().as_slice(),
-                compress_block_undo(&transition.transaction_undos)?.as_slice(),
-            )?;
+        self.commit_folded(transitions, &spent, &created)
+    }
+
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
         }
-        self.connect_mutation(&transaction, &spent, &created)?;
-        transaction.commit()?;
-        Ok(())
+        self.commit_folded(transitions, spent, created)
     }
 
     fn commit_disconnect(

@@ -306,7 +306,18 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             .name("write-back-flush".to_owned())
             .spawn(move || {
                 let started = Instant::now();
-                inner.commit_connect_batch(&thread_state.transitions)?;
+                // The buffered transitions no longer carry their coins; the
+                // maps are the batch's folded net change, sorted for the
+                // engine's single write pass.
+                let mut spent: Vec<OutPointKey> = thread_state.spent.iter().copied().collect();
+                spent.sort_unstable();
+                let mut created: Vec<(OutPointKey, Utxo)> = thread_state
+                    .created
+                    .iter()
+                    .map(|(outpoint, utxo)| (*outpoint, utxo.clone()))
+                    .collect();
+                created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+                inner.commit_connect_folded(&thread_state.transitions, &spent, &created)?;
                 Ok(WriteBackFlush {
                     batches,
                     blocks: u32::try_from(thread_state.transitions.len()).unwrap_or(u32::MAX),
@@ -444,7 +455,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
 
     /// Buffers one contiguous batch, starting a background flush afterwards
     /// if a limit is hit.
-    fn buffer(&self, transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
+    fn buffer(&self, mut transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
         if transitions.is_empty() {
             return Ok(());
         }
@@ -472,7 +483,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
                         .as_ref()
                         .is_some_and(|state| state.spent.contains(key))
             };
-            for transition in &transitions {
+            for transition in &mut transitions {
                 if transition.expected_parent != tip.hash
                     || tip.height.checked_add(1) != Some(transition.next.height)
                 {
@@ -496,12 +507,15 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
                         staged_spent.push(*key);
                     }
                 }
-                for (key, utxo) in &transition.created {
-                    if batch_created.contains(key) || known_created(key) {
-                        return Err(ChainStoreError::Utxo(UtxoError::Duplicate(*key)));
+                // The engine receives the folded net change at flush time, so
+                // the coins move into the buffer instead of being cloned and
+                // the transition keeps only its tips, spends and undo records.
+                for (key, utxo) in std::mem::take(&mut transition.created) {
+                    if batch_created.contains(&key) || known_created(&key) {
+                        return Err(ChainStoreError::Utxo(UtxoError::Duplicate(key)));
                     }
-                    batch_created.insert(*key);
-                    staged_created.push((*key, utxo.clone()));
+                    batch_created.insert(key);
+                    staged_created.push((key, utxo));
                 }
                 tip = transition.next;
             }
@@ -1092,13 +1106,11 @@ mod tests {
         let buffered = WriteBackChainstate::new(
             open(&directory, "buffered.redb"),
             WriteBackLimits {
-                max_batches: 1,
+                max_batches: 10,
                 max_created: u64::MAX,
             },
         );
         let genesis = direct.execution_tip().unwrap();
-        // Every batch starts a background commit; the next batch is accepted
-        // against the in-flight buffer and spends a coin it created.
         let batches = vec![
             vec![transition(
                 genesis,
@@ -1119,7 +1131,7 @@ mod tests {
                 vec![(key(4), coin(4))],
             )],
         ];
-        for batch in &batches {
+        for (index, batch) in batches.iter().enumerate() {
             direct.commit_connect_batch(batch).unwrap();
             buffered.commit_connect_batch(batch).unwrap();
             assert_eq!(
@@ -1129,12 +1141,21 @@ mod tests {
             for k in 1..=4 {
                 assert_eq!(buffered.get(key(k)).unwrap(), direct.get(key(k)).unwrap());
             }
+            if index == 0 {
+                // The first batch becomes durable on its own, so key(1) is a
+                // durable coin the later window spends.
+                buffered.flush().unwrap();
+            }
         }
-        // The last batches are in flight or still accepting: re-creating a
-        // coin they created, or spending a coin they spent, is rejected from
-        // the buffers without waiting for the engine. (key(3) was created and
-        // spent inside the window, so it cancelled and is unknown here;
-        // key(1) is a durable coin the window spent.)
+        // Hand the two buffered batches to a background commit; whether it
+        // has finished or not, its state stays in the in-flight buffer until
+        // it is harvested, so the assertions below are deterministic.
+        assert!(buffered.start_flush().unwrap());
+        // Re-creating a coin the window created, or spending a coin it
+        // spent, is rejected from the buffers without waiting for the
+        // engine. (key(3) was created and spent inside the window, so it
+        // cancelled and is unknown here; key(1) is a durable coin the
+        // window spent.)
         assert!(matches!(
             buffered.commit_connect_batch(&[transition(
                 tip(3),
@@ -1148,25 +1169,31 @@ mod tests {
             buffered.commit_connect_batch(&[transition(tip(3), tip(4), vec![key(1)], vec![])]),
             Err(ChainStoreError::Utxo(UtxoError::DuplicateSpend(_)))
         ));
+        // A batch that arrives while the commit is in flight is accepted
+        // into the fresh buffer and lands with the next flush.
+        let fourth = vec![transition(
+            tip(3),
+            tip(4),
+            vec![key(2)],
+            vec![(key(5), coin(5))],
+        )];
+        direct.commit_connect_batch(&fourth).unwrap();
+        buffered.commit_connect_batch(&fourth).unwrap();
+        assert_eq!(buffered.execution_tip().unwrap(), tip(4));
         buffered.flush().unwrap();
         let mut records = Vec::new();
         while let Some(record) = buffered.take_last_flush() {
             records.push(record);
         }
-        // A batch that arrives while a commit is running stays in the buffer
-        // and lands with the next one, so two or three commits cover the
-        // three blocks.
-        assert!(
-            (2..=3).contains(&records.len()),
-            "{} commits",
-            records.len()
-        );
-        assert_eq!(records.iter().map(|record| record.blocks).sum::<u32>(), 3);
-        assert_eq!(buffered.inner().execution_tip().unwrap(), tip(3));
-        assert_eq!(
-            buffered.inner().snapshot_entries().unwrap(),
-            direct.snapshot_entries().unwrap()
-        );
+        assert_eq!(records.len(), 3, "one record per flush");
+        assert_eq!(records.iter().map(|record| record.blocks).sum::<u32>(), 4);
+        for k in 1..=5 {
+            assert_eq!(
+                buffered.inner().get(key(k)).unwrap(),
+                direct.get(key(k)).unwrap()
+            );
+        }
+        assert_eq!(buffered.inner().execution_tip().unwrap(), tip(4));
     }
 
     #[test]
