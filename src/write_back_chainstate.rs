@@ -153,7 +153,13 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
     ///
     /// Fails if the flush fails; the buffer is kept.
     pub fn inner_mut_flushed(&mut self) -> Result<&mut C, ChainStoreError> {
-        self.flush()?;
+        if let Some(flush) = self.flush()? {
+            // Nobody logs the record here; leave it for `take_last_flush`.
+            self.finished
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(flush);
+        }
         Arc::get_mut(&mut self.inner).ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
             "write-back store is still shared with a background commit",
         )))
