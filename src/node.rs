@@ -15220,7 +15220,8 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     }
     blocks.extend(decoded_prefetch);
     let mut offset = blocks.len();
-    if let Some(replay) = replay {
+    // The read-ahead may already have filled the whole batch.
+    if let Some(replay) = replay.filter(|_| offset < hashes.len()) {
         // Replay reads the same blocks from a retained ledger instead of
         // peers, so a storage change can be measured without the network in
         // the number. Everything downstream — structure validation, staging,
