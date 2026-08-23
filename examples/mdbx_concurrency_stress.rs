@@ -18,7 +18,7 @@ use std::{
 };
 
 use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, WriteFlags,
+    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, TableFlags, WriteFlags,
 };
 
 #[allow(clippy::too_many_lines)]

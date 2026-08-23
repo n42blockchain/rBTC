@@ -621,6 +621,39 @@ larger, rarely compacted redb file answers the per-batch overlay reads more
 slowly than the smaller one did. redb's remaining cost on this window is
 its own file, not the loop; MDBX finishes the same work in 1,165–1,249 s.
 
+### The crash, found (2026-08-23 05:30Z)
+
+`examples/mdbx_concurrency_stress.rs` reproduces the v10 failure in under
+a minute with no rBTC code involved: one thread commits 200k-key write
+transactions back to back while two threads behave like the catch-up loop
+during a flush. Bisected by reader mode, sixty seconds each:
+
+| readers do | result |
+|---|---|
+| nothing | 33 commits, clean |
+| read transactions + point reads | 31 commits, 324M reads, clean |
+| `Database::info()` + `Database::stat()` polls | `MDBX_CORRUPTED` from the writer's `put`, `BadTxn` for readers, then a segfault |
+| the same polls through a read transaction (`Transaction::env_info/env_stat`) | 35 commits, 21.8M polls, clean |
+
+The mechanism is in libmdbx's `mdbx_env_stat_ex`/`mdbx_env_info_ex`:
+called with a null transaction they ask `env_owned_wrtxn()` for "the
+write transaction this thread owns" and, if there is one, read its state.
+The libmdbx crate opens every environment with `MDBX_NOTLS` and compiles
+the library with `MDBX_TXN_CHECKOWNER=0`, so the ownership test degrades
+to "a write transaction exists" and the poll walks the flush thread's
+transaction while that thread mutates it. `SnapshotOverlayChainstate::
+capacity()` made exactly those two calls, once per batch, from the main
+thread; before v10 the loop was always blocked behind the commit when it
+reached that point, from v10 on it was not. That also explains the
+statistics: the damage lands wherever the writer happens to be, so the
+symptom was a failing `put`, a crash inside the abort that followed, or
+an assertion — never the same twice, but always during a flush.
+
+Fix (the vendored crate gains transaction-scoped `env_info`/`env_stat`;
+both capacity queries open a read transaction for them) is measured as
+v13. Nothing else in the code base calls the environment-level
+`info()`/`stat()`.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with

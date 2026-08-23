@@ -77,6 +77,17 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   unchanged) while a commit is still running, so the loop no longer waits
   for the engine at all on a healthy host; the durable tip may now lag by
   up to 2N batches instead of N.
+- The MDBX capacity query (snapshot overlay and the MDBX chainstore) reads
+  environment info and statistics through its own read transaction. The
+  environment-level calls pass no transaction, and because the libmdbx
+  crate opens environments with `MDBX_NOTLS` and builds the library
+  without owner checks, libmdbx then borrows the write transaction another
+  thread owns; polled once per batch while the write-back flush committed
+  on its helper thread, that corrupted the commit (`MDBX_CORRUPTED`, a
+  crash inside the abort, or an assertion failure). The vendored crate
+  gains `Transaction::env_info`/`env_stat`, and
+  `examples/mdbx_concurrency_stress.rs` reproduces the fault in under a
+  minute and passes with the fix.
 - `overlay_audit` (`--features mdbx`) hashes the consensus content of an
   MDBX or redb snapshot overlay read-only — base identity, tip, every
   post-base coin's value/height/coinbase flag/creation MTP/script in key
