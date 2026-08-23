@@ -545,6 +545,25 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
         self.start_flush().map(|_| ())
     }
 
+    /// Overlays what the buffers hold onto coins read earlier through the
+    /// engine: a key the buffers created gets that coin, a key they spent is
+    /// gone, anything else keeps the value it was read with.
+    ///
+    /// A prefetch that ran while a batch executed saw the state before that
+    /// batch; everything the batch changed is in the buffers by the time the
+    /// next batch starts, so this makes the prefetch current.
+    pub fn overlay_buffers_onto(&self, entries: &mut [(OutPointKey, Option<Utxo>)]) {
+        let in_flight = self.in_flight_state();
+        let pending = self.read();
+        for (outpoint, value) in entries {
+            match Self::lookup_buffers(&pending, in_flight.as_deref(), outpoint) {
+                BufferAnswer::Coin(utxo) => *value = Some(utxo),
+                BufferAnswer::Spent => *value = None,
+                BufferAnswer::Unknown => {}
+            }
+        }
+    }
+
     /// Looks a key up in the accepting buffer, then the in-flight one.
     fn lookup_buffers(
         pending: &Pending,
@@ -747,6 +766,10 @@ impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainsta
             }
         }
         self.inner.block_undo(hash)
+    }
+
+    fn reconcile_prefetch(&self, entries: &mut [(OutPointKey, Option<Utxo>)]) {
+        self.overlay_buffers_onto(entries);
     }
 
     fn retains_block_undo(&self) -> bool {

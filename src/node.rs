@@ -91,10 +91,10 @@ use rbtc::{
     asmap::Asmap,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
-        BlockDeploymentContext, BlockExecutionError,
+        ActiveBlockUtxoPrefetch, BlockDeploymentContext, BlockExecutionError,
         connect_prevalidated_active_blocks_with_breakdown,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
-        prefetch_prevalidated_active_block_utxos,
+        prefetch_active_block_utxos_from, prefetch_prevalidated_active_block_utxos,
     },
     blockchain::{
         AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
@@ -2516,6 +2516,10 @@ struct PrefetchedBlocks {
     /// Blocks a replay read-ahead already decoded and structure-validated,
     /// in height order after `serialized`.
     validated: Vec<PrevalidatedBlock>,
+    /// The external inputs of `validated`, read while the previous batch
+    /// executed; valid only when `validated` is the whole next batch, and
+    /// reconciled with the write-back buffers before use.
+    utxos: Option<ActiveBlockUtxoPrefetch>,
 }
 
 /// A block the read-ahead thread decoded, matched against the active chain
@@ -11702,6 +11706,7 @@ trait OverlayCatchupStore: ExecutionChainStore {
     fn start_write_back_flush_if_idle(&self) -> Result<bool, String> {
         Ok(false)
     }
+
     fn engine_name(&self) -> &'static str;
     /// Commits anything a write-back layer still holds in memory.
     ///
@@ -15233,6 +15238,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     // Blocks the read-ahead validated skip structure validation below; they
     // still have to be the blocks the active chain names at their heights.
     let mut prevalidated = Vec::with_capacity(prefetched.validated.len());
+    let mut early_utxos = prefetched.utxos;
     for (index, prevalidated_block) in prefetched.validated.into_iter().enumerate() {
         let position = blocks.len();
         if position >= hashes.len() || prevalidated_block.hash != hashes[position] {
@@ -15333,6 +15339,10 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         }
     }
     let downloaded_at = Instant::now();
+    if prevalidated.len() != blocks.len() {
+        // The early prefetch covered only part of this batch.
+        early_utxos = None;
+    }
     let validated_blocks = if prevalidated.len() == blocks.len() {
         prevalidated
     } else {
@@ -15439,16 +15449,26 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             shard_result,
             shard_elapsed,
         ) = {
+            let early = early_utxos.take();
             let work = || {
                 std::thread::scope(|scope| {
-                    let utxos = scope.spawn(|| {
+                    // Coins read ahead during the previous batch only need
+                    // the buffers' changes overlaid; otherwise read them now.
+                    let ready = early.map(|mut prefetch| {
                         let started = Instant::now();
-                        let result = prefetch_prevalidated_active_block_utxos(
-                            chainstate,
-                            &blocks,
-                            &transaction_ids,
-                        );
-                        (result, started.elapsed())
+                        chainstate.reconcile_prefetch(prefetch.entries_mut());
+                        (Ok(prefetch), started.elapsed())
+                    });
+                    let utxos = ready.is_none().then(|| {
+                        scope.spawn(|| {
+                            let started = Instant::now();
+                            let result = prefetch_prevalidated_active_block_utxos(
+                                chainstate,
+                                &blocks,
+                                &transaction_ids,
+                            );
+                            (result, started.elapsed())
+                        })
                     });
                     let shard = scope.spawn(|| {
                         let started = Instant::now();
@@ -15458,9 +15478,13 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                     });
                     let stage_result = ledger.stage(next_height, &serialized);
                     let branch_staged_at = Instant::now();
-                    let (utxo_result, utxo_elapsed) = utxos
-                        .join()
-                        .expect("scoped UTXO-prefetch thread must not panic");
+                    let (utxo_result, utxo_elapsed) = match (ready, utxos) {
+                        (Some(ready), _) => ready,
+                        (None, Some(utxos)) => utxos
+                            .join()
+                            .expect("scoped UTXO-prefetch thread must not panic"),
+                        (None, None) => unreachable!("a prefetch thread runs when none is ready"),
+                    };
                     let (shard_result, shard_elapsed) = shard
                         .join()
                         .expect("scoped validation-delta shard thread must not panic");
@@ -15527,6 +15551,19 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                                 first,
                                 batch.blocks,
                             )
+                        })
+                        .map(|validated| {
+                            // Read through the write-back layer as it stands
+                            // now; what this batch changes is overlaid when
+                            // the next batch starts.
+                            let utxos = prefetch_active_block_utxos_from(
+                                chainstate,
+                                validated
+                                    .iter()
+                                    .map(|block| (&block.block, &block.transaction_ids)),
+                            )
+                            .ok();
+                            (validated, utxos)
                         });
                     (result, started.elapsed())
                 })
@@ -15557,19 +15594,20 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             execution_result.map_err(|error| PeerRunError::block(&error))?;
         // A failed read-ahead is not an error here: the next batch reads the
         // ledger itself and reports the failure where it can be acted on.
-        let validated_prefetch = match read_ahead_result {
-            Some(Ok(blocks)) => blocks,
+        let (validated_prefetch, early_utxos) = match read_ahead_result {
+            Some(Ok((blocks, utxos))) => (blocks, utxos),
             Some(Err(error)) => {
                 crate::rbtc_debug!("replay read-ahead dropped: {error}");
-                Vec::new()
+                (Vec::new(), None)
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
         (
             applied_blocks,
             PrefetchedBlocks {
                 serialized: Vec::new(),
                 validated: validated_prefetch,
+                utxos: early_utxos,
             },
             Instant::now(),
             prefetch_elapsed,
@@ -15679,6 +15717,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             PrefetchedBlocks {
                 serialized: downloaded_prefetch,
                 validated: Vec::new(),
+                utxos: None,
             },
             execution_core_at,
             prefetch_elapsed,
@@ -15760,6 +15799,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             PrefetchedBlocks {
                 serialized: downloaded_prefetch,
                 validated: Vec::new(),
+                utxos: None,
             },
             execution_core_at,
             prefetch_started.elapsed(),
@@ -15774,6 +15814,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     carried_prefetch.extend(downloaded_prefetch.serialized);
     prefetched_blocks.serialized = carried_prefetch;
     prefetched_blocks.validated = downloaded_prefetch.validated;
+    prefetched_blocks.utxos = downloaded_prefetch.utxos;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
@@ -19722,6 +19763,7 @@ mod tests {
         // break the contiguous ascending run the execution path requires.
         let mut prefetched = PrefetchedBlocks {
             validated: Vec::new(),
+            utxos: None,
             serialized: vec![serialize(&genesis)],
         };
         stage_submitted_blocks(

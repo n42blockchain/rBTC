@@ -451,6 +451,10 @@ pub trait ExecutionChainStore: UtxoStore {
     fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError>;
     /// Reports whether connect transitions must carry block undo data.
     fn retains_block_undo(&self) -> bool;
+    /// Brings coins read through this store during the previous batch up to
+    /// date with what that batch committed since. A store whose reads already
+    /// reflect every commit has nothing to do.
+    fn reconcile_prefetch(&self, _entries: &mut [(OutPointKey, Option<Utxo>)]) {}
 
     /// Reads and clears this store's commit profile, if it keeps one.
     ///

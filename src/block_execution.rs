@@ -60,6 +60,14 @@ pub struct ActiveBlockUtxoPrefetch {
     entries: Vec<(OutPointKey, Option<Utxo>)>,
 }
 
+impl ActiveBlockUtxoPrefetch {
+    /// The prefetched coins, for a store that must overlay what changed
+    /// since they were read.
+    pub fn entries_mut(&mut self) -> &mut [(OutPointKey, Option<Utxo>)] {
+        &mut self.entries
+    }
+}
+
 /// Failures while connecting one downloaded active-chain block.
 #[derive(Debug, Error)]
 pub enum BlockExecutionError {
@@ -440,6 +448,33 @@ pub fn prefetch_prevalidated_active_block_utxos<C: ExecutionChainStore>(
     Ok(ActiveBlockUtxoPrefetch { entries })
 }
 
+/// [`prefetch_prevalidated_active_block_utxos`] over blocks that are not held
+/// in one slice, as a read-ahead holds them beside their transaction ids.
+///
+/// # Errors
+///
+/// Fails when a block's transaction-id list does not match it, or on a store
+/// read error.
+pub fn prefetch_active_block_utxos_from<'a, C: ExecutionChainStore>(
+    chainstate: &C,
+    blocks: impl Iterator<Item = (&'a Block, &'a ValidatedBlockTransactionIds)> + Clone,
+) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
+    let mut output_count = 0_usize;
+    for (block, transaction_ids) in blocks.clone() {
+        if transaction_ids.as_slice().len() != block.txdata.len() {
+            return Err(BlockExecutionError::TransactionIdCount);
+        }
+        output_count += block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.output.len())
+            .sum::<usize>();
+    }
+    let input_outpoints = external_input_outpoints_with_ids(blocks, output_count);
+    let entries = chainstate.get_many(&input_outpoints)?;
+    Ok(ActiveBlockUtxoPrefetch { entries })
+}
+
 /// Connects a prevalidated batch using UTXOs read before archive staging ended.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChainStore>(
@@ -561,6 +596,42 @@ pub enum AppliedUndos {
     Drop,
 }
 
+/// Inputs of a batch that spend coins created before it, given each block's
+/// precomputed transaction ids.
+fn external_input_outpoints_with_ids<'a>(
+    blocks: impl Iterator<Item = (&'a Block, &'a ValidatedBlockTransactionIds)>,
+    output_count: usize,
+) -> Vec<OutPointKey> {
+    let mut input_outpoints = Vec::new();
+    let mut created_in_batch = AHashSet::with_capacity(output_count);
+    for (block, transaction_ids) in blocks {
+        for (index, (transaction, txid)) in block
+            .txdata
+            .iter()
+            .zip(transaction_ids.as_slice())
+            .enumerate()
+        {
+            if index != 0 {
+                input_outpoints.extend(
+                    transaction
+                        .input
+                        .iter()
+                        .map(|input| OutPointKey::from(input.previous_output))
+                        .filter(|outpoint| !created_in_batch.contains(outpoint)),
+                );
+            }
+            for (vout, output) in transaction.output.iter().enumerate() {
+                if is_unspendable(&output.script_pubkey) {
+                    continue;
+                }
+                let vout = u32::try_from(vout).expect("transaction output count fits u32");
+                created_in_batch.insert(OutPointKey::from(OutPoint::new(*txid, vout)));
+            }
+        }
+    }
+    input_outpoints
+}
+
 fn external_batch_input_outpoints(
     blocks: &[Block],
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
@@ -568,33 +639,9 @@ fn external_batch_input_outpoints(
 ) -> Vec<OutPointKey> {
     let mut input_outpoints = Vec::new();
     if let Some(transaction_ids) = transaction_ids {
-        let mut created_in_batch = AHashSet::with_capacity(output_count);
-        for (block, transaction_ids) in blocks.iter().zip(transaction_ids) {
-            for (index, (transaction, txid)) in block
-                .txdata
-                .iter()
-                .zip(transaction_ids.as_slice())
-                .enumerate()
-            {
-                if index != 0 {
-                    input_outpoints.extend(
-                        transaction
-                            .input
-                            .iter()
-                            .map(|input| OutPointKey::from(input.previous_output))
-                            .filter(|outpoint| !created_in_batch.contains(outpoint)),
-                    );
-                }
-                for (vout, output) in transaction.output.iter().enumerate() {
-                    if is_unspendable(&output.script_pubkey) {
-                        continue;
-                    }
-                    let vout = u32::try_from(vout).expect("transaction output count fits u32");
-                    created_in_batch.insert(OutPointKey::from(OutPoint::new(*txid, vout)));
-                }
-            }
-        }
-    } else {
+        return external_input_outpoints_with_ids(blocks.iter().zip(transaction_ids), output_count);
+    }
+    {
         input_outpoints.extend(
             blocks
                 .iter()
