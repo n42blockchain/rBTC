@@ -24,12 +24,12 @@
 //! UTXO mutation, snapshot export) flushes and waits first.
 
 use std::{
-    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
+use ahash::{AHashMap, AHashSet};
 use bitcoin::BlockHash;
 
 use crate::{
@@ -83,9 +83,9 @@ pub struct WriteBackFlush {
 struct Pending {
     transitions: Vec<ConnectTransition>,
     /// Net-created coins: created in the buffer and not yet spent.
-    created: HashMap<OutPointKey, Utxo>,
+    created: AHashMap<OutPointKey, Utxo>,
     /// Spends of coins the inner store (or the in-flight buffer) holds.
-    spent: HashSet<OutPointKey>,
+    spent: AHashSet<OutPointKey>,
     /// Tip after the last buffered transition; `None` when empty.
     tip: Option<ExecutionTip>,
     batches: u32,
@@ -101,8 +101,8 @@ impl Pending {
 /// A buffer handed to the engine: still answers reads until the commit lands.
 struct Committed {
     transitions: Vec<ConnectTransition>,
-    created: HashMap<OutPointKey, Utxo>,
-    spent: HashSet<OutPointKey>,
+    created: AHashMap<OutPointKey, Utxo>,
+    spent: AHashSet<OutPointKey>,
     tip: ExecutionTip,
 }
 
@@ -458,8 +458,8 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             let mut staged_created: Vec<(OutPointKey, Utxo)> = Vec::new();
             let mut staged_spent: Vec<OutPointKey> = Vec::new();
             let mut staged_cancelled: Vec<OutPointKey> = Vec::new();
-            let mut batch_created: HashSet<OutPointKey> = HashSet::new();
-            let mut batch_spent: HashSet<OutPointKey> = HashSet::new();
+            let mut batch_created: AHashSet<OutPointKey> = AHashSet::new();
+            let mut batch_spent: AHashSet<OutPointKey> = AHashSet::new();
             let known_created = |key: &OutPointKey| {
                 pending.created.contains_key(key)
                     || in_flight
@@ -507,7 +507,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             }
             // Creations cancelled within this same batch were removed from
             // `batch_created` above and must not be inserted.
-            let cancelled_in_batch: HashSet<OutPointKey> =
+            let cancelled_in_batch: AHashSet<OutPointKey> =
                 staged_cancelled.iter().copied().collect();
             for (key, utxo) in staged_created {
                 if cancelled_in_batch.contains(&key) {
