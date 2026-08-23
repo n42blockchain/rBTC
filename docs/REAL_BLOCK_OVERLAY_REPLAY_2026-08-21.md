@@ -572,6 +572,22 @@ publish 26 s, seven flushes of which only the final one was waited for
 first time, faster than the btcdmdbx pipeline's 1,318 s (1,400 s durable)
 on the same window and host.
 
+### An unplanned power-loss test (2026-08-22 23:05Z → 23 00:20Z)
+
+The host lost power while `mdbx-wb16-v12` (commit 289ebc1: the buffer keeps
+accepting up to 2N batches while a commit runs) was at block 955,736. After
+the reboot the overlay's durable tip read 951,384 — 17 batches behind the
+last validated block, inside the documented 2N = 32 bound — and the
+interrupted data directory was resumed in place with the same command line.
+The node opened the overlay at 951,384, truncated the retained ledger to it,
+re-executed 951,385–963,350 in 648 s (three write-back flushes, the last
+waited for at the tip as usual) and finished with the overlay digest
+`aadd289f…7f2819` — the seventeenth identical overlay, this time reached
+through the crash-recovery path rather than a clean run. That is the
+write-back layer's crash contract exercised by an actual power cut, with
+the asynchronous flush, the pipeline and the non-blocking buffer all in
+place.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
