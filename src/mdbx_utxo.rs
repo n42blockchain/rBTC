@@ -512,8 +512,10 @@ impl MdbxUtxoStore {
 
     /// Reports allocation high-water usage against the hard geometry ceiling.
     pub fn capacity(&self) -> Result<MdbxChainstateCapacity, UtxoError> {
-        let info = self.db().info()?;
-        let page_size = u64::from(self.db().stat()?.page_size());
+        // Explicit read transaction: see `SnapshotOverlayChainstate::capacity`.
+        let transaction = self.db().begin_ro_txn()?;
+        let info = transaction.env_info()?;
+        let page_size = u64::from(transaction.env_stat()?.page_size());
         let last_page = u64::try_from(info.last_pgno())
             .map_err(|_| UtxoError::Malformed("MDBX page number exceeds u64"))?;
         Ok(MdbxChainstateCapacity {

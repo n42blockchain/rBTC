@@ -10,19 +10,32 @@
 use std::{
     env,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use libmdbx::{Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, WriteFlags};
+use libmdbx::{
+    Database, DatabaseOptions, Mode, NoWriteMap, ReadWriteOptions, SyncMode, WriteFlags,
+};
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let mut args = env::args().skip(1);
-    let dir = args.next().expect("usage: mdbx_concurrency_stress <dir> <minutes>");
+    let dir = args
+        .next()
+        .expect("usage: mdbx_concurrency_stress <dir> <minutes>");
     let minutes: u64 = args.next().and_then(|m| m.parse().ok()).unwrap_or(5);
+    // Reader mode: "all" (reads + env-level info/stat polls), "reads", "info"
+    // (env-level polls only), "info-txn" (polls through a read transaction),
+    // or "none".
+    let mode = args.next().unwrap_or_else(|| "all".to_owned());
+    let do_reads = matches!(mode.as_str(), "all" | "reads");
+    let do_info = matches!(mode.as_str(), "all" | "info");
+    let do_info_txn = mode == "info-txn";
+    let reader_count = if mode == "none" { 0 } else { 2 };
     std::fs::create_dir_all(&dir).unwrap();
     let db = Database::<NoWriteMap>::open_with_options(
         &dir,
@@ -39,7 +52,8 @@ fn main() {
     .unwrap();
     {
         let txn = db.begin_rw_txn().unwrap();
-        txn.create_table(Some("coins"), Default::default()).unwrap();
+        txn.create_table(Some("coins"), TableFlags::default())
+            .unwrap();
         txn.commit().unwrap();
     }
     let db = Arc::new(db);
@@ -83,7 +97,7 @@ fn main() {
 
     // Readers: fresh read transactions, point reads and env info/stat polls.
     let mut readers = Vec::new();
-    for worker in 0..2u64 {
+    for worker in 0..reader_count {
         let db = Arc::clone(&db);
         let stop = Arc::clone(&stop);
         let reads = Arc::clone(&reads);
@@ -91,7 +105,7 @@ fn main() {
         readers.push(thread::spawn(move || {
             let mut probe: u64 = worker;
             while !stop.load(Ordering::Relaxed) {
-                {
+                if do_reads {
                     let txn = db.begin_ro_txn().unwrap();
                     let table = txn.open_table(Some("coins")).unwrap();
                     for _ in 0..2_000 {
@@ -101,9 +115,20 @@ fn main() {
                     }
                     reads.fetch_add(2_000, Ordering::Relaxed);
                 }
-                let _ = db.info().unwrap();
-                let _ = db.stat().unwrap();
-                infos.fetch_add(1, Ordering::Relaxed);
+                if do_info {
+                    let _ = db.info().unwrap();
+                    let _ = db.stat().unwrap();
+                    infos.fetch_add(1, Ordering::Relaxed);
+                }
+                if do_info_txn {
+                    let txn = db.begin_ro_txn().unwrap();
+                    let _ = txn.env_info().unwrap();
+                    let _ = txn.env_stat().unwrap();
+                    infos.fetch_add(1, Ordering::Relaxed);
+                }
+                if !do_reads && !do_info && !do_info_txn {
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         }));
     }
@@ -112,7 +137,7 @@ fn main() {
         reader.join().unwrap();
     }
     println!(
-        "ok: commits={} keys_written={} reads={} info_polls={}",
+        "ok: mode={mode} commits={} keys_written={} reads={} info_polls={}",
         commits.load(Ordering::Relaxed),
         keys,
         reads.load(Ordering::Relaxed),

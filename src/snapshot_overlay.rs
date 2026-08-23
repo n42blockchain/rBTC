@@ -322,8 +322,13 @@ impl SnapshotOverlayChainstate {
     ///
     /// Fails on MDBX environment errors.
     pub fn capacity(&self) -> Result<OverlayCapacity, SnapshotOverlayError> {
-        let info = self.db().info()?;
-        let page_size = u64::from(self.db().stat()?.page_size());
+        // Read through an explicit read transaction. The environment-level
+        // `info()`/`stat()` pass no transaction, and under `MDBX_NOTLS`
+        // libmdbx then borrows the write transaction another thread owns —
+        // which corrupts a commit running on the write-back flush thread.
+        let transaction = self.db().begin_ro_txn()?;
+        let info = transaction.env_info()?;
+        let page_size = u64::from(transaction.env_stat()?.page_size());
         let last_page = u64::try_from(info.last_pgno())
             .map_err(|_| SnapshotOverlayError::Invalid("page number overflows"))?;
         // `MDBX_MAP_FULL` fires when `last_pgno` — the file's high-water
