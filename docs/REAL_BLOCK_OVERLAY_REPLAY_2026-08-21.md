@@ -740,6 +740,28 @@ already downloads it): **1,033 s** (112,746 tx/s), digest `aadd289f…`.
 bytes and checking their hashes on the loop thread, and `structure`
 (32 s) and `stage` (54 s) are still serial per batch.
 
+### v20 and v21: the read-ahead does the batch's preparation (2026-08-23 14:46Z–15:56Z)
+
+Commit 9310eac moves decoding and structure validation of the next batch
+into the replay read-ahead thread (`mdbx-wb16-v20`: **1,016 s**,
+114,642 tx/s; `download` and `structure` are now 1 s and 0 s over the
+window). Commit f3b7c53 moves the UTXO prefetch there as well: the
+read-ahead reads the next batch's external inputs through the write-back
+layer while the current batch executes, and a new
+`ExecutionChainStore::reconcile_prefetch` overlays what the buffers hold
+— every change the current batch committed since — before the prefetch
+is used, so the early read is exact. `mdbx-wb16-v21`: **965 s**
+(120,697 tx/s), digest `aadd289f…`; `utxo-prefetch` fell 155 → 21 s
+(the reconcile), `execute` 839 → 755 s, and the read-ahead thread was
+busy 488 s of the 965, entirely beside execution. Against the btcdmdbx
+pipeline's 1,318 s on the same window and host that is 27% faster.
+
+What is still serial per batch: `core-validate` 307 s (input resolution
+and checks), the tail join, `core-commit` 135 s (the hand-off into the
+write-back buffer — its maps were std SipHash; commit 847a692 switches
+them to ahash), `stage` 72 s (the ledger write and its fsync), and
+`core-submit` 60 s (handing scripts to the pool).
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
