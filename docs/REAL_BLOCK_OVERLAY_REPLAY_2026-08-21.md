@@ -733,6 +733,13 @@ batches and 87 s. The burst fold left the stage split where v16 had it
 than lock contention. Against the btcdmdbx pipeline's 1,318 s (1,400 s
 durable) on the same window and host, MDBX is now 19% faster.
 
+`mdbx-wb16-v19` (13:51Z, commit ea7c5e7 — the replay reads the next batch
+from the ledger while the current one executes, as the networked path
+already downloads it): **1,033 s** (112,746 tx/s), digest `aadd289f…`.
+`download` fell 97 → 39 s; what remains of it is decoding the prefetched
+bytes and checking their hashes on the loop thread, and `structure`
+(32 s) and `stage` (54 s) are still serial per batch.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
