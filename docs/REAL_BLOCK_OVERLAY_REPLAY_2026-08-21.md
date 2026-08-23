@@ -698,6 +698,10 @@ step is therefore the tail: it clones every created coin once for the net
 change and again into the batch overlay, and builds undo records the
 catch-up never reads unless an explorer or index is attached.
 
+`redb-wb16-v14` (10:07Z): 1,405 s (82,879 tx/s), digest `aadd289f…`, −11%
+against `redb-wb16-v13` (1,585 s), validation 470 → 257 s; its compaction-
+forced flush waits (16–32 s at five of seven flushes) remain.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
