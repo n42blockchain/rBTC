@@ -762,6 +762,17 @@ write-back buffer — its maps were std SipHash; commit 847a692 switches
 them to ahash), `stage` 72 s (the ledger write and its fsync), and
 `core-submit` 60 s (handing scripts to the pool).
 
+`mdbx-wb16-v22` (16:30Z, commits 847a692 — ahash for the write-back
+buffers — and aa70698 — the tail hands scripts to the pool): **953 s**
+(122,278 tx/s), digest `aadd289f…`; `core-commit` 135 → 95 s and
+`core-validate` 307 → 249 s, the latter because every read that misses
+the block overlay probes the buffers. The tail is now the longer stage
+(apply 231 s plus submit 68 s of thread time against 249 s of
+preparation), so commit 3764ed7 splits it into two helpers per block
+(net change, fold and transition on one; undo records and script submit
+on the other), measured as v23. `redb-wb16-v22`: 1,297 s, digest
+`aadd289f…` (v21: 1,296 s).
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
