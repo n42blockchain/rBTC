@@ -88,6 +88,15 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   final flush it must wait for covers a batch or two instead of the whole
   window (22 s instead of 87 s on the mainnet lanes). The batch log splits
   `core-apply` into `core-apply-net` and `core-apply-fold`.
+- On the replay path the read-ahead thread now reads, decodes and
+  structure-validates the next batch and prefetches its external inputs
+  while the current batch executes; `ExecutionChainStore::reconcile_prefetch`
+  lets the write-back layer overlay what the current batch committed since,
+  so the early prefetch is exact. The pipeline tail is two helpers per
+  block (net change, fold and transition; undo records and script submit),
+  the write-back buffers hash with ahash, and the batch overlay is folded in
+  short per-shard bursts. Over mainnet 935,001–963,350 the MDBX lane went
+  from 1,062 s to 920 s (126,635 tx/s) with the same overlay digest.
 - The MDBX capacity query (snapshot overlay and the MDBX chainstore) reads
   environment info and statistics through its own read transaction. The
   environment-level calls pass no transaction, and because the libmdbx
