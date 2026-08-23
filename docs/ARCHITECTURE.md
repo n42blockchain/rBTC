@@ -784,15 +784,21 @@ flush), so the loop waits for the engine only when the engine is slower
 than two whole windows of validation. The crash contract is unchanged
 except for that bound — the durable tip lags by at most 2N batches.
 
-Block execution inside a batch is a two-stage pipeline. Validating block N
-produces its overlay shards (`BlockDelta`); a helper thread then derives the
-net changes from them, folds those into the sharded batch overlay and
-builds the store transition, while the main thread validates block N+1
-through a `DeltaView` that answers from N's shards first and from the batch
+Block execution inside a batch is a two-stage pipeline. The validation
+thread *prepares* block N: every transaction is resolved and checked, in
+order, against a `BlockPrepareView` — what the block itself has resolved
+so far (a `PreparedDelta`: the block's final word on each key it touched,
+plus the keys it removed from the state it started from) over the state
+the block starts from — and nothing is written. A helper thread then
+derives N's undo records, net change and store transition from the
+prepared transactions and folds the change into the sharded batch
+overlay, while the validation thread prepares block N+1 through a
+`DeltaView` that answers from N's `PreparedDelta` first and from the batch
 overlay otherwise. A key in N's delta is therefore read from the delta and
 any other key is untouched by the concurrent fold, so block N+1 sees
-exactly the state block N left; transitions are joined in order and a
-failed fold surfaces as the batch's error. The batch overlay itself is
+exactly the state block N left without waiting for a write; transitions
+are joined in order and a failed fold surfaces as the batch's error. The
+single-block and non-deferred paths still apply through a block overlay. The batch overlay itself is
 split into 64 independently locked shards so the fold, the validation
 reads and the parallel seeding of prefetched coins proceed without a single
 lock.

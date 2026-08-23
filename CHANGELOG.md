@@ -77,6 +77,12 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   unchanged) while a commit is still running, so the loop no longer waits
   for the engine at all on a healthy host; the durable tip may now lag by
   up to 2N batches instead of N.
+- Batch validation prepares each block without writing it: the validation
+  thread resolves and checks the transactions against a view of what the
+  block has resolved so far, and the pipeline tail derives undo records,
+  the net change and the store transition from the prepared transactions.
+  The per-block write into a block overlay, about a third of validation
+  time, leaves the critical path; the single-block paths are unchanged.
 - The MDBX capacity query (snapshot overlay and the MDBX chainstore) reads
   environment info and statistics through its own read transaction. The
   environment-level calls pass no transaction, and because the libmdbx
