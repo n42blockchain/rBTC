@@ -677,6 +677,27 @@ read transaction per batch and nothing visible. With the root cause fixed,
 the 1,165–1,170 s of v11 stands as the window's best MDBX time on the
 pre-reboot host, and v13 is the build to carry forward.
 
+### v14: prepare on the validation thread, apply on the tail (2026-08-23 09:43Z)
+
+Commit a04ef05. Batch blocks are no longer written into a block overlay on
+the validation thread: each transaction is resolved and checked against a
+`BlockPrepareView` (what the block has resolved so far, over the state it
+starts from) and nothing is written; the tail derives undo, net change and
+the store transition from the prepared transactions. `mdbx-wb16-v14`:
+**1,182 s** (98,558 tx/s), digest `aadd289f…`, no crash, peak working set
+28.3 GiB (2.5 GiB less — no block overlay). Against the same-day controls
+that is −13% on v13c (1,359 s) and −8% on the pre-fix v11c (1,285 s);
+`core-validate` fell 489 → 268 s (−45%), `execute` 987 → 832 s.
+
+Why the wall clock did not fall by the full validation saving: the tail
+now does the undo and net-change work as well as the fold — 279 s of
+thread time, 9.8 ms per block against 9.5 ms of prepare — so the two
+stages are balanced and the validation thread waits at the join roughly
+220 s over the window (`execute` minus its measured stages). The next
+step is therefore the tail: it clones every created coin once for the net
+change and again into the batch overlay, and builds undo records the
+catch-up never reads unless an explorer or index is attached.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
