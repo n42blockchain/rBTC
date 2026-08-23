@@ -235,6 +235,13 @@ impl DeferredScriptBatch {
     }
 
     pub(crate) fn finish(self) -> Option<(usize, ConsensusError)> {
+        self.finish_with_order()
+            .map(|(_, index, error)| (index, error))
+    }
+
+    /// [`Self::finish`], keeping the failing block's batch order so a caller
+    /// that also saw a validation failure can report whichever came first.
+    pub(crate) fn finish_with_order(self) -> Option<(usize, usize, ConsensusError)> {
         (0..self.work_items)
             .filter_map(|_| {
                 self.results
@@ -242,7 +249,6 @@ impl DeferredScriptBatch {
                     .expect("script-validation worker terminated without a result")
             })
             .min_by_key(|(block_order, index, _)| (*block_order, *index))
-            .map(|(_, index, error)| (index, error))
     }
 }
 

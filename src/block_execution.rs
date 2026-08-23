@@ -855,11 +855,15 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // one), and otherwise from the prefetched batch overlay, so it sees
     // exactly the state its predecessors leave without waiting for them.
     let validate_started = Instant::now();
-    let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot<'_>>> = (0..blocks.len())
+    let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
+    let mut deferred_scripts = Vec::new();
+    let script_sink = Mutex::new((&mut script_batch, &mut deferred_scripts));
+    let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
         .collect();
     let profile_totals = Mutex::new([Duration::ZERO; 4]);
     let next_prepare = std::sync::atomic::AtomicUsize::new(0);
+    let submit_total = Mutex::new(Duration::ZERO);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next_prepare;
@@ -868,8 +872,11 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let cumulative = &cumulative;
             let tips = &tips;
             let profile_totals = &profile_totals;
+            let script_sink = &script_sink;
+            let submit_total = &submit_total;
             scope.spawn(move || {
                 let _ = crate::validation_profile::take();
+                let mut submit_elapsed = Duration::ZERO;
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(block) = blocks.get(index) else {
@@ -891,6 +898,26 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         structure_prevalidated,
                         Some(transaction_ids[index].as_slice()),
                     );
+                    // Scripts go to the pool the moment a block is prepared,
+                    // so the script workers run beside the rest of the
+                    // batch's preparation instead of after it.
+                    let prepared = prepared.map(|(prepared, delta, mut scripts)| {
+                        let submit_started = Instant::now();
+                        for script in &mut scripts {
+                            script.set_block_order(index);
+                        }
+                        {
+                            let mut sink =
+                                script_sink.lock().expect("script sink lock not poisoned");
+                            if let Some(batch) = sink.0.as_mut() {
+                                batch.submit(scripts);
+                            } else {
+                                sink.1.extend(scripts);
+                            }
+                        }
+                        submit_elapsed += submit_started.elapsed();
+                        (prepared, delta)
+                    });
                     prepared_slots[index]
                         .set(prepared)
                         .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
@@ -900,6 +927,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                 for (total, sample) in totals.iter_mut().zip(profile) {
                     *total += sample;
                 }
+                *submit_total.lock().expect("submit total lock not poisoned") += submit_elapsed;
             });
         }
     });
@@ -913,29 +941,45 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         breakdown.validate_net += net_change;
         breakdown.validate_checks += checks;
     }
+    breakdown.submit += *submit_total.lock().expect("submit total lock not poisoned");
     // The first failing block wins, exactly as sequential preparation would
-    // have reported it; nothing was written anywhere.
+    // have reported it; a script failure outranks it only when it belongs to
+    // an earlier block. Nothing was written anywhere.
     let mut prepared_blocks = Vec::with_capacity(blocks.len());
     let mut failure = None;
-    for slot in prepared_slots {
+    for (index, slot) in prepared_slots.into_iter().enumerate() {
         match slot.into_inner().expect("phase two covered every block") {
             Ok(prepared) => prepared_blocks.push(prepared),
             Err(error) => {
-                failure = Some(error);
+                failure = Some((index, error));
                 break;
             }
         }
     }
-    if let Some(error) = failure {
+    if let Some((failed_index, error)) = failure {
+        let script_failure = {
+            let mut sink = script_sink.lock().expect("script sink lock not poisoned");
+            if let Some(batch) = sink.0.take() {
+                batch.finish_with_order()
+            } else {
+                verify_deferred_scripts(std::mem::take(sink.1))
+                    .map(|(index, source)| (0, index, source))
+            }
+        };
+        if let Some((block_order, index, source)) = script_failure {
+            if block_order < failed_index {
+                return Err(BlockExecutionError::Block(BlockError::Transaction {
+                    index,
+                    source: source.into(),
+                }));
+            }
+        }
         return Err(error);
     }
 
-    // Phase three: transitions, undo records and script hand-off, again in
-    // parallel per block, collected in block order.
+    // Phase three: transitions and undo records, again in parallel per
+    // block, collected in block order.
     let apply_started = Instant::now();
-    let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
-    let mut deferred_scripts = Vec::new();
-    let script_sink = Mutex::new((&mut script_batch, &mut deferred_scripts));
     let finished_slots: Vec<std::sync::OnceLock<FinishedSlot>> = (0..prepared_blocks.len())
         .map(|_| std::sync::OnceLock::new())
         .collect();
@@ -946,7 +990,6 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let next = &next_finish;
             let finished_slots = &finished_slots;
             let prepared_blocks = &prepared_blocks;
-            let script_sink = &script_sink;
             let tips = &tips;
             scope.spawn(move || {
                 loop {
@@ -954,26 +997,13 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                     let Some(slot) = finished_slots.get(index) else {
                         break;
                     };
-                    let (prepared, delta, mut scripts) = {
+                    let (prepared, delta) = {
                         let mut prepared_blocks =
                             prepared_blocks.lock().expect("prepared lock not poisoned");
                         prepared_blocks[index]
                             .take()
                             .expect("each block index is claimed once")
                     };
-                    let submit_started = Instant::now();
-                    for script in &mut scripts {
-                        script.set_block_order(index);
-                    }
-                    {
-                        let mut sink = script_sink.lock().expect("script sink lock not poisoned");
-                        if let Some(batch) = sink.0.as_mut() {
-                            batch.submit(scripts);
-                        } else {
-                            sink.1.extend(scripts);
-                        }
-                    }
-                    let submit_elapsed = submit_started.elapsed();
                     let changes = delta.net_changes();
                     let mut applied = prepared.into_applied(retains_undo);
                     let expected_parent = if index == 0 {
@@ -994,7 +1024,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                             }
                         },
                     };
-                    slot.set((transition, applied, submit_elapsed))
+                    slot.set((transition, applied))
                         .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
                 }
             });
@@ -1003,11 +1033,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let mut applied_blocks = Vec::with_capacity(finished_slots.len());
     let mut transitions = Vec::with_capacity(finished_slots.len());
     for slot in finished_slots {
-        let (transition, applied, submit) =
-            slot.into_inner().expect("phase three covered every block");
+        let (transition, applied) = slot.into_inner().expect("phase three covered every block");
         transitions.push(transition);
         applied_blocks.push(applied);
-        breakdown.submit += submit;
     }
     breakdown.apply += apply_started.elapsed();
     current = *tips.last().expect("non-empty batch has a final tip");
@@ -1356,17 +1384,11 @@ type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
 /// Every version each key takes across a batch, tagged by the block index
 /// that wrote it, in block order.
 type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
-/// One block's parallel-preparation result, in batch order.
-type PreparedSlot<'a> = Result<
-    (
-        PreparedActiveBlock,
-        PreparedDelta,
-        Vec<DeferredScriptCheck<'a>>,
-    ),
-    BlockExecutionError,
->;
-/// One block's transition, applied record and script hand-off time.
-type FinishedSlot = (ConnectTransition, AppliedBlock, Duration);
+/// One block's parallel-preparation result, in batch order; its deferred
+/// script checks were already handed to the pool by the preparing worker.
+type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
+/// One block's transition and applied record.
+type FinishedSlot = (ConnectTransition, AppliedBlock);
 
 /// The whole batch's coin history as of one block: every version each key
 /// takes across the batch, tagged with the block that wrote it. A block reads
