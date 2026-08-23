@@ -773,6 +773,15 @@ preparation), so commit 3764ed7 splits it into two helpers per block
 on the other), measured as v23. `redb-wb16-v22`: 1,297 s, digest
 `aadd289f…` (v21: 1,296 s).
 
+`mdbx-wb16-v23` (17:21Z, commit 3764ed7 — two helpers per block): **920 s**
+(126,635 tx/s), digest `aadd289f…`; `core-apply` (now the fold helper
+alone) 231 → 148 s, `core-validate` 249 → 286 s with three threads
+sharing the batch overlay and the allocator, `execute` 747 → 714 s.
+Against the btcdmdbx pipeline's 1,318 s on the same window and host the
+MDBX lane is now 30% faster; against the 3,823 s of the first MDBX lane
+two days earlier it is 4.2× faster, with the same overlay content every
+time.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
