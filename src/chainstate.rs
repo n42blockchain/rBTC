@@ -703,7 +703,7 @@ pub(crate) fn check_sequence_lock(
     Ok(())
 }
 
-fn created_outputs(
+pub(crate) fn created_outputs(
     transaction: &Transaction,
     txid: bitcoin::Txid,
     height: u32,

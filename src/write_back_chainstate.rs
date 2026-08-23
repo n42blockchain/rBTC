@@ -1057,7 +1057,7 @@ mod tests {
             },
         );
         let genesis = direct.execution_tip().unwrap();
-        let batches = vec![
+        let batches = [
             vec![transition(
                 genesis,
                 tip(1),
@@ -1111,7 +1111,7 @@ mod tests {
             },
         );
         let genesis = direct.execution_tip().unwrap();
-        let batches = vec![
+        let batches = [
             vec![transition(
                 genesis,
                 tip(1),

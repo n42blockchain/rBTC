@@ -40,6 +40,11 @@ impl ValidatedBlockTransactionIds {
     pub(crate) fn as_slice(&self) -> &[Txid] {
         &self.0
     }
+
+    /// Wraps transaction ids the caller computed for an unvalidated batch.
+    pub(crate) fn from_computed(transaction_ids: Vec<Txid>) -> Self {
+        Self(transaction_ids)
+    }
 }
 
 /// Reorg data produced by a successfully applied block.
