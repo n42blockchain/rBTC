@@ -22,6 +22,7 @@ use crate::{
     },
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     chainstate::{PreparedTransaction, is_unspendable},
+    consensus::ConsensusError,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
@@ -855,9 +856,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // one), and otherwise from the prefetched batch overlay, so it sees
     // exactly the state its predecessors leave without waiting for them.
     let validate_started = Instant::now();
-    let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
-    let mut deferred_scripts = Vec::new();
-    let script_sink = Mutex::new((&mut script_batch, &mut deferred_scripts));
+    // Each preparing worker owns a script batch of its own, so serialising
+    // the transactions for the pool runs in parallel and nothing contends;
+    // every batch drains into the same verdict at the end.
+    let use_script_pool = blocks.len() > 1;
+    let script_batches: Mutex<Vec<DeferredScriptBatch>> = Mutex::new(Vec::new());
+    let serial_scripts: Mutex<Vec<DeferredScriptCheck<'_>>> = Mutex::new(Vec::new());
     let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
         .collect();
@@ -872,11 +876,13 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let cumulative = &cumulative;
             let tips = &tips;
             let profile_totals = &profile_totals;
-            let script_sink = &script_sink;
+            let script_batches = &script_batches;
+            let serial_scripts = &serial_scripts;
             let submit_total = &submit_total;
             scope.spawn(move || {
                 let _ = crate::validation_profile::take();
                 let mut submit_elapsed = Duration::ZERO;
+                let mut local_batch = use_script_pool.then(DeferredScriptBatch::new);
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(block) = blocks.get(index) else {
@@ -906,14 +912,13 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         for script in &mut scripts {
                             script.set_block_order(index);
                         }
-                        {
-                            let mut sink =
-                                script_sink.lock().expect("script sink lock not poisoned");
-                            if let Some(batch) = sink.0.as_mut() {
-                                batch.submit(scripts);
-                            } else {
-                                sink.1.extend(scripts);
-                            }
+                        if let Some(batch) = local_batch.as_mut() {
+                            batch.submit(scripts);
+                        } else {
+                            serial_scripts
+                                .lock()
+                                .expect("serial script lock not poisoned")
+                                .extend(scripts);
                         }
                         submit_elapsed += submit_started.elapsed();
                         (prepared, delta)
@@ -928,6 +933,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                     *total += sample;
                 }
                 *submit_total.lock().expect("submit total lock not poisoned") += submit_elapsed;
+                if let Some(batch) = local_batch {
+                    script_batches
+                        .lock()
+                        .expect("script batch lock not poisoned")
+                        .push(batch);
+                }
             });
         }
     });
@@ -957,16 +968,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }
     }
     if let Some((failed_index, error)) = failure {
-        let script_failure = {
-            let mut sink = script_sink.lock().expect("script sink lock not poisoned");
-            if let Some(batch) = sink.0.take() {
-                batch.finish_with_order()
-            } else {
-                verify_deferred_scripts(std::mem::take(sink.1))
-                    .map(|(index, source)| (0, index, source))
-            }
-        };
-        if let Some((block_order, index, source)) = script_failure {
+        if let Some((block_order, index, source)) =
+            drain_script_batches(script_batches, serial_scripts)
+        {
             if block_order < failed_index {
                 return Err(BlockExecutionError::Block(BlockError::Transaction {
                     index,
@@ -1042,13 +1046,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let _ = current;
 
     let wait_started = Instant::now();
-    let script_failure = if let Some(batch) = script_batch {
-        batch.finish()
-    } else {
-        verify_deferred_scripts(deferred_scripts)
-    };
+    let script_failure = drain_script_batches(script_batches, serial_scripts);
     breakdown.script_wait = wait_started.elapsed();
-    if let Some((index, source)) = script_failure {
+    if let Some((_, index, source)) = script_failure {
         return Err(BlockExecutionError::Block(BlockError::Transaction {
             index,
             source: source.into(),
@@ -1384,6 +1384,40 @@ type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
 /// Every version each key takes across a batch, tagged by the block index
 /// that wrote it, in block order.
 type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
+/// Waits for every worker's script batch and returns the first failure by
+/// batch order, verifying any serially collected checks as block zero.
+fn drain_script_batches(
+    batches: Mutex<Vec<DeferredScriptBatch>>,
+    serial: Mutex<Vec<DeferredScriptCheck<'_>>>,
+) -> Option<(usize, usize, ConsensusError)> {
+    let batches = batches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut first = None;
+    for batch in batches {
+        if let Some(failure) = batch.finish_with_order() {
+            if first
+                .as_ref()
+                .is_none_or(|(order, index, _)| (failure.0, failure.1) < (*order, *index))
+            {
+                first = Some(failure);
+            }
+        }
+    }
+    let serial = serial
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((index, source)) = verify_deferred_scripts(serial) {
+        if first
+            .as_ref()
+            .is_none_or(|(order, first_index, _)| (0, index) < (*order, *first_index))
+        {
+            first = Some((0, index, source));
+        }
+    }
+    first
+}
+
 /// One block's parallel-preparation result, in batch order; its deferred
 /// script checks were already handed to the pool by the preparing worker.
 type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
