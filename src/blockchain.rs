@@ -13,7 +13,10 @@ use bitcoin::{
 use thiserror::Error;
 
 use crate::{
-    chainstate::{AppliedTransaction, ChainstateError, apply_transaction_with_deferred_scripts},
+    chainstate::{
+        AppliedTransaction, ChainstateError, PreparedTransaction,
+        apply_transaction_with_deferred_scripts, prepare_transaction_for_block,
+    },
     consensus::{
         ConsensusError, verify_serialized_transaction_scripts_with_flags,
         verify_transaction_scripts_with_flags,
@@ -705,6 +708,137 @@ fn apply_prevalidated_block_with_deployments_inner<'a, S: UtxoStore>(
                 .into_iter()
                 .map(|transaction| transaction.undo)
                 .collect(),
+        },
+        script_checks,
+    ))
+}
+
+/// A block whose transactions were resolved and checked but not written.
+///
+/// The per-transaction spent keys, prevouts and created coins are exactly what
+/// applying the block would write, so the caller can derive undo records and
+/// the block's net UTXO delta from it without a second pass over the store.
+pub(crate) struct PreparedBlock {
+    pub(crate) hash: bitcoin::BlockHash,
+    pub(crate) transactions: Vec<PreparedTransaction>,
+}
+
+/// Prepares a structurally validated block: every transaction is resolved and
+/// checked in order, nothing is written, scripts are deferred.
+///
+/// `store` must answer each transaction's inputs as the state after the
+/// transactions before it, which it cannot do on its own because nothing is
+/// written here: `record` is called with each prepared transaction, in order,
+/// before the next one is resolved, and the caller's view is expected to
+/// serve later lookups from what it recorded.
+///
+/// # Errors
+///
+/// Returns the same failures as the applying variant, reported the same way:
+/// a script failure of an earlier transaction takes precedence over a later
+/// non-script failure.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn prepare_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>(
+    store: &S,
+    block: &'a Block,
+    transaction_ids: &[Txid],
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    script_flags: u32,
+    csv_active: bool,
+    subsidy_sats: u64,
+    mut record: impl FnMut(&PreparedTransaction),
+) -> Result<(PreparedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
+    if transaction_ids.len() != block.txdata.len() {
+        return Err(BlockError::MerkleRoot);
+    }
+    let mut transactions = Vec::with_capacity(block.txdata.len());
+    let mut script_checks = Vec::with_capacity(block.txdata.len().saturating_sub(1));
+    let mut sigop_cost = 0_u64;
+    let mut fees = 0_u64;
+    let lock_time_context = if csv_active {
+        creation_mtp
+    } else {
+        block.header.time
+    };
+    for (index, transaction) in block.txdata.iter().enumerate() {
+        let prepared = match prepare_transaction_for_block(
+            store,
+            transaction,
+            transaction_ids[index],
+            height,
+            now,
+            creation_mtp,
+            lock_time_context,
+            script_flags,
+            csv_active,
+        ) {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                if let Some((index, source)) = verify_deferred_scripts(script_checks) {
+                    return Err(BlockError::Transaction {
+                        index,
+                        source: source.into(),
+                    });
+                }
+                return Err(BlockError::Transaction { index, source });
+            }
+        };
+        if index != 0 {
+            script_checks.push(DeferredScriptCheck {
+                index,
+                block_order: 0,
+                transaction: &block.txdata[index],
+                prevouts: prepared.prevouts.clone(),
+                script_flags,
+            });
+            let transaction_fee = prepared
+                .validated
+                .input_value_sats
+                .checked_sub(prepared.validated.output_value_sats)
+                .expect("validated non-coinbase transaction cannot inflate");
+            let Some(next_fees) = fees.checked_add(transaction_fee) else {
+                return Err(BlockError::FeeOverflow);
+            };
+            if next_fees > crate::chainstate::MAX_MONEY_SATS {
+                return Err(BlockError::FeeOutOfRange { fees: next_fees });
+            }
+            fees = next_fees;
+        }
+        let Some(next_sigop_cost) = sigop_cost.checked_add(prepared.validated.sigop_cost) else {
+            return Err(BlockError::SigopOverflow);
+        };
+        sigop_cost = next_sigop_cost;
+        if sigop_cost > MAX_BLOCK_SIGOPS_COST {
+            return Err(BlockError::SigopCost { cost: sigop_cost });
+        }
+        record(&prepared);
+        transactions.push(prepared);
+    }
+    let Some(allowed) = subsidy_sats.checked_add(fees) else {
+        if let Some((index, source)) = verify_deferred_scripts(script_checks) {
+            return Err(BlockError::Transaction {
+                index,
+                source: source.into(),
+            });
+        }
+        return Err(BlockError::FeeOverflow);
+    };
+    let claimed = transactions[0].validated.output_value_sats;
+    if claimed > allowed {
+        if let Some((index, source)) = verify_deferred_scripts(script_checks) {
+            return Err(BlockError::Transaction {
+                index,
+                source: source.into(),
+            });
+        }
+        return Err(BlockError::ExcessCoinbase { claimed, allowed });
+    }
+    Ok((
+        PreparedBlock {
+            hash: block.block_hash(),
+            transactions,
         },
         script_checks,
     ))

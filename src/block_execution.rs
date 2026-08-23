@@ -12,15 +12,16 @@ use thiserror::Error;
 
 use crate::{
     blockchain::{
-        AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck,
+        AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck, PreparedBlock,
         ValidatedBlockTransactionIds, apply_block_with_deployments,
         apply_prevalidated_block_with_deferred_scripts,
         apply_prevalidated_block_with_deferred_scripts_and_txids,
         apply_prevalidated_block_with_deployments, disconnect_block,
+        prepare_prevalidated_block_with_deferred_scripts,
         validate_block_structure_with_deployments, verify_deferred_scripts,
     },
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
-    chainstate::is_unspendable,
+    chainstate::{PreparedTransaction, is_unspendable},
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
@@ -608,7 +609,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     headers: &HeaderDag,
     blocks: &[Block],
     now: u64,
-    hot_window_secs: u64,
+    _hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
     structure_prevalidated: bool,
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
@@ -673,28 +674,20 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // overlay and builds N's transition. Each block still sees exactly the
     // state its predecessor left, and the transitions are collected in order.
     std::thread::scope(|scope| -> Result<(), BlockExecutionError> {
-        let mut previous_delta: Option<Arc<BlockDelta>> = None;
+        let mut previous_delta: Option<Arc<PreparedDelta>> = None;
         let mut pending_tail: Option<std::thread::ScopedJoinHandle<'_, PipelineTail>> = None;
         for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
-            let block_capacity = block
-                .txdata
-                .iter()
-                .map(|transaction| transaction.input.len() + transaction.output.len())
-                .sum();
             let validate_started = Instant::now();
             let validated = {
                 let view = DeltaView::new(previous_delta.as_deref(), &cumulative);
-                let block_overlay = UtxoOverlay::with_capacity(&view, block_capacity);
-                validate_active_block_inner(
-                    &block_overlay,
+                prepare_active_block_inner(
+                    &view,
                     headers,
                     block,
                     current,
                     now,
-                    hot_window_secs,
                     deployment,
                     structure_prevalidated,
-                    true,
                     transaction_ids.map(|ids| ids[block_order].as_slice()),
                 )
             };
@@ -713,7 +706,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                 applied_blocks.push(applied);
                 breakdown.apply += apply_elapsed;
             }
-            let (mut applied, delta, mut block_scripts) = match validated {
+            let (prepared, delta, mut block_scripts) = match validated {
                 Ok(validated) => validated,
                 Err(error) => {
                     let script_failure = if let Some(batch) = script_batch.take() {
@@ -738,20 +731,17 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                     .height
                     .checked_add(1)
                     .ok_or(BlockExecutionError::NoNextHeader(current.height))?,
-                hash: applied.hash,
+                hash: prepared.block.hash,
             };
-            if !retains_undo {
-                applied.transaction_undos.clear();
-            }
             let delta = Arc::new(delta);
             previous_delta = Some(Arc::clone(&delta));
             let cumulative_ref = &cumulative;
             let parent_hash = current.hash;
             pending_tail = Some(scope.spawn(move || {
                 let started = Instant::now();
-                let changes = delta.net_changes()?;
+                let changes = delta.net_changes();
                 cumulative_ref.apply_validated_changes(&changes);
-                let mut applied = applied;
+                let mut applied = prepared.into_applied(retains_undo);
                 let transition = ConnectTransition {
                     expected_parent: parent_hash,
                     next,
@@ -833,6 +823,130 @@ fn validate_active_block<S: UtxoStore>(
         crate::validation_profile::add(crate::validation_profile::NET, net_started.elapsed());
         Ok((applied, changes))
     })
+}
+
+/// The pipeline's counterpart of [`validate_active_block_inner`]: the same
+/// header, BIP30 and structure checks, then every transaction resolved and
+/// checked against a [`BlockPrepareView`] without writing anything.
+#[allow(clippy::too_many_arguments)]
+fn prepare_active_block_inner<'a, S: UtxoStore>(
+    chainstate: &S,
+    headers: &HeaderDag,
+    block: &'a Block,
+    current: ExecutionTip,
+    now: u64,
+    deployments: &BlockDeploymentContext,
+    structure_prevalidated: bool,
+    transaction_ids: Option<&[Txid]>,
+) -> Result<
+    (
+        PreparedActiveBlock,
+        PreparedDelta,
+        Vec<DeferredScriptCheck<'a>>,
+    ),
+    BlockExecutionError,
+> {
+    let checks_started = Instant::now();
+    let active_current = headers.active_header_at(current.height);
+    if active_current.is_none_or(|header| header.hash != current.hash) {
+        return Err(BlockExecutionError::TipNotActive {
+            height: current.height,
+            hash: current.hash,
+        });
+    }
+    let next_height = current
+        .height
+        .checked_add(1)
+        .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
+    let expected = headers
+        .active_header_at(next_height)
+        .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
+    let actual = block.block_hash();
+    if actual != expected.hash {
+        return Err(BlockExecutionError::UnexpectedBlock {
+            expected: expected.hash,
+            actual,
+        });
+    }
+    let parent_mtp = headers
+        .median_time_past(current.hash)
+        .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
+    let capacity = block
+        .txdata
+        .iter()
+        .map(|transaction| transaction.input.len() + transaction.output.len())
+        .sum();
+    let view = BlockPrepareView::new(chainstate, capacity);
+    let exception_undo = prepare_bip30_rules(&view, block, deployments)?;
+    if !structure_prevalidated {
+        validate_block_structure_with_deployments(
+            block,
+            next_height,
+            deployments.bip34_active,
+            deployments.segwit_active,
+            deployments.signet_challenge.as_deref(),
+        )
+        .map_err(BlockExecutionError::Block)?;
+    }
+    crate::validation_profile::add(crate::validation_profile::CHECKS, checks_started.elapsed());
+    let computed_ids;
+    let transaction_ids = if let Some(ids) = transaction_ids {
+        ids
+    } else {
+        computed_ids = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        computed_ids.as_slice()
+    };
+    let (prepared, scripts) = prepare_prevalidated_block_with_deferred_scripts(
+        &view,
+        block,
+        transaction_ids,
+        next_height,
+        now,
+        parent_mtp,
+        deployments.script_flags,
+        deployments.csv_active,
+        deployments.subsidy_sats,
+        |transaction| view.record(transaction),
+    )
+    .map_err(BlockExecutionError::Block)?;
+    Ok((
+        PreparedActiveBlock {
+            block: prepared,
+            exception_undo,
+        },
+        view.into_delta(),
+        scripts,
+    ))
+}
+
+/// [`apply_bip30_rules`] for a prepare view: the overwritten coins are
+/// recorded as spent in the view and returned as the exception undo.
+fn prepare_bip30_rules<S: UtxoStore>(
+    view: &BlockPrepareView<'_, S>,
+    block: &Block,
+    deployments: &BlockDeploymentContext,
+) -> Result<Option<UtxoUndo>, BlockExecutionError> {
+    if !deployments.bip30_enforced && !deployments.bip30_overwrite {
+        return Ok(None);
+    }
+    let collisions = block_output_collisions(view, block)?;
+    if collisions.is_empty() {
+        return Ok(None);
+    }
+    if !deployments.bip30_overwrite {
+        return Err(BlockExecutionError::Bip30Collision(collisions[0]));
+    }
+    let mut overwritten = Vec::with_capacity(collisions.len());
+    for outpoint in &collisions {
+        let utxo = view.get(*outpoint)?.ok_or(UtxoError::Missing(*outpoint))?;
+        overwritten.push((*outpoint, utxo));
+    }
+    view.mark_spent(&collisions);
+    Ok(Some(UtxoUndo::from_parts(overwritten, Vec::new())))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1012,7 +1126,7 @@ fn overlay_shard(outpoint: &OutPointKey) -> usize {
 /// sees a half-applied state: a key in the delta answers from the delta, any
 /// other key is untouched by the fold and answers from the batch overlay.
 struct DeltaView<'a, S> {
-    delta: Option<&'a BlockDelta>,
+    delta: Option<&'a PreparedDelta>,
     base: &'a S,
 }
 
@@ -1024,15 +1138,231 @@ enum DeltaAnswer {
 }
 
 impl<'a, S: UtxoStore> DeltaView<'a, S> {
-    fn new(delta: Option<&'a BlockDelta>, base: &'a S) -> Self {
+    fn new(delta: Option<&'a PreparedDelta>, base: &'a S) -> Self {
         Self { delta, base }
     }
 
     fn lookup(&self, outpoint: &OutPointKey) -> DeltaAnswer {
-        match self.delta.and_then(|delta| delta.cached(outpoint)) {
-            Some(Some(utxo)) => DeltaAnswer::Coin(utxo),
+        self.delta
+            .map_or(DeltaAnswer::Unknown, |delta| delta.lookup(outpoint))
+    }
+}
+
+/// What one block did to the coins it touched, recorded while it was
+/// prepared: the coins it created and the keys it spent (a coin created and
+/// spent inside the block is in both).
+///
+/// Built on the validation thread as the block's transactions resolve, read
+/// by the next block through a [`DeltaView`] and turned into the block's net
+/// change on the pipeline tail — so neither the next block nor the tail
+/// waits for a write.
+pub(crate) struct PreparedDelta {
+    /// The block's final word on every key it touched, updated in transaction
+    /// order: `Some` is a coin the block leaves behind, `None` a key it spent.
+    state: AHashMap<OutPointKey, Option<Utxo>>,
+    /// Keys the block spent (or overwrote under BIP30) that existed before it,
+    /// as opposed to coins it created and spent itself.
+    spent_from_base: AHashSet<OutPointKey>,
+}
+
+impl PreparedDelta {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: AHashMap::with_capacity(capacity),
+            spent_from_base: AHashSet::with_capacity(capacity),
+        }
+    }
+
+    fn lookup(&self, outpoint: &OutPointKey) -> DeltaAnswer {
+        match self.state.get(outpoint) {
+            Some(Some(utxo)) => DeltaAnswer::Coin(utxo.clone()),
             Some(None) => DeltaAnswer::Spent,
             None => DeltaAnswer::Unknown,
+        }
+    }
+
+    fn spend(&mut self, outpoint: OutPointKey) {
+        if self.state.insert(outpoint, None).is_none() {
+            self.spent_from_base.insert(outpoint);
+        }
+    }
+
+    fn record(&mut self, prepared: &PreparedTransaction) {
+        for outpoint in &prepared.spent {
+            self.spend(*outpoint);
+        }
+        for (outpoint, utxo) in &prepared.created {
+            self.state.insert(*outpoint, Some(utxo.clone()));
+        }
+    }
+
+    /// The block's net effect: coins it leaves behind, keys it removed from
+    /// the state it started from. A BIP30 overwrite puts a key in both, the
+    /// removal first. Sorted like the overlay's `net_changes`.
+    fn net_changes(&self) -> UtxoChanges {
+        let mut spent: Vec<OutPointKey> = self.spent_from_base.iter().copied().collect();
+        let mut created: Vec<(OutPointKey, Utxo)> = self
+            .state
+            .iter()
+            .filter_map(|(outpoint, value)| value.as_ref().map(|utxo| (*outpoint, utxo.clone())))
+            .collect();
+        spent.sort_unstable();
+        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+        // The pipeline carries undo per transaction in `AppliedBlock`; the
+        // block-level record is only built on the unpipelined path.
+        UtxoChanges {
+            spent,
+            created,
+            undo: UtxoUndo::from_parts(Vec::new(), Vec::new()),
+        }
+    }
+}
+
+/// The read view a block is prepared against: what the block itself has
+/// resolved so far, over the state it starts from.
+struct BlockPrepareView<'a, S> {
+    base: &'a S,
+    delta: Mutex<PreparedDelta>,
+}
+
+impl<'a, S: UtxoStore> BlockPrepareView<'a, S> {
+    fn new(base: &'a S, capacity: usize) -> Self {
+        Self {
+            base,
+            delta: Mutex::new(PreparedDelta::with_capacity(capacity)),
+        }
+    }
+
+    fn delta(&self) -> std::sync::MutexGuard<'_, PreparedDelta> {
+        self.delta.lock().expect("prepare view lock not poisoned")
+    }
+
+    fn record(&self, prepared: &PreparedTransaction) {
+        self.delta().record(prepared);
+    }
+
+    /// Removes coins the block overwrites under the BIP30 exception.
+    fn mark_spent(&self, outpoints: &[OutPointKey]) {
+        let mut delta = self.delta();
+        for outpoint in outpoints {
+            delta.spend(*outpoint);
+        }
+    }
+
+    fn into_delta(self) -> PreparedDelta {
+        self.delta
+            .into_inner()
+            .expect("prepare view lock not poisoned")
+    }
+}
+
+impl<S: UtxoStore> UtxoStore for BlockPrepareView<'_, S> {
+    fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        match self.delta().lookup(&outpoint) {
+            DeltaAnswer::Coin(utxo) => Ok(Some(utxo)),
+            DeltaAnswer::Spent => Ok(None),
+            DeltaAnswer::Unknown => self.base.get(outpoint),
+        }
+    }
+
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let mut results = Vec::with_capacity(outpoints.len());
+        let mut wanted = Vec::new();
+        let mut positions = Vec::new();
+        {
+            let delta = self.delta();
+            for outpoint in outpoints {
+                match delta.lookup(outpoint) {
+                    DeltaAnswer::Coin(utxo) => results.push((*outpoint, Some(utxo))),
+                    DeltaAnswer::Spent => results.push((*outpoint, None)),
+                    DeltaAnswer::Unknown => {
+                        positions.push(results.len());
+                        wanted.push(*outpoint);
+                        results.push((*outpoint, None));
+                    }
+                }
+            }
+        }
+        if !wanted.is_empty() {
+            let resolved = self.base.get_many(&wanted)?;
+            for (position, (_, utxo)) in positions.into_iter().zip(resolved) {
+                results[position].1 = utxo;
+            }
+        }
+        Ok(results)
+    }
+
+    fn apply(&self, _: &[OutPointKey], _: &[(OutPointKey, Utxo)]) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn apply_with_undo(
+        &self,
+        _: &[OutPointKey],
+        _: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn undo(&self, _: &UtxoUndo, _: u64, _: u64) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn age_to_cold(&self, _: u64, _: u64) -> Result<u64, UtxoError> {
+        Ok(0)
+    }
+
+    fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn replace_all(
+        &self,
+        _: &BTreeMap<OutPointKey, Utxo>,
+        _: u64,
+        _: u64,
+    ) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+        self.base.tier_stats()
+    }
+}
+
+/// A prepared block plus the BIP30 exception undo, ready for the tail.
+struct PreparedActiveBlock {
+    block: PreparedBlock,
+    exception_undo: Option<UtxoUndo>,
+}
+
+impl PreparedActiveBlock {
+    /// The `AppliedBlock` applying this block would have produced; undo
+    /// records are built from the prepared coins only when they are kept.
+    fn into_applied(self, retains_undo: bool) -> AppliedBlock {
+        let hash = self.block.hash;
+        let mut transaction_undos = Vec::new();
+        if retains_undo {
+            transaction_undos.reserve(self.block.transactions.len() + 1);
+            if let Some(undo) = self.exception_undo {
+                transaction_undos.push(undo);
+            }
+            for prepared in self.block.transactions {
+                let spent = prepared.spent.into_iter().zip(prepared.prevouts).collect();
+                let created = prepared
+                    .created
+                    .into_iter()
+                    .map(|(outpoint, _)| outpoint)
+                    .collect();
+                transaction_undos.push(UtxoUndo::from_parts(spent, created));
+            }
+        }
+        AppliedBlock {
+            hash,
+            transaction_undos,
         }
     }
 }
@@ -1127,16 +1457,6 @@ struct BlockDelta {
 impl BlockDelta {
     fn net_changes(&self) -> Result<UtxoChanges, UtxoError> {
         net_changes_of(&self.shards)
-    }
-
-    /// The block's view of a key, if it touched the key at all.
-    #[allow(clippy::option_option)]
-    fn cached(&self, outpoint: &OutPointKey) -> Option<Option<Utxo>> {
-        self.shards[overlay_shard(outpoint)]
-            .lock()
-            .expect("overlay lock not poisoned")
-            .cached(outpoint)
-            .cloned()
     }
 }
 

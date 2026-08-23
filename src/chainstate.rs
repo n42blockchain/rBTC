@@ -52,11 +52,12 @@ pub struct ValidatedTransaction {
     pub sigop_cost: u64,
 }
 
-struct PreparedTransaction {
-    validated: ValidatedTransaction,
-    spent: Vec<OutPointKey>,
-    created: Vec<(OutPointKey, Utxo)>,
-    prevouts: Vec<Utxo>,
+/// A transaction resolved and checked against a UTXO view, not yet written.
+pub(crate) struct PreparedTransaction {
+    pub(crate) validated: ValidatedTransaction,
+    pub(crate) spent: Vec<OutPointKey>,
+    pub(crate) created: Vec<(OutPointKey, Utxo)>,
+    pub(crate) prevouts: Vec<Utxo>,
 }
 
 /// Transaction application failure.
@@ -291,6 +292,49 @@ pub(crate) fn apply_transaction_with_deferred_scripts<S: UtxoStore>(
         },
         prepared.prevouts,
     ))
+}
+
+/// Resolves and checks one block transaction without writing anything.
+///
+/// Everything [`apply_transaction_with_deferred_scripts`] checks before its
+/// store mutation, with the mutation left to the caller: the returned spent
+/// keys, prevouts and created coins are what that mutation would write, and
+/// the prevouts are what the deferred script check needs.
+///
+/// # Errors
+///
+/// Returns the same validation failures as
+/// [`apply_transaction_with_deferred_scripts`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_transaction_for_block<S: UtxoStore>(
+    store: &S,
+    transaction: &Transaction,
+    txid: bitcoin::Txid,
+    height: u32,
+    now: u64,
+    creation_mtp: u32,
+    lock_time_context: u32,
+    script_flags: u32,
+    csv_active: bool,
+) -> Result<PreparedTransaction, ChainstateError> {
+    let prepare_started = std::time::Instant::now();
+    let prepared = prepare_transaction_with_context(
+        store,
+        transaction,
+        Some(txid),
+        height,
+        now,
+        creation_mtp,
+        lock_time_context,
+        script_flags,
+        csv_active,
+        false,
+    )?;
+    crate::validation_profile::add(
+        crate::validation_profile::PREPARE,
+        prepare_started.elapsed(),
+    );
+    Ok(prepared)
 }
 
 /// Checks one transaction against the current UTXO set without mutating it.
