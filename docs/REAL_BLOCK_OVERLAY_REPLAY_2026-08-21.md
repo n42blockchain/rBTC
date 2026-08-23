@@ -702,6 +702,20 @@ catch-up never reads unless an explorer or index is attached.
 against `redb-wb16-v13` (1,585 s), validation 470 → 257 s; its compaction-
 forced flush waits (16–32 s at five of seven flushes) remain.
 
+### v15: the tail measured, and lightened (2026-08-23 10:47Z)
+
+Commit 1532635 splits `core-apply` into net-change, fold and the rest in
+the batch log and stops maintaining the batch overlay's `original` map
+during the fold (the overlay's own net change is never read on the
+pipelined path). `mdbx-wb16-v15`: **1,140 s** (102,122 tx/s), digest
+`aadd289f…`, no crash — the window's best so far. The tail now costs
+222 s of thread time: 42 s deriving net changes, 130 s folding into the
+batch overlay, about 50 s building undo and the transition; the
+validation thread spends 239 s in `core-validate` (167 s of it resolving
+inputs and checking transactions). The two stages are still close to
+balanced, so the fold is the next target; commit 623470a groups a block's
+keys by shard and takes each shard lock once per block (v16).
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
