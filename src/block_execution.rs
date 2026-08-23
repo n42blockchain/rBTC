@@ -1588,13 +1588,32 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     /// — so only `current` is maintained: reads consult it first, and a key
     /// the block wrote needs no `original` entry to be answered correctly.
     fn apply_validated_changes(&self, changes: &UtxoChanges) {
+        // Group the keys by shard first so each shard is locked once per
+        // block instead of once per key; the tail thread and the validation
+        // thread share these locks, so fewer acquisitions help both.
+        let mut spent_by_shard: Vec<Vec<OutPointKey>> = vec![Vec::new(); OVERLAY_SHARDS];
         for outpoint in &changes.spent {
-            self.shard(outpoint).current.insert(*outpoint, None);
+            spent_by_shard[overlay_shard(outpoint)].push(*outpoint);
         }
-        for (outpoint, utxo) in &changes.created {
-            self.shard(outpoint)
-                .current
-                .insert(*outpoint, Some(utxo.clone()));
+        let mut created_by_shard: Vec<Vec<&(OutPointKey, Utxo)>> = vec![Vec::new(); OVERLAY_SHARDS];
+        for entry in &changes.created {
+            created_by_shard[overlay_shard(&entry.0)].push(entry);
+        }
+        for (shard, (spent, created)) in self
+            .shards
+            .iter()
+            .zip(spent_by_shard.into_iter().zip(created_by_shard))
+        {
+            if spent.is_empty() && created.is_empty() {
+                continue;
+            }
+            let mut state = shard.lock().expect("overlay lock not poisoned");
+            for outpoint in spent {
+                state.current.insert(outpoint, None);
+            }
+            for (outpoint, utxo) in created {
+                state.current.insert(*outpoint, Some(utxo.clone()));
+            }
         }
     }
 
