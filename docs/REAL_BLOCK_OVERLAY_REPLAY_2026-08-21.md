@@ -812,6 +812,26 @@ fold are gone. On the smoke ledger `core-validate` fell 2.4 → 0.9 s per
 256-block batch with the digest unchanged; the full-window lanes are
 running.
 
+The full-window lanes then said no: `mdbx-wb16-v25` came in at 1,011 s
+against v24's 895 s, with `core-script-wait` up from 10 s to 414 s —
+parallel preparation had moved the script hand-off after the whole
+batch, so the pool that used to chew scripts beside a six-second batch
+got them all at once and the loop waited for it. Commit 1fe0b75 made the
+preparing workers submit each block's checks the moment the block is
+prepared (`mdbx-wb16-v26`: 937 s, wait 277 s — better, still wrong),
+and the remaining cost turned out to be the shared submission sink: one
+mutex serialised the per-block transaction serialisation across all
+eight workers (258 s of thread time). Commit c250a1a gives every worker
+its own `DeferredScriptBatch`, drained into one first-failure verdict at
+the end; measured as v27. Two lane-harness notes from the same evening:
+`redb-wb16-v25` crossed the 85% threshold and rebased onto a new base at
+962,392 — its digest legitimately differs, since the audit digest is
+only comparable between overlays on the same base — and `redb-wb16-v26`
+then failed because the previous run's rebase output already occupied
+the shared snapshot paths; the benches now run redb with
+`--snapshot-overlay-rebase-percent 95` so no lane rebases inside the
+window.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
