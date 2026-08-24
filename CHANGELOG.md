@@ -97,6 +97,18 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
   the write-back buffers hash with ahash, and the batch overlay is folded in
   short per-shard bursts. Over mainnet 935,001–963,350 the MDBX lane went
   from 1,062 s to 920 s (126,635 tx/s) with the same overlay digest.
+- A batch is now prepared in parallel: workers derive each block's
+  transaction-level coin delta, the merged versioned view lets eight workers
+  prepare every block at once (each key resolved from the latest earlier
+  version), and every worker hands its blocks' script checks to the pool in
+  a batch of its own. The write-back buffer moves created coins instead of
+  cloning them and flushes the batch's pre-folded net change through
+  `commit_connect_folded` in one engine write pass. On the replay path the
+  script verdict then trails one batch behind execution — the carry drains
+  before anything becomes durable, and a carried failure outranks the newer
+  batch's errors. Together these took the MDBX lane from 920 s to 790 s
+  (147,436 tx/s) and redb to 1,046 s over the same window, script wait
+  0.1 s on both engines, overlay digest unchanged.
 - The MDBX capacity query (snapshot overlay and the MDBX chainstore) reads
   environment info and statistics through its own read transaction. The
   environment-level calls pass no transaction, and because the libmdbx

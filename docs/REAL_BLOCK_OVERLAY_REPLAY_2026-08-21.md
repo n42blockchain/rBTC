@@ -832,6 +832,36 @@ the shared snapshot paths; the benches now run redb with
 `--snapshot-overlay-rebase-percent 95` so no lane rebases inside the
 window.
 
+### v27/v28: the script verdict deferred one batch (2026-08-24)
+
+Per-worker batches (v27) cut the submission cost to 109 s but left
+`core-script-wait` at 275 s: the pool still needs about 2.5 s of CPU per
+batch, and once the rest of the batch takes only six seconds there is
+nothing left to hide it under. Commit 54b6aae stops waiting altogether
+on the replay path: batch k's script batches move into a carry that
+rides through the driver while batch k+1 executes, the verdict settles
+at k+1's wait point, and the carry drains before the final
+`flush_pending`. A carried failure outranks anything batch k+1 reports.
+Durability is unchanged — the write-back flush trails the verdict by at
+least fifteen batches, so nothing a peer could have fabricated becomes
+durable unverified.
+
+Measured over the full window, same host, all digests `aadd289f…`:
+
+| lane | catch-up | tx/s | script-wait |
+|---|---|---|---|
+| mdbx-wb16-v27 | 925 s | 125,913 | 275 s |
+| redb-wb16-v27 | 1,116 s | 104,408 | 269 s |
+| **mdbx-wb16-v28** | **790 s** | **147,436** | 0.1 s |
+| redb-wb16-v28 | 1,046 s | 111,397 | 0.1 s |
+
+790 s is 40% faster than btcdmdbx's rb_pipe8 (1,318 s) and 4.8× the
+day-1 MDBX baseline (3,823 s). What remains per 256-block batch on the
+loop is preparation (~3.0 s), submission (~1.0 s) and the buffered
+commit (~1.3 s); the engine terms (mutate 202 s, sync 171 s,
+base-lookup 115 s, undo 91 s over 111 batches) live on the flush thread
+and overlap execution almost entirely.
+
 ## 11. Tools added
 
 - `src/bin/fdb_ledger_import.rs` — read-only btcd `.fdb` → ledger import with
