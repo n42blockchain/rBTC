@@ -34,6 +34,7 @@ raw-record estimate previously copied into this document.
 | Same catch-up with write-back 16 plus the txid fingerprint sidecar (commit 0b8b3ae) | MDBX 2,314 s (0.61× its baseline, 50,340 tx/s), base probes 485 → 72 s, 93 GB written; same content digest | redb 2,407 s (0.63× the MDBX baseline); the engines are within 4% once neither pays for absent-key snapshot reads — catch-up is now bounded by validation, member base reads and flushes, not the engine |
 | Same catch-up with the asynchronous write-back flush, the block pipeline, the sharded batch overlay and the mimalloc allocator (commits e9aa0dc, 83b001d, 6156c00; 2026-08-22) | MDBX 1,435 s (0.38× its baseline, 81,159 tx/s); same content digest (thirteen overlays now) | redb 1,583 s (0.41× the MDBX baseline, 73,564 tx/s). Without mimalloc the same code was neutral on both engines (2,465 s / 2,444 s): the Windows system heap serialised the threads the pipeline and the flush had added. MDBX is now the faster engine on this window because its flush thread finishes sooner |
 | Power loss during `mdbx-wb16-v12` (2026-08-22 23:05Z, block 955,736 validated, durable overlay tip 951,384 = 17 batches behind) | Resumed in place after the reboot: overlay opened at 951,384, ledger truncated, 951,385–963,350 re-executed in 648 s, final digest `aadd289f…` identical to every clean run | The write-back crash contract (durable tip lags ≤ 2N batches, recovery re-executes only those) held on a real power cut; redb has not yet had an equivalent accident |
+| Same catch-up after the 2026-08-23/24 optimization series (parallel batch preparation, folded write-back commit, one-batch deferred script verdict; commits e5e5c45…54b6aae) | MDBX 790 s (0.21× its baseline, 147,436 tx/s, script wait 0.1 s) — 40% faster than btcdmdbx's rb_pipe8 pipeline (1,318 s) over the same corpus window | redb 1,046 s (111,397 tx/s); MDBX is now 25% faster than redb on this window. 26 valid overlays across every configuration hash to the one digest `aadd289f…7f2819` |
 
 The production-size copy-space implication is explicit: keeping the existing
 76.01 GB file while writing approximately 50.26 GB of live pages requires
@@ -156,8 +157,10 @@ cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
    buffered batches redb finished in 2,606 s and MDBX in 3,057 s; with the
    txid fingerprint sidecar added, 2,407 s and 2,314 s; with the
    asynchronous flush, the block pipeline, the sharded overlay and the
-   mimalloc allocator (2026-08-22), 1,583 s and 1,435 s — all thirteen
-   overlays hashing to the same content digest. **Item 4 is met for this corpus
+   mimalloc allocator (2026-08-22), 1,583 s and 1,435 s; and with parallel
+   batch preparation, the folded write-back commit and the one-batch
+   deferred script verdict (2026-08-24), redb 1,046 s and MDBX 790 s
+   (147,436 tx/s) — 26 valid overlays hashing to the same content digest. **Item 4 is met for this corpus
    window**; what it does not cover is a genesis-to-tip replay or the
    2015–2019 churn profile.
 5. The explicit backend manifest is complete. The daemon must still gain an

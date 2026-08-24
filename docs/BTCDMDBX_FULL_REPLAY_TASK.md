@@ -19,6 +19,9 @@ lane 按第 4 节准备完毕（两 lane 字节一致的 `--json` 测量补丁�
 交易总数与 durable TPS 仍未取得。lane A 未运行。证据与偏差记录见证据机
 `D:\rbtc-bench\btcdmdbx-full-replay-20260820\artifacts`；rBTC 侧随后的真实块
 A/B 见 [REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)。
+rBTC 侧最终成绩（2026-08-24，同一 935,001–963,350 语料窗口、全量校验）：MDBX
+790 s（147,436 tx/s）、redb 1,046 s，比 btcdmdbx rb_pipe8 的 1,318 s 快 40%，
+26 个有效 overlay 的共识内容 digest 全部一致（`aadd289f…7f2819`）。
 
 ## 1. 当前结论
 
