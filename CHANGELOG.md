@@ -139,6 +139,11 @@ Semantic Versioning; a release tag must exactly equal `v` plus the version in
 
 ### Changed
 
+- The MDBX concurrency stress example now defaults to the safe product-shaped
+  `all-txn` mode: point reads and transaction-scoped environment statistics run
+  beside the large writer transaction. The known-unsafe environment-level
+  `all` mode remains available only as an explicit negative control, and
+  unknown mode names fail instead of silently running a different workload.
 - The feature-gated MDBX chainstate now uses exactly four tables (`utxo_hot`,
   `utxo_cold`, `undo`, and `meta`). Its 34–37-byte physical outpoint keys use a
   wire-order txid plus an order-preserving width-tagged big-endian vout; coin and

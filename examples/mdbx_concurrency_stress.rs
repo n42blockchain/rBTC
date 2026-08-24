@@ -4,8 +4,14 @@
 //! `stat()` — the pattern that ran during every flush once the catch-up loop
 //! stopped waiting for the engine.
 //!
-//! Run with `cargo run --release --features mdbx --example mdbx_concurrency_stress -- <dir> <minutes>`.
+//! The default runs point reads and transaction-scoped environment statistics,
+//! matching the fixed product path:
+//! `cargo run --release --features mdbx --example mdbx_concurrency_stress -- <dir> <minutes>`.
 //! A clean exit prints the counters; a crash or an engine error is the finding.
+//!
+//! Pass `all` explicitly only as the negative control. It calls the known-unsafe
+//! environment-level `Database::info`/`Database::stat` beside the writer and is
+//! expected to reproduce `MDBX_CORRUPTED` under `MDBX_NOTLS`.
 
 use std::{
     env,
@@ -26,15 +32,22 @@ fn main() {
     let mut args = env::args().skip(1);
     let dir = args
         .next()
-        .expect("usage: mdbx_concurrency_stress <dir> <minutes>");
+        .expect("usage: mdbx_concurrency_stress <dir> <minutes> [mode]");
     let minutes: u64 = args.next().and_then(|m| m.parse().ok()).unwrap_or(5);
-    // Reader mode: "all" (reads + env-level info/stat polls), "reads", "info"
-    // (env-level polls only), "info-txn" (polls through a read transaction),
-    // or "none".
-    let mode = args.next().unwrap_or_else(|| "all".to_owned());
-    let do_reads = matches!(mode.as_str(), "all" | "reads");
+    // Reader mode: "all-txn" (safe default: reads + transaction-scoped
+    // info/stat), "reads", "info-txn", "none", or the known-unsafe negative
+    // controls "info" and "all".
+    let mode = args.next().unwrap_or_else(|| "all-txn".to_owned());
+    assert!(
+        matches!(
+            mode.as_str(),
+            "all-txn" | "all" | "reads" | "info" | "info-txn" | "none"
+        ),
+        "unknown reader mode {mode}"
+    );
+    let do_reads = matches!(mode.as_str(), "all-txn" | "all" | "reads");
     let do_info = matches!(mode.as_str(), "all" | "info");
-    let do_info_txn = mode == "info-txn";
+    let do_info_txn = matches!(mode.as_str(), "all-txn" | "info-txn");
     let reader_count = if mode == "none" { 0 } else { 2 };
     std::fs::create_dir_all(&dir).unwrap();
     let db = Database::<NoWriteMap>::open_with_options(
