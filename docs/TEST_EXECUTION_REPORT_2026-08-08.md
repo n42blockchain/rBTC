@@ -46,6 +46,7 @@ Initial real-daemon acceptance checks passed at this point. No regressions were 
 ### 补一轮 — 2026-08-08（复验）
 
 - Branch: `audit/group-b-decisions`
+- Commit checked: `36aa642`
 - Working directory: `/Users/jieliu/Documents/n42/rBTC`
 - Executed environment:
   - `RBTC_BITCOIND=/Users/jieliu/tools/bitcoin-31.0/bin/bitcoind`
