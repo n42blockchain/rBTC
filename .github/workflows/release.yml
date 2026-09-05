@@ -136,7 +136,7 @@ jobs:
             rbtcd-x86_64-unknown-linux-gnu.sha256
       - name: Attest Linux provenance
         id: provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: dist/rbtcd-x86_64-unknown-linux-gnu
       - name: Retain Linux provenance bundle
@@ -145,7 +145,7 @@ jobs:
           dist/rbtcd-x86_64-unknown-linux-gnu.provenance.sigstore.json
       - name: Attest release SBOM
         id: sbom
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: dist/rbtcd-x86_64-unknown-linux-gnu
           sbom-path: dist/rbtc.cdx.json
@@ -186,7 +186,7 @@ jobs:
             rbtcd-aarch64-unknown-linux-gnu.sha256
       - name: Attest native provenance
         id: provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: dist/rbtcd-aarch64-unknown-linux-gnu
       - name: Retain provenance bundle
@@ -301,7 +301,7 @@ jobs:
             >"$artifact.sha256"
       - name: Attest signed and notarized macOS artifact
         id: provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
             dist/rbtcd-${{ matrix.target }}
@@ -399,7 +399,7 @@ jobs:
           "$digest  $artifact" | Set-Content -NoNewline "dist/$artifact.sha256"
       - name: Attest signed Windows provenance
         id: provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: dist/rbtcd-x86_64-pc-windows-msvc.exe
       - name: Retain provenance bundle
@@ -440,7 +440,7 @@ jobs:
           scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
       - name: Sign common release identity with GitHub/Sigstore OIDC
         id: manifest_attestation
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: dist/RELEASE-MANIFEST.tsv
       - name: Retain offline-verifiable manifest signature bundle
