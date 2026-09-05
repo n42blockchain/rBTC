@@ -137,7 +137,45 @@ steady interval rose from 16.19 to 18.45 blocks/second. The exact target and a
 
 ## UTXO layout
 
-Each key is the Bitcoin outpoint's 32-byte txid in wire order plus a little-endian `vout`. The record stores amount, creating height, coinbase marker, last-touch time, and raw `scriptPubKey`. Outputs whose script begins with `OP_RETURN` or exceeds Core's 10,000-byte script limit affect transaction value accounting but are never inserted into chainstate or the explorer UTXO projection, matching `CScript::IsUnspendable`. `utxo_hot` is the write-optimized active tier and `utxo_cold` is the inactive tier. Moving tiers never changes consensus data. The legacy in-process aging interface uses a 60-day wall-clock window, but it is not a production boundary: historical snapshot import necessarily observes old coins as newly loaded. The operational replacement uses complete-replay consensus coin age in blocks. After the report selects a boundary, offline `--retier-utxos-window-blocks BLOCKS` scans the merged tiers in key order, classifies by creation height relative to the fixed execution tip, and commits at most 65,536 records per transaction. Its cursor and counters share the same transaction as every move, so a restart resumes without a giant transaction or ambiguous partial result; selecting a different tip/window safely starts a fresh idempotent scan. Tier metadata remains excluded from snapshot finalization and consensus identity.
+The default redb store retains its established key and row encoding for on-disk
+compatibility. The new MDBX chainstate has a separately versioned physical
+format: every key is 34–37 bytes, the txid in wire order followed by a
+one-byte width tag and the shortest big-endian `vout`. Bytewise cursor order
+therefore makes the outputs of one transaction contiguous and numerically
+ordered, enabling one txid-range cursor delete and naturally ordered snapshot
+paging. This costs about 1.7% more complete-state space than btcd's MSB-VLQ in
+the controlled 2M-coin test, but saves about 3.2% versus fixed 36-byte keys and
+does not inherit the VLQ's non-monotonic length boundary. Its coin value is the Bitcoin
+Core/btcd chainstate encoding: canonical VLQ `height << 1 | coinbase`, VLQ
+amount after Core's amount transform, and compressed standard script (or a
+length-coded raw script). Typical P2PKH coins at contemporary heights occupy
+roughly 25–26 bytes depending on the header and amount VLQs, versus roughly 54
+bytes for the legacy rBTC row. Neither `last_touched` nor
+`creation_mtp` is repeated per coin: MTP is recovered by creation height from
+`meta`, while `last_touched` is absent from the MDBX format. Compact undo rows
+use the same coin and big-endian outpoint encodings.
+
+One MDBX environment contains exactly `utxo_hot`, `utxo_cold`, `undo`, and
+`meta`. A successful connect commits both UTXO tiers, per-block undo, creation
+MTP/tip metadata, and the new execution tip in one durable MDBX write
+transaction; a validation or commit failure exposes none of them. IBD folds at
+most 256 contiguous blocks into that transaction, retains one undo row per
+block, and removes an output created and spent within the checkpoint from the
+net disk mutation. MDBX refuses a 257-block checkpoint instead of silently
+changing this memory/durability boundary. This atomic chainstore implementation
+is present behind the feature, but the daemon still selects redb by default;
+node-level MDBX selection and migration remain a separate gate.
+
+`utxo_hot` is the active tier and `utxo_cold` the inactive tier. MDBX placement
+uses only `tip_height - creation_height`, never wall time, and its wall-clock
+aging entry point fails explicitly. The selected boundary is 157,680 blocks
+(approximately three years): the completed replay measured P50 42 and P99
+122,194 blocks, 99.38467% hot hits, 65.95593% of UTXOs in hot, and about 1.006
+hot-first probes per spend. The legacy redb in-process aging interface still
+exists for compatibility, but it is not a production boundary. Offline
+`--retier-utxos-window-blocks BLOCKS` scans merged redb tiers by creation height
+relative to a fixed execution tip. Tier metadata remains excluded from snapshot
+finalization and consensus identity.
 
 Spent-output coin age is now accumulated as exact block-age/count rows in the
 network-bound chainstate. A checkpoint aggregates ages before sorted writes;
@@ -538,7 +576,17 @@ stalled-handshake process test exits successfully after logging that durable
 stores are closing, avoiding the allocator-repair cost caused by the operating
 system's default abrupt termination.
 
-The `mdbx` Cargo feature provides an experimental durable MDBX hot/cold UTXO backend. It is not a production chainstate selector yet because undo and tip metadata must first be moved into the same MDBX transaction. On the local 100-block/100-spend+create release fixture, durable MDBX completed in about 39 ms versus redb's 733 ms without quick repair and 1.43 s with quick repair; those numbers are a direction signal, not a deployment decision, and must be repeated on target NVMe/HDD hardware with full block undo and metadata included.
+The `mdbx` Cargo feature provides the experimental four-table chainstate
+described above. Compact UTXOs, compact undo, and execution-tip metadata now do
+share each write transaction. Data-format schema 4 explicitly binds the root
+manifest to `redb` or `mdbx`; the current redb node rejects an MDBX-marked
+directory before opening either engine, and schema-3 redb manifests migrate
+atomically. What remains experimental is node selection, content migration,
+and full-workload measurement. The older bare-UTXO
+100-block fixture (about 39 ms versus redb's 733 ms without quick repair and
+1.43 s with quick repair) omitted the now-implemented undo/tip work and is only
+a historical direction signal. It must not be presented as the performance of
+the complete MDBX chainstore.
 
 Recovery gates cover transaction-stage failure, simulated disk-full writes, repeated process SIGKILL followed by reopen, and truncated database copies. A damaged file must either reopen to a complete committed state or be rejected explicitly; it must never be served as partially current chainstate.
 
@@ -683,6 +731,100 @@ comparison:
   `last_pgno` does not shrink. `--snapshot-overlay-compact-percent` (default
   50, below the 85 rebase threshold) controls how early either engine tries
   reclaiming garbage before a full fold/rebase.
+
+`--snapshot-overlay-flush-batches N` (1–64, default 1) puts an engine-agnostic
+write-back layer (`write_back_chainstate::WriteBackChainstate`) in front of
+either overlay. It buffers the validated transitions of the last N batches,
+answers reads from the buffer before the engine (a buffered creation hits, a
+buffered spend misses, anything else falls through), and hands the engine one
+batch whose existing intra-batch fold cancels every coin created and spent
+inside the window. `--snapshot-overlay-flush-coins` (default 8,000,000)
+bounds the buffer by net-created coins. The layer exists because of the
+measured spend-age distribution of mainnet 935,001–963,350: 33.5% of inputs
+spend an output created in the same block and 80.7% one at most 256 blocks
+old ([2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)), so a
+store that commits every batch writes most coins only to delete them a batch
+later. Disconnect, rebase, compaction, direct UTXO mutation and snapshot
+export flush first — compaction does not: it only reshapes the engine's
+file, so it waits for a running background commit and keeps the buffer in
+memory, and the catch-up loop defers a compaction that would have to wait
+unless the overlay is already near its rebase threshold — and the catch-up
+loop flushes before reporting its tip;
+the engine's durable tip therefore lags the reported tip by at most 2N
+batches (N buffered plus up to N more accepted while the previous commit is
+still running), and a crash re-executes only those blocks because the overlay
+start-up path already truncates the retained ledger to the durable tip. The
+reported overlay capacity includes the buffer's estimated bytes so
+compaction and rebase still trigger before a flush could hit the geometry
+ceiling. At the default of one batch the bare engine runs unchanged. Over
+the first 1,024 real blocks above the 935,000 snapshot with four buffered
+batches, both engines wrote 1,795,392 coins and 1,549,874 spends and
+cancelled 3,833,838 coins in memory — 68% of the coins those blocks created
+never reached disk — and reached the same tip as the unbuffered runs. Over
+the full 28,350-block window with 16 buffered batches, 81% of created coins
+cancelled in memory and the read-only `overlay_audit` binary
+(`SnapshotOverlayChainstate::audit_content` /
+`SnapshotOverlayRedbChainstate::audit_content`) produced the same
+consensus-content digest for both engines with and without the layer; it
+hashes base identity, tip, every coin's value, height, coinbase flag,
+creation MTP and script, and every tombstone, leaving out the per-run
+`last_touched` bookkeeping and the prune-dependent undo rows.
+
+The write-back flush is asynchronous: when the buffer reaches its limit the
+buffered transitions move into an in-flight set and a helper thread hands
+them to the engine while the catch-up loop keeps validating into a fresh
+buffer. Reads consult the pending buffer, then the in-flight set, then the
+engine, so no coin is ever invisible; a second flush waits for the first;
+every synchronous flush point (disconnect, rebase, compaction, export, the
+final tip report) and the drop of the layer join the helper first; and a
+failed commit is reported on the next call instead of being lost. The
+batch limit is a target rather than a wall: while a commit is running the
+buffer keeps accepting up to twice the limit (the coin limit still forces a
+flush), so the loop waits for the engine only when the engine is slower
+than two whole windows of validation. The crash contract is unchanged
+except for that bound — the durable tip lags by at most 2N batches.
+
+Block execution inside a batch is a two-stage pipeline. The validation
+thread *prepares* block N: every transaction is resolved and checked, in
+order, against a `BlockPrepareView` — what the block itself has resolved
+so far (a `PreparedDelta`: the block's final word on each key it touched,
+plus the keys it removed from the state it started from) over the state
+the block starts from — and nothing is written. A helper thread then
+derives N's undo records, net change and store transition from the
+prepared transactions and folds the change into the sharded batch
+overlay, while the validation thread prepares block N+1 through a
+`DeltaView` that answers from N's `PreparedDelta` first and from the batch
+overlay otherwise. A key in N's delta is therefore read from the delta and
+any other key is untouched by the concurrent fold, so block N+1 sees
+exactly the state block N left without waiting for a write; transitions
+are joined in order and a failed fold surfaces as the batch's error. The
+single-block and non-deferred paths still apply through a block overlay. The batch overlay itself is
+split into 64 independently locked shards so the fold, the validation
+reads and the parallel seeding of prefetched coins proceed without a single
+lock.
+
+The `rbtcd` binary installs mimalloc as its global allocator by default
+(`--no-default-features` restores the system allocator): on Windows the
+system heap serialised the validation thread, the pipeline tail, the flush
+thread and the script threads, and with per-thread heaps the same mainnet
+window ran 35–42% faster on both engines with the same overlay digest.
+
+The base index also carries a fingerprint sidecar, `<index>.fp`: one 16-bit
+txid fingerprint per MPHF slot behind a header naming the index container
+digest, with a trailing SHA-256. `build_core_snapshot_index` writes it, an
+index written before it existed gets one on the first overlay open (one
+sequential scan of the snapshot, 54 s for 113.9M slots, logged), and a
+sidecar that is missing, damaged or belongs to another index is ignored. A
+lookup whose slot fingerprint differs from the key's is answered absent
+without reading the offset table or the snapshot; a match (one in 65,536
+for an absent key) falls through to the ordinary verified read. Almost
+every key the overlay probes at commit time is absent — created coins are
+checked against the base to prove they collide with nothing — so the probe
+cost on mainnet 935,001–963,350 fell from 485 s (233 s with the write-back
+layer) to 72 s and `utxo-prefetch` from 448 s to 149 s on the MDBX lane;
+with both the write-back layer and fingerprints MDBX finished in 2,314 s and
+redb in 2,407 s against baselines of 3,823 s and 3,289 s, with identical
+overlay content.
 
 On 2026-07-29/30, a real mainnet `utxo-935000.dat` (9,387,990,306 bytes,
 164,241,311 coins) was downloaded from a third-party community mirror
@@ -853,11 +995,12 @@ compaction defers a rebase cheaply, and MDBX's rebase does more work for
 twice the write cost — which of those is better depends on whether the run
 ends or continues.
 
-SQLite was then benchmarked as a third candidate, since it is the only
-surveyed engine offering both capabilities the other two each lack — an
-engine-enforced ceiling through `PRAGMA max_page_count`, which redb has no
-equivalent for, and in-place compaction through `VACUUM`, which the MDBX
-binding does not expose — and it is already linked into every build through
+SQLite was then benchmarked as a third candidate, since it was the only
+surveyed engine offering both capabilities the other two originally each
+lacked — an engine-enforced ceiling through `PRAGMA max_page_count`, which
+redb has no equivalent for, and in-place compaction through `VACUUM`. The MDBX
+binding now exposes compact copy rather than in-place compaction. SQLite is
+already linked into every build through
 `bdk_wallet`'s rusqlite feature, so adopting it would add no dependency. The
 benchmark drives it through the same `UtxoStore` harness as the other two,
 with a `WITHOUT ROWID` table keyed by the same 36-byte outpoint so a lookup
@@ -886,6 +1029,20 @@ Two cautions about these numbers. MDBX scaled best across the two sizes
 comparison at all: the redb entry drives the full `RedbChainStore`, committing
 tip and undo alongside the UTXO mutation, while the MDBX and SQLite entries
 drive a bare UTXO store. Only the lookup column compares like with like.
+
+A later matched complete-chainstate benchmark closes that commit-comparison
+gap for the current redb and candidate MDBX physical designs and adds a
+strictly labelled btcd-codec/Go-LevelDB storage lane. On a 64 GiB M1 Max Mac,
+three order-alternated 2M-coin rounds measured median MDBX/redb mutation ratios
+of 3.60x for per-block durable serving commits and 2.69x for 256-block IBD
+commits. MDBX warm batch lookup throughput was 1.53x and 1.55x redb after
+height-MTP caching inside each read view. After compaction, complete MDBX state
+occupied 271 MB versus redb's 678 MB serving / 931 MB IBD and the
+storage-only btcd lane's 269–271 MB. These are not cold reads or complete-node
+IBD results. The controlled boundary, raw-report hashes, supplied 169M-coin
+mainnet evidence, and the decision to retain redb pending a mainnet MDBX churn
+gate are in
+[`STORAGE_ENGINE_EVALUATION_2026-08-20.md`](STORAGE_ENGINE_EVALUATION_2026-08-20.md).
 
 The latest cold-base MDBX rerun makes the same-budget comparison closer:
 MDBX covered 935,000→960,313 in 90.29 process minutes (83.07 execution

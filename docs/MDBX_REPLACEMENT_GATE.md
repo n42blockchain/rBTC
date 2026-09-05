@@ -1,0 +1,176 @@
+# MDBX replacement gate
+
+The external full-mainnet replay assignment, including exact transaction-rate
+definitions, comparable btcdmdbx revisions, evidence retention, and rules for
+avoiding a 771 GB corpus copy on the Mac, is maintained in
+[`BTCDMDBX_FULL_REPLAY_TASK.md`](BTCDMDBX_FULL_REPLAY_TASK.md).
+
+MDBX is the leading complete-chainstate replacement candidate, but this
+revision does **not** select it as the daemon default. The implementation now
+has the machinery needed to run the remaining scale gate without weakening
+the atomic UTXO/undo/tip boundary or confusing synthetic churn with Bitcoin
+validation.
+
+The corrected external figures below come from btcdmdbx revision `56cc436d`
+(`docs/storage_engine_findings_correction.md`). They supersede the sampled
+raw-record estimate previously copied into this document.
+
+## What the candidate improves — and what it costs
+
+| evidence | MDBX improvement | MDBX cost or unresolved problem |
+|---|---|---|
+| Three-round 2M Mac complete-chainstate comparison | 89.01 vs 24.74 redb serving blocks/s (3.60x); 86.56 vs 32.15 IBD-256 (2.69x); 60–71% less allocated space | Warm in-memory scale; not mainnet churn or cold-disk evidence |
+| Same Mac lookup workload | 3.149–3.300M lookups/s vs redb 2.057–2.134M (1.53–1.55x) | Working set fits 64 GiB; supplied cold runs put engines within 8% |
+| Corrected full scan of the supplied 169,337,275-entry, pruned-undo store | 33.42 GB raw records occupied 50.26 GB live pages (1.50x), not the previously reported 4.3x | The 76.01 GB file was still 2.27x raw and contained 25.75 GB/34% free pages after long-running delete churn; this is not a stock-btcd size comparison |
+| Stock btcd MDBX replay, 951,225 blocks | 106.08 GB raw occupied 122.52 GB live pages (1.155x) with approximately zero free-page overhead; it completed the full replay | Stock btcd retains all spend journals, unlike rBTC's bounded undo policy, so its absolute size is an upper-semantics comparison rather than rBTC's expected footprint |
+| Completed btcd Pebble/MDBX replay | 200k writes were effectively tied (5,776 vs 5,653 blocks/s); MDBX loaded a 200k-block chain state in 728 ms and completed 951,225 blocks | Pebble was marginally smaller at the same ~830k height, but its 56,000 SST files made an 828,851-block chain-state load exceed one hour; the different load heights prohibit quoting an exact speedup ratio |
+| Supplied IBD batch comparison | MDBX reached 32,988 inserts/s, slightly above LevelDB's 30,663 | 800 MiB footprint vs LevelDB's 159 MiB; supplied 256-block peak RSS was about 35% above 64-block |
+| New 20k deterministic smoke | Verified copy kept the exact four-table SHA; one copy reduced high-water 3.49→2.18 MB and allocated bytes 4.72→2.18 MB; freelist 1.29 MB→0 | Tiny memory-resident evidence only; copy pauses writes, scans all records for verification, and temporarily needs source plus live copy |
+| New clean 64/256 runner smoke | 256 batching reached 1,415 vs 737 synthetic blocks/s; precompiled peak RSS was 64.5 vs 64.3 MiB | Too small to validate the production RSS ratio; full-scale run remains required |
+| 2M-live Mac churn pressure, 4,096 transitions × 5,000 updates ([2026-08-24 report](LOCAL_STORAGE_PRESSURE_2026-08-24.md)) | Both 64/256 lanes reached the same four-table SHA with 288 retained undo rows; every compact-copy preserved content and cleared the freelist | Batch 64 was 85.89 transitions/s with 917 MB peak RSS and no copy; batch 256 was 72.05/s with 2.93 GB RSS and five copies under an intentionally tight 1 GiB geometry. The 3.20 RSS ratio is a warning, not a substitute for the 160M gate |
+| Real-block overlay catch-up, mainnet 935,001–963,350 (28,350 blocks, 116.5M transactions, full validation, identical settings; [2026-08-21 report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)) | Same final tip as redb; exit 0 | MDBX was **slower**: 3,823 s vs redb 3,289 s (7.41 vs 8.62 blocks/s, 30,462 vs 35,415 tx/s), peak working set 10.3 vs 6.0 GiB, 480 vs 299 GB written, 19 compact-copies vs 2; its copy-on-write B-tree rewrote ~4.3 GB per 256-block batch for ~100 MB of net change |
+| Spent-output age over the same window (`utxo_locality`) | 33.5% of inputs spend same-block outputs, 80.7% outputs ≤ 256 blocks old, 91.5% ≤ 4,096 | Neither engine exploits this beyond intra-batch folding; a cross-batch write-back cache would cut durable writes about 5× before any engine choice matters |
+| Same catch-up with the cross-batch write-back layer (`--snapshot-overlay-flush-batches 16`, commit a1ed228) | MDBX 3,823 → 3,057 s; 81.1% of created coins cancelled in memory; MDBX commit work halved (sync 832 → 163 s) | redb gained more: 3,289 → 2,606 s, 44,689 tx/s, 120 GB written; MDBX + layer still trails redb + layer by 15%. Peak working set +12–13 GiB at the default 8M-coin buffer |
+| `overlay_audit` over all four overlays | Identical consensus content: 14,554,294 coins, 13,000,529 tombstones, digest `aadd289f…7f2819` on MDBX, redb, and both write-back lanes | Raw stored bytes differ only by the per-run `last_touched` field; undo row counts differ by prune timing and are excluded |
+| Same catch-up with write-back 16 plus the txid fingerprint sidecar (commit 0b8b3ae) | MDBX 2,314 s (0.61× its baseline, 50,340 tx/s), base probes 485 → 72 s, 93 GB written; same content digest | redb 2,407 s (0.63× the MDBX baseline); the engines are within 4% once neither pays for absent-key snapshot reads — catch-up is now bounded by validation, member base reads and flushes, not the engine |
+| Same catch-up with the asynchronous write-back flush, the block pipeline, the sharded batch overlay and the mimalloc allocator (commits e9aa0dc, 83b001d, 6156c00; 2026-08-22) | MDBX 1,435 s (0.38× its baseline, 81,159 tx/s); same content digest (thirteen overlays now) | redb 1,583 s (0.41× the MDBX baseline, 73,564 tx/s). Without mimalloc the same code was neutral on both engines (2,465 s / 2,444 s): the Windows system heap serialised the threads the pipeline and the flush had added. MDBX is now the faster engine on this window because its flush thread finishes sooner |
+| Power loss during `mdbx-wb16-v12` (2026-08-22 23:05Z, block 955,736 validated, durable overlay tip 951,384 = 17 batches behind) | Resumed in place after the reboot: overlay opened at 951,384, ledger truncated, 951,385–963,350 re-executed in 648 s, final digest `aadd289f…` identical to every clean run | The write-back crash contract (durable tip lags ≤ 2N batches, recovery re-executes only those) held on a real power cut; redb has not yet had an equivalent accident |
+| Same catch-up after the 2026-08-23/24 optimization series (parallel batch preparation, folded write-back commit, one-batch deferred script verdict; commits e5e5c45…54b6aae) | MDBX 790 s (0.21× its baseline, 147,436 tx/s, script wait 0.1 s) — 40% faster than btcdmdbx's rb_pipe8 pipeline (1,318 s) over the same corpus window | redb 1,046 s (111,397 tx/s); MDBX is now 25% faster than redb on this window. 26 valid overlays across every configuration hash to the one digest `aadd289f…7f2819` |
+
+The production-size copy-space implication is explicit: keeping the existing
+76.01 GB file while writing approximately 50.26 GB of live pages requires
+about 126.27 GB of simultaneous database files before filesystem overhead and
+the operator reserve. `compact()` now preflights estimated live bytes plus 10%
+(at least 64 MiB) and preserves another 16 GiB free. It fails before creating
+the copy if that space is unavailable. Those physical copy numbers are
+unchanged by the corrected raw-record scan; only the earlier amplification
+ratios were wrong.
+
+## Safety work now implemented
+
+- `audit()` hashes table names and every ordered key/value in `utxo_hot`,
+  `utxo_cold`, `undo`, and `meta`, while reporting raw records, live pages,
+  freelist pages, logical file length, allocated filesystem bytes, counts, and
+  execution tip.
+- Compact-copy audits source and destination before either rename. A durable
+  manifest carries the expected four-table identity through the swap. Reopen
+  accepts the old environment or a fully verified compact copy; a mismatched
+  manifest fails closed and preserves the old directory.
+- A subprocess test exits without destructors after the verified copy, after
+  each rename, and after each parent-directory sync. All five cases reopen to
+  the same tip, content SHA, non-empty undo, and UTXO counts.
+- The default 128 GiB policy first considers compaction at 55% high-water,
+  requires at least 10% of high-water bytes on the freelist, and requires 50%
+  growth over the last post-copy size before repeating it. The
+  supplied 76.01 GB file is about 55.3% of 128 GiB; its expected compacted live
+  size is about 36.6%. The growth guard prevents a large irreducible live set
+  from being copied every checkpoint. The post-copy baseline is persisted in
+  a strict sidecar and survives restart; losing it can cause extra maintenance
+  but cannot change chainstate contents.
+- The corrected btcd evidence changes the interpretation, not the need for
+  this maintenance path. A sequential full-undo replay had 1.155x live
+  amplification and essentially no freelist, while the long-running
+  pruned-undo store had a 34% freelist. Compact-copy therefore addresses
+  lifecycle churn; it is not evidence that MDBX intrinsically consumes 4.3x
+  live space.
+- btcdmdbx also found that Go write transactions deadlock if a goroutine moves
+  OS threads between begin and commit. That adapter now pins the goroutine.
+  rBTC does not use that Go adapter: its vendored Rust binding begins and
+  commits every write transaction on one dedicated transaction-manager thread
+  and opens the environment with `MDBX_NOTLS` for reads. The finding therefore
+  validates a binding invariant rather than requiring an rBTC thread-pin patch.
+- MDBX now implements authenticated undo-window pruning. Every undo hash is
+  resolved through the header DAG before one atomic delete transaction.
+- The ignored scale driver is persistent and resumable. It defaults to 160M
+  live P2PKH coins, 900,000 deterministic churn transitions, 5,000
+  spend/create pairs per transition, 256-transition commits, 288 retained undo
+  rows, a 128 GiB ceiling, and periodic physical metrics. It never calls these
+  synthetic transitions mainnet blocks.
+- Root data-format schema 4 names the chainstate backend. A schema-3 redb
+  directory migrates to `chainstate_backend: "redb"`; the current node rejects
+  an `mdbx` manifest without rewriting it. This establishes a fail-closed
+  rollback boundary before the future content migrator publishes MDBX.
+
+## Run the full 64/256 gate
+
+Use a dedicated volume. The output directory must not exist; the runner keeps
+both databases, reports, logs, host identity, filesystem snapshots, revision,
+dirty state, and a combined report hash. It prebuilds outside the timed lanes
+so compilation cannot pollute peak RSS.
+
+```sh
+RBTC_MDBX_GATE_UTXOS=160000000 \
+RBTC_MDBX_GATE_BLOCKS=900000 \
+RBTC_MDBX_GATE_UPDATES=5000 \
+RBTC_MDBX_GATE_UNDO_RETENTION=288 \
+RBTC_MDBX_GATE_CAPACITY_BYTES=137438953472 \
+RBTC_MDBX_GATE_COMPACT=1 \
+RBTC_MDBX_GATE_MIN_RECLAIM_PERCENT=10 \
+contrib/run_mdbx_replacement_gate.sh /dedicated-volume/rbtc-mdbx-gate
+```
+
+An interrupted individual lane can be resumed directly against its existing
+database. Keep every workload variable identical and raise only the target
+height when intentionally extending the run:
+
+```sh
+RBTC_MDBX_GATE_DIR=/dedicated-volume/rbtc-mdbx-gate/batch-256/chainstate.mdbx \
+RBTC_MDBX_GATE_REPORT=/dedicated-volume/rbtc-mdbx-gate/batch-256/resume.json \
+RBTC_MDBX_GATE_UTXOS=160000000 \
+RBTC_MDBX_GATE_BLOCKS=900000 \
+RBTC_MDBX_GATE_UPDATES=5000 \
+RBTC_MDBX_GATE_COMMIT_BATCH=256 \
+cargo test --release --all-features --test mdbx_mainnet_scale_gate \
+  -- --ignored --nocapture
+```
+
+Run the actual abrupt-process recovery matrix independently:
+
+```sh
+cargo test --release --all-features --test mdbx_compaction_crash -- --nocapture
+```
+
+## Acceptance criteria before selecting MDBX
+
+1. The full synthetic run reaches 160M live coins and 900,000 transitions in
+   both 64/256 lanes with no `MDBX_MAP_FULL`, content mismatch, unbounded undo,
+   or immediate repeated compaction. Every post-copy audit must preserve the
+   pre-copy SHA and clear the freelist represented in the copy.
+2. High-water must trigger maintenance near 55% only when at least 10% is
+   reclaimable freelist space, remain below the emergency region, and not
+   qualify again until at least 50% growth over the prior post-copy mark. The
+   report must include compaction duration and simultaneous disk requirement;
+   throughput alone is insufficient.
+3. Peak RSS for 64 and 256 must be captured from prebuilt binaries. A 256/64
+   ratio above 1.5 requires reducing the default IBD batch or an explicit
+   memory-budget design; the supplied observation was already about 1.35.
+4. A common immutable real mainnet block corpus must still be replayed through
+   redb and MDBX with identical cache, validation, retention, batch, and start
+   state. Final tip and canonical UTXO identity must match. **Run once on the
+   Windows corpus host on 2026-08-21** ([report](REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md)):
+   28,350 real blocks from the 935,000 snapshot, same tip on both engines,
+   redb 14% faster with 42% less memory and 38% fewer bytes written. The
+   canonical UTXO content was then compared with the read-only
+   `overlay_audit` tool: all four overlays (both engines, with and without
+   the write-back layer) hold the same 14,554,294 coins and 13,000,529
+   tombstones with consensus digest `aadd289f…7f2819`. The write-back layer
+   the report recommended was built and measured the same day: with 16
+   buffered batches redb finished in 2,606 s and MDBX in 3,057 s; with the
+   txid fingerprint sidecar added, 2,407 s and 2,314 s; with the
+   asynchronous flush, the block pipeline, the sharded overlay and the
+   mimalloc allocator (2026-08-22), 1,583 s and 1,435 s; and with parallel
+   batch preparation, the folded write-back commit and the one-batch
+   deferred script verdict (2026-08-24), redb 1,046 s and MDBX 790 s
+   (147,436 tx/s) — 26 valid overlays hashing to the same content digest. **Item 4 is met for this corpus
+   window**; what it does not cover is a genesis-to-tip replay or the
+   2015–2019 churn profile.
+5. The explicit backend manifest is complete. The daemon must still gain an
+   authenticated content migration/publish path and cover AssumeUTXO metadata,
+   consensus binding, background validation, offline repair, observability,
+   and operational rollback. The current candidate implements the
+   UTXO/undo/tip trait but is not yet a drop-in replacement for every redb-only
+   node surface.
+
+Only items 1–5 together authorize changing the default. The new recovery and
+maintenance code closes capability gaps; it does not manufacture the missing
+160M and real-block evidence.

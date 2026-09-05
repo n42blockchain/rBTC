@@ -145,7 +145,7 @@ impl ZmqPublisherHandle {
         );
         self.publish(NotificationTopic::RawBlock, raw_block);
         let mut body = Vec::with_capacity(33);
-        body.extend_from_slice(hash.as_byte_array());
+        body.extend_from_slice(&display_order(hash.as_byte_array()));
         body.push(b'C');
         self.publish(NotificationTopic::Sequence, body);
     }
@@ -153,7 +153,7 @@ impl ZmqPublisherHandle {
     /// Publishes the `D` sequence label for one disconnected block.
     pub fn publish_block_disconnected(&self, hash: BlockHash) {
         let mut body = Vec::with_capacity(33);
-        body.extend_from_slice(hash.as_byte_array());
+        body.extend_from_slice(&display_order(hash.as_byte_array()));
         body.push(b'D');
         self.publish(NotificationTopic::Sequence, body);
     }
@@ -172,7 +172,7 @@ impl ZmqPublisherHandle {
         );
         self.publish(NotificationTopic::RawTx, raw_transaction);
         let mut body = Vec::with_capacity(41);
-        body.extend_from_slice(txid.as_byte_array());
+        body.extend_from_slice(&display_order(txid.as_byte_array()));
         body.push(b'A');
         body.extend_from_slice(&mempool_sequence.to_le_bytes());
         self.publish(NotificationTopic::Sequence, body);
@@ -182,7 +182,7 @@ impl ZmqPublisherHandle {
     /// mempool for a reason other than block inclusion.
     pub fn publish_mempool_removal(&self, txid: Txid, mempool_sequence: u64) {
         let mut body = Vec::with_capacity(41);
-        body.extend_from_slice(txid.as_byte_array());
+        body.extend_from_slice(&display_order(txid.as_byte_array()));
         body.push(b'R');
         body.extend_from_slice(&mempool_sequence.to_le_bytes());
         self.publish(NotificationTopic::Sequence, body);
@@ -590,8 +590,11 @@ async fn read_frame<S: AsyncRead + Unpin>(
     Ok((flags & !FLAG_LONG, body))
 }
 
-/// Reverses internal hash bytes into RPC display order, matching Core's
-/// `hashblock`/`hashtx` payloads.
+/// Reverses internal hash bytes into RPC display order.
+///
+/// Core reverses the hash on every topic that carries one, including the
+/// `sequence` body, so a subscriber reading `sequence` and `hashtx` from the
+/// same node sees identical bytes for the same transaction.
 fn display_order(hash: &[u8]) -> Vec<u8> {
     hash.iter().rev().copied().collect()
 }
@@ -680,7 +683,11 @@ mod tests {
         assert_eq!(sequence, 0);
         let (topic, body, sequence) = read_notification(&mut subscriber).await;
         assert_eq!(topic, b"sequence");
-        assert_eq!(&body[..32], hash.as_byte_array());
+        assert_eq!(
+            &body[..32],
+            display_order(hash.as_byte_array()),
+            "Core reverses the hash on the sequence topic too, so it must              match the hashblock body byte for byte"
+        );
         assert_eq!(body[32], b'C');
         assert_eq!(sequence, 0);
         handle.publish_block_disconnected(hash);
@@ -718,7 +725,7 @@ mod tests {
         let txid = Txid::from_byte_array([0x11; 32]);
         handle.publish_mempool_transaction(txid, vec![0x00], 41);
         let (_, body, _) = read_notification(&mut subscriber).await;
-        assert_eq!(&body[..32], txid.as_byte_array());
+        assert_eq!(&body[..32], display_order(txid.as_byte_array()));
         assert_eq!(body[32], b'A');
         assert_eq!(body[33..], 41u64.to_le_bytes());
         handle.publish_mempool_removal(txid, 42);
@@ -819,13 +826,16 @@ mod tests {
         publisher.shutdown();
         // No peer input or notification is needed to release the read task.
         let mut remaining = Vec::new();
-        tokio::time::timeout(
+        let closed = tokio::time::timeout(
             Duration::from_secs(5),
             subscriber.read_to_end(&mut remaining),
         )
         .await
-        .expect("shutdown closes the whole socket")
-        .unwrap();
+        .expect("shutdown closes the whole socket");
+        // Closing a socket with unread subscription bytes may send TCP RST.
+        if let Err(error) = closed {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             while metrics.num_alive_tasks() > baseline {
                 tokio::task::yield_now().await;

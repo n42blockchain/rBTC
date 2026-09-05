@@ -1,6 +1,6 @@
 # Cross-platform release signing
 
-Status date: 2026-07-27.
+Status date: 2026-08-15.
 
 ## Local signing inventory
 
@@ -10,6 +10,33 @@ The local keychain currently exposes Apple Development identities and an
 `iPhone Distribution` identity for that team. It does **not** expose the
 `Developer ID Application` identity required to sign and notarize a standalone
 macOS command-line executable.
+
+The gate was rechecked on the macOS acceptance host on 2026-08-11. The keychain
+reported three valid code-signing identities and zero matching
+`Developer ID Application` identities for team `CFRXH38L48`. The release
+manifest positive/negative test passed, so the locally testable manifest
+machinery is ready; this check does not substitute for provisioning the Apple
+and Windows release identities or exercising the protected tagged workflow.
+
+Provisioning is an organization-owned external action, not a repository or
+developer-workstation task. An authorized owner of the Apple Developer team
+must request or grant access to the `Developer ID Application` identity and
+App Store Connect notarization credentials; an authorized organization owner
+must likewise procure or delegate the approved Authenticode certificate and
+timestamp policy. A developer cannot make either gate valid by generating a
+self-signed certificate, reusing an iOS distribution identity, or placing an
+unapproved personal certificate in CI. Until the organization grants those
+identities through the protected release environment, local workflow checks
+may prove readiness but must continue to report native release signing as
+blocked externally.
+
+At `b39f75d`, `cargo build --release --locked --bin rbtcd` completed locally,
+and `verify-release-binary.sh` accepted the resulting `rbtcd 0.1.0`
+`--version`/`--help` surface. Its local SHA-256 was
+`7c983039b736054c5b2ae6d371254451caaf4464b2d45c7ef54ccf52dd99f02f`.
+This is an unsigned macOS smoke artifact, not a supported release artifact and
+not evidence for notarization, Authenticode, reproducibility, or clean-host
+installation.
 
 The Android JKS key, Apple Developer ID key, and Windows Authenticode
 certificate are ecosystem-specific identities. Reusing one private key across

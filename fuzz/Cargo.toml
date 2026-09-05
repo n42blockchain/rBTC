@@ -3,6 +3,7 @@ name = "rbtc-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+rust-version = "1.85"
 license = "GPL-3.0-only"
 
 [package.metadata]
@@ -106,6 +107,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "asmap_interpret"
+path = "fuzz_targets/asmap_interpret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "feerate_diagram"
+path = "fuzz_targets/feerate_diagram.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
 
@@ -115,3 +130,4 @@ members = ["."]
 [patch.crates-io]
 bitcoinconsensus = { path = "../vendor/bitcoinconsensus" }
 redb = { path = "../vendor/redb" }
+libmdbx = { path = "../vendor/libmdbx" }

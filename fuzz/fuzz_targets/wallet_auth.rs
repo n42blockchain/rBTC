@@ -9,8 +9,9 @@ fn exercise(input: &[u8]) {
     let configured = WalletAuthToken::new(TOKEN).expect("fixed fuzz token");
     let _ = configured.authorizes(input);
 
-    if let Ok(candidate) = std::str::from_utf8(input)
-        && let Ok(candidate) = WalletAuthToken::new(candidate)
+    if let Some(candidate) = std::str::from_utf8(input)
+        .ok()
+        .and_then(|candidate| WalletAuthToken::new(candidate).ok())
     {
         let mut header = b"Bearer ".to_vec();
         header.extend_from_slice(input);

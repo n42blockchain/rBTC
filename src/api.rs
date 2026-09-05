@@ -832,7 +832,32 @@ pub trait LocalRpcOperator: Send + Sync + 'static {
         method: &str,
         params: &serde_json::Value,
     ) -> Option<Result<serde_json::Value, LocalRpcOperatorError>>;
+
+    /// Executes one method, awaiting a result the node can only produce later.
+    ///
+    /// Defaults to [`Self::execute`], so an operator that answers entirely
+    /// from state it already holds implements nothing extra. Override this
+    /// only for methods whose answer depends on work another task must
+    /// perform first — a block's connection verdict, a long poll — where a
+    /// synchronous handler would have to guess or block a runtime thread.
+    fn execute_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a serde_json::Value,
+    ) -> RpcFuture<'a> {
+        let result = self.execute(method, params);
+        Box::pin(async move { result })
+    }
 }
+
+/// A pending operator RPC result.
+pub type RpcFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Option<Result<serde_json::Value, LocalRpcOperatorError>>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Stable error returned by an operator RPC extension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -895,7 +920,9 @@ async fn rpc_call<I: ExplorerIndex>(
         state.operator.as_deref(),
         &request.method,
         &request.params,
-    ) {
+    )
+    .await
+    {
         Ok(result) => Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -938,7 +965,7 @@ fn valid_rpc_id(id: &serde_json::Value) -> bool {
     }
 }
 
-fn execute_rpc<I: ExplorerIndex>(
+async fn execute_rpc<I: ExplorerIndex>(
     index: &I,
     fee_estimator: Option<&RedbFeeEstimator>,
     operator: Option<&dyn LocalRpcOperator>,
@@ -1016,11 +1043,15 @@ fn execute_rpc<I: ExplorerIndex>(
             serde_json::to_value(transaction).map_err(|_| (-32603, "Internal error"))
         }
         "rbtc.getaddressutxos" => rpc_address_utxos(index, params),
-        _ => operator
-            .and_then(|operator| operator.execute(method, params))
-            .map_or(Err((-32601, "Method not found")), |result| {
+        _ => {
+            let executed = match operator {
+                Some(operator) => operator.execute_async(method, params).await,
+                None => None,
+            };
+            executed.map_or(Err((-32601, "Method not found")), |result| {
                 result.map_err(|error| (error.code, error.message))
-            }),
+            })
+        }
     }
 }
 
@@ -1942,8 +1973,8 @@ mod tests {
         assert!(!audit.contains("bcrt1test"));
     }
 
-    #[test]
-    fn rpc_fee_estimate_requires_mature_observations_and_returns_core_units() {
+    #[tokio::test]
+    async fn rpc_fee_estimate_requires_mature_observations_and_returns_core_units() {
         use std::collections::BTreeSet;
 
         use bitcoin::{BlockHash, Txid, hashes::Hash};
@@ -1985,6 +2016,7 @@ mod tests {
             "estimatesmartfee",
             &serde_json::json!([1]),
         )
+        .await
         .unwrap();
         assert_eq!(response["blocks"], 1);
         assert_eq!(response["feerate"], 0.00005);
@@ -2023,6 +2055,7 @@ mod tests {
             "estimatesmartfee",
             &serde_json::json!([1]),
         )
+        .await
         .unwrap();
         assert_eq!(insufficient["blocks"], 1);
         assert!(
@@ -2039,6 +2072,7 @@ mod tests {
                 "estimatesmartfee",
                 &serde_json::json!([0]),
             )
+            .await
             .is_err()
         );
     }

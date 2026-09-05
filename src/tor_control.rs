@@ -205,6 +205,10 @@ impl TorController {
         forward_to: SocketAddr,
         private_key: Option<&str>,
     ) -> Result<PublishedOnionService, TorControlError> {
+        // One command, and never `Flags=DiscardPK`: Tor rejects that flag
+        // with a non-`NEW` key type, and with a new key it would discard the
+        // very key this node must persist to keep its address across
+        // restarts.
         let key = private_key.unwrap_or("NEW:ED25519-V3");
         if key.is_empty()
             || key.len() > usize::try_from(MAX_REPLY_LINE_BYTES).expect("reply bound fits usize")
@@ -220,6 +224,9 @@ impl TorController {
             .find_map(|line| field(line, "ServiceID="))
             .ok_or(TorControlError::MalformedReply)?
             .to_owned();
+        // Tor returns `PrivateKey=` only when it generated one; a replayed
+        // key is carried through so the published service always reports the
+        // key that reproduces it.
         let private_key = reply
             .iter()
             .find_map(|line| field(line, "PrivateKey="))
@@ -602,6 +609,40 @@ mod tests {
             Err(TorControlError::UnreadableCookie)
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_non_ascii_reply_is_rejected_rather_than_panicking() {
+        // The first reply is read before authentication, so a hostile or
+        // malfunctioning local control port must not be able to abort the
+        // process by putting a multi-byte character across the split point.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    "25€ not a reply
+"
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = cookie_file(&directory, &[0x11_u8; COOKIE_LEN]);
+        let Err(error) = TorController::connect(control, &path, TorControlConfig::default()).await
+        else {
+            panic!("a non-ASCII reply must not authenticate");
+        };
+        assert!(
+            matches!(
+                error,
+                TorControlError::MalformedReply | TorControlError::CommandFailed { .. }
+            ),
+            "a non-ASCII reply must surface as an error rather than a panic, got {error:?}"
+        );
     }
 
     #[test]

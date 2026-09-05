@@ -10,8 +10,9 @@ keywords = ["bitcoin", "utxo", "node", "zstd"]
 categories = ["cryptography::cryptocurrencies"]
 
 [features]
-default = []
+default = ["mimalloc"]
 mdbx = ["dep:libmdbx"]
+mimalloc = ["dep:mimalloc"]
 
 [lib]
 name = "rbtc"
@@ -21,37 +22,72 @@ path = "src/lib.rs"
 name = "rbtcd"
 path = "src/bin/rbtcd.rs"
 
+[[bin]]
+name = "fdb_ledger_import"
+path = "src/bin/fdb_ledger_import.rs"
+
+[[bin]]
+name = "utxo_locality"
+path = "src/bin/utxo_locality.rs"
+
+[[bin]]
+name = "overlay_audit"
+path = "src/bin/overlay_audit.rs"
+required-features = ["mdbx"]
+
+# These diagnostics and integration suites require the optional MDBX backend.
+[[example]]
+name = "compare_snapshot_vs_mdbx"
+required-features = ["mdbx"]
+
+[[example]]
+name = "mdbx_concurrency_stress"
+required-features = ["mdbx"]
+
+[[test]]
+name = "mdbx_compaction_crash"
+required-features = ["mdbx"]
+
+[[test]]
+name = "mdbx_mainnet_scale_gate"
+required-features = ["mdbx"]
+
+[[test]]
+name = "storage_engine_comparison"
+required-features = ["mdbx"]
+
 [dependencies]
-ahash = "0.8"
+ahash = "0.8.12"
+mimalloc = { version = "0.1.52", optional = true, default-features = false }
 bitcoin = { version = "=0.32.102", default-features = true }
-bitcoinconsensus = "0.106"
+bitcoinconsensus = "0.106.0"
 bdk_wallet = { version = "=3.1.0", features = ["rusqlite"] }
 axum = "0.8.9"
 # BIP324 v2 transport record ciphers (FSChaCha20 / FSChaCha20Poly1305 are
 # built on these primitives in `p2p_v2`).
-chacha20 = "0.9"
-chacha20poly1305 = "0.10"
+chacha20 = "0.10.2"
+chacha20poly1305 = "0.11.0"
 fs2 = "=0.4.3"
 redb = "2.6.3"
 libmdbx = { version = "0.6.6", optional = true }
-rand = "0.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.11"
-sha3 = "0.11"
-thiserror = "2.0"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-zstd = { version = "0.13", features = ["zstdmt"] }
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+sha3 = "0.12.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+zstd = { version = "0.14.0", features = ["zstdmt"] }
 
 [dev-dependencies]
-proptest = "1.7"
+proptest = "1.11.0"
 # Benchmark-only. SQLite is already linked into every build through
 # bdk_wallet's rusqlite feature, so this evaluates an engine the binary
 # already carries rather than adding one.
 rusqlite = { version = "0.31", features = ["bundled"] }
-tempfile = "3.27"
-tower = { version = "0.5", features = ["util"] }
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
 
 [patch.crates-io]
 bitcoinconsensus = { path = "vendor/bitcoinconsensus" }

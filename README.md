@@ -8,7 +8,8 @@ High-performance Rust Bitcoin node kernel, designed around a compact and verifia
 > external-signer wallet are implemented. The accepted seven-day public-network
 > soak report and first native signed release remain release gates. On
 > 2026-08-08 the real Core 31/btcd interoperability acceptance for BIP324 v2,
-> Torv3 inbound, and bounded ZMQ publication passed.
+> inbound v1 handshakes, Tor v3 onion/SOCKS, i2pd SAM, and bounded ZMQ
+> publication passed.
 
 ### Capability map
 
@@ -128,8 +129,11 @@ documents for implementation detail and release boundaries.
   before any database or network open. The generated private key is stored
   owner-only inside the data directory and replayed on the next launch, so
   peers that learned the address keep reaching this node across restarts; it
-  is never logged. Shutdown withdraws the service with an explicit
-  `DEL_ONION` rather than relying on the connection close alone. The
+  is never logged. The service is published without
+  `Detach`, so Tor destroys it when the control connection closes, which
+  happens unconditionally when the node stops; an explicit `DEL_ONION` is
+  attempted first to make the withdrawal immediate, but it is best effort
+  because a task spawned during shutdown may never run. The
   published address is then announced to peers that negotiated BIP155, both
   on outbound sessions and in the inbound address relay, and never to a
   legacy `addr` peer, because an onion address has no legacy encoding and
@@ -154,6 +158,11 @@ documents for implementation detail and release boundaries.
   structurally before reaching a bridge or a store. The bridge is refused
   unless it is loopback, because it can open streams on this node's behalf,
   and session identifiers, destination keys, and reply lines are all bounded.
+  Reply lines are read one byte at a time rather than through a buffered
+  reader: a router may coalesce a reply with whatever follows it, and after
+  `STREAM CONNECT` what follows is the peer's own traffic, so a reader that
+  read ahead would either swallow the next reply or silently consume the
+  first bytes of the Bitcoin stream.
   Learned I2P destinations follow the same path as onion services:
   `addrv2` I2P entries are retained apart from routable and onion addresses,
   deduplicated, and stored in a third peer-store table with its own
@@ -165,10 +174,28 @@ documents for implementation detail and release boundaries.
   restarts. Persisted I2P candidates then join the same ordered outbound
   wave, dialled through `STREAM CONNECT` and handed to the ordinary v1 or
   BIP324 handshake. `--onlynet i2p` restricts outbound work to that network
-  and fails closed without a bridge. A SOCKS5 proxy is never substituted for
+  and fails closed without a bridge. Both anonymity-only restrictions also
+  short-circuit DNS seed resolution entirely: running the lookups and then
+  discarding every answer would still leak which Bitcoin seeds the node
+  consults, which is the leak the restriction exists to prevent. A SOCKS5 proxy is never substituted for
   the bridge — an I2P target has no proxy representation at all — because
-  that would connect to the wrong network. Inbound `STREAM ACCEPT` remains
-  open.
+  that would connect to the wrong network. The published destination is announced to
+  BIP155 peers on outbound sessions and in the inbound address relay, with a
+  zero port because I2P peers carry none. Inbound `STREAM ACCEPT` reports the dialling
+  peer's Destination alongside the stream, so an accepted peer is recorded
+  and ranked like a learned one; the status and destination lines are read
+  line-exactly because the very next byte already belongs to the peer. The
+  SAM session identifier is derived from the network and data directory
+  rather than fixed, so two nodes on one host do not collide with
+  `DUPLICATED_ID`. The accept loop runs inside the existing
+  inbound service, so I2P and routable peers share one global connection
+  semaphore, upload budget, and statistics rather than forming a second,
+  independently sized service. The per-source and per-group ceilings cannot
+  apply to a peer with no IP, so a separate eight-peer ceiling stands in for
+  them, and a small number of accepts is kept outstanding at the bridge
+  because awaiting one inline would drop a half-open SAM socket whenever
+  another intake won the select. A failing accept retires the I2P intake
+  without stopping the TCP one.
 - Header batches are validated through an in-place rollback guard and become
   visible only after their durable store append succeeds. Ordinary 2,000-header
   extensions retain `O(batch)` hashes instead of deep-cloning the complete
@@ -186,7 +213,7 @@ documents for implementation detail and release boundaries.
 - Pure-Rust redb chainstate with hot/cold UTXOs, per-block undo, and execution tip committed together in one physical database transaction; IBD supports multi-block durable checkpoints.
 - Deterministic zstd UTXO snapshots with bounded-memory two-pass import, in-transaction SHA-256/count verification, mandatory maximum-work active-header anchors, atomic publication, and an AssumeUTXO-style background-validation contract. A separate bounded-memory Core 31 `dumptxoutset` v2 loader uses compiled AssumeUTXO identities and Core's exact UTXO-set hash. Explicit HTTPS sources can be downloaded as bounded 64 MiB ranges with 1–8 workers, checkpoint restart, exact-length enforcement, and atomic publication; a real external Core 31 Testnet4 v2 file passes activation.
 - Offline `--build-core-snapshot-index SNAPSHOT --snapshot-index-output FILE` keeps a Core 31 snapshot such as `utxo-935000.dat` as an immutable compressed data source instead of expanding it. The current version-2 sidecar uses a safe-Rust BBhash minimal perfect hash function over txid groups and a bit-packed 34-bit group-offset table. A hit verifies the queried txid and vout against the source bytes before decoding Core's VARINT/script-template record, and the recorded maximum group span bounds every read. Building re-authenticates the release-pinned Core UTXO-set hash. On the real height-935,000 mainnet snapshot, 164,241,311 coins form 113,879,165 groups; the 18-level sidecar is 530,926,239 bytes, down from the former 1,155,791,488-byte outpoint-keyed format.
-- The `mdbx` feature adds a snapshot-backed overlay chainstate on that base. Post-base coins, spent-base tombstones, compressed per-block undo, and the execution tip commit atomically behind the same consensus executor used by redb. Both overlay engines understand legacy raw undo records; new `RUZ1` zstd records have a 256 MiB decompression ceiling and an 8 MiB zstd window ceiling. MDBX enforces a hard geometry budget (10 GiB by default), can reclaim copy-on-write garbage through a compact copy, and rebases only when folding the overlay into a new authenticated snapshot is required; redb uses its native compaction with a policy-enforced budget. Rebase and compaction directory swaps restore one interrupted set-aside copy, fail closed without guessing if two candidates exist, and clear stale copies before a new swap. Bounded `--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX --once` reuses ordinary headers-first download, staged/prefetched execution, stale-tip disconnection, and undo pruning. The default atomic validation batch is 256 blocks and can be lowered with `--validation-batch-size`. See [the architecture measurements](docs/ARCHITECTURE.md) for engine comparisons and memory/I/O trade-offs.
+- The `mdbx` feature adds a snapshot-backed overlay chainstate on that base. Post-base coins, spent-base tombstones, compressed per-block undo, and the execution tip commit atomically behind the same consensus executor used by redb. Both overlay engines understand legacy raw undo records; new `RUZ1` zstd records have a 256 MiB decompression ceiling and an 8 MiB zstd window ceiling. MDBX enforces a hard geometry budget (10 GiB by default), can reclaim copy-on-write garbage through a compact copy, and rebases only when folding the overlay into a new authenticated snapshot is required; redb uses its native compaction with a policy-enforced budget. Rebase and compaction directory swaps restore one interrupted set-aside copy, fail closed without guessing if two candidates exist, and clear stale copies before a new swap. Bounded `--snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX --once` reuses ordinary headers-first download, staged/prefetched execution, stale-tip disconnection, and undo pruning. The default atomic validation batch is 256 blocks and can be lowered with `--validation-batch-size`; `--snapshot-overlay-flush-batches N` keeps the last N batches in an engine-agnostic write-back buffer so coins created and spent inside the window never reach the overlay. See [the architecture measurements](docs/ARCHITECTURE.md) for engine comparisons and memory/I/O trade-offs.
 - Reorg-consistent spent-output ages are aggregated before sorted chainstate
   writes. Offline `--utxo-activity-report` scans current UTXOs in fixed-size
   pages and compares candidate block-age windows against historical spend-hit
@@ -231,7 +258,7 @@ Findings and per-platform verification status are recorded in [docs/AUDIT.md](do
 | Bitcoin types and v1 P2P encoding | `rust-bitcoin` | Maintained Rust Bitcoin primitives and consensus serialization. |
 | Script interpreter | `bitcoinconsensus` | Repository-owned Core v26.0 boundary, the last release line shipping `libbitcoinconsensus`; includes the Taproot spent-output API. |
 | Consensus rules | tracked through Core v31.1 | Public-network rules include Testnet4/BIP94; Core's default regtest keeps BIP94 disabled and uses its 144-block interval. The interpreter pin and tracked rules are separate decisions. |
-| UTXO persistence | redb default; optional MDBX experiment | redb keeps default builds pure Rust; `--features mdbx` enables a durable hot/cold UTXO comparison backend, not yet a production chainstate selector. |
+| UTXO persistence | redb default; MDBX is the leading gated replacement candidate | redb remains the recovery-proven daemon default. `--features mdbx` adds a versioned four-table chainstore with 34–37-byte order-preserving vout keys, Core/btcd compact coins and undo, height-only hot/cold placement, one-view batch reads, atomic UTXO/undo/tip commits, a 128 GiB hard geometry ceiling, and recoverable compact copy. The [2026-08-20 evaluation](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md) measured substantially faster writes and lower space at 2M coins, but the [2026-08-21 real-block overlay catch-up](docs/REAL_BLOCK_OVERLAY_REPLAY_2026-08-21.md) over 28,350 mainnet blocks found redb 14% faster with less memory and fewer bytes written, and with the new cross-batch write-back layer (`--snapshot-overlay-flush-batches 16`) redb reached 2,606 s against MDBX's 3,057 s with 81% of created coins never touching disk, and with the snapshot-index fingerprint sidecar as well 2,407 s and 2,314 s — within 4% of each other, all six overlays hashing to one content digest under `overlay_audit`. The 2026-08-22/24 optimization series (mimalloc, asynchronous write-back flush, parallel batch preparation, folded commit, one-batch deferred script verdict) then took the same window to MDBX 790 s (147,436 tx/s) against redb's 1,046 s — MDBX now 25% faster, 26 valid overlays on one digest; selection waits for the remaining gate items. |
 | Wallet | BDK (`bdk_wallet`) | Descriptor, PSBT, coin selection, signing, and sync model without reimplementing wallet correctness. |
 | Compression | zstd | Fast decompression and high ratio for snapshots and static block segments. |
 
@@ -271,7 +298,10 @@ scripts/public-network-sync-smoke.sh
 RBTC_FUZZ_RUNS=10000 scripts/run-fuzz-regression.sh
 cargo +nightly-2026-07-13 miri test --lib merkle_proof::tests::verifies_left_and_right_transaction_positions
 RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind cargo test --release --test core_block_differential -- --ignored --nocapture
+RBTC_TOR_CONTROL=127.0.0.1:9051 RBTC_TOR_COOKIE=/path/to/control_auth_cookie RBTC_TOR_SOCKS=127.0.0.1:9050 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
+RBTC_I2P_SAM=127.0.0.1:7656 cargo test --release --all-features --test anonymity_network_interop -- --ignored --nocapture
 cargo test --release --all-features --test storage_bench -- --ignored --nocapture
+cargo test --release --all-features --test storage_engine_comparison -- --ignored --nocapture
 ```
 
 The storage benchmark generates its block-shaped UTXO population at runtime and
@@ -293,6 +323,28 @@ chainstate to verify the execution tip before accepting the result. The same
 workflow runs `RBTC_BENCH_IBD_BLOCKS` generated regtest blocks through the
 production v1 handshake, headers-first download, script execution, atomic
 chainstate, ledger, and explorer path and retains a separate JSON report.
+The matched `storage_engine_comparison` gate instead compares the complete
+redb and MDBX UTXO/undo/tip transaction and includes a separate
+`contrib/btcd_storage_bench` lane for btcd's key/coin codec over pinned Go
+LevelDB, Pebble, Badger, and bbolt versions. The mutation path requires one
+synchronous atomic UTXO/undo/tip transaction; engines that cannot fit the
+256-block transaction are reported as rejected rather than silently split.
+Its serial one-hour matrix targets 900,000 deterministic transitions and
+records the actually completed count per lane. It explicitly does not call
+that storage-only lane a btcd IBD or a height-900,000 mainnet replay result. In
+the 56.2-minute Mac run no lane reached the target: bbolt led successful
+serving and IBD-256 throughput, Badger rejected the required atomic IBD
+checkpoint, and Pebble's sustained IBD result reversed its short-run lead.
+Method, three-round Mac medians, timebox results, limitations, and the
+default-engine decision are recorded in
+[docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md](docs/STORAGE_ENGINE_EVALUATION_2026-08-20.md).
+MDBX replacement preparation now includes verified four-table compact-copy,
+an abrupt-process recovery matrix, free-space and anti-thrashing policy, and a
+resumable 160M/900,000 churn/RSS runner. The root format manifest also binds a
+data directory to `redb` or `mdbx`, so a mismatched binary fails before opening
+either chainstate. The completed and still-external gates are separated in
+[docs/MDBX_REPLACEMENT_GATE.md](docs/MDBX_REPLACEMENT_GATE.md); MDBX remains
+opt-in until the full-scale and real-block evidence passes.
 
 The repository keeps only reviewed, human-named fuzz seeds and minimized
 crash/hang regressions. Coverage discoveries with cargo-fuzz's 40-character
@@ -302,6 +354,35 @@ Because `fuzz/` is an independent Cargo workspace, it explicitly patches
 workspace. CI checks its lock file before running every target under the dated
 `nightly-2026-07-13` toolchain; a local override must likewise name an exact
 dated nightly through `RBTC_FUZZ_TOOLCHAIN`.
+
+The optional anonymity-network gate is separate from every other Tor and
+I2P test in this repository, all of which run against in-process mocks and
+therefore pass without any daemon installed. It exercises the real
+protocols end to end: the Tor case authenticates against a live control
+port, publishes an ephemeral service, waits for its descriptor to reach the
+hash ring, dials that service back through the SOCKS5 port, and completes a
+Bitcoin handshake plus a ping exchange over the resulting circuit before
+withdrawing the service — so a control-port, SOCKS5-addressing, or
+descriptor-timing divergence fails visibly rather than passing against a
+mock. The I2P case creates a SAM session on a live router, checks the
+published destination is BIP155-shaped, republishes the same address from a
+stored key, and confirms an unreachable destination fails within its
+deadline instead of hanging. A two-node case then runs both halves against
+the router: two sessions must coexist on one bridge, one accepts while the
+other dials it, and each side must receive the other's destination in
+`addrv2`. Setting `RBTC_I2P_SAM_B` runs the two nodes against separate
+bridges instead. A further case dials the inbound service itself rather than
+a bare session, so the listener's select, shared connection semaphore,
+upload budget, and statistics are exercised on the I2P path too; it asserts
+the peer is accounted as accepted and handshaken and rejected by no ceiling
+keyed on an address it does not have. The cases that publish to an
+anonymity network take a shared lock so they run one at a time: a router
+publishes each destination's LeaseSet and builds its tunnels before it is
+reachable, and asking one daemon to do that for every case at once produced
+`LeaseSet not found` when the suite ran as a whole while each case passed
+alone. Each test names the environment variables it
+requires and fails with that message when they are absent, so a partially
+configured run reports what is missing rather than silently passing.
 
 The optional live differential gate requires the matching `bitcoin-cli` beside a Bitcoin Core 31.0 `bitcoind` and rejects another daemon version. It submits the same mined regtest blocks to Core and through rBTC's production header-DAG/block-connection path, including atomic rejection checks for the persisted tip, undo record, and candidate UTXO. The dependency and Core 27–31 change classification is documented in [docs/CORE31_COMPATIBILITY.md](docs/CORE31_COMPATIBILITY.md).
 
@@ -883,7 +964,7 @@ The embedded REST routes are deliberately typed behind an `ExplorerIndex` trait:
 
 The embedded page opens the SSE feed and displays the live persistent explorer tip. Every client first receives a `tip` snapshot, followed only by changes committed to `explorer.redb`: `connected`, `disconnected`, or snapshot-aware `rebased`. The broadcast ring is globally bounded at 128 events and 64 simultaneous streams. A client that falls behind receives `resync` with the missed count and must reconnect or reload its REST state; 15-second SSE comments keep idle intermediaries from silently expiring the stream.
 
-`/api/v1/health` is a process-liveness check. `/api/v1/ready` returns 503 during IBD, block catch-up, explorer/wallet reconciliation, or an unsafe disk forecast, and 200 only when header, execution, explorer, and optional wallet tips agree, the configured minimum chainwork is reached, and free space remains above the next-checkpoint threshold. `/api/v1/status` returns the same decision with hashes, phase, AssumeUTXO independence, hot/cold UTXO counts, compressed ledger footprint, and disk total/available/required/reserve bytes. `/metrics` exposes those bounded counters and gauges without reading archive payloads. Dynamic status and metric responses use `Cache-Control: no-store`; all routes remain loopback-only. Add `--rpc-auth-token-file PATH` beside `--explorer-listen` to mount the independently authenticated `/rpc` route. Its bounded methods are `help`, Core-compatible `getblockhash` and `estimatesmartfee`, `rbtc.getblocksummary`, `rbtc.gettransaction`, paged `rbtc.getaddressutxos`, stable operator equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`, `getindexinfo`, and `verifychain`, runtime `getloginfo`/`setloglevel`, disk forecast `getdiskinfo`, plus idempotent `stop`. Active-chain operations additionally include cursor-paged `getrawmempool`, `getblockheader`, retained-block metadata through `getblock`, 24 KiB raw pages through `rbtc.getblockchunk`, exact `gettxout`, and asynchronous `rbtc.submitrawtransaction`. Submission returns `queued=true` only after entering the bounded ordinary validation queue; it does not claim mempool admission before consensus/policy evaluation. Pruned block payloads return a stable unavailable error. The status methods deliberately expose only locally proven state and do not promise exact Core response-field parity. `stop` returns first, then signals the outer CLI or embedded runtime and waits for an in-flight atomic checkpoint before durable stores close. The RPC token file follows the same owner-only, 32–256 printable-byte, atomic-rotation, and fail-closed rules as the wallet token, but the two files must not alias so access scopes stay separate. Requests are strict JSON-RPC 2.0, reject batches, notifications, unknown envelope fields, invalid IDs, oversized methods/parameters, and bodies above 64 KiB, and never expose internal storage errors.
+`/api/v1/health` is a process-liveness check. `/api/v1/ready` returns 503 during IBD, block catch-up, explorer/wallet reconciliation, or an unsafe disk forecast, and 200 only when header, execution, explorer, and optional wallet tips agree, the configured minimum chainwork is reached, and free space remains above the next-checkpoint threshold. `/api/v1/status` returns the same decision with hashes, phase, AssumeUTXO independence, hot/cold UTXO counts, compressed ledger footprint, and disk total/available/required/reserve bytes. `/metrics` exposes those bounded counters and gauges without reading archive payloads. Dynamic status and metric responses use `Cache-Control: no-store`; all routes remain loopback-only. Add `--rpc-auth-token-file PATH` beside `--explorer-listen` to mount the independently authenticated `/rpc` route. Its bounded methods are `help`, Core-compatible `getblockhash` and `estimatesmartfee`, `rbtc.getblocksummary`, `rbtc.gettransaction`, paged `rbtc.getaddressutxos`, stable operator equivalents of `getblockchaininfo`, `getnetworkinfo`, `getpeerinfo`, `getmempoolinfo`, `getindexinfo`, and `verifychain`, runtime `getloginfo`/`setloglevel`, disk forecast `getdiskinfo`, plus idempotent `stop`. Active-chain operations additionally include cursor-paged `getrawmempool`, `getblockheader`, retained-block metadata through `getblock`, 24 KiB raw pages through `rbtc.getblockchunk`, exact `gettxout`, asynchronous `rbtc.submitrawtransaction`, and asynchronous `rbtc.submitblock`. Submission returns `queued=true` only after entering the bounded ordinary validation queue; it does not claim mempool admission before consensus/policy evaluation. `getblocktemplate` serves the BIP22/23 fields this node can state truthfully, including package-aware fee-optimal transaction selection bounded by both the block weight and sigop limits, a derived block version, and the default witness commitment; `longpollid` is null, proposal mode is absent, and any chainstate not independently validated from genesis is refused outright rather than served a template built on history it has not verified. `rbtc.submitblock` rejects a malformed or under-target block immediately, then waits for the execution loop to stage its header and connect it under the ordinary rules, answering `connected=true` or `connected=false` with a reason; a node that stops before deciding is reported as undecided rather than as a rejection. Blocks are capped at 32 KiB by the shared 64 KiB body limit, which suits regtest fixtures rather than full blocks. Pruned block payloads return a stable unavailable error. The status methods deliberately expose only locally proven state and do not promise exact Core response-field parity. `stop` returns first, then signals the outer CLI or embedded runtime and waits for an in-flight atomic checkpoint before durable stores close. The RPC token file follows the same owner-only, 32–256 printable-byte, atomic-rotation, and fail-closed rules as the wallet token, but the two files must not alias so access scopes stay separate. Requests are strict JSON-RPC 2.0, reject batches, notifications, unknown envelope fields, invalid IDs, oversized methods/parameters, and bodies above 64 KiB, and never expose internal storage errors.
 
 The wallet router accepts public descriptors only. BDK changesets are committed transactionally to an owner-only SQLite file before a derived address is returned; separate monotonically increasing receive and change cursors are reserved first so a crash can skip an address but cannot return or use it twice. Startup rejects a network or descriptor mismatch. Descriptor import supports a bounded `gap_limit` (default 20, maximum 1,000) on both receive and change keychains and an optional `birthday_height` (default 0). It repeatedly replays only fully validated blocks until the unused-script window converges, records the earliest completed scan boundary only after success, and uses sparse validated checkpoints to avoid fetching raw blocks before the birthday. Lowering a birthday or extending the discovered window triggers a durable rescan from the retained ledger or a full-history peer. On reorg, the wallet rewinds to the execution chain's common ancestor before replay.
 

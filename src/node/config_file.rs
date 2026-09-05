@@ -20,9 +20,11 @@ const LIST_KEYS: [&str; 7] = [
     "whitelist",
     "onlynet",
 ];
-const BOOL_KEYS: [&str; 10] = [
+const BOOL_KEYS: [&str; 12] = [
     "block_filter_index",
+    "cjdns_reachable",
     "cleanup_validation_dir",
+    "private_broadcast",
     "dns_seeds",
     "mempool_full_rbf",
     "listen",
@@ -32,7 +34,8 @@ const BOOL_KEYS: [&str; 10] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 37] = [
+const VALUE_KEYS: [&str; 39] = [
+    "asmap",
     "automatic_hot_standbys",
     "assumevalid",
     "background_assumeutxo",
@@ -56,6 +59,7 @@ const VALUE_KEYS: [&str; 37] = [
     "max_inbound_peers_per_ip",
     "max_upload_bytes_per_day",
     "minimum_free_bytes",
+    "name_proxy",
     "network",
     "prune_blocks",
     "prune_max_bytes",
@@ -315,6 +319,10 @@ fn argument_for_scalar(entry: &Entry) -> Result<ConfigArgument, String> {
         let flag = match (entry.key.as_str(), enabled) {
             ("block_filter_index", true) => "--block-filter-index",
             ("block_filter_index", false) => "--no-block-filter-index",
+            ("cjdns_reachable", true) => "--cjdns-reachable",
+            ("cjdns_reachable", false) => "--no-cjdns-reachable",
+            ("private_broadcast", true) => "--private-broadcast",
+            ("private_broadcast", false) => "--no-private-broadcast",
             ("cleanup_validation_dir", true) => "--cleanup-validation-dir",
             ("cleanup_validation_dir", false) => "--no-cleanup-validation-dir",
             ("dns_seeds", true) => "--dns-seeds",
@@ -360,6 +368,7 @@ fn known_key(key: &str) -> bool {
 
 fn flag_for_key(key: &str) -> &'static str {
     match key {
+        "asmap" => "--asmap",
         "assumevalid" => "--assumevalid",
         "automatic_hot_standbys" => "--automatic-hot-standbys",
         "background_assumeutxo" => "--background-assumeutxo",
@@ -385,6 +394,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "max_inbound_peers_per_ip" => "--max-inbound-peers-per-ip",
         "max_upload_bytes_per_day" => "--max-upload-bytes-per-day",
         "minimum_free_bytes" => "--minimum-free-bytes",
+        "name_proxy" => "--name-proxy",
         "network" => "--network",
         "onlynet" => "--onlynet",
         "prune_blocks" => "--prune-blocks",
@@ -419,8 +429,13 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
     let group = option_group(argument);
     matches!(
         argument,
-        "--assumevalid"
+        "--asmap"
+            | "--assumevalid"
             | "--assume-valid"
+            | "--cjdns-reachable"
+            | "--no-cjdns-reachable"
+            | "--private-broadcast"
+            | "--no-private-broadcast"
             | "--automatic-hot-standbys"
             | "--background-assumeutxo"
             | "--background-chainstate-cache-bytes"
@@ -449,6 +464,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--max-upload-bytes-per-day"
             | "--minimum-free-bytes"
             | "--minimum-chainwork"
+            | "--name-proxy"
             | "--network"
             | "--no-cleanup-validation-dir"
             | "--no-block-filter-index"
@@ -489,7 +505,10 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
 
 fn option_group(flag: &str) -> &'static str {
     match flag {
+        "--asmap" => "asmap",
         "--assume-valid" | "--assumevalid" => "assumevalid",
+        "--cjdns-reachable" | "--no-cjdns-reachable" => "cjdns-reachable",
+        "--private-broadcast" | "--no-private-broadcast" => "private-broadcast",
         "--automatic-hot-standbys" => "automatic-hot-standbys",
         "--cleanup-validation-dir" | "--no-cleanup-validation-dir" => "cleanup-validation-dir",
         "--block-filter-index" | "--no-block-filter-index" => "block-filter-index",
@@ -522,6 +541,7 @@ fn option_group(flag: &str) -> &'static str {
         "--mempool-max-bytes" => "mempool-max-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",
         "--minimum-free-bytes" => "minimum-free-bytes",
+        "--name-proxy" => "name-proxy",
         "--network" => "network",
         "--prune-blocks" => "prune-blocks",
         "--prune-max-bytes" => "prune-max-bytes",
@@ -603,6 +623,110 @@ mod tests {
         let dns_conflict = parse_config("dns_seeds=false\ndns_seed=seed.example:8333").unwrap();
         assert!(selected_arguments(&dns_conflict, Network::Bitcoin).is_err());
         assert!(parse_config("once=yes").is_err());
+    }
+
+    #[test]
+    fn the_asmap_key_maps_to_the_asmap_flag() {
+        let entries = parse_config("asmap=off\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| { entry.flag == "--asmap" && entry.value.as_deref() == Some("off") })
+        );
+
+        // A command-line --asmap must displace the file entry, exactly as
+        // every other single-valued option is merged.
+        let directory = TempDir::new().unwrap();
+        let config = directory.path().join("rbtc.conf");
+        fs::write(&config, "asmap=/etc/rbtc/operator.map\n").unwrap();
+        let merged = merge_config_arguments(vec![
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--asmap".to_owned(),
+            "off".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(
+            merged
+                .windows(2)
+                .filter(|pair| pair[0] == "--asmap")
+                .count(),
+            1,
+            "the file entry must be dropped in favour of the command line"
+        );
+        assert!(merged.ends_with(&["--asmap".to_owned(), "off".to_owned()]));
+    }
+
+    #[test]
+    fn the_cjdns_reachable_key_is_a_strict_bool() {
+        let entries = parse_config("cjdns_reachable=true\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--cjdns-reachable" && entry.value.is_none())
+        );
+        let entries = parse_config("cjdns_reachable=false\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--no-cjdns-reachable")
+        );
+        assert!(parse_config("cjdns_reachable=maybe\n").is_err());
+    }
+
+    #[test]
+    fn the_private_broadcast_key_is_a_strict_bool() {
+        let entries = parse_config("private_broadcast=true\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|entry| entry.flag == "--private-broadcast" && entry.value.is_none())
+        );
+        assert!(parse_config("private_broadcast=maybe\n").is_err());
+    }
+
+    #[test]
+    fn the_name_proxy_key_stays_independent_of_the_peer_proxy() {
+        let entries = parse_config("name_proxy=127.0.0.1:9050\n").unwrap();
+        let selected = selected_arguments(&entries, Network::Bitcoin).unwrap();
+        assert!(selected.iter().any(|entry| {
+            entry.flag == "--name-proxy" && entry.value.as_deref() == Some("127.0.0.1:9050")
+        }));
+
+        // Overriding one on the command line must not suppress the other.
+        // They express two different permissions — routing peer sockets, and
+        // disclosing which authorities this node is looking for — so an
+        // operator who changes where names go has not said anything about
+        // where peer traffic goes.
+        let directory = TempDir::new().unwrap();
+        let config = directory.path().join("rbtc.conf");
+        fs::write(&config, "proxy=127.0.0.1:9050\nname_proxy=127.0.0.1:9050\n").unwrap();
+        let merged = merge_config_arguments(vec![
+            "--config".to_owned(),
+            config.display().to_string(),
+            "--name-proxy".to_owned(),
+            "127.0.0.1:9150".to_owned(),
+        ])
+        .unwrap();
+        assert!(
+            merged
+                .windows(2)
+                .any(|pair| pair[0] == "--proxy" && pair[1] == "127.0.0.1:9050"),
+            "the configured peer proxy survives a name-proxy override"
+        );
+        assert_eq!(
+            merged
+                .windows(2)
+                .filter(|pair| pair[0] == "--name-proxy")
+                .count(),
+            1,
+            "--name-proxy is refused more than once, so the file entry must be dropped"
+        );
+        assert!(merged.ends_with(&["--name-proxy".to_owned(), "127.0.0.1:9150".to_owned()]));
     }
 
     #[test]

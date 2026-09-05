@@ -5,7 +5,7 @@ use std::{
     net::IpAddr,
     path::Path,
     str::FromStr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{
@@ -17,6 +17,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::asmap::Asmap;
 use crate::i2p_sam::I2pAddress;
 use crate::p2p::{I2pPeerAddress, OnionAddress, OnionPeerAddress, PeerAddress};
 
@@ -65,6 +66,30 @@ const MAX_STORED_I2P_PEERS: usize = 1_024;
 const I2P_SOURCE_GROUP_FAMILY: &str = "i2p";
 /// Complete source-group value stored on every I2P record.
 const I2P_SOURCE_GROUP: &str = "i2p:0:0";
+/// Family marker for CJDNS overlay addresses.
+const CJDNS_SOURCE_GROUP_FAMILY: &str = "cjdns";
+/// Complete source-group value for every CJDNS record.
+///
+/// One marker group for the whole overlay: CJDNS addresses are derived from
+/// node public keys, so their bit patterns carry no prefix or ASN structure
+/// to diversify over, and generating fresh ones is free. Sharing one group
+/// gives the entire overlay one group's quota and one address-group's tried
+/// slots, exactly as the onion and I2P books are bounded.
+const CJDNS_SOURCE_GROUP: &str = "cjdns:0:0";
+/// Family marker for ASN-derived groups when an asmap is configured.
+///
+/// One family for IPv4 and IPv6: the group is the autonomous system, and an
+/// operator announcing both address families is still one operator, exactly
+/// as Core buckets them.
+const ASN_SOURCE_GROUP_FAMILY: &str = "as";
+/// Family marker for addresses learned through a name-proxy bootstrap.
+const SEED_NAME_SOURCE_GROUP_FAMILY: &str = "seed-name";
+/// Complete source-group value for every address a name proxy's peer taught.
+///
+/// One value for all of them: the proxy chose each peer and reported no
+/// address, so this node knows of no range to diversify across and must not
+/// imply one by splitting them into separate groups.
+const SEED_NAME_SOURCE_GROUP: &str = "seed-name:0:0";
 const MAX_STORED_PEER_BYTES: usize = 1_024;
 const MAX_STORED_PENALTY_BYTES: usize = 256;
 const MAX_RECORDED_HANDSHAKE_MILLIS: u32 = 60_000;
@@ -181,17 +206,74 @@ pub struct PeerInsertStats {
     pub rejected: usize,
 }
 
+/// Bucket-placement identity: the persistent hash key plus the optional
+/// ASN map that widens address groups from IP prefixes to autonomous
+/// systems.
+struct BucketKeys {
+    hash_key: [u8; BUCKET_KEY_LEN],
+    asmap: Option<Arc<Asmap>>,
+}
+
+impl BucketKeys {
+    /// Derives the diversity group for one routable address.
+    ///
+    /// With an asmap configured and the address inside a known autonomous
+    /// system, the group is that ASN, shared across IPv4 and IPv6. Outside
+    /// the map, or without one, the group falls back to the IP-prefix
+    /// derivation, so a lookup miss keeps unrelated prefixes in separate
+    /// groups instead of collapsing them into one "unknown" group.
+    fn address_group(&self, ip: IpAddr) -> String {
+        // The overlay marker outranks every other derivation: a CJDNS
+        // address is key-derived, so neither its bit prefix nor an asmap
+        // lookup says anything true about who operates it.
+        if crate::p2p::is_cjdns_address(ip) {
+            return CJDNS_SOURCE_GROUP.to_owned();
+        }
+        if let Some(map) = &self.asmap {
+            let asn = map.map_asn(ip);
+            if asn != 0 {
+                return format!("{ASN_SOURCE_GROUP_FAMILY}:{asn}:0");
+            }
+        }
+        source_group(ip)
+    }
+}
+
 /// Redb-backed bounded peer-address pool.
 pub struct RedbPeerStore {
     db: Database,
     network: Network,
-    bucket_key: [u8; BUCKET_KEY_LEN],
+    cjdns_reachable: bool,
+    buckets: BucketKeys,
     write_guard: Mutex<()>,
 }
 
 impl RedbPeerStore {
-    /// Opens or creates a peer database bound to `network`.
+    /// Opens or creates a peer database bound to `network`, deriving
+    /// address-diversity groups from IP prefixes only and refusing CJDNS
+    /// overlay addresses.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, PeerStoreError> {
+        Self::open_with_policy(path, network, None, false)
+    }
+
+    /// Opens or creates a peer database bound to `network` under an
+    /// explicit network policy: `asmap` widens address-diversity groups to
+    /// announcing autonomous systems where it knows them, and
+    /// `cjdns_reachable` admits `fc00::/8` overlay addresses under one
+    /// shared marker group.
+    ///
+    /// Policy affects acceptance, bucket placement, and quotas only from
+    /// this process on; records persisted under another policy keep their
+    /// stored source groups, which remain valid, so changing either input
+    /// never invalidates the store. CJDNS records persisted while the
+    /// overlay was reachable are pruned on the first mutation after it
+    /// stops being so, exactly as any other no-longer-acceptable address.
+    pub fn open_with_policy(
+        path: impl AsRef<Path>,
+        network: Network,
+        asmap: Option<Arc<Asmap>>,
+        cjdns_reachable: bool,
+    ) -> Result<Self, PeerStoreError> {
         let genesis = bitcoin::blockdata::constants::genesis_block(network)
             .block_hash()
             .to_byte_array();
@@ -226,16 +308,51 @@ impl RedbPeerStore {
         Ok(Self {
             db,
             network,
-            bucket_key,
+            cjdns_reachable,
+            buckets: BucketKeys {
+                hash_key: bucket_key,
+                asmap,
+            },
             write_guard: Mutex::new(()),
         })
     }
 
+    /// Returns whether `address` is eligible for this store under its
+    /// network policy.
+    fn acceptable(&self, address: std::net::SocketAddr) -> bool {
+        is_acceptable_peer_address_with_cjdns(address, self.network, self.cjdns_reachable)
+    }
+
     /// Atomically filters and stores one peer-sourced address batch.
-    #[allow(clippy::too_many_lines)]
     pub fn insert_discovered(
         &self,
         source: std::net::SocketAddr,
+        addresses: &[PeerAddress],
+        now: u32,
+    ) -> Result<PeerInsertStats, PeerStoreError> {
+        self.insert_discovered_in_group(&self.buckets.address_group(source.ip()), addresses, now)
+    }
+
+    /// Stores addresses learned from a peer a name proxy selected.
+    ///
+    /// The proxy chose the peer and never reported its address, so there is no
+    /// IP range to diversify over and no honest per-source group to assign.
+    /// Every such batch shares one marker group, exactly as onion and I2P
+    /// records do. Sharing it is the conservative choice: one group carries
+    /// one group's quota however many authorities were contacted, so this path
+    /// can never claim more of the new table than an ordinary source.
+    pub fn insert_discovered_from_seed_name(
+        &self,
+        addresses: &[PeerAddress],
+        now: u32,
+    ) -> Result<PeerInsertStats, PeerStoreError> {
+        self.insert_discovered_in_group(SEED_NAME_SOURCE_GROUP, addresses, now)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn insert_discovered_in_group(
+        &self,
+        group: &str,
         addresses: &[PeerAddress],
         now: u32,
     ) -> Result<PeerInsertStats, PeerStoreError> {
@@ -245,11 +362,10 @@ impl RedbPeerStore {
         records.retain(|address, record| {
             std::net::SocketAddr::from_str(address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(record, now)
             })
         });
-        let group = source_group(source.ip());
         let mut group_count = records
             .values()
             .filter(|record| !record_is_tried(record) && record.source_group == group)
@@ -261,9 +377,7 @@ impl RedbPeerStore {
         for address in incoming {
             let key = address.socket.to_string();
             let existing = records.get(&key);
-            if !address.services.has(required)
-                || !is_acceptable_peer_address(address.socket, self.network)
-            {
+            if !address.services.has(required) || !self.acceptable(address.socket) {
                 stats.rejected += 1;
                 continue;
             }
@@ -282,7 +396,7 @@ impl RedbPeerStore {
                 maybe_add_new_reference(
                     &updated.source_group,
                     !record_is_tried(&updated),
-                    &group,
+                    group,
                     &mut updated.new_source_groups,
                 );
                 if updated.new_source_groups.len() == before {
@@ -308,7 +422,7 @@ impl RedbPeerStore {
                 in_new_table,
                 mut new_source_groups,
             ) = existing.map_or_else(
-                || (group.clone(), 0, 0, 0, 0, 0, 0, 0, false, Vec::new()),
+                || (group.to_owned(), 0, 0, 0, 0, 0, 0, 0, false, Vec::new()),
                 |record| {
                     (
                         record.source_group.clone(),
@@ -327,7 +441,7 @@ impl RedbPeerStore {
             maybe_add_new_reference(
                 &source_group,
                 last_success == 0 || in_new_table,
-                &group,
+                group,
                 &mut new_source_groups,
             );
             records.insert(
@@ -350,7 +464,7 @@ impl RedbPeerStore {
             stats.accepted += 1;
         }
 
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         self.replace_all(&ordered)?;
         Ok(stats)
     }
@@ -366,7 +480,7 @@ impl RedbPeerStore {
         now: u32,
     ) -> Result<bool, PeerStoreError> {
         let required = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-        if !services.has(required) || !is_acceptable_peer_address(address, self.network) {
+        if !services.has(required) || !self.acceptable(address) {
             return Ok(false);
         }
         let _guard = self.write_guard.lock().expect("peer lock not poisoned");
@@ -374,7 +488,7 @@ impl RedbPeerStore {
         records.retain(|stored_address, record| {
             std::net::SocketAddr::from_str(stored_address).is_ok_and(|socket| {
                 ServiceFlags::from(record.services).has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(record, now)
             })
         });
@@ -384,7 +498,7 @@ impl RedbPeerStore {
         let mut record = existing.unwrap_or_else(|| StoredPeer {
             services: services.to_u64(),
             last_seen: normalize_last_seen(now, now),
-            source_group: source_group(address.ip()),
+            source_group: self.buckets.address_group(address.ip()),
             last_attempt: 0,
             last_success: 0,
             consecutive_failures: 0,
@@ -405,13 +519,12 @@ impl RedbPeerStore {
             record.in_new_table = false;
             record.new_source_groups.clear();
         } else {
-            let position = tried_position(&self.bucket_key, address);
+            let position = tried_position(&self.buckets, address);
             let incumbent = records
                 .iter()
                 .filter_map(|(stored_address, stored)| {
                     let socket = std::net::SocketAddr::from_str(stored_address).ok()?;
-                    (record_is_tried(stored)
-                        && tried_position(&self.bucket_key, socket) == position)
+                    (record_is_tried(stored) && tried_position(&self.buckets, socket) == position)
                         .then_some((peer_priority(stored), stored_address))
                 })
                 .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
@@ -436,10 +549,10 @@ impl RedbPeerStore {
             }
         }
         records.insert(key.clone(), record);
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         let retained = ordered.iter().any(|(stored, _)| stored == &key);
         let retained_records = ordered.iter().cloned().collect::<HashMap<_, _>>();
-        let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.bucket_key);
+        let collisions = sanitize_tried_collisions(collisions, &retained_records, &self.buckets);
         self.replace_all_and_collisions(&ordered, &collisions)?;
         Ok(retained)
     }
@@ -783,7 +896,7 @@ impl RedbPeerStore {
                 let socket = std::net::SocketAddr::from_str(&address).ok()?;
                 let services = ServiceFlags::from(record.services);
                 (services.has(required)
-                    && is_acceptable_peer_address(socket, self.network)
+                    && self.acceptable(socket)
                     && !is_terrible(&record, now)
                     && retry_ready(&record, now))
                 .then_some((record, socket))
@@ -795,7 +908,7 @@ impl RedbPeerStore {
                 .map(|(record, socket)| {
                     (
                         peer_priority(&record),
-                        peer_bucket(&self.bucket_key, socket, &record),
+                        peer_bucket(&self.buckets, socket, &record),
                         socket,
                     )
                 })
@@ -805,6 +918,7 @@ impl RedbPeerStore {
             left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2))
         });
         Ok(diversify_candidates(
+            &self.buckets,
             candidates,
             limit.min(MAX_STORED_PEERS),
         ))
@@ -822,7 +936,7 @@ impl RedbPeerStore {
         records.retain(|_, record| !is_terrible(record, now));
         let removed = before.saturating_sub(records.len());
         if removed > 0 {
-            let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+            let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
             self.replace_all(&ordered)?;
         }
         Ok(removed)
@@ -832,7 +946,7 @@ impl RedbPeerStore {
     pub fn tried_collisions(&self) -> Result<Vec<TriedCollision>, PeerStoreError> {
         let records = self.load_records()?;
         Ok(
-            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key)
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.buckets)
                 .into_iter()
                 .map(|collision| TriedCollision {
                     challenger: collision
@@ -864,7 +978,7 @@ impl RedbPeerStore {
         let mut records = self.load_records()?;
         let incumbent_key = incumbent.to_string();
         let collisions =
-            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.bucket_key);
+            sanitize_tried_collisions(self.load_tried_collisions()?, &records, &self.buckets);
         let (matching, remaining): (Vec<_>, Vec<_>) = collisions
             .into_iter()
             .partition(|collision| collision.incumbent == incumbent_key);
@@ -899,9 +1013,9 @@ impl RedbPeerStore {
                 }
             }
         }
-        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let ordered = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         let retained = ordered.iter().cloned().collect::<HashMap<_, _>>();
-        let remaining = sanitize_tried_collisions(remaining, &retained, &self.bucket_key);
+        let remaining = sanitize_tried_collisions(remaining, &retained, &self.buckets);
         self.replace_all_and_collisions(&ordered, &remaining)?;
         Ok(true)
     }
@@ -1083,6 +1197,53 @@ impl RedbPeerStore {
         Ok(true)
     }
 
+    /// Seeds one operator-supplied routable address as an untried dial
+    /// candidate, returning whether it was retained.
+    ///
+    /// This enters the new table exactly like a peer-learned address, so it
+    /// is subject to the same acceptability, source-group quota, and bucket
+    /// bounds — an operator cannot use it to exceed the pool's limits. It
+    /// does not claim a handshake that never happened; the address is tried
+    /// on the ordinary schedule. The backing store for the `addnode add`
+    /// operator RPC.
+    pub fn insert_manual(
+        &self,
+        address: std::net::SocketAddr,
+        now: u32,
+    ) -> Result<bool, PeerStoreError> {
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        if !self.acceptable(address) {
+            return Ok(false);
+        }
+        let stats = self.insert_discovered(
+            address,
+            &[PeerAddress {
+                socket: address,
+                services,
+                last_seen: now,
+            }],
+            now,
+        )?;
+        Ok(stats.accepted > 0)
+    }
+
+    /// Removes one routable address from the candidate pool, returning
+    /// whether a record existed. The backing store for `addnode remove`.
+    ///
+    /// It clears only the stored candidate; it does not ban the address, so
+    /// the node may learn it again from a peer. To keep an address from
+    /// being dialed, use the cooldown surface (`setban`) instead.
+    pub fn forget_peer(&self, address: std::net::SocketAddr) -> Result<bool, PeerStoreError> {
+        let _guard = self.write_guard.lock().expect("peer lock not poisoned");
+        let mut records = self.load_records()?;
+        if records.remove(&address.to_string()).is_none() {
+            return Ok(false);
+        }
+        let records = records.into_iter().collect::<Vec<_>>();
+        self.replace_all(&records)?;
+        Ok(true)
+    }
+
     /// Returns every stored cooldown with its deadline, newest deadline first.
     pub fn discouragements(
         &self,
@@ -1157,7 +1318,7 @@ impl RedbPeerStore {
             return Ok(false);
         };
         update(record);
-        let records = retain_bucketed(records, MAX_STORED_PEERS, &self.bucket_key);
+        let records = retain_bucketed(records, MAX_STORED_PEERS, &self.buckets);
         self.replace_all(&records)?;
         Ok(records.iter().any(|(stored, _)| stored == &key))
     }
@@ -1217,7 +1378,7 @@ impl RedbPeerStore {
         let collisions = sanitize_tried_collisions(
             self.load_tried_collisions()?,
             &records_by_key,
-            &self.bucket_key,
+            &self.buckets,
         );
         self.replace_all_and_collisions(records, &collisions)
     }
@@ -1393,10 +1554,27 @@ fn valid_source_group(group: &str) -> bool {
             u16::from_str_radix(first, 16).is_ok_and(|value| format!("{value:x}") == first)
                 && u16::from_str_radix(second, 16).is_ok_and(|value| format!("{value:x}") == second)
         }
+        // ASN groups exist only when an asmap derivation produced them, but
+        // records persisted under one map stay valid after the map is
+        // replaced or removed, so the family is always accepted. ASN 0 is
+        // reserved (RFC 7607) and doubles as the derivation's "unknown", so
+        // it can never be a group.
+        ASN_SOURCE_GROUP_FAMILY => {
+            first
+                .parse::<u32>()
+                .is_ok_and(|value| value != 0 && value.to_string() == first)
+                && second == "0"
+        }
         // The onion address book shares this record type but has no IP
         // range to diversify across, so its entries carry one fixed marker
         // group. `source_group` never produces it for a routable address.
-        ONION_SOURCE_GROUP_FAMILY | I2P_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
+        // A name-proxy bootstrap carries one for the opposite reason: the
+        // record is a routable address, but the peer that taught it had none
+        // this node could see.
+        ONION_SOURCE_GROUP_FAMILY
+        | I2P_SOURCE_GROUP_FAMILY
+        | SEED_NAME_SOURCE_GROUP_FAMILY
+        | CJDNS_SOURCE_GROUP_FAMILY => first == "0" && second == "0",
         _ => false,
     }
 }
@@ -1493,33 +1671,28 @@ fn address_bucket_key(address: std::net::SocketAddr) -> Vec<u8> {
     encoded
 }
 
-fn new_bucket(
-    key: &[u8; BUCKET_KEY_LEN],
-    address: std::net::SocketAddr,
-    learned_from: &str,
-) -> u16 {
-    let address_group = source_group(address.ip());
+fn new_bucket(keys: &BucketKeys, address: std::net::SocketAddr, learned_from: &str) -> u16 {
+    let address_group = keys.address_group(address.ip());
     let selector = bucket_hash(
-        key,
+        &keys.hash_key,
         b"new-source",
         &[learned_from.as_bytes(), address_group.as_bytes()],
     ) % NEW_BUCKETS_PER_SOURCE_GROUP;
     let selector = selector.to_le_bytes();
     u16::try_from(
-        bucket_hash(key, b"new-bucket", &[learned_from.as_bytes(), &selector])
-            % u64::from(NEW_BUCKET_COUNT),
+        bucket_hash(
+            &keys.hash_key,
+            b"new-bucket",
+            &[learned_from.as_bytes(), &selector],
+        ) % u64::from(NEW_BUCKET_COUNT),
     )
     .expect("new bucket index fits u16")
 }
 
-fn new_buckets(
-    key: &[u8; BUCKET_KEY_LEN],
-    address: std::net::SocketAddr,
-    record: &StoredPeer,
-) -> Vec<u16> {
+fn new_buckets(keys: &BucketKeys, address: std::net::SocketAddr, record: &StoredPeer) -> Vec<u16> {
     std::iter::once(record.source_group.as_str())
         .chain(record.new_source_groups.iter().map(String::as_str))
-        .map(|source| new_bucket(key, address, source))
+        .map(|source| new_bucket(keys, address, source))
         .collect::<HashSet<_>>()
         .into_iter()
         .collect()
@@ -1550,24 +1723,30 @@ fn accept_new_reference_roll(reference_count: usize, roll: u64) -> bool {
     roll % denominator == 0
 }
 
-fn tried_bucket(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> u16 {
+fn tried_bucket(keys: &BucketKeys, address: std::net::SocketAddr) -> u16 {
     let address_key = address_bucket_key(address);
-    let address_group = source_group(address.ip());
-    let selector =
-        bucket_hash(key, b"tried-address", &[&address_key]) % TRIED_BUCKETS_PER_ADDRESS_GROUP;
+    let address_group = keys.address_group(address.ip());
+    let selector = bucket_hash(&keys.hash_key, b"tried-address", &[&address_key])
+        % TRIED_BUCKETS_PER_ADDRESS_GROUP;
     let selector = selector.to_le_bytes();
     u16::try_from(
-        bucket_hash(key, b"tried-bucket", &[address_group.as_bytes(), &selector])
-            % u64::from(TRIED_BUCKET_COUNT),
+        bucket_hash(
+            &keys.hash_key,
+            b"tried-bucket",
+            &[address_group.as_bytes(), &selector],
+        ) % u64::from(TRIED_BUCKET_COUNT),
     )
     .expect("tried bucket index fits u16")
 }
 
-fn tried_position(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> (u16, u8) {
-    let bucket = tried_bucket(key, address);
+fn tried_position(keys: &BucketKeys, address: std::net::SocketAddr) -> (u16, u8) {
+    let bucket = tried_bucket(keys, address);
     let address_key = address_bucket_key(address);
-    let slot = bucket_hash(key, b"tried-slot", &[&bucket.to_le_bytes(), &address_key])
-        % u64::try_from(BUCKET_CAPACITY).expect("bucket capacity fits u64");
+    let slot = bucket_hash(
+        &keys.hash_key,
+        b"tried-slot",
+        &[&bucket.to_le_bytes(), &address_key],
+    ) % u64::try_from(BUCKET_CAPACITY).expect("bucket capacity fits u64");
     (
         bucket,
         u8::try_from(slot).expect("tried slot index fits u8"),
@@ -1575,14 +1754,14 @@ fn tried_position(key: &[u8; BUCKET_KEY_LEN], address: std::net::SocketAddr) -> 
 }
 
 fn peer_bucket(
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
     address: std::net::SocketAddr,
     record: &StoredPeer,
 ) -> PeerBucket {
     if record_is_tried(record) {
-        (true, tried_bucket(key, address))
+        (true, tried_bucket(keys, address))
     } else {
-        (false, new_bucket(key, address, &record.source_group))
+        (false, new_bucket(keys, address, &record.source_group))
     }
 }
 
@@ -1593,7 +1772,7 @@ fn record_is_tried(record: &StoredPeer) -> bool {
 fn sanitize_tried_collisions(
     collisions: Vec<StoredTriedCollision>,
     records: &HashMap<String, StoredPeer>,
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
 ) -> Vec<StoredTriedCollision> {
     collisions
         .into_iter()
@@ -1613,7 +1792,8 @@ fn sanitize_tried_collisions(
             };
             !record_is_tried(challenger)
                 && record_is_tried(incumbent)
-                && tried_position(key, challenger_address) == tried_position(key, incumbent_address)
+                && tried_position(keys, challenger_address)
+                    == tried_position(keys, incumbent_address)
         })
         .collect()
 }
@@ -1621,7 +1801,7 @@ fn sanitize_tried_collisions(
 fn retain_bucketed(
     records: HashMap<String, StoredPeer>,
     limit: usize,
-    key: &[u8; BUCKET_KEY_LEN],
+    keys: &BucketKeys,
 ) -> Vec<(String, StoredPeer)> {
     let mut ordered = records.into_iter().collect::<Vec<_>>();
     ordered.sort_unstable_by(|(left_address, left), (right_address, right)| {
@@ -1636,11 +1816,11 @@ fn retain_bucketed(
         let socket = std::net::SocketAddr::from_str(&address)
             .expect("stored peer address was validated before retention");
         if record_is_tried(&record) {
-            if !tried_positions.insert(tried_position(key, socket)) {
+            if !tried_positions.insert(tried_position(keys, socket)) {
                 continue;
             }
         } else {
-            let available = new_buckets(key, socket, &record)
+            let available = new_buckets(keys, socket, &record)
                 .into_iter()
                 .filter(|bucket| {
                     new_bucket_counts.get(bucket).copied().unwrap_or(0) < BUCKET_CAPACITY
@@ -1661,11 +1841,15 @@ fn retain_bucketed(
     retained
 }
 
-fn diversify_candidates(ordered: Vec<PrioritizedPeer>, limit: usize) -> Vec<std::net::SocketAddr> {
+fn diversify_candidates(
+    keys: &BucketKeys,
+    ordered: Vec<PrioritizedPeer>,
+    limit: usize,
+) -> Vec<std::net::SocketAddr> {
     let mut group_indexes = HashMap::new();
     let mut groups: Vec<Vec<(PeerBucket, std::net::SocketAddr)>> = Vec::new();
     for (_, bucket, address) in ordered {
-        let group = source_group(address.ip());
+        let group = keys.address_group(address.ip());
         let index = *group_indexes.entry(group).or_insert_with(|| {
             groups.push(Vec::new());
             groups.len() - 1
@@ -1739,7 +1923,7 @@ fn source_group(ip: IpAddr) -> String {
     }
 }
 
-fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
+fn acceptable_ip(ip: IpAddr, network: Network, cjdns_reachable: bool) -> bool {
     if network == Network::Regtest {
         return !ip.is_unspecified() && !ip.is_multicast();
     }
@@ -1761,13 +1945,22 @@ fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
-                return acceptable_ip(IpAddr::V4(mapped), network);
+                return acceptable_ip(IpAddr::V4(mapped), network, cjdns_reachable);
             }
             let segments = ip.segments();
+            // Within the RFC 4193 unique-local block, `fc00::/8` is the
+            // CJDNS overlay and becomes eligible exactly when a local
+            // `cjdroute` interface is declared reachable; `fd00::/8` stays
+            // unroutable unconditionally.
+            let unique_local_excluded = if crate::p2p::is_cjdns_address(IpAddr::V6(ip)) {
+                !cjdns_reachable
+            } else {
+                segments[0] & 0xfe00 == 0xfc00
+            };
             !(ip.is_unspecified()
                 || ip.is_loopback()
                 || ip.is_multicast()
-                || segments[0] & 0xfe00 == 0xfc00
+                || unique_local_excluded
                 || segments[0] & 0xffc0 == 0xfe80
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)
                 || (segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020)))
@@ -1778,9 +1971,20 @@ fn acceptable_ip(ip: IpAddr, network: Network) -> bool {
 /// Returns whether a resolved socket is eligible for outbound use on `network`.
 ///
 /// Public networks exclude local, private, documentation, transition, multicast, and other
-/// reserved ranges. Regtest deliberately permits local addresses for isolated test networks.
+/// reserved ranges, including the whole `fc00::/7` unique-local block. Regtest deliberately
+/// permits local addresses for isolated test networks.
 pub fn is_acceptable_peer_address(address: std::net::SocketAddr, network: Network) -> bool {
-    address.port() != 0 && acceptable_ip(address.ip(), network)
+    is_acceptable_peer_address_with_cjdns(address, network, false)
+}
+
+/// Returns whether a resolved socket is eligible for outbound use on `network`,
+/// admitting `fc00::/8` CJDNS overlay addresses when `cjdns_reachable`.
+pub fn is_acceptable_peer_address_with_cjdns(
+    address: std::net::SocketAddr,
+    network: Network,
+    cjdns_reachable: bool,
+) -> bool {
+    address.port() != 0 && acceptable_ip(address.ip(), network, cjdns_reachable)
 }
 
 #[cfg(test)]
@@ -1796,8 +2000,15 @@ mod tests {
         }
     }
 
+    fn plain_keys(hash_key: [u8; BUCKET_KEY_LEN]) -> BucketKeys {
+        BucketKeys {
+            hash_key,
+            asmap: None,
+        }
+    }
+
     fn tried_collision_pairs(
-        key: &[u8; BUCKET_KEY_LEN],
+        keys: &BucketKeys,
         count: usize,
     ) -> Vec<(std::net::SocketAddr, std::net::SocketAddr)> {
         let mut incumbents = HashMap::new();
@@ -1806,7 +2017,7 @@ mod tests {
         for third in 0_u8..=u8::MAX {
             for fourth in 1_u8..=u8::MAX {
                 let address = format!("1.1.{third}.{fourth}:8333").parse().unwrap();
-                let position = tried_position(key, address);
+                let position = tried_position(keys, address);
                 if used_positions.contains(&position) {
                     continue;
                 }
@@ -1882,16 +2093,16 @@ mod tests {
         drop(database);
 
         let store = RedbPeerStore::open(&path, Network::Signet).unwrap();
-        let key = store.bucket_key;
+        let key = store.buckets.hash_key;
         let address = "1.2.3.4:38333".parse().unwrap();
-        let new = new_bucket(&key, address, "v4:8:8");
-        let tried = tried_bucket(&key, address);
+        let new = new_bucket(&store.buckets, address, "v4:8:8");
+        let tried = tried_bucket(&store.buckets, address);
         drop(store);
 
         let reopened = RedbPeerStore::open(&path, Network::Signet).unwrap();
-        assert_eq!(reopened.bucket_key, key);
-        assert_eq!(new_bucket(&reopened.bucket_key, address, "v4:8:8"), new);
-        assert_eq!(tried_bucket(&reopened.bucket_key, address), tried);
+        assert_eq!(reopened.buckets.hash_key, key);
+        assert_eq!(new_bucket(&reopened.buckets, address, "v4:8:8"), new);
+        assert_eq!(tried_bucket(&reopened.buckets, address), tried);
         let transaction = reopened.db.begin_write().unwrap();
         {
             let mut meta = transaction.open_table(META).unwrap();
@@ -2006,10 +2217,30 @@ mod tests {
             "2001:20::1".parse().unwrap(),
             "::ffff:10.0.0.1".parse().unwrap(),
         ] {
-            assert!(!acceptable_ip(IpAddr::V6(address), Network::Bitcoin));
+            assert!(!acceptable_ip(IpAddr::V6(address), Network::Bitcoin, false));
         }
         assert!(acceptable_ip(
             IpAddr::V6("::ffff:1.1.1.1".parse().unwrap()),
+            Network::Bitcoin,
+            false
+        ));
+    }
+
+    #[test]
+    fn cjdns_acceptability_is_a_policy_decision_and_fd00_never_qualifies() {
+        let cjdns: IpAddr = "fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa".parse().unwrap();
+        let unique_local: IpAddr = "fd00::1".parse().unwrap();
+        assert!(!acceptable_ip(cjdns, Network::Bitcoin, false));
+        assert!(acceptable_ip(cjdns, Network::Bitcoin, true));
+        assert!(!acceptable_ip(unique_local, Network::Bitcoin, false));
+        assert!(
+            !acceptable_ip(unique_local, Network::Bitcoin, true),
+            "fd00::/8 is not CJDNS and stays unroutable under every policy"
+        );
+        assert!(!is_acceptable_peer_address(
+            "[fc32:17ea:e415:c3bf:9808:149d:b5a2:c9aa]:8333"
+                .parse()
+                .unwrap(),
             Network::Bitcoin
         ));
     }
@@ -2518,7 +2749,7 @@ mod tests {
             ("3.3.3.3:8333".to_owned(), record(120, 100, 1)),
         ]);
 
-        let retained = retain_bucketed(records, 2, &[7; BUCKET_KEY_LEN])
+        let retained = retain_bucketed(records, 2, &plain_keys([7; BUCKET_KEY_LEN]))
             .into_iter()
             .map(|(address, _)| address)
             .collect::<Vec<_>>();
@@ -2532,7 +2763,7 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let (incumbent, challenger) = tried_collision_pairs(&store.bucket_key, 1)[0];
+        let (incumbent, challenger) = tried_collision_pairs(&store.buckets, 1)[0];
         assert!(store.insert_verified(incumbent, services, now).unwrap());
         assert!(
             store
@@ -2580,8 +2811,8 @@ mod tests {
             .filter(|(address, record)| {
                 record_is_tried(record)
                     && std::net::SocketAddr::from_str(address).is_ok_and(|address| {
-                        tried_position(&reopened.bucket_key, address)
-                            == tried_position(&reopened.bucket_key, challenger)
+                        tried_position(&reopened.buckets, address)
+                            == tried_position(&reopened.buckets, challenger)
                     })
             })
             .count();
@@ -2595,7 +2826,7 @@ mod tests {
         let now = 1_800_000_000;
         let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
         let store = RedbPeerStore::open(&path, Network::Regtest).unwrap();
-        let pairs = tried_collision_pairs(&store.bucket_key, MAX_TRIED_COLLISIONS + 1);
+        let pairs = tried_collision_pairs(&store.buckets, MAX_TRIED_COLLISIONS + 1);
         for (incumbent, _) in &pairs {
             store.insert_verified(*incumbent, services, now).unwrap();
         }
@@ -2631,7 +2862,7 @@ mod tests {
 
     #[test]
     fn keyed_new_capacity_and_exact_tried_slots_are_independent() {
-        let key = [11; BUCKET_KEY_LEN];
+        let keys = plain_keys([11; BUCKET_KEY_LEN]);
         let services = (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64();
         let make_record = |last_success| StoredPeer {
             services,
@@ -2648,17 +2879,17 @@ mod tests {
             new_source_groups: Vec::new(),
         };
 
-        let (incumbent, challenger) = tried_collision_pairs(&key, 1)[0];
+        let (incumbent, challenger) = tried_collision_pairs(&keys, 1)[0];
         assert_eq!(
-            tried_position(&key, incumbent),
-            tried_position(&key, challenger)
+            tried_position(&keys, incumbent),
+            tried_position(&keys, challenger)
         );
         let tried_records = [incumbent, challenger]
             .into_iter()
             .map(|address| (address.to_string(), make_record(1_799_999_999)))
             .collect();
         assert_eq!(
-            retain_bucketed(tried_records, MAX_STORED_PEERS, &key).len(),
+            retain_bucketed(tried_records, MAX_STORED_PEERS, &keys).len(),
             1
         );
 
@@ -2666,7 +2897,7 @@ mod tests {
         for third in 0_u8..=u8::MAX {
             for fourth in 1_u8..=u8::MAX {
                 let address = format!("2.2.{third}.{fourth}:8333").parse().unwrap();
-                let bucket = new_bucket(&key, address, "v4:8:8");
+                let bucket = new_bucket(&keys, address, "v4:8:8");
                 let addresses = new_by_bucket.entry(bucket).or_default();
                 addresses.push(address);
                 if addresses.len() > BUCKET_CAPACITY {
@@ -2689,14 +2920,14 @@ mod tests {
             .map(|address| (address.to_string(), make_record(0)))
             .collect();
         assert_eq!(
-            retain_bucketed(new_records, MAX_STORED_PEERS, &key).len(),
+            retain_bucketed(new_records, MAX_STORED_PEERS, &keys).len(),
             BUCKET_CAPACITY
         );
     }
 
     #[test]
     fn new_table_references_are_stochastic_bounded_and_backward_compatible() {
-        let key = [12; BUCKET_KEY_LEN];
+        let keys = plain_keys([12; BUCKET_KEY_LEN]);
         let address = "2.2.2.2:8333".parse().unwrap();
         let mut record = StoredPeer {
             services: (ServiceFlags::NETWORK | ServiceFlags::WITNESS).to_u64(),
@@ -2712,10 +2943,10 @@ mod tests {
             in_new_table: false,
             new_source_groups: Vec::new(),
         };
-        let mut buckets = HashSet::from([new_bucket(&key, address, &record.source_group)]);
+        let mut buckets = HashSet::from([new_bucket(&keys, address, &record.source_group)]);
         for first in 9_u8..=u8::MAX {
             let group = format!("v4:{first}:1");
-            let bucket = new_bucket(&key, address, &group);
+            let bucket = new_bucket(&keys, address, &group);
             if buckets.insert(bucket) {
                 record.new_source_groups.push(group);
                 if record.new_source_groups.len() == 2 {
@@ -2723,7 +2954,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(new_buckets(&key, address, &record).len(), 3);
+        assert_eq!(new_buckets(&keys, address, &record).len(), 3);
         assert!(accept_new_reference_roll(1, 0));
         assert!(!accept_new_reference_roll(1, 1));
         assert!(accept_new_reference_roll(3, 8));
@@ -2748,6 +2979,287 @@ mod tests {
             br#"{"services":9,"last_seen":1800000000,"source_group":"v4:8:8"}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn asn_groups_unite_address_families_and_fall_back_outside_the_map() {
+        let map = Asmap::from_bytes(crate::asmap::test_encoder::encode(&[
+            crate::asmap::test_encoder::v4_prefix16(8, 8, 15169),
+            crate::asmap::test_encoder::v6_prefix32(0x2001, 0x4860, 15169),
+        ]))
+        .unwrap();
+        let keys = BucketKeys {
+            hash_key: [1; BUCKET_KEY_LEN],
+            asmap: Some(Arc::new(map)),
+        };
+        assert_eq!(keys.address_group("8.8.8.8".parse().unwrap()), "as:15169:0");
+        assert_eq!(
+            keys.address_group("2001:4860:4860::8888".parse().unwrap()),
+            "as:15169:0",
+            "one operator's v4 and v6 space is one diversity group"
+        );
+        assert_eq!(
+            keys.address_group("9.9.9.9".parse().unwrap()),
+            "v4:9:9",
+            "an address outside the map keeps its prefix group"
+        );
+        assert!(valid_source_group("as:15169:0"));
+        assert!(
+            !valid_source_group("as:0:0"),
+            "reserved AS0 is never a group"
+        );
+        assert!(!valid_source_group("as:15169:1"));
+        assert!(!valid_source_group("as:015169:0"));
+    }
+
+    #[test]
+    fn a_single_asn_flood_is_capped_by_one_group_quota() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        // One autonomous system announcing 32 distinct /16 prefixes: the
+        // shape of an eclipse attempt whose addresses look diverse to a
+        // prefix-derived grouping.
+        let entries = (0_u8..32)
+            .map(|offset| crate::asmap::test_encoder::v4_prefix16(20 + offset, 20, 64500))
+            .collect::<Vec<_>>();
+        let map =
+            Arc::new(Asmap::from_bytes(crate::asmap::test_encoder::encode(&entries)).unwrap());
+        let grouped_by_asn = RedbPeerStore::open_with_policy(
+            directory.path().join("asn.redb"),
+            Network::Signet,
+            Some(map),
+            false,
+        )
+        .unwrap();
+        let grouped_by_prefix =
+            RedbPeerStore::open(directory.path().join("prefix.redb"), Network::Signet).unwrap();
+
+        let mut accepted_by_asn = 0;
+        let mut accepted_by_prefix = 0;
+        for prefix in 0_u8..32 {
+            let source = format!("{}.20.1.1:8333", 20 + prefix).parse().unwrap();
+            let addresses = (0_u8..8)
+                .map(|host| {
+                    learned(
+                        &format!("{}.20.2.{}:8333", 20 + prefix, host + 1),
+                        services,
+                        now,
+                    )
+                })
+                .collect::<Vec<_>>();
+            accepted_by_asn += grouped_by_asn
+                .insert_discovered(source, &addresses, now)
+                .unwrap()
+                .accepted;
+            accepted_by_prefix += grouped_by_prefix
+                .insert_discovered(source, &addresses, now)
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted_by_prefix, 256,
+            "prefix grouping grants every /16 its own quota"
+        );
+        assert_eq!(
+            accepted_by_asn, MAX_PEERS_PER_SOURCE_GROUP,
+            "ASN grouping caps the whole autonomous system at one group quota"
+        );
+        let records = grouped_by_asn.load_records().unwrap();
+        assert!(
+            records
+                .values()
+                .all(|record| record.source_group == "as:64500:0"),
+            "every flood record was learned under the attacker's one ASN group"
+        );
+    }
+
+    #[test]
+    fn the_embedded_map_groups_a_real_source_by_its_asn() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open_with_policy(
+            directory.path().join("peers.redb"),
+            Network::Signet,
+            Some(Asmap::embedded().unwrap()),
+            false,
+        )
+        .unwrap();
+        store
+            .insert_discovered(
+                "8.8.4.4:8333".parse().unwrap(),
+                &[learned("1.0.0.1:8333", services, now)],
+                now,
+            )
+            .unwrap();
+        let records = store.load_records().unwrap();
+        assert_eq!(
+            records["1.0.0.1:8333"].source_group, "as:15169:0",
+            "a real-world source address is grouped by its announcing ASN"
+        );
+    }
+
+    #[test]
+    fn cjdns_records_are_policy_gated_and_share_one_marker_group() {
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let source: std::net::SocketAddr = "8.8.4.4:8333".parse().unwrap();
+        let overlay = |tail: u8| {
+            learned(
+                &format!("[fc32:17ea:e415:c3bf::{tail:x}]:8333"),
+                services,
+                now,
+            )
+        };
+
+        // Default policy: the overlay is unreachable and nothing enters.
+        let closed =
+            RedbPeerStore::open(directory.path().join("closed.redb"), Network::Signet).unwrap();
+        let stats = closed
+            .insert_discovered(source, &[overlay(1), overlay(2)], now)
+            .unwrap();
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.rejected, 2);
+        assert!(
+            !closed
+                .insert_verified(
+                    "[fc32:17ea:e415:c3bf::1]:8333".parse().unwrap(),
+                    services,
+                    now
+                )
+                .unwrap(),
+            "a verified handshake does not override the reachability policy"
+        );
+        assert!(closed.candidates(now, 16).unwrap().is_empty());
+
+        // Reachable policy: accepted, and the whole overlay is one group.
+        let open = RedbPeerStore::open_with_policy(
+            directory.path().join("open.redb"),
+            Network::Signet,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            open.buckets
+                .address_group("fc32:17ea:e415:c3bf::1".parse().unwrap()),
+            CJDNS_SOURCE_GROUP
+        );
+        let stats = open
+            .insert_discovered(source, &[overlay(1), overlay(2)], now)
+            .unwrap();
+        assert_eq!(stats.accepted, 2);
+        let stats = open
+            .insert_discovered(
+                "[fc32:17ea:e415:c3bf::9]:8333".parse().unwrap(),
+                &[learned("2.2.2.2:8333", services, now)],
+                now,
+            )
+            .unwrap();
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(
+            open.load_records().unwrap()["2.2.2.2:8333"].source_group,
+            CJDNS_SOURCE_GROUP,
+            "an overlay source teaches under the shared marker group"
+        );
+        assert!(
+            open.candidates(now, 16)
+                .unwrap()
+                .iter()
+                .any(|address| crate::p2p::is_cjdns_address(address.ip())),
+            "stored overlay peers become dial candidates under the policy"
+        );
+        assert!(valid_source_group(CJDNS_SOURCE_GROUP));
+    }
+
+    #[test]
+    fn an_overlay_flood_from_many_fabricated_sources_shares_one_quota() {
+        // Overlay addresses are key-derived and free to fabricate, so a
+        // flood arrives from many "distinct" sources. Every one of them
+        // shares the single overlay marker group, so the whole flood gets
+        // one group's quota.
+        let directory = TempDir::new().unwrap();
+        let now: u32 = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let store = RedbPeerStore::open_with_policy(
+            directory.path().join("peers.redb"),
+            Network::Signet,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut accepted = 0;
+        for source in 0_u8..8 {
+            let addresses = (0_u8..16)
+                .map(|host| {
+                    learned(
+                        &format!("[fc32:17ea:e415:{source:x}::{:x}]:8333", host + 1),
+                        services,
+                        now,
+                    )
+                })
+                .collect::<Vec<_>>();
+            accepted += store
+                .insert_discovered(
+                    format!("[fc32:17ea:ffff::{:x}]:8333", source + 1)
+                        .parse()
+                        .unwrap(),
+                    &addresses,
+                    now,
+                )
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted, MAX_PEERS_PER_SOURCE_GROUP,
+            "128 fabricated overlay candidates collapse into one group quota"
+        );
+    }
+
+    #[test]
+    fn a_name_proxy_bootstrap_learns_under_one_shared_source_group() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = 1_800_000_000;
+        let services = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+
+        let first = learned("127.0.0.1:18444", services, now);
+        let stats = store
+            .insert_discovered_from_seed_name(std::slice::from_ref(&first), now)
+            .unwrap();
+        assert_eq!(stats.accepted, 1);
+        let record = store.load_records().unwrap()[&first.socket.to_string()].clone();
+        assert_eq!(
+            record.source_group, SEED_NAME_SOURCE_GROUP,
+            "the peer had no address this node saw, so the group is the marker, not a guess"
+        );
+        assert!(
+            valid_source_group(&record.source_group),
+            "the marker must survive the record validator on reload"
+        );
+
+        // Contacting more authorities must not widen the quota. Every batch
+        // lands in the same group, so this path can claim one group's share of
+        // the new table however many authorities the wave reached.
+        let mut accepted = stats.accepted;
+        for index in 0..MAX_PEERS_PER_SOURCE_GROUP + 20 {
+            let address = learned(
+                &format!("127.{}.{}.2:18444", index / 256, index % 256),
+                services,
+                now,
+            );
+            accepted += store
+                .insert_discovered_from_seed_name(std::slice::from_ref(&address), now)
+                .unwrap()
+                .accepted;
+        }
+        assert_eq!(
+            accepted, MAX_PEERS_PER_SOURCE_GROUP,
+            "one marker group carries one group's quota"
+        );
     }
 
     #[test]

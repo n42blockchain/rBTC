@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-08-08.
+Status date: 2026-08-13.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -261,9 +261,9 @@ optional where appropriate, and host-runtime compatible.
   one-parent/one-child package fee bumping, ephemeral dust, bounded orphan work,
   rolling minimum fee, persistence/reorg recovery, full-RBF default, and
   estimator bounds are implemented with atomic adversarial tests. Replacement
-  remains a documented conservative subset: exact Core feerate-diagram and
-  sibling-eviction ordering are P2 policy-fidelity work, not a consensus or
-  network-interoperability requirement.
+  adopted Core 31's feerate-diagram rule on 2026-08-14 and passed a live
+  replacement differential; TRUC sibling eviction followed on 2026-08-15,
+  so exact replacement ordering is no longer open P2 work.
 - [x] **Operator configuration and diagnostics.** The library/CLI now share
   strict typed peer, DNS, cache, freezer, mempool, API, consensus, and
   AssumeUTXO bounds, with subsystem status/events available to an embedded
@@ -342,28 +342,121 @@ optional where appropriate, and host-runtime compatible.
   Real daemon coverage includes `core_block_differential` (including
   `v2_transport_interoperates_with_core` and `v2_preference_falls_back_to_v1_against_a_v1_only_core`)
   against Bitcoin Core 31.0 and btcd 0.26.
-- [ ] Mining interfaces (`getblocktemplate`/`submitblock` or a versioned local
-  IPC boundary) only if rBTC is deployed for mining.
+- [x] Mining interfaces scoped to test self-sufficiency and interface parity,
+  not production mining. `rbtc.submitblock` stages a locally produced header
+  in the execution loop and answers with the real connection verdict;
+  `getblocktemplate` serves the BIP22/23 fields this node can state
+  truthfully, with package-aware selection bounded by the block weight and
+  sigop limits and a derived block version. Any chainstate not independently
+  validated from genesis is refused outright. `longpollid`, proposal mode, and
+  a live rather than snapshot header view remain open and are recorded, with
+  the ownership boundaries the work crossed, in
+  [GBT_BOUNDARIES.md](GBT_BOUNDARIES.md).
 - [x] ZMQ-compatible or native bounded event publication for indexers; the
   existing REST/event path remains sufficient for the base node.
   The `zmq_publisher::tests` suite now validates subscription-topic filtering,
   notification labeling, and bounded slow-subscriber drop policy.
 - [ ] Encrypted daemon-held keys and in-process signing only as a separately
   threat-modeled wallet product. The default node continues to prefer watch-only
-  descriptors and external signers.
+  descriptors and external signers. The assets, adversaries, trust boundaries,
+  non-negotiable invariants, candidate architecture, required product choices,
+  and implementation gates are defined in
+  [HOT_WALLET_THREAT_MODEL.md](HOT_WALLET_THREAT_MODEL.md); no private-key work
+  is authorized until those choices receive an explicit go decision.
 - [ ] Alternative atomic chainstate backends only after they include UTXO,
   execution metadata, undo, snapshot markers, and the complete crash matrix in
   one durability boundary. MDBX benchmark availability alone is insufficient.
 - [ ] GUI, legacy wallet import, exact Core RPC field parity, and specialized
   index/mining APIs only in response to a concrete deployment requirement.
-- [ ] Native onion/I2P address persistence and name-proxy discovery.
+- [x] Native onion/I2P address persistence. The inbound onion service stores
+  its ED25519 key owner-only and republishes it on every start, and a SAM
+  session replays a stored destination key, so both addresses survive a
+  restart.
+- [x] Name-proxy discovery. An explicit `--name-proxy` sends seed authorities
+  to a SOCKS5 endpoint as domain `CONNECT` requests only after explicit and
+  persisted candidates are exhausted, without falling back to the local
+  resolver. Learned peer addresses remain subject to the existing filters and
+  share one conservative source-group quota. Deterministic coverage, a real
+  Testnet4 handshake through a resolving endpoint, and a run through an
+  independently running Tor SOCKS endpoint are recorded in
+  [NAME_PROXY_DISCOVERY.md](NAME_PROXY_DISCOVERY.md). A privileged host capture
+  also observed unrelated DNS traffic while observing no traditional port 53
+  query for either pinned Testnet4 seed during the external-Tor run.
 - [x] Administrative peer mutation and a general bounded cursor chainstate
   scan. Authenticated `listbanned`/`setban` administer durable local peer
   cooldowns through the existing peer store, and `rbtc.scanchainstate` walks
   the active UTXO set in bounded cursor pages over the chainstate's
   fixed-memory pager. An offline scan without a running node remains open.
-- [ ] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering;
-  the supported conservative replacement subset remains interoperable.
+- [x] ASN-based address diversity (asmap). `src/asmap.rs` ports Core's asmap
+  interpreter, the IPv4-in-IPv6 lookup form, and the complete structural
+  sanity check; the 2026-08-06 `bitcoin-core/asmap-data` map is embedded in
+  the binary and validated fail-closed at first use, and
+  `--asmap <path>|embedded|off` (config key `asmap`) selects an operator file
+  or disables the derivation. The peer store derives `as:<asn>:0` groups
+  shared across IPv4 and IPv6 for source quotas, new/tried bucketing, and
+  candidate diversification, falls back to prefix groups outside the map,
+  and leaves the onion/I2P/name-proxy marker groups untouched. Pinned
+  real-address assignments verify the embedded data, a 32-prefix single-ASN
+  flood is capped at one group quota where prefix grouping accepted all 256
+  candidates, and the `asmap_interpret` fuzz target holds the interpreter's
+  no-panic/bounded-termination guarantee on unvalidated bytes. Provenance
+  and the update procedure are recorded in [ASMAP.md](ASMAP.md).
+- [ ] CJDNS reachability alongside onion/I2P, converging with the existing
+  per-network isolation. Implemented 2026-08-13: `fc00::/8` classification
+  with `fd00::/8` permanently unroutable, BIP155 CJDNS-ID-only encoding
+  (nothing on legacy `addr`), an explicit `--cjdns-reachable` policy gating
+  storage/dialing/advertising fail-closed, `--onlynet cjdns` isolation, the
+  shared `cjdns:0:0` marker group giving the whole overlay one quota, and
+  refusals for every unsound combination (`--proxy`, onlynet-without-
+  interface, overlay `--connect` without the declaration); semantics and
+  tests are recorded in [CJDNS.md](CJDNS.md). Open acceptance residue: one
+  live handshake with a real overlay peer through an independently running
+  `cjdroute`, recorded like the name-proxy external-Tor run.
+- [ ] Private transaction broadcast: a per-transaction
+  anonymity-network-exclusive broadcast path reusing the existing
+  proxy/`onlynet`/name-proxy isolation. Implemented 2026-08-13:
+  `--private-broadcast` replaces the wallet broadcast path with short-lived
+  onion (proxied) and I2P (fresh keyless SAM session) waves to up to four
+  peers, records success in the durable rebroadcast store, and on zero
+  reachable peers keeps the transaction queued rather than ever writing it
+  to a clearnet session or the hot-standby fan-out; it is refused at startup
+  without an anonymity path. The clearnet leak gate and the in-process
+  proxied-delivery path pass in-suite; semantics are in
+  [PRIVATE_BROADCAST.md](PRIVATE_BROADCAST.md). Open acceptance residue: one
+  end-to-end run over live Tor/I2P daemons recording no clearnet relay.
+- [x] Operator RPC remainder. Implemented 2026-08-13, all authenticated and
+  in the bounded-stable-contract style: `addnode <ip:port> add|onetry|remove`
+  seeds or forgets a routable dial candidate through the peer store (subject
+  to the same acceptability and source-group quotas, never a claimed
+  handshake); `gettxoutsetinfo [cursor,max]` aggregates the UTXO set in
+  bounded resumable windows over the fixed-memory pager, reporting each
+  window's txout count, amount, and bogosize with a continuation cursor and
+  a `complete` flag — never an unbounded pass; `getmempoolcluster <txid>`
+  exposes the existing dependency-connected cluster closure with its count,
+  vbytes, and the enforced 64-tx/101-kvB bounds, and reports a clear miss
+  for a transaction not in the pool. `getmempoolfeeratediagram` remains with
+  the feerate-diagram item below because it depends on linearization.
+- [x] Exact Core 31 replacement feerate-diagram and sibling-eviction ordering.
+  The pure layer shipped 2026-08-13 in `src/feerate_diagram.rs` with property
+  tests and a fuzz target (which caught a real constructor-boundary overflow
+  on its first 50,000-run smoke). The admission integration landed
+  2026-08-14: replacement now requires the affected clusters' diagram to be
+  strictly better, with signaling, absolute-fee, incremental-fee, and
+  eviction-bound rules retained and the per-direct-conflict feerate
+  heuristic retired; `getmempoolfeeratediagram` serves the compared chunks.
+  A live differential against Bitcoin Core v31.0.0 agreed on all fourteen
+  verdicts across six scenarios, including the case the retired heuristic
+  decided wrongly; evidence in [CORE31_COMPATIBILITY.md](CORE31_COMPATIBILITY.md)
+  and [FEERATE_DIAGRAM.md](FEERATE_DIAGRAM.md). Both former remainders
+  closed 2026-08-15: TRUC sibling eviction runs a second v3 child through
+  the full replacement rules (v3 implicitly replaceable, single
+  transactions only, with a previously missing parent-descendant topology
+  check), and a rolling-minimum pressure harness confirmed the rich-parent
+  package-feerate exclusion draws Core's line — an above-minimum parent
+  does not subsidise a below-minimum child, while a rich child lifts a
+  poor parent — per transaction on both implementations. The one watch
+  item is optimal linearization, reopened only if a differential corpus
+  ever splits the greedy baseline from Core's search.
 
 ## Performance work policy
 
@@ -392,4 +485,12 @@ correctness or security work.
 1. Finish the sustained Bitcoin/Testnet4 public-network soak.
 2. Exercise and publish the signed supported-platform release once the native
    signing identities are provisioned.
-3. Select P2 work only from an actual deployment need.
+3. Capability rounds, one completed and verified item per round: asmap,
+   CJDNS, private broadcast, and the operator RPC remainder all shipped
+   2026-08-13 (CJDNS and private broadcast each with one live-daemon
+   operational residue). The remaining capability work is the feerate-diagram
+   track, whose pure-function and fuzz layer leads; its admission-path change
+   and the `getmempoolfeeratediagram` RPC land only after that layer is
+   proven, per the rationale in [GAP_ANALYSIS.md](GAP_ANALYSIS.md).
+4. Select the remaining P2 work (GBT remainder, hot wallet, GUI, MDBX
+   promotion) only from an actual deployment need.

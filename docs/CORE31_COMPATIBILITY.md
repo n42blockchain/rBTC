@@ -53,7 +53,7 @@ Primary references:
 | Testnet4/BIP94 | Core 28 introduced Testnet4 behavior; Core 29 removed BIP94 from regtest. | Implemented for Testnet4 only, including retarget base and timewarp boundary; regtest retains its independent rules. |
 | AssumeUTXO | Chainparams identities, minimum work, assume-valid data, and snapshot tooling evolved. | Core 31 identities are pinned; v2 parsing, exact `hash_serialized`, maximum-work membership, base-to-live execution, and independent genesis replay are implemented. |
 | P2P transport | BIP324 became Core's default in 27. | Bounded v1 remains interoperable and secure; BIP324 is P2 because it does not alter validation trust. |
-| Mempool policy | TRUC, full-RBF defaults, ephemeral dust, 1p1c package relay, orphan accounting, 0.1 sat/vB defaults, multiple data carriers, and the 2,500 legacy-sigop standard limit changed across 27–31. | Implemented as a separate policy layer with Core 31 cluster/TRUC/standardness bounds and atomic adversarial coverage. Replacement is intentionally a conservative subset; exact feerate-diagram and sibling ordering is P2 and is not labeled exact parity. |
+| Mempool policy | TRUC, full-RBF defaults, ephemeral dust, 1p1c package relay, orphan accounting, 0.1 sat/vB defaults, multiple data carriers, and the 2,500 legacy-sigop standard limit changed across 27–31. | Implemented as a separate policy layer with Core 31 cluster/TRUC/standardness bounds and atomic adversarial coverage. Replacement adopted Core 31's feerate-diagram rule on 2026-08-14; the live differential below also closed TRUC sibling eviction and rich-parent package feerate under pressure on 2026-08-15. |
 | Storage/indexes | Pruning cadence, dbcache defaults, coinstats index format, and tx-output-spender index changed. | rBTC's freezer/cache retain independent bounded invariants; configurable pruning, both full reindex paths, and optional tx/spent-output/BIP158 indexes are complete. |
 | RPC/wallet/mining | JSON-RPC, wallet, descriptor, fee, mining IPC, and response fields changed. | rBTC's documented bounded authenticated API and watch-only external-signer wallet are supported; exact Core RPC, hot-wallet, and mining parity is not a validating-node requirement. |
 
@@ -91,4 +91,73 @@ Run the maintained gate with:
 ```sh
 RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind \
   cargo test --release --test core_block_differential -- --ignored --nocapture
+```
+
+## Core 31 replacement differential (2026-08-14)
+
+After rBTC's admission pool adopted the feerate-diagram replacement rule
+(`compare_diagrams` over the affected clusters, with the BIP125 signaling,
+absolute-fee, incremental-fee, and eviction-bound rules retained), a live
+differential against the official Bitcoin Core v31.0.0 win64 binary agreed on
+all fourteen verdicts across six scenarios:
+
+- same-shape fee bump — accepted by both;
+- larger, lower-feerate replacement (incomparable diagram) — rejected by
+  both, each specifically on the feerate question;
+- rich-descendant eviction, where the replacement out-rates its direct
+  conflict and out-pays the evicted pair in absolute fee — rejected by both.
+  The retired per-direct-conflict heuristic would have accepted this, so the
+  scenario pins the divergence the rule change closed;
+- whole-cluster bump — accepted by both, and the evicted child left both
+  mempools;
+- equal-total-fee replacement — rejected by both (absolute-fee rule);
+- sub-incremental bump — rejected by both (incremental-fee rule).
+
+The same gate was rerun on macOS 26.5.1 arm64 on 2026-08-14 against the
+official `bitcoin-31.0-arm64-apple-darwin.tar.gz` artifact. Its SHA-256 was
+verified as `a2d7a13b4da53d4a3e4c517f3a0269e2429813417bb320d3b268993cfdc545d0`,
+`bitcoind` reported v31.0.0, and macOS strict code-signature verification
+passed. Result: `1 passed; 0 failed` in `12.76s`, with all fourteen verdicts
+matching. The replacement gate therefore has native Windows and macOS
+evidence, not only two runs against one host platform.
+
+The greedy ancestor-set linearization produced no accept/reject divergence
+from Core's linearizer on this corpus.
+
+Both residues recorded here closed on 2026-08-15:
+
+- **TRUC sibling eviction** (scenario S7): a second v3 child of a
+  one-child v3 parent displaces its sibling through the full replacement
+  rules or is refused; all four verdicts (parent, first child, worse
+  second child, better second child) agreed with live Core 31, and the
+  evicted sibling left both mempools.
+- **Rich-parent package feerate under pressure**
+  (`core_31_and_rbtc_agree_on_package_feerate_under_pressure`): both
+  mempools were pressured with one ascending-feerate filler stream
+  (Core under `-maxmempool=5`, rBTC under an equivalent byte ceiling)
+  until both rolling minimums rose; scenario fees derive from the
+  measured minimums so the verdicts do not depend on the two
+  implementations raising identical values. An above-minimum parent did
+  not subsidise a below-minimum child on either side — rBTC's
+  deliberately atomic package refusal plus individual resubmission pins
+  the same per-transaction outcome as Core's per-transaction package
+  evaluation — and a rich child lifted a below-minimum parent on both.
+  This confirms the rich-parent exclusion draws the same line Core draws.
+
+The complete extended gate was rerun on macOS 26.5.1 arm64 on 2026-08-15
+against the same verified official Core 31.0 Darwin binary. Both test functions
+passed (`2 passed; 0 failed` in `38.98s`): the original six replacement
+scenarios, S7's four TRUC sibling verdicts and eviction residue, and both
+per-transaction pressure outcomes all agreed. This extends the existing
+Windows/macOS evidence to the two formerly recorded residues rather than
+leaving their closure supported by only one platform.
+
+The broader Core gate was rerun at the same revision and passed `9/9` in
+`18.10s`, covering activation boundaries, end-to-end valid/invalid block
+results, BIP324 interoperability, and v1 fallback.
+
+Run the maintained gate with:
+
+```sh
+RBTC_BITCOIND=/path/to/bitcoin-core-31/bin/bitcoind   cargo test --release --test core_replacement_differential -- --ignored --nocapture
 ```

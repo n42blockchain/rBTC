@@ -12,15 +12,17 @@ use thiserror::Error;
 
 use crate::{
     blockchain::{
-        AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck,
+        AppliedBlock, BlockError, DeferredScriptBatch, DeferredScriptCheck, PreparedBlock,
         ValidatedBlockTransactionIds, apply_block_with_deployments,
         apply_prevalidated_block_with_deferred_scripts,
         apply_prevalidated_block_with_deferred_scripts_and_txids,
         apply_prevalidated_block_with_deployments, disconnect_block,
+        prepare_prevalidated_block_with_deferred_scripts,
         validate_block_structure_with_deployments, verify_deferred_scripts,
     },
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
-    chainstate::is_unspendable,
+    chainstate::{PreparedTransaction, is_unspendable},
+    consensus::ConsensusError,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
     headers::HeaderDag,
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
@@ -57,6 +59,14 @@ pub struct BlockDeploymentContext {
 #[derive(Debug)]
 pub struct ActiveBlockUtxoPrefetch {
     entries: Vec<(OutPointKey, Option<Utxo>)>,
+}
+
+impl ActiveBlockUtxoPrefetch {
+    /// The prefetched coins, for a store that must overlay what changed
+    /// since they were read.
+    pub fn entries_mut(&mut self) -> &mut [(OutPointKey, Option<Utxo>)] {
+        &mut self.entries
+    }
 }
 
 /// Failures while connecting one downloaded active-chain block.
@@ -351,6 +361,8 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
         false,
         None,
         None,
+        AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -378,6 +390,8 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
         true,
         None,
         None,
+        AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -403,6 +417,8 @@ pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
         deployments,
         true,
         Some(transaction_ids),
+        None,
+        AppliedUndos::Keep,
         None,
     )
     .map(|(applied, _)| applied)
@@ -436,6 +452,33 @@ pub fn prefetch_prevalidated_active_block_utxos<C: ExecutionChainStore>(
     Ok(ActiveBlockUtxoPrefetch { entries })
 }
 
+/// [`prefetch_prevalidated_active_block_utxos`] over blocks that are not held
+/// in one slice, as a read-ahead holds them beside their transaction ids.
+///
+/// # Errors
+///
+/// Fails when a block's transaction-id list does not match it, or on a store
+/// read error.
+pub fn prefetch_active_block_utxos_from<'a, C: ExecutionChainStore>(
+    chainstate: &C,
+    blocks: impl Iterator<Item = (&'a Block, &'a ValidatedBlockTransactionIds)> + Clone,
+) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
+    let mut output_count = 0_usize;
+    for (block, transaction_ids) in blocks.clone() {
+        if transaction_ids.as_slice().len() != block.txdata.len() {
+            return Err(BlockExecutionError::TransactionIdCount);
+        }
+        output_count += block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.output.len())
+            .sum::<usize>();
+    }
+    let input_outpoints = external_input_outpoints_with_ids(blocks, output_count);
+    let entries = chainstate.get_many(&input_outpoints)?;
+    Ok(ActiveBlockUtxoPrefetch { entries })
+}
+
 /// Connects a prevalidated batch using UTXOs read before archive staging ended.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChainStore>(
@@ -457,6 +500,8 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
         now,
         hot_window_secs,
         deployments,
+        AppliedUndos::Keep,
+        None,
     )
     .map(|(applied, _)| applied)
 }
@@ -481,6 +526,8 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
     now: u64,
     hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
+    applied_undos: AppliedUndos,
+    script_carry: Option<&mut Vec<DeferredScriptBatch>>,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     connect_active_blocks_inner(
         chainstate,
@@ -492,6 +539,8 @@ pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>
         true,
         Some(transaction_ids),
         Some(prefetched_utxos),
+        applied_undos,
+        script_carry,
     )
 }
 
@@ -522,6 +571,72 @@ pub struct ExecutionBreakdown {
     pub script_wait: Duration,
     /// The batch's storage commit.
     pub commit: Duration,
+    /// Folding each validated block into the batch overlay and building its
+    /// transition.
+    pub apply: Duration,
+    /// Inside `validate`: input loading and consensus checks per transaction.
+    pub validate_prepare: Duration,
+    /// Inside `validate`: writing each transaction into the block overlay.
+    pub validate_utxo: Duration,
+    /// Inside `validate`: folding the block overlay into its net change.
+    pub validate_net: Duration,
+    /// Inside `validate`: header, tip and BIP30 checks before the loop.
+    pub validate_checks: Duration,
+    /// Inside `apply`: deriving the block's net change from its prepared
+    /// transactions.
+    pub apply_net: Duration,
+    /// Inside `apply`: folding the net change into the batch overlay.
+    pub apply_fold: Duration,
+}
+
+/// Whether the executor must leave each block's undo records in its
+/// [`AppliedBlock`] as well as in the store transition.
+///
+/// Explorer and auxiliary indexes read them from the applied block; a bare
+/// catch-up does not, and cloning ~7,000 spent coins per block for nobody is
+/// a measurable share of `core-apply`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppliedUndos {
+    /// Keep a copy on the applied block (clone into the transition).
+    Keep,
+    /// Move the records into the transition; the applied block keeps none.
+    Drop,
+}
+
+/// Inputs of a batch that spend coins created before it, given each block's
+/// precomputed transaction ids.
+fn external_input_outpoints_with_ids<'a>(
+    blocks: impl Iterator<Item = (&'a Block, &'a ValidatedBlockTransactionIds)>,
+    output_count: usize,
+) -> Vec<OutPointKey> {
+    let mut input_outpoints = Vec::new();
+    let mut created_in_batch = AHashSet::with_capacity(output_count);
+    for (block, transaction_ids) in blocks {
+        for (index, (transaction, txid)) in block
+            .txdata
+            .iter()
+            .zip(transaction_ids.as_slice())
+            .enumerate()
+        {
+            if index != 0 {
+                input_outpoints.extend(
+                    transaction
+                        .input
+                        .iter()
+                        .map(|input| OutPointKey::from(input.previous_output))
+                        .filter(|outpoint| !created_in_batch.contains(outpoint)),
+                );
+            }
+            for (vout, output) in transaction.output.iter().enumerate() {
+                if is_unspendable(&output.script_pubkey) {
+                    continue;
+                }
+                let vout = u32::try_from(vout).expect("transaction output count fits u32");
+                created_in_batch.insert(OutPointKey::from(OutPoint::new(*txid, vout)));
+            }
+        }
+    }
+    input_outpoints
 }
 
 fn external_batch_input_outpoints(
@@ -531,33 +646,9 @@ fn external_batch_input_outpoints(
 ) -> Vec<OutPointKey> {
     let mut input_outpoints = Vec::new();
     if let Some(transaction_ids) = transaction_ids {
-        let mut created_in_batch = AHashSet::with_capacity(output_count);
-        for (block, transaction_ids) in blocks.iter().zip(transaction_ids) {
-            for (index, (transaction, txid)) in block
-                .txdata
-                .iter()
-                .zip(transaction_ids.as_slice())
-                .enumerate()
-            {
-                if index != 0 {
-                    input_outpoints.extend(
-                        transaction
-                            .input
-                            .iter()
-                            .map(|input| OutPointKey::from(input.previous_output))
-                            .filter(|outpoint| !created_in_batch.contains(outpoint)),
-                    );
-                }
-                for (vout, output) in transaction.output.iter().enumerate() {
-                    if is_unspendable(&output.script_pubkey) {
-                        continue;
-                    }
-                    let vout = u32::try_from(vout).expect("transaction output count fits u32");
-                    created_in_batch.insert(OutPointKey::from(OutPoint::new(*txid, vout)));
-                }
-            }
-        }
-    } else {
+        return external_input_outpoints_with_ids(blocks.iter().zip(transaction_ids), output_count);
+    }
+    {
         input_outpoints.extend(
             blocks
                 .iter()
@@ -577,13 +668,18 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     headers: &HeaderDag,
     blocks: &[Block],
     now: u64,
-    hot_window_secs: u64,
+    _hot_window_secs: u64,
     deployments: &[BlockDeploymentContext],
     structure_prevalidated: bool,
     transaction_ids: Option<&[ValidatedBlockTransactionIds]>,
     prefetched_utxos: Option<ActiveBlockUtxoPrefetch>,
+    applied_undos: AppliedUndos,
+    mut script_carry: Option<&mut Vec<DeferredScriptBatch>>,
 ) -> Result<(Vec<AppliedBlock>, ExecutionBreakdown), BlockExecutionError> {
     let mut breakdown = ExecutionBreakdown::default();
+    // Stale accumulators from an earlier failed batch on this thread must not
+    // leak into this batch's figures.
+    let _ = crate::validation_profile::take();
     if blocks.len() != deployments.len() {
         return Err(BlockExecutionError::DeploymentCount {
             blocks: blocks.len(),
@@ -628,95 +724,373 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     } else {
         cumulative.prefetch(&input_outpoints)?;
     }
-    let mut applied_blocks = Vec::with_capacity(blocks.len());
-    let mut transitions = Vec::with_capacity(blocks.len());
-    let mut deferred_scripts = Vec::new();
-    let mut script_batch = (blocks.len() > 1).then(DeferredScriptBatch::new);
-    for (block_order, (block, deployment)) in blocks.iter().zip(deployments).enumerate() {
-        let block_capacity = block
-            .txdata
-            .iter()
-            .map(|transaction| transaction.input.len() + transaction.output.len())
-            .sum();
-        let block_overlay = UtxoOverlay::with_capacity(&cumulative, block_capacity);
-        let validate_started = Instant::now();
-        let validated = validate_active_block_inner(
-            &block_overlay,
-            headers,
-            block,
-            current,
-            now,
-            hot_window_secs,
-            deployment,
-            structure_prevalidated,
-            true,
-            transaction_ids.map(|ids| ids[block_order].as_slice()),
-        );
-        breakdown.validate += validate_started.elapsed();
-        let (applied, changes, mut block_scripts) = match validated {
-            Ok(validated) => validated,
-            Err(error) => {
-                let script_failure = if let Some(batch) = script_batch.take() {
-                    batch.finish()
-                } else {
-                    verify_deferred_scripts(std::mem::take(&mut deferred_scripts))
-                };
-                if let Some((index, source)) = script_failure {
-                    return Err(BlockExecutionError::Block(BlockError::Transaction {
-                        index,
-                        source: source.into(),
-                    }));
-                }
-                return Err(error);
-            }
-        };
-        for script in &mut block_scripts {
-            script.set_block_order(block_order);
-        }
-        let next = ExecutionTip {
-            height: current
-                .height
-                .checked_add(1)
-                .ok_or(BlockExecutionError::NoNextHeader(current.height))?,
-            hash: applied.hash,
-        };
-        cumulative.apply_validated_changes(&changes);
-        transitions.push(ConnectTransition {
-            expected_parent: current.hash,
-            next,
-            spent: changes.spent,
-            created: changes.created,
-            transaction_undos: if chainstate.retains_block_undo() {
-                applied.transaction_undos.clone()
-            } else {
-                Vec::new()
-            },
+    let retains_undo = chainstate.retains_block_undo();
+    // Which block each height belongs to, checked against the active chain
+    // once for the whole batch; workers then prepare blocks independently.
+    let base = current;
+    let mut tips = Vec::with_capacity(blocks.len());
+    let mut parent_mtps = Vec::with_capacity(blocks.len());
+    let mut parent_hash = base.hash;
+    let active_base = headers.active_header_at(base.height);
+    if active_base.is_none_or(|header| header.hash != base.hash) {
+        return Err(BlockExecutionError::TipNotActive {
+            height: base.height,
+            hash: base.hash,
         });
-        applied_blocks.push(applied);
-        let submit_started = Instant::now();
-        if let Some(batch) = &mut script_batch {
-            batch.submit(block_scripts);
-        } else {
-            deferred_scripts.extend(block_scripts);
-        }
-        breakdown.submit += submit_started.elapsed();
-        current = next;
     }
-    let wait_started = Instant::now();
-    let script_failure = if let Some(batch) = script_batch {
-        batch.finish()
+    for (offset, block) in blocks.iter().enumerate() {
+        let height = base
+            .height
+            .checked_add(u32::try_from(offset).expect("batch length fits u32"))
+            .and_then(|height| height.checked_add(1))
+            .ok_or(BlockExecutionError::NoNextHeader(base.height))?;
+        let expected = headers
+            .active_header_at(height)
+            .ok_or(BlockExecutionError::NoNextHeader(height.saturating_sub(1)))?;
+        let actual = block.block_hash();
+        if actual != expected.hash {
+            return Err(BlockExecutionError::UnexpectedBlock {
+                expected: expected.hash,
+                actual,
+            });
+        }
+        let parent_mtp = headers
+            .median_time_past(parent_hash)
+            .ok_or(BlockExecutionError::MissingParentMtp(parent_hash))?;
+        tips.push(ExecutionTip {
+            height,
+            hash: actual,
+        });
+        parent_mtps.push(parent_mtp);
+        parent_hash = actual;
+    }
+    let computed_ids;
+    let transaction_ids = if let Some(ids) = transaction_ids {
+        ids
     } else {
-        verify_deferred_scripts(deferred_scripts)
+        computed_ids = blocks
+            .iter()
+            .map(|block| {
+                ValidatedBlockTransactionIds::from_computed(
+                    block
+                        .txdata
+                        .iter()
+                        .map(bitcoin::Transaction::compute_txid)
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        computed_ids.as_slice()
     };
+
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .clamp(1, PREPARE_WORKERS)
+        .min(blocks.len());
+
+    // Phase one: what every block does to the coin set, derived from its raw
+    // transactions alone — created outputs carry their final values and
+    // scripts, spends are the inputs. Built in parallel per block, merged in
+    // block order into one versioned view of the whole batch.
+    let phase_one_started = Instant::now();
+    let tx_deltas: Vec<std::sync::OnceLock<TxDelta>> = (0..blocks.len())
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let next_tx_delta = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next_tx_delta;
+            let tx_deltas = &tx_deltas;
+            let tips = &tips;
+            let parent_mtps = &parent_mtps;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(block) = blocks.get(index) else {
+                        break;
+                    };
+                    let mut created = Vec::new();
+                    let mut spent = Vec::new();
+                    for (position, transaction) in block.txdata.iter().enumerate() {
+                        let txid = transaction_ids[index].as_slice()[position];
+                        if position != 0 {
+                            spent.extend(
+                                transaction
+                                    .input
+                                    .iter()
+                                    .map(|input| OutPointKey::from(input.previous_output)),
+                            );
+                        }
+                        created.extend(
+                            crate::chainstate::created_outputs(
+                                transaction,
+                                txid,
+                                tips[index].height,
+                                now,
+                                parent_mtps[index],
+                                position == 0,
+                            )
+                            .into_iter()
+                            .map(|(outpoint, utxo)| (outpoint, Arc::new(utxo))),
+                        );
+                    }
+                    tx_deltas[index]
+                        .set((created, spent))
+                        .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
+                }
+            });
+        }
+    });
+    let mut versions: CoinVersions = AHashMap::with_capacity(output_count);
+    for (index, slot) in tx_deltas.iter().enumerate() {
+        let (created, spent) = slot.get().expect("phase one covered every block");
+        let index = u32::try_from(index).expect("batch length fits u32");
+        for (outpoint, utxo) in created {
+            versions
+                .entry(*outpoint)
+                .or_default()
+                .push((index, Some(Arc::clone(utxo))));
+        }
+        for outpoint in spent {
+            versions.entry(*outpoint).or_default().push((index, None));
+        }
+    }
+    drop(tx_deltas);
+    breakdown.apply_net += phase_one_started.elapsed();
+
+    // Phase two: prepare every block in parallel. Block i resolves a key from
+    // the latest version an earlier block of this batch left (never a later
+    // one), and otherwise from the prefetched batch overlay, so it sees
+    // exactly the state its predecessors leave without waiting for them.
+    let validate_started = Instant::now();
+    // Each preparing worker owns a script batch of its own, so serialising
+    // the transactions for the pool runs in parallel and nothing contends;
+    // every batch drains into the same verdict at the end.
+    let use_script_pool = blocks.len() > 1;
+    let script_batches: Mutex<Vec<DeferredScriptBatch>> = Mutex::new(Vec::new());
+    let serial_scripts: Mutex<Vec<DeferredScriptCheck<'_>>> = Mutex::new(Vec::new());
+    let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot>> = (0..blocks.len())
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let profile_totals = Mutex::new([Duration::ZERO; 4]);
+    let next_prepare = std::sync::atomic::AtomicUsize::new(0);
+    let submit_total = Mutex::new(Duration::ZERO);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next_prepare;
+            let prepared_slots = &prepared_slots;
+            let versions = &versions;
+            let cumulative = &cumulative;
+            let tips = &tips;
+            let profile_totals = &profile_totals;
+            let script_batches = &script_batches;
+            let serial_scripts = &serial_scripts;
+            let submit_total = &submit_total;
+            scope.spawn(move || {
+                let _ = crate::validation_profile::take();
+                let mut submit_elapsed = Duration::ZERO;
+                let mut local_batch = use_script_pool.then(DeferredScriptBatch::new);
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(block) = blocks.get(index) else {
+                        break;
+                    };
+                    let view = BatchVersionView {
+                        versions,
+                        upto: u32::try_from(index).expect("batch length fits u32"),
+                        base: cumulative,
+                    };
+                    let block_current = if index == 0 { base } else { tips[index - 1] };
+                    let prepared = prepare_active_block_inner(
+                        &view,
+                        headers,
+                        block,
+                        block_current,
+                        now,
+                        &deployments[index],
+                        structure_prevalidated,
+                        Some(transaction_ids[index].as_slice()),
+                    );
+                    // Scripts go to the pool the moment a block is prepared,
+                    // so the script workers run beside the rest of the
+                    // batch's preparation instead of after it.
+                    let prepared = prepared.map(|(prepared, delta, mut scripts)| {
+                        let submit_started = Instant::now();
+                        for script in &mut scripts {
+                            script.set_block_order(index);
+                        }
+                        if let Some(batch) = local_batch.as_mut() {
+                            batch.submit(scripts);
+                        } else {
+                            serial_scripts
+                                .lock()
+                                .expect("serial script lock not poisoned")
+                                .extend(scripts);
+                        }
+                        submit_elapsed += submit_started.elapsed();
+                        (prepared, delta)
+                    });
+                    prepared_slots[index]
+                        .set(prepared)
+                        .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
+                }
+                let profile = crate::validation_profile::take();
+                let mut totals = profile_totals.lock().expect("profile lock not poisoned");
+                for (total, sample) in totals.iter_mut().zip(profile) {
+                    *total += sample;
+                }
+                *submit_total.lock().expect("submit total lock not poisoned") += submit_elapsed;
+                if let Some(batch) = local_batch {
+                    script_batches
+                        .lock()
+                        .expect("script batch lock not poisoned")
+                        .push(batch);
+                }
+            });
+        }
+    });
+    drop(versions);
+    breakdown.validate += validate_started.elapsed();
+    {
+        let [prepare, utxo, net_change, checks] =
+            *profile_totals.lock().expect("profile lock not poisoned");
+        breakdown.validate_prepare += prepare;
+        breakdown.validate_utxo += utxo;
+        breakdown.validate_net += net_change;
+        breakdown.validate_checks += checks;
+    }
+    breakdown.submit += *submit_total.lock().expect("submit total lock not poisoned");
+    // The first failing block wins, exactly as sequential preparation would
+    // have reported it; a script failure outranks it only when it belongs to
+    // an earlier block. Nothing was written anywhere.
+    let mut prepared_blocks = Vec::with_capacity(blocks.len());
+    let mut failure = None;
+    for (index, slot) in prepared_slots.into_iter().enumerate() {
+        match slot.into_inner().expect("phase two covered every block") {
+            Ok(prepared) => prepared_blocks.push(prepared),
+            Err(error) => {
+                failure = Some((index, error));
+                break;
+            }
+        }
+    }
+    if let Some((failed_index, error)) = failure {
+        // Carried batches belong to blocks before this whole batch, so their
+        // failure always outranks the validation error; this batch's own
+        // scripts outrank it only when they belong to an earlier block.
+        let carried = script_carry
+            .as_deref_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        if let Some((_, index, source)) = drain_script_batches(carried, Vec::new()) {
+            return Err(BlockExecutionError::Block(BlockError::Transaction {
+                index,
+                source: source.into(),
+            }));
+        }
+        let own = script_batches
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = serial_scripts
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((block_order, index, source)) = drain_script_batches(own, serial) {
+            if block_order < failed_index {
+                return Err(BlockExecutionError::Block(BlockError::Transaction {
+                    index,
+                    source: source.into(),
+                }));
+            }
+        }
+        return Err(error);
+    }
+
+    // Phase three: transitions and undo records, again in parallel per
+    // block, collected in block order.
+    let apply_started = Instant::now();
+    let finished_slots: Vec<std::sync::OnceLock<FinishedSlot>> = (0..prepared_blocks.len())
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let next_finish = std::sync::atomic::AtomicUsize::new(0);
+    let prepared_blocks = Mutex::new(prepared_blocks.into_iter().map(Some).collect::<Vec<_>>());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next_finish;
+            let finished_slots = &finished_slots;
+            let prepared_blocks = &prepared_blocks;
+            let tips = &tips;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(slot) = finished_slots.get(index) else {
+                        break;
+                    };
+                    let (prepared, delta) = {
+                        let mut prepared_blocks =
+                            prepared_blocks.lock().expect("prepared lock not poisoned");
+                        prepared_blocks[index]
+                            .take()
+                            .expect("each block index is claimed once")
+                    };
+                    let changes = delta.net_changes();
+                    let mut applied = prepared.into_applied(retains_undo);
+                    let expected_parent = if index == 0 {
+                        base.hash
+                    } else {
+                        tips[index - 1].hash
+                    };
+                    let transition = ConnectTransition {
+                        expected_parent,
+                        next: tips[index],
+                        spent: changes.spent,
+                        created: changes.created,
+                        transaction_undos: match (retains_undo, applied_undos) {
+                            (false, _) => Vec::new(),
+                            (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                            (true, AppliedUndos::Drop) => {
+                                std::mem::take(&mut applied.transaction_undos)
+                            }
+                        },
+                    };
+                    slot.set((transition, applied))
+                        .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
+                }
+            });
+        }
+    });
+    let mut applied_blocks = Vec::with_capacity(finished_slots.len());
+    let mut transitions = Vec::with_capacity(finished_slots.len());
+    for slot in finished_slots {
+        let (transition, applied) = slot.into_inner().expect("phase three covered every block");
+        transitions.push(transition);
+        applied_blocks.push(applied);
+    }
+    breakdown.apply += apply_started.elapsed();
+    current = *tips.last().expect("non-empty batch has a final tip");
+    let _ = current;
+
+    let wait_started = Instant::now();
+    let own_batches = script_batches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let serial = serial_scripts
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A store may flush at any batch/coin limit, during maintenance, or
+    // immediately (without a write-back wrapper). Every script in this
+    // batch must therefore finish before handing its transitions to it.
+    let mut batches = script_carry.map(std::mem::take).unwrap_or_default();
+    batches.extend(own_batches);
+    let script_failure = drain_script_batches(batches, serial);
     breakdown.script_wait = wait_started.elapsed();
-    if let Some((index, source)) = script_failure {
+    if let Some((_, index, source)) = script_failure {
         return Err(BlockExecutionError::Block(BlockError::Transaction {
             index,
             source: source.into(),
         }));
     }
     let commit_started = Instant::now();
-    chainstate.commit_connect_batch(&transitions)?;
+    chainstate.commit_connect_batch_owned(transitions)?;
     breakdown.commit = commit_started.elapsed();
     Ok((applied_blocks, breakdown))
 }
@@ -744,7 +1118,136 @@ fn validate_active_block<S: UtxoStore>(
         false,
         None,
     )
-    .map(|(applied, changes, _)| (applied, changes))
+    .and_then(|(applied, delta, _)| {
+        let net_started = Instant::now();
+        let changes = delta.net_changes()?;
+        crate::validation_profile::add(crate::validation_profile::NET, net_started.elapsed());
+        Ok((applied, changes))
+    })
+}
+
+/// The pipeline's counterpart of [`validate_active_block_inner`]: the same
+/// header, BIP30 and structure checks, then every transaction resolved and
+/// checked against a [`BlockPrepareView`] without writing anything.
+#[allow(clippy::too_many_arguments)]
+fn prepare_active_block_inner<'a, S: UtxoStore>(
+    chainstate: &S,
+    headers: &HeaderDag,
+    block: &'a Block,
+    current: ExecutionTip,
+    now: u64,
+    deployments: &BlockDeploymentContext,
+    structure_prevalidated: bool,
+    transaction_ids: Option<&[Txid]>,
+) -> Result<
+    (
+        PreparedActiveBlock,
+        PreparedDelta,
+        Vec<DeferredScriptCheck<'a>>,
+    ),
+    BlockExecutionError,
+> {
+    let checks_started = Instant::now();
+    let active_current = headers.active_header_at(current.height);
+    if active_current.is_none_or(|header| header.hash != current.hash) {
+        return Err(BlockExecutionError::TipNotActive {
+            height: current.height,
+            hash: current.hash,
+        });
+    }
+    let next_height = current
+        .height
+        .checked_add(1)
+        .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
+    let expected = headers
+        .active_header_at(next_height)
+        .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
+    let actual = block.block_hash();
+    if actual != expected.hash {
+        return Err(BlockExecutionError::UnexpectedBlock {
+            expected: expected.hash,
+            actual,
+        });
+    }
+    let parent_mtp = headers
+        .median_time_past(current.hash)
+        .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
+    let capacity = block
+        .txdata
+        .iter()
+        .map(|transaction| transaction.input.len() + transaction.output.len())
+        .sum();
+    let view = BlockPrepareView::new(chainstate, capacity);
+    let exception_undo = prepare_bip30_rules(&view, block, deployments)?;
+    if !structure_prevalidated {
+        validate_block_structure_with_deployments(
+            block,
+            next_height,
+            deployments.bip34_active,
+            deployments.segwit_active,
+            deployments.signet_challenge.as_deref(),
+        )
+        .map_err(BlockExecutionError::Block)?;
+    }
+    crate::validation_profile::add(crate::validation_profile::CHECKS, checks_started.elapsed());
+    let computed_ids;
+    let transaction_ids = if let Some(ids) = transaction_ids {
+        ids
+    } else {
+        computed_ids = block
+            .txdata
+            .iter()
+            .map(bitcoin::Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        computed_ids.as_slice()
+    };
+    let (prepared, scripts) = prepare_prevalidated_block_with_deferred_scripts(
+        &view,
+        block,
+        transaction_ids,
+        next_height,
+        now,
+        parent_mtp,
+        deployments.script_flags,
+        deployments.csv_active,
+        deployments.subsidy_sats,
+        |transaction| view.record(transaction),
+    )
+    .map_err(BlockExecutionError::Block)?;
+    Ok((
+        PreparedActiveBlock {
+            block: prepared,
+            exception_undo,
+        },
+        view.into_delta(),
+        scripts,
+    ))
+}
+
+/// [`apply_bip30_rules`] for a prepare view: the overwritten coins are
+/// recorded as spent in the view and returned as the exception undo.
+fn prepare_bip30_rules<S: UtxoStore>(
+    view: &BlockPrepareView<'_, S>,
+    block: &Block,
+    deployments: &BlockDeploymentContext,
+) -> Result<Option<UtxoUndo>, BlockExecutionError> {
+    if !deployments.bip30_enforced && !deployments.bip30_overwrite {
+        return Ok(None);
+    }
+    let collisions = block_output_collisions(view, block)?;
+    if collisions.is_empty() {
+        return Ok(None);
+    }
+    if !deployments.bip30_overwrite {
+        return Err(BlockExecutionError::Bip30Collision(collisions[0]));
+    }
+    let mut overwritten = Vec::with_capacity(collisions.len());
+    for outpoint in &collisions {
+        let utxo = view.get(*outpoint)?.ok_or(UtxoError::Missing(*outpoint))?;
+        overwritten.push((*outpoint, utxo));
+    }
+    view.mark_spent(&collisions);
+    Ok(Some(UtxoUndo::from_parts(overwritten, Vec::new())))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -759,7 +1262,8 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     structure_prevalidated: bool,
     defer_scripts: bool,
     transaction_ids: Option<&[Txid]>,
-) -> Result<(AppliedBlock, UtxoChanges, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
+) -> Result<(AppliedBlock, BlockDelta, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
+    let checks_started = Instant::now();
     let active_current = headers.active_header_at(current.height);
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
@@ -786,6 +1290,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let overlay = UtxoOverlay::new(chainstate);
     let exception_undo = apply_bip30_rules(&overlay, block, deployments)?;
+    crate::validation_profile::add(crate::validation_profile::CHECKS, checks_started.elapsed());
     let (mut applied, scripts) = if defer_scripts {
         if !structure_prevalidated {
             validate_block_structure_with_deployments(
@@ -862,14 +1367,29 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     if let Some(undo) = exception_undo {
         applied.transaction_undos.insert(0, undo);
     }
-    let transition = overlay.net_changes()?;
-    Ok((applied, transition, scripts))
+    Ok((applied, overlay.into_delta(), scripts))
 }
 
+/// Per-overlay view of the coins a block or batch touched.
+///
+/// `original` caches every coin read from the base exactly as it was first
+/// seen; `current` holds only keys this overlay modified. A read therefore
+/// costs one clone and one insert on first touch instead of two, and the net
+/// change of the overlay is the set of `current` keys whose value differs
+/// from `original`.
 #[derive(Default)]
 struct OverlayState {
     original: AHashMap<OutPointKey, Option<Utxo>>,
     current: AHashMap<OutPointKey, Option<Utxo>>,
+}
+
+impl OverlayState {
+    /// The overlay's view of a key, without touching the base.
+    fn cached(&self, outpoint: &OutPointKey) -> Option<&Option<Utxo>> {
+        self.current
+            .get(outpoint)
+            .or_else(|| self.original.get(outpoint))
+    }
 }
 
 struct UtxoChanges {
@@ -878,51 +1398,425 @@ struct UtxoChanges {
     undo: UtxoUndo,
 }
 
-/// Block-scoped UTXO mutations retained in memory until validation succeeds.
-struct UtxoOverlay<'a, S> {
-    base: &'a S,
-    state: Mutex<OverlayState>,
+/// Independently locked shards per overlay.
+///
+/// A batch overlay is read by the block being validated while the block
+/// before it is folded in and while prefetched coins are seeded; one mutex
+/// around a multi-million-entry map would serialize all of that. Keys route
+/// by their first txid bytes, which are uniformly random.
+const OVERLAY_SHARDS: usize = 64;
+
+/// Below this many prefetched coins, seeding on the calling thread is cheaper
+/// than fanning out.
+const PARALLEL_SEED_THRESHOLD: usize = 65_536;
+
+/// Threads preparing a batch's blocks in parallel.
+const PREPARE_WORKERS: usize = 8;
+
+/// What one block's raw transactions do to the coin set: the coins it
+/// creates and the keys it spends.
+type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
+/// Every version each key takes across a batch, tagged by the block index
+/// that wrote it, in block order.
+type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
+/// Waits for every script batch and returns the first failure by batch
+/// order, verifying any serially collected checks as block zero.
+pub(crate) fn drain_script_batches(
+    batches: Vec<DeferredScriptBatch>,
+    serial: Vec<DeferredScriptCheck<'_>>,
+) -> Option<(usize, usize, ConsensusError)> {
+    let mut first = None;
+    for batch in batches {
+        if let Some(failure) = batch.finish_with_order() {
+            if first
+                .as_ref()
+                .is_none_or(|(order, index, _)| (failure.0, failure.1) < (*order, *index))
+            {
+                first = Some(failure);
+            }
+        }
+    }
+    if let Some((index, source)) = verify_deferred_scripts(serial) {
+        if first
+            .as_ref()
+            .is_none_or(|(order, first_index, _)| (0, index) < (*order, *first_index))
+        {
+            first = Some((0, index, source));
+        }
+    }
+    first
 }
 
-impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
-    fn new(base: &'a S) -> Self {
-        Self::with_capacity(base, 0)
+/// One block's parallel-preparation result, in batch order; its deferred
+/// script checks were already handed to the pool by the preparing worker.
+type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
+/// One block's transition and applied record.
+type FinishedSlot = (ConnectTransition, AppliedBlock);
+
+/// The whole batch's coin history as of one block: every version each key
+/// takes across the batch, tagged with the block that wrote it. A block reads
+/// the latest version an *earlier* block left and never a later one, so every
+/// block sees exactly the state its predecessors leave while all of them are
+/// prepared at once.
+struct BatchVersionView<'a, S> {
+    versions: &'a CoinVersions,
+    upto: u32,
+    base: &'a S,
+}
+
+impl<S: UtxoStore> BatchVersionView<'_, S> {
+    fn lookup(&self, outpoint: &OutPointKey) -> DeltaAnswer {
+        let Some(entries) = self.versions.get(outpoint) else {
+            return DeltaAnswer::Unknown;
+        };
+        for (index, value) in entries.iter().rev() {
+            if *index < self.upto {
+                return match value {
+                    Some(utxo) => DeltaAnswer::Coin(Utxo::clone(utxo)),
+                    None => DeltaAnswer::Spent,
+                };
+            }
+        }
+        DeltaAnswer::Unknown
+    }
+}
+
+impl<S: UtxoStore> UtxoStore for BatchVersionView<'_, S> {
+    fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        match self.lookup(&outpoint) {
+            DeltaAnswer::Coin(utxo) => Ok(Some(utxo)),
+            DeltaAnswer::Spent => Ok(None),
+            DeltaAnswer::Unknown => self.base.get(outpoint),
+        }
     }
 
-    fn with_capacity(base: &'a S, capacity: usize) -> Self {
+    fn get_many(
+        &self,
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let mut results = Vec::with_capacity(outpoints.len());
+        let mut wanted = Vec::new();
+        let mut positions = Vec::new();
+        for outpoint in outpoints {
+            match self.lookup(outpoint) {
+                DeltaAnswer::Coin(utxo) => results.push((*outpoint, Some(utxo))),
+                DeltaAnswer::Spent => results.push((*outpoint, None)),
+                DeltaAnswer::Unknown => {
+                    positions.push(results.len());
+                    wanted.push(*outpoint);
+                    results.push((*outpoint, None));
+                }
+            }
+        }
+        if !wanted.is_empty() {
+            let resolved = self.base.get_many(&wanted)?;
+            for (position, (_, utxo)) in positions.into_iter().zip(resolved) {
+                results[position].1 = utxo;
+            }
+        }
+        Ok(results)
+    }
+
+    fn apply(&self, _: &[OutPointKey], _: &[(OutPointKey, Utxo)]) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("batch version view is read-only"))
+    }
+
+    fn apply_with_undo(
+        &self,
+        _: &[OutPointKey],
+        _: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        Err(UtxoError::Malformed("batch version view is read-only"))
+    }
+
+    fn undo(&self, _: &UtxoUndo, _: u64, _: u64) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("batch version view is read-only"))
+    }
+
+    fn age_to_cold(&self, _: u64, _: u64) -> Result<u64, UtxoError> {
+        Ok(0)
+    }
+
+    fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+        Err(UtxoError::Malformed("batch version view is read-only"))
+    }
+
+    fn replace_all(
+        &self,
+        _: &BTreeMap<OutPointKey, Utxo>,
+        _: u64,
+        _: u64,
+    ) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("batch version view is read-only"))
+    }
+
+    fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+        self.base.tier_stats()
+    }
+}
+/// Threads used to seed a large prefetch; each owns a contiguous shard range.
+const SEED_WORKERS: usize = 8;
+
+fn overlay_shard(outpoint: &OutPointKey) -> usize {
+    let bytes = outpoint.as_bytes();
+    let mut word = [0_u8; 8];
+    word.copy_from_slice(&bytes[..8]);
+    usize::try_from(u64::from_le_bytes(word) % OVERLAY_SHARDS as u64).expect("shard index fits")
+}
+
+/// What the delta knows about one outpoint.
+enum DeltaAnswer {
+    Coin(Utxo),
+    Spent,
+    Unknown,
+}
+
+/// What one block did to the coins it touched, recorded while it was
+/// prepared: the coins it created and the keys it spent (a coin created and
+/// spent inside the block is in both).
+///
+/// Built on the validation thread as the block's transactions resolve, read
+/// by the next block through a [`DeltaView`] and turned into the block's net
+/// change on the pipeline tail — so neither the next block nor the tail
+/// waits for a write.
+pub(crate) struct PreparedDelta {
+    /// The block's final word on every key it touched, updated in transaction
+    /// order: `Some` is a coin the block leaves behind, `None` a key it spent.
+    state: AHashMap<OutPointKey, Option<Utxo>>,
+    /// Keys the block spent (or overwrote under BIP30) that existed before it,
+    /// as opposed to coins it created and spent itself.
+    spent_from_base: AHashSet<OutPointKey>,
+}
+
+impl PreparedDelta {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: AHashMap::with_capacity(capacity),
+            spent_from_base: AHashSet::with_capacity(capacity),
+        }
+    }
+
+    fn lookup(&self, outpoint: &OutPointKey) -> DeltaAnswer {
+        match self.state.get(outpoint) {
+            Some(Some(utxo)) => DeltaAnswer::Coin(utxo.clone()),
+            Some(None) => DeltaAnswer::Spent,
+            None => DeltaAnswer::Unknown,
+        }
+    }
+
+    fn spend(&mut self, outpoint: OutPointKey) {
+        if self.state.insert(outpoint, None).is_none() {
+            self.spent_from_base.insert(outpoint);
+        }
+    }
+
+    fn record(&mut self, prepared: &PreparedTransaction) {
+        for outpoint in &prepared.spent {
+            self.spend(*outpoint);
+        }
+        for (outpoint, utxo) in &prepared.created {
+            self.state.insert(*outpoint, Some(utxo.clone()));
+        }
+    }
+
+    /// The block's net effect: coins it leaves behind, keys it removed from
+    /// the state it started from. A BIP30 overwrite puts a key in both, the
+    /// removal first. Sorted like the overlay's `net_changes`.
+    fn net_changes(&self) -> UtxoChanges {
+        let mut spent: Vec<OutPointKey> = self.spent_from_base.iter().copied().collect();
+        let mut created: Vec<(OutPointKey, Utxo)> = self
+            .state
+            .iter()
+            .filter_map(|(outpoint, value)| value.as_ref().map(|utxo| (*outpoint, utxo.clone())))
+            .collect();
+        spent.sort_unstable();
+        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+        // The pipeline carries undo per transaction in `AppliedBlock`; the
+        // block-level record is only built on the unpipelined path.
+        UtxoChanges {
+            spent,
+            created,
+            undo: UtxoUndo::from_parts(Vec::new(), Vec::new()),
+        }
+    }
+}
+
+/// The read view a block is prepared against: what the block itself has
+/// resolved so far, over the state it starts from.
+struct BlockPrepareView<'a, S> {
+    base: &'a S,
+    delta: Mutex<PreparedDelta>,
+}
+
+impl<'a, S: UtxoStore> BlockPrepareView<'a, S> {
+    fn new(base: &'a S, capacity: usize) -> Self {
         Self {
             base,
-            state: Mutex::new(OverlayState {
-                original: AHashMap::with_capacity(capacity),
-                current: AHashMap::with_capacity(capacity),
-            }),
+            delta: Mutex::new(PreparedDelta::with_capacity(capacity)),
         }
     }
 
-    fn load(
+    fn delta(&self) -> std::sync::MutexGuard<'_, PreparedDelta> {
+        self.delta.lock().expect("prepare view lock not poisoned")
+    }
+
+    fn record(&self, prepared: &PreparedTransaction) {
+        self.delta().record(prepared);
+    }
+
+    /// Removes coins the block overwrites under the BIP30 exception.
+    fn mark_spent(&self, outpoints: &[OutPointKey]) {
+        let mut delta = self.delta();
+        for outpoint in outpoints {
+            delta.spend(*outpoint);
+        }
+    }
+
+    fn into_delta(self) -> PreparedDelta {
+        self.delta
+            .into_inner()
+            .expect("prepare view lock not poisoned")
+    }
+}
+
+impl<S: UtxoStore> UtxoStore for BlockPrepareView<'_, S> {
+    fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        match self.delta().lookup(&outpoint) {
+            DeltaAnswer::Coin(utxo) => Ok(Some(utxo)),
+            DeltaAnswer::Spent => Ok(None),
+            DeltaAnswer::Unknown => self.base.get(outpoint),
+        }
+    }
+
+    fn get_many(
         &self,
-        state: &mut OverlayState,
-        outpoint: OutPointKey,
-    ) -> Result<Option<Utxo>, UtxoError> {
-        if let Some(value) = state.current.get(&outpoint) {
-            return Ok(value.clone());
+        outpoints: &[OutPointKey],
+    ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let mut results = Vec::with_capacity(outpoints.len());
+        let mut wanted = Vec::new();
+        let mut positions = Vec::new();
+        {
+            let delta = self.delta();
+            for outpoint in outpoints {
+                match delta.lookup(outpoint) {
+                    DeltaAnswer::Coin(utxo) => results.push((*outpoint, Some(utxo))),
+                    DeltaAnswer::Spent => results.push((*outpoint, None)),
+                    DeltaAnswer::Unknown => {
+                        positions.push(results.len());
+                        wanted.push(*outpoint);
+                        results.push((*outpoint, None));
+                    }
+                }
+            }
         }
-        let value = self.base.get(outpoint)?;
-        state.original.insert(outpoint, value.clone());
-        state.current.insert(outpoint, value.clone());
-        Ok(value)
+        if !wanted.is_empty() {
+            let resolved = self.base.get_many(&wanted)?;
+            for (position, (_, utxo)) in positions.into_iter().zip(resolved) {
+                results[position].1 = utxo;
+            }
+        }
+        Ok(results)
     }
 
+    fn apply(&self, _: &[OutPointKey], _: &[(OutPointKey, Utxo)]) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn apply_with_undo(
+        &self,
+        _: &[OutPointKey],
+        _: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn undo(&self, _: &UtxoUndo, _: u64, _: u64) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn age_to_cold(&self, _: u64, _: u64) -> Result<u64, UtxoError> {
+        Ok(0)
+    }
+
+    fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn replace_all(
+        &self,
+        _: &BTreeMap<OutPointKey, Utxo>,
+        _: u64,
+        _: u64,
+    ) -> Result<(), UtxoError> {
+        Err(UtxoError::Malformed("prepare view is read-only"))
+    }
+
+    fn tier_stats(&self) -> Result<TierStats, UtxoError> {
+        self.base.tier_stats()
+    }
+}
+
+/// A prepared block plus the BIP30 exception undo, ready for the tail.
+struct PreparedActiveBlock {
+    block: PreparedBlock,
+    exception_undo: Option<UtxoUndo>,
+}
+
+impl PreparedActiveBlock {
+    /// The `AppliedBlock` applying this block would have produced; undo
+    /// records are built from the prepared coins only when they are kept.
+    fn into_applied(self, retains_undo: bool) -> AppliedBlock {
+        let hash = self.block.hash;
+        let mut transaction_undos = Vec::new();
+        if retains_undo {
+            transaction_undos.reserve(self.block.transactions.len() + 1);
+            if let Some(undo) = self.exception_undo {
+                transaction_undos.push(undo);
+            }
+            for prepared in self.block.transactions {
+                let spent = prepared.spent.into_iter().zip(prepared.prevouts).collect();
+                let created = prepared
+                    .created
+                    .into_iter()
+                    .map(|(outpoint, _)| outpoint)
+                    .collect();
+                transaction_undos.push(UtxoUndo::from_parts(spent, created));
+            }
+        }
+        AppliedBlock {
+            hash,
+            transaction_undos,
+        }
+    }
+}
+
+/// A validated block's overlay shards, detached from their base.
+///
+/// Keeps everything the block read or wrote, so it serves two purposes at
+/// once: the next block reads through it while the batch overlay is still
+/// being updated, and the pipeline tail derives the block's net changes from
+/// it off the validation thread.
+struct BlockDelta {
+    shards: Vec<Mutex<OverlayState>>,
+}
+
+impl BlockDelta {
     fn net_changes(&self) -> Result<UtxoChanges, UtxoError> {
-        let state = self.state.lock().expect("overlay lock not poisoned");
-        let mut spent = Vec::new();
-        let mut created = Vec::new();
-        let mut undo_spent = Vec::new();
-        for (outpoint, original) in &state.original {
-            let current = state
-                .current
+        net_changes_of(&self.shards)
+    }
+}
+
+fn net_changes_of(shards: &[Mutex<OverlayState>]) -> Result<UtxoChanges, UtxoError> {
+    let mut spent = Vec::new();
+    let mut created = Vec::new();
+    let mut undo_spent = Vec::new();
+    for shard in shards {
+        let state = shard.lock().expect("overlay lock not poisoned");
+        for (outpoint, current) in &state.current {
+            let original = state
+                .original
                 .get(outpoint)
-                .ok_or(UtxoError::Malformed("overlay current value"))?;
+                .ok_or(UtxoError::Malformed("overlay original value"))?;
             if original == current {
                 continue;
             }
@@ -937,46 +1831,156 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
                 created.push((*outpoint, utxo.clone()));
             }
         }
-        spent.sort_unstable();
-        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
-        undo_spent.sort_unstable_by_key(|(outpoint, _)| *outpoint);
-        let undo_created = created.iter().map(|(outpoint, _)| *outpoint).collect();
-        Ok(UtxoChanges {
-            spent,
-            created,
-            undo: UtxoUndo::new(undo_spent, undo_created),
-        })
+    }
+    spent.sort_unstable();
+    created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+    undo_spent.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+    let undo_created = created.iter().map(|(outpoint, _)| *outpoint).collect();
+    Ok(UtxoChanges {
+        spent,
+        created,
+        undo: UtxoUndo::new(undo_spent, undo_created),
+    })
+}
+
+/// Block-scoped UTXO mutations retained in memory until validation succeeds.
+struct UtxoOverlay<'a, S> {
+    base: &'a S,
+    shards: Vec<Mutex<OverlayState>>,
+}
+
+impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
+    fn new(base: &'a S) -> Self {
+        Self::with_capacity(base, 0)
     }
 
-    fn apply_validated_changes(&self, changes: &UtxoChanges) {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
-        for outpoint in &changes.spent {
-            state.current.insert(*outpoint, None);
-        }
-        for (outpoint, utxo) in &changes.created {
-            state.current.insert(*outpoint, Some(utxo.clone()));
+    fn with_capacity(base: &'a S, capacity: usize) -> Self {
+        let per_shard = capacity.div_ceil(OVERLAY_SHARDS);
+        Self {
+            base,
+            shards: (0..OVERLAY_SHARDS)
+                .map(|_| {
+                    Mutex::new(OverlayState {
+                        original: AHashMap::with_capacity(per_shard),
+                        current: AHashMap::with_capacity(per_shard),
+                    })
+                })
+                .collect(),
         }
     }
 
+    fn shard(&self, outpoint: &OutPointKey) -> std::sync::MutexGuard<'_, OverlayState> {
+        self.shards[overlay_shard(outpoint)]
+            .lock()
+            .expect("overlay lock not poisoned")
+    }
+
+    /// Reads a key through the shard the caller already holds.
+    fn load_in(
+        &self,
+        state: &mut OverlayState,
+        outpoint: OutPointKey,
+    ) -> Result<Option<Utxo>, UtxoError> {
+        if let Some(value) = state.cached(&outpoint) {
+            return Ok(value.clone());
+        }
+        let value = self.base.get(outpoint)?;
+        state.original.insert(outpoint, value.clone());
+        Ok(value)
+    }
+
+    fn load(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let mut state = self.shard(&outpoint);
+        self.load_in(&mut state, outpoint)
+    }
+
+    /// The overlay's cached view of a key, without touching the base:
+    /// `None` when the key was never touched, `Some(None)` when it is known
+    /// absent, `Some(Some(_))` when it is known present.
+    #[allow(clippy::option_option)]
+    fn cached_value(&self, outpoint: &OutPointKey) -> Option<Option<Utxo>> {
+        self.shard(outpoint).cached(outpoint).cloned()
+    }
+
+    fn net_changes(&self) -> Result<UtxoChanges, UtxoError> {
+        net_changes_of(&self.shards)
+    }
+
+    /// Hand over the shards so the block's delta outlives the overlay.
+    fn into_delta(self) -> BlockDelta {
+        BlockDelta {
+            shards: self.shards,
+        }
+    }
+
+    /// Folds a block's net change in. The batch overlay's own net change is
+    /// never read on the pipelined path — the blocks carry their transitions
+    /// — so only `current` is maintained: reads consult it first, and a key
+    /// the block wrote needs no `original` entry to be answered correctly.
     fn prefetch(&self, outpoints: &[OutPointKey]) -> Result<(), UtxoError> {
         let prefetched = self.base.get_many(outpoints)?;
         self.seed_prefetched(prefetched);
         Ok(())
     }
 
+    /// Seeds the read cache with coins fetched ahead of validation.
+    ///
+    /// A batch's inputs run to millions of coins; they are partitioned by
+    /// shard once and inserted by a few threads that each own a shard range,
+    /// so no two threads ever contend for a lock.
     fn seed_prefetched(&self, prefetched: Vec<(OutPointKey, Option<Utxo>)>) {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
-        for (outpoint, value) in prefetched {
-            state.original.insert(outpoint, value.clone());
-            state.current.insert(outpoint, value);
+        if prefetched.len() < PARALLEL_SEED_THRESHOLD {
+            for (outpoint, value) in prefetched {
+                self.shard(&outpoint).original.insert(outpoint, value);
+            }
+            return;
         }
+        let mut partitioned: Vec<Vec<(OutPointKey, Option<Utxo>)>> =
+            (0..OVERLAY_SHARDS).map(|_| Vec::new()).collect();
+        for (outpoint, value) in prefetched {
+            partitioned[overlay_shard(&outpoint)].push((outpoint, value));
+        }
+        let shards_per_worker = OVERLAY_SHARDS.div_ceil(SEED_WORKERS);
+        std::thread::scope(|scope| {
+            for (worker, chunk) in partitioned.chunks_mut(shards_per_worker).enumerate() {
+                let first_shard = worker * shards_per_worker;
+                let shards = &self.shards;
+                scope.spawn(move || {
+                    for (offset, entries) in chunk.iter_mut().enumerate() {
+                        if entries.is_empty() {
+                            continue;
+                        }
+                        let mut state = shards[first_shard + offset]
+                            .lock()
+                            .expect("overlay lock not poisoned");
+                        state.original.reserve(entries.len());
+                        for (outpoint, value) in entries.drain(..) {
+                            state.original.insert(outpoint, value);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Records a spend in its shard.
+    fn write_spent(&self, outpoint: &OutPointKey) {
+        let mut state = self.shard(outpoint);
+        state.original.entry(*outpoint).or_insert(None);
+        state.current.insert(*outpoint, None);
+    }
+
+    /// Records a creation in its shard.
+    fn write_created(&self, outpoint: &OutPointKey, utxo: &Utxo) {
+        let mut state = self.shard(outpoint);
+        state.original.entry(*outpoint).or_insert(None);
+        state.current.insert(*outpoint, Some(utxo.clone()));
     }
 }
 
 impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
-        self.load(&mut state, outpoint)
+        self.load(outpoint)
     }
 
     fn apply(
@@ -992,31 +1996,28 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError> {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
         let mut seen_spent = BTreeSet::new();
         let mut undo_spent = Vec::with_capacity(spent.len());
         for outpoint in spent {
             if !seen_spent.insert(*outpoint) {
                 return Err(UtxoError::DuplicateSpend(*outpoint));
             }
-            let previous = self
-                .load(&mut state, *outpoint)?
-                .ok_or(UtxoError::Missing(*outpoint))?;
+            let previous = self.load(*outpoint)?.ok_or(UtxoError::Missing(*outpoint))?;
             undo_spent.push((*outpoint, previous));
         }
         let mut seen_created = BTreeSet::new();
         for (outpoint, _) in created {
             if !seen_created.insert(*outpoint)
-                || (!seen_spent.contains(outpoint) && self.load(&mut state, *outpoint)?.is_some())
+                || (!seen_spent.contains(outpoint) && self.load(*outpoint)?.is_some())
             {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
         }
         for outpoint in spent {
-            state.current.insert(*outpoint, None);
+            self.write_spent(outpoint);
         }
         for (outpoint, utxo) in created {
-            state.current.insert(*outpoint, Some(utxo.clone()));
+            self.write_created(outpoint, utxo);
         }
         Ok(UtxoUndo::new(
             undo_spent,
@@ -1029,23 +2030,22 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError> {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
         let mut seen_spent = BTreeSet::new();
         let mut undo_spent = Vec::with_capacity(spent.len());
         for outpoint in spent {
             if !seen_spent.insert(*outpoint) {
                 return Err(UtxoError::DuplicateSpend(*outpoint));
             }
-            let previous = self
-                .load(&mut state, *outpoint)?
-                .ok_or(UtxoError::Missing(*outpoint))?;
+            let previous = self.load(*outpoint)?.ok_or(UtxoError::Missing(*outpoint))?;
             undo_spent.push((*outpoint, previous));
         }
         let mut seen_created = BTreeSet::new();
         for (outpoint, _) in created {
             if !seen_created.insert(*outpoint)
                 || (!seen_spent.contains(outpoint)
-                    && state.current.get(outpoint).is_some_and(Option::is_some))
+                    && self
+                        .cached_value(outpoint)
+                        .is_some_and(|value| value.is_some()))
             {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
@@ -1060,17 +2060,70 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             // `apply_validated_changes_transaction` rejects the collision.
             if cfg!(debug_assertions) && !seen_spent.contains(outpoint) {
                 assert!(
-                    self.load(&mut state, *outpoint)?.is_none(),
+                    self.load(*outpoint)?.is_none(),
                     "fresh-output fast path was given an outpoint that already exists: {outpoint}"
                 );
             }
         }
         for outpoint in spent {
-            state.current.insert(*outpoint, None);
+            self.write_spent(outpoint);
         }
         for (outpoint, utxo) in created {
-            state.original.entry(*outpoint).or_insert(None);
-            state.current.insert(*outpoint, Some(utxo.clone()));
+            self.write_created(outpoint, utxo);
+        }
+        Ok(UtxoUndo::new(
+            undo_spent,
+            created.iter().map(|(outpoint, _)| *outpoint).collect(),
+        ))
+    }
+
+    fn apply_with_undo_fresh_outputs_from_prevouts(
+        &self,
+        spent: &[OutPointKey],
+        prevouts: &[Utxo],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        if prevouts.len() != spent.len() {
+            return Err(UtxoError::Malformed(
+                "prevout count does not match spent count",
+            ));
+        }
+        let mut seen_spent = BTreeSet::new();
+        let mut undo_spent = Vec::with_capacity(spent.len());
+        for (outpoint, prevout) in spent.iter().zip(prevouts) {
+            if !seen_spent.insert(*outpoint) {
+                return Err(UtxoError::DuplicateSpend(*outpoint));
+            }
+            // The caller read this coin through `get` moments ago, so the
+            // overlay already caches its original; in a debug build make
+            // sure the handed-in value is that coin.
+            let cached = self.cached_value(outpoint);
+            debug_assert_eq!(
+                cached.clone().flatten().as_ref(),
+                Some(prevout),
+                "prevout handed to the overlay differs from its cached coin: {outpoint}"
+            );
+            if cached.is_none_or(|value| value.is_none()) {
+                return Err(UtxoError::Missing(*outpoint));
+            }
+            undo_spent.push((*outpoint, prevout.clone()));
+        }
+        let mut seen_created = BTreeSet::new();
+        for (outpoint, _) in created {
+            if !seen_created.insert(*outpoint)
+                || (!seen_spent.contains(outpoint)
+                    && self
+                        .cached_value(outpoint)
+                        .is_some_and(|value| value.is_some()))
+            {
+                return Err(UtxoError::Duplicate(*outpoint));
+            }
+        }
+        for outpoint in spent {
+            self.write_spent(outpoint);
+        }
+        for (outpoint, utxo) in created {
+            self.write_created(outpoint, utxo);
         }
         Ok(UtxoUndo::new(
             undo_spent,
@@ -1079,18 +2132,17 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
     }
 
     fn undo(&self, undo: &UtxoUndo, _now: u64, _hot_window_secs: u64) -> Result<(), UtxoError> {
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
         for (outpoint, _) in undo.spent() {
-            if self.load(&mut state, *outpoint)?.is_some() {
+            if self.load(*outpoint)?.is_some() {
                 return Err(UtxoError::Duplicate(*outpoint));
             }
         }
         for outpoint in undo.created() {
-            self.load(&mut state, *outpoint)?;
-            state.current.insert(*outpoint, None);
+            self.load(*outpoint)?;
+            self.write_spent(outpoint);
         }
         for (outpoint, utxo) in undo.spent() {
-            state.current.insert(*outpoint, Some(utxo.clone()));
+            self.write_created(outpoint, utxo);
         }
         Ok(())
     }
@@ -1101,12 +2153,14 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
 
     fn snapshot_entries(&self) -> Result<BTreeMap<OutPointKey, Utxo>, UtxoError> {
         let mut entries = self.base.snapshot_entries()?;
-        let state = self.state.lock().expect("overlay lock not poisoned");
-        for (outpoint, current) in &state.current {
-            if let Some(utxo) = current {
-                entries.insert(*outpoint, utxo.clone());
-            } else {
-                entries.remove(outpoint);
+        for shard in &self.shards {
+            let state = shard.lock().expect("overlay lock not poisoned");
+            for (outpoint, current) in &state.current {
+                if let Some(utxo) = current {
+                    entries.insert(*outpoint, utxo.clone());
+                } else {
+                    entries.remove(outpoint);
+                }
             }
         }
         Ok(entries)
@@ -1119,10 +2173,13 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
         _hot_window_secs: u64,
     ) -> Result<(), UtxoError> {
         let base = self.base.snapshot_entries()?;
-        let mut state = self.state.lock().expect("overlay lock not poisoned");
-        state.original.clear();
-        state.current.clear();
+        for shard in &self.shards {
+            let mut state = shard.lock().expect("overlay lock not poisoned");
+            state.original.clear();
+            state.current.clear();
+        }
         for outpoint in base.keys().chain(entries.keys()) {
+            let mut state = self.shard(outpoint);
             state
                 .original
                 .insert(*outpoint, base.get(outpoint).cloned());
@@ -1144,16 +2201,19 @@ impl<S: UtxoStore> UtxoStore for UtxoOverlay<'_, S> {
             .hot
             .checked_add(base.cold)
             .ok_or(UtxoError::Malformed("base entry count"))?;
-        let state = self.state.lock().expect("overlay lock not poisoned");
         let mut delta = 0_i64;
-        for (outpoint, current) in &state.current {
-            let present_before = match state.original.get(outpoint) {
-                Some(original) => original.is_some(),
-                // Reached only for an outpoint written straight into `current`
-                // without a recorded pre-image; bounded by the overlay size.
-                None => self.base.get(*outpoint)?.is_some(),
-            };
-            delta += i64::from(current.is_some()) - i64::from(present_before);
+        for shard in &self.shards {
+            let state = shard.lock().expect("overlay lock not poisoned");
+            for (outpoint, current) in &state.current {
+                let present_before = match state.original.get(outpoint) {
+                    Some(original) => original.is_some(),
+                    // Reached only for an outpoint written straight into
+                    // `current` without a recorded pre-image; bounded by the
+                    // overlay size.
+                    None => self.base.get(*outpoint)?.is_some(),
+                };
+                delta += i64::from(current.is_some()) - i64::from(present_before);
+            }
         }
         let hot = i64::try_from(total)
             .ok()
@@ -1699,6 +2759,15 @@ mod tests {
 
     #[test]
     fn ibd_checkpoint_defers_all_scripts_but_reports_the_earliest_block() {
+        assert_invalid_scripts_do_not_commit(false);
+    }
+
+    #[test]
+    fn replay_script_carry_cannot_commit_an_invalid_batch() {
+        assert_invalid_scripts_do_not_commit(true);
+    }
+
+    fn assert_invalid_scripts_do_not_commit(replay: bool) {
         let directory = TempDir::new().unwrap();
         let chainstate =
             RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
@@ -1761,20 +2830,31 @@ mod tests {
             .insert_contextual(second.header, second.header.time)
             .unwrap();
 
+        let mut carry = Vec::new();
+        let result = connect_active_blocks_inner(
+            &chainstate,
+            &headers,
+            &[first, second],
+            1,
+            60,
+            &[deployments(1), deployments(2)],
+            true,
+            None,
+            None,
+            AppliedUndos::Keep,
+            replay.then_some(&mut carry),
+        );
         assert!(matches!(
-            connect_prevalidated_active_blocks(
-                &chainstate,
-                &headers,
-                &[first, second],
-                1,
-                60,
-                &[deployments(1), deployments(2)],
-            ),
+            result,
             Err(BlockExecutionError::Block(BlockError::Transaction {
                 index: 4,
                 ..
             }))
         ));
+        assert!(
+            carry.is_empty(),
+            "no unverified scripts may outlive a committed batch"
+        );
         assert_eq!(chainstate.execution().tip().unwrap().height, 0);
         for outpoint in outpoints {
             assert!(chainstate.get(outpoint.into()).unwrap().is_some());

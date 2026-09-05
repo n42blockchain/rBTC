@@ -322,8 +322,13 @@ impl SnapshotOverlayChainstate {
     ///
     /// Fails on MDBX environment errors.
     pub fn capacity(&self) -> Result<OverlayCapacity, SnapshotOverlayError> {
-        let info = self.db().info()?;
-        let page_size = u64::from(self.db().stat()?.page_size());
+        // Read through an explicit read transaction. The environment-level
+        // `info()`/`stat()` pass no transaction, and under `MDBX_NOTLS`
+        // libmdbx then borrows the write transaction another thread owns —
+        // which corrupts a commit running on the write-back flush thread.
+        let transaction = self.db().begin_ro_txn()?;
+        let info = transaction.env_info()?;
+        let page_size = u64::from(transaction.env_stat()?.page_size());
         let last_page = u64::try_from(info.last_pgno())
             .map_err(|_| SnapshotOverlayError::Invalid("page number overflows"))?;
         // `MDBX_MAP_FULL` fires when `last_pgno` — the file's high-water
@@ -599,6 +604,33 @@ impl SnapshotOverlayChainstate {
         CommitProfile::add(&self.commit_profile.fold, fold_started);
         let _guard = self.lock();
         let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
+        // A failure below aborts the write transaction when it drops; the
+        // stage and error are logged first so an abort that goes wrong
+        // inside the engine still leaves a trace of what preceded it.
+        let result = Self::write_transitions(self, &transaction, transitions, &spent, &created);
+        if let Err(error) = &result {
+            crate::rbtc_warn!(
+                "overlay batch commit of {} blocks ({} spent, {} created) failed before commit, aborting: {}",
+                transitions.len(),
+                spent.len(),
+                created.len(),
+                error
+            );
+        }
+        result?;
+        let sync_started = Instant::now();
+        transaction.commit().map_err(utxo_mdbx)?;
+        CommitProfile::add(&self.commit_profile.sync, sync_started);
+        Ok(())
+    }
+
+    fn write_transitions(
+        &self,
+        transaction: &Transaction<'_, RW, NoWriteMap>,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
         let overlay = transaction.open_table(Some(OVERLAY)).map_err(utxo_mdbx)?;
         let tombstone = transaction.open_table(Some(TOMBSTONE)).map_err(utxo_mdbx)?;
         let undo = transaction.open_table(Some(UNDO)).map_err(utxo_mdbx)?;
@@ -606,7 +638,7 @@ impl SnapshotOverlayChainstate {
         let undo_started = Instant::now();
         for transition in transitions {
             Self::advance_tip(
-                &transaction,
+                transaction,
                 &meta,
                 transition.expected_parent,
                 transition.next,
@@ -623,11 +655,8 @@ impl SnapshotOverlayChainstate {
         }
         CommitProfile::add(&self.commit_profile.undo, undo_started);
         let mutate_started = Instant::now();
-        self.connect_mutation(&transaction, &overlay, &tombstone, &spent, &created)?;
+        self.connect_mutation(transaction, &overlay, &tombstone, spent, created)?;
         CommitProfile::add(&self.commit_profile.mutate, mutate_started);
-        let sync_started = Instant::now();
-        transaction.commit().map_err(utxo_mdbx)?;
-        CommitProfile::add(&self.commit_profile.sync, sync_started);
         Ok(())
     }
 
@@ -1830,6 +1859,34 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         self.commit_transitions(transitions)
     }
 
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock();
+        let transaction = self.db().begin_rw_txn().map_err(utxo_mdbx)?;
+        let result = Self::write_transitions(self, &transaction, transitions, spent, created);
+        if let Err(error) = &result {
+            crate::rbtc_warn!(
+                "overlay folded commit of {} blocks ({} spent, {} created) failed before commit, aborting: {}",
+                transitions.len(),
+                spent.len(),
+                created.len(),
+                error
+            );
+        }
+        result?;
+        let sync_started = Instant::now();
+        transaction.commit().map_err(utxo_mdbx)?;
+        CommitProfile::add(&self.commit_profile.sync, sync_started);
+        Ok(())
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,
@@ -1893,6 +1950,205 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
 
 /// Opens (creating if absent) an MDBX environment with the fixed four-table
 /// geometry every constructor in this module shares.
+/// Logical content of an overlay store, engine-independent.
+///
+/// Two overlays built from the same base by different engines, batch sizes or
+/// write-back settings must agree on every field but `engine` and
+/// `undo_entries`; `content_sha256` binds the base identity, the tip and the
+/// ordered overlay and tombstone tables into one digest so that comparison is
+/// a single string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayContentAudit {
+    /// Engine that held the store (`mdbx` or `redb`); not part of the digest.
+    pub engine: &'static str,
+    /// Base snapshot the overlay was built on.
+    pub identity: SnapshotBaseIdentity,
+    /// Execution tip recorded in the store.
+    pub tip: ExecutionTip,
+    /// Post-base coins still unspent.
+    pub overlay_entries: u64,
+    /// Sum of overlay key lengths.
+    pub overlay_key_bytes: u64,
+    /// Sum of overlay value lengths.
+    pub overlay_value_bytes: u64,
+    /// SHA-256 over the consensus content of every overlay entry in key
+    /// order: `key`, `value_sats`, `height`, `is_coinbase`, `creation_mtp`
+    /// and the script. `last_touched` is wall-clock bookkeeping and excluded.
+    pub overlay_sha256: String,
+    /// SHA-256 over `u32 len(key) key u32 len(value) value` per overlay entry,
+    /// i.e. the stored bytes including `last_touched`; differs between runs
+    /// by design and is reported only to explain raw-file differences.
+    pub overlay_raw_sha256: String,
+    /// Base coins spent since the base.
+    pub tombstone_entries: u64,
+    /// SHA-256 over `u32 len(key) key` per tombstone in key order.
+    pub tombstone_sha256: String,
+    /// Undo rows present; retention-dependent and excluded from the digest.
+    pub undo_entries: u64,
+    /// SHA-256 over the identity height/hash/serialized-hash, the tip, and
+    /// the two table digests.
+    pub content_sha256: String,
+}
+
+/// Accumulates the per-table digests of [`OverlayContentAudit`].
+pub(crate) struct OverlayContentHasher {
+    overlay: sha2::Sha256,
+    overlay_raw: sha2::Sha256,
+    tombstone: sha2::Sha256,
+    pub(crate) overlay_entries: u64,
+    pub(crate) overlay_key_bytes: u64,
+    pub(crate) overlay_value_bytes: u64,
+    pub(crate) tombstone_entries: u64,
+    pub(crate) undo_entries: u64,
+}
+
+impl OverlayContentHasher {
+    pub(crate) fn new() -> Self {
+        use sha2::Digest as _;
+        Self {
+            overlay: sha2::Sha256::new(),
+            overlay_raw: sha2::Sha256::new(),
+            tombstone: sha2::Sha256::new(),
+            overlay_entries: 0,
+            overlay_key_bytes: 0,
+            overlay_value_bytes: 0,
+            tombstone_entries: 0,
+            undo_entries: 0,
+        }
+    }
+
+    pub(crate) fn overlay_entry(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), SnapshotOverlayError> {
+        use sha2::Digest as _;
+        self.overlay_raw
+            .update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_be_bytes());
+        self.overlay_raw.update(key);
+        self.overlay_raw
+            .update(u32::try_from(value.len()).unwrap_or(u32::MAX).to_be_bytes());
+        self.overlay_raw.update(value);
+        let utxo = Utxo::decode(value)?;
+        self.overlay
+            .update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_be_bytes());
+        self.overlay.update(key);
+        self.overlay.update(utxo.value_sats.to_be_bytes());
+        self.overlay.update(utxo.height.to_be_bytes());
+        self.overlay.update([u8::from(utxo.is_coinbase)]);
+        self.overlay.update(utxo.creation_mtp.to_be_bytes());
+        self.overlay.update(
+            u32::try_from(utxo.script_pubkey.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        self.overlay.update(&utxo.script_pubkey);
+        self.overlay_entries += 1;
+        self.overlay_key_bytes += key.len() as u64;
+        self.overlay_value_bytes += value.len() as u64;
+        Ok(())
+    }
+
+    pub(crate) fn tombstone_entry(&mut self, key: &[u8]) {
+        use sha2::Digest as _;
+        self.tombstone
+            .update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_be_bytes());
+        self.tombstone.update(key);
+        self.tombstone_entries += 1;
+    }
+
+    pub(crate) fn finish(
+        self,
+        engine: &'static str,
+        identity: SnapshotBaseIdentity,
+        tip: ExecutionTip,
+    ) -> OverlayContentAudit {
+        use sha2::Digest as _;
+        let overlay_sha256 = hex_lower(&self.overlay.finalize());
+        let overlay_raw_sha256 = hex_lower(&self.overlay_raw.finalize());
+        let tombstone_sha256 = hex_lower(&self.tombstone.finalize());
+        let mut content = sha2::Sha256::new();
+        content.update(identity.height.to_be_bytes());
+        content.update(identity.block_hash.as_byte_array());
+        content.update(identity.hash_serialized.as_bytes());
+        content.update(tip.height.to_be_bytes());
+        content.update(tip.hash.as_byte_array());
+        content.update(overlay_sha256.as_bytes());
+        content.update(tombstone_sha256.as_bytes());
+        OverlayContentAudit {
+            engine,
+            identity,
+            tip,
+            overlay_entries: self.overlay_entries,
+            overlay_key_bytes: self.overlay_key_bytes,
+            overlay_value_bytes: self.overlay_value_bytes,
+            overlay_sha256,
+            overlay_raw_sha256,
+            tombstone_entries: self.tombstone_entries,
+            tombstone_sha256,
+            undo_entries: self.undo_entries,
+            content_sha256: hex_lower(&content.finalize()),
+        }
+    }
+}
+
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+impl SnapshotOverlayChainstate {
+    /// Hashes the logical content of an existing MDBX overlay without
+    /// touching the base snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the environment cannot be opened, a table or the identity or
+    /// tip is missing, or a record does not decode.
+    pub fn audit_content(
+        database_dir: &Path,
+        capacity_bytes: u64,
+    ) -> Result<OverlayContentAudit, SnapshotOverlayError> {
+        let db = open_environment(database_dir, capacity_bytes)?;
+        let transaction = db.begin_ro_txn()?;
+        let meta = transaction.open_table(Some(META))?;
+        let identity = transaction
+            .get::<Vec<u8>>(&meta, META_IDENTITY)?
+            .ok_or(SnapshotOverlayError::Invalid("overlay has no identity"))?;
+        let identity = decode_identity(&identity)?;
+        let tip = Self::read_tip(&transaction, &meta)
+            .map_err(|_| SnapshotOverlayError::Invalid("overlay has no tip"))?;
+        let mut hasher = OverlayContentHasher::new();
+        {
+            let overlay = transaction.open_table(Some(OVERLAY))?;
+            let mut cursor = transaction.cursor(&overlay)?;
+            for row in cursor.iter_start::<Vec<u8>, Vec<u8>>() {
+                let (key, value) = row?;
+                hasher.overlay_entry(&key, &value)?;
+            }
+        }
+        {
+            let tombstone = transaction.open_table(Some(TOMBSTONE))?;
+            let mut cursor = transaction.cursor(&tombstone)?;
+            for row in cursor.iter_start::<Vec<u8>, ()>() {
+                let (key, ()) = row?;
+                hasher.tombstone_entry(&key);
+            }
+        }
+        {
+            let undo = transaction.open_table(Some(UNDO))?;
+            hasher.undo_entries =
+                u64::try_from(transaction.table_stat(&undo)?.entries()).unwrap_or(u64::MAX);
+        }
+        Ok(hasher.finish("mdbx", identity, tip))
+    }
+}
+
 fn open_environment(
     database_dir: &Path,
     capacity_bytes: u64,
@@ -3503,7 +3759,7 @@ pub(crate) mod tests {
     ///
     /// Set `RBTC_DEBUG_OVERLAY_MDBX` and `RBTC_DEBUG_CAPACITY_BYTES`.
     #[test]
-    #[ignore]
+    #[ignore = "requires an operator-provided MDBX environment"]
     fn diagnose_capacity_accounting() {
         let (Ok(overlay_mdbx), Ok(capacity_bytes)) = (
             std::env::var("RBTC_DEBUG_OVERLAY_MDBX"),
@@ -3562,7 +3818,7 @@ pub(crate) mod tests {
     /// Set `RBTC_DEBUG_BASE_SNAPSHOT`, `RBTC_DEBUG_OVERLAY_MDBX`,
     /// `RBTC_DEBUG_BASE_HEIGHT`, and `RBTC_DEBUG_REBASED_SNAPSHOT` to run it.
     #[test]
-    #[ignore]
+    #[ignore = "requires operator-provided snapshots and an MDBX environment"]
     #[allow(clippy::too_many_lines)]
     fn diagnose_rebase_commitment_mismatch() {
         let (Ok(base_snapshot), Ok(overlay_mdbx), Ok(base_height), Ok(rebased_snapshot)) = (

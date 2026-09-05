@@ -225,6 +225,46 @@ impl SnapshotOverlayRedbChainstate {
             .transpose()
     }
 
+    /// Hashes the logical content of an existing redb overlay without
+    /// touching the base snapshot; same digest definition as the MDBX engine.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the database cannot be opened, a table or the identity or tip
+    /// is missing, or a record does not decode.
+    pub fn audit_content(
+        database_path: &Path,
+    ) -> Result<crate::snapshot_overlay::OverlayContentAudit, SnapshotOverlayError> {
+        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let transaction = db.begin_read().map_err(overlay_redb)?;
+        let meta = transaction.open_table(META).map_err(overlay_redb)?;
+        let identity = meta
+            .get(META_IDENTITY)
+            .map_err(overlay_redb)?
+            .ok_or(SnapshotOverlayError::Invalid("overlay has no identity"))?;
+        let identity = decode_identity(identity.value())?;
+        let tip = meta
+            .get(META_TIP)
+            .map_err(overlay_redb)?
+            .ok_or(SnapshotOverlayError::Invalid("overlay has no tip"))?;
+        let tip = crate::snapshot_overlay::decode_tip(tip.value())
+            .map_err(|_| SnapshotOverlayError::Invalid("overlay tip does not decode"))?;
+        let mut hasher = crate::snapshot_overlay::OverlayContentHasher::new();
+        let overlay = transaction.open_table(OVERLAY).map_err(overlay_redb)?;
+        for row in overlay.iter().map_err(overlay_redb)? {
+            let (key, value) = row.map_err(overlay_redb)?;
+            hasher.overlay_entry(key.value(), value.value())?;
+        }
+        let tombstone = transaction.open_table(TOMBSTONE).map_err(overlay_redb)?;
+        for row in tombstone.iter().map_err(overlay_redb)? {
+            let (key, _unit) = row.map_err(overlay_redb)?;
+            hasher.tombstone_entry(key.value());
+        }
+        let undo = transaction.open_table(UNDO).map_err(overlay_redb)?;
+        hasher.undo_entries = undo.len().map_err(overlay_redb)?;
+        Ok(hasher.finish("redb", identity, tip))
+    }
+
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.write_guard
             .lock()
@@ -920,6 +960,31 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
     }
 }
 
+impl SnapshotOverlayRedbChainstate {
+    /// One durable transaction: per-block tips and undo records, then the
+    /// batch's folded net change in a single mutation pass.
+    fn commit_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        let _guard = self.lock();
+        let transaction = self.begin_durable_write()?;
+        for transition in transitions {
+            Self::advance_tip(&transaction, transition.expected_parent, transition.next)?;
+            let mut undo_table = transaction.open_table(UNDO)?;
+            undo_table.insert(
+                transition.next.hash.to_byte_array().as_slice(),
+                compress_block_undo(&transition.transaction_undos)?.as_slice(),
+            )?;
+        }
+        self.connect_mutation(&transaction, spent, created)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
 impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db.begin_read()?;
@@ -982,19 +1047,19 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
             return Ok(());
         }
         let (spent, created) = crate::snapshot_overlay::fold_connect_batch(transitions)?;
-        let _guard = self.lock();
-        let transaction = self.begin_durable_write()?;
-        for transition in transitions {
-            Self::advance_tip(&transaction, transition.expected_parent, transition.next)?;
-            let mut undo_table = transaction.open_table(UNDO)?;
-            undo_table.insert(
-                transition.next.hash.to_byte_array().as_slice(),
-                compress_block_undo(&transition.transaction_undos)?.as_slice(),
-            )?;
+        self.commit_folded(transitions, &spent, &created)
+    }
+
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        if transitions.is_empty() {
+            return Ok(());
         }
-        self.connect_mutation(&transaction, &spent, &created)?;
-        transaction.commit()?;
-        Ok(())
+        self.commit_folded(transitions, spent, created)
     }
 
     fn commit_disconnect(

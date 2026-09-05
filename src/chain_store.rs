@@ -420,6 +420,7 @@ fn validation_bloom_hashes(outpoint: OutPointKey) -> (u64, u64) {
 }
 
 /// One already-validated active-chain transition in an atomic IBD checkpoint.
+#[derive(Clone)]
 pub struct ConnectTransition {
     /// Hash the durable tip must currently have.
     pub expected_parent: BlockHash,
@@ -450,6 +451,28 @@ pub trait ExecutionChainStore: UtxoStore {
     fn block_undo(&self, hash: BlockHash) -> Result<Option<Vec<UtxoUndo>>, ChainStoreError>;
     /// Reports whether connect transitions must carry block undo data.
     fn retains_block_undo(&self) -> bool;
+    /// Brings coins read through this store during the previous batch up to
+    /// date with what that batch committed since. Even a durable store must
+    /// refresh values that were read before the previous commit completed.
+    fn reconcile_prefetch(
+        &self,
+        entries: &mut [(OutPointKey, Option<Utxo>)],
+    ) -> Result<(), UtxoError> {
+        let keys: Vec<_> = entries.iter().map(|(key, _)| *key).collect();
+        let current = self.get_many(&keys)?;
+        if current.len() != entries.len()
+            || current
+                .iter()
+                .zip(&keys)
+                .any(|((key, _), expected)| key != expected)
+        {
+            return Err(UtxoError::Malformed(
+                "prefetch refresh returned misaligned coins",
+            ));
+        }
+        entries.clone_from_slice(&current);
+        Ok(())
+    }
 
     /// Reads and clears this store's commit profile, if it keeps one.
     ///
@@ -477,6 +500,51 @@ pub trait ExecutionChainStore: UtxoStore {
         &self,
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError>;
+    /// Commits a batch the caller no longer needs.
+    ///
+    /// Stores that keep transitions past the call (a write-back buffer) take
+    /// them by value instead of cloning; the default borrows and commits.
+    fn commit_connect_batch_owned(
+        &self,
+        transitions: Vec<ConnectTransition>,
+    ) -> Result<(), ChainStoreError> {
+        self.commit_connect_batch(&transitions)
+    }
+    /// Commits a batch whose net coin change the caller already folded.
+    ///
+    /// `transitions` carry the per-block tips and undo records; their own
+    /// coin lists are ignored (a write-back buffer drains them as it folds).
+    /// `spent` and `created` are the batch's net change in key order. The
+    /// default walks the blocks with [`Self::commit_connect`], landing the
+    /// coins with the final block — correct but not atomic across blocks;
+    /// engines with an atomic batch commit override it.
+    fn commit_connect_folded(
+        &self,
+        transitions: &[ConnectTransition],
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<(), ChainStoreError> {
+        let Some((last, rest)) = transitions.split_last() else {
+            return Ok(());
+        };
+        for transition in rest {
+            self.commit_connect(
+                transition.expected_parent,
+                transition.next,
+                &[],
+                &[],
+                &transition.transaction_undos,
+            )?;
+        }
+        self.commit_connect(
+            last.expected_parent,
+            last.next,
+            spent,
+            created,
+            &last.transaction_undos,
+        )?;
+        Ok(())
+    }
     /// Reverses the tip block and removes its undo in one transaction.
     fn commit_disconnect(
         &self,

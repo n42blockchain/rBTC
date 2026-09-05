@@ -19,14 +19,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
         with:
           components: rustfmt, clippy, llvm-tools-preview
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: contrib/btcd_storage_bench/go.mod
+          cache-dependency-path: contrib/btcd_storage_bench/go.sum
       - run: cargo fmt --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: bash -n scripts/*.sh
+      - run: sh -n contrib/run_mdbx_replacement_gate.sh
       - run: scripts/test-release-manifest.sh
       - run: scripts/test-public-network-soak-monitor.sh
       - run: scripts/test-public-network-soak-report.sh
       - run: scripts/test-public-network-soak-exercise.sh
       - run: scripts/enrich-historical-utxos.py --self-test
+      - run: go test ./...
+        working-directory: contrib/btcd_storage_bench
+      - run: go vet ./...
+        working-directory: contrib/btcd_storage_bench
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+        working-directory: contrib/btcd_storage_bench
+      - run: sh -n run_one_hour_matrix.sh
+        working-directory: contrib/btcd_storage_bench
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1

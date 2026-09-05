@@ -1,6 +1,6 @@
 use crate::{
     Cursor, Decodable, Error, Stat,
-    database::{Database, DatabaseKind, NoWriteMap, TxnManagerMessage, TxnPtr},
+    database::{Database, DatabaseKind, Info, NoWriteMap, TxnManagerMessage, TxnPtr},
     error::{Result, mdbx_result},
     flags::{TableFlags, WriteFlags, c_enum},
     table::Table,
@@ -108,6 +108,39 @@ where
     /// Returns the transaction id.
     pub fn id(&self) -> u64 {
         txn_execute(&self.txn, |txn| unsafe { ffi::mdbx_txn_id(txn) })
+    }
+
+    /// Environment info as seen by this transaction.
+    ///
+    /// Unlike [`Database::info`], which passes no transaction and therefore
+    /// lets libmdbx borrow a write transaction that another thread owns under
+    /// `MDBX_NOTLS`, this reads through the caller's own snapshot and is safe
+    /// to call while a writer is active elsewhere.
+    pub fn env_info(&self) -> Result<Info> {
+        txn_execute(&self.txn, |txn| unsafe {
+            let mut info = Info(std::mem::zeroed());
+            mdbx_result(ffi::mdbx_env_info_ex(
+                self.db.ptr().0,
+                txn,
+                &mut info.0,
+                std::mem::size_of::<Info>(),
+            ))?;
+            Ok(info)
+        })
+    }
+
+    /// Environment statistics as seen by this transaction (see [`Self::env_info`]).
+    pub fn env_stat(&self) -> Result<Stat> {
+        txn_execute(&self.txn, |txn| unsafe {
+            let mut stat = Stat::new();
+            mdbx_result(ffi::mdbx_env_stat_ex(
+                self.db.ptr().0,
+                txn,
+                stat.mdb_stat(),
+                std::mem::size_of::<Stat>(),
+            ))?;
+            Ok(stat)
+        })
     }
 
     /// Gets an item from a table.

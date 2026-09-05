@@ -91,6 +91,17 @@ impl BlockTemplate {
 /// Returns an error when a template transaction is a coinbase or when no
 /// nonce in the 32-bit search space satisfies the target.
 pub fn assemble_block(template: &BlockTemplate) -> Result<Block, BlockAssemblyError> {
+    grind_block(build_block(template)?, template.target)
+}
+
+/// Assembles one unsolved block from `template`, leaving the nonce at zero.
+///
+/// This is what a block template is: everything except the proof of work.
+///
+/// # Errors
+///
+/// Returns an error when a template transaction is a coinbase.
+pub fn build_block(template: &BlockTemplate) -> Result<Block, BlockAssemblyError> {
     if template.transactions.iter().any(Transaction::is_coinbase) {
         return Err(BlockAssemblyError::UnexpectedCoinbase);
     }
@@ -144,10 +155,25 @@ pub fn assemble_block(template: &BlockTemplate) -> Result<Block, BlockAssemblyEr
     block.header.merkle_root = block
         .compute_merkle_root()
         .expect("an assembled block always has transactions");
+    Ok(block)
+}
+
+/// Searches the 32-bit nonce space for a header meeting `target`.
+///
+/// Separate from [`build_block`] because a template server must never grind:
+/// it hands the unsolved block to whoever asked for it. Only callers that
+/// genuinely want a solved block — regtest fixtures, tests — grind here.
+///
+/// # Errors
+///
+/// Returns an error when no nonce in the 32-bit space satisfies `target`.
+/// A real miner rolls the coinbase or the timestamp at that point; this
+/// deliberately does neither, so a caller cannot mistake it for a miner.
+pub fn grind_block(mut block: Block, target: Target) -> Result<Block, BlockAssemblyError> {
     let mut nonce: u32 = 0;
     loop {
         block.header.nonce = nonce;
-        if block.header.validate_pow(template.target).is_ok() {
+        if block.header.validate_pow(target).is_ok() {
             return Ok(block);
         }
         nonce = match nonce.checked_add(1) {
@@ -160,6 +186,30 @@ pub fn assemble_block(template: &BlockTemplate) -> Result<Block, BlockAssemblyEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn building_a_template_leaves_the_proof_of_work_undone() {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let template = BlockTemplate::regtest(genesis.block_hash(), 1, 1_800_000_000);
+
+        let unsolved = build_block(&template).expect("the template builds");
+
+        assert_eq!(
+            unsolved.header.nonce, 0,
+            "a template server hands out an unsolved block; grinding is the miner's job"
+        );
+        assert_eq!(
+            unsolved.compute_merkle_root(),
+            Some(unsolved.header.merkle_root),
+            "everything except the nonce must already be committed"
+        );
+
+        let solved = grind_block(unsolved.clone(), template.target).expect("regtest grinds");
+        assert!(solved.header.validate_pow(template.target).is_ok());
+        assert_eq!(solved.header.merkle_root, unsolved.header.merkle_root);
+        assert_eq!(solved.txdata, unsolved.txdata);
+    }
+
     use crate::blockchain::validate_block_structure_with_deployments;
     use bitcoin::Network;
 

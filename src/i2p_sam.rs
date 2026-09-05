@@ -15,13 +15,20 @@
 //! The SAM bridge is a fully privileged local interface — it can open
 //! arbitrary streams on this node's behalf — so the connection is refused
 //! unless it is loopback.
+//!
+//! One property of I2P streaming differs from TCP and shapes how callers must
+//! close: a stream drops data the peer has not yet acknowledged. A live
+//! router was observed retransmitting a final frame ten times and then
+//! terminating the stream for want of an acknowledgement, which the peer saw
+//! as an early EOF. A side that writes last must therefore let the other side
+//! close first, rather than closing as soon as its own write returns.
 
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::p2p::{decode_base32, encode_base32};
@@ -36,6 +43,10 @@ const DESTINATION_HASH_LEN: usize = 32;
 const MAX_SESSION_ID_LEN: usize = 32;
 /// Bound on a destination key retained from the bridge.
 const MAX_DESTINATION_KEY_LEN: usize = 8 * 1024;
+/// Length of an I2P Destination before its certificate.
+const DESTINATION_BASE_LEN: usize = 387;
+/// Offset of the big-endian certificate length inside a Destination.
+const DESTINATION_CERT_LEN_OFFSET: usize = 385;
 
 /// I2P SAM failures.
 #[derive(Debug, Error)]
@@ -205,14 +216,15 @@ impl I2pSamSession {
         }
         let mut control = connect_and_greet(bridge, config).await?;
         let destination = destination_key.unwrap_or("TRANSIENT");
-        let reply = command(
-            &mut control,
-            &format!(
+        let request = match destination_key {
+            Some(_) => {
+                format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={destination}")
+            }
+            None => format!(
                 "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={destination} SIGNATURE_TYPE=7"
             ),
-            config,
-        )
-        .await?;
+        };
+        let reply = command(&mut control, &request, config).await?;
         let destination_key = field(&reply, "DESTINATION=")
             .ok_or(I2pSamError::MalformedReply)?
             .to_owned();
@@ -269,6 +281,56 @@ impl I2pSamSession {
     }
 }
 
+/// One accepted inbound I2P peer.
+pub struct AcceptedI2pPeer {
+    /// The stream carrying ordinary Bitcoin P2P bytes.
+    pub stream: TcpStream,
+    /// The dialling peer's destination.
+    ///
+    /// SAM reports the full Destination of the remote side, from which the
+    /// BIP155 address is derived, so an accepted peer can be recorded and
+    /// ranked exactly like a learned one.
+    pub peer: I2pAddress,
+}
+
+impl I2pSamSession {
+    /// Waits for one inbound stream on this session.
+    ///
+    /// Each accept occupies its own socket, so a caller that wants several
+    /// concurrent inbound peers calls this repeatedly; the bridge queues at
+    /// most one pending connection per outstanding accept. The returned
+    /// stream carries ordinary Bitcoin P2P bytes, so the caller drives the
+    /// same inbound handshake it would on a TCP peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bridge refuses the accept, reports a
+    /// destination this client cannot parse, or any bound is violated.
+    pub async fn accept_stream(&self) -> Result<AcceptedI2pPeer, I2pSamError> {
+        let mut stream = connect_and_greet(self.bridge, self.config).await?;
+        command(
+            &mut stream,
+            &format!("STREAM ACCEPT ID={} SILENT=false", self.session_id),
+            self.config,
+        )
+        .await?;
+        // With `SILENT=false` the bridge writes the dialling peer's
+        // Destination on its own line before any peer byte, so this must be
+        // read line-exactly for the same reason every other reply is: the
+        // very next byte belongs to the peer.
+        let destination = read_reply_line(&mut stream).await?;
+        let destination = destination
+            .split_whitespace()
+            .next()
+            .ok_or(I2pSamError::MalformedReply)?;
+        if destination.len() > MAX_DESTINATION_KEY_LEN {
+            return Err(I2pSamError::OversizedParameter);
+        }
+        let peer = I2pAddress::from_destination_hash(destination_hash(destination)?);
+        Ok(AcceptedI2pPeer { stream, peer })
+    }
+}
+
 /// Connects to the bridge and completes SAM version negotiation.
 async fn connect_and_greet(
     bridge: SocketAddr,
@@ -292,26 +354,15 @@ async fn command(
     config: I2pSamConfig,
 ) -> Result<String, I2pSamError> {
     tokio::time::timeout(config.timeout, async {
-        stream.write_all(request.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
+        // Keep the command and its terminator in one write. i2pd's SAM
+        // parser can close a connection when it observes a complete command
+        // line split across two TCP segments before the terminator arrives.
+        let mut wire = Vec::with_capacity(request.len() + 1);
+        wire.extend_from_slice(request.as_bytes());
+        wire.push(b'\n');
+        stream.write_all(&wire).await?;
         stream.flush().await?;
-        // The socket becomes a raw P2P stream after STREAM STATUS. Never
-        // read past the newline into a buffer that is discarded on return.
-        let mut reader = BufReader::with_capacity(1, &mut *stream);
-        let mut line = String::new();
-        let read = tokio::io::AsyncReadExt::take(&mut reader, MAX_REPLY_LINE_BYTES)
-            .read_line(&mut line)
-            .await?;
-        if read == 0 {
-            return Err(I2pSamError::MalformedReply);
-        }
-        if u64::try_from(read).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
-            return Err(I2pSamError::OversizedReply);
-        }
-        if !line.ends_with('\n') {
-            return Err(I2pSamError::MalformedReply);
-        }
-        let line = line.trim_end_matches(['\r', '\n']).to_owned();
+        let line = read_reply_line(stream).await?;
         let result = field(&line, "RESULT=").ok_or(I2pSamError::MalformedReply)?;
         if result != "OK" {
             return Err(I2pSamError::CommandFailed {
@@ -325,19 +376,63 @@ async fn command(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sam command timed out"))?
 }
 
+/// Reads exactly one bounded reply line, consuming no byte beyond it.
+///
+/// Buffered reads must not be used here. A bridge may coalesce a reply with
+/// whatever follows it in one segment, and after `STREAM CONNECT` what
+/// follows is the peer's own traffic: a buffer that read ahead would either
+/// swallow the next reply or silently consume the first bytes of the
+/// Bitcoin stream. Reading a byte at a time costs one syscall per byte on a
+/// handful of short control lines and keeps the socket positioned exactly
+/// after the newline.
+async fn read_reply_line(stream: &mut (impl AsyncRead + Unpin)) -> Result<String, I2pSamError> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream.read_exact(&mut byte).await.map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                I2pSamError::MalformedReply
+            } else {
+                I2pSamError::Io(error)
+            }
+        })?;
+        debug_assert_eq!(read, 1);
+        if byte[0] == b'\n' {
+            break;
+        }
+        if u64::try_from(line.len()).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
+            return Err(I2pSamError::OversizedReply);
+        }
+        line.push(byte[0]);
+    }
+    let line = String::from_utf8(line).map_err(|_| I2pSamError::MalformedReply)?;
+    Ok(line.trim_end_matches('\r').to_owned())
+}
+
 /// Computes the BIP155 destination hash of a SAM destination key.
+///
+/// SAM's `DESTINATION=` value is the private-key blob, which begins with the
+/// public Destination and then carries the private signing and encryption
+/// keys. Only the Destination is hashed: it is 387 bytes plus the
+/// certificate length stored big-endian at offsets 385..387. Hashing the
+/// whole blob instead yields a well-formed but unreachable `.b32.i2p` name,
+/// because no peer can derive it from the Destination this node publishes.
 fn destination_hash(destination_key: &str) -> Result<[u8; DESTINATION_HASH_LEN], I2pSamError> {
     use sha2::{Digest, Sha256};
     // SAM renders destinations in I2P's base64 alphabet, which substitutes
     // `-` and `~` for `+` and `/`.
     let decoded = decode_i2p_base64(destination_key).ok_or(I2pSamError::MalformedReply)?;
-    // A SAM private key file starts with a public Destination: 256 bytes
-    // encryption key/padding, 128 bytes signing key/padding, and a certificate
-    // (type byte, two-byte big-endian length, payload). Private keys follow
-    // the certificate and must never contribute to the advertised address.
-    let length = decoded.get(385..387).ok_or(I2pSamError::MalformedReply)?;
-    let end = 387 + usize::from(u16::from_be_bytes([length[0], length[1]]));
-    let destination = decoded.get(..end).ok_or(I2pSamError::MalformedReply)?;
+    let certificate_length = decoded
+        .get(DESTINATION_CERT_LEN_OFFSET..DESTINATION_BASE_LEN)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_be_bytes)
+        .ok_or(I2pSamError::MalformedReply)?;
+    let destination_length = DESTINATION_BASE_LEN
+        .checked_add(usize::from(certificate_length))
+        .ok_or(I2pSamError::MalformedReply)?;
+    let destination = decoded
+        .get(..destination_length)
+        .ok_or(I2pSamError::MalformedReply)?;
     Ok(Sha256::digest(destination).into())
 }
 
@@ -398,7 +493,7 @@ mod tests {
     use super::*;
     use sha2::Digest;
     use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     /// A destination key in I2P's base64 alphabet.
@@ -418,11 +513,56 @@ mod tests {
         "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg==",
     );
 
+    /// Encodes bytes in I2P's base64 alphabet, the inverse of the decoder.
+    fn encode_i2p_base64(input: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+        let mut output = String::new();
+        let mut accumulator: u32 = 0;
+        let mut bits = 0_u32;
+        for byte in input {
+            accumulator = (accumulator << 8) | u32::from(*byte);
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                output.push(char::from(
+                    ALPHABET[usize::try_from((accumulator >> bits) & 0x3f).expect("masked")],
+                ));
+            }
+        }
+        if bits > 0 {
+            output.push(char::from(
+                ALPHABET[usize::try_from((accumulator << (6 - bits)) & 0x3f).expect("masked")],
+            ));
+        }
+        output
+    }
+
+    /// Builds a structurally realistic SAM destination key.
+    ///
+    /// A real value is the private-key blob: a 387-byte Destination with a
+    /// zero certificate length at offsets 385..387, followed by the private
+    /// signing and encryption keys. Only the Destination prefix determines
+    /// the published `.b32.i2p` address.
+    fn test_destination_blob() -> Vec<u8> {
+        let mut blob = (0..663_u32)
+            .map(|index| u8::try_from(index % 251).expect("modulus fits a byte"))
+            .collect::<Vec<_>>();
+        blob[DESTINATION_CERT_LEN_OFFSET] = 0;
+        blob[DESTINATION_CERT_LEN_OFFSET + 1] = 0;
+        blob
+    }
+
+    fn test_destination() -> String {
+        encode_i2p_base64(&test_destination_blob())
+    }
+
     /// A SAM bridge answering the subset this client speaks.
     ///
     /// Connections are served concurrently because a session holds its
     /// control socket open while every outbound peer opens another one.
     fn serve_sam_bridge(listener: TcpListener, version: &'static str) -> Arc<Mutex<Vec<String>>> {
+        let destination = test_destination();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&commands);
         tokio::spawn(async move {
@@ -431,6 +571,7 @@ mod tests {
                     return;
                 };
                 let recorded = Arc::clone(&recorded);
+                let destination = destination.clone();
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
@@ -447,9 +588,14 @@ mod tests {
                         let reply = if line.starts_with("HELLO") {
                             format!("HELLO REPLY RESULT=OK VERSION={version}\n")
                         } else if line.starts_with("SESSION CREATE") {
-                            format!("SESSION STATUS RESULT=OK DESTINATION={TEST_DESTINATION}\n")
+                            format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n")
                         } else if line.starts_with("STREAM CONNECT") {
                             "STREAM STATUS RESULT=OK\n".to_owned()
+                        } else if line.starts_with("STREAM ACCEPT") {
+                            // Status, then the dialling peer's destination,
+                            // then the peer's own first bytes — all in one
+                            // write, which is what a bridge may really do.
+                            format!("STREAM STATUS RESULT=OK\n{destination}\nPEER-PAYLOAD")
                         } else {
                             "RESULT=I2P_ERROR MESSAGE=\"unsupported command\"\n".to_owned()
                         };
@@ -500,11 +646,21 @@ mod tests {
         let session = I2pSamSession::create(bridge, "rbtc-test", None, I2pSamConfig::default())
             .await
             .expect("the session is created");
-        assert_eq!(session.destination_key(), TEST_DESTINATION);
+        assert_eq!(session.destination_key(), test_destination());
+        // The address must hash only the Destination prefix, never the
+        // private-key tail that follows it in the SAM blob.
+        let blob = test_destination_blob();
         let expected = I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(
-            &decode_i2p_base64(TEST_DESTINATION).unwrap()[..391],
+            &blob[..DESTINATION_BASE_LEN],
         )));
         assert_eq!(session.address(), &expected);
+        let whole_blob =
+            I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(&blob)));
+        assert_ne!(
+            session.address(),
+            &whole_blob,
+            "hashing the private-key tail as well would publish an address no peer can reach"
+        );
 
         let peer = I2pAddress::from_destination_hash([0x11; DESTINATION_HASH_LEN]);
         let stream = session
@@ -529,6 +685,119 @@ mod tests {
                     "STREAM CONNECT ID=rbtc-test DESTINATION={} SILENT=false",
                     peer.name()
                 )),
+            "{commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_destination_keys_do_not_set_a_transient_signature_type() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        let commands = serve_sam_bridge(listener, "3.3");
+
+        let session = I2pSamSession::create(
+            bridge,
+            "rbtc-replay",
+            Some(&test_destination()),
+            I2pSamConfig::default(),
+        )
+        .await
+        .expect("the persisted destination key is accepted");
+        assert_eq!(session.destination_key(), test_destination());
+
+        let commands = commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            commands[1],
+            "SESSION CREATE STYLE=STREAM ID=rbtc-replay DESTINATION=".to_owned()
+                + &test_destination()
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_replies_are_read_one_line_at_a_time() {
+        // A real router may put the HELLO reply and the session status in one
+        // segment. A buffered reader would swallow the second line with the
+        // first and report a malformed reply; this reproduces that shape.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        let destination = test_destination();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("HELLO"),
+                "the client greets first"
+            );
+            // Both replies in one write, before the client sends its second
+            // command.
+            stream
+                .write_all(
+                    format!(
+                        "HELLO REPLY RESULT=OK VERSION=3.3
+SESSION STATUS RESULT=OK DESTINATION={destination}
+"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut sink = [0_u8; 256];
+            let _ = stream.read(&mut sink).await;
+            std::future::pending::<()>().await;
+        });
+
+        let session =
+            I2pSamSession::create(bridge, "rbtc-coalesced", None, I2pSamConfig::default())
+                .await
+                .expect("a coalesced reply pair must still be parsed line by line");
+        assert_eq!(session.destination_key(), test_destination());
+    }
+
+    #[tokio::test]
+    async fn accepted_streams_report_the_peer_and_keep_its_first_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge = listener.local_addr().unwrap();
+        let commands = serve_sam_bridge(listener, "3.3");
+
+        let session = I2pSamSession::create(bridge, "rbtc-accept", None, I2pSamConfig::default())
+            .await
+            .expect("the session is created");
+        let mut accepted = session.accept_stream().await.expect("an inbound stream");
+
+        // The mock announces this node's own destination, which is enough to
+        // prove the reported peer is derived from the announced Destination
+        // rather than invented.
+        let blob = test_destination_blob();
+        assert_eq!(
+            accepted.peer,
+            I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(
+                &blob[..DESTINATION_BASE_LEN]
+            )))
+        );
+
+        // Everything after the destination line belongs to the peer and must
+        // still be readable: consuming one byte too many here would corrupt
+        // the Bitcoin handshake that follows.
+        let mut payload = [0_u8; 12];
+        accepted
+            .stream
+            .read_exact(&mut payload)
+            .await
+            .expect("the peer's first bytes survive the accept");
+        assert_eq!(&payload, b"PEER-PAYLOAD");
+
+        let commands = commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "STREAM ACCEPT ID=rbtc-accept SILENT=false"),
             "{commands:?}"
         );
     }

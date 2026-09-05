@@ -7,6 +7,8 @@ use std::{
     thread,
 };
 
+#[cfg(any(test, feature = "mdbx"))]
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{OutPoint, Txid, hashes::Hash};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use sha2::{Digest, Sha256};
@@ -83,7 +85,11 @@ pub enum UtxoError {
     DuplicateSpend(OutPointKey),
 }
 
-/// A fixed-width Bitcoin outpoint key: wire-order txid followed by vout (LE).
+/// A fixed-width legacy rBTC outpoint key: wire-order txid followed by vout (LE).
+///
+/// The new MDBX chainstate translates this API key to a big-endian vout suffix
+/// at its storage boundary. Keeping this established representation unchanged
+/// preserves existing redb databases and snapshot commitments.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OutPointKey([u8; 36]);
 
@@ -126,7 +132,13 @@ impl std::fmt::Display for OutPointKey {
     }
 }
 
-/// The consensus-relevant data of an unspent transaction output plus storage metadata.
+/// The consensus-relevant data of an unspent transaction output.
+///
+/// The new MDBX UTXO values use Bitcoin Core/btcd's compact coin encoding and
+/// only persist `value_sats`, `height`, `is_coinbase`, and `script_pubkey`.
+/// `creation_mtp` is hydrated from height-indexed metadata. `last_touched`
+/// remains in this shared API for legacy redb compatibility, but MDBX neither
+/// persists it nor uses it for tier placement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Utxo {
     /// Value in satoshis.
@@ -165,6 +177,26 @@ impl Utxo {
         Ok(())
     }
 
+    /// Encodes a durable MDBX coin using Bitcoin Core/btcd's compact format.
+    #[cfg(any(test, feature = "mdbx"))]
+    pub(crate) fn encode_compact(&self) -> Result<Vec<u8>, UtxoError> {
+        let mut bytes = Vec::with_capacity(12 + self.script_pubkey.len());
+        self.encode_compact_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    #[cfg(any(test, feature = "mdbx"))]
+    fn encode_compact_into(&self, bytes: &mut Vec<u8>) -> Result<(), UtxoError> {
+        let header_code = u64::from(self.height)
+            .checked_mul(2)
+            .and_then(|code| code.checked_add(u64::from(self.is_coinbase)))
+            .ok_or(UtxoError::Malformed("UTXO header code overflow"))?;
+        encode_vlq(bytes, header_code);
+        encode_vlq(bytes, compress_amount(self.value_sats));
+        encode_script(bytes, &self.script_pubkey)?;
+        Ok(())
+    }
+
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
         Self::validate_encoded(bytes)?;
         let value_sats = u64::from_le_bytes(bytes[..8].try_into().expect("checked length"));
@@ -182,6 +214,33 @@ impl Utxo {
         })
     }
 
+    /// Decodes a compact MDBX coin and attaches MTP obtained by creation height.
+    #[cfg(any(test, feature = "mdbx"))]
+    pub(crate) fn decode_compact_with_creation_mtp(
+        bytes: &[u8],
+        creation_mtp: u32,
+    ) -> Result<Self, UtxoError> {
+        let mut cursor = 0;
+        let header_code = decode_vlq(bytes, &mut cursor, "UTXO header code")?;
+        let height = u32::try_from(header_code >> 1)
+            .map_err(|_| UtxoError::Malformed("UTXO height exceeds u32"))?;
+        let is_coinbase = header_code & 1 != 0;
+        let compressed_amount = decode_vlq(bytes, &mut cursor, "compressed amount")?;
+        let value_sats = decompress_amount(compressed_amount)?;
+        let script_pubkey = decode_script(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(UtxoError::Malformed("trailing UTXO bytes"));
+        }
+        Ok(Self {
+            value_sats,
+            height,
+            is_coinbase,
+            last_touched: 0,
+            creation_mtp,
+            script_pubkey,
+        })
+    }
+
     pub(crate) fn validate_encoded(bytes: &[u8]) -> Result<(), UtxoError> {
         if bytes.len() < 29 {
             return Err(UtxoError::Malformed("record header"));
@@ -196,6 +255,193 @@ impl Utxo {
             return Err(UtxoError::Malformed("script length"));
         }
         Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+const SPECIAL_SCRIPT_COUNT: u64 = 6;
+
+#[cfg(any(test, feature = "mdbx"))]
+fn encode_vlq(target: &mut Vec<u8>, mut value: u64) {
+    let start = target.len();
+    loop {
+        let continuation = u8::from(target.len() != start) << 7;
+        target.push(u8::try_from(value & 0x7f).expect("masked to seven bits") | continuation);
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7) - 1;
+    }
+    target[start..].reverse();
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+fn decode_vlq(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Result<u64, UtxoError> {
+    let start = *cursor;
+    let mut value = 0_u64;
+    loop {
+        let byte = *bytes.get(*cursor).ok_or(UtxoError::Malformed(field))?;
+        *cursor += 1;
+        value = value
+            .checked_mul(128)
+            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
+            .ok_or(UtxoError::Malformed(field))?;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        value = value.checked_add(1).ok_or(UtxoError::Malformed(field))?;
+    }
+    let mut canonical = Vec::new();
+    encode_vlq(&mut canonical, value);
+    if canonical.as_slice() != &bytes[start..*cursor] {
+        return Err(UtxoError::Malformed("non-canonical VLQ"));
+    }
+    Ok(value)
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+fn compress_amount(mut amount: u64) -> u64 {
+    if amount == 0 {
+        return 0;
+    }
+    let mut exponent = 0_u64;
+    while amount % 10 == 0 && exponent < 9 {
+        amount /= 10;
+        exponent += 1;
+    }
+    if exponent < 9 {
+        let digit = amount % 10;
+        amount /= 10;
+        1 + 10 * (9 * amount + digit - 1) + exponent
+    } else {
+        10 + 10 * (amount - 1)
+    }
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+fn decompress_amount(mut amount: u64) -> Result<u64, UtxoError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    amount -= 1;
+    let exponent = amount % 10;
+    amount /= 10;
+    let mut value = if exponent < 9 {
+        let digit = amount % 9 + 1;
+        amount /= 9;
+        amount
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or(UtxoError::Malformed("compressed amount overflow"))?
+    } else {
+        amount
+            .checked_add(1)
+            .ok_or(UtxoError::Malformed("compressed amount overflow"))?
+    };
+    for _ in 0..exponent {
+        value = value
+            .checked_mul(10)
+            .ok_or(UtxoError::Malformed("compressed amount overflow"))?;
+    }
+    Ok(value)
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+fn encode_script(target: &mut Vec<u8>, script: &[u8]) -> Result<(), UtxoError> {
+    if script.len() == 25 && script[..3] == [0x76, 0xa9, 0x14] && script[23..] == [0x88, 0xac] {
+        target.push(0);
+        target.extend_from_slice(&script[3..23]);
+        return Ok(());
+    }
+    if script.len() == 23 && script[..2] == [0xa9, 0x14] && script[22] == 0x87 {
+        target.push(1);
+        target.extend_from_slice(&script[2..22]);
+        return Ok(());
+    }
+    let public_key = match script {
+        [0x21, key @ .., 0xac] if key.len() == 33 && matches!(key[0], 0x02 | 0x03) => {
+            PublicKey::from_slice(key).ok().map(|_| key)
+        }
+        [0x41, key @ .., 0xac] if key.len() == 65 && key[0] == 0x04 => {
+            PublicKey::from_slice(key).ok().map(|_| key)
+        }
+        _ => None,
+    };
+    if let Some(public_key) = public_key {
+        match public_key[0] {
+            0x02 | 0x03 => {
+                target.push(public_key[0]);
+                target.extend_from_slice(&public_key[1..33]);
+            }
+            0x04 => {
+                target.push(0x04 | (public_key[64] & 1));
+                target.extend_from_slice(&public_key[1..33]);
+            }
+            _ => unreachable!("validated public key encoding"),
+        }
+        return Ok(());
+    }
+    let length = u64::try_from(script.len())
+        .map_err(|_| UtxoError::Malformed("script length exceeds u64"))?
+        .checked_add(SPECIAL_SCRIPT_COUNT)
+        .ok_or(UtxoError::Malformed("script length overflow"))?;
+    encode_vlq(target, length);
+    target.extend_from_slice(script);
+    Ok(())
+}
+
+#[cfg(any(test, feature = "mdbx"))]
+fn decode_script(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, UtxoError> {
+    let encoded_size = decode_vlq(bytes, cursor, "compressed script type")?;
+    match encoded_size {
+        0 => {
+            let hash = take(bytes, cursor, 20, "compressed P2PKH")?;
+            let mut script = Vec::with_capacity(25);
+            script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+            script.extend_from_slice(hash);
+            script.extend_from_slice(&[0x88, 0xac]);
+            Ok(script)
+        }
+        1 => {
+            let hash = take(bytes, cursor, 20, "compressed P2SH")?;
+            let mut script = Vec::with_capacity(23);
+            script.extend_from_slice(&[0xa9, 0x14]);
+            script.extend_from_slice(hash);
+            script.push(0x87);
+            Ok(script)
+        }
+        2 | 3 => {
+            let x = take(bytes, cursor, 32, "compressed public key")?;
+            let mut script = Vec::with_capacity(35);
+            script.push(0x21);
+            script.push(u8::try_from(encoded_size).expect("special type fits u8"));
+            script.extend_from_slice(x);
+            PublicKey::from_slice(&script[1..34])
+                .map_err(|_| UtxoError::Malformed("invalid compressed public key"))?;
+            script.push(0xac);
+            Ok(script)
+        }
+        4 | 5 => {
+            let x = take(bytes, cursor, 32, "compressed public key")?;
+            let mut compressed = [0_u8; 33];
+            compressed[0] = u8::try_from(encoded_size - 2).expect("special type fits u8");
+            compressed[1..].copy_from_slice(x);
+            let public_key = PublicKey::from_slice(&compressed)
+                .map_err(|_| UtxoError::Malformed("invalid compressed public key"))?;
+            let mut script = Vec::with_capacity(67);
+            script.push(0x41);
+            script.extend_from_slice(&public_key.serialize_uncompressed());
+            script.push(0xac);
+            Ok(script)
+        }
+        length => {
+            let length = length
+                .checked_sub(SPECIAL_SCRIPT_COUNT)
+                .ok_or(UtxoError::Malformed("compressed script type"))?;
+            let length = usize::try_from(length)
+                .map_err(|_| UtxoError::Malformed("script length exceeds usize"))?;
+            Ok(take(bytes, cursor, length, "compressed script")?.to_vec())
+        }
     }
 }
 
@@ -455,6 +701,22 @@ pub trait UtxoStore: Send + Sync {
         created: &[(OutPointKey, Utxo)],
     ) -> Result<UtxoUndo, UtxoError> {
         self.apply_with_undo(spent, created)
+    }
+    /// Like [`Self::apply_with_undo_fresh_outputs`], for a caller that has
+    /// already loaded every spent coin and passes them in `spent` order.
+    ///
+    /// Validation loads each input once to check it and once more inside the
+    /// store to build undo; an in-memory overlay can take the loaded values
+    /// instead of looking them up again. The default ignores `prevouts` and
+    /// behaves exactly like the plain call, so durable stores are unaffected.
+    fn apply_with_undo_fresh_outputs_from_prevouts(
+        &self,
+        spent: &[OutPointKey],
+        prevouts: &[Utxo],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<UtxoUndo, UtxoError> {
+        let _ = prevouts;
+        self.apply_with_undo_fresh_outputs(spent, created)
     }
     /// Reverses one prior mutation using its undo data.
     fn undo(&self, undo: &UtxoUndo, now: u64, hot_window_secs: u64) -> Result<(), UtxoError>;
@@ -1433,6 +1695,115 @@ mod tests {
             store.apply(&[], &[(key, coin(1))]),
             Err(UtxoError::Duplicate(_))
         ));
+    }
+
+    #[test]
+    fn legacy_outpoint_key_keeps_little_endian_compatibility() {
+        let txid = Txid::from_byte_array([7; 32]);
+        let keys = [0_u32, 1, 255, 256, u32::MAX].map(|vout| {
+            let key = OutPointKey::from(OutPoint::new(txid, vout));
+            assert_eq!(&key.as_bytes()[32..], &vout.to_le_bytes());
+            key
+        });
+        assert!(
+            keys.iter()
+                .all(|key| key.as_bytes()[..32] == txid.to_byte_array())
+        );
+    }
+
+    #[test]
+    fn compact_coin_matches_btcd_p2pkh_vector_and_is_26_bytes() {
+        // btcd blockchain/chainio.go example 2 (block 113,931).
+        let encoded = decode_hex("8cf316800900b8025be1b3efc63b0ad48e7f9f10e87544528d58");
+        let mut script = vec![0x76, 0xa9, 0x14];
+        script.extend_from_slice(&decode_hex("b8025be1b3efc63b0ad48e7f9f10e87544528d58"));
+        script.extend_from_slice(&[0x88, 0xac]);
+        let coin = Utxo {
+            value_sats: 15_000_000,
+            height: 113_931,
+            is_coinbase: false,
+            last_touched: 123,
+            creation_mtp: 456,
+            script_pubkey: script,
+        };
+        assert_eq!(encoded.len(), 26);
+        assert_eq!(coin.encode_compact().unwrap(), encoded);
+        let decoded = Utxo::decode_compact_with_creation_mtp(&encoded, 456).unwrap();
+        assert_eq!(
+            decoded,
+            Utxo {
+                last_touched: 0,
+                ..coin
+            }
+        );
+    }
+
+    #[test]
+    fn compact_coin_matches_btcd_p2sh_vector() {
+        // btcd blockchain/chainio.go example 3 (block 338,156).
+        let encoded = decode_hex("a8a2588ba5b9e763011dd46a006572d820e448e12d2bbb38640bc718e6");
+        let mut script = vec![0xa9, 0x14];
+        script.extend_from_slice(&decode_hex("1dd46a006572d820e448e12d2bbb38640bc718e6"));
+        script.push(0x87);
+        let coin = Utxo {
+            value_sats: 366_875_659,
+            height: 338_156,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 789,
+            script_pubkey: script,
+        };
+        assert_eq!(coin.encode_compact().unwrap(), encoded);
+        assert_eq!(
+            Utxo::decode_compact_with_creation_mtp(&encoded, 789).unwrap(),
+            coin
+        );
+    }
+
+    #[test]
+    fn compact_amount_and_vlq_roundtrip_boundaries() {
+        for amount in [
+            0,
+            1,
+            1_000,
+            10_000,
+            12_345_678,
+            50_000_000,
+            100_000_000,
+            5_000_000_000,
+            2_100_000_000_000_000,
+        ] {
+            assert_eq!(decompress_amount(compress_amount(amount)).unwrap(), amount);
+        }
+        for value in [
+            0,
+            127,
+            128,
+            129,
+            255,
+            256,
+            16_511,
+            16_512,
+            2_113_663,
+            u64::MAX,
+        ] {
+            let mut encoded = Vec::new();
+            encode_vlq(&mut encoded, value);
+            let mut cursor = 0;
+            assert_eq!(decode_vlq(&encoded, &mut cursor, "test").unwrap(), value);
+            assert_eq!(cursor, encoded.len());
+        }
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
     }
 
     #[test]

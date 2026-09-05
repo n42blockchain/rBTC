@@ -317,7 +317,11 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         mempool_max_bytes: 300 * 1024 * 1024,
         only_net: rbtc::node::NodeOnlyNet::Any,
         proxy: None,
+        name_proxy: None,
         v2_transport: false,
+        asmap: rbtc::node::NodeAsmapSource::Embedded,
+        cjdns_reachable: false,
+        private_broadcast: false,
     };
     config.storage = NodeStorageConfig {
         prune_blocks: 576,
@@ -405,7 +409,10 @@ async fn host_can_run_two_isolated_nodes_in_one_runtime() {
         .launch()
         .unwrap();
 
-    timeout(Duration::from_secs(2), async {
+    // Both nodes must handshake, but the deadline only guards against a hang:
+    // a tight one turns ordinary scheduling delay on a loaded machine into a
+    // failure, which this test did twice while the suite ran in parallel.
+    timeout(Duration::from_secs(20), async {
         first_accepted.await.unwrap();
         second_accepted.await.unwrap();
     })
@@ -625,7 +632,8 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     assert_eq!(topic, b"sequence");
     assert_eq!(
         &body[..32],
-        bitcoin::hashes::Hash::as_byte_array(&block.block_hash())
+        display,
+        "Core reverses the hash on the sequence topic too, so it must match          the hashblock body byte for byte"
     );
     assert_eq!(body[32], b'C');
 

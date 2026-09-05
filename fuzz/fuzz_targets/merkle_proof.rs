@@ -12,11 +12,10 @@ fuzz_target!(|input: &[u8]| {
     let position = u32::from_le_bytes(input[32..36].try_into().expect("fixed position"));
     let expected_root =
         TxMerkleNode::from_byte_array(input[36..68].try_into().expect("fixed root"));
-    let (sibling_hashes, _) = input[68..].as_chunks::<32>();
-    let siblings = sibling_hashes
-        .iter()
+    let siblings = input[68..]
+        .chunks_exact(32)
         .take(33)
-        .map(|bytes| TxMerkleNode::from_byte_array(*bytes))
+        .map(|bytes| TxMerkleNode::from_byte_array(bytes.try_into().expect("fixed sibling")))
         .collect::<Vec<_>>();
     let _ = verify_transaction_merkle_proof(txid, position, &siblings, expected_root);
 });

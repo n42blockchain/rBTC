@@ -371,6 +371,101 @@ impl DeploymentConfig {
     }
 }
 
+/// One BIP9 deployment as a block template must present it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TemplateDeployment {
+    /// BIP9 deployment name, matching Core's `getblocktemplate` vocabulary.
+    pub name: &'static str,
+    /// Version bit this deployment signals on.
+    pub bit: u32,
+    /// Started: a miner may signal, and this node does by default.
+    pub signalling: bool,
+    /// Locked in: a miner must signal for the block to be counted correctly.
+    pub required: bool,
+}
+
+/// Block version for a template, with the deployments that produced it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TemplateVersionBits {
+    /// Version to put in the template's header.
+    pub version: i32,
+    /// Deployments currently signalling or requiring a bit.
+    pub deployments: Vec<TemplateDeployment>,
+}
+
+impl TemplateVersionBits {
+    /// Mask of bits a miner must not clear.
+    #[must_use]
+    pub fn required_mask(&self) -> u32 {
+        self.deployments
+            .iter()
+            .filter(|deployment| deployment.required)
+            .fold(0, |mask, deployment| mask | (1 << deployment.bit))
+    }
+}
+
+/// Computes the block version a template at `candidate_height` should carry.
+///
+/// The version is the BIP9 top bits with every started or locked-in
+/// deployment's bit set, raised to the buried minimum version for the height
+/// so a template can never fall below a version the validator already
+/// rejects. Deployments configured as always- or never-active contribute no
+/// bit: there is nothing left to signal about them.
+///
+/// In practice every deployment on the configured networks is long active, so
+/// this yields a bare `0x20000000` — but that value is now derived rather
+/// than assumed, and the machinery reports honestly if a future deployment is
+/// added.
+///
+/// # Errors
+///
+/// Returns an error when `headers` describes a different network than `config`.
+pub fn template_version_bits(
+    headers: &HeaderDag,
+    candidate_height: u32,
+    config: &DeploymentConfig,
+) -> Result<TemplateVersionBits, DeploymentConfigError> {
+    if headers.network() != config.network {
+        return Err(DeploymentConfigError::NetworkMismatch);
+    }
+    let mut deployments = Vec::new();
+    if config.taproot.start_time != ALWAYS_ACTIVE && config.taproot.start_time != NEVER_ACTIVE {
+        let state = threshold_state_cached(
+            headers,
+            candidate_height,
+            config.taproot,
+            &config.taproot_state_cache,
+        );
+        match state {
+            ThresholdState::Started => deployments.push(TemplateDeployment {
+                name: "taproot",
+                bit: TAPROOT_BIT,
+                signalling: true,
+                required: false,
+            }),
+            ThresholdState::LockedIn => deployments.push(TemplateDeployment {
+                name: "taproot",
+                bit: TAPROOT_BIT,
+                signalling: true,
+                required: true,
+            }),
+            ThresholdState::Defined | ThresholdState::Active | ThresholdState::Failed => {}
+        }
+    }
+    let signalled = deployments
+        .iter()
+        .fold(VERSION_BITS_TOP_BITS, |version, deployment| {
+            version | (1 << deployment.bit)
+        });
+    let version = i32::try_from(signalled)
+        .unwrap_or(i32::MAX)
+        .max(config.minimum_block_version(candidate_height));
+    Ok(TemplateVersionBits {
+        version,
+        deployments,
+    })
+}
+
 /// Derives block and script consensus flags for one candidate.
 ///
 /// Core 26 reduced block script flags to an unconditional
@@ -776,6 +871,56 @@ fn parse_hash(hash: &str) -> BlockHash {
 
 #[cfg(test)]
 mod tests {
+    use super::{TemplateVersionBits, template_version_bits};
+
+    #[test]
+    fn a_regtest_template_version_is_derived_rather_than_assumed() {
+        let config = DeploymentConfig::for_network(Network::Regtest);
+        let headers = HeaderDag::with_deployments(config.clone());
+
+        let bits = template_version_bits(&headers, 1, &config).expect("matching network");
+
+        assert_eq!(
+            bits.version,
+            i32::try_from(VERSION_BITS_TOP_BITS).unwrap(),
+            "every configured deployment is long active, so no bit is signalled"
+        );
+        assert!(bits.deployments.is_empty());
+        assert_eq!(bits.required_mask(), 0);
+        assert!(
+            bits.version >= config.minimum_block_version(1),
+            "a template must never fall below the buried version floor"
+        );
+    }
+
+    #[test]
+    fn template_version_bits_refuses_a_mismatched_network() {
+        let config = DeploymentConfig::for_network(Network::Regtest);
+        let headers = HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Signet));
+
+        assert!(matches!(
+            template_version_bits(&headers, 1, &config),
+            Err(DeploymentConfigError::NetworkMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_locked_in_deployment_is_reported_as_required() {
+        // Constructed directly: no configured network currently has a
+        // deployment in this state, but the template surface must report one
+        // correctly if a future soft fork reaches it.
+        let bits = TemplateVersionBits {
+            version: i32::try_from(VERSION_BITS_TOP_BITS | (1 << TAPROOT_BIT)).unwrap(),
+            deployments: vec![super::TemplateDeployment {
+                name: "taproot",
+                bit: TAPROOT_BIT,
+                signalling: true,
+                required: true,
+            }],
+        };
+        assert_eq!(bits.required_mask(), 1 << TAPROOT_BIT);
+    }
+
     use bitcoin::{
         TxMerkleNode,
         block::{Header, Version},

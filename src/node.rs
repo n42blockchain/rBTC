@@ -3,6 +3,7 @@
 mod config_file;
 
 use crate::i2p_sam::{I2pAddress, I2pSamSession};
+use crate::seed_name::{SeedName, SeedNameError, seed_name_wave};
 use crate::zmq_publisher::{ZmqNotifier, ZmqPublisher, ZmqPublisherConfig};
 use fs2::FileExt;
 use std::{
@@ -82,20 +83,22 @@ use bitcoin::{
 use rbtc::{
     api::{
         AuthorizationAuditLog, ExplorerEventHub, ExplorerEventKind, LocalAuthToken,
-        LocalRpcOperator, LocalRpcOperatorError, MAX_RPC_BODY_BYTES,
+        LocalRpcOperator, LocalRpcOperatorError, MAX_RPC_BODY_BYTES, RpcFuture,
         WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
         explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
     archive::bounded_archive_prefix_len,
+    asmap::Asmap,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
-        BlockDeploymentContext, BlockExecutionError,
+        ActiveBlockUtxoPrefetch, BlockDeploymentContext, BlockExecutionError,
         connect_prevalidated_active_blocks_with_breakdown,
         connect_prevalidated_active_blocks_with_txids_and_utxos, disconnect_execution_tip,
-        prefetch_prevalidated_active_block_utxos,
+        prefetch_active_block_utxos_from, prefetch_prevalidated_active_block_utxos,
     },
     blockchain::{
-        AppliedBlock, ValidatedBlockTransactionIds, validate_block_structure_with_deployments,
+        AppliedBlock, DeferredScriptBatch, ValidatedBlockTransactionIds,
+        validate_block_structure_with_deployments,
         validate_block_structure_with_deployments_and_txids,
     },
     chain_store::{
@@ -115,8 +118,8 @@ use rbtc::{
     headers::{HeaderDag, HeaderError, HeaderInfo},
     ibd::IbdPolicy,
     inbound::{
-        InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats, InboundStatsSnapshot,
-        TestAcceptResult, run_listener_with_stats_and_relay,
+        BlockSubmission, InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats,
+        InboundStatsSnapshot, TestAcceptResult, run_listener_with_i2p,
     },
     index_policy::{
         IndexBuildState, IndexHistoryAvailability, IndexKind, validate_index_activation,
@@ -144,8 +147,9 @@ use rbtc::{
     transaction_admission::{
         AdmittedTransactionRelay, MAX_ADMITTED_TRANSACTION_BYTES, MAX_ADMITTED_TRANSACTIONS,
         MAX_CONFIGURED_MEMPOOL_BYTES, MAX_CONFIGURED_MEMPOOL_TRANSACTIONS,
-        TransactionAdmissionContext, TransactionAdmissionPool, TransactionRequestId,
-        dependency_packages, transaction_descendant_closure,
+        MAX_MEMPOOL_CLUSTER_TRANSACTIONS, MAX_MEMPOOL_CLUSTER_VBYTES, TransactionAdmissionContext,
+        TransactionAdmissionPool, TransactionRequestId, dependency_packages,
+        transaction_descendant_closure,
     },
     transaction_pool_store::{DEFAULT_MEMPOOL_EXPIRY_SECS, RedbTransactionPoolStore},
     utxo::{DEFAULT_HOT_WINDOW_SECS, OutPointKey, Utxo, UtxoStore},
@@ -157,7 +161,9 @@ use rbtc::{
         parse_wallet_descriptor_config, read_persisted_wallet_sync_height,
     },
 };
-use tokio::sync::{broadcast, mpsc, watch};
+#[cfg(feature = "mdbx")]
+use rbtc::{block_execution::drain_script_batches, blockchain::BlockError};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -256,7 +262,7 @@ const DATA_DIRECTORY_LOCK_OWNER_FILE: &str = ".rbtc.lock.owner";
 const DATA_DIRECTORY_LOCK_OWNER_TEMP_FILE: &str = ".rbtc.lock.owner.tmp";
 const MAX_DATA_DIRECTORY_LOCK_MARKER_BYTES: u64 = 512;
 const DATA_FORMAT_MANIFEST_FILE: &str = ".rbtc-data-format.json";
-const DATA_FORMAT_SCHEMA_VERSION: u32 = 3;
+const DATA_FORMAT_SCHEMA_VERSION: u32 = 4;
 const MAX_DATA_FORMAT_MANIFEST_BYTES: u64 = 4 * 1024;
 const NODE_EVENT_CAPACITY: usize = 32;
 const DEFAULT_STORAGE_AUDIT_MAX_SEGMENTS: u32 = DEFAULT_RETENTION_BLOCKS;
@@ -735,7 +741,7 @@ impl Default for NodeStorageConfig {
 }
 
 /// Bounded peer and transaction-pool resources for one node instance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeResourceConfig {
     /// Maximum automatically discovered hot standby sessions.
     pub automatic_hot_standbys: usize,
@@ -747,10 +753,48 @@ pub struct NodeResourceConfig {
     pub only_net: NodeOnlyNet,
     /// Optional no-authentication SOCKS5 proxy for every outbound peer socket.
     pub proxy: Option<SocketAddr>,
+    /// Optional SOCKS5 endpoint authorised to resolve DNS seed names.
+    ///
+    /// Kept distinct from `proxy` because the two express different trust
+    /// choices: routing a peer socket through a proxy does not by itself
+    /// authorise handing that proxy the names this node is looking for.
+    pub name_proxy: Option<SocketAddr>,
     /// Prefer the BIP324 v2 encrypted transport on outbound connections,
     /// retrying each address once over v1 when the peer closes the v2
     /// handshake attempt.
     pub v2_transport: bool,
+    /// Origin of the ASN map that widens peer-address diversity groups
+    /// from IP prefixes to autonomous systems.
+    pub asmap: NodeAsmapSource,
+    /// Whether a local `cjdroute` interface makes `fc00::/8` CJDNS overlay
+    /// destinations dialable and their addresses storable.
+    ///
+    /// Off by default: without the interface, overlay addresses are
+    /// unroutable and are refused everywhere. Incompatible with `proxy`,
+    /// because CJDNS traffic never traverses a SOCKS5 proxy and a proxied
+    /// deployment must not be surprised by direct dials.
+    pub cjdns_reachable: bool,
+    /// Whether locally originated transactions are broadcast exclusively
+    /// over anonymity networks (onion via the SOCKS5 proxy, I2P via the
+    /// SAM bridge), unlinking them from this node's routable address.
+    ///
+    /// Off by default. Requires at least one anonymity path to be
+    /// configured; a broadcast that cannot reach one fails, bounded — it
+    /// never falls back to clearnet relay.
+    pub private_broadcast: bool,
+}
+
+/// Origin of the ASN map used for peer-address diversity bucketing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NodeAsmapSource {
+    /// The map compiled into this binary; the default, matching Core 31's
+    /// embedded-asmap posture.
+    #[default]
+    Embedded,
+    /// An operator-supplied asmap file, validated fail-closed at startup.
+    File(PathBuf),
+    /// No ASN mapping; diversity groups stay IP-prefix derived.
+    Off,
 }
 
 /// One peer destination in an address family the node can dial.
@@ -767,6 +811,18 @@ pub enum NodePeerTarget {
     Onion(OnionAddress),
     /// An I2P destination reached through the configured SAM bridge.
     I2p(I2pAddress),
+    /// A DNS seed authority the name proxy resolves on this node's behalf.
+    ///
+    /// Transient, and the only target whose address this node never learns.
+    /// The proxy chooses the peer, so nothing about this target may be keyed
+    /// as an address: it is never a peer-store entry, never a manual peer,
+    /// never persisted, and it is discarded once the wave that built it ends.
+    SeedName {
+        /// Validated authority name submitted to the proxy.
+        name: SeedName,
+        /// Network P2P port requested from the proxy.
+        port: u16,
+    },
 }
 
 impl NodePeerTarget {
@@ -775,8 +831,17 @@ impl NodePeerTarget {
     pub const fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Socket(socket) => Some(*socket),
-            Self::Onion(_) | Self::I2p(_) => None,
+            Self::Onion(_) | Self::I2p(_) | Self::SeedName { .. } => None,
         }
+    }
+
+    /// Returns whether this destination is reached by submitting a name to a proxy.
+    ///
+    /// Callers use this to keep a name target out of every address-keyed book:
+    /// the proxy resolved it, so this node has no address to record against.
+    #[must_use]
+    pub const fn is_seed_name(&self) -> bool {
+        matches!(self, Self::SeedName { .. })
     }
 }
 
@@ -784,6 +849,12 @@ impl std::str::FromStr for NodePeerTarget {
     type Err = String;
 
     /// Parses `IP:PORT` or `<service>.onion:PORT`.
+    ///
+    /// Deliberately never produces a seed-name target. Those exist only inside
+    /// a bootstrap wave the node builds from its own seed list; accepting one
+    /// here would let `--connect` hand an arbitrary hostname to the proxy as a
+    /// peer, which is neither a peer nor something the operator asked to
+    /// disclose.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if let Ok(socket) = SocketAddr::from_str(value) {
             return Ok(Self::Socket(socket));
@@ -803,6 +874,9 @@ impl std::fmt::Display for NodePeerTarget {
             Self::Socket(socket) => write!(f, "{socket}"),
             Self::Onion(onion) => write!(f, "{onion}"),
             Self::I2p(i2p) => write!(f, "{i2p}"),
+            // The name and port are what this node knows; the address the
+            // proxy picked is deliberately absent rather than guessed.
+            Self::SeedName { name, port } => write!(f, "{name}:{port}"),
         }
     }
 }
@@ -819,6 +893,10 @@ impl TryFrom<&NodePeerTarget> for ProxyTarget {
         match target {
             NodePeerTarget::Socket(socket) => Ok(Self::Socket(*socket)),
             NodePeerTarget::Onion(onion) => Ok(Self::Onion(onion.clone())),
+            NodePeerTarget::SeedName { name, port } => Ok(Self::SeedName {
+                name: name.clone(),
+                port: *port,
+            }),
             NodePeerTarget::I2p(_) => Err(()),
         }
     }
@@ -854,18 +932,25 @@ pub enum NodeOnlyNet {
     Onion,
     /// Permit only I2P destinations, which require a SAM bridge.
     I2p,
+    /// Permit only CJDNS overlay destinations, which require a local
+    /// `cjdroute` interface declared with `--cjdns-reachable`.
+    Cjdns,
 }
 
 impl NodeOnlyNet {
     /// Returns whether a routable destination is permitted.
     ///
     /// An onion-only restriction permits no IP destination at all, which is
-    /// what makes it a leak guard rather than a preference.
+    /// what makes it a leak guard rather than a preference. CJDNS is its
+    /// own network: an IPv6-only restriction excludes `fc00::/8`, and a
+    /// CJDNS-only restriction excludes everything else.
     const fn permits(self, ip: IpAddr) -> bool {
-        matches!(
-            (self, ip),
-            (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) | (Self::Ipv6, IpAddr::V6(_))
-        )
+        match (self, ip) {
+            (Self::Any, _) | (Self::Ipv4, IpAddr::V4(_)) => true,
+            (Self::Ipv6, IpAddr::V6(_)) => !crate::p2p::is_cjdns_address(ip),
+            (Self::Cjdns, IpAddr::V6(_)) => crate::p2p::is_cjdns_address(ip),
+            _ => false,
+        }
     }
 
     /// Returns whether v3 onion destinations are permitted.
@@ -890,7 +975,11 @@ impl Default for NodeResourceConfig {
             mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            name_proxy: None,
             v2_transport: false,
+            asmap: NodeAsmapSource::Embedded,
+            cjdns_reachable: false,
+            private_broadcast: false,
         }
     }
 }
@@ -1056,7 +1145,7 @@ impl NodeBuilder {
 
     /// Sets bounded hot-standby and transaction-pool resources.
     #[must_use]
-    pub const fn resources(mut self, resources: NodeResourceConfig) -> Self {
+    pub fn resources(mut self, resources: NodeResourceConfig) -> Self {
         self.config.resources = resources;
         self
     }
@@ -1253,7 +1342,11 @@ fn validate_inbound_options(options: &Options) -> Result<(), String> {
         if options.inbound_listen.is_none() {
             return Err("an advertised inbound address requires --listen ADDRESS".to_owned());
         }
-        if !is_acceptable_peer_address(address, options.network) {
+        if !crate::peer_store::is_acceptable_peer_address_with_cjdns(
+            address,
+            options.network,
+            options.resources.cjdns_reachable,
+        ) {
             return Err(format!(
                 "advertised inbound address {address} is not routable on {}",
                 options.network
@@ -1351,10 +1444,27 @@ fn resolve_only_net(values: &[NodeOnlyNet]) -> Result<NodeOnlyNet, String> {
             Ok(NodeOnlyNet::Any)
         }
         _ => Err(
-            "--onlynet accepts one network, or both IP families; onion and i2p cannot be combined with another network"
+            "--onlynet accepts one network, or both IP families; onion, i2p, and cjdns cannot be combined with another network"
                 .to_owned(),
         ),
     }
+}
+
+fn validate_private_broadcast_options(options: &Options) -> Result<(), String> {
+    if options.resources.private_broadcast
+        && options.resources.proxy.is_none()
+        && options.i2p_sam.is_none()
+    {
+        // The option's whole promise is that a transaction never leaves
+        // over clearnet. Without a Tor SOCKS5 proxy or an I2P SAM bridge
+        // there is no anonymity path to keep that promise on, so the
+        // configuration is refused rather than silently degraded.
+        return Err(
+            "--private-broadcast requires an anonymity path: configure --proxy (Tor SOCKS5, for onion peers) or --i2psam (I2P SAM bridge), or both"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_peer_options(options: &Options) -> Result<(), String> {
@@ -1406,17 +1516,64 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
             "automatic hot standbys cannot exceed {MAX_AUTOMATIC_HOT_STANDBYS}"
         ));
     }
+    if let Some(name_proxy) = options.resources.name_proxy {
+        if name_proxy.port() == 0 || name_proxy.ip().is_unspecified() {
+            return Err("name proxy must have a concrete IP and nonzero port".to_owned());
+        }
+        // Clearnet seed discovery cannot produce a permitted target under an
+        // anonymity-only restriction, so authorising it would only leak the
+        // names this node is looking for and return nothing usable.
+        if options.resources.only_net != NodeOnlyNet::Any {
+            return Err(
+                "--name-proxy cannot be combined with an anonymity-only --onlynet: clearnet seed discovery cannot produce a permitted peer"
+                    .to_owned(),
+            );
+        }
+    }
+    validate_private_broadcast_options(options)?;
+    if options.resources.only_net == NodeOnlyNet::Cjdns && !options.resources.cjdns_reachable {
+        return Err(
+            "--onlynet cjdns requires --cjdns-reachable: without a local cjdroute interface no permitted destination exists"
+                .to_owned(),
+        );
+    }
+    if options.resources.cjdns_reachable {
+        // CJDNS traffic never traverses a SOCKS5 proxy: the overlay is
+        // reached through a local interface. Permitting both would either
+        // surprise a proxied deployment with direct dials or silently hand
+        // overlay sockets to a proxy that cannot carry them, so the
+        // combination is refused outright.
+        if options.resources.proxy.is_some() {
+            return Err(
+                "--cjdns-reachable cannot be combined with --proxy: overlay sockets are dialed through the local cjdroute interface, never a SOCKS5 proxy"
+                    .to_owned(),
+            );
+        }
+    } else if let Some(remote) = options
+        .remotes
+        .iter()
+        .find(|remote| crate::p2p::is_cjdns_address(remote.ip()))
+    {
+        return Err(format!(
+            "preferred peer {remote} is a CJDNS overlay address and requires --cjdns-reachable"
+        ));
+    }
     if let Some(proxy) = options.resources.proxy {
         if proxy.port() == 0 || proxy.ip().is_unspecified() {
             return Err("SOCKS5 proxy must have a concrete IP and nonzero port".to_owned());
         }
-        if options
-            .dns_seeds
-            .as_ref()
-            .is_none_or(|seeds| !seeds.is_empty())
+        // `--name-proxy` is the explicit authorisation that lets seed names be
+        // resolved by a proxy instead of the host resolver. Without it the
+        // refusal stands: seeds and a proxy together would otherwise resolve
+        // locally and leak the lookup the proxy exists to hide.
+        if options.resources.name_proxy.is_none()
+            && options
+                .dns_seeds
+                .as_ref()
+                .is_none_or(|seeds| !seeds.is_empty())
         {
             return Err(
-                "SOCKS5 proxy requires DNS seeds to be disabled; use explicit IP peers or the persisted peer database to prevent resolver leaks"
+                "SOCKS5 proxy requires DNS seeds to be disabled, or --name-proxy to authorise resolving them through a proxy; otherwise use explicit IP peers or the persisted peer database to prevent resolver leaks"
                     .to_owned(),
             );
         }
@@ -2126,6 +2283,23 @@ const DEFAULT_SNAPSHOT_OVERLAY_REBASE_PERCENT: u8 = 85;
 /// mechanism.
 const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
 
+/// Batches the write-back layer buffers before one durable overlay commit.
+///
+/// One keeps the engine's own commit-per-batch behaviour and bypasses the
+/// layer entirely, so existing measurements stay comparable. Over mainnet
+/// 935,001–963,350, 80.7% of inputs spend an output at most 256 blocks old and
+/// 91.5% one at most 4,096 blocks old, so buffering 16 batches lets most coins
+/// cancel in memory instead of being written and deleted.
+const DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES: u32 = 1;
+/// Upper bound on buffered batches: 64 batches of 256 blocks is over a week of
+/// mainnet blocks and the most any crash should have to re-execute.
+const MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES: u32 = 64;
+/// Net-created coins that force a flush regardless of batch count; roughly
+/// 128 bytes each in memory, so the default bounds the buffer near 1 GiB.
+const DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 8_000_000;
+const MIN_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 100_000;
+const MAX_SNAPSHOT_OVERLAY_FLUSH_COINS: u64 = 200_000_000;
+
 /// Growth over the last post-compaction size required before compacting
 /// again, as a percentage of that size.
 ///
@@ -2135,6 +2309,7 @@ const DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT: u8 = 50;
 /// compaction ties the decision to how much garbage has actually
 /// accumulated, which is what makes the rewrite worth its cost, and adapts
 /// to any budget and working set rather than assuming one.
+#[cfg(feature = "mdbx")]
 const SNAPSHOT_OVERLAY_RECOMPACT_GROWTH_PERCENT: u64 = 50;
 
 /// Decides whether compacting the overlay now is worth the rewrite it costs.
@@ -2187,6 +2362,11 @@ struct NodeSnapshotOverlayConfig {
     /// so a storage change can be compared without network variance, which a
     /// networked soak cannot resolve.
     replay_blocks: Option<PathBuf>,
+    /// Batches buffered in memory before one durable engine commit; `1`
+    /// commits every batch as before.
+    flush_batches: u32,
+    /// Net-created coins that force a flush before `flush_batches` is reached.
+    flush_coins: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2335,7 +2515,25 @@ struct ValidationLimits {
 
 #[derive(Default)]
 struct PrefetchedBlocks {
+    /// Blocks fetched ahead as bytes; decoded and validated by the next batch.
     serialized: Vec<Vec<u8>>,
+    /// Blocks a replay read-ahead already decoded and structure-validated,
+    /// in height order after `serialized`.
+    validated: Vec<PrevalidatedBlock>,
+    /// The external inputs of `validated`, read while the previous batch
+    /// executed; valid only when `validated` is the whole next batch, and
+    /// reconciled with the write-back buffers before use.
+    utxos: Option<ActiveBlockUtxoPrefetch>,
+}
+
+/// A block the read-ahead thread decoded, matched against the active chain
+/// and structure-validated, with the bytes it came from.
+struct PrevalidatedBlock {
+    block: Block,
+    hash: BlockHash,
+    deployments: BlockDeploymentContext,
+    transaction_ids: ValidatedBlockTransactionIds,
+    bytes: Vec<u8>,
 }
 
 impl Default for ValidationLimits {
@@ -2696,15 +2894,34 @@ struct DataFormatManifest {
     schema_version: u32,
     minimum_reader_version: u32,
     network: String,
+    #[serde(default = "default_chainstate_backend")]
+    chainstate_backend: ChainstateBackend,
     stores: DataStoreSchemaVersions,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ChainstateBackend {
+    #[default]
+    Redb,
+    Mdbx,
+}
+
+const fn default_chainstate_backend() -> ChainstateBackend {
+    ChainstateBackend::Redb
 }
 
 impl DataFormatManifest {
     fn current(network: Network) -> Self {
+        Self::current_for_backend(network, ChainstateBackend::Redb)
+    }
+
+    fn current_for_backend(network: Network, chainstate_backend: ChainstateBackend) -> Self {
         Self {
             schema_version: DATA_FORMAT_SCHEMA_VERSION,
             minimum_reader_version: DATA_FORMAT_SCHEMA_VERSION,
             network: network.to_string(),
+            chainstate_backend,
             stores: DataStoreSchemaVersions {
                 headers: 1,
                 chainstate: 1,
@@ -2727,6 +2944,13 @@ impl DataFormatManifest {
         manifest.schema_version = 2;
         manifest.minimum_reader_version = 2;
         manifest.stores.basic_filter_index = 1;
+        manifest
+    }
+
+    fn version3(network: Network) -> Self {
+        let mut manifest = Self::current(network);
+        manifest.schema_version = 3;
+        manifest.minimum_reader_version = 3;
         manifest
     }
 }
@@ -2867,6 +3091,14 @@ fn validate_data_format_manifest(
                 "version-1 basic-filter index omitted the genesis filter; rebuild it with a complete freezer or --reindex-chainstate"
                     .to_owned(),
             );
+        }
+        return Ok(true);
+    }
+    if actual.schema_version == 3 && actual.minimum_reader_version == 3 {
+        if actual != DataFormatManifest::version3(network) {
+            return Err(format!(
+                "data-format manifest does not match the {network} version-3 schema inventory"
+            ));
         }
         return Ok(true);
     }
@@ -3048,6 +3280,123 @@ struct WalletApiRuntime {
     pending_broadcast: Arc<tokio::sync::Mutex<Option<WalletBroadcastRequest>>>,
     compact_candidates: CompactTransactionCandidates,
     rebroadcast: Arc<RedbRebroadcastStore>,
+    /// Set exactly once, after the peer store and network resources exist,
+    /// when `--private-broadcast` is on. While set, no locally originated
+    /// transaction is ever written to a clearnet peer session or handed to
+    /// the hot-standby relay fan-out.
+    private_broadcast: std::sync::OnceLock<PrivateBroadcastContext>,
+}
+
+/// The only paths a privately broadcast transaction may travel.
+struct PrivateBroadcastContext {
+    /// Tor SOCKS5 proxy carrying onion-peer waves.
+    proxy: Option<SocketAddr>,
+    /// I2P SAM bridge; each wave creates a transient session on it, because
+    /// the node's persistent I2P destination is public identity and linking
+    /// the transaction to it would defeat the option.
+    i2p_sam: Option<SocketAddr>,
+    /// Source of onion and I2P wave targets.
+    peer_store: Option<Arc<RedbPeerStore>>,
+    message_start: bitcoin::p2p::Magic,
+}
+
+/// Distinct anonymity-network peers one private-broadcast wave contacts.
+const MAX_PRIVATE_BROADCAST_TARGETS: usize = 4;
+
+/// Sends one transaction over short-lived anonymity-network sessions.
+///
+/// Returns how many peers accepted the write. Zero is a bounded failure the
+/// caller retries later; under no circumstance does the transaction fall
+/// back to clearnet relay. Wave sessions deliberately use the v1 transport:
+/// both carriers already encrypt end to end, and a deterministic handshake
+/// beats a v2-with-retry dance on connections that live for one message.
+async fn private_broadcast_wave(
+    context: &PrivateBroadcastContext,
+    transaction: &Transaction,
+) -> usize {
+    let Some(store) = context.peer_store.as_ref() else {
+        return 0;
+    };
+    let Ok(now) = unix_time() else {
+        return 0;
+    };
+    let mut delivered = 0_usize;
+    let mut budget = MAX_PRIVATE_BROADCAST_TARGETS;
+    if let Some(proxy) = context.proxy {
+        for onion in store.onion_candidates(now, budget).unwrap_or_default() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let target = ProxyTarget::Onion(onion);
+            let sent = timeout(PEER_TIMEOUT, async {
+                let mut session = connect_proxied_target(
+                    proxy,
+                    &target,
+                    context.message_start,
+                    rand::random(),
+                    USER_AGENT.to_owned(),
+                    0,
+                    false,
+                )
+                .await?;
+                session.broadcast_transaction(transaction).await
+            })
+            .await;
+            if matches!(sent, Ok(Ok(()))) {
+                delivered += 1;
+            }
+        }
+    }
+    if let Some(bridge) = context.i2p_sam {
+        if budget > 0 {
+            let destinations = store.i2p_candidates(now, budget).unwrap_or_default();
+            if !destinations.is_empty() {
+                let session_id = format!("rbtc-private-{:016x}", rand::random::<u64>());
+                if let Ok(Ok(sam)) = timeout(
+                    PEER_TIMEOUT,
+                    I2pSamSession::create(
+                        bridge,
+                        &session_id,
+                        None,
+                        crate::i2p_sam::I2pSamConfig::default(),
+                    ),
+                )
+                .await
+                {
+                    for destination in destinations {
+                        if budget == 0 {
+                            break;
+                        }
+                        budget -= 1;
+                        let sent = timeout(PEER_TIMEOUT, async {
+                            let stream =
+                                sam.connect_stream(&destination).await.map_err(|error| {
+                                    rbtc::p2p::P2pError::Io(std::io::Error::other(
+                                        error.to_string(),
+                                    ))
+                                })?;
+                            let mut session = rbtc::p2p::complete_outbound_handshake_on_stream(
+                                stream,
+                                context.message_start,
+                                rand::random(),
+                                USER_AGENT.to_owned(),
+                                0,
+                                false,
+                            )
+                            .await?;
+                            session.broadcast_transaction(transaction).await
+                        })
+                        .await;
+                        if matches!(sent, Ok(Ok(()))) {
+                            delivered += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    delivered
 }
 
 #[derive(Default)]
@@ -3209,8 +3558,13 @@ const MAX_RPC_CHAINSTATE_PAGE: usize = 1_000;
 /// Default operator cooldown when `setban add` omits a duration; matches
 /// Core's 24-hour default and the automatic cooldown ceiling.
 const DEFAULT_RPC_BAN_SECONDS: u32 = 24 * 60 * 60;
-/// Stable SAM session identifier for this node's I2P destination.
-const I2P_SESSION_ID: &str = "rbtc";
+/// Prefix of the SAM session identifier for this node's I2P destination.
+///
+/// The identifier must be unique per session on a bridge: a fixed value
+/// makes a second node on the same host fail with `DUPLICATED_ID`, which is
+/// an ordinary configuration — mainnet and Testnet4 side by side, for
+/// instance — rather than an error case.
+const I2P_SESSION_ID_PREFIX: &str = "rbtc";
 /// Ceiling shared with the automatic protocol-violation cooldown.
 const MAX_PROTOCOL_COOLDOWN_SECS: u32 = 24 * 60 * 60;
 /// Bound on one reported rejection reason.
@@ -3228,10 +3582,16 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "gettxout",
     "rbtc.getblockchunk",
     "rbtc.submitrawtransaction",
+    "rbtc.submitblock",
+    "getblocktemplate",
     "testmempoolaccept",
     "rbtc.scanchainstate",
+    "gettxoutsetinfo",
+    "getmempoolcluster",
+    "getmempoolfeeratediagram",
     "listbanned",
     "setban",
+    "addnode",
     "getindexinfo",
     "gettxindexlocation",
     "gettxspendingprevout",
@@ -3243,9 +3603,328 @@ const NODE_OPERATOR_RPC_METHODS: &[&str] = &[
     "stop",
 ];
 
+/// A block accepted by the context-free checks and handed to the node.
+struct QueuedSubmission {
+    hash: BlockHash,
+    submission: BlockSubmission,
+}
+
+impl NodeRpcOperator {
+    /// Decodes, context-free-validates, and queues one submitted block.
+    ///
+    /// Shared by both dispatch paths so they cannot drift apart on what they
+    /// accept. Only rejections that need no chain context are decided here;
+    /// everything else is the execution loop's to answer.
+    fn submit_block_for_verdict(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<QueuedSubmission, LocalRpcOperatorError> {
+        let unavailable = || LocalRpcOperatorError {
+            code: -28,
+            message: "Node data is not ready",
+        };
+        let values = params.as_array().ok_or(LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        })?;
+        let raw = values
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .filter(|_| values.len() == 1)
+            .and_then(|value| Vec::<u8>::from_hex(value).ok())
+            .filter(|raw| raw.len() <= MAX_RPC_BODY_BYTES / 2)
+            .ok_or(LocalRpcOperatorError {
+                code: -22,
+                message: "Block decode failed",
+            })?;
+        let block = deserialize::<Block>(&raw).map_err(|_| LocalRpcOperatorError {
+            code: -22,
+            message: "Block decode failed",
+        })?;
+        let hash = block.block_hash();
+        if block.header.validate_pow(block.header.target()).is_err() {
+            return Err(LocalRpcOperatorError {
+                code: -25,
+                message: "high-hash",
+            });
+        }
+        // Height zero with BIP34 disabled: the coinbase height commitment
+        // depends on the active chain, so the execution loop checks it.
+        rbtc::blockchain::validate_block_structure_with_deployments(&block, 0, false, true, None)
+            .map_err(|_| LocalRpcOperatorError {
+            code: -25,
+            message: "bad-block-structure",
+        })?;
+        let source = self.source.as_ref().ok_or_else(unavailable)?;
+        let source = source.current().map_err(|_| unavailable())?;
+        let submission = source
+            .submit_block(block)
+            .map_err(|_| LocalRpcOperatorError {
+                code: -32603,
+                message: "Block submission is not available on this node",
+            })?;
+        Ok(QueuedSubmission { hash, submission })
+    }
+
+    /// Builds one block template for the current tip.
+    ///
+    /// Refuses on any chainstate that is not independently validated from
+    /// genesis. A snapshot-overlay or an AssumeUTXO chain still completing its
+    /// background sync has not verified the history its UTXO set claims, and a
+    /// template built on it would ask a miner to stake a block reward on that
+    /// claim. Refusing is the conservative answer and matches this node
+    /// declining to serve mining from a chainstate it cannot vouch for.
+    #[allow(clippy::too_many_lines)]
+    fn block_template(&self) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let unavailable = || LocalRpcOperatorError {
+            code: -28,
+            message: "Node data is not ready",
+        };
+        let progress = self
+            .status
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !progress.independently_validated {
+            return Err(LocalRpcOperatorError {
+                code: -32041,
+                message: "Block templates require a chainstate independently validated from genesis",
+            });
+        }
+        if !progress.minimum_chainwork_reached
+            || progress.header.height != progress.execution.height
+        {
+            return Err(LocalRpcOperatorError {
+                code: -10,
+                message: "Bitcoin is downloading blocks...",
+            });
+        }
+        let source = self.source.as_ref().ok_or_else(unavailable)?;
+        let (headers, deployments) = source.template_source().ok_or_else(unavailable)?;
+        let headers = headers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tip = headers.active_tip();
+        let height = tip.height.checked_add(1).ok_or_else(unavailable)?;
+
+        // Core's rule: never below the median time past, never behind the clock.
+        let median_time_past = headers.median_time_past(tip.hash).ok_or_else(unavailable)?;
+        let minimum_time = median_time_past.checked_add(1).ok_or_else(unavailable)?;
+        let now = unix_time().map_err(|_| unavailable())?;
+        let current_time = now.max(minimum_time);
+
+        let version_bits = rbtc::deployments::template_version_bits(&headers, height, &deployments)
+            .map_err(|_| unavailable())?;
+        let candidate = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(version_bits.version),
+            prev_blockhash: tip.hash,
+            merkle_root: bitcoin::TxMerkleNode::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            time: current_time,
+            bits: tip.header.bits,
+            nonce: 0,
+        };
+        let bits = headers
+            .expected_next_bits(&candidate)
+            .map_err(|_| unavailable())?;
+        let taproot = rbtc::deployments::taproot_active(&headers, height, &deployments)
+            .map_err(|_| unavailable())?;
+        drop(headers);
+
+        let candidates: Vec<rbtc::block_template::TemplateCandidate> = self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relay_snapshot()
+            .into_iter()
+            .map(|entry| rbtc::block_template::TemplateCandidate {
+                transaction: entry.transaction,
+                fee_sats: entry.fee_sats,
+                sigop_cost: entry.sigop_cost,
+            })
+            .collect();
+        let limits = rbtc::block_template::TemplateLimits::default();
+        let selection = rbtc::block_template::select_template_transactions(&candidates, limits);
+
+        let template = rbtc::block_assembly::BlockTemplate {
+            parent: tip.hash,
+            height,
+            time: current_time,
+            target: bits.into(),
+            version: version_bits.version,
+            coinbase_script_pubkey: bitcoin::ScriptBuf::new(),
+            subsidy_halving_interval: rbtc::deployments::halving_interval(deployments.network()),
+            fee_sats: selection.fee_sats,
+            transactions: selection.transactions.clone(),
+        };
+        // Built rather than derived by hand so the witness commitment a miner
+        // is handed is exactly the one this node's assembler would produce.
+        let assembled =
+            rbtc::block_assembly::build_block(&template).map_err(|_| LocalRpcOperatorError {
+                code: -32603,
+                message: "Block template assembly failed",
+            })?;
+        let coinbase = assembled.txdata.first().ok_or_else(unavailable)?;
+        let witness_commitment = coinbase
+            .output
+            .iter()
+            .rev()
+            .find(|output| output.script_pubkey.is_op_return())
+            .map(|output| output.script_pubkey.to_hex_string());
+        let coinbase_value = coinbase
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .sum::<u64>();
+
+        let position: std::collections::HashMap<Txid, usize> = selection
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| (transaction.compute_txid(), index))
+            .collect();
+        // Looked up rather than zipped against the filtered candidate list:
+        // the two happen to share an order today, and a template that pairs a
+        // transaction with another's fee would be silently wrong.
+        let metadata: std::collections::HashMap<Txid, &rbtc::block_template::TemplateCandidate> =
+            candidates
+                .iter()
+                .map(|candidate| (candidate.transaction.compute_txid(), candidate))
+                .collect();
+        let transactions: Vec<serde_json::Value> = selection
+            .transactions
+            .iter()
+            .filter_map(|transaction| {
+                metadata
+                    .get(&transaction.compute_txid())
+                    .map(|candidate| (transaction, *candidate))
+            })
+            .map(|(transaction, candidate)| {
+                let mut depends: Vec<usize> = transaction
+                    .input
+                    .iter()
+                    .filter_map(|input| position.get(&input.previous_output.txid))
+                    // One-based, as BIP22 requires: index zero is the coinbase.
+                    .map(|index| index + 1)
+                    .collect();
+                depends.sort_unstable();
+                depends.dedup();
+                serde_json::json!({
+                    "data": serialize(transaction).to_lower_hex_string(),
+                    "txid": transaction.compute_txid().to_string(),
+                    "hash": transaction.compute_wtxid().to_string(),
+                    "depends": depends,
+                    "fee": candidate.fee_sats,
+                    "sigops": candidate.sigop_cost,
+                    "weight": transaction.weight().to_wu(),
+                })
+            })
+            .collect();
+
+        let mut rules = vec!["!segwit"];
+        if taproot {
+            rules.push("taproot");
+        }
+        let vbavailable: serde_json::Map<String, serde_json::Value> = version_bits
+            .deployments
+            .iter()
+            .filter(|deployment| !deployment.required)
+            .map(|deployment| {
+                (
+                    deployment.name.to_owned(),
+                    serde_json::Value::from(deployment.bit),
+                )
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "version": version_bits.version,
+            "rules": rules,
+            "vbavailable": vbavailable,
+            "vbrequired": version_bits.required_mask(),
+            "previousblockhash": tip.hash.to_string(),
+            "transactions": transactions,
+            "coinbaseaux": serde_json::json!({}),
+            "coinbasevalue": coinbase_value,
+            "longpollid": serde_json::Value::Null,
+            "target": bitcoin::Target::from(bits).to_be_bytes().to_lower_hex_string(),
+            "mintime": minimum_time,
+            "mutable": ["time", "transactions", "prevblock"],
+            "noncerange": "00000000ffffffff",
+            "sigoplimit": limits.max_sigop_cost,
+            "sizelimit": rbtc::blockchain::MAX_BLOCK_WEIGHT / 4,
+            "weightlimit": limits.max_weight,
+            "curtime": current_time,
+            "bits": bits.to_consensus().to_be_bytes().to_lower_hex_string(),
+            "height": height,
+            "default_witness_commitment": witness_commitment,
+            "rbtc_skipped_over_ceiling": selection.skipped_over_ceiling,
+        }))
+    }
+
+    /// Describes a submission that never entered the queue.
+    fn describe_unqueued(
+        queued: &QueuedSubmission,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        match queued.submission {
+            BlockSubmission::Duplicate => Ok(serde_json::json!({
+                "hash": queued.hash,
+                "connected": false,
+                "reason": "duplicate",
+            })),
+            BlockSubmission::Full => Err(LocalRpcOperatorError {
+                code: -32040,
+                message: "Block submission queue is full",
+            }),
+            BlockSubmission::Queued(_) => {
+                unreachable!("a queued submission is awaited rather than described")
+            }
+        }
+    }
+}
+
 impl LocalRpcOperator for NodeRpcOperator {
     fn methods(&self) -> &'static [&'static str] {
         NODE_OPERATOR_RPC_METHODS
+    }
+
+    /// Answers `rbtc.submitblock` with the execution loop's real verdict.
+    ///
+    /// Everything else is decided from state this operator already holds, so
+    /// it goes straight to the synchronous path. Submission is the exception:
+    /// the block has to be staged and connected by another task before there
+    /// is anything truthful to say about it.
+    fn execute_async<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a serde_json::Value,
+    ) -> RpcFuture<'a> {
+        Box::pin(async move {
+            if method != "rbtc.submitblock" {
+                return self.execute(method, params);
+            }
+            let queued = match self.submit_block_for_verdict(params) {
+                Ok(queued) => queued,
+                Err(error) => return Some(Err(error)),
+            };
+            let BlockSubmission::Queued(verdict) = queued.submission else {
+                return Some(Self::describe_unqueued(&queued));
+            };
+            // A closed channel means the node stopped before deciding. That is
+            // not a rejection and must not be reported as one.
+            Some(match verdict.await {
+                Ok(Ok(())) => Ok(serde_json::json!({"hash": queued.hash, "connected": true})),
+                Ok(Err(reason)) => Ok(serde_json::json!({
+                    "hash": queued.hash,
+                    "connected": false,
+                    "reason": reason,
+                })),
+                Err(_) => Err(LocalRpcOperatorError {
+                    code: -32603,
+                    message: "The node stopped before the block was decided",
+                }),
+            })
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3270,7 +3949,7 @@ impl LocalRpcOperator for NodeRpcOperator {
                 Ok(serde_json::json!({"level": level.as_str()}))
             }));
         }
-        if matches!(method, "listbanned" | "setban") {
+        if matches!(method, "listbanned" | "setban" | "addnode") {
             return Some(self.execute_peer_administration(method, params));
         }
         if matches!(
@@ -3284,8 +3963,13 @@ impl LocalRpcOperator for NodeRpcOperator {
                 | "gettxout"
                 | "rbtc.getblockchunk"
                 | "rbtc.submitrawtransaction"
+                | "rbtc.submitblock"
+                | "getblocktemplate"
                 | "testmempoolaccept"
                 | "rbtc.scanchainstate"
+                | "gettxoutsetinfo"
+                | "getmempoolcluster"
+                | "getmempoolfeeratediagram"
         ) {
             return Some(
                 if matches!(
@@ -3560,6 +4244,57 @@ impl NodeRpcOperator {
         }
     }
 
+    /// Seeds or forgets one operator-supplied routable dial candidate.
+    ///
+    /// `add` and `onetry` both seed a candidate; the bounded pool keeps no
+    /// persistent manual list distinct from its candidate table, so the two
+    /// collapse to the same effect rather than pretending to a distinction
+    /// this node does not keep. `remove` forgets the stored candidate but
+    /// does not ban it — use `setban` to keep an address from being dialed.
+    fn execute_add_node(
+        peer_store: &RedbPeerStore,
+        params: &serde_json::Value,
+        now: u32,
+    ) -> Result<serde_json::Value, LocalRpcOperatorError> {
+        let invalid = || LocalRpcOperatorError {
+            code: -32602,
+            message: "Invalid params",
+        };
+        let storage = || LocalRpcOperatorError {
+            code: -32020,
+            message: "Node storage failure",
+        };
+        let values = params.as_array().ok_or_else(invalid)?;
+        if values.len() != 2 {
+            return Err(invalid());
+        }
+        let address = values[0]
+            .as_str()
+            .and_then(|value| SocketAddr::from_str(value).ok())
+            .ok_or_else(invalid)?;
+        match values[1].as_str().ok_or_else(invalid)? {
+            command @ ("add" | "onetry") => {
+                let added = peer_store
+                    .insert_manual(address, now)
+                    .map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "command": command,
+                    "added": added,
+                }))
+            }
+            "remove" => {
+                let removed = peer_store.forget_peer(address).map_err(|_| storage())?;
+                Ok(serde_json::json!({
+                    "address": address.to_string(),
+                    "command": "remove",
+                    "removed": removed,
+                }))
+            }
+            _ => Err(invalid()),
+        }
+    }
+
     /// Serves the bounded administrative peer-cooldown surface.
     ///
     /// This mutates local peer policy only: a cooldown makes an address an
@@ -3588,6 +4323,9 @@ impl NodeRpcOperator {
                 message: "Node data is not ready",
             })?;
         let now = unix_time().map_err(|_| storage())?;
+        if method == "addnode" {
+            return Self::execute_add_node(&peer_store, params, now);
+        }
         if method == "listbanned" {
             if !rpc_has_no_params(params) {
                 return Err(invalid());
@@ -3689,6 +4427,81 @@ impl NodeRpcOperator {
                 "transactions": transactions,
                 "total": total,
                 "next_offset": next_offset,
+            }));
+        }
+        if method == "getmempoolcluster" {
+            let values = params.as_array().ok_or_else(invalid)?;
+            if values.len() != 1 {
+                return Err(invalid());
+            }
+            let txid = values[0]
+                .as_str()
+                .and_then(|value| Txid::from_str(value).ok())
+                .ok_or_else(invalid)?;
+            let cluster = self
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cluster_of(txid);
+            let (members, vbytes) = cluster.ok_or(LocalRpcOperatorError {
+                code: -5,
+                message: "Transaction not in mempool",
+            })?;
+            return Ok(serde_json::json!({
+                "txid": txid.to_string(),
+                "cluster": members
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "count": members.len(),
+                "vbytes": vbytes,
+                "max_count": MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
+                "max_vbytes": MAX_MEMPOOL_CLUSTER_VBYTES,
+            }));
+        }
+        if method == "getmempoolfeeratediagram" {
+            let values = params.as_array().ok_or_else(invalid)?;
+            if values.len() != 1 {
+                return Err(invalid());
+            }
+            let txid = values[0]
+                .as_str()
+                .and_then(|value| Txid::from_str(value).ok())
+                .ok_or_else(invalid)?;
+            let chunks = self
+                .transaction_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cluster_feerate_diagram(txid)
+                .ok_or(LocalRpcOperatorError {
+                    code: -5,
+                    message: "Transaction not in mempool",
+                })?;
+            // The same chunks the replacement rule compares: non-increasing
+            // feerate, with the cumulative (size, fee) points tracing the
+            // concave diagram.
+            let mut cumulative_size = 0_i128;
+            let mut cumulative_fee = 0_i128;
+            let mut points = vec![serde_json::json!({"size": 0, "fee": 0})];
+            let chunk_values = chunks
+                .iter()
+                .map(|chunk| {
+                    cumulative_size += i128::from(chunk.size);
+                    cumulative_fee += i128::from(chunk.fee);
+                    points.push(serde_json::json!({
+                        "size": cumulative_size,
+                        "fee": cumulative_fee,
+                    }));
+                    serde_json::json!({
+                        "vbytes": chunk.size,
+                        "fee_sats": chunk.fee,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(serde_json::json!({
+                "txid": txid.to_string(),
+                "chunks": chunk_values,
+                "diagram": points,
             }));
         }
         let source = self.source.as_ref().ok_or_else(unavailable)?;
@@ -3867,6 +4680,61 @@ impl NodeRpcOperator {
                         .collect(),
                 ))
             }
+            "gettxoutsetinfo" => {
+                // A resumable, bounded aggregation over the fixed-memory
+                // pager. Each call scans one window from `cursor` and reports
+                // that window's partial totals plus a `next_cursor`; the
+                // operator sums the windows until `complete` is true. This
+                // never walks the whole set in one unbounded pass — the
+                // explicit ceiling is the contract, exactly as
+                // `rbtc.scanchainstate` bounds its page.
+                let values = params.as_array().ok_or_else(invalid)?;
+                if values.len() > 2 {
+                    return Err(invalid());
+                }
+                let after = match values.first() {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(serde_json::Value::String(cursor)) => {
+                        Some(rpc_outpoint_cursor(cursor).ok_or_else(invalid)?)
+                    }
+                    Some(_) => return Err(invalid()),
+                };
+                let limit = match values.get(1) {
+                    None | Some(serde_json::Value::Null) => MAX_RPC_CHAINSTATE_PAGE,
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|limit| (1..=MAX_RPC_CHAINSTATE_PAGE).contains(limit))
+                        .ok_or_else(invalid)?,
+                };
+                let page = source
+                    .chainstate_page(after, limit)
+                    .map_err(|_| unavailable())?;
+                let mut total_amount_sats = 0_u64;
+                // Core's "bogosize" is a serialization-independent size proxy:
+                // 32 bytes of overhead per output plus its scriptPubKey.
+                let mut bogosize = 0_u64;
+                for (_, utxo) in &page {
+                    total_amount_sats = total_amount_sats.saturating_add(utxo.value_sats);
+                    bogosize = bogosize
+                        .saturating_add(32)
+                        .saturating_add(utxo.script_pubkey.len() as u64);
+                }
+                let next_cursor = (page.len() == limit)
+                    .then(|| page.last().map(|(outpoint, _)| outpoint.to_string()))
+                    .flatten();
+                let complete = next_cursor.is_none();
+                let status = self.status.response();
+                Ok(serde_json::json!({
+                    "height": status.execution.height,
+                    "bestblock": status.execution.hash,
+                    "window_txouts": page.len(),
+                    "window_total_amount_sats": total_amount_sats,
+                    "window_bogosize": bogosize,
+                    "next_cursor": next_cursor,
+                    "complete": complete,
+                }))
+            }
             "rbtc.scanchainstate" => {
                 let values = params.as_array().ok_or_else(invalid)?;
                 if values.len() != 2 {
@@ -3938,6 +4806,23 @@ impl NodeRpcOperator {
                     });
                 }
                 Ok(serde_json::json!({"txid": txid, "queued": true}))
+            }
+            "getblocktemplate" => self.block_template(),
+            "rbtc.submitblock" => {
+                // The synchronous dispatcher cannot wait for the execution
+                // loop, so it reports only that the block was queued. The
+                // async dispatcher used by the HTTP route answers with the
+                // real connection verdict; both accept exactly the same
+                // blocks because both queue through one helper.
+                let queued = self.submit_block_for_verdict(params)?;
+                match queued.submission {
+                    BlockSubmission::Queued(_) => {
+                        Ok(serde_json::json!({"hash": queued.hash, "queued": true}))
+                    }
+                    BlockSubmission::Duplicate | BlockSubmission::Full => {
+                        Self::describe_unqueued(&queued)
+                    }
+                }
             }
             _ => unreachable!("data method membership checked"),
         }
@@ -4505,6 +5390,8 @@ struct NodeInboundSource {
     ledger: Arc<PrunedBlockLedger>,
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
     pending_transactions: Arc<Mutex<InboundTransactionQueue>>,
+    pending_blocks: Arc<Mutex<PendingBlockQueue>>,
+    submitted_blocks: Arc<Notify>,
     basic_filter: Option<Arc<RedbAuxiliaryIndex>>,
     deployments: DeploymentConfig,
     mempool_full_rbf: bool,
@@ -4512,6 +5399,7 @@ struct NodeInboundSource {
 
 struct SharedInboundSource {
     advertised_onion: RwLock<Option<(OnionAddress, ServiceFlags)>>,
+    advertised_i2p: RwLock<Option<(I2pAddress, ServiceFlags)>>,
     current: RwLock<Option<Arc<dyn InboundDataSource>>>,
     peer_store: RwLock<Option<Arc<RedbPeerStore>>>,
     stats: Arc<InboundStats>,
@@ -4527,6 +5415,7 @@ impl SharedInboundSource {
     ) -> Self {
         Self {
             advertised_onion: RwLock::new(None),
+            advertised_i2p: RwLock::new(None),
             current: RwLock::new(None),
             peer_store: RwLock::new(None),
             stats: Arc::new(InboundStats::new(max_upload_bytes_per_day)),
@@ -4565,6 +5454,21 @@ impl SharedInboundSource {
             .advertised_onion
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    /// Records the I2P destination announced to peers.
+    fn install_advertised_i2p(&self, advertised: Option<(I2pAddress, ServiceFlags)>) {
+        *self
+            .advertised_i2p
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advertised;
+    }
+
+    fn advertised_i2p_destination(&self) -> Option<(I2pAddress, ServiceFlags)> {
+        self.advertised_i2p
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn advertised_onion_service(&self) -> Option<(OnionAddress, ServiceFlags)> {
@@ -4671,6 +5575,18 @@ impl InboundDataSource for SharedInboundSource {
         self.advertised_onion_service()
     }
 
+    fn advertised_i2p(&self) -> Option<(I2pAddress, ServiceFlags)> {
+        self.advertised_i2p_destination()
+    }
+
+    fn submit_block(&self, block: Block) -> Result<BlockSubmission, String> {
+        self.current()?.submit_block(block)
+    }
+
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+        self.current().ok()?.template_source()
+    }
+
     fn test_accept(&self, transactions: Vec<Transaction>) -> Result<Vec<TestAcceptResult>, String> {
         self.current()?.test_accept(transactions)
     }
@@ -4686,6 +5602,51 @@ impl InboundDataSource for SharedInboundSource {
     fn advertised_address(&self) -> Option<(SocketAddr, ServiceFlags)> {
         self.advertised_address
             .map(|address| (address, self.services))
+    }
+}
+
+/// Blocks submitted locally and awaiting connection.
+///
+/// Bounded because submission has no backpressure of its own: the RPC answers
+/// as soon as the block is queued, so nothing upstream slows down when the
+/// execution loop is busy.
+/// Submissions staged onto the active chain and awaiting an execution verdict.
+type AwaitingSubmissions = Vec<(BlockHash, u32, oneshot::Sender<Result<(), String>>)>;
+
+/// A submitted block and the channel its verdict returns on.
+struct PendingBlock {
+    block: Block,
+    verdict: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Default)]
+struct PendingBlockQueue {
+    blocks: VecDeque<PendingBlock>,
+}
+
+/// How many submitted blocks may await connection at once.
+const MAX_PENDING_SUBMITTED_BLOCKS: usize = 16;
+
+impl PendingBlockQueue {
+    fn push(&mut self, block: Block) -> BlockSubmission {
+        let hash = block.block_hash();
+        if self
+            .blocks
+            .iter()
+            .any(|queued| queued.block.block_hash() == hash)
+        {
+            return BlockSubmission::Duplicate;
+        }
+        if self.blocks.len() >= MAX_PENDING_SUBMITTED_BLOCKS {
+            return BlockSubmission::Full;
+        }
+        let (verdict, receiver) = oneshot::channel();
+        self.blocks.push_back(PendingBlock { block, verdict });
+        BlockSubmission::Queued(receiver)
+    }
+
+    fn drain(&mut self) -> Vec<PendingBlock> {
+        self.blocks.drain(..).collect()
     }
 }
 
@@ -4897,6 +5858,25 @@ impl InboundDataSource for NodeInboundSource {
             }))
     }
 
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+        Some((Arc::clone(&self.headers), self.deployments.clone()))
+    }
+
+    fn submit_block(&self, block: Block) -> Result<BlockSubmission, String> {
+        let queued = self
+            .pending_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(block);
+        if matches!(queued, BlockSubmission::Queued(_)) {
+            // The execution loop idles on a long poll when it is caught up,
+            // which is exactly when a submitted block arrives. Waking it keeps
+            // submission latency bounded by the work, not by the poll period.
+            self.submitted_blocks.notify_one();
+        }
+        Ok(queued)
+    }
+
     fn submit_transaction(&self, transaction: Transaction) -> Result<bool, String> {
         Ok(self
             .pending_transactions
@@ -4985,6 +5965,7 @@ impl InboundServer {
         stats: Arc<InboundStats>,
         serve_compact_filters: bool,
         transaction_relay: broadcast::Sender<TransactionRelay>,
+        i2p_session: Option<Arc<I2pSamSession>>,
     ) -> Result<Self, String> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -5000,8 +5981,11 @@ impl InboundServer {
             limits.max_upload_bytes_per_day,
             limits.max_requests_per_minute
         );
+        if i2p_session.is_some() {
+            rbtc_info!("inbound I2P peers are accepted through the configured SAM session");
+        }
         let task = tokio::spawn(async move {
-            run_listener_with_stats_and_relay(
+            run_listener_with_i2p(
                 listener,
                 network.magic(),
                 local_nonce,
@@ -5011,6 +5995,7 @@ impl InboundServer {
                 source,
                 stats,
                 Some(transaction_relay),
+                i2p_session,
             )
             .await
             .map_err(|error| error.to_string())
@@ -5649,6 +6634,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
                 compact_candidates,
                 rebroadcast,
+                private_broadcast: std::sync::OnceLock::new(),
             })
         })
         .transpose()?;
@@ -7190,7 +8176,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} private_broadcast={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -7204,6 +8190,13 @@ fn startup_configuration_summary(options: &Options) -> String {
             .proxy
             .map_or_else(|| "direct".to_owned(), |proxy| proxy.to_string()),
         options.resources.v2_transport,
+        match &options.resources.asmap {
+            NodeAsmapSource::Embedded => "embedded".to_owned(),
+            NodeAsmapSource::File(path) => path.display().to_string(),
+            NodeAsmapSource::Off => "off".to_owned(),
+        },
+        options.resources.cjdns_reachable,
+        options.resources.private_broadcast,
         options
             .zmq_listen
             .map_or_else(|| "disabled".to_owned(), |listen| listen.to_string()),
@@ -7612,6 +8605,19 @@ async fn run_peer_pool_session(
                 inbound_service_flags(options.indexes.basic_filter),
             ))
         });
+    let i2p_session = match options.i2p_sam {
+        Some(bridge) => {
+            let session = Arc::new(create_i2p_session(options, bridge).await?);
+            if let Some(source) = &inbound_source {
+                source.install_advertised_i2p(Some((
+                    session.address().clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )));
+            }
+            Some(session)
+        }
+        None => None,
+    };
     let mut inbound_server = if let (Some(address), Some(source)) =
         (options.inbound_listen, inbound_source.as_ref())
     {
@@ -7629,15 +8635,12 @@ async fn run_peer_pool_session(
                     .stats(),
                 options.indexes.basic_filter,
                 transaction_relay.clone(),
+                i2p_session.clone(),
             )
             .await?,
         )
     } else {
         None
-    };
-    let i2p_session = match options.i2p_sam {
-        Some(bridge) => Some(Arc::new(create_i2p_session(options, bridge).await?)),
-        None => None,
     };
     let _onion_service = match (&options.tor_control, options.inbound_listen) {
         (Some(tor), Some(listen)) => {
@@ -7652,16 +8655,50 @@ async fn run_peer_pool_session(
         }
         _ => None,
     };
+    // The map is resolved before asking whether a peer store exists, so a
+    // broken --asmap file refuses startup instead of being silently unused
+    // on a store-less node.
+    let asmap = match &options.resources.asmap {
+        NodeAsmapSource::Off => None,
+        NodeAsmapSource::Embedded => Some(Asmap::embedded().map_err(|error| error.to_string())?),
+        NodeAsmapSource::File(path) => {
+            Some(Arc::new(Asmap::from_file(path).map_err(|error| {
+                format!("--asmap {}: {error}", path.display())
+            })?))
+        }
+    };
     let peer_store = if let Some(data_dir) = &options.data_dir {
         Some(Arc::new(
-            RedbPeerStore::open(data_dir.join("peers.redb"), options.network)
-                .map_err(|error| error.to_string())?,
+            RedbPeerStore::open_with_policy(
+                data_dir.join("peers.redb"),
+                options.network,
+                asmap,
+                options.resources.cjdns_reachable,
+            )
+            .map_err(|error| error.to_string())?,
         ))
     } else {
         None
     };
     if let Some(source) = &inbound_source {
         source.install_peer_store(peer_store.as_ref().map(Arc::clone));
+    }
+    if options.resources.private_broadcast {
+        if let Some(wallet) = api_runtime.as_ref().and_then(|api| api.wallet.as_ref()) {
+            let context = PrivateBroadcastContext {
+                proxy: options.resources.proxy,
+                i2p_sam: options.i2p_sam,
+                peer_store: peer_store.as_ref().map(Arc::clone),
+                message_start: options.deployments.message_start(),
+            };
+            wallet
+                .private_broadcast
+                .set(context)
+                .unwrap_or_else(|_| unreachable!("private broadcast context is set once"));
+            rbtc_info!(
+                "private broadcast active: wallet transactions travel only over anonymity networks"
+            );
+        }
     }
     let manual_remotes = options
         .remotes
@@ -7779,70 +8816,121 @@ async fn run_peer_pool_session(
     }
 
     let seeds = selected_dns_seeds(options);
-    if !seeds.is_empty() {
-        // The configured-peer cap bounds each connection wave, not the
-        // lifetime candidate set. A full persisted wave may consist entirely
-        // of stale addresses; still resolve one fresh, independently bounded
-        // DNS wave rather than exiting without consulting the bootstrap
-        // source. `attempted` remains excluded so no address is retried in the
-        // same run.
-        let remaining = MAX_CONFIGURED_PEERS;
-        let mut dns_excluded = attempted
-            .iter()
-            .filter_map(NodePeerTarget::socket)
-            .collect::<HashSet<_>>();
-        if let Some(store) = &peer_store {
-            for discouraged in store
-                .discouraged_addresses(unix_time()?)
-                .map_err(|error| error.to_string())?
-            {
-                dns_excluded.insert(discouraged);
+    match seed_bootstrap(options.resources.name_proxy, &seeds) {
+        SeedBootstrap::None => {}
+        SeedBootstrap::NameProxy(name_proxy) => {
+            let (wave, refused) = seed_name_wave_targets(&seeds);
+            for (candidate, error) in refused {
+                rbtc_warn!("seed authority {candidate} not submitted to the name proxy: {error}");
+            }
+            if !wave.is_empty() {
+                rbtc_info!(
+                    "submitting {} seed {} to the name proxy at {name_proxy}",
+                    wave.len(),
+                    if wave.len() == 1 {
+                        "authority"
+                    } else {
+                        "authorities"
+                    }
+                );
+                // Each authority appears once and the wave runs once. A failed
+                // name is not retried within this run: the wave already collapsed
+                // repeated spellings so one authority is contacted once, and
+                // dialing it again would repeat that disclosure to buy a retry
+                // the ordinary per-attempt deadline has already spent. What a
+                // successful name yields instead is `addr` data, which enters the
+                // normal address-keyed candidate path where retry policy lives.
+                attempted.extend(wave.iter().cloned());
+                if try_peer_candidates(
+                    options,
+                    &wave,
+                    local_nonce,
+                    peer_store.as_ref(),
+                    i2p_session.as_ref(),
+                    api_runtime.as_ref(),
+                    zmq_notifier.as_ref(),
+                    background_validation,
+                    validation_scheduler,
+                    &transaction_pool,
+                    &transaction_relay,
+                    &mempool_relay_source,
+                    inbound_source.as_ref(),
+                    &mut inbound_server,
+                    &manual_remotes,
+                    &mut failures,
+                    &network_time,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             }
         }
-        let (resolved, resolution_failures, rejected) = resolve_dns_candidates(
-            options.network,
-            options.resources.only_net,
-            &seeds,
-            &dns_excluded,
-            remaining,
-        )
-        .await;
-        for failure in resolution_failures {
-            rbtc_warn!("DNS seed failed: {failure}");
-        }
-        if !resolved.is_empty() || rejected > 0 {
-            rbtc_info!(
-                "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
-                resolved.len()
-            );
-        }
-        let resolved = resolved
-            .into_iter()
-            .map(NodePeerTarget::Socket)
-            .collect::<Vec<_>>();
-        attempted.extend(resolved.iter().cloned());
-        if try_peer_candidates(
-            options,
-            &resolved,
-            local_nonce,
-            peer_store.as_ref(),
-            i2p_session.as_ref(),
-            api_runtime.as_ref(),
-            zmq_notifier.as_ref(),
-            background_validation,
-            validation_scheduler,
-            &transaction_pool,
-            &transaction_relay,
-            &mempool_relay_source,
-            inbound_source.as_ref(),
-            &mut inbound_server,
-            &manual_remotes,
-            &mut failures,
-            &network_time,
-        )
-        .await?
-        {
-            return Ok(());
+        SeedBootstrap::LocalResolver => {
+            // The configured-peer cap bounds each connection wave, not the
+            // lifetime candidate set. A full persisted wave may consist entirely
+            // of stale addresses; still resolve one fresh, independently bounded
+            // DNS wave rather than exiting without consulting the bootstrap
+            // source. `attempted` remains excluded so no address is retried in the
+            // same run.
+            let remaining = MAX_CONFIGURED_PEERS;
+            let mut dns_excluded = attempted
+                .iter()
+                .filter_map(NodePeerTarget::socket)
+                .collect::<HashSet<_>>();
+            if let Some(store) = &peer_store {
+                for discouraged in store
+                    .discouraged_addresses(unix_time()?)
+                    .map_err(|error| error.to_string())?
+                {
+                    dns_excluded.insert(discouraged);
+                }
+            }
+            let (resolved, resolution_failures, rejected) = resolve_dns_candidates(
+                options.network,
+                options.resources.only_net,
+                &seeds,
+                &dns_excluded,
+                remaining,
+            )
+            .await;
+            for failure in resolution_failures {
+                rbtc_warn!("DNS seed failed: {failure}");
+            }
+            if !resolved.is_empty() || rejected > 0 {
+                rbtc_info!(
+                    "DNS bootstrap selected {} peer candidates and rejected {rejected} ineligible or duplicate addresses",
+                    resolved.len()
+                );
+            }
+            let resolved = resolved
+                .into_iter()
+                .map(NodePeerTarget::Socket)
+                .collect::<Vec<_>>();
+            attempted.extend(resolved.iter().cloned());
+            if try_peer_candidates(
+                options,
+                &resolved,
+                local_nonce,
+                peer_store.as_ref(),
+                i2p_session.as_ref(),
+                api_runtime.as_ref(),
+                zmq_notifier.as_ref(),
+                background_validation,
+                validation_scheduler,
+                &transaction_pool,
+                &transaction_relay,
+                &mempool_relay_source,
+                inbound_source.as_ref(),
+                &mut inbound_server,
+                &manual_remotes,
+                &mut failures,
+                &network_time,
+            )
+            .await?
+            {
+                return Ok(());
+            }
         }
     }
     if attempted.is_empty() {
@@ -8736,6 +9824,23 @@ async fn connect_peer(
     .await
 }
 
+/// Opens one bounded SAM stream to an I2P destination.
+async fn open_i2p_stream(
+    session: &I2pSamSession,
+    destination: &I2pAddress,
+    remote: &NodePeerTarget,
+) -> Result<tokio::net::TcpStream, PeerRunError> {
+    timeout(PEER_TIMEOUT, session.connect_stream(destination))
+        .await
+        .map_err(|_| {
+            PeerRunError::transient(format!(
+                "I2P stream to {remote} timed out after {} seconds",
+                PEER_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn connect_i2p_peer(
     session: Arc<I2pSamSession>,
@@ -8748,34 +9853,47 @@ async fn connect_i2p_peer(
     prefer_v2: bool,
     handshake_started: Instant,
 ) -> Result<ConnectedPeer, PeerRunError> {
-    let stream = timeout(PEER_TIMEOUT, session.connect_stream(destination))
+    // A v2 attempt consumes its stream, and a peer that closes it leaves
+    // nothing to retry on. Open a second stream and fall back to v1, matching
+    // the one-shot retry TCP and proxied peers already get; without it,
+    // enabling --v2-transport would make every v1-only I2P peer undiallable.
+    let mut attempts = if prefer_v2 {
+        vec![true, false]
+    } else {
+        vec![false]
+    };
+    attempts.reverse();
+    let mut session = loop {
+        let prefer_v2 = attempts.pop().expect("the v1 attempt always remains");
+        let stream = open_i2p_stream(&session, destination, remote).await?;
+        let outcome = timeout(
+            PEER_TIMEOUT,
+            rbtc::p2p::complete_outbound_handshake_on_stream(
+                stream,
+                deployments.message_start(),
+                local_nonce,
+                USER_AGENT.to_owned(),
+                0,
+                prefer_v2,
+            ),
+        )
         .await
         .map_err(|_| {
             PeerRunError::transient(format!(
-                "I2P stream to {remote} timed out after {} seconds",
+                "peer handshake timed out after {} seconds",
                 PEER_TIMEOUT.as_secs()
             ))
-        })?
-        .map_err(|error| PeerRunError::transient(format!("open an I2P stream: {error}")))?;
-    let mut session = timeout(
-        PEER_TIMEOUT,
-        rbtc::p2p::complete_outbound_handshake_on_stream(
-            stream,
-            deployments.message_start(),
-            local_nonce,
-            USER_AGENT.to_owned(),
-            0,
-            prefer_v2,
-        ),
-    )
-    .await
-    .map_err(|_| {
-        PeerRunError::transient(format!(
-            "peer handshake timed out after {} seconds",
-            PEER_TIMEOUT.as_secs()
-        ))
-    })?
-    .map_err(|error| PeerRunError::p2p(&error))?;
+        })?;
+        match outcome {
+            Ok(session) => break session,
+            Err(rbtc::p2p::P2pError::V2Transport(
+                rbtc::p2p_v2::V2TransportError::PeerRejectedV2,
+            )) if !attempts.is_empty() => {
+                rbtc_info!("I2P peer {remote} closed the v2 attempt; retrying over v1");
+            }
+            Err(error) => return Err(PeerRunError::p2p(&error)),
+        }
+    };
     let remote_version = session.remote_version();
     rbtc_info!(
         "connected to {remote}: version={}, height={}, agent={}",
@@ -8804,7 +9922,7 @@ async fn connect_i2p_peer(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn connect_peer_with_transport(
     deployments: DeploymentConfig,
     remote: NodePeerTarget,
@@ -8820,6 +9938,16 @@ async fn connect_peer_with_transport(
     if matches!(remote, NodePeerTarget::Onion(_)) && proxy.is_none() {
         return Err(PeerRunError::local(format!(
             "onion peer {remote} requires a configured SOCKS5 proxy"
+        )));
+    }
+    // A seed name is likewise unreachable without the proxy that resolves it,
+    // and here the missing proxy must fail rather than degrade: the only other
+    // way to reach the name is the local lookup this whole path exists to
+    // avoid. Reported as a local fault so it is not counted against a peer
+    // that was never contacted.
+    if remote.is_seed_name() && proxy.is_none() {
+        return Err(PeerRunError::local(format!(
+            "seed authority {remote} requires --name-proxy; resolving it locally would leak the lookup"
         )));
     }
     let handshake_started = Instant::now();
@@ -8859,6 +9987,16 @@ async fn connect_peer_with_transport(
                     prefer_v2,
                 )
                 .await
+            }
+            // A seed name has no meaning without a proxy: resolving it here
+            // is exactly the local lookup this path exists to avoid.
+            (None, ProxyTarget::SeedName { name, .. }) => {
+                Err(rbtc::p2p::P2pError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "seed authority {name} needs --name-proxy; resolving it locally would leak the lookup"
+                    ),
+                )))
             }
             (None, ProxyTarget::Socket(socket)) => {
                 connect_outbound_with_transport(
@@ -9089,6 +10227,7 @@ async fn connect_and_maintain_standby(
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
     advertised_onion: Option<(OnionAddress, ServiceFlags)>,
+    advertised_i2p: Option<(I2pAddress, ServiceFlags)>,
     network_time: Arc<NetworkTime>,
 ) -> Result<ConnectedPeer, PeerRunError> {
     let mut connected = connect_peer_with_transport(
@@ -9128,6 +10267,17 @@ async fn connect_and_maintain_standby(
         )
         .await
         .map_err(|_| PeerRunError::transient("local address advertisement timed out"))?
+        .map_err(|error| PeerRunError::p2p(&error))?;
+    }
+    if let Some((destination, services)) = advertised_i2p {
+        timeout(
+            PEER_TIMEOUT,
+            connected
+                .session
+                .advertise_i2p_address(&destination, services, local_time),
+        )
+        .await
+        .map_err(|_| PeerRunError::transient("I2P address advertisement timed out"))?
         .map_err(|error| PeerRunError::p2p(&error))?;
     }
     if let Some((onion, services)) = advertised_onion {
@@ -9229,7 +10379,21 @@ fn spawn_peer_connections(
                 .advertised_address
                 .map(|address| (address, inbound_service_flags(options.indexes.basic_filter)));
             let advertised_onion = advertised_onion.cloned();
-            let proxy = options.resources.proxy;
+            let advertised_i2p = i2p_session.as_ref().map(|session| {
+                (
+                    session.address().clone(),
+                    inbound_service_flags(options.indexes.basic_filter),
+                )
+            });
+            // A name target goes to the endpoint explicitly authorised to see
+            // seed names, never to the ordinary peer proxy: routing a socket
+            // and disclosing what this node is looking for are two separate
+            // permissions, so one is not silently borrowed for the other.
+            let proxy = if remote.is_seed_name() {
+                options.resources.name_proxy
+            } else {
+                options.resources.proxy
+            };
             let i2p_session = i2p_session.cloned();
             let task = tokio::spawn(connect_and_maintain_standby(
                 deployments,
@@ -9248,6 +10412,7 @@ fn spawn_peer_connections(
                 transaction_pool,
                 advertised_address,
                 advertised_onion,
+                advertised_i2p,
                 network_time,
             ));
             (
@@ -9564,9 +10729,10 @@ async fn run_connected_peer(
         validated_header_height,
     } = connected;
     let _peer_observation = ActivePeerObservation::new(options.observer.clone(), remote.clone());
-    // Address-book maintenance, throughput ranking, and the socket-typed
-    // status view all key on a routable address, which an onion peer has
-    // none of; those steps are skipped rather than given a fabricated one.
+    // Throughput ranking and the socket-typed status view key on a routable
+    // address, which an onion peer has none of; those steps are skipped rather
+    // than given a fabricated one. Address-book maintenance decides for itself
+    // — see `discover_peer_addresses`.
     let routable = remote.socket();
     let orphan_source = session.local_id();
     if let Some(height) = validated_header_height {
@@ -9579,9 +10745,7 @@ async fn run_connected_peer(
 
     if let Some(path) = &options.data_dir {
         if let Some(store) = peer_store {
-            if let Some(routable) = routable {
-                discover_peer_addresses(&mut session, store, routable).await;
-            }
+            discover_peer_addresses(&mut session, store, &remote).await;
         }
         let transfer_before = session.block_transfer_stats();
         let result = if options.snapshot_overlay.is_some() {
@@ -9784,6 +10948,29 @@ async fn complete_assumeutxo_validation(
 /// learned it keep reaching this node across restarts. The key is secret
 /// material: it is written owner-only inside the data directory and never
 /// logged.
+/// Builds a SAM session identifier unique to this launch.
+///
+/// The identifier combines the network and data directory, so two nodes on
+/// one host never collide, with a random suffix, so a restart never collides
+/// with its own previous session while the bridge is still tearing it down.
+/// Nothing depends on the identifier being stable: the published address
+/// comes from the persisted destination key, not from this name. It stays
+/// inside SAM's accepted character set and length bound.
+fn i2p_session_id(options: &Options) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(options.network.to_string().as_bytes());
+    if let Some(data_dir) = &options.data_dir {
+        digest.update(data_dir.to_string_lossy().as_bytes());
+    }
+    let fingerprint = digest.finalize();
+    format!(
+        "{I2P_SESSION_ID_PREFIX}-{}-{}",
+        crate::utxo::hex_lower(&fingerprint[..6]),
+        crate::utxo::hex_lower(&rand::random::<[u8; 4]>())
+    )
+}
+
 async fn create_i2p_session(
     options: &Options,
     bridge: SocketAddr,
@@ -9799,7 +10986,7 @@ async fn create_i2p_session(
         .flatten();
     let session = I2pSamSession::create(
         bridge,
-        I2P_SESSION_ID,
+        &i2p_session_id(options),
         existing.as_deref(),
         crate::i2p_sam::I2pSamConfig::default(),
     )
@@ -9838,9 +11025,12 @@ impl Drop for PublishedInboundOnion {
             return;
         };
         let service = self.service.clone();
-        // The control connection is async, so the withdrawal runs on the
-        // ambient runtime when one is still available; the connection close
-        // withdraws the ephemeral service either way.
+        // Withdrawal is best effort: `DEL_ONION` needs the async runtime, and
+        // a task spawned during shutdown may never be polled. Correctness
+        // does not depend on it. The service was published without `Detach`,
+        // so Tor destroys it when this control connection closes, which
+        // dropping the controller does unconditionally; the explicit command
+        // only makes the withdrawal immediate when the runtime outlives it.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Err(error) = controller.remove_onion_service(&service).await {
@@ -9971,6 +11161,10 @@ fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
         NodePeerTarget::Socket(socket) => store.record_attempt(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_attempt(onion, now).map(|_| ()),
         NodePeerTarget::I2p(i2p) => store.record_i2p_attempt(i2p, now).map(|_| ()),
+        // A name target has no address, so there is no entry to age, promote,
+        // or discourage. Recording it under the authority name would create a
+        // peer-store key for something that is not a peer.
+        NodePeerTarget::SeedName { .. } => return,
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer attempt history for {remote} failed: {error}");
@@ -10031,6 +11225,10 @@ fn record_peer_session_success(store: Option<&RedbPeerStore>, remote: &NodePeerT
         NodePeerTarget::Socket(socket) => store.record_session_success(*socket, now).map(|_| ()),
         NodePeerTarget::Onion(onion) => store.record_onion_success(onion, now).map(|_| ()),
         NodePeerTarget::I2p(i2p) => store.record_i2p_success(i2p, now).map(|_| ()),
+        // A successful name target is not promoted: what succeeded was a proxy
+        // connection to an address this node never learned. Only the IP
+        // entries that peer advertises, after the ordinary checks, persist.
+        NodePeerTarget::SeedName { .. } => return,
     };
     if let Err(error) = recorded {
         rbtc_warn!("peer session success for {remote} failed: {error}");
@@ -10095,11 +11293,24 @@ fn block_throughput_bps(before: BlockTransferStats, after: BlockTransferStats) -
     Some(u32::try_from(bytes_per_second).unwrap_or(u32::MAX))
 }
 
+/// Requests one bounded address batch and persists what survives the filters.
+///
+/// Which peers this runs for is decided here rather than at the call site,
+/// because the answer follows from what each target can honestly claim as a
+/// source. A routable peer is its own source group. A name target has no
+/// address at all, yet it is the one peer type that otherwise leaves nothing
+/// behind, so learning from it is what stops the next start from having to
+/// contact the seed authorities again — its batch goes to a shared marker
+/// group instead of an invented one. Onion and I2P peers keep their existing
+/// behaviour of learning nothing rather than being given a fabricated source.
 async fn discover_peer_addresses(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     store: &RedbPeerStore,
-    source: SocketAddr,
+    source: &NodePeerTarget,
 ) {
+    if matches!(source, NodePeerTarget::Onion(_) | NodePeerTarget::I2p(_)) {
+        return;
+    }
     let discovery = timeout(PEER_DISCOVERY_TIMEOUT, async {
         session.request_addresses().await?;
         session.receive_addresses().await
@@ -10114,7 +11325,16 @@ async fn discover_peer_addresses(
                     return;
                 }
             };
-            match store.insert_discovered(source, &addresses, now) {
+            let inserted = match source {
+                NodePeerTarget::Socket(socket) => store.insert_discovered(*socket, &addresses, now),
+                // The proxy chose this peer and never said which address it
+                // picked, so the batch carries no source group of its own.
+                NodePeerTarget::SeedName { .. } => {
+                    store.insert_discovered_from_seed_name(&addresses, now)
+                }
+                NodePeerTarget::Onion(_) | NodePeerTarget::I2p(_) => return,
+            };
+            match inserted {
                 Ok(stats) if stats.accepted > 0 => rbtc_info!(
                     "persisted {} learned peer addresses from {source}; rejected {}",
                     stats.accepted,
@@ -10156,6 +11376,116 @@ async fn discover_peer_addresses(
             PEER_DISCOVERY_TIMEOUT.as_secs()
         ),
     }
+}
+
+/// Answers every submission whose block has now been executed, or not.
+///
+/// Called after each execution batch. A submission is confirmed only when the
+/// active header at its height is still its own hash *and* the execution tip
+/// has reached that height: a reorg between staging and execution would leave
+/// the first true and the second meaningless on its own.
+fn settle_submitted_blocks(
+    awaiting: &mut AwaitingSubmissions,
+    headers: &HeaderDag,
+    execution_height: u32,
+) {
+    let mut still_pending = Vec::new();
+    for (hash, height, verdict) in std::mem::take(awaiting) {
+        if height > execution_height {
+            still_pending.push((hash, height, verdict));
+            continue;
+        }
+        let connected = headers
+            .active_header_at(height)
+            .is_some_and(|active| active.hash == hash);
+        let _ = verdict.send(if connected {
+            Ok(())
+        } else {
+            Err("the block was replaced on the active chain before it connected".to_owned())
+        });
+    }
+    *awaiting = still_pending;
+}
+
+/// Stages locally submitted blocks so the ordinary execution path connects them.
+///
+/// Every other block this node connects is announced by a header first. A
+/// submitted block is not, so its header has to be staged here, under exactly
+/// the contextual rules a peer's header must pass. Handing the body to the
+/// prefetch buffer then lets `download_execute_batch` connect it without
+/// asking a peer for bytes the node already holds, which keeps full block
+/// validation, indexing, and notification on one path.
+///
+/// A header-level rejection is answered here. A block that reaches the active
+/// chain cannot be answered yet, because it has not been connected: its
+/// channel joins `awaiting` and is settled once execution has run.
+fn stage_submitted_blocks(
+    pending: &Mutex<PendingBlockQueue>,
+    headers: &mut HeaderDag,
+    headers_path: &std::path::Path,
+    inbound_headers: &RwLock<HeaderDag>,
+    network_time: &NetworkTime,
+    prefetched_blocks: &mut PrefetchedBlocks,
+    awaiting: &mut AwaitingSubmissions,
+) -> Result<(), PeerRunError> {
+    // Blocks already carried over from a previous batch must be consumed in
+    // their own order first; appending behind them would break the contiguous
+    // ascending run `download_execute_batch` expects.
+    if !prefetched_blocks.serialized.is_empty() {
+        return Ok(());
+    }
+    let submitted = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain();
+    if submitted.is_empty() {
+        return Ok(());
+    }
+    // Opened per drain rather than held across the loop: `sync_headers`
+    // reopens this same database on every resync, and redb admits one writer.
+    let store = RedbHeaderStore::open(headers_path)
+        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let adjusted = network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?);
+    let mut staged_any = false;
+    for PendingBlock { block, verdict } in submitted {
+        let hash = block.block_hash();
+        let staged = match headers.stage_batch_contextual(&[block.header], adjusted) {
+            Ok(staged) => staged,
+            Err(error) => {
+                rbtc_warn!("rejected submitted block {hash}: {error}");
+                let _ = verdict.send(Err(error.to_string()));
+                continue;
+            }
+        };
+        if let Err(error) = store.append_batch(&[block.header]) {
+            // Dropping the guard rolls the header back, so the in-memory DAG
+            // and the durable store cannot disagree about it.
+            rbtc_warn!("could not persist submitted block header {hash}: {error}");
+            let _ = verdict.send(Err(format!("could not persist the block header: {error}")));
+            continue;
+        }
+        let _ = staged.commit();
+        staged_any = true;
+        if headers.active_tip().hash == hash {
+            let height = headers.active_tip().height;
+            prefetched_blocks.serialized.push(serialize(&block));
+            awaiting.push((hash, height, verdict));
+            rbtc_info!("staged submitted block {hash} at height {height}");
+        } else {
+            // A valid header that loses the work comparison stays recorded, but
+            // nothing executes it: connection follows the active chain only.
+            rbtc_info!("recorded submitted block {hash} off the active chain");
+            let _ = verdict.send(Err(
+                "inconclusive: the header is valid but does not extend the active chain".to_owned(),
+            ));
+        }
+    }
+    if staged_any {
+        *inbound_headers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.clone();
+    }
+    Ok(())
 }
 
 async fn sync_headers(
@@ -10266,12 +11596,25 @@ async fn sync_snapshot_overlay_node(
             (path, stored)
         }
     };
+    let cli_identity = compiled_overlay_identity(&overlay.snapshot, options.network)?;
     let (identity, snapshot_path, index_path) = match stored_identity {
         None => (
-            compiled_overlay_identity(&overlay.snapshot, options.network)?,
+            cli_identity,
             overlay.snapshot.clone(),
             overlay.index.clone(),
         ),
+        // A store that is still on the operator-supplied base keeps using the
+        // operator-supplied files: only a rebase moves the base to a derived
+        // `utxo-<height>.dat`/`.rbtcidx` pair beside the original snapshot.
+        // Deriving the pair unconditionally sent a resumed run (for example
+        // after a peer failover) to whatever index happened to sit next to
+        // the snapshot, not the one `--snapshot-overlay-index` named.
+        Some(identity)
+            if identity.height == cli_identity.height
+                && identity.block_hash == cli_identity.block_hash =>
+        {
+            (identity, overlay.snapshot.clone(), overlay.index.clone())
+        }
         Some(identity) => {
             let (snapshot_path, index_path) =
                 overlay_base_paths_for_height(&overlay.snapshot, identity.height);
@@ -10286,6 +11629,27 @@ async fn sync_snapshot_overlay_node(
             "snapshot base is not on the synchronized active header chain",
         ));
     }
+    // Indexes written before the fingerprint sidecar existed get one now, so
+    // every commit's duplicate-creation probe can reject absent keys without
+    // touching the snapshot.  One sequential scan of the snapshot, once.
+    let fingerprint_sidecar = crate::core_snapshot_index::fingerprint_sidecar_path(&index_path);
+    if !fingerprint_sidecar.exists() {
+        let started = Instant::now();
+        let slots = crate::core_snapshot_index::CoreSnapshotUtxoIndex::build_fingerprints(
+            &index_path,
+            &snapshot_path,
+            &identity,
+        )
+        .map_err(|error| {
+            PeerRunError::transient(format!("build snapshot index fingerprints: {error}"))
+        })?;
+        rbtc_info!(
+            "built snapshot index fingerprints for {} slots at {} in {} ms",
+            slots,
+            fingerprint_sidecar.display(),
+            started.elapsed().as_millis()
+        );
+    }
     let store_config = SnapshotOverlayConfig {
         database_dir: database_path,
         snapshot_path,
@@ -10295,15 +11659,33 @@ async fn sync_snapshot_overlay_node(
         mtp_by_height: creation_mtp_range(&headers, 0, identity.height)?,
     };
 
-    match overlay.engine {
-        SnapshotOverlayEngine::Mdbx => {
+    // With a flush interval of one batch the bare engine is run as before, so
+    // the baseline measurement stays byte-for-byte the same code path.
+    let write_back = (overlay.flush_batches > 1).then_some(WriteBackLimits {
+        max_batches: overlay.flush_batches,
+        max_created: overlay.flush_coins,
+    });
+    match (overlay.engine, write_back) {
+        (SnapshotOverlayEngine::Mdbx, None) => {
             let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
                 .map_err(|error| PeerRunError::transient(error.to_string()))?;
             run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
         }
-        SnapshotOverlayEngine::Redb => {
+        (SnapshotOverlayEngine::Mdbx, Some(limits)) => {
+            let chainstate = SnapshotOverlayChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            let chainstate = WriteBackChainstate::new(chainstate, limits);
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        (SnapshotOverlayEngine::Redb, None) => {
             let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
                 .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
+        }
+        (SnapshotOverlayEngine::Redb, Some(limits)) => {
+            let chainstate = SnapshotOverlayRedbChainstate::open(store_config, Some(&identity))
+                .map_err(|error| PeerRunError::transient(error.to_string()))?;
+            let chainstate = WriteBackChainstate::new(chainstate, limits);
             run_overlay_catchup(session, options, &data_dir, &headers, chainstate).await
         }
     }
@@ -10315,6 +11697,9 @@ struct OverlayCompaction {
     before_bytes: u64,
     after_bytes: u64,
 }
+
+#[cfg(feature = "mdbx")]
+use crate::write_back_chainstate::{WriteBackChainstate, WriteBackFlush, WriteBackLimits};
 
 /// The engine-specific capabilities the catch-up loop needs beyond ordinary
 /// block execution, so the loop itself can be written once for both stores.
@@ -10333,7 +11718,91 @@ trait OverlayCatchupStore: ExecutionChainStore {
     /// Returns `None` when the engine offers no in-place compaction. When to
     /// call this is the catch-up loop's policy decision, not the store's.
     fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String>;
+    /// Whether `overlay_compact` would first have to wait for a background
+    /// commit. The loop defers compaction while that is true, unless the
+    /// overlay is close to its rebase threshold.
+    fn overlay_compact_would_wait(&self) -> bool {
+        false
+    }
+    /// Hands the write-back buffer to the engine now if no commit is
+    /// running, without waiting. The loop uses this inside the last flush
+    /// window before the ceiling so the final, waited-for flush stays small.
+    fn start_write_back_flush_if_idle(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn engine_name(&self) -> &'static str;
+    /// Commits anything a write-back layer still holds in memory.
+    ///
+    /// Stores that commit every batch durably have nothing to do.
+    fn flush_pending(&self) -> Result<Option<WriteBackFlush>, String> {
+        Ok(None)
+    }
+    /// Takes the record of the most recent write-back flush, if any.
+    fn take_write_back_flush(&self) -> Option<WriteBackFlush> {
+        None
+    }
+}
+
+/// The write-back layer forwards the overlay surface to the engine it wraps,
+/// flushing before any operation that must see the durable state.
+#[cfg(feature = "mdbx")]
+impl<C: OverlayCatchupStore + 'static> OverlayCatchupStore for WriteBackChainstate<C> {
+    fn overlay_base_identity(&self) -> &rbtc::core_snapshot_index::SnapshotBaseIdentity {
+        self.inner().overlay_base_identity()
+    }
+
+    fn overlay_capacity(&self) -> Result<rbtc::snapshot_overlay::OverlayCapacity, String> {
+        // Count what the buffer will add at the next flush, so compaction
+        // and rebase trigger before the flush itself could hit the ceiling.
+        let mut capacity = self.inner().overlay_capacity()?;
+        capacity.used_bytes = capacity
+            .used_bytes
+            .saturating_add(self.pending_estimated_bytes());
+        Ok(capacity)
+    }
+
+    fn overlay_rebase(
+        &mut self,
+        snapshot: &std::path::Path,
+        index: &std::path::Path,
+        mtp_extension: &[u32],
+    ) -> Result<rbtc::snapshot_overlay::RebaseReport, String> {
+        self.inner_mut_flushed()
+            .map_err(|error| error.to_string())?
+            .overlay_rebase(snapshot, index, mtp_extension)
+    }
+
+    fn overlay_compact(&mut self) -> Result<Option<OverlayCompaction>, String> {
+        // Compaction reshapes the engine's file, not its content, so the
+        // buffer stays in memory; only a running commit has to land first.
+        self.inner_mut_settled()
+            .map_err(|error| error.to_string())?
+            .overlay_compact()
+    }
+
+    fn overlay_compact_would_wait(&self) -> bool {
+        self.commit_in_progress()
+    }
+
+    fn start_write_back_flush_if_idle(&self) -> Result<bool, String> {
+        if self.commit_in_progress() || self.pending_blocks() == 0 {
+            return Ok(false);
+        }
+        self.start_flush().map_err(|error| error.to_string())
+    }
+
+    fn engine_name(&self) -> &'static str {
+        self.inner().engine_name()
+    }
+
+    fn flush_pending(&self) -> Result<Option<WriteBackFlush>, String> {
+        self.flush().map_err(|error| error.to_string())
+    }
+
+    fn take_write_back_flush(&self) -> Option<WriteBackFlush> {
+        self.take_last_flush()
+    }
 }
 
 #[cfg(feature = "mdbx")]
@@ -10527,6 +11996,8 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
     let mut auxiliary_session = None;
     let mut prefetched_blocks = PrefetchedBlocks::default();
+    // The executor drains replay script work before submitting each batch.
+    let mut script_carry = Vec::new();
     // File size immediately after the last compaction, whatever it released.
     // Compaction rewrites every surviving byte, so repeating it before
     // meaningful garbage has re-accumulated costs far more than it returns —
@@ -10535,6 +12006,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     // accumulates slowly. Gating on growth since this point covers both the
     // fruitless case and the merely uneconomical one.
     let mut last_compacted_bytes: Option<u64> = None;
+    let mut compaction_deferred = false;
     loop {
         loop {
             let tip = chainstate
@@ -10575,6 +12047,19 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
         if tip.height >= ceiling {
             break;
         }
+        // Inside the last flush window before the ceiling, hand each batch
+        // to the engine as soon as the previous commit has landed: the loop
+        // never waits here, and the flush it must wait for at the end then
+        // covers a batch or two instead of the whole window.
+        let taper_blocks = u64::from(overlay.flush_batches)
+            .saturating_mul(options.validation_limits.max_blocks_per_batch as u64);
+        if u64::from(ceiling.saturating_sub(tip.height)) <= taper_blocks
+            && chainstate
+                .start_write_back_flush_if_idle()
+                .map_err(PeerRunError::transient)?
+        {
+            crate::rbtc_debug!("tapering write-back flushes towards the ceiling");
+        }
         let base_height = chainstate.overlay_base_identity().height;
         // Reclaiming space in place is far cheaper than folding the overlay
         // into a whole new snapshot, so try that first; only engines that
@@ -10588,7 +12073,17 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             overlay.compact_percent,
             last_compacted_bytes,
         );
-        if worth_compacting {
+        let compaction_can_wait = chainstate.overlay_compact_would_wait()
+            && usage.used_percent() < overlay.rebase_percent;
+        if worth_compacting && compaction_can_wait {
+            if !compaction_deferred {
+                rbtc_info!(
+                    "deferring overlay compaction until the background write-back commit lands"
+                );
+            }
+            compaction_deferred = true;
+        } else if worth_compacting {
+            compaction_deferred = false;
             if let Some(compaction) = chainstate
                 .overlay_compact()
                 .map_err(PeerRunError::transient)?
@@ -10643,11 +12138,38 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             options.validation_limits.max_blocks_per_batch,
             &mut auxiliary_session,
             &mut prefetched_blocks,
+            &mut script_carry,
             replay.is_none(),
             replay.as_ref(),
             None,
         )
         .await?;
+        while let Some(flush) = chainstate.take_write_back_flush() {
+            log_write_back_flush(&flush);
+        }
+    }
+    // Defensively drain any remaining replay work before final flushing.
+    // Normal execution already validates each batch before submitting it.
+    if let Some((_, index, source)) =
+        drain_script_batches(std::mem::take(&mut script_carry), Vec::new())
+    {
+        return Err(PeerRunError::block(&BlockExecutionError::Block(
+            BlockError::Transaction {
+                index,
+                source: source.into(),
+            },
+        )));
+    }
+    // Whatever the write-back layer still holds becomes durable before the
+    // run reports its tip; a run that errored out above re-executes the
+    // unflushed blocks from the ledger on its next start.
+    chainstate
+        .flush_pending()
+        .map_err(PeerRunError::transient)?;
+    // Every commit is reported from the finished list, including the one
+    // the final flush waited for and one that landed while it was started.
+    while let Some(flush) = chainstate.take_write_back_flush() {
+        log_write_back_flush(&flush);
     }
     let tip = chainstate
         .execution_tip()
@@ -10676,6 +12198,20 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
 /// always names them `utxo-<height>.dat`/`.rbtcidx` beside the original
 /// snapshot — reusing that convention here is what lets a restart find the
 /// current base without persisting a file path anywhere.
+#[cfg(feature = "mdbx")]
+fn log_write_back_flush(flush: &WriteBackFlush) {
+    rbtc_info!(
+        "write-back flushed {} batches / {} blocks to the overlay in {} ms (caller waited {} ms): wrote {} coins and {} spends, cancelled {} coins in memory",
+        flush.batches,
+        flush.blocks,
+        flush.elapsed.as_millis(),
+        flush.waited.as_millis(),
+        flush.created,
+        flush.spent,
+        flush.cancelled,
+    );
+}
+
 #[cfg(feature = "mdbx")]
 fn overlay_base_paths_for_height(
     cli_snapshot: &std::path::Path,
@@ -10746,15 +12282,15 @@ fn creation_mtp_range(
 
 /// Fails closed when the binary was built without the MDBX backend.
 #[cfg(not(feature = "mdbx"))]
-async fn sync_snapshot_overlay_node(
+fn sync_snapshot_overlay_node(
     _session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     _options: &Options,
     _data_dir: PathBuf,
     _network_time: &NetworkTime,
-) -> Result<(), PeerRunError> {
-    Err(PeerRunError::transient(
+) -> std::future::Ready<Result<(), PeerRunError>> {
+    std::future::ready(Err(PeerRunError::transient(
         "snapshot-overlay catch-up requires a build with the mdbx feature",
-    ))
+    )))
 }
 
 fn unseen_header_suffix<'a>(
@@ -10793,6 +12329,7 @@ async fn wait_for_peer_poll(
     duration: Duration,
     wallet: Option<&WalletApiRuntime>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
+    submitted_blocks: &Notify,
 ) -> Result<(), PeerRunError> {
     struct BroadcastWork {
         transaction: Transaction,
@@ -10800,7 +12337,15 @@ async fn wait_for_peer_poll(
         result: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
     }
 
-    let sleep = tokio::time::sleep(duration);
+    // A submitted block ends the poll early. `Notify::notified` is
+    // cancellation-safe and this races only a timer, so nothing in flight on
+    // the peer session can be interrupted part-way.
+    let sleep = async {
+        tokio::select! {
+            () = tokio::time::sleep(duration) => {}
+            () = submitted_blocks.notified() => {}
+        }
+    };
     tokio::pin!(sleep);
     let Some(wallet) = wallet else {
         sleep.await;
@@ -10863,6 +12408,47 @@ async fn wait_for_peer_poll(
             .is_some_and(tokio::sync::oneshot::Sender::is_closed)
         {
             continue;
+        }
+        if let Some(context) = wallet.private_broadcast.get() {
+            // The clearnet session drives scheduling only. The transaction
+            // itself travels exclusively over the anonymity wave, and the
+            // hot-standby relay fan-out is deliberately skipped: standbys
+            // are clearnet sessions and not part of the anonymity path.
+            let delivered = private_broadcast_wave(context, &work.transaction).await;
+            if delivered > 0 {
+                wallet
+                    .rebroadcast
+                    .record_broadcast(work.transaction.compute_wtxid(), u64::from(unix_time()?))
+                    .map_err(|error| PeerRunError::transient(error.to_string()))?;
+                wallet.compact_candidates.insert(work.transaction.clone());
+                rbtc_info!(
+                    "privately broadcast {} to {delivered} anonymity-network peer(s)",
+                    work.transaction.compute_txid()
+                );
+                if let Some(result) = work.result {
+                    let _ = result.send(Ok(()));
+                }
+                continue;
+            }
+            rbtc_warn!(
+                "private broadcast of {} reached no anonymity-network peer; it stays queued and never falls back to clearnet",
+                work.transaction.compute_txid()
+            );
+            if let Some(result) = work.result {
+                retain_wallet_broadcast(
+                    wallet,
+                    WalletBroadcastRequest {
+                        transaction: work.transaction,
+                        fee_sats: work.fee_sats.expect("live request retains validated fee"),
+                        result,
+                    },
+                )
+                .await;
+            }
+            // Ending the poll instead of looping keeps a persistently
+            // unreachable wave from busy-spinning on the same due entry.
+            sleep.await;
+            return Ok(());
         }
         match timeout(
             PEER_TIMEOUT,
@@ -11855,6 +13441,8 @@ async fn sync_validating_node(
     let mut api_server: Option<ApiServer> = None;
     let mut inbound_source_lease: Option<SharedInboundSourceLease> = None;
     let inbound_transactions = Arc::new(Mutex::new(InboundTransactionQueue::default()));
+    let inbound_blocks = Arc::new(Mutex::new(PendingBlockQueue::default()));
+    let submitted_blocks = Arc::new(Notify::new());
     let mut headers = sync_headers(
         session,
         deployment_config,
@@ -11965,6 +13553,8 @@ async fn sync_validating_node(
             server.ensure_running().await?;
         }
         let mut prefetched_blocks = PrefetchedBlocks::default();
+        let mut script_carry = Vec::new();
+        let mut awaiting_submissions = Vec::new();
         loop {
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
@@ -12198,6 +13788,8 @@ async fn sync_validating_node(
                     ledger: Arc::clone(&ledger),
                     transaction_pool: Arc::clone(transaction_pool),
                     pending_transactions: Arc::clone(&inbound_transactions),
+                    pending_blocks: Arc::clone(&inbound_blocks),
+                    submitted_blocks: Arc::clone(&submitted_blocks),
                     basic_filter: auxiliary_indexes.basic_filter.as_ref().map(Arc::clone),
                     deployments: deployment_config.clone(),
                     mempool_full_rbf,
@@ -12212,7 +13804,22 @@ async fn sync_validating_node(
             if let Some(server) = &mut api_server {
                 server.ensure_running().await?;
             }
+            // Before the caught-up comparison below, so a staged submission
+            // advances the active header tip and this iteration executes it
+            // instead of idling on the poll.
+            stage_submitted_blocks(
+                &inbound_blocks,
+                &mut headers,
+                &headers_path,
+                &inbound_headers,
+                network_time,
+                &mut prefetched_blocks,
+                &mut awaiting_submissions,
+            )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
+            // Settle before anything can return or park: a submission staged in
+            // an earlier iteration is decided as soon as execution passes it.
+            settle_submitted_blocks(&mut awaiting_submissions, &headers, tip.height);
             if let Some(status) = &node_status {
                 status.update(collect_node_status(
                     network,
@@ -12370,6 +13977,7 @@ async fn sync_validating_node(
                     Duration::from_secs(poll_seconds),
                     wallet_runtime,
                     transaction_relay,
+                    &submitted_blocks,
                 )
                 .await?;
                 if background_validation.is_none() {
@@ -12427,6 +14035,7 @@ async fn sync_validating_node(
                 effective_validation_limits.max_blocks_per_batch,
                 &mut auxiliary_session,
                 &mut prefetched_blocks,
+                &mut script_carry,
                 overlap_next_download,
                 None,
                 zmq_notifier,
@@ -13594,11 +15203,20 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     maximum_batch_size: usize,
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     prefetched_blocks: &mut PrefetchedBlocks,
+    script_carry: &mut Vec<DeferredScriptBatch>,
     prefetch_next_batch: bool,
     replay: Option<&PrunedBlockLedger>,
     zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
+    // Only the explorer and auxiliary indexes read undo records from the
+    // applied blocks; without them the executor moves the records straight
+    // into the store transition instead of cloning them.
+    let applied_undos = if explorer.is_some() || auxiliary_indexes.enabled().next().is_some() {
+        crate::block_execution::AppliedUndos::Keep
+    } else {
+        crate::block_execution::AppliedUndos::Drop
+    };
     let tip = chainstate
         .execution_tip()
         .map_err(|error| error.to_string())?;
@@ -13659,8 +15277,27 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         ));
     }
     blocks.extend(decoded_prefetch);
+    // Blocks the read-ahead validated skip structure validation below; they
+    // still have to be the blocks the active chain names at their heights.
+    let mut prevalidated = Vec::with_capacity(prefetched.validated.len());
+    let mut early_utxos = prefetched.utxos;
+    for (index, prevalidated_block) in prefetched.validated.into_iter().enumerate() {
+        let position = blocks.len();
+        if position >= hashes.len() || prevalidated_block.hash != hashes[position] {
+            return Err(PeerRunError::transient(format!(
+                "prevalidated block {index} does not match the next active-chain batch"
+            )));
+        }
+        blocks.push(prevalidated_block.block);
+        prevalidated.push((
+            prevalidated_block.deployments,
+            prevalidated_block.transaction_ids,
+            prevalidated_block.bytes,
+        ));
+    }
     let mut offset = blocks.len();
-    if let Some(replay) = replay {
+    // The read-ahead may already have filled the whole batch.
+    if let Some(replay) = replay.filter(|_| offset < hashes.len()) {
         // Replay reads the same blocks from a retained ledger instead of
         // peers, so a storage change can be measured without the network in
         // the number. Everything downstream — structure validation, staging,
@@ -13744,8 +15381,22 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         }
     }
     let downloaded_at = Instant::now();
-    let validated_blocks =
-        validate_downloaded_blocks(deployment_config, headers, &expected, &blocks)?;
+    if prevalidated.len() != blocks.len() {
+        // The early prefetch covered only part of this batch.
+        early_utxos = None;
+    }
+    let validated_blocks = if prevalidated.len() == blocks.len() {
+        prevalidated
+    } else {
+        let rest = validate_downloaded_blocks(
+            deployment_config,
+            headers,
+            &expected[prevalidated.len()..],
+            &blocks[prevalidated.len()..],
+        )?;
+        prevalidated.extend(rest);
+        prevalidated
+    };
     let mut deployment_contexts = Vec::with_capacity(validated_blocks.len());
     let mut transaction_ids = Vec::with_capacity(validated_blocks.len());
     let mut serialized = Vec::with_capacity(validated_blocks.len());
@@ -13840,16 +15491,29 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             shard_result,
             shard_elapsed,
         ) = {
+            let early = early_utxos.take();
             let work = || {
                 std::thread::scope(|scope| {
-                    let utxos = scope.spawn(|| {
+                    // Read-ahead may precede the previous batch's commit.
+                    // Refresh against the current view before consuming it.
+                    let ready = early.map(|mut prefetch| {
                         let started = Instant::now();
-                        let result = prefetch_prevalidated_active_block_utxos(
-                            chainstate,
-                            &blocks,
-                            &transaction_ids,
-                        );
+                        let result = chainstate
+                            .reconcile_prefetch(prefetch.entries_mut())
+                            .map(|()| prefetch)
+                            .map_err(BlockExecutionError::from);
                         (result, started.elapsed())
+                    });
+                    let utxos = ready.is_none().then(|| {
+                        scope.spawn(|| {
+                            let started = Instant::now();
+                            let result = prefetch_prevalidated_active_block_utxos(
+                                chainstate,
+                                &blocks,
+                                &transaction_ids,
+                            );
+                            (result, started.elapsed())
+                        })
                     });
                     let shard = scope.spawn(|| {
                         let started = Instant::now();
@@ -13859,9 +15523,13 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                     });
                     let stage_result = ledger.stage(next_height, &serialized);
                     let branch_staged_at = Instant::now();
-                    let (utxo_result, utxo_elapsed) = utxos
-                        .join()
-                        .expect("scoped UTXO-prefetch thread must not panic");
+                    let (utxo_result, utxo_elapsed) = match (ready, utxos) {
+                        (Some(ready), _) => ready,
+                        (None, Some(utxos)) => utxos
+                            .join()
+                            .expect("scoped UTXO-prefetch thread must not panic"),
+                        (None, None) => unreachable!("a prefetch thread runs when none is ready"),
+                    };
                     let (shard_result, shard_elapsed) = shard
                         .join()
                         .expect("scoped validation-delta shard thread must not panic");
@@ -13888,22 +15556,109 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
         let prefetched_utxos = utxo_result.map_err(|error| PeerRunError::block(&error))?;
-        let (applied_blocks, breakdown) = connect_prevalidated_active_blocks_with_breakdown(
-            chainstate,
-            headers,
-            &blocks,
-            &transaction_ids,
-            prefetched_utxos,
-            now,
-            DEFAULT_HOT_WINDOW_SECS,
-            &deployment_contexts,
-        )
-        .map_err(|error| PeerRunError::block(&error))?;
+        // A replay reads the next batch from the ledger while this one
+        // executes, the way the networked path downloads it: the bytes land
+        // in the prefetch buffer and the next batch starts from them.
+        let read_ahead = replay.and_then(|replay| {
+            let last_height = expected
+                .last()
+                .expect("non-empty block batch has a last header")
+                .height;
+            let carried_len =
+                u32::try_from(carried_prefetch.len()).expect("validation prefetch length fits u32");
+            let carried_height = last_height.checked_add(carried_len)?;
+            let remaining = execution_ceiling.checked_sub(carried_height)?;
+            let wanted = u32::try_from(
+                validation_prefetch_limit(maximum_batch_size)
+                    .saturating_sub(carried_prefetch.len()),
+            )
+            .unwrap_or(u32::MAX)
+            .min(remaining);
+            let first = carried_height.checked_add(1)?;
+            (wanted > 0).then_some((replay, first, wanted))
+        });
+        let (execution_result, read_ahead_result, prefetch_elapsed) = std::thread::scope(|scope| {
+            let ahead = read_ahead.map(|(replay, first, wanted)| {
+                scope.spawn(move || {
+                    let started = Instant::now();
+                    let result = replay
+                        .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
+                        .map_err(|error| error.to_string())
+                        .and_then(|batch| {
+                            if batch.first_height != first {
+                                return Err(
+                                    "read-ahead batch starts at the wrong height".to_owned()
+                                );
+                            }
+                            prevalidate_replay_blocks(
+                                deployment_config,
+                                headers,
+                                first,
+                                batch.blocks,
+                            )
+                        })
+                        .map(|validated| {
+                            // Read through the write-back layer as it stands
+                            // now; what this batch changes is overlaid when
+                            // the next batch starts.
+                            let utxos = prefetch_active_block_utxos_from(
+                                chainstate,
+                                validated
+                                    .iter()
+                                    .map(|block| (&block.block, &block.transaction_ids)),
+                            )
+                            .ok();
+                            (validated, utxos)
+                        });
+                    (result, started.elapsed())
+                })
+            });
+            let execution_result = connect_prevalidated_active_blocks_with_breakdown(
+                chainstate,
+                headers,
+                &blocks,
+                &transaction_ids,
+                prefetched_utxos,
+                now,
+                DEFAULT_HOT_WINDOW_SECS,
+                &deployment_contexts,
+                applied_undos,
+                // Drain every script before this batch can enter a store
+                // that may immediately start a durable write-back flush.
+                replay.and(Some(&mut *script_carry)),
+            );
+            let (read_ahead_result, prefetch_elapsed) = match ahead {
+                Some(handle) => {
+                    let (result, elapsed) = handle
+                        .join()
+                        .expect("scoped replay read-ahead thread must not panic");
+                    (Some(result), elapsed)
+                }
+                None => (None, Duration::ZERO),
+            };
+            (execution_result, read_ahead_result, prefetch_elapsed)
+        });
+        let (applied_blocks, breakdown) =
+            execution_result.map_err(|error| PeerRunError::block(&error))?;
+        // A failed read-ahead is not an error here: the next batch reads the
+        // ledger itself and reports the failure where it can be acted on.
+        let (validated_prefetch, early_utxos) = match read_ahead_result {
+            Some(Ok((blocks, utxos))) => (blocks, utxos),
+            Some(Err(error)) => {
+                crate::rbtc_debug!("replay read-ahead dropped: {error}");
+                (Vec::new(), None)
+            }
+            None => (Vec::new(), None),
+        };
         (
             applied_blocks,
-            Vec::new(),
+            PrefetchedBlocks {
+                serialized: Vec::new(),
+                validated: validated_prefetch,
+                utxos: early_utxos,
+            },
             Instant::now(),
-            Duration::ZERO,
+            prefetch_elapsed,
             utxo_elapsed,
             breakdown,
         )
@@ -13964,6 +15719,8 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                             now,
                             DEFAULT_HOT_WINDOW_SECS,
                             &deployment_contexts,
+                            applied_undos,
+                            None,
                         ))
                     }
                     (Ok(()), Err(error)) => Some(Err(error)),
@@ -14006,7 +15763,11 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         };
         (
             applied_blocks,
-            downloaded_prefetch,
+            PrefetchedBlocks {
+                serialized: downloaded_prefetch,
+                validated: Vec::new(),
+                utxos: None,
+            },
             execution_core_at,
             prefetch_elapsed,
             utxo_prefetch_elapsed,
@@ -14063,6 +15824,8 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             now,
             DEFAULT_HOT_WINDOW_SECS,
             &deployment_contexts,
+            applied_undos,
+            None,
         )
         .map_err(|error| PeerRunError::block(&error))?;
         let execution_core_at = Instant::now();
@@ -14083,7 +15846,11 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         };
         (
             applied_blocks,
-            downloaded_prefetch,
+            PrefetchedBlocks {
+                serialized: downloaded_prefetch,
+                validated: Vec::new(),
+                utxos: None,
+            },
             execution_core_at,
             prefetch_started.elapsed(),
             utxo_elapsed,
@@ -14091,9 +15858,13 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         )
     };
     let commit_profile = chainstate.take_commit_profile();
-    let execution_prefetch_count = carried_prefetch.len() + downloaded_prefetch.len();
-    carried_prefetch.extend(downloaded_prefetch);
+    let execution_prefetch_count = carried_prefetch.len()
+        + downloaded_prefetch.serialized.len()
+        + downloaded_prefetch.validated.len();
+    carried_prefetch.extend(downloaded_prefetch.serialized);
     prefetched_blocks.serialized = carried_prefetch;
+    prefetched_blocks.validated = downloaded_prefetch.validated;
+    prefetched_blocks.utxos = downloaded_prefetch.utxos;
     let executed_at = Instant::now();
     if maximum_height.is_none() {
         let removed_orphans = {
@@ -14142,7 +15913,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     let pruned_index_undos = prune_expired_auxiliary_index_undos(auxiliary_indexes, ledger)?;
     let published_at = Instant::now();
     rbtc_info!(
-        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
+        "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-validate-prepare={}ms core-validate-utxo={}ms core-validate-net={}ms core-validate-checks={}ms core-apply={}ms core-apply-net={}ms core-apply-fold={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
         blocks.len(),
         first.height,
         last.height,
@@ -14156,6 +15927,13 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         executed_at.duration_since(staged_at).as_millis(),
         execution_core_at.duration_since(staged_at).as_millis(),
         breakdown.validate.as_millis(),
+        breakdown.validate_prepare.as_millis(),
+        breakdown.validate_utxo.as_millis(),
+        breakdown.validate_net.as_millis(),
+        breakdown.validate_checks.as_millis(),
+        breakdown.apply.as_millis(),
+        breakdown.apply_net.as_millis(),
+        breakdown.apply_fold.as_millis(),
         breakdown.submit.as_millis(),
         breakdown.script_wait.as_millis(),
         breakdown.commit.as_millis(),
@@ -14311,6 +16089,52 @@ fn validate_downloaded_block(
         ))
     })?;
     Ok((deployments, transaction_ids, serialize(block)))
+}
+
+/// Decodes and structure-validates blocks a replay read ahead of execution,
+/// keeping the bytes they came from for staging.
+fn prevalidate_replay_blocks(
+    deployment_config: &DeploymentConfig,
+    headers: &HeaderDag,
+    first_height: u32,
+    serialized: Vec<Vec<u8>>,
+) -> Result<Vec<PrevalidatedBlock>, String> {
+    let mut validated = Vec::with_capacity(serialized.len());
+    for (offset, bytes) in serialized.into_iter().enumerate() {
+        let height = first_height
+            .checked_add(u32::try_from(offset).map_err(|_| "read-ahead offset".to_owned())?)
+            .ok_or_else(|| "read-ahead height overflow".to_owned())?;
+        let expected_hash = headers
+            .active_header_at(height)
+            .map(|header| header.hash)
+            .ok_or_else(|| format!("missing active header at height {height}"))?;
+        let block = deserialize::<Block>(&bytes).map_err(|error| error.to_string())?;
+        let hash = block.block_hash();
+        if hash != expected_hash {
+            return Err(format!(
+                "read-ahead block at height {height} is not on the active chain"
+            ));
+        }
+        let deployments =
+            block_deployment_context_for_headers(deployment_config, headers, height, hash)
+                .map_err(|error| error.to_string())?;
+        let transaction_ids = validate_block_structure_with_deployments_and_txids(
+            &block,
+            height,
+            deployments.bip34_active,
+            deployments.segwit_active,
+            deployments.signet_challenge.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        validated.push(PrevalidatedBlock {
+            block,
+            hash,
+            deployments,
+            transaction_ids,
+            bytes,
+        });
+    }
+    Ok(validated)
 }
 
 fn validate_downloaded_blocks(
@@ -14618,6 +16442,63 @@ fn elapsed_ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
+/// Which source may consult the configured seed authorities this run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeedBootstrap {
+    /// Submit each authority's name to the proxy authorised to resolve it.
+    NameProxy(SocketAddr),
+    /// Resolve each authority on this host.
+    LocalResolver,
+    /// No authority is configured, so neither source runs.
+    None,
+}
+
+/// Chooses the one source allowed to consult the seed authorities.
+///
+/// An authorised name proxy replaces the local resolver rather than preceding
+/// it. The two are mutually exclusive because running both would send the very
+/// lookup the proxy exists to prevent, and a fallback from one to the other
+/// would do the same the first time the proxy failed.
+const fn seed_bootstrap(name_proxy: Option<SocketAddr>, seeds: &[DnsSeed]) -> SeedBootstrap {
+    if seeds.is_empty() {
+        return SeedBootstrap::None;
+    }
+    match name_proxy {
+        Some(proxy) => SeedBootstrap::NameProxy(proxy),
+        None => SeedBootstrap::LocalResolver,
+    }
+}
+
+/// Pairs the authorities a proxied wave may contact with the port to request.
+///
+/// Selection belongs to [`seed_name_wave`]; this only supplies the port, taken
+/// from the configured entry that first names each authority. That matches the
+/// wave's own choice to keep the first spelling of an authority written twice,
+/// so the two cannot disagree about which entry an authority came from.
+fn seed_name_wave_targets(
+    seeds: &[DnsSeed],
+) -> (Vec<NodePeerTarget>, Vec<(String, SeedNameError)>) {
+    let hosts = seeds
+        .iter()
+        .map(|seed| seed.host.clone())
+        .collect::<Vec<_>>();
+    let (names, refused) = seed_name_wave(&hosts);
+    let mut ports: HashMap<SeedName, u16> = HashMap::new();
+    for seed in seeds {
+        if let Ok(name) = SeedName::parse(&seed.host) {
+            ports.entry(name).or_insert(seed.port);
+        }
+    }
+    let targets = names
+        .into_iter()
+        .filter_map(|name| {
+            let port = *ports.get(&name)?;
+            Some(NodePeerTarget::SeedName { name, port })
+        })
+        .collect();
+    (targets, refused)
+}
+
 fn selected_dns_seeds(options: &Options) -> Vec<DnsSeed> {
     options.dns_seeds.clone().unwrap_or_else(|| {
         pinned_dns_seed_hosts(options.network)
@@ -14672,6 +16553,22 @@ const fn default_p2p_port(network: Network) -> u16 {
     }
 }
 
+/// Counts the local resolver requests this process has begun.
+///
+/// A bootstrap that must not resolve is otherwise only checkable by reading
+/// the code. This makes it observable instead: take the count before and
+/// after, and any lookup this process started shows up whether it succeeded,
+/// failed, or timed out. It counts requests, not packets, so it cannot speak
+/// for what the host's resolver library or a sidecar does with a request that
+/// was never made here.
+static DNS_LOOKUPS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns how many local resolver requests this process has begun.
+#[cfg(test)]
+fn dns_lookups_started() -> usize {
+    DNS_LOOKUPS_STARTED.load(Ordering::Relaxed)
+}
+
 async fn resolve_dns_candidates(
     network: Network,
     only_net: NodeOnlyNet,
@@ -14679,12 +16576,25 @@ async fn resolve_dns_candidates(
     excluded: &HashSet<SocketAddr>,
     limit: usize,
 ) -> (Vec<SocketAddr>, Vec<String>, usize) {
+    // An anonymity-network restriction rejects every resolved IP, so running
+    // the lookups first would send clear-net DNS queries for Bitcoin seed
+    // hostnames and then discard all of the answers — precisely the leak the
+    // restriction exists to prevent. Short-circuit before any query leaves
+    // this host.
+    if !only_net.permits(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+        && !only_net.permits(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+    {
+        return (Vec::new(), Vec::new(), 0);
+    }
     let mut lookups = tokio::task::JoinSet::new();
     let seed_count = seeds.len().min(MAX_DNS_SEEDS);
     for (index, seed) in seeds.iter().take(MAX_DNS_SEEDS).cloned().enumerate() {
         lookups.spawn(async move {
             let host = seed.host;
             let port = seed.port;
+            // Counted before the request, not after it resolves: a lookup that
+            // times out or fails still left this host.
+            DNS_LOOKUPS_STARTED.fetch_add(1, Ordering::Relaxed);
             let lookup = timeout(
                 DNS_SEED_TIMEOUT,
                 tokio::net::lookup_host((host.as_str(), port)),
@@ -14832,6 +16742,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut no_dns_seeds = false;
     let mut only_net_values = Vec::new();
     let mut outbound_proxy = None;
+    let mut name_proxy = None;
     let mut network = Network::Bitcoin;
     let mut fetch_block = None;
     let mut headers_db = None;
@@ -14867,6 +16778,9 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut background_assumeutxo = None;
     let mut mempool_full_rbf = true;
     let mut v2_transport = false;
+    let mut asmap_source = None;
+    let mut cjdns_reachable = false;
+    let mut private_broadcast = false;
     let mut transaction_index = false;
     let mut spent_output_index = false;
     let mut basic_filter_index = false;
@@ -14903,6 +16817,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut snapshot_overlay_replay_blocks: Option<PathBuf> = None;
     let mut snapshot_overlay_rebase_percent = None;
     let mut snapshot_overlay_compact_percent = None;
+    let mut snapshot_overlay_flush_batches: Option<u32> = None;
+    let mut snapshot_overlay_flush_coins: Option<u64> = None;
     let mut snapshot_overlay_engine = None;
     let mut validation_batch_size = None;
     let mut validation_pause_ms = None;
@@ -14957,6 +16873,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     "ipv6" => NodeOnlyNet::Ipv6,
                     "onion" => NodeOnlyNet::Onion,
                     "i2p" => NodeOnlyNet::I2p,
+                    "cjdns" => NodeOnlyNet::Cjdns,
                     _ => return Err(format!("unsupported --onlynet value: {value}")),
                 };
                 if !only_net_values.contains(&family) {
@@ -14972,6 +16889,31 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     value
                         .parse::<SocketAddr>()
                         .map_err(|_| format!("invalid SOCKS5 proxy address: {value}"))?,
+                );
+            }
+            "--name-proxy" => {
+                if name_proxy.is_some() {
+                    return Err("--name-proxy cannot be supplied more than once".to_owned());
+                }
+                let value = required_option_value(&mut args, "--name-proxy")?;
+                name_proxy = Some(
+                    value
+                        .parse::<SocketAddr>()
+                        .map_err(|_| format!("invalid name proxy address: {value}"))?,
+                );
+            }
+            "--asmap" => {
+                if asmap_source.is_some() {
+                    return Err("--asmap cannot be supplied more than once".to_owned());
+                }
+                // The literals win over paths, so a file spelled exactly
+                // `embedded` or `off` must be addressed as `./embedded`.
+                asmap_source = Some(
+                    match required_option_value(&mut args, "--asmap")?.as_str() {
+                        "embedded" => NodeAsmapSource::Embedded,
+                        "off" => NodeAsmapSource::Off,
+                        path => NodeAsmapSource::File(PathBuf::from(path)),
+                    },
                 );
             }
             "--network" => {
@@ -15181,6 +17123,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             "--no-mempool-full-rbf" => mempool_full_rbf = false,
             "--v2-transport" => v2_transport = true,
             "--no-v2-transport" => v2_transport = false,
+            "--cjdns-reachable" => cjdns_reachable = true,
+            "--no-cjdns-reachable" => cjdns_reachable = false,
+            "--private-broadcast" => private_broadcast = true,
+            "--no-private-broadcast" => private_broadcast = false,
             "--txindex" => transaction_index = true,
             "--no-txindex" => transaction_index = false,
             "--spent-output-index" => spent_output_index = true,
@@ -15572,6 +17518,44 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     return Err("overlay compaction percent must be between 10 and 95".to_owned());
                 }
                 snapshot_overlay_compact_percent = Some(percent);
+            }
+            "--snapshot-overlay-flush-batches" => {
+                if snapshot_overlay_flush_batches.is_some() {
+                    return Err(
+                        "--snapshot-overlay-flush-batches cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-flush-batches")?;
+                let batches = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid overlay flush batch count: {value}"))?;
+                if !(1..=MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES).contains(&batches) {
+                    return Err(format!(
+                        "overlay flush batch count must be between 1 and {MAX_SNAPSHOT_OVERLAY_FLUSH_BATCHES}"
+                    ));
+                }
+                snapshot_overlay_flush_batches = Some(batches);
+            }
+            "--snapshot-overlay-flush-coins" => {
+                if snapshot_overlay_flush_coins.is_some() {
+                    return Err(
+                        "--snapshot-overlay-flush-coins cannot be supplied more than once"
+                            .to_owned(),
+                    );
+                }
+                let value = required_option_value(&mut args, "--snapshot-overlay-flush-coins")?;
+                let coins = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid overlay flush coin count: {value}"))?;
+                if !(MIN_SNAPSHOT_OVERLAY_FLUSH_COINS..=MAX_SNAPSHOT_OVERLAY_FLUSH_COINS)
+                    .contains(&coins)
+                {
+                    return Err(format!(
+                        "overlay flush coin count must be between {MIN_SNAPSHOT_OVERLAY_FLUSH_COINS} and {MAX_SNAPSHOT_OVERLAY_FLUSH_COINS}"
+                    ));
+                }
+                snapshot_overlay_flush_coins = Some(coins);
             }
             "--snapshot-overlay-rebase-percent" => {
                 if snapshot_overlay_rebase_percent.is_some() {
@@ -16119,6 +18103,8 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 || snapshot_overlay_compact_percent.is_some()
                 || snapshot_overlay_engine.is_some()
                 || snapshot_overlay_replay_blocks.is_some()
+                || snapshot_overlay_flush_batches.is_some()
+                || snapshot_overlay_flush_coins.is_some()
             {
                 return Err(
                     "overlay capacity, engine, replay, and rebase options require --snapshot-overlay-catchup"
@@ -16138,6 +18124,10 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                 .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT),
             engine: snapshot_overlay_engine.unwrap_or(SnapshotOverlayEngine::Mdbx),
             replay_blocks: snapshot_overlay_replay_blocks,
+            flush_batches: snapshot_overlay_flush_batches
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES),
+            flush_coins: snapshot_overlay_flush_coins
+                .unwrap_or(DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS),
         }),
         _ => {
             return Err(
@@ -16857,7 +18847,11 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             mempool_max_bytes: mempool_max_bytes.unwrap_or(MAX_ADMITTED_TRANSACTION_BYTES),
             only_net: resolve_only_net(&only_net_values)?,
             proxy: outbound_proxy,
+            name_proxy,
             v2_transport,
+            asmap: asmap_source.unwrap_or_default(),
+            cjdns_reachable,
+            private_broadcast,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -16969,7 +18963,7 @@ fn print_usage() {
             "  rbtcd --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest --prune-through-height HEIGHT [--apply-prune-token PLAN_TOKEN]\n",
             "  rbtcd --download-core-assumeutxo HTTPS_URL --snapshot-download-output FILE --snapshot-download-bytes BYTES [--snapshot-download-workers 1..8]\n",
             "  rbtcd --build-core-snapshot-index CORE_DUMPTXOUTSET_FILE --snapshot-index-output FILE\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network NETWORK --once --snapshot-overlay-catchup SNAPSHOT --snapshot-overlay-index INDEX [--snapshot-overlay-capacity-bytes BYTES] [--snapshot-overlay-rebase-percent 50..99] [--snapshot-overlay-flush-batches 1..64] [--snapshot-overlay-flush-coins N]\n",
             "  rbtcd [PEER OPTIONS] --fetch-block BLOCK_HASH [--network NETWORK]\n\n",
             "CONFIG:\n",
             "  Strict key=value files are capped at 64 KiB. Global values apply first; [bitcoin], [testnet], [testnet4], [signet], or [regtest] values replace them. Unknown keys and duplicate scalars fail. Explicit CLI option groups replace file values.\n\n",
@@ -17019,6 +19013,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+
+    /// Serialises tests that read the process-wide resolver counter.
+    static DNS_OBSERVATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     const RECEIVE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/0/*)#g0w0ymmw";
     const CHANGE_DESCRIPTOR: &str = "wpkh([41f2aed0/84h/1h/0h]tpubDDFSdQWw75hk1ewbwnNpPp5DvXFRKt68ioPoyJDY752cNHKkFxPWqkqCyCf4hxrEfpuxh46QisehL3m8Bi6MsAv394QVLopwbtfvryFQNUH/1/*)#emtwewtk";
@@ -17399,6 +19396,101 @@ mod tests {
 
     /// Builds a regtest node data source whose chainstate holds one mature
     /// spendable coinbase output at the active tip.
+    /// Builds an operator whose status reports the given independence.
+    fn template_test_operator(
+        source: Option<Arc<SharedInboundSource>>,
+        independently_validated: bool,
+    ) -> NodeRpcOperator {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest).block_hash();
+        let status = ready_test_node_status(genesis);
+        status.progress.lock().unwrap().independently_validated = independently_validated;
+        NodeRpcOperator {
+            status,
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source,
+        }
+    }
+
+    #[test]
+    fn a_chainstate_that_is_not_independently_validated_serves_no_template() {
+        // The decision this encodes: a snapshot overlay or an AssumeUTXO chain
+        // still completing its background sync has not verified the history its
+        // UTXO set asserts. Handing a miner a template built on that asks them
+        // to stake a block reward on an unverified claim.
+        let operator = template_test_operator(None, false);
+
+        let error = operator
+            .block_template()
+            .expect_err("an unverified chainstate must not serve templates");
+
+        assert_eq!(error.code, -32041);
+        assert!(error.message.contains("independently validated"));
+    }
+
+    #[test]
+    fn the_independence_gate_is_checked_before_data_availability() {
+        // Both operators lack a source. The unverified one must still report
+        // why it refuses, rather than the generic not-ready error, or an
+        // operator could mistake a policy refusal for a transient one.
+        let unverified = template_test_operator(None, false);
+        let verified = template_test_operator(None, true);
+
+        assert_eq!(unverified.block_template().unwrap_err().code, -32041);
+        assert_eq!(verified.block_template().unwrap_err().code, -28);
+    }
+
+    #[test]
+    fn a_template_describes_the_next_block_on_the_active_chain() {
+        let directory = TempDir::new().unwrap();
+        let (inbound, _, _) = dry_run_test_source(directory.path());
+        let tip = inbound
+            .template_source()
+            .expect("a node-backed source offers a template context")
+            .0
+            .read()
+            .unwrap()
+            .active_tip();
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let _lease = shared.install(Arc::new(inbound));
+        let operator = template_test_operator(Some(Arc::clone(&shared)), true);
+
+        let template = operator.block_template().expect("a template is produced");
+
+        assert_eq!(template["height"], tip.height + 1);
+        assert_eq!(template["previousblockhash"], tip.hash.to_string());
+        assert_eq!(
+            template["version"],
+            i32::try_from(0x2000_0000_u32).unwrap(),
+            "the version is derived from deployment state, not assumed"
+        );
+        assert_eq!(
+            template["coinbasevalue"], 5_000_000_000_u64,
+            "an empty template pays exactly the height subsidy"
+        );
+        assert_eq!(template["transactions"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            template["mutable"],
+            serde_json::json!(["time", "transactions", "prevblock"])
+        );
+        assert!(
+            template["curtime"].as_u64().unwrap() >= template["mintime"].as_u64().unwrap(),
+            "a template must never propose a time the median-time-past rule rejects"
+        );
+        assert!(
+            template["default_witness_commitment"].is_string(),
+            "a segwit template must carry the commitment a miner has to copy"
+        );
+        assert_eq!(template["rules"], serde_json::json!(["!segwit", "taproot"]));
+        assert_eq!(template["rbtc_skipped_over_ceiling"], 0);
+    }
+
     fn dry_run_test_source(directory: &std::path::Path) -> (NodeInboundSource, OutPoint, Utxo) {
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let mut dag = HeaderDag::new(Network::Regtest);
@@ -17451,6 +19543,8 @@ mod tests {
                 ledger: Arc::new(ledger),
                 transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
                 pending_transactions: Arc::new(Mutex::new(InboundTransactionQueue::default())),
+                pending_blocks: Arc::new(Mutex::new(PendingBlockQueue::default())),
+                submitted_blocks: Arc::new(Notify::new()),
                 basic_filter: None,
                 deployments: DeploymentConfig::for_network(Network::Regtest),
                 mempool_full_rbf: true,
@@ -17458,6 +19552,288 @@ mod tests {
             funding,
             utxo,
         )
+    }
+
+    /// Builds one regtest block that extends `parent` at `height`.
+    fn submitted_regtest_block(parent: BlockHash, height: u32, time: u32) -> Block {
+        let template = rbtc::block_assembly::BlockTemplate::regtest(parent, height, time);
+        rbtc::block_assembly::assemble_block(&template).expect("regtest block assembles")
+    }
+
+    #[test]
+    fn the_pending_block_queue_separates_duplicates_from_its_ceiling() {
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let block = submitted_regtest_block(genesis.block_hash(), 1, 1_800_000_000);
+        let mut queue = PendingBlockQueue::default();
+
+        assert!(matches!(
+            queue.push(block.clone()),
+            BlockSubmission::Queued(_)
+        ));
+        assert!(
+            matches!(queue.push(block.clone()), BlockSubmission::Duplicate),
+            "resubmitting the same block must be distinguishable from a full queue"
+        );
+
+        // Distinct blocks until the ceiling, then `Full` rather than a silent drop:
+        // the transaction queue evicts under pressure, but a dropped block would
+        // leave the submitter believing work was accepted that nothing will connect.
+        for offset in 1..MAX_PENDING_SUBMITTED_BLOCKS {
+            let filler = submitted_regtest_block(
+                genesis.block_hash(),
+                1,
+                1_800_000_000 + u32::try_from(offset).unwrap(),
+            );
+            assert!(matches!(queue.push(filler), BlockSubmission::Queued(_)));
+        }
+        let overflow = submitted_regtest_block(genesis.block_hash(), 1, 1_900_000_000);
+        assert!(matches!(queue.push(overflow), BlockSubmission::Full));
+        assert_eq!(queue.drain().len(), MAX_PENDING_SUBMITTED_BLOCKS);
+    }
+
+    #[test]
+    fn staging_a_submitted_block_extends_the_active_chain_and_queues_its_body() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        assert!(matches!(
+            pending.lock().unwrap().push(block.clone()),
+            BlockSubmission::Queued(_)
+        ));
+        let mut prefetched = PrefetchedBlocks::default();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(headers.active_tip().hash, block.block_hash());
+        assert_eq!(headers.active_tip().height, 1);
+        assert_eq!(
+            prefetched.serialized,
+            vec![serialize(&block)],
+            "the body must reach the prefetch buffer, or the execution loop asks a peer for a block it already has"
+        );
+        assert_eq!(
+            inbound_headers.read().unwrap().active_tip().hash,
+            block.block_hash(),
+            "the RPC-side snapshot must advance too, or the next submission cannot see its own parent"
+        );
+
+        // Persisted, so the resync that follows every caught-up poll reloads the
+        // header instead of silently dropping back to the previous tip.
+        let reloaded = RedbHeaderStore::open(&headers_path)
+            .unwrap()
+            .load_dag_with_deployments(
+                DeploymentConfig::for_network(Network::Regtest),
+                unix_time().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(reloaded.active_tip().hash, block.block_hash());
+    }
+
+    #[test]
+    fn a_submitted_block_with_an_unknown_parent_leaves_the_chain_and_prefetch_untouched() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let tip_before = headers.active_tip().hash;
+        let inbound_headers = RwLock::new(headers.clone());
+        // Height 2 on a parent nothing has ever seen.
+        let orphan =
+            submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        pending.lock().unwrap().push(orphan);
+        let mut prefetched = PrefetchedBlocks::default();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut Vec::new(),
+        )
+        .expect("a rejected submission is not a node failure");
+
+        assert_eq!(headers.active_tip().hash, tip_before);
+        assert!(
+            prefetched.serialized.is_empty(),
+            "an unconnectable body must never reach the prefetch buffer: the execution path would then fail to match it against the active chain and abort the peer run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_header_answers_its_submitter_instead_of_only_logging() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let orphan =
+            submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        let BlockSubmission::Queued(verdict) = pending.lock().unwrap().push(orphan) else {
+            panic!("the first submission is queued");
+        };
+        let mut prefetched = PrefetchedBlocks::default();
+        let mut awaiting = Vec::new();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut awaiting,
+        )
+        .unwrap();
+
+        let reason = verdict
+            .await
+            .expect("a rejected header is answered, not dropped")
+            .expect_err("an unconnectable header is not a success");
+        assert!(
+            reason.contains("parent") || reason.contains("Parent"),
+            "the submitter must learn why, not just that it failed: {reason}"
+        );
+        assert!(awaiting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_connected_submission_is_confirmed_only_after_execution_reaches_it() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        let BlockSubmission::Queued(mut verdict) = pending.lock().unwrap().push(block.clone())
+        else {
+            panic!("the submission is queued");
+        };
+        let mut prefetched = PrefetchedBlocks::default();
+        let mut awaiting = Vec::new();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut awaiting,
+        )
+        .unwrap();
+
+        // Staged but not executed: answering now would claim a connection that
+        // has not happened.
+        assert_eq!(awaiting.len(), 1);
+        settle_submitted_blocks(&mut awaiting, &headers, 0);
+        assert_eq!(awaiting.len(), 1);
+        assert!(
+            verdict.try_recv().is_err(),
+            "a staged block must not be reported as connected before execution reaches it"
+        );
+
+        settle_submitted_blocks(&mut awaiting, &headers, 1);
+        assert!(awaiting.is_empty());
+        assert_eq!(verdict.await.expect("the verdict is delivered"), Ok(()));
+    }
+
+    #[test]
+    fn a_competing_submission_is_recorded_but_its_body_is_not_queued() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let now = unix_time().unwrap();
+        let first = submitted_regtest_block(genesis.block_hash(), 1, now);
+        // Same parent, same work: a valid header that does not win the active
+        // chain. Its body must stay out of the prefetch buffer, which the
+        // execution path matches positionally against the active chain.
+        let competing = submitted_regtest_block(genesis.block_hash(), 1, now + 1);
+        assert_ne!(first.block_hash(), competing.block_hash());
+
+        let pending = Mutex::new(PendingBlockQueue::default());
+        pending.lock().unwrap().push(first.clone());
+        pending.lock().unwrap().push(competing.clone());
+        let mut prefetched = PrefetchedBlocks::default();
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(headers.active_tip().hash, first.block_hash());
+        assert!(headers.get(&competing.block_hash()).is_some());
+        assert_eq!(
+            prefetched.serialized,
+            vec![serialize(&first)],
+            "only the block that took the active tip may be handed to the execution path"
+        );
+    }
+
+    #[test]
+    fn staging_defers_while_a_previous_batch_is_still_buffered() {
+        let directory = TempDir::new().unwrap();
+        let headers_path = directory.path().join("headers.redb");
+        let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+        let mut headers =
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let inbound_headers = RwLock::new(headers.clone());
+        let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
+        let pending = Mutex::new(PendingBlockQueue::default());
+        pending.lock().unwrap().push(block);
+
+        // Carried-over prefetch from an earlier batch. Appending behind it would
+        // break the contiguous ascending run the execution path requires.
+        let mut prefetched = PrefetchedBlocks {
+            validated: Vec::new(),
+            utxos: None,
+            serialized: vec![serialize(&genesis)],
+        };
+        stage_submitted_blocks(
+            &pending,
+            &mut headers,
+            &headers_path,
+            &inbound_headers,
+            &NetworkTime::default(),
+            &mut prefetched,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(prefetched.serialized, vec![serialize(&genesis)]);
+        assert_eq!(headers.active_tip().height, 0);
+        assert_eq!(
+            pending.lock().unwrap().drain().len(),
+            1,
+            "a deferred submission must stay queued rather than being consumed and lost"
+        );
     }
 
     #[test]
@@ -17634,6 +20010,257 @@ mod tests {
         assert!(past_end["next_cursor"].is_null());
     }
 
+    #[test]
+    fn gettxoutsetinfo_aggregates_the_utxo_set_in_bounded_windows() {
+        let directory = TempDir::new().unwrap();
+        let (node_source, funding, funded) = dry_run_test_source(directory.path());
+        let extra = (1..4u32)
+            .map(|vout| OutPoint::new(funding.txid, vout))
+            .collect::<Vec<_>>();
+        node_source
+            .chainstate
+            .apply(
+                &[],
+                &extra
+                    .iter()
+                    .map(|outpoint| (OutPointKey::from(*outpoint), funded.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let total_outputs = 1 + extra.len();
+
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
+        let _lease = shared.install(dynamic);
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+
+        // Windowed aggregation summed across pages must equal the whole set.
+        let mut cursor = serde_json::Value::Null;
+        let mut txouts = 0_u64;
+        let mut total_amount = 0_u64;
+        let mut windows = 0;
+        loop {
+            let window = operator
+                .execute("gettxoutsetinfo", &serde_json::json!([cursor.clone(), 2]))
+                .unwrap()
+                .unwrap();
+            txouts += window["window_txouts"].as_u64().unwrap();
+            total_amount += window["window_total_amount_sats"].as_u64().unwrap();
+            windows += 1;
+            cursor = window["next_cursor"].clone();
+            if window["complete"].as_bool().unwrap() {
+                assert!(cursor.is_null());
+                break;
+            }
+            assert!(windows < 100, "windowed scan must terminate");
+        }
+        assert_eq!(txouts, total_outputs as u64);
+        assert_eq!(total_amount, funded.value_sats * total_outputs as u64);
+        assert!(windows > 1, "a 2-entry window paged the 4-entry set");
+
+        // The default (no cursor, no limit) completes small sets in one call.
+        let whole = operator
+            .execute("gettxoutsetinfo", &serde_json::json!([]))
+            .unwrap()
+            .unwrap();
+        assert!(whole["complete"].as_bool().unwrap());
+        assert_eq!(
+            whole["window_txouts"].as_u64().unwrap(),
+            total_outputs as u64
+        );
+        assert_eq!(whole["height"], 0);
+
+        for invalid in [
+            serde_json::json!(["not-a-cursor", 2]),
+            serde_json::json!([null, 0]),
+            serde_json::json!([null, 2, 3]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("gettxoutsetinfo", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn getmempoolcluster_rpc_reports_a_miss_and_validates_params() {
+        // Closure correctness is covered where the admission helpers live
+        // (`cluster_of_reports_the_dependency_connected_closure`); this
+        // exercises the RPC dispatch and error surface against an empty pool.
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: None,
+        };
+
+        // An absent transaction is a clear miss, not an empty cluster.
+        let absent = operator
+            .execute(
+                "getmempoolcluster",
+                &serde_json::json!([Txid::from_byte_array([0x33; 32]).to_string()]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent.code, -5);
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!(["not-a-txid"]),
+            serde_json::json!([Txid::from_byte_array([0x33; 32]).to_string(), 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("getmempoolcluster", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn getmempoolfeeratediagram_rpc_reports_a_miss_and_validates_params() {
+        // Diagram correctness lives with the admission and pure-layer
+        // tests; this exercises the RPC dispatch and error surface.
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: None,
+        };
+        let absent = operator
+            .execute(
+                "getmempoolfeeratediagram",
+                &serde_json::json!([Txid::from_byte_array([0x35; 32]).to_string()]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent.code, -5);
+        for invalid in [
+            serde_json::json!([]),
+            serde_json::json!(["not-a-txid"]),
+            serde_json::json!([Txid::from_byte_array([0x35; 32]).to_string(), 1]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("getmempoolfeeratediagram", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
+    #[test]
+    fn addnode_seeds_and_forgets_a_dial_candidate() {
+        let directory = TempDir::new().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        shared.install_peer_store(Some(Arc::clone(&peer_store)));
+        let operator = NodeRpcOperator {
+            status: ready_test_node_status(BlockHash::all_zeros()),
+            transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
+            runtime_control: Arc::new(RuntimeControl::default()),
+            active_peer: None,
+            auxiliary_indexes: Arc::new(AuxiliaryIndexes {
+                transaction: None,
+                spent_output: None,
+                basic_filter: None,
+            }),
+            source: Some(Arc::clone(&shared)),
+        };
+        let address = "203.0.113.7:8333";
+        let now = unix_time().unwrap();
+
+        let added = operator
+            .execute("addnode", &serde_json::json!([address, "add"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(added["added"], true);
+        assert!(
+            peer_store
+                .candidates(now, 16)
+                .unwrap()
+                .contains(&address.parse().unwrap()),
+            "an added node becomes a dial candidate"
+        );
+
+        // onetry seeds the same candidate table.
+        assert_eq!(
+            operator
+                .execute("addnode", &serde_json::json!([address, "onetry"]))
+                .unwrap()
+                .unwrap()["command"],
+            "onetry"
+        );
+
+        let removed = operator
+            .execute("addnode", &serde_json::json!([address, "remove"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed["removed"], true);
+        assert!(
+            !peer_store
+                .candidates(now, 16)
+                .unwrap()
+                .contains(&address.parse().unwrap()),
+            "a removed node is no longer a candidate"
+        );
+        assert_eq!(
+            operator
+                .execute("addnode", &serde_json::json!([address, "remove"]))
+                .unwrap()
+                .unwrap()["removed"],
+            false
+        );
+
+        for invalid in [
+            serde_json::json!([address]),
+            serde_json::json!(["not-an-address", "add"]),
+            serde_json::json!([address, "sometimes"]),
+        ] {
+            assert_eq!(
+                operator
+                    .execute("addnode", &invalid)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                -32602
+            );
+        }
+    }
+
     #[tokio::test]
     async fn onion_peers_are_dialed_only_through_a_proxy_and_skip_socket_bookkeeping() {
         let onion = OnionAddress::from_public_key([0x44; 32], 8333);
@@ -17705,6 +20332,816 @@ mod tests {
             store.onion_candidates(now, 10).unwrap().contains(&onion),
             "a completed session clears the onion backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn seed_name_peers_need_a_name_proxy_and_enter_no_address_book() {
+        let name = SeedName::parse("seed.bitcoin.sipa.be").expect("a seed authority parses");
+        let target = NodePeerTarget::SeedName {
+            name: name.clone(),
+            port: 8333,
+        };
+        assert_eq!(target.socket(), None);
+        assert!(target.is_seed_name());
+        assert_eq!(target.to_string(), "seed.bitcoin.sipa.be:8333");
+        assert_eq!(
+            ProxyTarget::try_from(&target).expect("a name target converts"),
+            ProxyTarget::SeedName { name, port: 8333 }
+        );
+        // Unlike every other target, this one must not round-trip through its
+        // textual form: parsing it back would let `--connect` hand an
+        // arbitrary hostname to the proxy as though it were a peer.
+        assert!(
+            target.to_string().parse::<NodePeerTarget>().is_err(),
+            "a seed name is never a configurable peer address"
+        );
+
+        // Without the proxy authorised to see seed names there is no route at
+        // all. Failing here is the point: the only alternative route is the
+        // local lookup this path exists to avoid.
+        let Err(error) = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            None,
+            700,
+            false,
+            None,
+        )
+        .await
+        else {
+            panic!("a seed name cannot be dialed without a name proxy");
+        };
+        assert_eq!(error.kind, PeerFailureKind::LocalResource);
+        assert!(error.message.contains("--name-proxy"));
+
+        // The proxy chose the address and never reported it, so no book keyed
+        // by an address may gain an entry from any outcome of this target.
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let now = unix_time().unwrap();
+        record_peer_attempt(Some(&store), &target);
+        record_peer_failure(
+            Some(&store),
+            &target,
+            PeerFailureKind::ProtocolViolation,
+            false,
+        );
+        record_peer_session_success(Some(&store), &target);
+        assert!(
+            store.candidates(now, 10).unwrap().is_empty(),
+            "a name target is never written as a routable peer"
+        );
+        assert!(store.onion_candidates(now, 10).unwrap().is_empty());
+        assert!(store.i2p_candidates(now, 10).unwrap().is_empty());
+        assert!(
+            store.discouraged_addresses(now).unwrap().is_empty(),
+            "a name failure has no address to discourage, so it discourages none"
+        );
+    }
+
+    #[test]
+    fn an_authorised_name_proxy_replaces_the_local_seed_lookup() {
+        let seeds = vec![DnsSeed {
+            host: "seed.example.com".to_owned(),
+            port: 8333,
+        }];
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+
+        // The two sources are exclusive. Consulting the resolver as well, or
+        // falling back to it when the proxy fails, would send exactly the
+        // lookup the authorisation was given to prevent.
+        assert_eq!(
+            seed_bootstrap(Some(proxy), &seeds),
+            SeedBootstrap::NameProxy(proxy)
+        );
+        assert_eq!(seed_bootstrap(None, &seeds), SeedBootstrap::LocalResolver);
+
+        // With no authority configured neither source runs, so authorising a
+        // name proxy alone never invents a bootstrap the operator did not ask
+        // for.
+        assert_eq!(seed_bootstrap(Some(proxy), &[]), SeedBootstrap::None);
+        assert_eq!(seed_bootstrap(None, &[]), SeedBootstrap::None);
+    }
+
+    #[test]
+    fn a_name_wave_pairs_each_authority_with_the_port_of_its_first_entry() {
+        let seeds = vec![
+            DnsSeed {
+                host: "seed.example.com".to_owned(),
+                port: 8333,
+            },
+            DnsSeed {
+                host: "127.0.0.1".to_owned(),
+                port: 8333,
+            },
+            // The same authority again, under a spelling that normalises to
+            // the first. It must not become a second target, and must not
+            // change the port the first entry chose.
+            DnsSeed {
+                host: "SEED.EXAMPLE.COM.".to_owned(),
+                port: 48_333,
+            },
+            DnsSeed {
+                host: "other.example.org".to_owned(),
+                port: 48_333,
+            },
+        ];
+
+        let (wave, refused) = seed_name_wave_targets(&seeds);
+
+        assert_eq!(
+            wave,
+            vec![
+                NodePeerTarget::SeedName {
+                    name: SeedName::parse("seed.example.com").unwrap(),
+                    port: 8333,
+                },
+                NodePeerTarget::SeedName {
+                    name: SeedName::parse("other.example.org").unwrap(),
+                    port: 48_333,
+                },
+            ]
+        );
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(candidate, error)| (candidate.as_str(), *error))
+                .collect::<Vec<_>>(),
+            vec![("127.0.0.1", SeedNameError::IpLiteral)],
+            "the operator must be able to see which configured entry was unusable"
+        );
+
+        assert!(seed_name_wave_targets(&[]).0.is_empty());
+    }
+
+    /// Accepts one SOCKS5 request and reports the target it carried.
+    ///
+    /// Returns the address type byte and, for a domain request, the name and
+    /// port. Nothing is resolved here: the point is to observe exactly what
+    /// this node asked the proxy for.
+    async fn accept_socks5_request(
+        listener: TcpListener,
+        upstream: Option<SocketAddr>,
+    ) -> (u8, String, u16) {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut greeting = [0_u8; 3];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0], "no-authentication SOCKS5 only");
+        client.write_all(&[5, 0]).await.unwrap();
+        let mut header = [0_u8; 4];
+        client.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[..3], [5, 1, 0]);
+        let address_type = header[3];
+        let target = match address_type {
+            1 => {
+                let mut octets = [0_u8; 4];
+                client.read_exact(&mut octets).await.unwrap();
+                std::net::Ipv4Addr::from(octets).to_string()
+            }
+            3 => {
+                let mut length = [0_u8; 1];
+                client.read_exact(&mut length).await.unwrap();
+                let mut name = vec![0_u8; usize::from(length[0])];
+                client.read_exact(&mut name).await.unwrap();
+                String::from_utf8(name).unwrap()
+            }
+            other => panic!("unexpected SOCKS5 address type {other}"),
+        };
+        let mut port = [0_u8; 2];
+        client.read_exact(&mut port).await.unwrap();
+        client
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        if let Some(upstream) = upstream {
+            let mut peer = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut peer).await;
+        }
+        (address_type, target, u16::from_be_bytes(port))
+    }
+
+    #[tokio::test]
+    async fn a_seed_name_bootstraps_a_peer_the_proxy_chose_and_this_node_never_resolved() {
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = peer_listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut peer, local_version) = accept_peer(peer_listener, peer_version(909)).await;
+            // Hold the connection open so the handshake is not raced by a
+            // close, then report what this node claimed about itself.
+            while peer.read_message().await.is_ok() {}
+            local_version
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(accept_socks5_request(proxy_listener, Some(peer_address)));
+
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse("seed.example.com").unwrap(),
+            port: 8333,
+        };
+        let connected = connect_peer(
+            DeploymentConfig::for_network(Network::Regtest),
+            target.clone(),
+            Some(name_proxy),
+            808,
+            false,
+            None,
+        )
+        .await
+        .expect("the proxy resolves the authority and the handshake completes");
+        assert_eq!(connected.session.remote_version().nonce, 909);
+        assert_eq!(
+            connected.remote, target,
+            "the session is still identified by the name, not by an address this node invented"
+        );
+        drop(connected);
+
+        // Bounded, so a target that never reaches this endpoint fails the test
+        // instead of hanging it.
+        let (address_type, name, port) = tokio::time::timeout(Duration::from_secs(10), proxy)
+            .await
+            .expect("the name proxy is contacted")
+            .unwrap();
+        assert_eq!(
+            address_type, 3,
+            "the authority reaches the proxy as a name; resolving it here is the leak"
+        );
+        assert_eq!(name, "seed.example.com");
+        assert_eq!(port, 8333);
+
+        // The proxy picked the peer and never said which address it picked, so
+        // the receiver this node advertised must stay unspecified rather than
+        // carry a guess onward to whoever relays it.
+        let local_version = peer.await.unwrap();
+        assert!(
+            local_version
+                .receiver
+                .socket_addr()
+                .expect("an advertised receiver decodes")
+                .ip()
+                .is_unspecified()
+        );
+    }
+
+    /// A SOCKS5 endpoint that actually resolves the name it is given.
+    ///
+    /// Unlike the mock elsewhere in this file, this one does the resolving —
+    /// which is the whole division of labour being tested. It reports what it
+    /// was asked for before connecting, then joins the two streams.
+    async fn resolving_socks5_proxy(
+        listener: TcpListener,
+        observed: tokio::sync::oneshot::Sender<(u8, String, u16)>,
+    ) -> Result<(), String> {
+        let (mut client, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let mut greeting = [0_u8; 3];
+        client
+            .read_exact(&mut greeting)
+            .await
+            .map_err(|e| e.to_string())?;
+        client.write_all(&[5, 0]).await.map_err(|e| e.to_string())?;
+        let mut header = [0_u8; 4];
+        client
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| e.to_string())?;
+        let address_type = header[3];
+        let mut length = [0_u8; 1];
+        client
+            .read_exact(&mut length)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut name = vec![0_u8; usize::from(length[0])];
+        client
+            .read_exact(&mut name)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut port = [0_u8; 2];
+        client
+            .read_exact(&mut port)
+            .await
+            .map_err(|e| e.to_string())?;
+        let host = String::from_utf8(name).map_err(|e| e.to_string())?;
+        let port = u16::from_be_bytes(port);
+        let _ = observed.send((address_type, host.clone(), port));
+
+        let candidates = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|e| format!("proxy could not resolve {host}: {e}"))?
+            .collect::<Vec<_>>();
+        let mut upstream = None;
+        for candidate in candidates {
+            if let Ok(stream) = timeout(Duration::from_secs(5), async move {
+                tokio::net::TcpStream::connect(candidate).await
+            })
+            .await
+            .map_err(|_| "connect timed out".to_owned())?
+            {
+                upstream = Some(stream);
+                break;
+            }
+        }
+        let mut upstream = upstream.ok_or_else(|| format!("no peer behind {host} accepted"))?;
+        client
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "reaches the public Testnet4 network through a resolving SOCKS5 endpoint"]
+    async fn a_real_seed_authority_bootstraps_testnet4_through_a_resolving_proxy() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = listener.local_addr().unwrap();
+        let (observed, was_observed) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(resolving_socks5_proxy(listener, observed));
+
+        let authority = "seed.testnet4.bitcoin.sprovoost.nl";
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse(authority).unwrap(),
+            port: default_p2p_port(Network::Testnet4),
+        };
+
+        let before = dns_lookups_started();
+        let connected = timeout(
+            Duration::from_secs(60),
+            connect_peer(
+                DeploymentConfig::for_network(Network::Testnet4),
+                target,
+                Some(name_proxy),
+                0x5eed_0000_0000_0001,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("the proxied handshake completes within a minute")
+        .expect("a real Testnet4 peer completes the handshake");
+
+        let version = connected.session.remote_version();
+        assert!(
+            version.version >= 70_001,
+            "a real peer negotiated: {version:?}"
+        );
+        assert!(
+            version.services.has(ServiceFlags::NETWORK),
+            "the seed's answer serves blocks: {:?}",
+            version.services
+        );
+
+        let (address_type, name, port) = was_observed.await.unwrap();
+        assert_eq!(
+            address_type, 3,
+            "the proxy was given a name, not an address"
+        );
+        assert_eq!(name, authority);
+        assert_eq!(port, default_p2p_port(Network::Testnet4));
+
+        // The proxy resolved, and it does so in this process only because a
+        // test cannot conveniently fork one. What this asserts is narrower and
+        // still the point: the node's own seed-resolution path never ran.
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the node handed over the name instead of resolving it"
+        );
+
+        drop(connected);
+        let _ = timeout(Duration::from_secs(5), proxy).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "set RBTC_NAME_PROXY to a deployment-selected resolving SOCKS5 endpoint"]
+    async fn a_real_seed_authority_bootstraps_testnet4_through_the_configured_name_proxy() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        let name_proxy = std::env::var("RBTC_NAME_PROXY")
+            .expect("set RBTC_NAME_PROXY, for example to 127.0.0.1:9050")
+            .parse::<SocketAddr>()
+            .expect("RBTC_NAME_PROXY must be an IP:PORT socket address");
+        let before = dns_lookups_started();
+        let mut failures = Vec::new();
+        let mut connected = None;
+        for (index, authority) in pinned_dns_seed_hosts(Network::Testnet4).iter().enumerate() {
+            let target = NodePeerTarget::SeedName {
+                name: SeedName::parse(authority).unwrap(),
+                port: default_p2p_port(Network::Testnet4),
+            };
+            match timeout(
+                Duration::from_secs(60),
+                connect_peer(
+                    DeploymentConfig::for_network(Network::Testnet4),
+                    target,
+                    Some(name_proxy),
+                    0x5eed_0000_0000_0002 + u64::try_from(index).unwrap(),
+                    false,
+                    None,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(peer)) => {
+                    connected = Some(peer);
+                    break;
+                }
+                Ok(Err(error)) => failures.push(format!("{authority}: {error:?}")),
+                Err(_) => failures.push(format!("{authority}: timed out after 60 seconds")),
+            }
+        }
+
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the node handed every authority to the external proxy instead of resolving it"
+        );
+        let connected = connected.unwrap_or_else(|| {
+            panic!(
+                "no pinned Testnet4 authority completed a handshake through the configured proxy: {}",
+                failures.join("; ")
+            )
+        });
+
+        let version = connected.session.remote_version();
+        assert!(
+            version.version >= 70_001,
+            "a real peer negotiated: {version:?}"
+        );
+        assert!(
+            version.services.has(ServiceFlags::NETWORK),
+            "the seed's answer serves blocks: {:?}",
+            version.services
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_wave_waits_while_the_peers_a_restart_already_had_are_viable() {
+        // A peer that accepts the connection and then says nothing, standing
+        // in for a candidate a restart still considers viable: it has neither
+        // succeeded nor failed.
+        let stalled = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_remote = stalled.local_addr().unwrap();
+        let (dialed, was_dialed) = tokio::sync::oneshot::channel();
+        let stalled_server = tokio::spawn(async move {
+            let (stream, _) = stalled.accept().await.unwrap();
+            dialed.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+
+        let name_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_listener.local_addr().unwrap();
+        let contacted = Arc::new(AtomicBool::new(false));
+        let observer = Arc::clone(&contacted);
+        let name_server = tokio::spawn(async move {
+            let _ = name_listener.accept().await;
+            observer.store(true, Ordering::Relaxed);
+        });
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.remotes = vec![stalled_remote];
+        options.resources.name_proxy = Some(name_proxy);
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+        let session = tokio::spawn(async move {
+            let _ = run_peer_pool_session(&options, 1, None, None).await;
+        });
+
+        timeout(Duration::from_secs(5), was_dialed)
+            .await
+            .expect("the existing candidate is dialed first")
+            .unwrap();
+        // The first wave is still outstanding — its per-attempt deadline is
+        // far from spent — so the authorities must not have been told anything
+        // yet. Every name submitted before that is a disclosure the node did
+        // not need to make.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !contacted.load(Ordering::Relaxed),
+            "no authority is named to the proxy while an existing candidate is still viable"
+        );
+
+        session.abort();
+        stalled_server.abort();
+        name_server.abort();
+
+        // The other half, without which the assertion above would also pass if
+        // the wave simply never ran: once nothing viable is left, the
+        // authorities are contacted.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused = dead.local_addr().unwrap();
+        drop(dead);
+
+        let name_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_listener.local_addr().unwrap();
+        let (submitted, was_submitted) = tokio::sync::oneshot::channel();
+        let name_server = tokio::spawn(async move {
+            let _ = name_listener.accept().await;
+            submitted.send(()).unwrap();
+        });
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.remotes = vec![refused];
+        options.resources.name_proxy = Some(name_proxy);
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+        let session = tokio::spawn(async move {
+            let _ = run_peer_pool_session(&options, 1, None, None).await;
+        });
+
+        timeout(Duration::from_secs(5), was_submitted)
+            .await
+            .expect("an exhausted wave falls through to the authorities")
+            .unwrap();
+
+        session.abort();
+        name_server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_authorised_name_proxy_bootstrap_begins_no_local_lookup() {
+        let _observation = DNS_OBSERVATION.lock().await;
+
+        // A port nothing listens on, so the wave fails at the proxy rather
+        // than anywhere that could disguise a fallback as success.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = dead.local_addr().unwrap();
+        drop(dead);
+
+        let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
+        options.resources.name_proxy = Some(name_proxy);
+        // A name that cannot resolve, so a fallback would fail loudly instead
+        // of quietly succeeding — and no real authority is contacted either
+        // way.
+        options.dns_seeds = Some(vec![DnsSeed {
+            host: "seed.invalid".to_owned(),
+            port: 18_444,
+        }]);
+
+        let before = dns_lookups_started();
+        let error = run_peer_pool_session(&options, 909, None, None)
+            .await
+            .expect_err("a dead name proxy exhausts the wave");
+        assert!(
+            error.starts_with(PEER_CANDIDATE_EXHAUSTED_PREFIX),
+            "{error}"
+        );
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "an authorised name proxy must submit the name to the proxy and never to the resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_session_persists_the_addresses_its_peer_advertised() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let now = unix_time().unwrap();
+        let eligible: SocketAddr = "127.0.0.5:18444".parse().unwrap();
+        let ineligible: SocketAddr = "127.0.0.6:18444".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(717)).await;
+            assert!(
+                matches!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetAddr
+                ),
+                "a name bootstrap must ask for addresses; without them it leaves nothing behind"
+            );
+            peer.write_message(NetworkMessage::AddrV2(vec![
+                bitcoin::p2p::address::AddrV2Message {
+                    time: now,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.5".parse().unwrap()),
+                    port: 18_444,
+                },
+                // Missing the required services. A peer the proxy chose gets no
+                // relaxation of the filters an ordinary peer's addresses face.
+                bitcoin::p2p::address::AddrV2Message {
+                    time: now,
+                    services: ServiceFlags::NONE,
+                    addr: bitcoin::p2p::address::AddrV2::Ipv4("127.0.0.6".parse().unwrap()),
+                    port: 18_444,
+                },
+            ]))
+            .await
+            .unwrap();
+            while peer.read_message().await.is_ok() {}
+        });
+
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            707,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let target = NodePeerTarget::SeedName {
+            name: SeedName::parse("seed.example.com").unwrap(),
+            port: 8333,
+        };
+
+        discover_peer_addresses(&mut session, &store, &target).await;
+        drop(session);
+
+        let candidates = store.candidates(now, 10).unwrap();
+        assert!(
+            candidates.contains(&eligible),
+            "what a name bootstrap learns is what stops the next start from contacting the authorities again"
+        );
+        assert!(
+            !candidates.contains(&ineligible),
+            "the ordinary service filter still applies to a proxy-chosen peer's advertisements"
+        );
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the name target itself is never persisted as a candidate"
+        );
+
+        // Across a restart, which is the point: the next start has a candidate
+        // and does not have to name an authority to anyone.
+        drop(store);
+        let reopened =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        assert!(
+            reopened.candidates(now, 10).unwrap().contains(&eligible),
+            "a restart finds what the name bootstrap learned"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_onion_session_still_asks_for_no_addresses() {
+        // The decision about who learns addresses moved from the call site
+        // into `discover_peer_addresses`. An onion peer has no source this
+        // node could honestly record, so it must still send no getaddr at all
+        // — not send one and discard the answer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(818)).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), peer.read_message())
+                    .await
+                    .is_err(),
+                "an onion session sends no getaddr"
+            );
+        });
+
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            808,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap();
+        let onion = NodePeerTarget::Onion(OnionAddress::from_public_key([0x55; 32], 8333));
+
+        discover_peer_addresses(&mut session, &store, &onion).await;
+
+        server.await.unwrap();
+        assert!(
+            store
+                .candidates(unix_time().unwrap(), 10)
+                .unwrap()
+                .is_empty(),
+            "nothing is learned from a peer whose source cannot be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_target_uses_the_name_proxy_and_a_socket_target_the_peer_proxy() {
+        // Two separate endpoints stand in for the two authorisations. Each
+        // asserts the address type it must see, so a target sent to the wrong
+        // one fails rather than quietly working because both happen to be the
+        // same service in ordinary deployments.
+        let peer_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_proxy = peer_proxy_listener.local_addr().unwrap();
+        let peer_proxy_task = tokio::spawn(accept_socks5_request(peer_proxy_listener, None));
+
+        let name_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let name_proxy = name_proxy_listener.local_addr().unwrap();
+        let name_proxy_task = tokio::spawn(accept_socks5_request(name_proxy_listener, None));
+
+        let mut options = peer_retry_test_options(false, Arc::new(RuntimeControl::default()));
+        options.resources.proxy = Some(peer_proxy);
+        options.resources.name_proxy = Some(name_proxy);
+
+        let routable: SocketAddr = "192.0.2.7:8333".parse().unwrap();
+        let remotes = vec![
+            NodePeerTarget::Socket(routable),
+            NodePeerTarget::SeedName {
+                name: SeedName::parse("seed.example.com").unwrap(),
+                port: 8333,
+            },
+        ];
+        let mut pending = spawn_peer_connections(
+            &options,
+            &remotes,
+            808,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Arc::new(NetworkTime::default()),
+        )
+        .unwrap();
+
+        // Bounded so a misrouted target fails the test rather than hanging it
+        // on an endpoint that is never contacted.
+        let (address_type, name, port) =
+            tokio::time::timeout(Duration::from_secs(10), name_proxy_task)
+                .await
+                .expect("the name proxy is contacted for the seed authority")
+                .unwrap();
+        assert_eq!(
+            (address_type, name.as_str(), port),
+            (3, "seed.example.com", 8333),
+            "the endpoint authorised to see seed names is the only one that sees them"
+        );
+        let (address_type, address, port) =
+            tokio::time::timeout(Duration::from_secs(10), peer_proxy_task)
+                .await
+                .expect("the peer proxy is contacted for the routable socket")
+                .unwrap();
+        assert_eq!(
+            (address_type, address.as_str(), port),
+            (1, "192.0.2.7", 8333),
+            "an ordinary peer socket still goes to the ordinary proxy"
+        );
+
+        abort_pending_connections(&mut pending).await;
+    }
+
+    #[tokio::test]
+    async fn anonymity_only_restrictions_send_no_dns_query() {
+        let _observation = DNS_OBSERVATION.lock().await;
+        // A hostname that would resolve if a query were actually issued. The
+        // restriction must short-circuit before any query leaves the host,
+        // because rejecting the answers afterwards still leaks which seeds a
+        // Tor-only or I2P-only node consults.
+        let seeds = vec![DnsSeed {
+            host: "localhost".to_owned(),
+            port: 18_444,
+        }];
+        let before = dns_lookups_started();
+        for restricted in [NodeOnlyNet::Onion, NodeOnlyNet::I2p] {
+            let (resolved, failures, rejected) =
+                resolve_dns_candidates(Network::Regtest, restricted, &seeds, &HashSet::new(), 16)
+                    .await;
+            assert!(resolved.is_empty(), "{restricted:?} permits no IP peer");
+            assert!(
+                failures.is_empty(),
+                "{restricted:?} must not report lookup failures for queries it never made"
+            );
+            assert_eq!(
+                rejected, 0,
+                "{restricted:?} must reject nothing because it resolves nothing"
+            );
+        }
+        assert_eq!(
+            dns_lookups_started(),
+            before,
+            "the restriction must be observed as no request, not inferred from empty results"
+        );
+
+        // An unrestricted node still resolves — which is also what shows the
+        // counter above measures something rather than never moving.
+        let (resolved, _, _) = resolve_dns_candidates(
+            Network::Regtest,
+            NodeOnlyNet::Any,
+            &seeds,
+            &HashSet::new(),
+            16,
+        )
+        .await;
+        assert!(
+            !resolved.is_empty(),
+            "an unrestricted node must still consult its seeds"
+        );
+        assert!(dns_lookups_started() > before);
     }
 
     #[test]
@@ -18987,6 +22424,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Arc::new(NetworkTime::default()),
         ));
         timeout(Duration::from_secs(2), ready)
@@ -19585,11 +23023,13 @@ mod tests {
             policy_vsize: first.vsize(),
             transaction: first,
             fee_sats: 500,
+            sigop_cost: 0,
         };
         let second = AdmittedTransactionRelay {
             policy_vsize: second.vsize(),
             transaction: second,
             fee_sats: 1_000,
+            sigop_cost: 0,
         };
 
         let relayed = relay_selected_transactions(
@@ -19625,6 +23065,7 @@ mod tests {
             policy_vsize: transaction.vsize(),
             transaction: transaction.clone(),
             fee_sats: 1_000,
+            sigop_cost: 0,
         }];
         let (relay, receiver) = broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
         drop(receiver);
@@ -20283,6 +23724,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            private_broadcast: std::sync::OnceLock::new(),
         };
         let (result, mut completion) = tokio::sync::oneshot::channel();
         let (abandoned_result, abandoned_completion) = tokio::sync::oneshot::channel();
@@ -20316,6 +23758,7 @@ mod tests {
                 Duration::from_millis(10),
                 Some(&wallet),
                 &standby_relay,
+                &Notify::new(),
             )
             .await
             .is_err()
@@ -20340,6 +23783,7 @@ mod tests {
             Duration::from_millis(10),
             Some(&wallet),
             &standby_relay,
+            &Notify::new(),
         )
         .await
         .unwrap();
@@ -20348,6 +23792,230 @@ mod tests {
         assert_eq!(relayed.transaction, transaction);
         assert_eq!(relayed.fee_sats, Some(1_000));
         assert_eq!(wallet.compact_candidates.snapshot(), vec![transaction]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn private_broadcast_never_writes_the_transaction_to_a_clearnet_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        // The clearnet peer must observe only handshake keepalives, never a
+        // Tx. It answers pings so the poll's own liveness path is exercised
+        // rather than dying on the wire.
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(2)).await;
+            // Drain until the client hangs up, asserting no Tx ever arrives.
+            while let Ok(Ok(message)) =
+                tokio::time::timeout(Duration::from_millis(200), peer.read_message()).await
+            {
+                assert!(
+                    !matches!(message.into_payload(), NetworkMessage::Tx(_)),
+                    "a privately broadcast transaction must never reach a clearnet peer"
+                );
+            }
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            1,
+            "/rbtcd:test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let directory = TempDir::new().unwrap();
+        let (broadcast_sender, broadcast_receiver) = mpsc::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let (standby_relay, mut standby_receiver) =
+            broadcast::channel(WALLET_BROADCAST_QUEUE_CAPACITY);
+        let transaction = wallet_broadcast_transaction();
+        // A peer store with no reachable onion/I2P candidates: the wave has
+        // nowhere to deliver, so it must report zero and keep the promise
+        // by leaving the transaction queued, not by using the session.
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        let private_broadcast = std::sync::OnceLock::new();
+        private_broadcast
+            .set(PrivateBroadcastContext {
+                proxy: Some("127.0.0.1:1".parse().unwrap()),
+                i2p_sam: None,
+                peer_store: Some(peer_store),
+                message_start: Network::Regtest.magic(),
+            })
+            .unwrap_or_else(|_| unreachable!());
+        let wallet = WalletApiRuntime {
+            wallet: Arc::new(
+                EmbeddedWallet::open_or_create(
+                    directory.path().join("wallet.sqlite"),
+                    RECEIVE_DESCRIPTOR,
+                    CHANGE_DESCRIPTOR,
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            token: LocalAuthToken::new("a".repeat(32)).unwrap(),
+            token_path: directory.path().join("wallet.token"),
+            audit: AuthorizationAuditLog::open(directory.path().join(API_AUDIT_FILE)).unwrap(),
+            scan: WalletScanConfig {
+                gap_limit: DEFAULT_WALLET_GAP_LIMIT,
+                birthday_height: 0,
+            },
+            broadcast_sender: broadcast_sender.clone(),
+            broadcast_receiver: Arc::new(tokio::sync::Mutex::new(broadcast_receiver)),
+            pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
+            compact_candidates: CompactTransactionCandidates::default(),
+            rebroadcast: Arc::new(
+                RedbRebroadcastStore::open(
+                    directory.path().join("rebroadcast.redb"),
+                    Network::Regtest,
+                )
+                .unwrap(),
+            ),
+            private_broadcast,
+        };
+        let (result, mut completion) = tokio::sync::oneshot::channel();
+        assert!(
+            broadcast_sender
+                .try_send(WalletBroadcastRequest {
+                    transaction: transaction.clone(),
+                    fee_sats: 1_000,
+                    result,
+                })
+                .is_ok()
+        );
+
+        // The wave fails (no reachable target), so the poll returns without
+        // erroring the clearnet session and without completing the request.
+        wait_for_peer_poll(
+            &mut session,
+            Duration::from_millis(10),
+            Some(&wallet),
+            &standby_relay,
+            &Notify::new(),
+        )
+        .await
+        .unwrap();
+
+        // The transaction is retained for a later wave, not delivered.
+        assert!(matches!(
+            completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            wallet
+                .pending_broadcast
+                .lock()
+                .await
+                .as_ref()
+                .map(|request| request.transaction.compute_txid()),
+            Some(transaction.compute_txid()),
+            "the undeliverable transaction stays queued"
+        );
+        // Nothing was handed to the hot-standby (clearnet) relay fan-out.
+        assert!(matches!(
+            standby_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            wallet.compact_candidates.snapshot().is_empty(),
+            "an undelivered transaction is not a compact-block candidate"
+        );
+        // Closing the client lets the draining server observe end-of-stream
+        // and confirm it never read a Tx.
+        drop(session);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn private_broadcast_delivers_over_the_proxied_onion_path() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let onion = OnionAddress::parse(
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:8333",
+        )
+        .unwrap();
+        let transaction = wallet_broadcast_transaction();
+        let expected = transaction.clone();
+        let expected_name = onion.name().to_owned();
+
+        // One socket plays both roles: it answers the SOCKS5 CONNECT that
+        // connect_proxied_target issues, then — on that same stream, exactly
+        // as a proxy that dialed the onion service would — completes the
+        // Bitcoin inbound handshake and reads the transaction. That is the
+        // real proxied path end to end, minus the Tor circuit.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut header = [0_u8; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[..3], [5, 1, 0]);
+            assert_eq!(header[3], 3, "an onion destination uses the domain form");
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut name = vec![0_u8; usize::from(length[0])];
+            stream.read_exact(&mut name).await.unwrap();
+            assert_eq!(String::from_utf8(name).unwrap(), expected_name);
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let mut peer = V1Transport::new(stream, Network::Regtest.magic());
+            let NetworkMessage::Version(_) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected version");
+            };
+            peer.write_message(NetworkMessage::Version(peer_version(11)))
+                .await
+                .unwrap();
+            receive_client_negotiation(&mut peer).await;
+            peer.write_message(NetworkMessage::WtxidRelay)
+                .await
+                .unwrap();
+            peer.write_message(NetworkMessage::Verack).await.unwrap();
+            assert_eq!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::Tx(expected),
+                "the transaction arrives over the proxied onion session"
+            );
+        });
+
+        let directory = TempDir::new().unwrap();
+        let now = unix_time().unwrap();
+        let peer_store = Arc::new(
+            RedbPeerStore::open(directory.path().join("peers.redb"), Network::Regtest).unwrap(),
+        );
+        peer_store
+            .insert_discovered_onion(
+                &[rbtc::p2p::OnionPeerAddress {
+                    onion: onion.clone(),
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    last_seen: now - 5,
+                }],
+                now,
+            )
+            .unwrap();
+
+        let context = PrivateBroadcastContext {
+            proxy: Some(proxy_address),
+            i2p_sam: None,
+            peer_store: Some(peer_store),
+            message_start: Network::Regtest.magic(),
+        };
+        let delivered = private_broadcast_wave(&context, &transaction).await;
+        assert_eq!(
+            delivered, 1,
+            "the wave delivered to the one onion candidate"
+        );
         server.await.unwrap();
     }
 
@@ -20407,6 +24075,7 @@ mod tests {
             pending_broadcast: Arc::new(tokio::sync::Mutex::new(None)),
             compact_candidates: CompactTransactionCandidates::default(),
             rebroadcast: Arc::clone(&rebroadcast),
+            private_broadcast: std::sync::OnceLock::new(),
         };
 
         wait_for_peer_poll(
@@ -20414,6 +24083,7 @@ mod tests {
             Duration::from_millis(10),
             Some(&wallet),
             &standby_relay,
+            &Notify::new(),
         )
         .await
         .unwrap();
@@ -20919,6 +24589,139 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_asmap_source_and_refuses_duplicates() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-asmap-parser",
+            ];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert_eq!(default.resources.asmap, NodeAsmapSource::Embedded);
+        let embedded = parse(vec!["--asmap", "embedded"]).unwrap().unwrap();
+        assert_eq!(embedded.resources.asmap, NodeAsmapSource::Embedded);
+        let off = parse(vec!["--asmap", "off"]).unwrap().unwrap();
+        assert_eq!(off.resources.asmap, NodeAsmapSource::Off);
+        let file = parse(vec!["--asmap", "/tmp/operator.map"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file.resources.asmap,
+            NodeAsmapSource::File(PathBuf::from("/tmp/operator.map"))
+        );
+        // The keywords win over file names, so the escape hatch is a path.
+        let keyword_shadowed = parse(vec!["--asmap", "./off"]).unwrap().unwrap();
+        assert_eq!(
+            keyword_shadowed.resources.asmap,
+            NodeAsmapSource::File(PathBuf::from("./off"))
+        );
+        let Err(duplicated) = parse(vec!["--asmap", "off", "--asmap", "embedded"]) else {
+            panic!("a duplicated --asmap must be refused");
+        };
+        assert!(duplicated.contains("--asmap"));
+        assert!(parse(vec!["--asmap"]).is_err());
+    }
+
+    #[test]
+    fn cjdns_reachability_is_explicit_and_fails_closed() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec![
+                "--network",
+                "regtest",
+                "--data-dir",
+                "/tmp/rbtc-cjdns-parser",
+            ];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert!(!default.resources.cjdns_reachable);
+        let enabled = parse(vec!["--cjdns-reachable"]).unwrap().unwrap();
+        assert!(enabled.resources.cjdns_reachable);
+        let only = parse(vec!["--cjdns-reachable", "--onlynet", "cjdns"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(only.resources.only_net, NodeOnlyNet::Cjdns);
+
+        // Without the local interface no permitted destination exists.
+        let Err(refused) = parse(vec!["--onlynet", "cjdns"]) else {
+            panic!("--onlynet cjdns without --cjdns-reachable must be refused");
+        };
+        assert!(refused.contains("--cjdns-reachable"));
+
+        // The overlay never rides a SOCKS5 proxy.
+        let Err(proxied) = parse(vec!["--cjdns-reachable", "--proxy", "127.0.0.1:9050"]) else {
+            panic!("--cjdns-reachable combined with --proxy must be refused");
+        };
+        assert!(proxied.contains("--proxy"));
+
+        // A preferred overlay peer requires the interface declaration.
+        let overlay = "[fc32:17ea:e415:c3bf::1]:18444";
+        let Err(remote) = parse(vec!["--connect", overlay]) else {
+            panic!("an overlay --connect without --cjdns-reachable must be refused");
+        };
+        assert!(remote.contains("--cjdns-reachable"));
+        let connected = parse(vec!["--cjdns-reachable", "--connect", overlay])
+            .unwrap()
+            .unwrap();
+        assert!(connected.remotes.contains(&overlay.parse().unwrap()));
+    }
+
+    #[test]
+    fn private_broadcast_requires_an_anonymity_path() {
+        let parse = |arguments: Vec<&str>| {
+            let mut full = vec!["--network", "regtest", "--data-dir", "/tmp/rbtc-pb-parser"];
+            full.extend(arguments);
+            parse_options(full.into_iter().map(str::to_owned))
+        };
+        let default = parse(vec![]).unwrap().unwrap();
+        assert!(!default.resources.private_broadcast);
+
+        // Without a single anonymity path the promise cannot be kept.
+        let Err(refused) = parse(vec!["--private-broadcast"]) else {
+            panic!("--private-broadcast without an anonymity path must be refused");
+        };
+        assert!(refused.contains("--private-broadcast"));
+
+        // A Tor SOCKS5 proxy (with seeds disabled, per the existing proxy
+        // rule) or an I2P SAM bridge each satisfy the requirement.
+        let with_proxy = parse(vec![
+            "--private-broadcast",
+            "--proxy",
+            "127.0.0.1:9050",
+            "--no-dns-seeds",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(with_proxy.resources.private_broadcast);
+        let with_i2p = parse(vec!["--private-broadcast", "--i2psam", "127.0.0.1:7656"])
+            .unwrap()
+            .unwrap();
+        assert!(with_i2p.resources.private_broadcast);
+    }
+
+    #[test]
+    fn onlynet_treats_the_overlay_as_its_own_network() {
+        let overlay: IpAddr = "fc32:17ea:e415:c3bf::1".parse().unwrap();
+        let global: IpAddr = "2001:4860:4860::8888".parse().unwrap();
+        assert!(NodeOnlyNet::Any.permits(overlay));
+        assert!(
+            !NodeOnlyNet::Ipv6.permits(overlay),
+            "an IPv6-only restriction excludes the overlay"
+        );
+        assert!(NodeOnlyNet::Ipv6.permits(global));
+        assert!(NodeOnlyNet::Cjdns.permits(overlay));
+        assert!(!NodeOnlyNet::Cjdns.permits(global));
+        assert!(!NodeOnlyNet::Cjdns.permits("1.2.3.4".parse().unwrap()));
+        assert!(!NodeOnlyNet::Cjdns.permits_onion());
+        assert!(!NodeOnlyNet::Cjdns.permits_i2p());
+    }
+
+    #[test]
     fn parses_and_bounds_peer_and_mempool_resource_budgets() {
         let options = parse_options(
             [
@@ -20946,7 +24749,11 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
 
@@ -20985,6 +24792,76 @@ mod tests {
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
         }
+    }
+
+    /// Parses one option set, returning the validation error if any.
+    fn name_proxy_options(extra: &[&str]) -> Result<(), String> {
+        let mut arguments = vec![
+            "--network",
+            "bitcoin",
+            "--data-dir",
+            "/tmp/rbtc-name-proxy-parser",
+        ];
+        arguments.extend_from_slice(extra);
+        parse_options(arguments.into_iter().map(str::to_owned)).map(|_| ())
+    }
+
+    #[test]
+    fn name_proxy_authorises_seed_names_that_a_bare_proxy_still_refuses() {
+        // Without the explicit authorisation the refusal stands: a proxy and
+        // DNS seeds together would resolve locally and leak exactly the lookup
+        // the proxy exists to hide.
+        let refused = name_proxy_options(&["--proxy", "127.0.0.1:9050"])
+            .expect_err("a bare proxy still conflicts with DNS seeds");
+        assert!(refused.contains("--name-proxy"), "{refused}");
+
+        name_proxy_options(&[
+            "--proxy",
+            "127.0.0.1:9050",
+            "--name-proxy",
+            "127.0.0.1:9050",
+        ])
+        .expect("naming the proxy explicitly authorises seed resolution");
+    }
+
+    #[test]
+    fn name_proxy_is_refused_for_anonymity_only_operation() {
+        // Clearnet seed discovery cannot produce a permitted target here, so
+        // authorising it would leak the names and return nothing usable.
+        for network in ["onion", "i2p"] {
+            let error = name_proxy_options(&[
+                "--name-proxy",
+                "127.0.0.1:9050",
+                "--onlynet",
+                network,
+                "--proxy",
+                "127.0.0.1:9050",
+            ])
+            .expect_err("anonymity-only operation must refuse a name proxy");
+            assert!(error.contains("--name-proxy"), "{network}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_name_proxy_needs_a_concrete_address() {
+        for candidate in ["0.0.0.0:9050", "127.0.0.1:0"] {
+            let error = name_proxy_options(&["--name-proxy", candidate])
+                .expect_err("an unusable endpoint must be refused at startup");
+            assert!(
+                error.contains("concrete IP and nonzero port"),
+                "{candidate}: {error}"
+            );
+        }
+        assert!(
+            name_proxy_options(&[
+                "--name-proxy",
+                "127.0.0.1:9050",
+                "--name-proxy",
+                "127.0.0.1:9051"
+            ])
+            .unwrap_err()
+            .contains("more than once")
+        );
     }
 
     #[test]
@@ -21159,7 +25036,11 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -21204,7 +25085,11 @@ mod tests {
             mempool_max_bytes: 300 * 1024 * 1024,
             only_net: NodeOnlyNet::Any,
             proxy: None,
+            name_proxy: None,
             v2_transport: false,
+            asmap: NodeAsmapSource::Embedded,
+            cjdns_reachable: false,
+            private_broadcast: false,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -21252,7 +25137,11 @@ mod tests {
                 mempool_max_bytes: 300 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
+                private_broadcast: false,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -21343,7 +25232,11 @@ mod tests {
                 mempool_max_bytes: 64 * 1024 * 1024,
                 only_net: NodeOnlyNet::Any,
                 proxy: None,
+                name_proxy: None,
                 v2_transport: false,
+                asmap: NodeAsmapSource::Embedded,
+                cjdns_reachable: false,
+                private_broadcast: false,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()
@@ -22734,6 +26627,8 @@ mod tests {
                 compact_percent: DEFAULT_SNAPSHOT_OVERLAY_COMPACT_PERCENT,
                 engine: SnapshotOverlayEngine::Mdbx,
                 replay_blocks: None,
+                flush_batches: DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES,
+                flush_coins: DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS,
             })
         );
 
@@ -22871,6 +26766,129 @@ mod tests {
                 "/srv/snapshots/utxo-935000.rbtcidx",
                 "--snapshot-overlay-rebase-percent",
                 "100",
+            ],
+        ] {
+            assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parses_snapshot_overlay_write_back_limits() {
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "16",
+                "--snapshot-overlay-flush-coins",
+                "4000000",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        let overlay = options.snapshot_overlay.expect("overlay configuration");
+        assert_eq!(overlay.flush_batches, 16);
+        assert_eq!(overlay.flush_coins, 4_000_000);
+
+        // Defaults keep the engine's commit-per-batch behaviour.
+        let options = parse_options(
+            [
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        let overlay = options.snapshot_overlay.expect("overlay configuration");
+        assert_eq!(
+            overlay.flush_batches,
+            DEFAULT_SNAPSHOT_OVERLAY_FLUSH_BATCHES
+        );
+        assert_eq!(overlay.flush_coins, DEFAULT_SNAPSHOT_OVERLAY_FLUSH_COINS);
+
+        // Bounds, repeats, and use outside the overlay mode are rejected.
+        for arguments in [
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "0",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "65",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-coins",
+                "1",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-catchup",
+                "/srv/snapshots/utxo-935000.dat",
+                "--snapshot-overlay-index",
+                "/srv/snapshots/utxo-935000.rbtcidx",
+                "--snapshot-overlay-flush-batches",
+                "4",
+                "--snapshot-overlay-flush-batches",
+                "8",
+            ],
+            vec![
+                "--network",
+                "bitcoin",
+                "--data-dir",
+                "/tmp/rbtc-overlay",
+                "--once",
+                "--snapshot-overlay-flush-batches",
+                "4",
             ],
         ] {
             assert!(parse_options(arguments.into_iter().map(str::to_owned)).is_err());
@@ -23809,7 +27827,7 @@ mod tests {
         assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap()["schema_version"],
-            3
+            4
         );
 
         let version2 = serde_json::to_vec(&DataFormatManifest::version2(Network::Regtest)).unwrap();
@@ -23829,8 +27847,8 @@ mod tests {
         assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
 
         let future = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 4,
-            "minimum_reader_version": 4,
+            "schema_version": 5,
+            "minimum_reader_version": 5,
             "network": "regtest",
             "stores": {
                 "headers": 1,
@@ -23854,6 +27872,43 @@ mod tests {
                 .contains("unsupported data-format schema version")
         );
         assert_eq!(fs::read(path).unwrap(), future);
+    }
+
+    #[test]
+    fn data_format_manifest_binds_chainstate_backend_and_migrates_version_three() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join(DATA_FORMAT_MANIFEST_FILE);
+        let mut version3 =
+            serde_json::to_value(DataFormatManifest::version3(Network::Regtest)).unwrap();
+        version3
+            .as_object_mut()
+            .unwrap()
+            .remove("chainstate_backend");
+        fs::write(&path, serde_json::to_vec(&version3).unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        publish_data_format_manifest(directory.path(), Network::Regtest).unwrap();
+        assert!(!validate_data_format_manifest(directory.path(), Network::Regtest).unwrap());
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(migrated["schema_version"], 4);
+        assert_eq!(migrated["chainstate_backend"], "redb");
+
+        let wrong_backend = serde_json::to_vec(&DataFormatManifest::current_for_backend(
+            Network::Regtest,
+            ChainstateBackend::Mdbx,
+        ))
+        .unwrap();
+        fs::write(&path, &wrong_backend).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert!(
+            validate_data_format_manifest(directory.path(), Network::Regtest)
+                .unwrap_err()
+                .contains("does not match the regtest schema inventory")
+        );
+        assert_eq!(fs::read(&path).unwrap(), wrong_backend);
     }
 
     #[cfg(unix)]
@@ -24936,6 +28991,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            private_broadcast: std::sync::OnceLock::new(),
         };
         let rpc = RpcApiRuntime {
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),

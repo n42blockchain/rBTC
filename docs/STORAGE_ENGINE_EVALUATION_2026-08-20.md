@@ -1,0 +1,387 @@
+# Storage-engine re-evaluation — 2026-08-20
+
+## Decision
+
+Keep redb as the daemon default for this revision. MDBX is now the leading
+replacement candidate, not merely an overlay experiment, but it is not ready
+to become the default until a mainnet-scale churn and crash-recovery gate has
+covered the complete four-table chainstate and its compact-copy swap. Do not
+replace redb with Go LevelDB on the strength of this benchmark.
+
+The reason is two-sided. On this Mac, the complete MDBX chainstate is 2.69–3.60
+times faster to mutate than the current complete redb chainstate, with
+1.53–1.55 times the warm batch-read throughput and 60–71% less allocated
+space. Against the storage-only btcd-codec/Go-LevelDB lane, MDBX is 5.68–12.34
+times faster to mutate and ends within 0.8% of its post-compaction allocation.
+However, the supplied mainnet measurement shows a long-running, high-delete
+MDBX chainstate growing to 4.3 times its live bytes and 6.5 times its raw data
+on disk before compact copy. The new compact-copy path removes the former
+capability blocker; it does not remove the need to prove its operating policy
+at 160M+ live coins.
+
+## What was compared
+
+The repository now has two deliberately separate reproducible lanes:
+
+- `tests/storage_engine_comparison.rs` drives the production rBTC redb and
+  MDBX chainstores through the same complete state transition: UTXOs,
+  transaction-grouped per-block undo, and execution tip. Serving mode commits
+  and flushes every block. IBD mode folds exactly 256 blocks into one durable
+  transaction. This compares deployable physical designs, so it includes the
+  current redb legacy row format versus the new compact MDBX format; it is not
+  a codec-normalized engine microbenchmark.
+- `contrib/btcd_storage_bench` pins the Go LevelDB revision used by btcd
+  v0.26.2 and mirrors btcd's outpoint key, MSB-VLQ header/amount, and
+  compressed P2PKH coin. The same synchronous atomic UTXO/undo/tip mutation
+  now runs over LevelDB, Pebble, Badger, and bbolt. It deliberately excludes
+  btcd's UTXO cache, immutable-treap write cache, block files, block index,
+  scripts, and validation. It is therefore labelled “btcd codec + selected Go
+  engine”, never “btcd IBD”.
+
+Official btcd does **not** use the evaluated fixed 36-byte physical key. At
+btcd commit `05585e037ba0690572208dbc46d121a49cc0c4c9`, `outpointKey` is the
+32-byte wire-order txid followed by an MSB-VLQ vout, hence 33–37 bytes. That
+VLQ is compact but is not globally bytewise-monotonic when its encoded length
+grows (for example, vout 16,512 encodes `808000`, which sorts before vout
+16,384's `ff00`). The measured rBTC format therefore uses a one-byte width tag
+plus minimal big-endian vout: 34–37 bytes, true numeric byte order, and direct
+cursor range boundaries. It is neither fixed-width nor byte-for-byte btcd.
+
+Every lookup result below is warm: the 2M-record datasets fit comfortably in
+64 GiB and the page cache was not purged. The benchmark opens one read view and
+one table set per 4,096 caller-ordered requests, with 75% hits and 25% misses.
+No cold-read claim is made.
+
+## Controlled Mac results
+
+Host: MacBookPro18,2, Apple M1 Max (10 cores), 64 GiB RAM, internal Apple
+APFS SSD, macOS 26.5.1. Toolchains: rustc 1.85.0 and Go 1.26.5. Workload:
+2,000,000 live P2PKH UTXOs, 256 blocks, 5,000 spends plus 5,000 creates per
+block, and 500,000 lookups. Each number is the median of three fresh-database
+rounds. The Rust backend order was redb→MDBX, MDBX→redb, redb→MDBX to expose
+fixed-order bias.
+
+The repository's seven-day Bitcoin/Testnet4 public soak remained active on the
+same SSD; stopping it would invalidate that separate gate. During a spot check
+the Bitcoin process used about 10.5% CPU and 3.3 GiB RSS while Testnet4 was
+idle. These are therefore co-resident workstation results, not idle-machine
+maximums. Serial execution and alternating the three short-run engine orders
+limit systematic bias, but the absolute rates should not be compared with an
+otherwise idle host without rerunning there.
+
+| complete chainstate / storage lane | serving blocks/s | IBD-256 blocks/s | serving warm lookups/s | IBD warm lookups/s |
+|---|---:|---:|---:|---:|
+| rBTC redb | 24.74 | 32.15 | 2.057M | 2.134M |
+| rBTC MDBX | **89.01** | **86.56** | **3.149M** | **3.300M** |
+| btcd codec + pinned Go LevelDB | 7.22 | 15.24 | 0.358M | 0.690M |
+
+The MDBX/redb write ratios are 3.60x serving and 2.69x IBD-256. Its warm batch
+lookup ratios are 1.53x and 1.55x after removing per-key heap allocation and
+caching creation MTP by height inside each read view. The Go lane is 12.34x
+slower than MDBX in serving mutation and 5.68x slower in IBD mutation under
+this stricter direct-to-LevelDB durability boundary. That is not a prediction
+of btcd node speed because actual btcd places two caches in front of these
+writes.
+
+## Codec-normalized Go-engine results
+
+The cross-language lane was then widened without changing its btcd codec or
+logical transaction. LevelDB and Pebble use Bloom-10 and no compression;
+Badger also disables compression; bbolt uses its map freelist. Every measured
+serving block and every 256-block IBD group must put UTXOs, retained undo, and
+tip in one synchronous atomic transaction. Initial population is outside the
+mutation measurement and may use an engine's bulk loader. After mutation each
+engine is closed and reopened before lookup; `quiesce_ns` records that drain so
+deferred LSM work is visible rather than contaminating an unlabelled lookup.
+The engines retain their native internal cache/mmap policies and share the OS
+page cache; no btcd-style UTXO cache sits in front. This is a transaction- and
+codec-normalized comparison, not a claim that unlike engine caches can be made
+byte-for-byte identical. Lookup rates therefore remain diagnostic only.
+
+The workload and host match the preceding 2M table. Three new databases were
+created per lane and multi-engine order was alternated. LevelDB was rerun
+three more times after review caught an existence-only `Has` probe where the
+other adapters fetched the value; the table uses the corrected `Get` runs.
+These are medians:
+
+| btcd-codec storage engine | serving blocks/s | IBD-256 blocks/s | serving warm lookups/s | IBD warm lookups/s | post-compact allocation |
+|---|---:|---:|---:|---:|---:|
+| Go LevelDB | 8.07 | 16.21 | 0.506M | 0.659M | 269.0–269.4 MB |
+| Pebble | 6.56 | **51.02** | 0.516M | 0.755M | **267.6–267.7 MB** |
+| Badger | 30.26 | **rejected** | 0.356M | — | 284.3 MB |
+| bbolt | **36.03** | **51.31** | **2.692M** | **2.768M** | 293.1 MB |
+
+Badger's IBD row is not a timeout: its atomic transaction returned `Txn is too
+big to fit into one request`. Using Badger `WriteBatch` made the earlier smoke
+number look successful, but that API splits work across transactions and
+would violate rBTC's atomic checkpoint requirement. The corrected harness
+uses it only for unmeasured prefill and records the production mutation as a
+failure. This is a selection constraint, not a benchmark loss.
+
+The bbolt result is equally important in the other direction. On this APFS
+host it completed the approximately 1.28M UTXO replacements plus retained
+undo in one IBD transaction in about five seconds and compacted to 293.1 MB;
+the supplied Windows run reported that its corresponding transaction did not
+finish in twenty minutes. The Mac result is real, but the cross-platform
+reversal is too large to treat bbolt as a safe default without explaining the
+OS/filesystem and version sensitivity.
+
+Pebble gives the most useful family signal: it is near bbolt on IBD and has
+the smallest compacted allocation, but per-block synchronous serving is
+slower than LevelDB in this short run. It is a Go engine, not direct evidence
+for any Rust binding. The result justifies a Rust LSM prototype under the same
+atomic and recovery contract; it does not justify changing rBTC's daemon
+backend today. Warm lookup rankings are also not selection evidence because
+the 2M dataset fits memory and the supplied cold-disk run put all five engines
+within 8%.
+
+The three multi-engine raw reports used for Pebble, Badger, and bbolt are not
+versioned; their SHA-256 digests are
+`47ca06ea281e1a8a49435b139209e8b156143ecdcc129308fca95d5a092d5baf`,
+`733dd4fb9465ec141014055d0e7ca3aef51312a91eafe9529ad743cd47cdc60b`,
+and `b2e298f0311da60704d531bcf249d950d8f8b817b57f2fe57ccddfd8f803210f`.
+The corrected LevelDB reports are
+`eb4246fbcf3f590e87ab25ec2f906fb72c3a0c85cf85da03794083106cafd5ab`,
+`995dbb3b69259bc61aad11e9fb820b39a62a561464420d4c568846768e8d1282`,
+and `e668d9ff9e6874c1f77b1b82850a9ed6a0e48922078d1d2f968f453d26cfaf6f`.
+
+## One-hour storage-only timebox
+
+A second run tested whether the short-run ranking survived sustained churn.
+It used the same 2M-live-UTXO btcd codec workload, targeted 900,000 synthetic
+transitions per lane, and gave each engine/scenario a 450-second mutation
+budget. The eight lanes ran serially. A 256-block atomic transaction may finish
+after the budget boundary, so the table uses measured mutation time and actual
+completed blocks. The complete matrix took 3,372 seconds (56.2 minutes):
+
+| engine | mode | completed / 900,000 | blocks/s | peak RSS | post-compact allocation | compaction | result |
+|---|---|---:|---:|---:|---:|---:|---|
+| Go LevelDB | serving | 3,108 | 6.90 | 1.87 GiB | 1.69 GiB | 22.57 s | completed timebox |
+| Go LevelDB | IBD-256 | 7,168 | 15.69 | 5.66 GiB | 3.74 GiB | 39.31 s | completed timebox |
+| Pebble | serving | 4,128 | 9.17 | **0.86 GiB** | 2.20 GiB | 15.71 s | completed timebox |
+| Pebble | IBD-256 | 4,608 | 9.96 | 3.34 GiB | 2.44 GiB | 19.26 s | completed timebox |
+| Badger | serving | 11,585 | 25.74 | 12.03 GiB | 5.98 GiB | 13.80 s | completed timebox |
+| Badger | IBD-256 | 0 | 0 | 2.35 GiB | — | — | rejected: transaction too large |
+| bbolt | serving | **12,033** | **26.74** | 7.20 GiB | 6.29 GiB | **9.68 s** | completed timebox |
+| bbolt | IBD-256 | **8,704** | **18.63** | 5.85 GiB | 4.56 GiB | 10.15 s | completed timebox |
+
+No lane reached 900,000. These are deterministic storage transitions, not
+Bitcoin blocks, so the run is neither a btcd IBD benchmark nor evidence of a
+mainnet replay through height 900,000. The fastest lanes also retain undo for
+more completed transitions. Their larger final allocation therefore contains
+more logical data and cannot be compared as a fixed-cardinality space result;
+the 256-block three-round table remains the controlled footprint comparison.
+
+The longer run materially changed one conclusion from the short table. Pebble
+IBD-256 fell from a 51.02 blocks/s short median to 9.96 blocks/s under sustained
+churn, below LevelDB's 15.69 blocks/s. Its serving lane remained 1.33 times
+LevelDB with 54% lower peak RSS. bbolt retained the best successful throughput
+on this Mac, but used the most post-compact space and the supplied Windows
+non-completion remains unexplained. Badger's serving rate was high but its
+first atomic IBD checkpoint still failed. The evidence therefore supports an
+LSM prototype and further bbolt diagnosis, not changing rBTC's default.
+
+The run used source revision
+`416b97db7b7446193d7fad21e49a891cda3fc13e` with `source_dirty=false` and
+binary SHA-256
+`9ea955ac6f3d5c1b205e12ea84a8cb2e33d9dfd3894aceca96fa6f997118ea2f`.
+The combined `matrix.json` SHA-256 is
+`83bcf1328c969cad02978697b912094cf09da7fa21a6d3595fbc4e8c55416754`.
+
+## Key-format A/B
+
+The key decision was measured separately on the same Go LevelDB lane so engine,
+coin value, undo, durability, and workload remained unchanged. Generated
+outpoints use vouts 0–3, representing the dominant short-suffix case; the
+ordering tests separately cover every encoding-width boundary through
+`u32::MAX`:
+
+| vout suffix | total key | serving blocks/s | IBD blocks/s | serving post-compact | IBD post-compact |
+|---|---:|---:|---:|---:|---:|
+| btcd MSB-VLQ | 33–37 B | 7.22 | 15.24 | **270,540,800 B** | **269,017,088 B** |
+| ordered width + BE | 34–37 B | 8.79 | 15.82 | 275,038,208 B | 273,526,784 B |
+| fixed BE u32 | 36 B | 8.67 | 16.73 | 284,053,504 B | 282,550,272 B |
+
+The space result was stable: fixed 36-byte keys cost about 5.0% over btcd VLQ;
+the ordered variable key cost about 1.7% over VLQ and saved about 3.2% versus
+fixed. Timing did not establish a key-format winner. A later VLQ bracket run
+measured 9.12 serving blocks/s, reversing the first three-round timing rank,
+while its size stayed within 0.03%. Query rates also crossed between runs.
+Therefore the format decision uses the stable space result plus required cursor
+semantics, not the unstable timing rank.
+
+The 34–37-byte ordered format was selected. It pays roughly 1.7% versus the
+smallest format, preserves canonical `(txid, numeric vout)` iteration even for
+a transaction with 16,512 or more outputs, and avoids the fixed format's other
+3.2%. Its production encoder uses a stack buffer, so variable length does not
+allocate per lookup. The MDBX format marker was advanced to version 2; version
+1 experimental stores fail closed and require rebuild rather than being
+silently reinterpreted.
+
+Key-format report hashes:
+
+| format | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| fixed 36 | `1f5cdf1b391f9ba2cc6e068eb8e0b2079c2e8b3a45cd78820fa5d3c46a83d246` | `8db6ae2bfd67c309a12d64bdac673de07fefd628fb3496ed74ac9fabc00e4a7d` | `5f3d3b7480000e942f7f9614938c7ad81261f098a016b725ea9fde5cf9e0b92a` |
+| ordered variable | `2e37dce4e46bee96d2de0dc3583aaeb11e9dd7afc8db1bc720935e46a81c00da` | `7ea81489b03f0b4cd5cfc6bd1b85deca3a05d6c37bd23e35d8cc40f3dae81db5` | `58ddf78d2843a9c6fc2e6f39e8fafa8183baaf3a09e29898c3051f2e1b6baca0` |
+
+The btcd-VLQ hashes are in the main evidence table below; the bracket run was
+`12c18fe2a792e13db7cc6295031bc2a81af1301601213439a58e573bd6619f6e`.
+
+Post-compaction allocated size includes 2M live coins, all retained undo for
+the 256 measured blocks, and metadata/tip—not just raw UTXO values:
+
+| lane | serving | IBD-256 | serving bytes/live UTXO | IBD bytes/live UTXO |
+|---|---:|---:|---:|---:|
+| rBTC redb | 677,933,056 B | 930,787,328 B | 338.97 | 465.39 |
+| rBTC MDBX | 271,204,352 B | 271,204,352 B | 135.60 | 135.60 |
+| btcd codec + pinned Go LevelDB | 270,540,800 B | 269,017,088 B | 135.27 | 134.51 |
+
+MDBX compact copy reduced the IBD high-water allocation from 361,611,264 to
+271,204,352 bytes (25.0%). Its serving workload had little garbage to reclaim.
+The MDBX file may contain sparse address-space growth, so APFS allocated
+blocks, not only logical length, are the comparable metric. redb's copy
+compaction did not reduce the two large files in these runs. Go LevelDB forced
+compaction reduced the median serving allocation from 380,928,000 to
+270,540,800 bytes and IBD allocation from 342,396,928 to 269,017,088 bytes.
+
+Raw JSON was intentionally not versioned, matching the repository benchmark
+policy. The six reports used here had these SHA-256 digests:
+
+| report | SHA-256 |
+|---|---|
+| Rust round 1 | `4fca42553f7e7b044b0b09e44bc32df52e4bf3c183d3200673760de4b0dd3a94` |
+| Rust round 2 | `570850bb112762d0196ab64f5e478295d72f958ef01033cb449d5c9ec2708a6e` |
+| Rust round 3 | `b8f768ab18f94da2ed9df8b7b884abc6743efa85fefee0c3d5735c0ec83d9d6b` |
+| btcd lane round 1 | `16c1b6bd69fa7116f85ae9dd648cb005ee4d2a8fcc57490883be2836d6a1ec78` |
+| btcd lane round 2 | `6e45fc3cab92ef586cbb9b3092b45a40ad757784913b42282de5bebd25e4cad7` |
+| btcd lane round 3 | `c35f9b0d8ea9a29f55de2ca81d78d4f5c57d6f6771d5034306f824aee22ceeab` |
+
+## Mainnet evidence supplied with this review
+
+The corrected full scans and completed replay are recorded by btcdmdbx
+revision `56cc436d` in `docs/storage_engine_findings_correction.md`; they
+supersede the biased raw-record estimate used by the first version of this
+section.
+
+The accompanying Windows 11 report used 32 logical cores, 125 GiB RAM and an
+existing 771 GiB mainnet block corpus. Its deterministic 2M-UTXO workload used
+the same 5,000-created/4,700-spent block rate, real Bitcoin spend-age sampling,
+fsync commits, one read view per block, and forced LSM compaction. It found:
+
+- an unset btcd UTXO cache cut 200,000-block replay from 5,699 to 407 blocks/s,
+  a 14x loss that can be mistaken for an engine problem;
+- cold lookup rates across LevelDB, Pebble, bbolt, Badger, and MDBX within 8%
+  at 2M records, reinforcing that the warm Mac lookup ranking is not decisive;
+- MDBX serving and IBD write rates of 24,315 and 32,988 inserts/s, versus
+  LevelDB's 67,842 and 30,663; batching helped MDBX but raised its synthetic
+  IBD footprint to 800 MiB versus LevelDB's 159 MiB;
+- the original 11.7 GB raw-record estimate for a 169,337,275-entry MDBX
+  chainstate was biased toward small UTXOs. A later full scan found 33.42 GB
+  raw, 50.26 GB live B-tree pages (1.50x), and the same 76.01 GB file (2.27x),
+  including 25.75 GB/34% reusable free pages before compact copy;
+- that production store pruned old undo and therefore was not stock btcd.
+  Replaying stock semantics retained 670,893 large undo rows and produced
+  106.08 GB raw in 122.52 GB live pages (1.155x) with approximately zero
+  freelist overhead;
+- Pebble matched LevelDB's roughly 77 B/UTXO synthetic footprint and increased
+  bulk insert rate from 233,945 to 744,477 inserts/s in that Go implementation;
+- the completed real-block replay made Pebble and MDBX write throughput a tie
+  over 200,000 blocks (5,776 vs 5,653 blocks/s). MDBX completed all 951,225
+  blocks and loaded a 200,000-block chain state in 728 ms; Pebble reached
+  height 828,851 but its 56,000 SST files made chain-state loading exceed one
+  hour. Pebble then crashed in the Go 1.26.5 garbage collector, not in Pebble.
+
+Those measurements still do not select MDBX for rBTC unconditionally: the
+btcd adapter, record mix, undo policy, language runtime, and startup access
+pattern differ. They do correct the family-level conclusion. Long-lived
+delete churn is a compact-copy maintenance risk, not evidence of intrinsic
+4.3x B-tree amplification; on sequential complete data MDBX measured 1.155x.
+The completed replay also shows why an LSM's short-run write result cannot
+stand in for startup behaviour once file fan-out reaches tens of thousands.
+
+## Selection matrix
+
+| option | strongest evidence | unresolved cost or failure | disposition |
+|---|---|---|---|
+| redb | current production integration, recovery and crash gates | slowest/largest complete rBTC lane | keep as default until a replacement passes the full gate |
+| MDBX | fastest complete rBTC lane; stock-btcd replay completed 951,225 blocks with 1.155x live amplification and near-zero freelist; compact copy and atomic four-table store exist | rBTC's bounded-undo 160M churn, real-block differential, migration, and startup gates remain open; a long-running pruned store still accumulated a 34% freelist | leading feature-gated replacement candidate |
+| Pebble | marginally smaller than MDBX at the same supplied ~830k height and tied its 200k write rate | 56,000 SST files made chain-state loading exceed one hour; Go-only evidence, a separate Go-runtime crash, and no rBTC recovery/migration integration | retain as structural comparison; do not prioritize an rBTC prototype before MDBX's gate finishes |
+| Badger | high serving mutation rate | cannot atomically commit the measured 256-block transaction | reject for this checkpoint contract |
+| bbolt | best successful Mac timebox rates and valid large atomic transaction | largest successful serving allocation; supplied Windows result reverses by orders of magnitude; no rBTC integration | reject pending an explained cross-platform result; not a default candidate |
+| Go LevelDB | exact btcd revision/codec reference and stable compacted size | materially slower mutation than the leading lanes | retain as reference, not an rBTC replacement |
+| SQLite | already deployed for wallet metadata and has an engine size ceiling | existing 2M UTXO point lookup and p99 are materially worse | retain for wallet metadata; reject for chainstate hot path |
+
+This ordering is based on node requirements rather than implementation
+familiarity. A fast short run cannot override atomicity, recovery,
+deployability, or long-lived lifecycle behaviour. The corrected data removes
+the earlier claim of severe intrinsic MDBX amplification, but the integrated
+implementation still cannot win merely because it is already written:
+rBTC's full-scale lifecycle and real-block gates remain open.
+
+## Required gate before changing the default
+
+The executable procedure and current status are maintained in
+[`MDBX_REPLACEMENT_GATE.md`](MDBX_REPLACEMENT_GATE.md). This revision adds a
+resumable 160M/900,000 churn driver, physical amplification checkpoints,
+precompiled 64/256 peak-RSS lanes, verified four-table compact-copy, a
+55%/10%/50% capacity/reclaim/growth policy, free-space preflight, bounded undo
+pruning, and abrupt
+subprocess exits at all five copy/rename/fsync boundaries. The small local
+smoke and crash matrix pass; the full-scale and real-block rows below remain
+open evidence gates.
+
+1. Replay a common mainnet block corpus into current redb and the complete
+   four-table MDBX store, with the same UTXO cache budget, validation flags,
+   undo retention, batch size, and starting state.
+2. Continue MDBX past 160M live coins and through enough spend churn to measure
+   high-water growth, freelist reuse, and compact-copy frequency. Report raw,
+   live-page, allocated, and copied bytes separately.
+3. **Mechanism and small-scale gate complete:** inject process exits
+   before/after the two directory renames and parent directory syncs, then
+   verify reopen exposes either the old or fully compacted chainstate with the
+   same tip and all four tables. Repeat alongside the full-scale run before
+   selection.
+4. Hold a 128 GiB hard geometry ceiling and demonstrate an operator threshold
+   that compacts before `MDBX_MAP_FULL` without repeated compaction.
+5. Measure peak RSS for 64- and 256-block batches. The supplied replay already
+   observed roughly 35% more peak memory at 256 blocks, so write throughput
+   cannot be considered alone.
+
+Until this gate passes, redb remains the recovery-proven default and MDBX stays
+feature-gated. SQLite remains rejected for the UTXO hot path by the existing
+2M-point-lookup data. A Rust LSM candidate should be evaluated only if it can
+match the same atomic UTXO/undo/tip boundary, bounded cache, crash tests, and
+license/build constraints; the btcd/Go Pebble result is a reason to run that
+experiment, not permission to transplant its conclusion.
+
+## Reproduction
+
+```sh
+RBTC_ENGINE_BENCH_UTXOS=2000000 \
+RBTC_ENGINE_BENCH_BLOCKS=256 \
+RBTC_ENGINE_BENCH_UPDATES=5000 \
+RBTC_ENGINE_BENCH_LOOKUPS=500000 \
+RBTC_ENGINE_BENCH_REPORT=/tmp/rbtc-storage-rust.json \
+cargo test --release --all-features --test storage_engine_comparison \
+  -- --ignored --nocapture
+
+cd contrib/btcd_storage_bench
+RBTC_ENGINE_BENCH_UTXOS=2000000 \
+RBTC_ENGINE_BENCH_BLOCKS=256 \
+RBTC_ENGINE_BENCH_UPDATES=5000 \
+RBTC_ENGINE_BENCH_LOOKUPS=500000 \
+RBTC_ENGINE_BENCH_REPORT=/tmp/rbtc-storage-btcd.json \
+go run .
+
+# Serial storage-only timebox: 900,000-transition target, about one hour wall.
+./run_one_hour_matrix.sh
+```
+
+Set `RBTC_ENGINE_BENCH_REVERSE=1` on alternating Rust rounds. A genuine cold
+read comparison needs either a dataset larger than memory or a controlled
+cache purge; neither condition was present in this run. The timeboxed matrix
+is also synthetic storage evidence, not a real mainnet replay. Closing the
+height-900,000 replay gate requires the same immutable flat block corpus and
+the exact custom `cmd/replayblocks` btcd revision; neither is present on this
+Mac or in upstream btcd v0.26.2.
