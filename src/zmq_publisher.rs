@@ -40,6 +40,10 @@ const MAX_PEER_FRAME_LEN: usize = 1024;
 const MAX_SUBSCRIPTION_LEN: usize = 64;
 /// Bound on retained subscription prefixes per peer.
 const MAX_SUBSCRIPTIONS_PER_PEER: usize = 64;
+/// Bound includes peers still negotiating their greeting.
+const MAX_SUBSCRIBERS: usize = 64;
+/// A peer that stops reading must eventually release its connection slot.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Topics published by the endpoint, in sequence-counter order.
 const TOPICS: [&[u8]; 5] = [b"hashblock", b"hashtx", b"rawblock", b"rawtx", b"sequence"];
 
@@ -311,6 +315,10 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
+                if connections.len() >= MAX_SUBSCRIBERS {
+                    drop(stream);
+                    continue;
+                }
                 let receiver = shared.sender.subscribe();
                 let shared = Arc::clone(&shared);
                 connections.spawn(async move {
@@ -331,23 +339,12 @@ async fn serve_subscriber(
     tokio::time::timeout(config.handshake_timeout, zmtp_handshake(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "zmtp handshake timed out"))??;
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = stream.into_split();
     // Peer frames are parsed on their own task because `read_frame` is not
     // cancel-safe inside `select!`; the bounded channel keeps the peer's
     // subscription traffic from outrunning frame application.
     let (frame_sender, mut frames) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(8);
-    let reader = tokio::spawn(async move {
-        loop {
-            match read_frame(&mut read_half, MAX_PEER_FRAME_LEN).await {
-                Ok(frame) => {
-                    if frame_sender.send(frame).await.is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
+    let mut readers = spawn_subscription_reader(read_half, frame_sender);
     let mut subscriptions: Vec<Vec<u8>> = Vec::new();
     let result = loop {
         tokio::select! {
@@ -369,10 +366,15 @@ async fn serve_subscriber(
                             .iter()
                             .any(|prefix| topic.starts_with(prefix))
                         {
-                            if let Err(error) =
-                                write_notification(&mut write_half, &notification).await
-                            {
-                                break Err(error);
+                            match tokio::time::timeout(
+                                WRITE_TIMEOUT,
+                                write_notification(&mut write_half, &notification),
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => break Err(error),
+                                Err(_) => break Err(io::Error::new(
+                                    io::ErrorKind::TimedOut, "subscriber stopped reading",
+                                )),
                             }
                         }
                     }
@@ -386,8 +388,25 @@ async fn serve_subscriber(
             }
         }
     };
-    reader.abort();
+    readers.abort_all();
     result
+}
+
+// Ownership follows the subscriber: dropping the set aborts the reader.
+// A bare JoinHandle would detach it when shutdown cancels the subscriber.
+fn spawn_subscription_reader(
+    mut read_half: impl AsyncRead + Unpin + Send + 'static,
+    frame_sender: tokio::sync::mpsc::Sender<(u8, Vec<u8>)>,
+) -> JoinSet<()> {
+    let mut readers = JoinSet::new();
+    readers.spawn(async move {
+        while let Ok(frame) = read_frame(&mut read_half, MAX_PEER_FRAME_LEN).await {
+            if frame_sender.send(frame).await.is_err() {
+                return;
+            }
+        }
+    });
+    readers
 }
 
 /// Applies one post-handshake peer frame: a subscription message
@@ -789,6 +808,76 @@ mod tests {
         assert!(
             stream.read_exact(&mut probe).await.is_err(),
             "connection is closed"
+        );
+    }
+    #[tokio::test]
+    async fn shutdown_closes_idle_subscriber_readers() {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let publisher = bound_publisher().await;
+        let mut subscriber = connect_sub(publisher.local_addr(), &[]).await;
+        publisher.shutdown();
+        // No peer input or notification is needed to release the read task.
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            subscriber.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("shutdown closes the whole socket")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.num_alive_tasks() > baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must not leave detached readers");
+    }
+
+    #[tokio::test]
+    async fn subscriber_limit_includes_pending_handshakes() {
+        let publisher = ZmqPublisher::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ZmqPublisherConfig {
+                handshake_timeout: Duration::from_secs(60),
+                ..ZmqPublisherConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut peers = Vec::new();
+        for _ in 0..MAX_SUBSCRIBERS {
+            let mut peer = TcpStream::connect(publisher.local_addr()).await.unwrap();
+            let mut greeting = [0u8; 64];
+            peer.read_exact(&mut greeting).await.unwrap();
+            peers.push(peer);
+        }
+        let mut excess = TcpStream::connect(publisher.local_addr()).await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), excess.read(&mut byte))
+                .await
+                .expect("excess peers are refused immediately")
+                .unwrap(),
+            0
+        );
+        publisher.shutdown();
+    }
+    #[tokio::test]
+    async fn dropping_subscriber_ownership_releases_an_idle_reader() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let (sender, _frames) = tokio::sync::mpsc::channel(8);
+        let readers = spawn_subscription_reader(server, sender);
+        tokio::task::yield_now().await;
+        drop(readers);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .expect("an idle reader must not be detached on cancellation")
+                .unwrap(),
+            0
         );
     }
 }

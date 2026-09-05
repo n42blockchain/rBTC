@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::p2p::{decode_base32, encode_base32};
@@ -196,8 +196,12 @@ impl I2pSamSession {
         {
             return Err(I2pSamError::OversizedParameter);
         }
-        if destination_key.is_some_and(|key| key.len() > MAX_DESTINATION_KEY_LEN) {
-            return Err(I2pSamError::OversizedParameter);
+        if let Some(key) = destination_key {
+            if key.len() > MAX_DESTINATION_KEY_LEN {
+                return Err(I2pSamError::OversizedParameter);
+            }
+            // Validate before interpolating secret material into a SAM command.
+            destination_hash(key)?;
         }
         let mut control = connect_and_greet(bridge, config).await?;
         let destination = destination_key.unwrap_or("TRANSIENT");
@@ -275,7 +279,7 @@ async fn connect_and_greet(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "sam connect timed out"))??;
     let reply = command(&mut stream, "HELLO VERSION MIN=3.1 MAX=3.3", config).await?;
     let version = field(&reply, "VERSION=").ok_or(I2pSamError::MalformedReply)?;
-    if !version.starts_with("3.") {
+    if !matches!(version, "3.1" | "3.2" | "3.3") {
         return Err(I2pSamError::UnsupportedVersion);
     }
     Ok(stream)
@@ -283,7 +287,7 @@ async fn connect_and_greet(
 
 /// Sends one command and returns its single bounded reply line.
 async fn command(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     request: &str,
     config: I2pSamConfig,
 ) -> Result<String, I2pSamError> {
@@ -291,7 +295,9 @@ async fn command(
         stream.write_all(request.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;
-        let mut reader = BufReader::new(&mut *stream);
+        // The socket becomes a raw P2P stream after STREAM STATUS. Never
+        // read past the newline into a buffer that is discarded on return.
+        let mut reader = BufReader::with_capacity(1, &mut *stream);
         let mut line = String::new();
         let read = tokio::io::AsyncReadExt::take(&mut reader, MAX_REPLY_LINE_BYTES)
             .read_line(&mut line)
@@ -301,6 +307,9 @@ async fn command(
         }
         if u64::try_from(read).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
             return Err(I2pSamError::OversizedReply);
+        }
+        if !line.ends_with('\n') {
+            return Err(I2pSamError::MalformedReply);
         }
         let line = line.trim_end_matches(['\r', '\n']).to_owned();
         let result = field(&line, "RESULT=").ok_or(I2pSamError::MalformedReply)?;
@@ -322,22 +331,37 @@ fn destination_hash(destination_key: &str) -> Result<[u8; DESTINATION_HASH_LEN],
     // SAM renders destinations in I2P's base64 alphabet, which substitutes
     // `-` and `~` for `+` and `/`.
     let decoded = decode_i2p_base64(destination_key).ok_or(I2pSamError::MalformedReply)?;
-    Ok(Sha256::digest(&decoded).into())
+    // A SAM private key file starts with a public Destination: 256 bytes
+    // encryption key/padding, 128 bytes signing key/padding, and a certificate
+    // (type byte, two-byte big-endian length, payload). Private keys follow
+    // the certificate and must never contribute to the advertised address.
+    let length = decoded.get(385..387).ok_or(I2pSamError::MalformedReply)?;
+    let end = 387 + usize::from(u16::from_be_bytes([length[0], length[1]]));
+    let destination = decoded.get(..end).ok_or(I2pSamError::MalformedReply)?;
+    Ok(Sha256::digest(destination).into())
 }
 
 /// Decodes I2P's base64 alphabet without padding requirements.
 fn decode_i2p_base64(input: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let body = input.trim_end_matches('=');
+    let padding = input.len() - body.len();
+    if body.is_empty()
+        || body.len() % 4 == 1
+        || padding > 2
+        || (padding != 0 && input.len() % 4 != 0)
+    {
+        return None;
+    }
+    let mut output = Vec::with_capacity(body.len() * 3 / 4);
     let mut accumulator: u32 = 0;
     let mut bits = 0_u32;
-    for byte in input.bytes() {
+    for byte in body.bytes() {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
             b'-' => 62,
             b'~' => 63,
-            b'=' => continue,
             _ => return None,
         };
         accumulator = (accumulator << 6) | u32::from(value);
@@ -346,6 +370,9 @@ fn decode_i2p_base64(input: &str) -> Option<Vec<u8>> {
             bits -= 8;
             output.push(u8::try_from((accumulator >> bits) & 0xff).expect("masked to one byte"));
         }
+    }
+    if accumulator & ((1 << bits) - 1) != 0 {
+        return None;
     }
     Some(output)
 }
@@ -375,7 +402,21 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// A destination key in I2P's base64 alphabet.
-    const TEST_DESTINATION: &str = "abcdEFGH1234-~abcdEFGH1234-~abcdEFGH1234-~";
+    // Ed25519 key certificate followed by 256+32 private-key bytes.
+    const TEST_DESTINATION: &str = concat!(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQAEAAcAAFpaWlpaWlpa",
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpa",
+        "WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWg==",
+    );
 
     /// A SAM bridge answering the subset this client speaks.
     ///
@@ -461,7 +502,7 @@ mod tests {
             .expect("the session is created");
         assert_eq!(session.destination_key(), TEST_DESTINATION);
         let expected = I2pAddress::from_destination_hash(<[u8; 32]>::from(sha2::Sha256::digest(
-            decode_i2p_base64(TEST_DESTINATION).unwrap(),
+            &decode_i2p_base64(TEST_DESTINATION).unwrap()[..391],
         )));
         assert_eq!(session.address(), &expected);
 
@@ -543,8 +584,67 @@ mod tests {
         assert_eq!(field("RESULT=OK VERSION=3.3", "VERSION="), Some("3.3"));
         assert_eq!(field("RESULT=OK MESSAGE=\"a b\"", "MESSAGE="), Some("a b"));
         assert_eq!(field("RESULT=OK", "VERSION="), None);
-        assert_eq!(decode_i2p_base64("-~"), Some(vec![0xfb]));
+        assert_eq!(decode_i2p_base64("-w"), Some(vec![0xfb]));
         assert_eq!(decode_i2p_base64("!!"), None);
         assert!(decode_i2p_base64("AAAA").is_some());
+    }
+    #[tokio::test]
+    async fn sam_reply_preserves_coalesced_peer_bytes() {
+        let (mut stream, mut server) = tokio::io::duplex(1024);
+        // Queue both records before reading to make read-ahead deterministic.
+        server
+            .write_all(b"STREAM STATUS RESULT=OK\npeer payload")
+            .await
+            .unwrap();
+        server.shutdown().await.unwrap();
+        command(
+            &mut stream,
+            "STREAM CONNECT ID=test DESTINATION=test",
+            I2pSamConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut payload = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut payload)
+            .await
+            .unwrap();
+        assert_eq!(payload, b"peer payload");
+    }
+
+    #[tokio::test]
+    async fn sam_rejects_unterminated_reply() {
+        let (mut stream, mut server) = tokio::io::duplex(1024);
+        server.write_all(b"STREAM STATUS RESULT=OK").await.unwrap();
+        server.shutdown().await.unwrap();
+        assert!(matches!(
+            command(&mut stream, "STREAM CONNECT", I2pSamConfig::default()).await,
+            Err(I2pSamError::MalformedReply)
+        ));
+    }
+
+    #[test]
+    fn destination_identity_excludes_private_keys_and_checks_certificate_bounds() {
+        let expected = [
+            194, 145, 221, 131, 81, 183, 171, 210, 1, 71, 243, 64, 221, 205, 60, 245, 206, 208,
+            202, 147, 96, 85, 48, 90, 128, 207, 199, 245, 246, 61, 147, 4,
+        ];
+        assert_eq!(destination_hash(TEST_DESTINATION).unwrap(), expected);
+        // The public destination alone has exactly the same identity.
+        let public = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQAEAAcAAA==";
+        assert_eq!(destination_hash(public).unwrap(), expected);
+        for malformed in [
+            "AAAA",
+            "",
+            "A",
+            "AA=A",
+            "-~",
+            "AAAA\nSESSION CREATE",
+            "AAAA===",
+        ] {
+            assert!(destination_hash(malformed).is_err());
+        }
+        // 387 decoded bytes claiming an absent 65535-byte certificate.
+        let truncated = format!("{}AP~~", "A".repeat(512));
+        assert!(destination_hash(&truncated).is_err());
     }
 }

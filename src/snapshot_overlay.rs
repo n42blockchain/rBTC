@@ -157,8 +157,8 @@ pub struct SnapshotOverlayConfig {
 
 /// Snapshot-backed chainstate with one bounded MDBX overlay environment.
 pub struct SnapshotOverlayChainstate {
-    /// `None` only transiently inside `rebase_into`, while the environment
-    /// file is being recreated.
+    /// `None` while the environment is being replaced, or after a fatal
+    /// reopen error. A failed reopen requires discarding and reopening the store.
     db: Option<Database<NoWriteMap>>,
     database_dir: PathBuf,
     base: CoreSnapshotUtxoIndex,
@@ -647,18 +647,36 @@ impl SnapshotOverlayChainstate {
     ///
     /// # Errors
     ///
-    /// Fails closed without switching identity on I/O errors, existing
-    /// output paths, an MTP extension of the wrong length, or any
-    /// merge/re-authentication mismatch.
-    #[allow(clippy::too_many_lines)]
+    /// Before the durable switch, rejects existing output paths, a wrong MTP
+    /// extension, merge/re-authentication mismatches, and I/O errors.
+    ///
+    /// After the durable identity switch, maintenance/reopen errors retain
+    /// the new files. Reopen the store using its stored identity before
+    /// retrying; an error at that point does not roll back the switch.
     pub fn rebase_into(
         &mut self,
         new_snapshot_path: impl AsRef<Path>,
         new_index_path: impl AsRef<Path>,
         mtp_extension: &[u32],
     ) -> Result<RebaseReport, SnapshotOverlayError> {
-        let new_snapshot_path = new_snapshot_path.as_ref();
-        let new_index_path = new_index_path.as_ref();
+        self.rebase_with_reopen(
+            new_snapshot_path.as_ref(),
+            new_index_path.as_ref(),
+            mtp_extension,
+            open_environment,
+        )
+    }
+
+    // Keep the final reopen injectable so failure after the directory switch
+    // can be tested without relying on OS races or a process-global failpoint.
+    #[allow(clippy::too_many_lines)]
+    fn rebase_with_reopen(
+        &mut self,
+        new_snapshot_path: &Path,
+        new_index_path: &Path,
+        mtp_extension: &[u32],
+        reopen: impl FnOnce(&Path, u64) -> Result<Database<NoWriteMap>, SnapshotOverlayError>,
+    ) -> Result<RebaseReport, SnapshotOverlayError> {
         if new_snapshot_path.exists() || new_index_path.exists() {
             return Err(SnapshotOverlayError::Invalid(
                 "rebase output paths already exist",
@@ -698,8 +716,8 @@ impl SnapshotOverlayChainstate {
 
         // Stream-merge the old snapshot (minus tombstones) with the overlay
         // into a temporary file, hashing Core's commitment as we go. Every
-        // file this function creates is tracked here and removed on any
-        // early return, so a failed rebase — including a re-verification
+        // file this function creates is tracked here until the identity
+        // switch, so a pre-switch failure — including a re-verification
         // mismatch after publication — never leaves an orphan blocking a
         // retry at the same target height.
         // Same precondition the compaction enforces: recovery is only
@@ -715,8 +733,14 @@ impl SnapshotOverlayChainstate {
             name.push(".tmp");
             name
         });
+        // Only clean up a staging file that this invocation created.
+        // Existing files and symlinks must neither be truncated nor removed.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         cleanup.track(temporary.clone());
-        let mut writer = std::io::BufWriter::new(File::create(&temporary)?);
+        let mut writer = std::io::BufWriter::new(file);
         let mut header = Vec::with_capacity(51);
         header.extend_from_slice(b"utxo\xff");
         header.extend_from_slice(&2_u16.to_le_bytes());
@@ -925,17 +949,16 @@ impl SnapshotOverlayChainstate {
                 return Err(error.into());
             }
         }
-        // Reopen fresh so MDBX's own bookkeeping matches the directory's
-        // current (renamed-back) path rather than the transient one it was
-        // built under.
-        self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
-
+        // The canonical environment now durably names the new base. Never
+        // remove its files on a later reopen failure: recovery needs them.
+        cleanup.disarm();
         self.mtp_by_height.extend_from_slice(mtp_extension);
         self.base = new_base;
         self.identity = identity.clone();
         new_snapshot_path.clone_into(&mut self.snapshot_path);
         new_index_path.clone_into(&mut self.index_path);
-        cleanup.disarm();
+        // Reopen fresh so MDBX's bookkeeping uses the canonical path.
+        self.db = Some(reopen(&self.database_dir, self.capacity_bytes)?);
         Ok(RebaseReport {
             identity,
             coins,
@@ -1344,10 +1367,10 @@ pub(crate) fn fold_connect_batch(
 
 /// Removes its tracked paths on drop unless [`Self::disarm`] was called.
 ///
-/// [`SnapshotOverlayChainstate::rebase_into`] uses this so every early
-/// return — including a re-verification failure after the new snapshot file
-/// was already published — cleans up its own partial output instead of
-/// leaving a file that would block a retry at the same target height.
+/// [`SnapshotOverlayChainstate::rebase_into`] uses this to clean up partial
+/// output on errors before the identity switch. After the switch the guard
+/// must be disarmed before any fallible maintenance, because the database
+/// already references these files.
 #[derive(Default)]
 pub(crate) struct RemoveFilesOnDrop {
     paths: Vec<PathBuf>,
@@ -3696,5 +3719,52 @@ pub(crate) mod tests {
             mismatches, 0,
             "{mismatches} coins diverged between expected and actual"
         );
+    }
+    #[test]
+    fn rebase_reopen_failure_keeps_the_new_base_recoverable() {
+        let (directory, mut store, identity) = setup(32 << 20);
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip(BASE_HEIGHT + 1, block_hash(BASE_HEIGHT + 1)),
+                &[key(1, 0)],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let snapshot = directory.path().join("rebased.dat");
+        let index = directory.path().join("rebased.idx");
+        assert!(matches!(
+            store.rebase_with_reopen(&snapshot, &index, &[mtp_for(BASE_HEIGHT + 1)], |_, _| Err(
+                SnapshotOverlayError::Invalid("injected reopen failure")
+            )),
+            Err(SnapshotOverlayError::Invalid("injected reopen failure"))
+        ));
+        assert!(snapshot.exists());
+        assert!(index.exists());
+        let committed = store.base_identity().clone();
+        assert_eq!(committed.height, BASE_HEIGHT + 1);
+        drop(store);
+        let reopened =
+            open_store(directory.path(), &snapshot, &index, &committed, 32 << 20).unwrap();
+        assert_eq!(
+            reopened.execution_tip().unwrap(),
+            tip(BASE_HEIGHT + 1, block_hash(BASE_HEIGHT + 1))
+        );
+        assert_eq!(reopened.get(key(1, 0)).unwrap(), None);
+    }
+
+    #[test]
+    fn rebase_refuses_existing_staging_file_without_modifying_it() {
+        let (directory, mut store, identity) = setup(32 << 20);
+        let snapshot = directory.path().join("rebased.dat");
+        let index = directory.path().join("rebased.idx");
+        let staging = directory.path().join("rebased.dat.tmp");
+        fs::write(&staging, b"keep existing bytes").unwrap();
+        assert!(store.rebase_into(&snapshot, &index, &[]).is_err());
+        assert_eq!(fs::read(&staging).unwrap(), b"keep existing bytes");
+        assert_eq!(store.base_identity(), &identity);
+        assert!(!snapshot.exists());
+        assert!(!index.exists());
     }
 }

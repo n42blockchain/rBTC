@@ -9794,7 +9794,9 @@ async fn create_i2p_session(
         .map(|data_dir| data_dir.join("i2p_destination_key"));
     let existing = key_path
         .as_ref()
-        .and_then(|path| read_owner_only_text_file(path, "i2p destination key", 16 * 1024).ok());
+        .map(|path| read_optional_owner_only_secret(path, "i2p destination key", 16 * 1024))
+        .transpose()?
+        .flatten();
     let session = I2pSamSession::create(
         bridge,
         I2P_SESSION_ID,
@@ -9869,7 +9871,9 @@ async fn publish_inbound_onion_service(
         .map(|data_dir| data_dir.join("onion_service_key"));
     let existing = key_path
         .as_ref()
-        .and_then(|path| read_owner_only_text_file(path, "onion service key", 4096).ok());
+        .map(|path| read_optional_owner_only_secret(path, "onion service key", 4096))
+        .transpose()?
+        .flatten();
     let mut controller = TorController::connect(
         tor.control,
         &tor.cookie,
@@ -9900,25 +9904,56 @@ async fn publish_inbound_onion_service(
     })
 }
 
-/// Writes one secret owner-only, replacing any previous content.
+/// Only absence permits creating a new identity. Invalid existing keys must
+/// fail startup instead of silently rotating or overwriting an operator key.
+fn read_optional_owner_only_secret(
+    path: &std::path::Path,
+    label: &str,
+    limit: u64,
+) -> Result<Option<String>, String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect {label}: {error}")),
+        Ok(_) => read_owner_only_text_file(path, label, limit).map(Some),
+    }
+}
+
+/// Atomically replaces a secret through an owner-only, create-new file.
 fn write_owner_only_secret(path: &std::path::Path, secret: &str) -> Result<(), String> {
-    use std::io::Write;
-    let mut open_options = std::fs::OpenOptions::new();
-    open_options.create(true).write(true).truncate(true);
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| "secret path has no filename".to_owned())?;
+    let temporary = parent.join(format!(
+        ".{}.{}.{:016x}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        open_options.mode(0o600);
+        options.mode(0o600);
     }
-    let mut file = open_options
-        .open(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .map_err(|error| format!("restrict {}: {error}", path.display()))?;
-    file.write_all(secret.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("persist {}: {error}", path.display()))
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create secret staging file: {error}"))?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(secret.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| format!("persist {}: {error}", path.display()))
 }
 
 fn record_peer_attempt(store: Option<&RedbPeerStore>, remote: &NodePeerTarget) {
@@ -17818,6 +17853,32 @@ mod tests {
         let tor = options.tor_control.expect("the control port is retained");
         assert_eq!(tor.control, "127.0.0.1:9051".parse().unwrap());
         assert_eq!(tor.cookie, PathBuf::from("cookie"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_links_cannot_redirect_writes_or_silently_replace_identity() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("unrelated");
+        fs::write(&target, "keep me").unwrap();
+        let path = directory.path().join("onion_service_key");
+        symlink(&target, &path).unwrap();
+        assert!(read_optional_owner_only_secret(&path, "key", 4096).is_err());
+        write_owner_only_secret(&path, "new secret").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new secret");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_optional_owner_only_secret(&path, "key", 4096).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&target, &path).unwrap();
+        write_owner_only_secret(&path, "replacement").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret(&path, "key", 4096).unwrap(),
+            None
+        );
     }
 
     #[test]

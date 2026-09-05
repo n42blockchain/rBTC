@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -206,22 +206,15 @@ impl TorController {
         private_key: Option<&str>,
     ) -> Result<PublishedOnionService, TorControlError> {
         let key = private_key.unwrap_or("NEW:ED25519-V3");
+        if key.is_empty()
+            || key.len() > usize::try_from(MAX_REPLY_LINE_BYTES).expect("reply bound fits usize")
+            || !key.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(TorControlError::MalformedReply);
+        }
         let reply = self
-            .command(&format!(
-                "ADD_ONION {key} Flags=DiscardPK Port={virtual_port},{forward_to}"
-            ))
-            .await;
-        // DiscardPK is only valid with an existing key; retry retaining the
-        // generated key when Tor was asked for a fresh one.
-        let reply = match (private_key, reply) {
-            (None, _) => {
-                self.command(&format!(
-                    "ADD_ONION NEW:ED25519-V3 Port={virtual_port},{forward_to}"
-                ))
-                .await?
-            }
-            (Some(_), reply) => reply?,
-        };
+            .command(&format!("ADD_ONION {key} Port={virtual_port},{forward_to}"))
+            .await?;
         let service_id = reply
             .iter()
             .find_map(|line| field(line, "ServiceID="))
@@ -230,7 +223,9 @@ impl TorController {
         let private_key = reply
             .iter()
             .find_map(|line| field(line, "PrivateKey="))
-            .unwrap_or_default()
+            .or(private_key)
+            .filter(|key| !key.is_empty())
+            .ok_or(TorControlError::MalformedReply)?
             .to_owned();
         let address = OnionAddress::new(&format!("{service_id}.onion"), virtual_port)
             .map_err(|_| TorControlError::InvalidServiceId)?;
@@ -262,46 +257,56 @@ impl TorController {
             self.writer.write_all(command.as_bytes()).await?;
             self.writer.write_all(b"\r\n").await?;
             self.writer.flush().await?;
-            self.read_reply().await
+            read_reply(&mut self.reader).await
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tor control command timed out"))?
     }
+}
 
-    async fn read_reply(&mut self) -> Result<Vec<String>, TorControlError> {
-        let mut lines = Vec::new();
-        for _ in 0..MAX_REPLY_LINES {
-            let mut line = String::new();
-            let read = tokio::io::AsyncReadExt::take(&mut self.reader, MAX_REPLY_LINE_BYTES)
-                .read_line(&mut line)
-                .await?;
-            if read == 0 {
-                return Err(TorControlError::MalformedReply);
-            }
-            if u64::try_from(read).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
-                return Err(TorControlError::OversizedReply);
-            }
-            let line = line.trim_end_matches(['\r', '\n']).to_owned();
-            if line.len() < 4 {
-                return Err(TorControlError::MalformedReply);
-            }
-            let (status, rest) = line.split_at(3);
-            let separator = rest.as_bytes()[0];
-            let body = rest[1..].to_owned();
-            if !status.starts_with('2') {
-                return Err(TorControlError::CommandFailed {
-                    status: status.to_owned(),
-                    detail: body,
-                });
-            }
-            lines.push(body);
-            // `-` and `+` mark continuation lines; a space ends the reply.
-            if separator == b' ' {
-                return Ok(lines);
-            }
+async fn read_reply(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> Result<Vec<String>, TorControlError> {
+    let mut lines = Vec::new();
+    for _ in 0..MAX_REPLY_LINES {
+        let mut line = String::new();
+        let read = tokio::io::AsyncReadExt::take(&mut *reader, MAX_REPLY_LINE_BYTES)
+            .read_line(&mut line)
+            .await?;
+        if read == 0 {
+            return Err(TorControlError::MalformedReply);
         }
-        Err(TorControlError::OversizedReply)
+        if u64::try_from(read).unwrap_or(u64::MAX) >= MAX_REPLY_LINE_BYTES {
+            return Err(TorControlError::OversizedReply);
+        }
+        if !line.ends_with('\n') {
+            return Err(TorControlError::MalformedReply);
+        }
+        let line = line.trim_end_matches(['\r', '\n']).to_owned();
+        let bytes = line.as_bytes();
+        if bytes.len() < 4
+            || !bytes[..3].iter().all(u8::is_ascii_digit)
+            || !matches!(bytes[3], b' ' | b'-')
+        {
+            return Err(TorControlError::MalformedReply);
+        }
+        let (status, rest) = line.split_at(3);
+        let separator = rest.as_bytes()[0];
+        let body = rest[1..].to_owned();
+        if !status.starts_with('2') {
+            return Err(TorControlError::CommandFailed {
+                status: status.to_owned(),
+                detail: body,
+            });
+        }
+        lines.push(body);
+        // These commands use `-` continuation lines, never data blocks.
+        // A space ends the reply.
+        if separator == b' ' {
+            return Ok(lines);
+        }
     }
+    Err(TorControlError::OversizedReply)
 }
 
 /// Reads Tor's 32-byte authentication cookie.
@@ -337,7 +342,7 @@ fn hex_upper(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if input.len() % 2 != 0 || !input.is_ascii() {
         return None;
     }
     (0..input.len() / 2)
@@ -515,11 +520,13 @@ mod tests {
                 .all(|command| !command.contains(&hex_upper(&cookie))),
             "the cookie itself is never sent to the control port"
         );
-        assert!(
+        assert_eq!(
             commands
                 .iter()
-                .any(|command| command.contains("ADD_ONION NEW:ED25519-V3")),
-            "a fresh key is requested when none is supplied"
+                .filter(|command| command.starts_with("ADD_ONION "))
+                .collect::<Vec<_>>(),
+            vec![&"ADD_ONION NEW:ED25519-V3 Port=8333,127.0.0.1:8333".to_owned()],
+            "exactly one service is created and its key is retained"
         );
         assert!(
             commands
@@ -615,5 +622,33 @@ mod tests {
             default_cookie_path(Path::new("/var/lib/tor")),
             Path::new("/var/lib/tor/control_auth_cookie")
         );
+    }
+    #[test]
+    fn malformed_unicode_hex_is_rejected_without_panicking() {
+        for value in ["0€", "é00", "💣", "00\r\n"] {
+            assert_eq!(decode_hex(value), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_reply_headers_are_rejected_without_panicking() {
+        for reply in [
+            "00é OK\r\n",
+            "250éOK\r\n",
+            "2ab OK\r\n",
+            "250?OK\r\n",
+            "250 OK",
+        ] {
+            let (stream, mut server) = tokio::io::duplex(1024);
+            server.write_all(reply.as_bytes()).await.unwrap();
+            server.shutdown().await.unwrap();
+            assert!(
+                matches!(
+                    read_reply(&mut BufReader::new(stream)).await,
+                    Err(TorControlError::MalformedReply)
+                ),
+                "{reply:?}"
+            );
+        }
     }
 }

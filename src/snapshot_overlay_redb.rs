@@ -444,8 +444,12 @@ impl SnapshotOverlayRedbChainstate {
     ///
     /// # Errors
     ///
-    /// Fails closed without switching identity on I/O errors, existing output
-    /// paths, an MTP extension of the wrong length, or a merge mismatch.
+    /// Before the durable switch, rejects existing output paths, a wrong MTP
+    /// extension, merge mismatches, and I/O errors.
+    ///
+    /// After the durable identity switch, maintenance/reopen errors retain
+    /// the new files. Reopen the store using its stored identity before
+    /// retrying; an error at that point does not roll back the switch.
     #[allow(clippy::too_many_lines)]
     pub fn rebase_into(
         &mut self,
@@ -502,8 +506,14 @@ impl SnapshotOverlayRedbChainstate {
             name.push(".tmp");
             name
         });
+        // Only clean up a staging file that this invocation created.
+        // Existing files and symlinks must neither be truncated nor removed.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         cleanup.track(temporary.clone());
-        let mut writer = std::io::BufWriter::new(fs::File::create(&temporary)?);
+        let mut writer = std::io::BufWriter::new(file);
         let mut header = Vec::with_capacity(51);
         header.extend_from_slice(b"utxo\xff");
         header.extend_from_slice(&2_u16.to_le_bytes());
@@ -654,18 +664,21 @@ impl SnapshotOverlayRedbChainstate {
             )
             .map_err(overlay_redb)?;
             drop(meta);
+            // A commit I/O error can leave its durable outcome uncertain.
+            // Keep the authenticated files from this point onward: the DB
+            // may already reference them, even when this call returns Err.
+            cleanup.disarm();
             write.commit().map_err(overlay_redb)?;
         }
-        // Reclaim the space the cleared tables just freed, so the budget is
-        // genuinely available again rather than merely marked reusable.
-        self.db.compact().map_err(overlay_redb)?;
-
         self.mtp_by_height.extend_from_slice(mtp_extension);
         self.base = new_base;
         self.identity = identity.clone();
         new_snapshot_path.clone_into(&mut self.snapshot_path);
         new_index_path.clone_into(&mut self.index_path);
-        cleanup.disarm();
+        // Compaction is fallible maintenance after the identity switch.
+        // Both the live view and its files must already match the committed
+        // database if maintenance fails and the caller reopens or retries.
+        self.db.compact().map_err(overlay_redb)?;
         Ok(RebaseReport {
             identity,
             coins,
@@ -1703,5 +1716,61 @@ mod tests {
                 &[],
             )
             .unwrap();
+    }
+    #[test]
+    fn rebase_compaction_failure_preserves_committed_base_and_reopens() {
+        let (directory, mut store, identity, ..) = setup(32 << 20);
+        let spent = key(1, 0);
+        let created = key(42, 0);
+        let mut coin = overlay_coin(BASE_HEIGHT + 1, 123);
+        coin.last_touched = IMPORT_TIME;
+        store
+            .commit_connect(
+                identity.block_hash,
+                tip(BASE_HEIGHT + 1, block_hash(BASE_HEIGHT + 1)),
+                &[spent],
+                &[(created, coin.clone())],
+                &[],
+            )
+            .unwrap();
+        // A persistent savepoint deterministically refuses compaction while
+        // allowing the identity-switch transaction to commit normally.
+        let write = store.db.begin_write().unwrap();
+        let savepoint = write.persistent_savepoint().unwrap();
+        write.commit().unwrap();
+        let snapshot = directory.path().join("rebased.dat");
+        let index = directory.path().join("rebased.idx");
+        assert!(
+            store
+                .rebase_into(&snapshot, &index, &[mtp_for(BASE_HEIGHT + 1)])
+                .is_err()
+        );
+        assert!(snapshot.exists());
+        assert!(index.exists());
+        let committed = store.base_identity().clone();
+        assert_eq!(committed.height, BASE_HEIGHT + 1);
+        assert_eq!(store.get(spent).unwrap(), None);
+        assert_eq!(store.get(created).unwrap(), Some(coin.clone()));
+        let write = store.db.begin_write().unwrap();
+        write.delete_persistent_savepoint(savepoint).unwrap();
+        write.commit().unwrap();
+        drop(store);
+        let reopened =
+            open_store(directory.path(), &snapshot, &index, &committed, 32 << 20).unwrap();
+        assert_eq!(reopened.get(spent).unwrap(), None);
+        assert_eq!(reopened.get(created).unwrap(), Some(coin));
+    }
+    #[test]
+    fn rebase_refuses_existing_staging_file_without_modifying_it() {
+        let (directory, mut store, identity, ..) = setup(32 << 20);
+        let snapshot = directory.path().join("rebased.dat");
+        let index = directory.path().join("rebased.idx");
+        let staging = directory.path().join("rebased.dat.tmp");
+        fs::write(&staging, b"keep existing bytes").unwrap();
+        assert!(store.rebase_into(&snapshot, &index, &[]).is_err());
+        assert_eq!(fs::read(&staging).unwrap(), b"keep existing bytes");
+        assert_eq!(store.base_identity(), &identity);
+        assert!(!snapshot.exists());
+        assert!(!index.exists());
     }
 }
