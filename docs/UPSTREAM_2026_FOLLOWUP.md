@@ -6,24 +6,64 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-10)
 
-The previously accepted implementation was committed and pushed to `main` as
-`f3c2e9e`. This continuation closes missing fuzz coverage and removes repeated
-full-DAG copies from the inbound serving view. Durable competing-header
-retention and the external operational gates remain open.
+The previous implementation and supplementary acceptance were pushed to `main`
+as `f3c2e9e` and `1a54604`. They close missing fuzz coverage and remove repeated
+full-DAG serving copies. This continuation also reuses successful incumbent
+SCRIPT verification with a commitment to the exact transaction, fresh prevouts
+and verification flags. Durable competing-header retention, remaining admission
+replay work and the external operational gates remain open.
 
 | Follow-up item | Current implementation / acceptance | Remaining work |
 | --- | --- | --- |
 | P0 BIP30/BIP34 | Historical exceptions, activation anchors and overwrite undo have passing regressions and live Core block fixtures. | No new defect found in the covered boundaries. |
 | P0 script lifetime | Owned jobs, bounded pending work, cancellation, inline backpressure and rollback regressions pass. | Whole-pipeline RSS/work accounting is still separate from the pending-queue limit. |
 | P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
-| P1 orphan/CPU/disk DoS | Orphan input-work bounds and existing hostile-input/log tests pass. | Incumbent admission replay still needs chain-bound cache/work-budget design. |
+| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. Incumbent SCRIPT results now reuse an entry-owned content commitment after fresh contextual/policy checks. | Pool cloning, input lookup, hashing, policy checks and graph work still need end-to-end resource budgets. |
 | P1 cluster mempool | Chunk membership, topological order, exact totals and 64-entry components are now fuzzed alongside diagrams; selection/eviction regressions pass. | Exact Core optimizer parity remains unclaimed. |
-| P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed on 2026-09-09. | Broader rolling-floor and optimizer differential coverage remains open. |
+| P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed again on 2026-09-10. | Broader rolling-floor and optimizer differential coverage remains open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
 | P1 chainstate I/O | Non-ignored redb/MDBX recovery and write-back equivalence tests pass. | Optional scale/benchmark and sustained I/O acceptance remain separate; no LevelDB tuning was transplanted. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Supplementary validation
+### Incumbent SCRIPT reuse
+
+Each retained admission entry owns one optional SHA256d commitment covering a
+versioned domain, the full witness transaction ID, the consensus and public
+standard SCRIPT flags, and every ordered prevout's amount and length-framed
+script. Successful consensus **and** public standard verification are required
+before returning a stamp. The candidate pool publishes stamps only if the whole
+admission succeeds. Failures are not cached; eviction/removal drops the stamp
+with its entry. Snapshots persist raw transactions only, and chain reconciliation
+discards old stamps before readmitting transactions.
+
+Replay still resolves the current UTXOs and checks accounting, coinbase maturity,
+absolute/relative locks, standardness and sigops before comparing commitments.
+Height alone never authorizes a cache hit. This also handles same-height views
+with changed amounts/scripts; metadata that SCRIPT does not consume remains
+subject to fresh contextual validation.
+
+Six focused regressions pass. Sequentially admitting 32 independent transactions
+executes **32 SCRIPT verification rounds instead of the previous 528** (a round
+includes the required consensus and public standard calls). This is a deterministic
+work-count assertion, not a latency or RSS measurement. Tests cover changed
+witnesses, ordered prevouts, flags, an amount change invalidating a real ECDSA
+signature, failed-candidate atomicity, missing inputs, immature coinbase,
+height/time lock boundaries and fee policy on an otherwise matching stamp.
+
+All-feature acceptance on this continuation: **913 passed**, 0 failed, 26
+ignored (874 library + 39 integration tests; subprocess helpers not counted
+twice). Both live Core 31 replacement/package-pressure differential tests pass;
+strict all-target/all-feature Clippy and formatting checks pass. The final focused
+cache regression rerun also passes after Clippy-only test cleanup.
+Logs for this change are in
+`target/upstream-followup/2026-09-10/admission-script-cache/`.
+
+The cache adds one fixed-size optional digest per retained entry, bounded by the
+configured transaction-count limit. It does **not** eliminate repeated pool
+cloning, fresh input lookup, transaction/prevout hashing, policy checks or cluster
+work; admission remains subject to the remaining whole-pipeline work/RSS gate.
+
+### Prior serving/fuzz supplementary validation (`1a54604`)
 
 - `cargo test --locked --all-features --no-fail-fast`: **907 passed**, 0 failed,
   26 ignored (868 library + 39 integration tests; subprocess helpers not counted
@@ -145,10 +185,11 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 - Implement and measure valid competing-header retention, bounded recovery
   and durable eviction as specified in [the resource gate](UPSTREAM_HEADER_RESOURCE_GATE.md).
-- Bound and measure admission replay and whole-pipeline allocations; a pending
-  script queue accounting limit is not an RSS bound or a chain-bound validity cache.
+- Bound and measure the remaining admission replay and whole-pipeline allocations.
+  Content-bound SCRIPT reuse removes repeated interpreter work for incumbents;
+  it does not bound total admission work or process RSS.
 - Run real Tor/I2P, sustained public-network and resource-pressure workloads,
-  plus fuzz acceptance and optional ignored storage-scale gates. Non-ignored
+  plus longer fuzz campaigns and optional ignored storage-scale gates. Non-ignored
   MDBX tests passing does not close its scale/benchmark gates.
 - Broaden live cluster optimizer/fee-floor differential coverage before claiming
   complete Core policy parity. Existing successful fixtures establish only

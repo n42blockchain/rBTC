@@ -10,8 +10,9 @@ use std::{
 };
 
 use bitcoin::{
-    BlockHash, OutPoint, ScriptBuf, Transaction, Txid, Wtxid, consensus::encode::serialize,
-    hashes::sha256d,
+    BlockHash, OutPoint, ScriptBuf, Transaction, Txid, Wtxid,
+    consensus::encode::serialize,
+    hashes::{Hash, HashEngine, sha256d},
 };
 use rand::RngExt;
 use thiserror::Error;
@@ -383,6 +384,7 @@ struct AdmittedTransaction {
     fee_sats: u64,
     policy_vsize: usize,
     sigop_cost: u64,
+    script_verification: Option<ScriptVerificationStamp>,
 }
 
 #[derive(Clone)]
@@ -1298,15 +1300,17 @@ impl TransactionAdmissionPool {
         let use_package_feerate = child_with_parents && replacement.txids.is_empty();
 
         let overlay = AdmissionUtxoOverlay::new(store);
-        for entry in &self.entries {
-            let _ = apply_to_overlay(
+        for entry in &mut self.entries {
+            let applied = apply_to_overlay(
                 &overlay,
                 &entry.transaction,
                 context,
                 // Already-admitted zero-fee parents were paid for by their
                 // child. Replaying them individually must not revoke CPFP.
                 0,
+                entry.script_verification,
             )?;
+            entry.script_verification = Some(applied.script_verification);
         }
         let (accepted, replacement_fee_sats, replacement_vbytes) =
             self.append_ordered_package(&overlay, ordered, context, use_package_feerate)?;
@@ -1598,7 +1602,7 @@ impl TransactionAdmissionPool {
             } else {
                 DEFAULT_MIN_RELAY_FEE_SAT_KVB
             };
-            let applied = apply_to_overlay(overlay, &transaction, context, policy_rate)?;
+            let applied = apply_to_overlay(overlay, &transaction, context, policy_rate, None)?;
             let individual_rate = if use_package_feerate { 0 } else { rolling_rate };
             let minimum_sats = fee_for_rate(individual_rate, applied.policy_vsize);
             if applied.fee_sats < minimum_sats {
@@ -1630,6 +1634,7 @@ impl TransactionAdmissionPool {
                 fee_sats: applied.fee_sats,
                 policy_vsize: applied.policy_vsize,
                 sigop_cost: applied.sigop_cost,
+                script_verification: Some(applied.script_verification),
             });
             accepted.push(txid);
         }
@@ -2442,10 +2447,40 @@ fn is_child_with_parents_tree(transactions: &[Transaction]) -> bool {
     })
 }
 
+// Successful SCRIPT results belong to retained entries, so memory is bounded by
+// the pool's transaction limit and eviction drops the stamp with its owner.
+// They are never persisted. A content commitment covers every input consumed by
+// the consensus ABI, including ordered prevouts used by Taproot sighashes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScriptVerificationStamp(sha256d::Hash);
+
+impl ScriptVerificationStamp {
+    fn new(transaction: &Transaction, prevouts: &[Utxo], script_flags: u32) -> Self {
+        let mut engine = sha256d::Hash::engine();
+        engine.input(b"rBTC/admission-script-verification/v1");
+        engine.input(transaction.compute_wtxid().as_byte_array());
+        engine.input(&script_flags.to_le_bytes());
+        engine.input(&PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS.to_le_bytes());
+        engine.input(&(prevouts.len() as u64).to_le_bytes());
+        for prevout in prevouts {
+            engine.input(&prevout.value_sats.to_le_bytes());
+            engine.input(&(prevout.script_pubkey.len() as u64).to_le_bytes());
+            engine.input(&prevout.script_pubkey);
+        }
+        Self(sha256d::Hash::from_engine(engine))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRIPT_VERIFICATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct AppliedAdmission {
     fee_sats: u64,
     policy_vsize: usize,
     sigop_cost: u64,
+    script_verification: ScriptVerificationStamp,
 }
 
 fn apply_to_overlay<S: UtxoStore>(
@@ -2453,6 +2488,7 @@ fn apply_to_overlay<S: UtxoStore>(
     transaction: &Transaction,
     context: TransactionAdmissionContext,
     minimum_relay_fee_sat_kvb: u64,
+    cached_scripts: Option<ScriptVerificationStamp>,
 ) -> Result<AppliedAdmission, TransactionAdmissionError> {
     let legacy_sigops = transaction_legacy_sigops(transaction);
     if legacy_sigops > MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS {
@@ -2505,17 +2541,25 @@ fn apply_to_overlay<S: UtxoStore>(
             limit: MAX_STANDARD_TRANSACTION_SIGOP_COST,
         });
     }
-    verify_transaction_scripts_with_flags(transaction, prevouts, context.script_flags)
-        .map_err(ChainstateError::from)?;
-    if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
-        != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
-    {
-        verify_transaction_scripts_with_flags(
-            transaction,
-            prevouts,
-            PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS,
-        )
-        .map_err(TransactionAdmissionError::StandardScript)?;
+    // Only SCRIPT execution is reusable. Input lookup, maturity, locktimes,
+    // accounting, sigops and standardness above always use the current view.
+    let script_verification =
+        ScriptVerificationStamp::new(transaction, prevouts, context.script_flags);
+    if cached_scripts != Some(script_verification) {
+        #[cfg(test)]
+        SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(runs.get() + 1));
+        verify_transaction_scripts_with_flags(transaction, prevouts, context.script_flags)
+            .map_err(ChainstateError::from)?;
+        if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+            != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+        {
+            verify_transaction_scripts_with_flags(
+                transaction,
+                prevouts,
+                PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS,
+            )
+            .map_err(TransactionAdmissionError::StandardScript)?;
+        }
     }
     overlay
         .apply_with_undo(&prepared.spent, &prepared.created)
@@ -2524,6 +2568,7 @@ fn apply_to_overlay<S: UtxoStore>(
         fee_sats,
         policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
         sigop_cost: applied.sigop_cost,
+        script_verification,
     })
 }
 
@@ -2929,6 +2974,7 @@ mod tests {
                 serialized_len,
                 fee_sats: 0,
                 sigop_cost: 0,
+                script_verification: None,
             });
         }
         pool.rebuild_indexes();
@@ -2944,6 +2990,313 @@ mod tests {
             .iter()
             .map(Transaction::compute_txid)
             .collect()
+    }
+
+    #[test]
+    fn incumbent_script_cache_avoids_repeated_work_and_rejects_atomically() {
+        let (_directory, store) = store();
+        let mut pool = TransactionAdmissionPool::default();
+        SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
+        for index in 1..=32 {
+            let (outpoint, utxo, transaction) = spend(index);
+            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            pool.admit(&store, transaction, context()).unwrap();
+        }
+        // Sequential admission used to execute 1 + ... + 32 = 528 pairs.
+        assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 32);
+        let before = txids(&pool);
+        let stamps = pool
+            .entries
+            .iter()
+            .map(|e| e.script_verification)
+            .collect::<Vec<_>>();
+        let bytes = pool.retained_bytes();
+        let (outpoint, utxo, mut invalid) = spend(33);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        invalid.input[0].witness = Witness::new();
+        for expected_runs in 33..=35 {
+            assert!(matches!(
+                pool.admit(&store, invalid.clone(), context()),
+                Err(TransactionAdmissionError::Chainstate(
+                    ChainstateError::Script(_)
+                ))
+            ));
+            assert_eq!(
+                SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get),
+                expected_runs
+            );
+            assert_eq!(txids(&pool), before);
+            assert_eq!(pool.retained_bytes(), bytes);
+            assert_eq!(
+                pool.entries
+                    .iter()
+                    .map(|e| e.script_verification)
+                    .collect::<Vec<_>>(),
+                stamps
+            );
+        }
+    }
+
+    #[test]
+    fn incumbent_script_cache_commits_witness_ordered_prevouts_and_flags() {
+        let (_, first, mut transaction) = spend(1);
+        let (_, mut second, _) = spend(2);
+        second.value_sats += 1;
+        transaction.input.push(spend(2).2.input.remove(0));
+        let prevouts = vec![first, second];
+        let stamp = ScriptVerificationStamp::new(&transaction, &prevouts, context().script_flags);
+        let mut witness_variant = transaction.clone();
+        witness_variant.input[0].witness.push([42]);
+        assert_eq!(transaction.compute_txid(), witness_variant.compute_txid());
+        assert_ne!(
+            stamp,
+            ScriptVerificationStamp::new(&witness_variant, &prevouts, context().script_flags)
+        );
+        let mut changed = prevouts.clone();
+        changed[1].value_sats += 1;
+        assert_ne!(
+            stamp,
+            ScriptVerificationStamp::new(&transaction, &changed, context().script_flags)
+        );
+        changed = prevouts.clone();
+        changed[1].script_pubkey.push(0);
+        assert_ne!(
+            stamp,
+            ScriptVerificationStamp::new(&transaction, &changed, context().script_flags)
+        );
+        changed = prevouts.clone();
+        changed.reverse();
+        assert_ne!(
+            stamp,
+            ScriptVerificationStamp::new(&transaction, &changed, context().script_flags)
+        );
+        assert_ne!(
+            stamp,
+            ScriptVerificationStamp::new(&transaction, &prevouts, bitcoinconsensus::VERIFY_NONE)
+        );
+    }
+
+    #[test]
+    fn incumbent_script_cache_rechecks_changed_witness_and_script() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, transaction) = spend(1);
+        store
+            .apply(&[], &[(outpoint.into(), utxo.clone())])
+            .unwrap();
+        let applied = apply_to_overlay(
+            &AdmissionUtxoOverlay::new(&store),
+            &transaction,
+            context(),
+            0,
+            None,
+        )
+        .unwrap();
+        let mut invalid = transaction.clone();
+        invalid.input[0].witness = Witness::new();
+        assert!(matches!(
+            apply_to_overlay(
+                &AdmissionUtxoOverlay::new(&store),
+                &invalid,
+                context(),
+                0,
+                Some(applied.script_verification)
+            ),
+            Err(TransactionAdmissionError::Chainstate(
+                ChainstateError::Script(_)
+            ))
+        ));
+        let (_changed_directory, changed_store) = self::store();
+        let mut changed = utxo;
+        changed.script_pubkey = ScriptBuf::new_p2wsh(&ScriptBuf::new().wscript_hash()).into_bytes();
+        changed_store
+            .apply(&[], &[(outpoint.into(), changed)])
+            .unwrap();
+        assert!(matches!(
+            apply_to_overlay(
+                &AdmissionUtxoOverlay::new(&changed_store),
+                &transaction,
+                context(),
+                0,
+                Some(applied.script_verification)
+            ),
+            Err(TransactionAdmissionError::Chainstate(
+                ChainstateError::Script(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn incumbent_script_cache_rechecks_amount_committed_by_signature() {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[7; 32]).unwrap();
+        let public = bitcoin::PublicKey::new(secret.public_key(&secp));
+        let script = Builder::new()
+            .push_key(&public)
+            .push_opcode(opcodes::all::OP_CHECKSIG)
+            .into_script();
+        let (outpoint, mut utxo, mut transaction) = spend(1);
+        utxo.script_pubkey = ScriptBuf::new_p2wsh(&script.wscript_hash()).into_bytes();
+        let sighash = bitcoin::sighash::SighashCache::new(&transaction)
+            .p2wsh_signature_hash(
+                0,
+                &script,
+                Amount::from_sat(utxo.value_sats),
+                bitcoin::EcdsaSighashType::All,
+            )
+            .unwrap();
+        let message = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+        let signature = bitcoin::ecdsa::Signature::sighash_all(secp.sign_ecdsa(&message, &secret));
+        transaction.input[0].witness =
+            Witness::from_slice(&[signature.to_vec(), script.into_bytes()]);
+        let (_directory, store) = store();
+        store
+            .apply(&[], &[(outpoint.into(), utxo.clone())])
+            .unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, transaction.clone(), context()).unwrap();
+        let stamp = pool.entries[0].script_verification;
+        let (_changed_directory, changed_store) = self::store();
+        utxo.value_sats += 1;
+        let (second, second_utxo, candidate) = spend(2);
+        changed_store
+            .apply(
+                &[],
+                &[(outpoint.into(), utxo), (second.into(), second_utxo)],
+            )
+            .unwrap();
+        // Same outpoint and height, different amount: the old signature fails.
+        assert!(matches!(
+            pool.admit(&changed_store, candidate, context()),
+            Err(TransactionAdmissionError::Chainstate(
+                ChainstateError::Script(_)
+            ))
+        ));
+        assert_eq!(txids(&pool), vec![transaction.compute_txid()]);
+        assert_eq!(pool.entries[0].script_verification, stamp);
+    }
+
+    #[test]
+    fn incumbent_script_cache_rechecks_flags_and_refreshes_only_on_success() {
+        let (_directory, store) = store();
+        let mut pool = TransactionAdmissionPool::default();
+        let (first, first_utxo, transaction) = spend(1);
+        let (second, second_utxo, candidate) = spend(2);
+        store
+            .apply(
+                &[],
+                &[(first.into(), first_utxo), (second.into(), second_utxo)],
+            )
+            .unwrap();
+        pool.admit(&store, transaction, context()).unwrap();
+        let stamp = pool.entries[0].script_verification;
+        let mut changed_context = context();
+        changed_context.script_flags = PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS;
+        SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
+        let mut invalid = candidate.clone();
+        invalid.input[0].witness = Witness::new();
+        assert!(pool.admit(&store, invalid, changed_context).is_err());
+        assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 2);
+        assert_eq!(pool.entries[0].script_verification, stamp);
+        pool.admit(&store, candidate, changed_context).unwrap();
+        assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 4);
+        assert_ne!(pool.entries[0].script_verification, stamp);
+    }
+
+    #[test]
+    fn incumbent_script_cache_preserves_fresh_context_and_fee_checks() {
+        // The unchanged SCRIPT commitment must not suppress validation of
+        // metadata or context which the SCRIPT ABI itself does not consume.
+        for case in 0..7 {
+            let (_directory, store) = store();
+            let (outpoint, mut utxo, mut transaction) = spend(1);
+            let mut current = context();
+            if case == 2 {
+                transaction.input[0].sequence = Sequence::from_height(2);
+            }
+            if case == 3 {
+                transaction.input[0].sequence = Sequence::from_512_second_intervals(1);
+            }
+            if case == 4 {
+                transaction.input[0].sequence = Sequence::ZERO;
+                transaction.lock_time = LockTime::from_height(current.height - 1).unwrap();
+            }
+            if case == 5 {
+                transaction.input[0].sequence = Sequence::ZERO;
+                transaction.lock_time = LockTime::from_time(current.parent_mtp - 1).unwrap();
+            }
+            store
+                .apply(&[], &[(outpoint.into(), utxo.clone())])
+                .unwrap();
+            let applied = apply_to_overlay(
+                &AdmissionUtxoOverlay::new(&store),
+                &transaction,
+                current,
+                0,
+                None,
+            )
+            .unwrap();
+            match case {
+                1 => {
+                    utxo.is_coinbase = true;
+                    utxo.height = current.height - 99;
+                }
+                2 => utxo.height = current.height - 1,
+                3 => utxo.creation_mtp = current.parent_mtp - 511,
+                4 => current.height -= 1,
+                5 => current.parent_mtp -= 1,
+                _ => {}
+            }
+            let (_changed_directory, changed_store) = self::store();
+            if case != 0 {
+                changed_store
+                    .apply(&[], &[(outpoint.into(), utxo.clone())])
+                    .unwrap();
+            }
+            assert_eq!(
+                applied.script_verification,
+                ScriptVerificationStamp::new(&transaction, &[utxo], current.script_flags)
+            );
+            SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
+            let rate = if case == 6 { 1_000_000_000 } else { 0 };
+            let error = apply_to_overlay(
+                &AdmissionUtxoOverlay::new(&changed_store),
+                &transaction,
+                current,
+                rate,
+                Some(applied.script_verification),
+            )
+            .err()
+            .unwrap();
+            match case {
+                0 => assert!(matches!(
+                    error,
+                    TransactionAdmissionError::Chainstate(ChainstateError::Utxo(
+                        UtxoError::Missing(_)
+                    ))
+                )),
+                1 => assert!(matches!(
+                    error,
+                    TransactionAdmissionError::Chainstate(ChainstateError::ImmatureCoinbase { .. })
+                )),
+                2 => assert!(matches!(
+                    error,
+                    TransactionAdmissionError::Chainstate(
+                        ChainstateError::RelativeHeightLock { .. }
+                    )
+                )),
+                3 => assert!(matches!(
+                    error,
+                    TransactionAdmissionError::Chainstate(ChainstateError::RelativeTimeLock { .. })
+                )),
+                4 | 5 => assert!(matches!(
+                    error,
+                    TransactionAdmissionError::Chainstate(ChainstateError::NonFinalLockTime { .. })
+                )),
+                6 => assert!(matches!(error, TransactionAdmissionError::Policy(_))),
+                _ => unreachable!(),
+            }
+            assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 0);
+        }
     }
 
     #[test]
