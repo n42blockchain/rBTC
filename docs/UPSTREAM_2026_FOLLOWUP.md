@@ -4,7 +4,76 @@ Tracking started 2026-09-08 for releases/disclosures from 2025-09-08 through
 2026-09-08. This is an active implementation and acceptance ledger, not a
 claim that the older P1 roadmap or every item below has passed this checkout.
 
-## Current acceptance (2026-09-09)
+## Current progress (2026-09-10)
+
+The previously accepted implementation was committed and pushed to `main` as
+`f3c2e9e`. This continuation closes missing fuzz coverage and removes repeated
+full-DAG copies from the inbound serving view. Durable competing-header
+retention and the external operational gates remain open.
+
+| Follow-up item | Current implementation / acceptance | Remaining work |
+| --- | --- | --- |
+| P0 BIP30/BIP34 | Historical exceptions, activation anchors and overwrite undo have passing regressions and live Core block fixtures. | No new defect found in the covered boundaries. |
+| P0 script lifetime | Owned jobs, bounded pending work, cancellation, inline backpressure and rollback regressions pass. | Whole-pipeline RSS/work accounting is still separate from the pending-queue limit. |
+| P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
+| P1 orphan/CPU/disk DoS | Orphan input-work bounds and existing hostile-input/log tests pass. | Incumbent admission replay still needs chain-bound cache/work-budget design. |
+| P1 cluster mempool | Chunk membership, topological order, exact totals and 64-entry components are now fuzzed alongside diagrams; selection/eviction regressions pass. | Exact Core optimizer parity remains unclaimed. |
+| P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed on 2026-09-09. | Broader rolling-floor and optimizer differential coverage remains open. |
+| P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
+| P1 chainstate I/O | Non-ignored redb/MDBX recovery and write-back equivalence tests pass. | Optional scale/benchmark and sustained I/O acceptance remain separate; no LevelDB tuning was transplanted. |
+| P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
+
+### Supplementary validation
+
+- `cargo test --locked --all-features --no-fail-fast`: **907 passed**, 0 failed,
+  26 ignored (868 library + 39 integration tests; subprocess helpers not counted
+  twice). Three new projection tests cover 1,000 valid siblings, reorg/rollback
+  and incompatible destination replacement. The existing submitted-block test
+  also checks that a losing header stays in the validation DAG and is absent
+  from the serving view.
+- Live Core block/transport differential: **9 passed** on the updated code.
+- Strict Clippy passed for all targets/all features, the fuzz workspace, and
+  the final resource probe. Root/fuzz formatting checks passed.
+- The pinned `nightly-2026-07-13` toolchain and `cargo-fuzz 0.13.2` completed
+  all **15 targets × 10,000 runs = 150,000 runs**, with no crash. PSBT checks
+  compare canonical base64 against the dependency implementation and reject
+  extra/truncated maps; fee checks assert every member occurs once, parents
+  precede children and chunk totals match their members. Named raw PSBT,
+  malformed witness, shared-parent, component-limit and trailing P2P seeds
+  are tracked. Generated hash-named corpus discoveries remain untracked.
+- A reproducible header/store probe compared full serving copies with the new
+  projection at 50,000 and 100,000 valid siblings over a 2,501-header active
+  chain. The projection stayed at 2,501 entries. With the daemon's mimalloc
+  allocator, the 100,000-sibling endpoint used 102,344 KiB process RSS versus
+  140,688 KiB for full copies. Both databases grew to 67,907,584 bytes and
+  retained every sibling after reopen. These are kernel/store observations,
+  not a whole-node memory cap. See [resource measurements](UPSTREAM_HEADER_RESOURCE_GATE.md).
+- Real Tor/I2P were **not run**: no `RBTC_TOR_SOCKS`, `RBTC_TOR_CONTROL` or
+  `RBTC_I2P_SAM` setting was present, and default loopback ports 9050, 9051 and
+  7656 were not listening. The continuation did not run a sustained public
+  network workload or ignored storage-scale gates.
+
+Reports and raw logs are under `target/upstream-followup/2026-09-10/`, including
+`summary.tsv`, `fuzz-summary.json`, `all-features-tests.log`, `core-block.log`
+and the per-mode resource JSON lines/time reports. The large fuzz log retains
+each target's random seed and run summary. These are local build artifacts.
+
+```sh
+export CARGO_HOME=/tmp/rbtc-cargo-home
+export PATH=/tmp/rbtc-tools/bin:$PATH
+RBTC_FUZZ_RUNS=10000 bash scripts/run-fuzz-regression.sh
+cargo test --locked --all-features --no-fail-fast
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --manifest-path fuzz/Cargo.toml --locked --all-targets -- -D warnings
+cargo run --locked --release --example header_resource_probe -- full 2500 100000
+cargo run --locked --release --example header_resource_probe -- active 2500 100000
+```
+
+The four consensus/policy/privacy constraints below remain in force. This
+continuation does not add a competing-header rejection rule or mark the
+complete industry follow-up finished.
+
+## Previous acceptance (2026-09-09)
 
 The dependency blocker is resolved for this checkout. The default local and
 live Core gates now pass, as do the non-ignored all-feature tests and strict

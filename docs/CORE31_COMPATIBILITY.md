@@ -2,7 +2,7 @@
 
 Status date: 2026-07-25.
 
-The active P0/P1 follow-up, its 2026-09-09 integration results and remaining gates are
+The active P0/P1 follow-up, its 2026-09-10 supplementary results and remaining gates are
 tracked in [UPSTREAM_2026_FOLLOWUP.md](UPSTREAM_2026_FOLLOWUP.md). Historical
 acceptance results below do not constitute acceptance of that follow-up.
 

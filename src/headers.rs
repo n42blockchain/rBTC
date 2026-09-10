@@ -254,6 +254,62 @@ impl HeaderDag {
         self.headers[&self.active_tip]
     }
 
+    /// Returns the number of retained headers, including genesis and side chains.
+    #[must_use]
+    pub fn retained_header_count(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// Copies the active chain and its complete ancestor context for read-only serving.
+    ///
+    /// Off-chain hashes are absent from this projection. Keep the full source
+    /// DAG for synchronization, competing-chain validation and execution rollback.
+    #[must_use]
+    pub fn active_chain_snapshot(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            deployments: self.deployments.clone(),
+            headers: self
+                .active_chain
+                .iter()
+                .map(|hash| (*hash, self.headers[hash]))
+                .collect(),
+            active_tip: self.active_tip,
+            active_chain: self.active_chain.clone(),
+        }
+    }
+
+    /// Refreshes a serving projection, replacing only the changed active suffix.
+    ///
+    /// Adding losing forks leaves the projection's header allocations unchanged.
+    /// If the destination contains side chains or a different genesis, rebuilds
+    /// it as an active-only snapshot. The caller must exclude concurrent readers
+    /// while refreshing, so they see one complete active-chain view.
+    pub fn refresh_active_chain_snapshot(&self, snapshot: &mut Self) {
+        if snapshot.headers.len() != snapshot.active_chain.len()
+            || snapshot.active_chain.first() != self.active_chain.first()
+        {
+            *snapshot = self.active_chain_snapshot();
+            return;
+        }
+        snapshot.params = self.params.clone();
+        snapshot.deployments = self.deployments.clone();
+        let mut shared_len = snapshot.active_chain.len().min(self.active_chain.len());
+        while shared_len > 0
+            && snapshot.active_chain[shared_len - 1] != self.active_chain[shared_len - 1]
+        {
+            shared_len -= 1;
+        }
+        for hash in snapshot.active_chain.drain(shared_len..) {
+            snapshot.headers.remove(&hash);
+        }
+        for hash in &self.active_chain[shared_len..] {
+            snapshot.headers.insert(*hash, self.headers[hash]);
+            snapshot.active_chain.push(*hash);
+        }
+        snapshot.active_tip = self.active_tip;
+    }
+
     /// Returns the active-chain header at `height`.
     #[must_use]
     pub fn active_header_at(&self, height: u32) -> Option<HeaderInfo> {
@@ -765,6 +821,120 @@ mod tests {
             assert_eq!(dag.headers.len(), 1);
             assert_eq!(dag.active_tip(), genesis);
         }
+    }
+
+    fn assert_active_snapshot(source: &HeaderDag, snapshot: &HeaderDag) {
+        assert_eq!(source.active_tip(), snapshot.active_tip());
+        assert_eq!(source.active_chain, snapshot.active_chain);
+        assert_eq!(
+            snapshot.retained_header_count(),
+            snapshot.active_chain.len()
+        );
+        assert_eq!(source.block_locator(), snapshot.block_locator());
+        for hash in &source.active_chain {
+            assert_eq!(source.get(hash), snapshot.get(hash));
+            assert_eq!(
+                source.median_time_past(*hash),
+                snapshot.median_time_past(*hash)
+            );
+        }
+        let parent = source.active_tip();
+        let candidate = mine_child(parent.hash, parent.header.time + 1);
+        assert_eq!(
+            source.expected_next_bits(&candidate).unwrap(),
+            snapshot.expected_next_bits(&candidate).unwrap()
+        );
+    }
+
+    #[test]
+    fn serving_snapshot_excludes_losing_forks_without_growing_on_refresh() {
+        let mut source = HeaderDag::new(Network::Regtest);
+        let genesis = source.active_tip();
+        for _ in 0..32 {
+            let parent = source.active_tip();
+            let header = mine_child(parent.hash, parent.header.time + 1);
+            source.insert_contextual(header, header.time).unwrap();
+        }
+        let mut snapshot = source.active_chain_snapshot();
+        let capacities = (
+            snapshot.headers.capacity(),
+            snapshot.active_chain.capacity(),
+        );
+        for offset in 100..1_100 {
+            let fork = mine_child(genesis.hash, genesis.header.time + offset);
+            source.insert_contextual(fork, fork.time).unwrap();
+            source.refresh_active_chain_snapshot(&mut snapshot);
+            assert!(source.get(&fork.block_hash()).is_some());
+            assert!(snapshot.get(&fork.block_hash()).is_none());
+            assert_eq!(
+                (
+                    snapshot.headers.capacity(),
+                    snapshot.active_chain.capacity()
+                ),
+                capacities,
+                "losing forks cannot enlarge the serving view"
+            );
+        }
+        assert_eq!(source.retained_header_count(), 1_033);
+        assert_active_snapshot(&source, &snapshot);
+        // Construction after the flood must also copy only active entries.
+        assert_active_snapshot(&source, &source.active_chain_snapshot());
+    }
+
+    #[test]
+    fn serving_snapshot_tracks_reorgs_staged_rollback_and_subsequent_extension() {
+        let mut source = HeaderDag::new(Network::Regtest);
+        for _ in 0..32 {
+            let parent = source.active_tip();
+            let header = mine_child(parent.hash, parent.header.time + 1);
+            source.insert_contextual(header, header.time).unwrap();
+        }
+        let mut snapshot = source.active_chain_snapshot();
+        let old_tip = source.active_tip();
+        let mut parent = source.active_header_at(30).unwrap().header;
+        let mut branch = Vec::new();
+        for _ in 0..3 {
+            parent = mine_child(parent.block_hash(), parent.time + 10);
+            branch.push(parent);
+        }
+        {
+            let staged = source.stage_batch_contextual(&branch, parent.time).unwrap();
+            staged.dag.refresh_active_chain_snapshot(&mut snapshot);
+            assert_active_snapshot(staged.dag, &snapshot);
+            assert!(snapshot.get(&old_tip.hash).is_none());
+        }
+        source.refresh_active_chain_snapshot(&mut snapshot);
+        assert_active_snapshot(&source, &snapshot);
+        assert!(snapshot.get(&parent.block_hash()).is_none());
+        let _ = source
+            .stage_batch_contextual(&branch, parent.time)
+            .unwrap()
+            .commit();
+        source.refresh_active_chain_snapshot(&mut snapshot);
+        assert_active_snapshot(&source, &snapshot);
+        assert!(source.get(&old_tip.hash).is_some());
+        assert!(snapshot.get(&old_tip.hash).is_none());
+        let extension = mine_child(parent.block_hash(), parent.time + 1);
+        source.insert_contextual(extension, extension.time).unwrap();
+        source.refresh_active_chain_snapshot(&mut snapshot);
+        assert_active_snapshot(&source, &snapshot);
+    }
+
+    #[test]
+    fn serving_snapshot_refresh_replaces_an_incompatible_destination() {
+        let mut source = HeaderDag::new(Network::Regtest);
+        let genesis = source.active_tip();
+        for offset in 1..3 {
+            let header = mine_child(genesis.hash, genesis.header.time + offset);
+            source.insert_contextual(header, header.time).unwrap();
+        }
+        let mut full_copy = source.clone();
+        source.refresh_active_chain_snapshot(&mut full_copy);
+        assert_active_snapshot(&source, &full_copy);
+        let mut different_network = HeaderDag::new(Network::Bitcoin);
+        source.refresh_active_chain_snapshot(&mut different_network);
+        assert_eq!(different_network.network(), Network::Regtest);
+        assert_active_snapshot(&source, &different_network);
     }
 
     #[test]

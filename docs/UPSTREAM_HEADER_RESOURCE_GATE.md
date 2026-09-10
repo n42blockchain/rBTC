@@ -1,7 +1,8 @@
 # Competing-header resource gate
 
-Status: design and acceptance requirements recorded on 2026-09-09;
-production resource limits are **not implemented or accepted**.
+Status: updated 2026-09-10. The active-only serving projection is implemented
+and measured. Primary DAG/candidate/disk retention limits are **not implemented
+or accepted**.
 
 ## Findings in this checkout
 
@@ -11,16 +12,66 @@ production resource limits are **not implemented or accepted**.
 - `node::sync_headers` stages unseen headers, persists them with
   `RedbHeaderStore::append_batch`, then commits the stage. The 2,000-header
   response cap bounds one message, not successive messages or retained forks.
-- `node::drain_submitted_blocks` also persists valid losing headers. A limit
+- `node::stage_submitted_blocks` also persists valid losing headers. A limit
   applied only to peer synchronization would leave this ingress uncovered.
 - `RedbHeaderStore::load_dag_with_deployments` reconstructs the retained graph
   on restart. An in-memory eviction alone would not bound disk usage or
   prevent the same headers from being loaded again.
-- The inbound serving projection clones the header DAG. Peak memory accounting
-  must include those copies, staging, database caches and index overhead;
-  counting raw 80-byte headers is insufficient.
+- The inbound serving projection previously cloned the full header DAG. It now
+  uses `HeaderDag::active_chain_snapshot` and `refresh_active_chain_snapshot` at
+  initialization, resync and submitted-block publication. Only active ancestors
+  are copied; losing forks do not allocate header entries in that view. Refresh
+  compares tips and replaces the changed suffix while holding the existing
+  write lock. Peak memory accounting must still include the primary DAG, staging,
+  source reloads, database caches and index overhead.
 - The existing changed-suffix reorg optimization reduces a particular traversal
   cost. It does not bound fork retention, repeated reloads or total work.
+
+## Serving projection measurement (2026-09-10)
+
+`examples/header_resource_probe.rs` generates a 2,501-entry active chain and
+valid regtest siblings of genesis, persists batches of up to 2,000, and compares
+the previous full-copy serving behavior (`full`) with the production projection
+(`active`). It uses the daemon's mimalloc allocator by default and identifies
+the selected allocator in every JSON record. No peer-level messages, block
+bodies or admission penalties are simulated.
+
+The following values are sampled immediately after the last sibling batch.
+RSS is the whole probe process's `/proc/self/status` value, not a per-DAG
+allocation claim. Database bytes are file length, not an estimate from 80-byte
+wire headers. Each mode/count was a separate process run.
+
+| Valid siblings | Full-copy projection entries | Active projection entries | Full-copy RSS (KiB) | Active RSS (KiB) | Database bytes (both modes) |
+| --- | --- | --- | --- | --- | --- |
+| 50,000 | 52,501 | 2,501 | 111,588 | 65,532 | 34,222,080 |
+| 100,000 | 102,501 | 2,501 | 140,688 | 102,344 | 67,907,584 |
+
+The final projection updates measured 868/1,944 microseconds for full copies
+at 50,000/100,000 siblings. Active updates were below the one-microsecond
+reporting resolution; this is not a claim of zero work. Reopen in the same
+process preserved the tip and every retained sibling. Allocator reuse affects
+RSS, so that phase is not a cold-process restart measurement. Early runs using
+the system allocator are also retained in the reports and are not the table's
+daemon-allocator results.
+
+The result closes the extra competing-branch copy in the serving view. It also
+demonstrates the remaining problem directly: primary retained entries, disk
+length and replay work continue to grow. The observations do not justify
+claiming a whole-node bound or choosing a consensus rejection threshold.
+
+Tests cover unchanged serving capacities under 1,000 siblings, exact active
+ancestors/MTP/difficulty context, extension, reorg, staged rollback, network
+replacement, and local losing-block submission. All-feature regression
+(907 passing tests) and live Core block/transport fixtures (9 passing tests)
+passed after the production publication paths were changed.
+
+```sh
+cargo run --locked --release --example header_resource_probe -- full 2500 100000
+cargo run --locked --release --example header_resource_probe -- active 2500 100000
+```
+
+JSON lines and `/usr/bin/time -v` reports are in
+`target/upstream-followup/2026-09-10/headers-mimalloc-{full,active}-{50000,100000}.*`.
 
 ## Implementation sequence
 

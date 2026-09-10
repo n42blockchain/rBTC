@@ -4,8 +4,9 @@ use std::cmp::Ordering;
 
 use libfuzzer_sys::fuzz_target;
 use rbtc::feerate_diagram::{
-    Cluster, DiagramComparison, FeeFrac, chunk_linearization, cluster_diagram, compare_diagrams,
-    diagram_points,
+    Cluster, DiagramComparison, FeeFrac, LinearizedChunk, chunk_linearization,
+    chunk_linearization_with_members, cluster_diagram, compare_diagrams, diagram_points,
+    linearize_components,
 };
 
 /// Reads one little-endian i64 fee and u16 size pair per entry.
@@ -26,6 +27,40 @@ fn parse_entries(data: &mut &[u8], count: usize) -> Vec<FeeFrac> {
         entries.push(FeeFrac::new(i64::from_le_bytes(fee), size));
     }
     entries
+}
+
+fn check_members(entries: &[FeeFrac], parents: &[Vec<usize>], chunks: &[LinearizedChunk]) {
+    let mut positions = vec![usize::MAX; entries.len()];
+    let mut next = 0;
+    for chunk in chunks {
+        assert!(!chunk.members.is_empty());
+        let mut fee = 0_i128;
+        let mut size = 0_i128;
+        for &member in &chunk.members {
+            assert_eq!(positions[member], usize::MAX, "each member is charged once");
+            positions[member] = next;
+            next += 1;
+            fee += i128::from(entries[member].fee);
+            size += i128::from(entries[member].size);
+        }
+        assert_eq!(fee, i128::from(chunk.fraction.fee));
+        assert_eq!(size, i128::from(chunk.fraction.size));
+    }
+    assert_eq!(next, entries.len(), "no transaction is lost");
+    for (child, direct) in parents.iter().enumerate() {
+        for &parent in direct {
+            assert!(
+                positions[parent] < positions[child],
+                "parents precede children"
+            );
+        }
+    }
+    for pair in chunks.windows(2) {
+        assert_ne!(
+            pair[0].fraction.feerate_cmp(pair[1].fraction),
+            Ordering::Less
+        );
+    }
 }
 
 fuzz_target!(|input: &[u8]| {
@@ -69,7 +104,13 @@ fuzz_target!(|input: &[u8]| {
         parents.push(list);
     }
 
-    let Ok(cluster) = Cluster::new(entries, parents) else {
+    // This path also covers invalid/oversized components and a large pool
+    // whose independent components each remain within the 64-entry cap.
+    if let Ok(chunks) = linearize_components(&entries, &parents, 64) {
+        check_members(&entries, &parents, &chunks);
+        assert!(chunks.iter().all(|chunk| chunk.members.len() <= 64));
+    }
+    let Ok(cluster) = Cluster::new(entries, parents.clone()) else {
         return;
     };
 
@@ -85,6 +126,15 @@ fuzz_target!(|input: &[u8]| {
 
     // Chunk feerates are non-increasing and preserve the totals exactly.
     let chunks = chunk_linearization(cluster.fractions(), &order);
+    let with_members = chunk_linearization_with_members(cluster.fractions(), &order);
+    check_members(cluster.fractions(), &parents, &with_members);
+    assert_eq!(
+        chunks,
+        with_members
+            .iter()
+            .map(|chunk| chunk.fraction)
+            .collect::<Vec<_>>()
+    );
     for window in chunks.windows(2) {
         assert_ne!(window[0].feerate_cmp(window[1]), Ordering::Less);
     }

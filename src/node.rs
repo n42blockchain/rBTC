@@ -11493,9 +11493,11 @@ fn stage_submitted_blocks(
         }
     }
     if staged_any {
-        *inbound_headers
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.clone();
+        headers.refresh_active_chain_snapshot(
+            &mut inbound_headers
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
     Ok(())
 }
@@ -13462,7 +13464,7 @@ async fn sync_validating_node(
         network_time,
     )
     .await?;
-    let inbound_headers = Arc::new(RwLock::new(headers.clone()));
+    let inbound_headers = Arc::new(RwLock::new(headers.active_chain_snapshot()));
     if network_execution.extends_validation_target() {
         let target = validation_target.expect("parser requires an explicit extension target");
         let active = headers.active_header_at(target.height).ok_or_else(|| {
@@ -14005,9 +14007,11 @@ async fn sync_validating_node(
                     network_time,
                 )
                 .await?;
-                *inbound_headers
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.clone();
+                headers.refresh_active_chain_snapshot(
+                    &mut inbound_headers
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
                 continue 'resync;
             }
             let effective_validation_limits = validation_scheduler
@@ -19829,6 +19833,12 @@ mod tests {
 
         assert_eq!(headers.active_tip().hash, first.block_hash());
         assert!(headers.get(&competing.block_hash()).is_some());
+        {
+            let serving = inbound_headers.read().unwrap();
+            assert_eq!(serving.active_tip().hash, first.block_hash());
+            assert_eq!(serving.retained_header_count(), 2);
+            assert!(serving.get(&competing.block_hash()).is_none());
+        }
         assert_eq!(
             prefetched.serialized,
             vec![serialize(&first)],
