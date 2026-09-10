@@ -3305,11 +3305,13 @@ const MAX_PRIVATE_BROADCAST_TARGETS: usize = 4;
 
 /// Sends one transaction over short-lived anonymity-network sessions.
 ///
-/// Returns how many peers accepted the write. Zero is a bounded failure the
-/// caller retries later; under no circumstance does the transaction fall
+/// Returns how many peers answered a ping following the write. The response
+/// keeps transient proxy sessions alive through remote receipt; it does not
+/// imply mempool acceptance. Zero is a bounded failure the caller retries
+/// later; under no circumstance does the transaction fall
 /// back to clearnet relay. Wave sessions deliberately use the v1 transport:
 /// both carriers already encrypt end to end, and a deterministic handshake
-/// beats a v2-with-retry dance on connections that live for one message.
+/// beats a v2-with-retry dance on connections that carry one transaction.
 async fn private_broadcast_wave(
     context: &PrivateBroadcastContext,
     transaction: &Transaction,
@@ -3340,7 +3342,8 @@ async fn private_broadcast_wave(
                     false,
                 )
                 .await?;
-                session.broadcast_transaction(transaction).await
+                session.broadcast_transaction(transaction).await?;
+                session.ping(rand::random()).await
             })
             .await;
             if matches!(sent, Ok(Ok(()))) {
@@ -3385,7 +3388,10 @@ async fn private_broadcast_wave(
                                 false,
                             )
                             .await?;
-                            session.broadcast_transaction(transaction).await
+                            session.broadcast_transaction(transaction).await?;
+                            // Dropping the SAM control session before the peer
+                            // responds can discard bytes accepted by the local proxy.
+                            session.ping(rand::random()).await
                         })
                         .await;
                         if matches!(sent, Ok(Ok(()))) {
@@ -18996,6 +19002,8 @@ fn print_version() {
 
 #[cfg(test)]
 mod tests {
+    mod private_broadcast_interop;
+
     use super::*;
     use bitcoin::{
         Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Txid,
@@ -23988,8 +23996,17 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn private_broadcast_delivers_over_the_proxied_onion_path() {
+        assert_private_proxy_delivery(true).await;
+    }
+
+    #[tokio::test]
+    async fn private_broadcast_requires_the_matching_remote_delivery_pong() {
+        assert_private_proxy_delivery(false).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_private_proxy_delivery(acknowledge: bool) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let onion = OnionAddress::parse(
@@ -24046,6 +24063,20 @@ mod tests {
                 NetworkMessage::Tx(expected),
                 "the transaction arrives over the proxied onion session"
             );
+            let NetworkMessage::Ping(nonce) = peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected the private delivery barrier");
+            };
+            // An unrelated pong followed by closure cannot acknowledge the
+            // private write, even though the socket accepted the transaction.
+            let response = if acknowledge {
+                nonce
+            } else {
+                nonce.wrapping_add(1)
+            };
+            peer.write_message(NetworkMessage::Pong(response))
+                .await
+                .unwrap();
         });
 
         let directory = TempDir::new().unwrap();
@@ -24072,8 +24103,9 @@ mod tests {
         };
         let delivered = private_broadcast_wave(&context, &transaction).await;
         assert_eq!(
-            delivered, 1,
-            "the wave delivered to the one onion candidate"
+            delivered,
+            usize::from(acknowledge),
+            "only a matching remote pong completes the private delivery"
         );
         server.await.unwrap();
     }

@@ -6,12 +6,13 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-10)
 
-The previous implementation and supplementary acceptance were pushed to `main`
-as `f3c2e9e` and `1a54604`. They close missing fuzz coverage and remove repeated
-full-DAG serving copies. This continuation also reuses successful incumbent
-SCRIPT verification with a commitment to the exact transaction, fresh prevouts
-and verification flags. Durable competing-header retention, remaining admission
-replay work and the external operational gates remain open.
+The implementation through content-bound incumbent SCRIPT reuse was pushed as
+`f3c2e9e`, `1a54604` and `51aee2a`. This continuation completes real Tor/I2P
+transport and wallet-wave tests, a real Tor name-proxy handshake, generated
+storage benchmarks, and million-UTXO compaction/restart equivalence. The live
+wallet test found and fixed premature private-session teardown by waiting for a
+matching post-transaction pong. Header retention, total admission resource
+budgets, full mainnet scale and the seven-day soak remain open.
 
 | Follow-up item | Current implementation / acceptance | Remaining work |
 | --- | --- | --- |
@@ -22,10 +23,37 @@ replay work and the external operational gates remain open.
 | P1 cluster mempool | Chunk membership, topological order, exact totals and 64-entry components are now fuzzed alongside diagrams; selection/eviction regressions pass. | Exact Core optimizer parity remains unclaimed. |
 | P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed again on 2026-09-10. | Broader rolling-floor and optimizer differential coverage remains open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
-| P1 chainstate I/O | Non-ignored redb/MDBX recovery and write-back equivalence tests pass. | Optional scale/benchmark and sustained I/O acceptance remain separate; no LevelDB tuning was transplanted. |
+| P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Incumbent SCRIPT reuse
+### Current operational acceptance
+
+See [the operational report](UPSTREAM_OPERATIONAL_ACCEPTANCE_2026-09-10.md) for
+versions, workload sizes, raw evidence paths and reproduction commands.
+
+- Five real Tor/I2P transport/service tests and the real Tor Testnet4 name-proxy
+  bootstrap test passed. Two added wallet/private-wave tests passed over real
+  circuits, including two distinct I2P sender identities and continuous clearnet
+  and standby-relay isolation checks.
+- The first live I2P wallet run failed: local write completion did not imply that
+  the receiver obtained both transactions before transient-session teardown.
+  Private waves now wait for a matching pong within their existing limits.
+  A new deterministic test refuses an unrelated pong even after a successful write.
+- Generated storage microbenchmarks passed. The 200,000-UTXO complete-chainstate
+  comparison passed in both engine orders. A million-UTXO lane reached 8,192
+  transitions through compaction and a process restart; its full logical audit
+  matched an uninterrupted, uncompacted reference exactly, with 288 undo rows.
+- Final all-feature regression: **914 passed**, 0 failed, **28 ignored**
+  (875 library + 39 integration, excluding duplicate subprocess-helper output).
+  The additional ignored tests are the two new live wallet gates, run explicitly
+  above. Strict all-target/all-feature Clippy and formatting checks pass.
+
+These checks close the covered real-daemon and selected generated-workload gaps.
+They do not establish mainnet replay, process-wide resource bounds or seven-day
+continuous public-network acceptance. No synthetic transactions were sent to
+public Bitcoin peers; wallet delivery used test-owned regtest receivers.
+
+### Prior incumbent SCRIPT reuse (`51aee2a`)
 
 Each retained admission entry owns one optional SHA256d commitment covering a
 versioned domain, the full witness transaction ID, the consensus and public
@@ -188,9 +216,10 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 - Bound and measure the remaining admission replay and whole-pipeline allocations.
   Content-bound SCRIPT reuse removes repeated interpreter work for incumbents;
   it does not bound total admission work or process RSS.
-- Run real Tor/I2P, sustained public-network and resource-pressure workloads,
-  plus longer fuzz campaigns and optional ignored storage-scale gates. Non-ignored
-  MDBX tests passing does not close its scale/benchmark gates.
+- Complete sustained public-network and resource-pressure workloads, longer fuzz
+  campaigns, cold-disk and full mainnet storage-scale gates. Real Tor/I2P and the
+  selected generated benchmarks now pass; the 160-million-UTXO workload and
+  seven-day public-network finalizer have not been run in this continuation.
 - Broaden live cluster optimizer/fee-floor differential coverage before claiming
   complete Core policy parity. Existing successful fixtures establish only
   their tested scenarios.

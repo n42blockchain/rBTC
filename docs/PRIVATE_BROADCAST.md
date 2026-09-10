@@ -1,6 +1,6 @@
 # Private transaction broadcast
 
-Status date: 2026-09-09.
+Status date: 2026-09-10.
 
 `--private-broadcast` makes every locally originated wallet transaction
 travel exclusively over anonymity networks — onion peers via the Tor SOCKS5
@@ -37,17 +37,19 @@ supplemented:
 2. Up to `MAX_PRIVATE_BROADCAST_TARGETS` (4) distinct anonymity-network
    peers are selected from the onion and I2P address books.
 3. Each is dialed as a short-lived session — a proxied SOCKS5 connect for
-   onion, a transient SAM session for I2P — the transaction is written, and
-   the session is dropped. Wave sessions use the v1 transport deliberately:
+   onion, a transient SAM session for I2P. After writing the transaction, the
+   sender waits for a matching ping/pong exchange before dropping the session.
+   This keeps a transient proxy destination alive through remote receipt;
+   writing to the local proxy alone is insufficient. Wave sessions use v1:
    both carriers already encrypt end to end, and a one-message connection
    gains nothing from a v2-with-retry negotiation.
 4. The I2P wave creates a *fresh, keyless* SAM session per wave rather than
    reusing the node's persistent destination, because that destination is
    public identity and linking the transaction to it would defeat the
    option.
-5. At least one accepting peer counts as success: the transaction is
-   recorded in the durable rebroadcast store and becomes a compact-block
-   candidate, exactly as a clearnet broadcast would.
+5. At least one peer answering the post-transaction ping counts as delivery:
+   the durable rebroadcast record is updated and the transaction becomes a
+   compact-block candidate. A pong proves receipt, not mempool acceptance.
 6. Zero accepting peers is a **bounded failure**: the transaction stays
    queued for a later wave and the poll ends rather than busy-spinning. It
    is never written to a clearnet peer and never handed to the hot-standby
@@ -68,16 +70,19 @@ SOCKS5 CONNECT that `connect_proxied_target` issues, then completes the
 Bitcoin inbound handshake on the same stream and reads the transaction —
 the true path minus the Tor circuit.
 
-## Acceptance residue
+## Live acceptance
 
-The deterministic gates — the fail-closed configuration refusal, the
-clearnet leak gate, and the proxied-delivery path — all run in this
-repository's suite. Delivery over *live* Tor and I2P circuits is exercised
-by the `--ignored` tests in `tests/anonymity_network_interop.rs`, which
-need real daemons; running `--private-broadcast` end to end against those
-daemons and recording that no clearnet transaction relay occurred is the
-one operational residue, in the same spirit as the CJDNS live-handshake and
-name-proxy external-Tor runs.
+The deterministic configuration, clearnet isolation, raw-RPC refusal and proxy
+regressions run in the ordinary suite. Real-daemon transport gates live in
+`tests/anonymity_network_interop.rs`; wallet-queue/private-wave gates are in
+`src/node/tests/private_broadcast_interop.rs`. The latter retain a clearnet
+observer until EOF, require an empty standby relay and verify real receiver
+payloads. Two I2P waves from one wallet runtime must use different destinations.
+They start at the wallet broadcast queue, without HTTP PSBT signing.
+
+The [September operational report](UPSTREAM_OPERATIONAL_ACCEPTANCE_2026-09-10.md)
+records the real Tor/I2P runs, the transient-session delivery defect they found,
+the bounded ping/pong correction, reproduction commands and remaining scope.
 
 ## September ingress and fallback audit
 
@@ -108,4 +113,5 @@ protocol errors retain their failure paths. Deterministic stream-fault tests
 cover read, write and flush. The new
 `onion_v2_fallback_reconnects_through_the_same_proxy_and_target` test passed,
 checking both SOCKS5 requests and the unspecified version receiver address.
-These are local mocked-network tests. Live Tor/I2P validation remains outstanding.
+These fallback checks use local mocks. Subsequent real Tor/I2P and private-wave
+acceptance is recorded in the operational report linked above.
