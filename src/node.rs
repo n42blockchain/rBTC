@@ -3445,6 +3445,7 @@ impl CompactTransactionCandidates {
 }
 
 struct RpcApiRuntime {
+    private_broadcast: bool,
     token: LocalAuthToken,
     token_path: PathBuf,
     audit: AuthorizationAuditLog,
@@ -3541,6 +3542,7 @@ struct NodeStatus {
 }
 
 struct NodeRpcOperator {
+    private_broadcast: bool,
     status: NodeStatus,
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
     runtime_control: Arc<RuntimeControl>,
@@ -4779,6 +4781,14 @@ impl NodeRpcOperator {
                 }))
             }
             "rbtc.submitrawtransaction" => {
+                // This queue feeds ordinary mempool relay. It cannot preserve
+                // private origin, even when a wallet anonymity path exists.
+                if self.private_broadcast {
+                    return Err(LocalRpcOperatorError {
+                        code: -32041,
+                        message: "Raw transaction submission is disabled with private broadcast; use the wallet PSBT broadcast endpoint",
+                    });
+                }
                 let values = params.as_array().ok_or_else(invalid)?;
                 let raw = values
                     .first()
@@ -6080,6 +6090,7 @@ impl ApiServer {
                 token_path, token, "RPC",
             )));
             let operator: Arc<dyn LocalRpcOperator> = Arc::new(NodeRpcOperator {
+                private_broadcast: rpc.private_broadcast,
                 status: node_status.clone(),
                 transaction_pool: Arc::clone(&transaction_pool),
                 runtime_control: Arc::clone(&runtime_control),
@@ -6655,6 +6666,7 @@ fn prepare_api_runtime(options: &Options) -> Result<Option<ApiRuntime>, String> 
                 token_path.display()
             );
             Ok::<_, String>(RpcApiRuntime {
+                private_broadcast: options.resources.private_broadcast,
                 token,
                 token_path,
                 audit,
@@ -19233,6 +19245,7 @@ mod tests {
         let runtime_control = Arc::new(RuntimeControl::default());
         let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(genesis),
             transaction_pool,
             runtime_control: Arc::clone(&runtime_control),
@@ -19339,6 +19352,7 @@ mod tests {
         let dynamic: Arc<dyn InboundDataSource> = source.clone();
         let _lease = shared.install(dynamic);
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(hash),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19394,6 +19408,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn private_broadcast_refuses_raw_rpc_before_transaction_queueing() {
+        let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let source = Arc::new(RpcTestSource {
+            block: block.clone(),
+            submitted: Mutex::new(Vec::new()),
+            test_accept_calls: Mutex::new(Vec::new()),
+        });
+        let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
+        let dynamic: Arc<dyn InboundDataSource> = source.clone();
+        let _lease = shared.install(dynamic);
+        let mut operator = template_test_operator(Some(shared), true);
+        operator.private_broadcast = true;
+        let error = operator
+            .execute(
+                "rbtc.submitrawtransaction",
+                &serde_json::json!([serialize(&block.txdata[0]).to_lower_hex_string()]),
+            )
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, -32041);
+        assert!(source.submitted.lock().unwrap().is_empty());
+    }
+
     /// Builds a regtest node data source whose chainstate holds one mature
     /// spendable coinbase output at the active tip.
     /// Builds an operator whose status reports the given independence.
@@ -19405,6 +19443,7 @@ mod tests {
         let status = ready_test_node_status(genesis);
         status.progress.lock().unwrap().independently_validated = independently_validated;
         NodeRpcOperator {
+            private_broadcast: false,
             status,
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -19944,6 +19983,7 @@ mod tests {
         let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
         let _lease = shared.install(dynamic);
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20033,6 +20073,7 @@ mod tests {
         let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
         let _lease = shared.install(dynamic);
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20103,6 +20144,7 @@ mod tests {
         // (`cluster_of_reports_the_dependency_connected_closure`); this
         // exercises the RPC dispatch and error surface against an empty pool.
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20145,6 +20187,7 @@ mod tests {
         // Diagram correctness lives with the admission and pure-layer
         // tests; this exercises the RPC dispatch and error surface.
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -20189,6 +20232,7 @@ mod tests {
         let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
         shared.install_peer_store(Some(Arc::clone(&peer_store)));
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21421,6 +21465,7 @@ mod tests {
         let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
         shared.install_peer_store(Some(Arc::clone(&peer_store)));
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21508,6 +21553,7 @@ mod tests {
         let shared = Arc::new(SharedInboundSource::new(0, None, ServiceFlags::NONE));
         shared.install_peer_store(Some(peer_store));
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21557,6 +21603,7 @@ mod tests {
         let dynamic: Arc<dyn InboundDataSource> = Arc::new(node_source);
         let _lease = shared.install(dynamic);
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(BlockHash::all_zeros()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21600,6 +21647,7 @@ mod tests {
         let dynamic: Arc<dyn InboundDataSource> = source.clone();
         let _lease = shared.install(dynamic);
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(hash),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -21715,6 +21763,7 @@ mod tests {
         spent.connect_block(1, &block, &[]).unwrap();
         filters.connect_block(1, &block, &[]).unwrap();
         let operator = NodeRpcOperator {
+            private_broadcast: false,
             status: ready_test_node_status(genesis.block_hash()),
             transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
             runtime_control: Arc::new(RuntimeControl::default()),
@@ -28994,6 +29043,7 @@ mod tests {
             private_broadcast: std::sync::OnceLock::new(),
         };
         let rpc = RpcApiRuntime {
+            private_broadcast: false,
             token: LocalAuthToken::new(&rpc_token_text).unwrap(),
             token_path: rpc_token_path.clone(),
             audit,

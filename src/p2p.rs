@@ -3149,8 +3149,31 @@ pub fn encode_v1(magic: Magic, payload: NetworkMessage) -> Vec<u8> {
 
 /// Parses and checks the magic, command, length, and checksum of a v1 P2P envelope.
 pub fn decode_v1(bytes: &[u8]) -> Result<RawNetworkMessage, EncodeError> {
-    match deserialize(bytes) {
-        Ok(message) => Ok(message),
+    match deserialize::<RawNetworkMessage>(bytes) {
+        Ok(message) => {
+            // Some envelope decoders consume the whole payload buffer without
+            // checking that the inner message used it all. These messages have
+            // exact encodings; version/reject/addrv2/unknown extension handling
+            // deliberately stays on its existing compatibility path.
+            if matches!(
+                message.payload(),
+                NetworkMessage::Verack
+                    | NetworkMessage::Ping(_)
+                    | NetworkMessage::Pong(_)
+                    | NetworkMessage::Headers(_)
+                    | NetworkMessage::Tx(_)
+                    | NetworkMessage::Block(_)
+                    | NetworkMessage::Inv(_)
+                    | NetworkMessage::GetData(_)
+                    | NetworkMessage::NotFound(_)
+                    | NetworkMessage::FeeFilter(_)
+                    | NetworkMessage::GetAddr
+            ) && serialize(&message).len() != bytes.len()
+            {
+                return Err(EncodeError::ParseFailed("unconsumed message payload"));
+            }
+            Ok(message)
+        }
         Err(error) => {
             // rust-bitcoin 0.32.102 rejects out-of-MoneyRange `feefilter`
             // payloads during decoding. Core 31's `ProcessMessage` instead
@@ -3287,6 +3310,23 @@ mod tests {
         let decoded = decode_v1(&message).unwrap();
         assert_eq!(decoded.magic(), &Magic::BITCOIN);
         assert!(matches!(decoded.into_payload(), NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn upstream_checksum_valid_trailing_payload_is_rejected() {
+        for payload in [
+            NetworkMessage::Verack,
+            NetworkMessage::Ping(7),
+            NetworkMessage::Headers(vec![]),
+        ] {
+            let mut frame = encode_v1(Magic::REGTEST, payload);
+            frame.push(0x42);
+            let length = u32::try_from(frame.len() - V1_HEADER_LEN).unwrap();
+            frame[16..20].copy_from_slice(&length.to_le_bytes());
+            let digest = sha256d::Hash::hash(&frame[V1_HEADER_LEN..]).to_byte_array();
+            frame[20..24].copy_from_slice(&digest[..4]);
+            assert!(decode_v1(&frame).is_err());
+        }
     }
 
     #[test]
@@ -6390,6 +6430,74 @@ mod tests {
             client_transport.read_message().await,
             Ok(NetworkMessage::Pong(41))
         ));
+    }
+
+    #[tokio::test]
+    async fn onion_v2_fallback_reconnects_through_the_same_proxy_and_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let onion = OnionAddress::parse(
+            "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion:8333",
+        )
+        .unwrap();
+        let expected = onion.clone();
+        let magic = Network::Regtest.magic();
+        let proxy = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0]).await.unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                assert_eq!(&header[..4], &[5, 1, 0, 3]);
+                let mut name = vec![0; usize::from(header[4])];
+                stream.read_exact(&mut name).await.unwrap();
+                let mut port = [0; 2];
+                stream.read_exact(&mut port).await.unwrap();
+                assert_eq!(name, expected.name().as_bytes());
+                assert_eq!(u16::from_be_bytes(port), expected.port());
+                stream
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                if attempt == 0 {
+                    let mut opening = [0; 64];
+                    stream.read_exact(&mut opening).await.unwrap();
+                    // Close the v2 attempt with any remaining garbage unread.
+                    drop(stream);
+                } else {
+                    let mut transport = V1Transport::new(stream, magic);
+                    let mut local = version(9);
+                    local.version = PROTOCOL_VERSION;
+                    let remote = transport.handshake_inbound(local).await.unwrap();
+                    assert!(remote.receiver.socket_addr().unwrap().ip().is_unspecified());
+                    return remote;
+                }
+            }
+            unreachable!("second proxy connection completes v1");
+        });
+        let session = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_proxied_target(
+                proxy_address,
+                &onion.into(),
+                magic,
+                7,
+                "/rbtcd:proxy-fallback-test/".to_owned(),
+                0,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            session.into_test_transport(),
+            PeerTransport::V1(_)
+        ));
+        assert_eq!(proxy.await.unwrap().nonce, 7);
     }
 
     #[tokio::test]

@@ -783,7 +783,9 @@ impl EmbeddedWallet {
         if request.psbt.len() > MAX_WALLET_PSBT_FINALIZE_REQUEST_BYTES {
             return Err(WalletError::Psbt("encoded PSBT exceeds request bound"));
         }
-        let mut psbt = Psbt::from_str(&request.psbt)
+        let raw = crate::psbt_envelope::decode_base64(&request.psbt, MAX_WALLET_PSBT_BYTES)
+            .map_err(WalletError::Psbt)?;
+        let mut psbt = Psbt::deserialize(&raw)
             .map_err(|_| WalletError::Psbt("PSBT is not valid base64 BIP174"))?;
         if psbt.serialize().len() > MAX_WALLET_PSBT_BYTES
             || !(1..=MAX_WALLET_PSBT_INPUTS).contains(&psbt.inputs.len())
@@ -798,6 +800,8 @@ impl EmbeddedWallet {
                 "PSBT size, input/output count, or finalization state is invalid",
             ));
         }
+        crate::psbt_envelope::validate_envelope(&raw, psbt.inputs.len(), psbt.outputs.len())
+            .map_err(WalletError::Psbt)?;
         if !psbt_uses_safe_sighashes(&psbt) {
             return Err(WalletError::Psbt(
                 "PSBT signatures must use SIGHASH_ALL or Taproot default",

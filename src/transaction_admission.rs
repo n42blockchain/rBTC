@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::{
     chainstate::{
-        ChainstateError, apply_transaction_with_context, check_sequence_lock, enforces_bip68,
+        ChainstateError, check_sequence_lock, enforces_bip68, prepare_transaction_for_block,
         transaction_legacy_sigops,
     },
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
@@ -40,6 +40,8 @@ pub const MAX_CONFIGURED_MEMPOOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_ORPHAN_TRANSACTIONS: usize = 64;
 /// Maximum witness-serialized bytes retained by the orphan pool.
 pub const MAX_ORPHAN_TRANSACTION_BYTES: usize = 4_000_000;
+/// Orphan entries plus one work unit per ten inputs (Core 30 resource model).
+pub const MAX_ORPHAN_WORK_UNITS: usize = 3_000;
 /// Maximum distinct blind parent requests retained across the orphanage.
 pub const MAX_ORPHAN_PARENT_REQUESTS: usize = 64;
 /// Maximum exact witness-independent transaction rejects remembered per chain tip.
@@ -436,6 +438,11 @@ struct ReplacementPlan {
     affected_survivors: BTreeSet<Txid>,
 }
 
+struct PoolChunk {
+    fraction: crate::feerate_diagram::FeeFrac,
+    members: Vec<Txid>,
+}
+
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
 #[derive(Clone)]
 pub struct TransactionAdmissionPool {
@@ -615,6 +622,7 @@ impl TransactionAdmissionPool {
             inserted.insert(txid);
             while self.orphans.len() > MAX_ORPHAN_TRANSACTIONS
                 || self.orphan_bytes > MAX_ORPHAN_TRANSACTION_BYTES
+                || self.orphan_work_units() > MAX_ORPHAN_WORK_UNITS
             {
                 let index = rng.random_range(0..self.orphans.len());
                 let removed = self
@@ -631,6 +639,14 @@ impl TransactionAdmissionPool {
             .map(|orphan| orphan.transaction.compute_txid())
             .collect::<BTreeSet<_>>();
         inserted.intersection(&retained).count()
+    }
+
+    /// Returns bounded orphan bookkeeping work, including input-index entries.
+    #[must_use]
+    pub fn orphan_work_units(&self) -> usize {
+        self.orphans.iter().fold(0_usize, |total, orphan| {
+            total.saturating_add(1 + orphan.transaction.input.len() / 10)
+        })
     }
 
     /// Schedules live children of newly accepted parents for their source peer.
@@ -1161,8 +1177,26 @@ impl TransactionAdmissionPool {
     /// Clones the active pool with exact fee and policy-vsize relay metadata.
     #[must_use]
     pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
-        self.entries
+        let by_txid = self
+            .entries
             .iter()
+            .map(|entry| (entry.transaction.compute_txid(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let all = by_txid.keys().copied().collect();
+        // Ordering is a relay optimization, not an additional validity gate.
+        // If an invariant fails, retain the original dependency-ordered view.
+        let entries = self.chunks_for(&all).map_or_else(
+            |_| self.entries.iter().collect::<Vec<_>>(),
+            |chunks| {
+                chunks
+                    .into_iter()
+                    .flat_map(|chunk| chunk.members)
+                    .map(|txid| by_txid[&txid])
+                    .collect()
+            },
+        );
+        entries
+            .into_iter()
             .map(|entry| AdmittedTransactionRelay {
                 transaction: entry.transaction.clone(),
                 fee_sats: entry.fee_sats,
@@ -1269,7 +1303,9 @@ impl TransactionAdmissionPool {
                 &overlay,
                 &entry.transaction,
                 context,
-                DEFAULT_MIN_RELAY_FEE_SAT_KVB,
+                // Already-admitted zero-fee parents were paid for by their
+                // child. Replaying them individually must not revoke CPFP.
+                0,
             )?;
         }
         let (accepted, replacement_fee_sats, replacement_vbytes) =
@@ -1663,12 +1699,49 @@ impl TransactionAdmissionPool {
     ) -> Result<Vec<Txid>, TransactionAdmissionError> {
         let mut evicted = Vec::new();
         while self.entries.len() > self.max_transactions || self.retained_bytes > self.max_bytes {
-            let removed = self
+            let positions = self
                 .entries
                 .iter()
-                .map(|entry| self.descendant_closure(entry.transaction.compute_txid()))
-                .find(|closure| closure.is_disjoint(protected))
+                .enumerate()
+                .map(|(index, entry)| (entry.transaction.compute_txid(), index))
+                .collect::<BTreeMap<_, _>>();
+            let chunks = self.chunks_for(&positions.keys().copied().collect())?;
+            let chunk_of = chunks
+                .iter()
+                .enumerate()
+                .flat_map(|(index, chunk)| chunk.members.iter().map(move |txid| (*txid, index)))
+                .collect::<BTreeMap<_, _>>();
+            let mut has_child_chunk = vec![false; chunks.len()];
+            for entry in &self.entries {
+                let child = chunk_of[&entry.transaction.compute_txid()];
+                for input in &entry.transaction.input {
+                    if let Some(&parent) = chunk_of.get(&input.previous_output.txid) {
+                        if parent != child {
+                            has_child_chunk[parent] = true;
+                        }
+                    }
+                }
+            }
+            let (_, worst) = chunks
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !has_child_chunk[*index])
+                .min_by(|(_, left), (_, right)| {
+                    left.fraction.feerate_cmp(right.fraction).then_with(|| {
+                        left.members
+                            .iter()
+                            .map(|txid| positions[txid])
+                            .min()
+                            .cmp(&right.members.iter().map(|txid| positions[txid]).min())
+                    })
+                })
                 .ok_or(TransactionAdmissionError::PackageCapacity)?;
+            let removed = worst.members.iter().copied().collect::<BTreeSet<_>>();
+            // A new low-fee candidate cannot evict a better existing chunk.
+            // The caller's private candidate clone makes this refusal atomic.
+            if !removed.is_disjoint(protected) {
+                return Err(TransactionAdmissionError::PackageCapacity);
+            }
             let (removed_fee_sats, removed_vbytes) = self
                 .entries
                 .iter()
@@ -1850,17 +1923,55 @@ impl TransactionAdmissionPool {
         &self,
         affected: &BTreeSet<Txid>,
     ) -> Result<Vec<crate::feerate_diagram::FeeFrac>, TransactionAdmissionError> {
-        use crate::feerate_diagram::{Cluster, FeeFrac, chunk_linearization};
+        Ok(self
+            .chunks_for(affected)?
+            .into_iter()
+            .map(|chunk| chunk.fraction)
+            .collect())
+    }
+
+    fn chunks_for(
+        &self,
+        affected: &BTreeSet<Txid>,
+    ) -> Result<Vec<PoolChunk>, TransactionAdmissionError> {
+        use crate::feerate_diagram::{Cluster, FeeFrac, chunk_linearization_with_members};
         let unavailable = TransactionAdmissionError::ReplacementDiagramUnavailable;
-        let mut chunks: Vec<FeeFrac> = Vec::new();
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| (entry.transaction.compute_txid(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut neighbors: BTreeMap<Txid, Vec<Txid>> = BTreeMap::new();
+        for (child, entry) in &entries {
+            for input in &entry.transaction.input {
+                let parent = input.previous_output.txid;
+                if !entries.contains_key(&parent) {
+                    continue;
+                }
+                if affected.contains(child) != affected.contains(&parent) {
+                    return Err(unavailable("affected transactions must be cluster-closed"));
+                }
+                if affected.contains(child) {
+                    neighbors.entry(*child).or_default().push(parent);
+                    neighbors.entry(parent).or_default().push(*child);
+                }
+            }
+        }
+        let mut chunks: Vec<PoolChunk> = Vec::new();
         let mut visited: BTreeSet<Txid> = BTreeSet::new();
         for txid in affected {
             if visited.contains(txid) {
                 continue;
             }
-            let members = self.cluster_closure(*txid);
-            if !members.iter().all(|member| affected.contains(member)) {
-                return Err(unavailable("affected transactions must be cluster-closed"));
+            let mut members = BTreeSet::new();
+            let mut pending = vec![*txid];
+            while let Some(member) = pending.pop() {
+                if members.insert(member) {
+                    if members.len() > MAX_MEMPOOL_CLUSTER_TRANSACTIONS {
+                        return Err(unavailable("cluster exceeds transaction limit"));
+                    }
+                    pending.extend(neighbors.get(&member).into_iter().flatten().copied());
+                }
             }
             visited.extend(members.iter().copied());
             let ordered_members = members.iter().copied().collect::<Vec<_>>();
@@ -1873,10 +1984,8 @@ impl TransactionAdmissionPool {
             let mut fractions = Vec::with_capacity(ordered_members.len());
             let mut parents: Vec<Vec<usize>> = Vec::with_capacity(ordered_members.len());
             for member in &ordered_members {
-                let entry = self
-                    .entries
-                    .iter()
-                    .find(|entry| entry.transaction.compute_txid() == *member)
+                let entry = entries
+                    .get(member)
                     .ok_or(unavailable("affected transaction left the pool"))?;
                 let fee = i64::try_from(entry.fee_sats)
                     .map_err(|_| unavailable("fee exceeds the diagram range"))?;
@@ -1896,9 +2005,21 @@ impl TransactionAdmissionPool {
             let cluster = Cluster::new(fractions, parents)
                 .map_err(|_| unavailable("affected cluster is not representable"))?;
             let order = cluster.linearize();
-            chunks.extend(chunk_linearization(cluster.fractions(), &order));
+            chunks.extend(
+                chunk_linearization_with_members(cluster.fractions(), &order)
+                    .into_iter()
+                    .map(|chunk| PoolChunk {
+                        fraction: chunk.fraction,
+                        members: chunk
+                            .members
+                            .into_iter()
+                            .map(|index| ordered_members[index])
+                            .collect(),
+                    }),
+            );
         }
-        chunks.sort_by(|left, right| right.feerate_cmp(*left));
+        // Stable sorting preserves parent-before-child order for equal rates.
+        chunks.sort_by(|left, right| right.fraction.feerate_cmp(left.fraction));
         Ok(chunks)
     }
 
@@ -2340,24 +2461,13 @@ fn apply_to_overlay<S: UtxoStore>(
             limit: MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS,
         });
     }
-    let prevouts = transaction
-        .input
-        .iter()
-        .map(|input| {
-            let outpoint = OutPointKey::from(input.previous_output);
-            overlay
-                .get(outpoint)
-                .map_err(ChainstateError::from)?
-                .ok_or(ChainstateError::Utxo(UtxoError::Missing(outpoint)))
-        })
-        .collect::<Result<Vec<Utxo>, ChainstateError>>()?;
-    let prevout_scripts = prevouts
-        .iter()
-        .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey.clone()))
-        .collect::<Vec<_>>();
-    let applied = apply_transaction_with_context(
+    // Resolve inputs and check contextual accounting once, without running
+    // scripts or mutating the overlay. Cheap policy failures must not consume
+    // script-verification work or leave partially applied admission state.
+    let prepared = prepare_transaction_for_block(
         overlay,
         transaction,
+        transaction.compute_txid(),
         context.height,
         0,
         context.parent_mtp,
@@ -2365,8 +2475,10 @@ fn apply_to_overlay<S: UtxoStore>(
         context.script_flags,
         context.csv_active,
     )?;
+    let prevouts = &prepared.prevouts;
+    let applied = &prepared.validated;
     if !context.csv_active && enforces_bip68(transaction) {
-        for (input, utxo) in transaction.input.iter().zip(&prevouts) {
+        for (input, utxo) in transaction.input.iter().zip(prevouts) {
             check_sequence_lock(
                 input.sequence,
                 OutPointKey::from(input.previous_output),
@@ -2382,23 +2494,32 @@ fn apply_to_overlay<S: UtxoStore>(
         .checked_sub(applied.output_value_sats)
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction_at_rate(transaction, fee_sats, minimum_relay_fee_sat_kvb)?;
+    let prevout_scripts = prevouts
+        .iter()
+        .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey.clone()))
+        .collect::<Vec<_>>();
     validate_standard_inputs(transaction, &prevout_scripts)?;
-    if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
-        != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
-    {
-        verify_transaction_scripts_with_flags(
-            transaction,
-            &prevouts,
-            PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS,
-        )
-        .map_err(TransactionAdmissionError::StandardScript)?;
-    }
     if applied.sigop_cost > MAX_STANDARD_TRANSACTION_SIGOP_COST {
         return Err(TransactionAdmissionError::TooManySigops {
             cost: applied.sigop_cost,
             limit: MAX_STANDARD_TRANSACTION_SIGOP_COST,
         });
     }
+    verify_transaction_scripts_with_flags(transaction, prevouts, context.script_flags)
+        .map_err(ChainstateError::from)?;
+    if context.script_flags & PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+        != PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS
+    {
+        verify_transaction_scripts_with_flags(
+            transaction,
+            prevouts,
+            PUBLIC_STANDARD_SCRIPT_VERIFY_FLAGS,
+        )
+        .map_err(TransactionAdmissionError::StandardScript)?;
+    }
+    overlay
+        .apply_with_undo(&prepared.spent, &prepared.created)
+        .map_err(ChainstateError::from)?;
     Ok(AppliedAdmission {
         fee_sats,
         policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
@@ -4863,13 +4984,14 @@ mod tests {
     }
 
     #[test]
-    fn capacity_evicts_an_oldest_parent_with_all_descendants() {
+    fn capacity_evicts_low_fee_cpfp_chunk_with_all_descendants() {
         let (_directory, store) = store();
-        let (root_outpoint, root_utxo, parent) = spend(7);
+        let (root_outpoint, root_utxo, mut parent) = spend(7);
+        parent.output[0].value = Amount::from_sat(99_900);
         store
             .apply(&[], &[(root_outpoint.into(), root_utxo)])
             .unwrap();
-        let child = child(&parent, 80_000);
+        let child = child(&parent, 99_000);
         let parent_txid = parent.compute_txid();
         let child_txid = child.compute_txid();
         let mut pool = TransactionAdmissionPool::default();
@@ -4919,6 +5041,19 @@ mod tests {
         assert_eq!(pool.rolling_minimum_fee_sat_kvb(200 + 48 * 60 * 60), bumped);
         pool.observe_chain_tip(second_tip, 300);
         assert_eq!(pool.rolling_minimum_fee_sat_kvb(300 + 48 * 60 * 60), 0);
+        // Fee-floor decay does not create capacity: a cheaper candidate still
+        // cannot displace a higher-fee retained chunk from the full pool.
+        assert!(matches!(
+            pool.admit_at(&store, low_fee.clone(), context(), 300 + 48 * 60 * 60),
+            Err(TransactionAdmissionError::PackageCapacity)
+        ));
+        assert_eq!(txids(&pool), before);
+        // Model a block freeing space before retrying at the decayed floor.
+        assert_eq!(
+            pool.remove_with_descendants(&BTreeSet::from([before[0]]))
+                .len(),
+            1
+        );
         pool.admit_at(&store, low_fee, context(), 300 + 48 * 60 * 60)
             .unwrap();
     }
@@ -5047,5 +5182,88 @@ mod tests {
                 .iter()
                 .any(|transaction| transaction.compute_txid() == last_txid)
         );
+    }
+
+    #[test]
+    fn upstream_capacity_keeps_rich_old_entries_and_refuses_a_worse_new_chunk() {
+        let (_directory, store) = store();
+        let mut pool = TransactionAdmissionPool::with_capacity(2, MAX_ADMITTED_TRANSACTION_BYTES);
+        let mut transactions = Vec::new();
+        for (index, value) in [(1, 90_000), (2, 99_000), (3, 95_000), (4, 99_900)] {
+            let (outpoint, utxo, mut tx) = spend(index);
+            tx.output[0].value = Amount::from_sat(value);
+            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            transactions.push(tx);
+        }
+        for tx in &transactions[..3] {
+            pool.admit(&store, tx.clone(), context()).unwrap();
+        }
+        assert_eq!(
+            txids(&pool),
+            vec![
+                transactions[0].compute_txid(),
+                transactions[2].compute_txid()
+            ]
+        );
+        // Isolate capacity admission from the separately tested rolling floor.
+        pool.rolling_minimum_fee_sat_kvb = 0;
+        let before = txids(&pool);
+        assert!(matches!(
+            pool.admit(&store, transactions[3].clone(), context()),
+            Err(TransactionAdmissionError::PackageCapacity)
+        ));
+        assert_eq!(txids(&pool), before);
+    }
+
+    #[test]
+    fn upstream_relay_orders_cpfp_chunks_before_lower_rate_transactions() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, mut low) = spend(1);
+        low.output[0].value = Amount::from_sat(99_000);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let (outpoint, utxo, mut parent) = spend(2);
+        parent.output[0].value = Amount::from_sat(100_000);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let child = child(&parent, 90_000);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, low.clone(), context()).unwrap();
+        pool.admit_package(&store, vec![parent.clone(), child.clone()], context())
+            .unwrap();
+        assert_eq!(
+            pool.relay_snapshot()
+                .iter()
+                .map(|entry| entry.transaction.compute_txid())
+                .collect::<Vec<_>>(),
+            vec![
+                parent.compute_txid(),
+                child.compute_txid(),
+                low.compute_txid()
+            ]
+        );
+        let (outpoint, utxo, next) = spend(3);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        pool.admit(&store, next, context()).unwrap();
+        assert!(txids(&pool).contains(&parent.compute_txid()));
+    }
+
+    #[test]
+    fn upstream_orphan_input_work_is_bounded_independently_of_count() {
+        let mut pool = TransactionAdmissionPool::default();
+        for index in 1..=40 {
+            let (_, _, mut tx) = spend(index);
+            let input = tx.input[0].clone();
+            tx.input = (0..1_000)
+                .map(|vout| {
+                    let mut input = input.clone();
+                    input.previous_output.vout = vout;
+                    input
+                })
+                .collect();
+            pool.retain_orphans(&[tx], 1, u64::from(index));
+            assert!(pool.orphan_work_units() <= MAX_ORPHAN_WORK_UNITS);
+            assert!(pool.orphan_bytes() <= MAX_ORPHAN_TRANSACTION_BYTES);
+        }
+        assert!(pool.orphan_len() > 0);
+        assert!(pool.orphan_len() < 40);
     }
 }

@@ -1,8 +1,9 @@
 //! Atomic block-to-chainstate transition checks.
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Condvar, Mutex, OnceLock, mpsc},
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 
 use bitcoin::{
@@ -86,13 +87,32 @@ struct ScriptValidationJob {
 struct ScriptValidationWork {
     jobs: Vec<ScriptValidationJob>,
     result: mpsc::Sender<ScriptValidationResult>,
+    cancelled: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
-struct ScriptValidationQueue {
-    work: Mutex<VecDeque<ScriptValidationWork>>,
-    available: Condvar,
+impl ScriptValidationWork {
+    fn retained_bytes(&self) -> usize {
+        self.jobs.iter().fold(
+            self.jobs
+                .capacity()
+                .saturating_mul(size_of::<ScriptValidationJob>()),
+            |total, job| {
+                job.prevouts.iter().fold(
+                    total
+                        .saturating_add(job.raw_transaction.capacity())
+                        .saturating_add(job.prevouts.capacity().saturating_mul(size_of::<Utxo>())),
+                    |total, coin| total.saturating_add(coin.script_pubkey.capacity()),
+                )
+            },
+        )
+    }
 }
+
+type ScriptValidationQueue = crate::script_queue::ScriptQueue<ScriptValidationWork>;
+
+/// Pending work only; executing workers and the submitting validation batch
+/// retain their own bounded pipeline allocations outside this budget.
+const MAX_PENDING_SCRIPT_BYTES: usize = 64 * 1024 * 1024;
 
 struct ScriptValidationPool {
     queue: Arc<ScriptValidationQueue>,
@@ -104,7 +124,7 @@ impl ScriptValidationPool {
         let workers = std::thread::available_parallelism()
             .map_or(1, std::num::NonZero::get)
             .max(1);
-        let queue = Arc::new(ScriptValidationQueue::default());
+        let queue = Arc::new(ScriptValidationQueue::new(MAX_PENDING_SCRIPT_BYTES));
         for worker in 0..workers {
             let queue = Arc::clone(&queue);
             std::thread::Builder::new()
@@ -115,58 +135,50 @@ impl ScriptValidationPool {
         Self { queue, workers }
     }
 
-    fn enqueue(&self, work: Vec<ScriptValidationWork>) {
-        if work.is_empty() {
-            return;
-        }
-        let work_items = work.len();
-        self.queue
-            .work
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(work);
-        if work_items == 1 {
-            self.queue.available.notify_one();
-        } else {
-            self.queue.available.notify_all();
+    fn enqueue(&self, work: ScriptValidationWork) {
+        let retained_bytes = work.retained_bytes();
+        let cancelled = Arc::clone(&work.cancelled);
+        if let Some(work) = self.queue.try_push(work, retained_bytes, cancelled) {
+            // Backpressure without dropping verification or waiting for space
+            // in a pool whose other producers may themselves be workers.
+            execute_script_work(work);
         }
     }
 }
 
 fn script_validation_worker(queue: &ScriptValidationQueue) {
     loop {
-        let work = {
-            let mut work = queue
-                .work
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while work.is_empty() {
-                work = queue
-                    .available
-                    .wait(work)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            work.pop_front().expect("non-empty script queue")
-        };
-        let ScriptValidationWork { jobs, result } = work;
-        // The submitting batch keeps its own live sender, so a dropped result
-        // channel never disconnects the receiver. An unwinding job would
-        // therefore block `DeferredScriptBatch::finish` forever; report the
-        // failure instead so the candidate block is rejected.
-        let failure = contain_script_worker_panic(|| {
-            jobs.into_iter().find_map(|job| {
-                verify_serialized_transaction_scripts_with_flags(
-                    &job.raw_transaction,
-                    job.input_count,
-                    &job.prevouts,
-                    job.script_flags,
-                )
-                .err()
-                .map(|error| (job.block_order, job.index, error))
-            })
-        });
-        let _ = result.send(failure);
+        execute_script_work(queue.pop());
     }
+}
+
+fn execute_script_work(work: ScriptValidationWork) {
+    let ScriptValidationWork {
+        jobs,
+        result,
+        cancelled,
+    } = work;
+    // The submitting batch keeps its own live sender, so a dropped result
+    // channel never disconnects the receiver. An unwinding job would
+    // therefore block `DeferredScriptBatch::finish` forever; report the
+    // failure instead so the candidate block is rejected.
+    let failure = contain_script_worker_panic(|| {
+        for job in jobs {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            if let Err(error) = verify_serialized_transaction_scripts_with_flags(
+                &job.raw_transaction,
+                job.input_count,
+                &job.prevouts,
+                job.script_flags,
+            ) {
+                return Some((job.block_order, job.index, error));
+            }
+        }
+        None
+    });
+    let _ = result.send(failure);
 }
 
 fn contain_script_worker_panic(
@@ -190,6 +202,8 @@ pub struct DeferredScriptBatch {
     result: mpsc::Sender<ScriptValidationResult>,
     results: mpsc::Receiver<ScriptValidationResult>,
     work_items: usize,
+    cancelled: Arc<AtomicBool>,
+    queue: Option<Arc<ScriptValidationQueue>>,
 }
 
 impl DeferredScriptBatch {
@@ -199,13 +213,14 @@ impl DeferredScriptBatch {
             result,
             results,
             work_items: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue: None,
         }
     }
 
     pub(crate) fn submit(&mut self, checks: Vec<DeferredScriptCheck<'_>>) {
         let pool = script_validation_pool();
-        let work_items = checks.len().div_ceil(SCRIPT_VALIDATION_WORK_SIZE);
-        let mut work = Vec::with_capacity(work_items);
+        self.queue = Some(Arc::clone(&pool.queue));
         let mut jobs = Vec::with_capacity(SCRIPT_VALIDATION_WORK_SIZE);
         for check in checks {
             jobs.push(ScriptValidationJob {
@@ -217,21 +232,23 @@ impl DeferredScriptBatch {
                 script_flags: check.script_flags,
             });
             if jobs.len() == SCRIPT_VALIDATION_WORK_SIZE {
-                work.push(ScriptValidationWork {
+                self.work_items += 1;
+                pool.enqueue(ScriptValidationWork {
                     jobs: std::mem::take(&mut jobs),
                     result: self.result.clone(),
+                    cancelled: Arc::clone(&self.cancelled),
                 });
                 jobs.reserve(SCRIPT_VALIDATION_WORK_SIZE);
             }
         }
         if !jobs.is_empty() {
-            work.push(ScriptValidationWork {
+            self.work_items += 1;
+            pool.enqueue(ScriptValidationWork {
                 jobs,
                 result: self.result.clone(),
+                cancelled: Arc::clone(&self.cancelled),
             });
         }
-        self.work_items = self.work_items.saturating_add(work.len());
-        pool.enqueue(work);
     }
 
     pub(crate) fn finish(self) -> Option<(usize, ConsensusError)> {
@@ -249,6 +266,15 @@ impl DeferredScriptBatch {
                     .expect("script-validation worker terminated without a result")
             })
             .min_by_key(|(block_order, index, _)| (*block_order, *index))
+    }
+}
+
+impl Drop for DeferredScriptBatch {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(queue) = &self.queue {
+            queue.discard_cancelled();
+        }
     }
 }
 
@@ -1547,6 +1573,65 @@ mod tests {
         assert!(matches!(
             result,
             Some((0, 0, ConsensusError::WorkerPanicked))
+        ));
+    }
+
+    #[test]
+    fn upstream_full_script_queue_executes_inline_and_reports_failure() {
+        let pool = ScriptValidationPool {
+            queue: Arc::new(ScriptValidationQueue::new(0)),
+            workers: 0,
+        };
+        let (result, results) = mpsc::channel();
+        pool.enqueue(ScriptValidationWork {
+            jobs: vec![ScriptValidationJob {
+                index: 7,
+                block_order: 3,
+                raw_transaction: vec![],
+                input_count: 1,
+                prevouts: vec![],
+                script_flags: 0,
+            }],
+            result,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(matches!(
+            results.try_recv().unwrap(),
+            Some((
+                3,
+                7,
+                ConsensusError::PrevoutCount {
+                    inputs: 1,
+                    prevouts: 0
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn upstream_dropping_a_batch_releases_pending_script_jobs() {
+        let queue = Arc::new(ScriptValidationQueue::new(1_024));
+        let mut batch = DeferredScriptBatch::new();
+        batch.queue = Some(queue.clone());
+        let (result, results) = mpsc::channel();
+        assert!(
+            queue
+                .try_push(
+                    ScriptValidationWork {
+                        jobs: vec![],
+                        result,
+                        cancelled: batch.cancelled.clone(),
+                    },
+                    0,
+                    batch.cancelled.clone()
+                )
+                .is_none()
+        );
+        drop(batch);
+        // Dropping the queued work disconnects its otherwise unique sender.
+        assert!(matches!(
+            results.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
         ));
     }
 }

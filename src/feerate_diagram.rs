@@ -110,6 +110,87 @@ pub enum ClusterError {
     NegativeFee,
     /// Aggregate fee or size cannot be represented by [`FeeFrac`].
     AggregateOutOfRange,
+    /// A connected component exceeds the caller's resource bound.
+    ComponentTooLarge,
+}
+
+/// Linearizes independent components with a bound on each component's work.
+///
+/// Indices must already use the caller's canonical transaction ordering.
+/// Stable fee sorting preserves parent-before-child order at equal rates.
+pub fn linearize_components(
+    fractions: &[FeeFrac],
+    parents: &[Vec<usize>],
+    max_component_size: usize,
+) -> Result<Vec<LinearizedChunk>, ClusterError> {
+    if fractions.len() != parents.len() {
+        return Err(ClusterError::ParentOutOfRange);
+    }
+    let mut neighbors = vec![Vec::new(); fractions.len()];
+    for (child, ancestors) in parents.iter().enumerate() {
+        for &parent in ancestors {
+            if parent >= fractions.len() {
+                return Err(ClusterError::ParentOutOfRange);
+            }
+            if parent == child {
+                return Err(ClusterError::SelfParent);
+            }
+            neighbors[child].push(parent);
+            neighbors[parent].push(child);
+        }
+    }
+    let mut visited = vec![false; fractions.len()];
+    let mut chunks = Vec::new();
+    for root in 0..fractions.len() {
+        if visited[root] {
+            continue;
+        }
+        let mut pending = vec![root];
+        let mut members = Vec::new();
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut visited[index], true) {
+                continue;
+            }
+            members.push(index);
+            if members.len() > max_component_size {
+                return Err(ClusterError::ComponentTooLarge);
+            }
+            pending.extend(neighbors[index].iter().copied());
+        }
+        members.sort_unstable();
+        let positions = members
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(local, global)| (global, local))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let cluster = Cluster::new(
+            members.iter().map(|&index| fractions[index]).collect(),
+            members
+                .iter()
+                .map(|&index| {
+                    parents[index]
+                        .iter()
+                        .map(|parent| positions[parent])
+                        .collect()
+                })
+                .collect(),
+        )?;
+        chunks.extend(
+            chunk_linearization_with_members(cluster.fractions(), &cluster.linearize())
+                .into_iter()
+                .map(|chunk| LinearizedChunk {
+                    fraction: chunk.fraction,
+                    members: chunk
+                        .members
+                        .into_iter()
+                        .map(|local| members[local])
+                        .collect(),
+                }),
+        );
+    }
+    chunks.sort_by(|left, right| right.fraction.feerate_cmp(left.fraction));
+    Ok(chunks)
 }
 
 impl Cluster {
@@ -333,7 +414,30 @@ impl Cluster {
 /// duplicate indices are ignored so a malformed order cannot panic.
 #[must_use]
 pub fn chunk_linearization(fractions: &[FeeFrac], order: &[usize]) -> Vec<FeeFrac> {
-    let mut chunks: Vec<FeeFrac> = Vec::with_capacity(order.len());
+    chunk_linearization_with_members(fractions, order)
+        .into_iter()
+        .map(|chunk| chunk.fraction)
+        .collect()
+}
+
+/// A chunk's aggregate fee and its dependency-ordered transaction indices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinearizedChunk {
+    /// Aggregate fee and policy virtual size.
+    pub fraction: FeeFrac,
+    /// Transaction indices, with parents before children.
+    pub members: Vec<usize>,
+}
+
+/// Chunks a linearization without losing the identities needed for relay and eviction.
+///
+/// Like [`chunk_linearization`], ignores duplicate and out-of-range indices.
+#[must_use]
+pub fn chunk_linearization_with_members(
+    fractions: &[FeeFrac],
+    order: &[usize],
+) -> Vec<LinearizedChunk> {
+    let mut chunks: Vec<LinearizedChunk> = Vec::with_capacity(order.len());
     let mut seen = vec![false; fractions.len()];
     for &index in order {
         let Some(entry) = fractions.get(index) else {
@@ -343,11 +447,16 @@ pub fn chunk_linearization(fractions: &[FeeFrac], order: &[usize]) -> Vec<FeeFra
             continue;
         }
         seen[index] = true;
-        let mut chunk = *entry;
-        while let Some(&previous) = chunks.last() {
-            if previous.feerate_cmp(chunk) == Ordering::Less {
-                chunk = chunk.combined(previous);
-                chunks.pop();
+        let mut chunk = LinearizedChunk {
+            fraction: *entry,
+            members: vec![index],
+        };
+        while let Some(previous) = chunks.last() {
+            if previous.fraction.feerate_cmp(chunk.fraction) == Ordering::Less {
+                let mut previous = chunks.pop().expect("last chunk exists");
+                previous.fraction = previous.fraction.combined(chunk.fraction);
+                previous.members.extend(chunk.members);
+                chunk = previous;
             } else {
                 break;
             }
@@ -479,6 +588,82 @@ mod tests {
 
     fn frac(fee: i64, size: i32) -> FeeFrac {
         FeeFrac::new(fee, size)
+    }
+
+    #[test]
+    fn upstream_chunk_members_preserve_cpfp_order_and_tail_identity() {
+        let fractions = [frac(0, 100), frac(1_000, 100), frac(10, 100)];
+        let chunks = chunk_linearization_with_members(&fractions, &[0, 1, 2]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].members, vec![0, 1]);
+        assert_eq!(chunks[0].fraction, frac(1_000, 200));
+        assert_eq!(chunks[1].members, vec![2]);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.fraction)
+                .collect::<Vec<_>>(),
+            chunk_linearization(&fractions, &[0, 1, 2])
+        );
+        assert_eq!(
+            chunk_linearization_with_members(&fractions, &[0, 0, 99, 1, 2]),
+            chunks
+        );
+    }
+
+    #[test]
+    fn upstream_components_share_parents_without_double_counting() {
+        let fractions = [
+            frac(0, 100),
+            frac(1_000, 100),
+            frac(100, 100),
+            frac(200, 100),
+        ];
+        let chunks =
+            linearize_components(&fractions, &[vec![], vec![0], vec![0], vec![]], 64).unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.members.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 1], vec![3], vec![2]]
+        );
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.fraction.fee).sum::<i64>(),
+            1_300
+        );
+    }
+
+    #[test]
+    fn upstream_components_preserve_equal_rate_dependency_order() {
+        let chunks =
+            linearize_components(&[frac(1, 1); 3], &[vec![1], vec![], vec![]], 64).unwrap();
+        let order = chunks
+            .iter()
+            .flat_map(|chunk| chunk.members.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            order.iter().position(|&index| index == 1) < order.iter().position(|&index| index == 0)
+        );
+    }
+
+    #[test]
+    fn upstream_component_bounds_and_cycles_fail_before_linearization() {
+        assert_eq!(
+            linearize_components(&[frac(1, 1); 2], &[vec![], vec![0]], 1),
+            Err(ClusterError::ComponentTooLarge)
+        );
+        assert_eq!(
+            linearize_components(&[frac(1, 1); 2], &[vec![1], vec![0]], 64),
+            Err(ClusterError::Cycle)
+        );
+        // A large pool of independent transactions does not hit a cluster cap.
+        assert_eq!(
+            linearize_components(&[frac(1, 1); 100], &vec![vec![]; 100], 1)
+                .unwrap()
+                .len(),
+            100
+        );
     }
 
     #[test]

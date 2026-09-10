@@ -1,6 +1,6 @@
 # Private transaction broadcast
 
-Status date: 2026-08-13.
+Status date: 2026-09-09.
 
 `--private-broadcast` makes every locally originated wallet transaction
 travel exclusively over anonymity networks — onion peers via the Tor SOCKS5
@@ -20,6 +20,12 @@ Fail-closed: `--private-broadcast` with neither `--proxy` (Tor SOCKS5, for
 onion peers) nor `--i2psam` (I2P SAM bridge) is refused at startup — there
 would be no anonymity path on which to keep the promise, and the option
 must never degrade silently to clearnet.
+
+With private broadcast enabled, `rbtc.submitrawtransaction` returns error
+`-32041` before enqueueing a transaction. That operator RPC uses the ordinary
+mempool relay queue, so callers must use the wallet PSBT broadcast endpoint
+for private submission. The refusal also applies when no wallet is configured.
+Peer-originated transactions continue through ordinary mempool relay.
 
 ## The broadcast wave
 
@@ -72,3 +78,34 @@ need real daemons; running `--private-broadcast` end to end against those
 daemons and recording that no clearnet transaction relay occurred is the
 one operational residue, in the same spirit as the CJDNS live-handshake and
 name-proxy external-Tor runs.
+
+## September ingress and fallback audit
+
+Static inspection traced the wallet PSBT endpoint through
+`WalletBroadcastSink` to the private wave and durable retry path. It also
+found that the raw operator RPC shared `InboundTransactionQueue` with P2P
+transactions, which the execution loop drains into ordinary admission and
+relay. The RPC now refuses submission in private mode; its flag comes from
+startup configuration independently of wallet availability.
+
+`connect_proxied_target` opens both its preferred v2 connection and any v1
+retry through `open_socks5_stream` with the same proxy and target. Private
+waves request v1 directly. The I2P wave opens streams through a transient
+SAM session; failed waves return to retry handling.
+
+The `private_broadcast_refuses_raw_rpc_before_transaction_queueing`
+regression checks the RPC error and an unchanged submission queue. It passed
+on 2026-09-09, together with `private_broadcast_never_writes_the_transaction_to_a_clearnet_session`
+and `private_broadcast_delivers_over_the_proxied_onion_path` in the full default
+library suite. Dependencies were downloaded using a writable temporary Cargo
+cache; the earlier dependency blocker is resolved for this run.
+
+That run exposed an intermittent v2 fallback failure: closing a TCP stream
+with unread handshake garbage can return a connection reset rather than EOF.
+Outbound v2 handshake I/O now treats reset/abort/broken-pipe/EOF errors as
+peer closure, allowing the existing single v1 retry. Other I/O errors and
+protocol errors retain their failure paths. Deterministic stream-fault tests
+cover read, write and flush. The new
+`onion_v2_fallback_reconnects_through_the_same_proxy_and_target` test passed,
+checking both SOCKS5 requests and the unspecified version receiver address.
+These are local mocked-network tests. Live Tor/I2P validation remains outstanding.

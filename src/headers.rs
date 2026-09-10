@@ -561,26 +561,25 @@ impl HeaderDag {
     }
 
     fn rebuild_active_chain(&mut self, info: HeaderInfo) {
-        let chain_len = usize::try_from(info.height)
-            .expect("header height fits usize")
-            .checked_add(1)
-            .expect("active-chain length fits usize");
-        let mut active_chain = vec![info.hash; chain_len];
+        // Work is cached in HeaderInfo. Walk only the changed suffix, not
+        // genesis-to-tip history on every shallow reorg or staged rollback.
+        let mut suffix = Vec::new();
         let mut current = info;
         loop {
-            active_chain[usize::try_from(current.height).expect("header height fits usize")] =
-                current.hash;
-            if current.height == 0 {
+            let height = usize::try_from(current.height).expect("header height fits usize");
+            if self.active_chain.get(height) == Some(&current.hash) {
+                self.active_chain.truncate(height + 1);
                 break;
             }
+            suffix.push(current.hash);
             current = self
                 .headers
                 .get(&current.header.prev_blockhash)
                 .copied()
                 .expect("known header has every ancestor");
         }
+        self.active_chain.extend(suffix.into_iter().rev());
         self.active_tip = info.hash;
-        self.active_chain = active_chain;
     }
 
     fn insertion_rebuilds_active_chain(&self, header: &Header) -> bool {
@@ -750,6 +749,55 @@ mod tests {
                 .expect("regtest nonce search succeeds");
         }
         header
+    }
+
+    #[test]
+    fn upstream_low_work_headers_never_enter_the_contextual_dag() {
+        let mut dag = HeaderDag::new(Network::Bitcoin);
+        let genesis = dag.active_tip();
+        for offset in 1..=1_000 {
+            // Valid cheap regtest PoW is not valid mainnet contextual work.
+            let header = mine_child(genesis.hash, genesis.header.time + offset);
+            assert!(matches!(
+                dag.insert_contextual(header, header.time),
+                Err(HeaderError::UnexpectedDifficulty { .. })
+            ));
+            assert_eq!(dag.headers.len(), 1);
+            assert_eq!(dag.active_tip(), genesis);
+        }
+    }
+
+    #[test]
+    fn upstream_shallow_reorg_and_staged_rollback_preserve_the_shared_prefix() {
+        let mut dag = HeaderDag::new(Network::Regtest);
+        for _ in 0..512 {
+            let parent = dag.active_tip();
+            let header = mine_child(parent.hash, parent.header.time + 1);
+            dag.insert_contextual(header, header.time).unwrap();
+        }
+        let original = dag.active_tip();
+        let prefix = dag.active_chain.clone();
+        let fork = dag.active_header_at(510).unwrap();
+        let mut parent = fork.header;
+        let mut branch = Vec::new();
+        for _ in 0..3 {
+            parent = mine_child(parent.block_hash(), parent.time + 10);
+            branch.push(parent);
+        }
+        {
+            let staged = dag.stage_batch_contextual(&branch, parent.time).unwrap();
+            assert_eq!(staged.dag.active_tip().height, 513);
+            assert_eq!(&staged.dag.active_chain[..511], &prefix[..511]);
+            // Dropping must restore the prior tip even after a promotion.
+        }
+        assert_eq!(dag.active_tip(), original);
+        assert_eq!(dag.active_chain, prefix);
+        let _ = dag
+            .stage_batch_contextual(&branch, parent.time)
+            .unwrap()
+            .commit();
+        assert_eq!(dag.active_tip().hash, parent.block_hash());
+        assert_eq!(&dag.active_chain[..511], &prefix[..511]);
     }
 
     #[test]

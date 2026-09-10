@@ -767,6 +767,20 @@ impl V2TransportError {
     }
 }
 
+// Only the outbound transport handshake permits this retry classification.
+// TCP peers closing with unread opening bytes can reset the stream instead
+// of delivering EOF; writes can observe the same close as a broken pipe.
+fn outbound_handshake_io_error(error: std::io::Error) -> V2TransportError {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::UnexpectedEof => V2TransportError::PeerRejectedV2,
+        _ => V2TransportError::Io(error),
+    }
+}
+
 /// Result of accepting one inbound connection on a v2-capable listener.
 pub enum V2Accepted<S> {
     /// The peer completed the v2 handshake.
@@ -834,24 +848,33 @@ impl<S> V2Transport<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin> V2Transport<S> {
     /// Runs the initiator handshake on an established outbound stream.
     ///
-    /// A clean close before completion maps to
+    /// A clean close or connection reset before completion maps to
     /// [`V2TransportError::PeerRejectedV2`], the only error after which the
     /// caller should reconnect over v1; every other error is an ordinary
     /// connection failure or a protocol violation.
     pub async fn connect_outbound(mut stream: S, magic: Magic) -> Result<Self, V2TransportError> {
         let (mut handshake, first) = V2Handshake::initiator(magic, random_garbage())?;
-        stream.write_all(&first).await?;
-        stream.flush().await?;
+        stream
+            .write_all(&first)
+            .await
+            .map_err(outbound_handshake_io_error)?;
+        stream.flush().await.map_err(outbound_handshake_io_error)?;
         let mut chunk = [0u8; 4096];
         loop {
-            let read = stream.read(&mut chunk).await?;
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .map_err(outbound_handshake_io_error)?;
             if read == 0 {
                 return Err(V2TransportError::PeerRejectedV2);
             }
             let step = handshake.push_bytes(&chunk[..read])?;
             if !step.send.is_empty() {
-                stream.write_all(&step.send).await?;
-                stream.flush().await?;
+                stream
+                    .write_all(&step.send)
+                    .await
+                    .map_err(outbound_handshake_io_error)?;
+                stream.flush().await.map_err(outbound_handshake_io_error)?;
             }
             match step.event {
                 HandshakeEvent::NeedMoreData => {}
@@ -1851,6 +1874,78 @@ mod tests {
         let result = V2Transport::connect_outbound(client_end, Magic::REGTEST).await;
         assert!(matches!(result, Err(V2TransportError::PeerRejectedV2)));
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn outbound_handshake_classifies_stream_closures_at_each_io_boundary() {
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::ReadBuf;
+
+        // Inject failures independently of platform-specific TCP close timing.
+        struct FailingStream {
+            kind: io::ErrorKind,
+            boundary: u8,
+        }
+        impl AsyncRead for FailingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(self.kind.into()))
+            }
+        }
+        impl AsyncWrite for FailingStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(if self.boundary == 0 {
+                    Err(self.kind.into())
+                } else {
+                    Ok(bytes.len())
+                })
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(if self.boundary == 1 {
+                    Err(self.kind.into())
+                } else {
+                    Ok(())
+                })
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        for boundary in 0..3 {
+            for kind in [
+                io::ErrorKind::ConnectionReset,
+                io::ErrorKind::ConnectionAborted,
+                io::ErrorKind::BrokenPipe,
+                io::ErrorKind::UnexpectedEof,
+                io::ErrorKind::TimedOut,
+                io::ErrorKind::PermissionDenied,
+            ] {
+                let result =
+                    V2Transport::connect_outbound(FailingStream { kind, boundary }, Magic::REGTEST)
+                        .await;
+                if matches!(
+                    kind,
+                    io::ErrorKind::TimedOut | io::ErrorKind::PermissionDenied
+                ) {
+                    assert!(
+                        matches!(result, Err(V2TransportError::Io(error)) if error.kind() == kind)
+                    );
+                } else {
+                    assert!(matches!(result, Err(V2TransportError::PeerRejectedV2)));
+                }
+            }
+        }
     }
 
     #[tokio::test]

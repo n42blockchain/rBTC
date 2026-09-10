@@ -2,6 +2,10 @@
 
 Status date: 2026-07-25.
 
+The active P0/P1 follow-up, its 2026-09-09 integration results and remaining gates are
+tracked in [UPSTREAM_2026_FOLLOWUP.md](UPSTREAM_2026_FOLLOWUP.md). Historical
+acceptance results below do not constitute acceptance of that follow-up.
+
 Bitcoin Core 31 is rBTC's current public-network reference. This document
 separates consensus compatibility, which is a release trust requirement, from
 relay policy and operator feature parity, which are independently versioned

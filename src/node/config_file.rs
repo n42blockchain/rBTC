@@ -618,6 +618,10 @@ mod tests {
     #[test]
     fn rejects_unknown_duplicate_and_cross_field_values() {
         assert!(parse_config("mystery=true").is_err());
+        // Knots' RDTS deployment is not an rBTC Bitcoin consensus switch.
+        // A copied configuration must fail rather than silently enable it.
+        assert!(parse_config("consensusrules=rdts").is_err());
+        assert!(parse_config("bip110=true").is_err());
         let duplicate = parse_config("prune_blocks=500\nprune_blocks=600").unwrap();
         assert!(selected_arguments(&duplicate, Network::Bitcoin).is_err());
         let dns_conflict = parse_config("dns_seeds=false\ndns_seed=seed.example:8333").unwrap();

@@ -1,21 +1,25 @@
-//! Fee-optimal transaction selection for a block template.
+//! Chunk-feerate transaction selection for a block template.
 //!
 //! The mempool hands out a dependency-ordered snapshot, which is enough to
 //! build *a* valid block but not a well-paying one: a child paying for its
 //! parent (CPFP) looks unattractive on its own fee rate, and nothing in the
-//! snapshot bounds a block's weight or sigop cost. This module scores whole
-//! ancestor packages, so a high-fee child pulls its parents in with it, and
+//! snapshot bounds a block's weight or sigop cost. This module uses the same
+//! bounded cluster linearization and chunks as the admission pool, and
 //! it fills the block against both consensus ceilings.
 //!
 //! Selection is deliberately separate from assembly. It reads no chain state
 //! and performs no validation: every candidate is already mempool-validated,
 //! and the block that results is validated again on connection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bitcoin::{Transaction, Txid};
 
-use crate::blockchain::{MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT};
+use crate::{
+    blockchain::{MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT},
+    feerate_diagram::{FeeFrac, linearize_components},
+    transaction_admission::MAX_MEMPOOL_CLUSTER_TRANSACTIONS,
+};
 
 /// Weight held back for the coinbase transaction.
 ///
@@ -28,8 +32,8 @@ pub const DEFAULT_RESERVED_SIGOP_COST: u64 = 400;
 
 /// How many candidates one selection will consider.
 ///
-/// Ancestor scoring is quadratic in the worst case, so an unbounded mempool
-/// could stall template construction. Anything dropped by this ceiling is
+/// Linearization work is bounded per cluster; this additionally caps the
+/// number of components considered. Anything dropped by this ceiling is
 /// reported in [`TemplateSelection::skipped_over_ceiling`] rather than
 /// silently discarded.
 pub const MAX_TEMPLATE_CANDIDATES: usize = 8_000;
@@ -78,35 +82,17 @@ pub struct TemplateSelection {
     pub skipped_over_ceiling: usize,
 }
 
-/// One candidate's package: itself plus every ancestor also in the candidate set.
-struct Package {
-    /// Indices into the candidate list, ascending, so dependencies come first.
-    members: Vec<usize>,
-    fee_sats: u64,
-    weight: u64,
-}
-
-impl Package {
-    /// Fee rate in sats per 1,000 weight units, saturating rather than dividing by zero.
-    fn score(&self) -> u128 {
-        if self.weight == 0 {
-            return u128::MAX;
-        }
-        u128::from(self.fee_sats)
-            .saturating_mul(1_000)
-            .saturating_div(u128::from(self.weight))
-    }
-}
-
-/// Selects the best-paying transactions that fit inside `limits`.
+/// Selects fee-ordered chunks that fit inside `limits`.
 ///
 /// Candidates must arrive in a valid dependency order, which is what the
-/// mempool's relay snapshot provides; the result preserves that order.
-/// Scoring is by ancestor package, so a child that pays its parent's way is
-/// evaluated together with the parents it needs.
+/// mempool's relay snapshot provides, so truncating at the candidate ceiling
+/// cannot drop a retained child's parent. Within that prefix, canonical txid
+/// order feeds the same linearization/chunking primitives as mempool RBF.
+/// Fees use sigop-adjusted policy vsize, not a rounded weight-only score.
 ///
-/// A package that does not fit is skipped and selection continues, because a
-/// single oversized package must not shut out every smaller one behind it.
+/// A chunk that does not fit is skipped, as are its dependent chunks; unrelated
+/// work remains eligible. Invalid graphs or unrepresentable fees fail closed
+/// with an empty selection. Candidates are already consensus-validated.
 #[must_use]
 pub fn select_template_transactions(
     candidates: &[TemplateCandidate],
@@ -114,107 +100,106 @@ pub fn select_template_transactions(
 ) -> TemplateSelection {
     let skipped_over_ceiling = candidates.len().saturating_sub(MAX_TEMPLATE_CANDIDATES);
     let candidates = &candidates[..candidates.len().min(MAX_TEMPLATE_CANDIDATES)];
+    let mut selection = TemplateSelection {
+        skipped_over_ceiling,
+        ..TemplateSelection::default()
+    };
+    let by_txid = candidates
+        .iter()
+        .map(|candidate| (candidate.transaction.compute_txid(), candidate))
+        .collect::<BTreeMap<_, _>>();
+    if by_txid.len() != candidates.len() {
+        return selection;
+    }
+    let candidates = by_txid.values().copied().collect::<Vec<_>>();
     let position: HashMap<Txid, usize> = candidates
         .iter()
         .enumerate()
         .map(|(index, candidate)| (candidate.transaction.compute_txid(), index))
         .collect();
 
-    let mut packages: Vec<(usize, Package)> = Vec::with_capacity(candidates.len());
-    for index in 0..candidates.len() {
-        packages.push((index, ancestor_package(candidates, &position, index)));
-    }
-    // Best-paying package first; ties broken by position so the order is
-    // deterministic for a given snapshot rather than dependent on sort
-    // implementation details.
-    packages.sort_by(|left, right| {
-        right
-            .1
-            .score()
-            .cmp(&left.1.score())
-            .then_with(|| left.0.cmp(&right.0))
-    });
-
-    let mut chosen: HashSet<usize> = HashSet::new();
-    let mut selection = TemplateSelection {
-        skipped_over_ceiling,
-        ..TemplateSelection::default()
+    let parents = candidates
+        .iter()
+        .map(|candidate| {
+            let mut parents = candidate
+                .transaction
+                .input
+                .iter()
+                .filter_map(|input| position.get(&input.previous_output.txid).copied())
+                .collect::<Vec<_>>();
+            parents.sort_unstable();
+            parents.dedup();
+            parents
+        })
+        .collect::<Vec<_>>();
+    let fractions = candidates
+        .iter()
+        .map(|candidate| {
+            let size = candidate
+                .transaction
+                .weight()
+                .to_wu()
+                .max(candidate.sigop_cost.saturating_mul(20))
+                .div_ceil(4);
+            Ok(FeeFrac::new(
+                i64::try_from(candidate.fee_sats)?,
+                i32::try_from(size)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, std::num::TryFromIntError>>();
+    let Ok(fractions) = fractions else {
+        return selection;
     };
-    for (_, package) in packages {
-        let pending: Vec<usize> = package
-            .members
-            .iter()
-            .copied()
-            .filter(|member| !chosen.contains(member))
-            .collect();
-        if pending.is_empty() {
+    let Ok(chunks) = linearize_components(&fractions, &parents, MAX_MEMPOOL_CLUSTER_TRANSACTIONS)
+    else {
+        return selection;
+    };
+    let mut chosen = vec![false; candidates.len()];
+    for chunk in chunks {
+        let members = chunk.members.iter().copied().collect::<BTreeSet<_>>();
+        if members.iter().any(|&member| {
+            parents[member]
+                .iter()
+                .any(|parent| !chosen[*parent] && !members.contains(parent))
+        }) {
             continue;
         }
-        let (weight, sigop_cost, fee_sats) = pending.iter().fold((0, 0, 0), |totals, member| {
-            let candidate = &candidates[*member];
-            (
-                totals.0 + candidate.transaction.weight().to_wu(),
-                totals.1 + candidate.sigop_cost,
-                totals.2 + candidate.fee_sats,
-            )
-        });
-        if selection.weight + weight > limits.max_weight
-            || selection.sigop_cost + sigop_cost > limits.max_sigop_cost
+        let totals = chunk
+            .members
+            .iter()
+            .try_fold((0_u64, 0_u64, 0_u64), |totals, member| {
+                let candidate = &candidates[*member];
+                Some((
+                    totals
+                        .0
+                        .checked_add(candidate.transaction.weight().to_wu())?,
+                    totals.1.checked_add(candidate.sigop_cost)?,
+                    totals.2.checked_add(candidate.fee_sats)?,
+                ))
+            });
+        let Some((weight, sigop_cost, fee_sats)) = totals else {
+            continue;
+        };
+        if weight > limits.max_weight.saturating_sub(selection.weight)
+            || sigop_cost > limits.max_sigop_cost.saturating_sub(selection.sigop_cost)
         {
             continue;
         }
-        chosen.extend(pending);
+        let Some(total_fees) = selection.fee_sats.checked_add(fee_sats) else {
+            continue;
+        };
+        for member in chunk.members {
+            chosen[member] = true;
+            selection
+                .transactions
+                .push(candidates[member].transaction.clone());
+        }
         selection.weight += weight;
         selection.sigop_cost += sigop_cost;
-        selection.fee_sats += fee_sats;
+        selection.fee_sats = total_fees;
     }
 
-    // Emitting by candidate position restores the snapshot's dependency order
-    // across every package at once, so no child precedes a parent chosen for
-    // a different package.
-    let mut ordered: Vec<usize> = chosen.into_iter().collect();
-    ordered.sort_unstable();
-    selection.transactions = ordered
-        .into_iter()
-        .map(|index| candidates[index].transaction.clone())
-        .collect();
     selection
-}
-
-/// Collects `index` and every candidate ancestor it depends on.
-fn ancestor_package(
-    candidates: &[TemplateCandidate],
-    position: &HashMap<Txid, usize>,
-    index: usize,
-) -> Package {
-    let mut members = HashSet::from([index]);
-    let mut frontier = vec![index];
-    while let Some(current) = frontier.pop() {
-        for input in &candidates[current].transaction.input {
-            let Some(parent) = position.get(&input.previous_output.txid) else {
-                // A confirmed prevout: outside the candidate set and already
-                // paid for by the block that contains it.
-                continue;
-            };
-            if members.insert(*parent) {
-                frontier.push(*parent);
-            }
-        }
-    }
-    let mut members: Vec<usize> = members.into_iter().collect();
-    members.sort_unstable();
-    let (fee_sats, weight) = members.iter().fold((0, 0), |totals, member| {
-        let candidate = &candidates[*member];
-        (
-            totals.0 + candidate.fee_sats,
-            totals.1 + candidate.transaction.weight().to_wu(),
-        )
-    });
-    Package {
-        members,
-        fee_sats,
-        weight,
-    }
 }
 
 #[cfg(test)]
@@ -261,6 +246,74 @@ mod tests {
             txid: Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([seed; 32])),
             vout: 0,
         }
+    }
+
+    #[test]
+    fn upstream_selection_scores_sigop_adjusted_vsize() {
+        let expensive = candidate(transaction(&[outpoint(1)], 1, 0), 1_000, 1_000);
+        let efficient = candidate(transaction(&[outpoint(2)], 1, 0), 100, 0);
+        let wanted = efficient.transaction.compute_txid();
+        let limits = TemplateLimits {
+            max_weight: efficient.transaction.weight().to_wu(),
+            max_sigop_cost: MAX_BLOCK_SIGOPS_COST,
+        };
+        let selected = select_template_transactions(&[expensive, efficient], limits);
+        assert_eq!(selected.transactions[0].compute_txid(), wanted);
+    }
+
+    #[test]
+    fn upstream_skipped_parent_chunk_cannot_leave_a_child_in_the_template() {
+        let parent = transaction(&[outpoint(1)], 1, 2_000);
+        let child = transaction(&[OutPoint::new(parent.compute_txid(), 0)], 1, 0);
+        let other = transaction(&[outpoint(2)], 1, 0);
+        let wanted = other.compute_txid();
+        let limits = TemplateLimits {
+            max_weight: other.weight().to_wu() * 2,
+            max_sigop_cost: MAX_BLOCK_SIGOPS_COST,
+        };
+        let selected = select_template_transactions(
+            &[
+                candidate(parent, 10_000_000, 0),
+                candidate(child, 1, 0),
+                candidate(other, 2, 0),
+            ],
+            limits,
+        );
+        assert_eq!(
+            selected
+                .transactions
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>(),
+            vec![wanted]
+        );
+    }
+
+    #[test]
+    fn upstream_shared_parent_is_charged_once_and_low_fee_child_waits() {
+        let parent = transaction(&[outpoint(1)], 2, 0);
+        let rich = transaction(&[OutPoint::new(parent.compute_txid(), 0)], 1, 0);
+        let low = transaction(&[OutPoint::new(parent.compute_txid(), 1)], 1, 0);
+        let other = transaction(&[outpoint(2)], 1, 0);
+        let expected = [&parent, &rich, &other, &low].map(Transaction::compute_txid);
+        let selected = select_template_transactions(
+            &[
+                candidate(parent, 0, 0),
+                candidate(low, 100, 0),
+                candidate(other, 150, 0),
+                candidate(rich, 1_000, 0),
+            ],
+            TemplateLimits::default(),
+        );
+        assert_eq!(
+            selected
+                .transactions
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(selected.fee_sats, 1_250);
     }
 
     #[test]

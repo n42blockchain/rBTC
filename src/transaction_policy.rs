@@ -85,6 +85,9 @@ pub enum TransactionPolicyError {
     /// A P2SH input has no parseable final redeem-script push.
     #[error("input {0} has no parseable P2SH redeem script")]
     P2shRedeemScript(usize),
+    /// Legacy scriptCode must remain constant even across unexecuted branches.
+    #[error("input {0} contains a non-standard legacy OP_CODESEPARATOR")]
+    LegacyCodeSeparator(usize),
     /// A P2SH redeem script exceeds the accurate sigop ceiling.
     #[error("input {index} P2SH redeem script has {sigops} sigops; limit is {limit}")]
     P2shSigops {
@@ -266,10 +269,21 @@ pub fn validate_standard_inputs(
                 return Err(TransactionPolicyError::UpgradableWitnessProgram(index));
             }
         }
+        let witness_program = redeem_script.as_deref().unwrap_or(prevout.as_script());
+        // SCRIPT_VERIFY_CONST_SCRIPTCODE is policy, not a block-validity rule.
+        // Scan parsed instructions rather than raw bytes: pushed 0xab data is
+        // permitted, but OP_CODESEPARATOR in an unexecuted branch is not.
+        if !witness_program.is_witness_program()
+            && witness_program.instructions().any(|instruction| {
+                matches!(instruction, Ok(bitcoin::script::Instruction::Op(opcode))
+                    if opcode == bitcoin::opcodes::all::OP_CODESEPARATOR)
+            })
+        {
+            return Err(TransactionPolicyError::LegacyCodeSeparator(index));
+        }
         if input.witness.is_empty() {
             continue;
         }
-        let witness_program = redeem_script.as_deref().unwrap_or(prevout.as_script());
         if !witness_program.is_witness_program() {
             return Err(TransactionPolicyError::UnexpectedWitness(index));
         }
@@ -461,6 +475,45 @@ mod tests {
             .push_int(i64::try_from(public_keys).unwrap())
             .push_opcode(opcodes::all::OP_CHECKMULTISIG)
             .into_script()
+    }
+
+    #[test]
+    fn upstream_codesep_is_policy_only_and_does_not_reject_pushed_bytes_or_segwit() {
+        let redeem = ScriptBuf::from_bytes(vec![0x00, 0x63, 0xab, 0x68, 0x51]);
+        let prevout = redeem.to_p2sh();
+        let mut tx = standard_transaction();
+        tx.input[0].witness = Witness::new();
+        tx.input[0].script_sig = Builder::new()
+            .push_slice(PushBytesBuf::try_from(redeem.clone().into_bytes()).unwrap())
+            .into_script();
+        let coin = crate::utxo::Utxo {
+            value_sats: 10_000,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 1,
+            script_pubkey: prevout.clone().into_bytes(),
+        };
+        crate::consensus::verify_transaction_scripts_with_flags(
+            &tx,
+            &[coin],
+            bitcoinconsensus::VERIFY_P2SH,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_standard_inputs(&tx, &[prevout]),
+            Err(TransactionPolicyError::LegacyCodeSeparator(0))
+        );
+
+        let pushed = ScriptBuf::from_bytes(vec![0x01, 0xab, 0x75, 0x51]);
+        tx.input[0].script_sig = Builder::new()
+            .push_slice(PushBytesBuf::try_from(pushed.clone().into_bytes()).unwrap())
+            .into_script();
+        assert_eq!(validate_standard_inputs(&tx, &[pushed.to_p2sh()]), Ok(()));
+
+        tx.input[0].script_sig = ScriptBuf::new();
+        tx.input[0].witness = Witness::from_slice(&[redeem.as_bytes()]);
+        assert_eq!(validate_standard_inputs(&tx, &[redeem.to_p2wsh()]), Ok(()));
     }
 
     #[test]
