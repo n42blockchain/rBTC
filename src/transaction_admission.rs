@@ -6,7 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use bitcoin::{
@@ -379,7 +379,11 @@ pub struct AdmittedTransactionRelay {
 
 #[derive(Clone)]
 struct AdmittedTransaction {
-    transaction: Transaction,
+    // Candidate pools share immutable payloads. IDs are computed before sharing
+    // and cannot become stale through any admission or snapshot API.
+    transaction: Arc<Transaction>,
+    txid: Txid,
+    wtxid: Wtxid,
     serialized_len: usize,
     fee_sats: u64,
     policy_vsize: usize,
@@ -449,6 +453,7 @@ struct PoolChunk {
 #[derive(Clone)]
 pub struct TransactionAdmissionPool {
     entries: VecDeque<AdmittedTransaction>,
+    positions: BTreeMap<Txid, usize>,
     spent: BTreeMap<OutPoint, Txid>,
     retained_bytes: usize,
     orphans: VecDeque<OrphanTransaction>,
@@ -474,6 +479,7 @@ impl Default for TransactionAdmissionPool {
     fn default() -> Self {
         Self {
             entries: VecDeque::new(),
+            positions: BTreeMap::new(),
             spent: BTreeMap::new(),
             retained_bytes: 0,
             orphans: VecDeque::new(),
@@ -599,10 +605,7 @@ impl TransactionAdmissionPool {
             let wtxid = transaction.compute_wtxid();
             if transaction.is_coinbase()
                 || transaction.weight().to_wu() > u64::from(bitcoin::policy::MAX_STANDARD_TX_WEIGHT)
-                || self
-                    .entries
-                    .iter()
-                    .any(|entry| entry.transaction.compute_txid() == txid)
+                || self.positions.contains_key(&txid)
                 || self.orphans.iter().any(|orphan| {
                     orphan.transaction.compute_txid() == txid
                         || orphan.transaction.compute_wtxid() == wtxid
@@ -659,12 +662,7 @@ impl TransactionAdmissionPool {
         });
         let mut child_txids = BTreeSet::<Txid>::new();
         for parent in parents {
-            let Some(transaction) = self
-                .entries
-                .iter()
-                .find(|entry| entry.transaction.compute_txid() == *parent)
-                .map(|entry| &entry.transaction)
-            else {
+            let Some(transaction) = self.entry(*parent).map(|entry| &entry.transaction) else {
                 continue;
             };
             for vout in 0..transaction.output.len() {
@@ -731,9 +729,7 @@ impl TransactionAdmissionPool {
     /// Returns whether the active pool, orphanage, or recent chain knows a txid.
     #[must_use]
     pub fn knows_transaction(&self, txid: Txid) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.transaction.compute_txid() == txid)
+        self.positions.contains_key(&txid)
             || self
                 .orphans
                 .iter()
@@ -744,9 +740,7 @@ impl TransactionAdmissionPool {
     /// Returns whether the active pool, orphanage, or recent chain knows a wtxid.
     #[must_use]
     pub fn knows_wtxid(&self, wtxid: Wtxid) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| entry.transaction.compute_wtxid() == wtxid)
+        self.entries.iter().any(|entry| entry.wtxid == wtxid)
             || self
                 .orphans
                 .iter()
@@ -1129,7 +1123,7 @@ impl TransactionAdmissionPool {
     pub fn snapshot(&self) -> Vec<Transaction> {
         self.entries
             .iter()
-            .map(|entry| entry.transaction.clone())
+            .map(|entry| (*entry.transaction).clone())
             .collect()
     }
 
@@ -1143,10 +1137,7 @@ impl TransactionAdmissionPool {
     /// [`MAX_MEMPOOL_CLUSTER_VBYTES`].
     #[must_use]
     pub fn cluster_of(&self, txid: Txid) -> Option<(Vec<Txid>, usize)> {
-        let in_pool = self
-            .entries
-            .iter()
-            .any(|entry| entry.transaction.compute_txid() == txid);
+        let in_pool = self.positions.contains_key(&txid);
         if !in_pool {
             return None;
         }
@@ -1165,11 +1156,7 @@ impl TransactionAdmissionPool {
         &self,
         txid: Txid,
     ) -> Option<Vec<crate::feerate_diagram::FeeFrac>> {
-        if !self
-            .entries
-            .iter()
-            .any(|entry| entry.transaction.compute_txid() == txid)
-        {
+        if !self.positions.contains_key(&txid) {
             return None;
         }
         let affected = self.cluster_closure(txid);
@@ -1179,12 +1166,7 @@ impl TransactionAdmissionPool {
     /// Clones the active pool with exact fee and policy-vsize relay metadata.
     #[must_use]
     pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
-        let by_txid = self
-            .entries
-            .iter()
-            .map(|entry| (entry.transaction.compute_txid(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let all = by_txid.keys().copied().collect();
+        let all = self.positions.keys().copied().collect();
         // Ordering is a relay optimization, not an additional validity gate.
         // If an invariant fails, retain the original dependency-ordered view.
         let entries = self.chunks_for(&all).map_or_else(
@@ -1193,14 +1175,14 @@ impl TransactionAdmissionPool {
                 chunks
                     .into_iter()
                     .flat_map(|chunk| chunk.members)
-                    .map(|txid| by_txid[&txid])
+                    .map(|txid| self.entry(txid).expect("chunk members remain retained"))
                     .collect()
             },
         );
         entries
             .into_iter()
             .map(|entry| AdmittedTransactionRelay {
-                transaction: entry.transaction.clone(),
+                transaction: (*entry.transaction).clone(),
                 fee_sats: entry.fee_sats,
                 policy_vsize: entry.policy_vsize,
                 sigop_cost: entry.sigop_cost,
@@ -1231,11 +1213,7 @@ impl TransactionAdmissionPool {
         now: u32,
     ) -> Result<TransactionAdmissionOutcome, TransactionAdmissionError> {
         let wtxid = transaction.compute_wtxid();
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.transaction.compute_wtxid() == wtxid)
-        {
+        if self.entries.iter().any(|entry| entry.wtxid == wtxid) {
             return Ok(TransactionAdmissionOutcome::AlreadyPresent(wtxid));
         }
         let txid = transaction.compute_txid();
@@ -1368,19 +1346,11 @@ impl TransactionAdmissionPool {
                 return Err(TransactionAdmissionError::DuplicatePackageTransaction(txid));
             }
             let wtxid = transaction.compute_wtxid();
-            if self
-                .entries
-                .iter()
-                .any(|entry| entry.transaction.compute_wtxid() == wtxid)
-            {
+            if self.entries.iter().any(|entry| entry.wtxid == wtxid) {
                 already_present += 1;
                 continue;
             }
-            if self
-                .entries
-                .iter()
-                .any(|entry| entry.transaction.compute_txid() == txid)
-            {
+            if self.positions.contains_key(&txid) {
                 // Core package submission substitutes the already-admitted
                 // witness variant and deliberately ignores this one's validity.
                 already_present += 1;
@@ -1414,8 +1384,7 @@ impl TransactionAdmissionPool {
         for input in &candidate.input {
             let parent_txid = input.previous_output.txid;
             let parent_is_truc = self.entries.iter().any(|entry| {
-                entry.transaction.compute_txid() == parent_txid
-                    && entry.transaction.version.0 == TRUC_VERSION
+                entry.txid == parent_txid && entry.transaction.version.0 == TRUC_VERSION
             });
             if !parent_is_truc {
                 continue;
@@ -1430,7 +1399,7 @@ impl TransactionAdmissionPool {
                         .iter()
                         .any(|input| input.previous_output.txid == parent_txid)
                 })
-                .map(|entry| entry.transaction.compute_txid())
+                .map(|entry| entry.txid)
                 .filter(|sibling| !direct_conflicts.contains(sibling))
                 .collect::<BTreeSet<_>>();
             if siblings.len() == 1 {
@@ -1476,18 +1445,13 @@ impl TransactionAdmissionPool {
         let direct_conflict_fees_and_sizes = self
             .entries
             .iter()
-            .filter(|entry| direct_conflicts.contains(&entry.transaction.compute_txid()))
-            .map(|entry| {
-                (
-                    entry.transaction.compute_txid(),
-                    (entry.fee_sats, entry.policy_vsize),
-                )
-            })
+            .filter(|entry| direct_conflicts.contains(&entry.txid))
+            .map(|entry| (entry.txid, (entry.fee_sats, entry.policy_vsize)))
             .collect();
         let conflicts_fee_sats = self
             .entries
             .iter()
-            .filter(|entry| txids.contains(&entry.transaction.compute_txid()))
+            .filter(|entry| txids.contains(&entry.txid))
             .fold(0_u64, |total, entry| total.saturating_add(entry.fee_sats));
         // Capture the affected diagram before any mutation. The affected set
         // spans every cluster the replacement touches: the conflicts'
@@ -1500,12 +1464,7 @@ impl TransactionAdmissionPool {
         for transaction in ordered {
             for input in &transaction.input {
                 let parent = input.previous_output.txid;
-                if !affected.contains(&parent)
-                    && self
-                        .entries
-                        .iter()
-                        .any(|entry| entry.transaction.compute_txid() == parent)
-                {
+                if !affected.contains(&parent) && self.positions.contains_key(&parent) {
                     affected.extend(self.cluster_closure(parent));
                 }
             }
@@ -1515,8 +1474,7 @@ impl TransactionAdmissionPool {
             .difference(&txids)
             .copied()
             .collect::<BTreeSet<_>>();
-        self.entries
-            .retain(|entry| !txids.contains(&entry.transaction.compute_txid()));
+        self.entries.retain(|entry| !txids.contains(&entry.txid));
         self.rebuild_indexes();
         Ok(ReplacementPlan {
             txids,
@@ -1535,7 +1493,7 @@ impl TransactionAdmissionPool {
         let allowed_parent_txids = self
             .entries
             .iter()
-            .filter(|entry| direct_conflicts.contains(&entry.transaction.compute_txid()))
+            .filter(|entry| direct_conflicts.contains(&entry.txid))
             .flat_map(|entry| {
                 entry
                     .transaction
@@ -1547,7 +1505,7 @@ impl TransactionAdmissionPool {
         let pool_txids = self
             .entries
             .iter()
-            .map(|entry| entry.transaction.compute_txid())
+            .map(|entry| entry.txid)
             .collect::<BTreeSet<_>>();
         if let Some(outpoint) = ordered
             .iter()
@@ -1628,8 +1586,11 @@ impl TransactionAdmissionPool {
                 .retained_bytes
                 .checked_add(serialized_len)
                 .expect("bounded admitted transaction bytes fit usize");
+            self.positions.insert(txid, self.entries.len());
             self.entries.push_back(AdmittedTransaction {
-                transaction,
+                txid,
+                wtxid: transaction.compute_wtxid(),
+                transaction: Arc::new(transaction),
                 serialized_len,
                 fee_sats: applied.fee_sats,
                 policy_vsize: applied.policy_vsize,
@@ -1664,9 +1625,10 @@ impl TransactionAdmissionPool {
         let previous = self
             .entries
             .drain(..)
-            .map(|entry| entry.transaction)
+            .map(|entry| Arc::unwrap_or_clone(entry.transaction))
             .collect::<Vec<_>>();
         self.spent.clear();
+        self.positions.clear();
         self.retained_bytes = 0;
         let before = previous.len();
         for transaction in previous {
@@ -1684,7 +1646,7 @@ impl TransactionAdmissionPool {
             .collect::<BTreeSet<_>>();
         let mut removed = Vec::new();
         self.entries.retain(|entry| {
-            let txid = entry.transaction.compute_txid();
+            let txid = entry.txid;
             if closure.contains(&txid) {
                 removed.push(txid);
                 false
@@ -1704,12 +1666,7 @@ impl TransactionAdmissionPool {
     ) -> Result<Vec<Txid>, TransactionAdmissionError> {
         let mut evicted = Vec::new();
         while self.entries.len() > self.max_transactions || self.retained_bytes > self.max_bytes {
-            let positions = self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (entry.transaction.compute_txid(), index))
-                .collect::<BTreeMap<_, _>>();
+            let positions = &self.positions;
             let chunks = self.chunks_for(&positions.keys().copied().collect())?;
             let chunk_of = chunks
                 .iter()
@@ -1718,7 +1675,7 @@ impl TransactionAdmissionPool {
                 .collect::<BTreeMap<_, _>>();
             let mut has_child_chunk = vec![false; chunks.len()];
             for entry in &self.entries {
-                let child = chunk_of[&entry.transaction.compute_txid()];
+                let child = chunk_of[&entry.txid];
                 for input in &entry.transaction.input {
                     if let Some(&parent) = chunk_of.get(&input.previous_output.txid) {
                         if parent != child {
@@ -1750,7 +1707,7 @@ impl TransactionAdmissionPool {
             let (removed_fee_sats, removed_vbytes) = self
                 .entries
                 .iter()
-                .filter(|entry| removed.contains(&entry.transaction.compute_txid()))
+                .filter(|entry| removed.contains(&entry.txid))
                 .fold((0_u64, 0_usize), |(fees, vbytes), entry| {
                     (
                         fees.saturating_add(entry.fee_sats),
@@ -1768,7 +1725,7 @@ impl TransactionAdmissionPool {
                 self.rolling_fee_decay_enabled = false;
             }
             self.entries.retain(|entry| {
-                let txid = entry.transaction.compute_txid();
+                let txid = entry.txid;
                 if removed.contains(&txid) {
                     evicted.push(txid);
                     false
@@ -1811,54 +1768,47 @@ impl TransactionAdmissionPool {
         }
     }
 
+    fn entry(&self, txid: Txid) -> Option<&AdmittedTransaction> {
+        self.positions
+            .get(&txid)
+            .map(|position| &self.entries[*position])
+    }
+
+    fn children(&self, txid: Txid) -> impl Iterator<Item = Txid> + '_ {
+        // OutPoint sorts by txid and then vout. The conflict index already
+        // contains every input edge, so no second child graph is allocated.
+        self.spent
+            .range(OutPoint::new(txid, 0)..=OutPoint::new(txid, u32::MAX))
+            .map(|(_, child)| *child)
+    }
+
     fn descendant_closure(&self, txid: Txid) -> BTreeSet<Txid> {
-        let mut removed = BTreeSet::from([txid]);
-        loop {
-            let descendants = self
-                .entries
-                .iter()
-                .filter(|entry| {
-                    entry
-                        .transaction
-                        .input
-                        .iter()
-                        .any(|input| removed.contains(&input.previous_output.txid))
-                })
-                .map(|entry| entry.transaction.compute_txid())
-                .filter(|txid| !removed.contains(txid))
-                .collect::<Vec<_>>();
-            if descendants.is_empty() {
-                break;
+        let mut descendants = BTreeSet::from([txid]);
+        let mut pending = vec![txid];
+        while let Some(candidate) = pending.pop() {
+            for child in self.children(candidate) {
+                if descendants.insert(child) {
+                    pending.push(child);
+                }
             }
-            removed.extend(descendants);
         }
-        removed
+        descendants
     }
 
     fn ancestor_closure(&self, txid: Txid) -> BTreeSet<Txid> {
-        let pool_txids = self
-            .entries
-            .iter()
-            .map(|entry| entry.transaction.compute_txid())
-            .collect::<BTreeSet<_>>();
         let mut ancestors = BTreeSet::from([txid]);
         let mut pending = vec![txid];
         while let Some(candidate) = pending.pop() {
-            let Some(transaction) = self
-                .entries
-                .iter()
-                .find(|entry| entry.transaction.compute_txid() == candidate)
-                .map(|entry| &entry.transaction)
-            else {
+            let Some(entry) = self.entry(candidate) else {
                 continue;
             };
-            for parent in transaction
+            for parent in entry
+                .transaction
                 .input
                 .iter()
                 .map(|input| input.previous_output.txid)
-                .filter(|parent| pool_txids.contains(parent))
             {
-                if ancestors.insert(parent) {
+                if self.positions.contains_key(&parent) && ancestors.insert(parent) {
                     pending.push(parent);
                 }
             }
@@ -1867,52 +1817,35 @@ impl TransactionAdmissionPool {
     }
 
     fn closure_vbytes(&self, txids: &BTreeSet<Txid>) -> usize {
-        self.entries
+        txids
             .iter()
-            .filter(|entry| txids.contains(&entry.transaction.compute_txid()))
+            .filter_map(|txid| self.entry(*txid))
             .fold(0_usize, |total, entry| {
                 total.saturating_add(entry.policy_vsize)
             })
     }
 
     fn cluster_closure(&self, txid: Txid) -> BTreeSet<Txid> {
-        let pool_txids = self
-            .entries
-            .iter()
-            .map(|entry| entry.transaction.compute_txid())
-            .collect::<BTreeSet<_>>();
-        let mut cluster = BTreeSet::new();
+        let mut cluster = BTreeSet::from([txid]);
         let mut pending = vec![txid];
         while let Some(candidate) = pending.pop() {
-            if !cluster.insert(candidate) {
-                continue;
-            }
-            if let Some(transaction) = self
-                .entries
-                .iter()
-                .find(|entry| entry.transaction.compute_txid() == candidate)
-                .map(|entry| &entry.transaction)
-            {
-                pending.extend(
-                    transaction
-                        .input
-                        .iter()
-                        .map(|input| input.previous_output.txid)
-                        .filter(|parent| pool_txids.contains(parent)),
-                );
-            }
-            pending.extend(
-                self.entries
+            if let Some(entry) = self.entry(candidate) {
+                for parent in entry
+                    .transaction
+                    .input
                     .iter()
-                    .filter(|entry| {
-                        entry
-                            .transaction
-                            .input
-                            .iter()
-                            .any(|input| input.previous_output.txid == candidate)
-                    })
-                    .map(|entry| entry.transaction.compute_txid()),
-            );
+                    .map(|input| input.previous_output.txid)
+                {
+                    if self.positions.contains_key(&parent) && cluster.insert(parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+            for child in self.children(candidate) {
+                if cluster.insert(child) {
+                    pending.push(child);
+                }
+            }
         }
         cluster
     }
@@ -1941,27 +1874,6 @@ impl TransactionAdmissionPool {
     ) -> Result<Vec<PoolChunk>, TransactionAdmissionError> {
         use crate::feerate_diagram::{Cluster, FeeFrac, chunk_linearization_with_members};
         let unavailable = TransactionAdmissionError::ReplacementDiagramUnavailable;
-        let entries = self
-            .entries
-            .iter()
-            .map(|entry| (entry.transaction.compute_txid(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let mut neighbors: BTreeMap<Txid, Vec<Txid>> = BTreeMap::new();
-        for (child, entry) in &entries {
-            for input in &entry.transaction.input {
-                let parent = input.previous_output.txid;
-                if !entries.contains_key(&parent) {
-                    continue;
-                }
-                if affected.contains(child) != affected.contains(&parent) {
-                    return Err(unavailable("affected transactions must be cluster-closed"));
-                }
-                if affected.contains(child) {
-                    neighbors.entry(*child).or_default().push(parent);
-                    neighbors.entry(parent).or_default().push(*child);
-                }
-            }
-        }
         let mut chunks: Vec<PoolChunk> = Vec::new();
         let mut visited: BTreeSet<Txid> = BTreeSet::new();
         for txid in affected {
@@ -1975,7 +1887,21 @@ impl TransactionAdmissionPool {
                     if members.len() > MAX_MEMPOOL_CLUSTER_TRANSACTIONS {
                         return Err(unavailable("cluster exceeds transaction limit"));
                     }
-                    pending.extend(neighbors.get(&member).into_iter().flatten().copied());
+                    if !affected.contains(&member) {
+                        return Err(unavailable("affected transactions must be cluster-closed"));
+                    }
+                    let entry = self
+                        .entry(member)
+                        .ok_or(unavailable("affected transaction left the pool"))?;
+                    pending.extend(
+                        entry
+                            .transaction
+                            .input
+                            .iter()
+                            .map(|input| input.previous_output.txid)
+                            .filter(|parent| self.positions.contains_key(parent)),
+                    );
+                    pending.extend(self.children(member));
                 }
             }
             visited.extend(members.iter().copied());
@@ -1989,8 +1915,8 @@ impl TransactionAdmissionPool {
             let mut fractions = Vec::with_capacity(ordered_members.len());
             let mut parents: Vec<Vec<usize>> = Vec::with_capacity(ordered_members.len());
             for member in &ordered_members {
-                let entry = entries
-                    .get(member)
+                let entry = self
+                    .entry(*member)
                     .ok_or(unavailable("affected transaction left the pool"))?;
                 let fee = i64::try_from(entry.fee_sats)
                     .map_err(|_| unavailable("fee exceeds the diagram range"))?;
@@ -2083,7 +2009,7 @@ impl TransactionAdmissionPool {
             .iter()
             .map(|entry| {
                 (
-                    entry.transaction.compute_txid(),
+                    entry.txid,
                     (entry.transaction.version.0, entry.policy_vsize),
                 )
             })
@@ -2093,9 +2019,7 @@ impl TransactionAdmissionPool {
                 continue;
             };
             let parents = self
-                .entries
-                .iter()
-                .find(|entry| entry.transaction.compute_txid() == *txid)
+                .entry(*txid)
                 .into_iter()
                 .flat_map(|entry| &entry.transaction.input)
                 .map(|input| input.previous_output.txid)
@@ -2179,12 +2103,12 @@ impl TransactionAdmissionPool {
         let pool_txids = self
             .entries
             .iter()
-            .map(|entry| entry.transaction.compute_txid())
+            .map(|entry| entry.txid)
             .collect::<BTreeSet<_>>();
         for entry in self
             .entries
             .iter()
-            .filter(|entry| accepted.contains(&entry.transaction.compute_txid()))
+            .filter(|entry| accepted.contains(&entry.txid))
         {
             relevant.extend(
                 entry
@@ -2198,9 +2122,9 @@ impl TransactionAdmissionPool {
         for entry in self
             .entries
             .iter()
-            .filter(|entry| relevant.contains(&entry.transaction.compute_txid()))
+            .filter(|entry| relevant.contains(&entry.txid))
         {
-            let txid = entry.transaction.compute_txid();
+            let txid = entry.txid;
             let dust = entry
                 .transaction
                 .output
@@ -2263,12 +2187,7 @@ impl TransactionAdmissionPool {
             if !visited.insert(candidate) {
                 continue;
             }
-            let Some(transaction) = self
-                .entries
-                .iter()
-                .find(|entry| entry.transaction.compute_txid() == candidate)
-                .map(|entry| &entry.transaction)
-            else {
+            let Some(transaction) = self.entry(candidate).map(|entry| &entry.transaction) else {
                 continue;
             };
             // TRUC transactions signal replaceability by version alone,
@@ -2295,9 +2214,11 @@ impl TransactionAdmissionPool {
 
     fn rebuild_indexes(&mut self) {
         self.spent.clear();
+        self.positions.clear();
         self.retained_bytes = 0;
-        for entry in &self.entries {
-            let txid = entry.transaction.compute_txid();
+        for (position, entry) in self.entries.iter().enumerate() {
+            let txid = entry.txid;
+            self.positions.insert(txid, position);
             for input in &entry.transaction.input {
                 self.spent.insert(input.previous_output, txid);
             }
@@ -2970,7 +2891,9 @@ mod tests {
             let serialized_len = serialize(&transaction).len();
             pool.entries.push_back(AdmittedTransaction {
                 policy_vsize: transaction.vsize(),
-                transaction,
+                txid: transaction.compute_txid(),
+                wtxid: transaction.compute_wtxid(),
+                transaction: Arc::new(transaction),
                 serialized_len,
                 fee_sats: 0,
                 sigop_cost: 0,
@@ -2990,6 +2913,171 @@ mod tests {
             .iter()
             .map(Transaction::compute_txid)
             .collect()
+    }
+
+    #[test]
+    fn candidate_clones_share_payloads_but_keep_pool_and_snapshot_mutations_isolated() {
+        let (_directory, store) = store();
+        let (first, first_utxo, transaction) = spend(1);
+        let (second, second_utxo, candidate) = spend(2);
+        store
+            .apply(
+                &[],
+                &[(first.into(), first_utxo), (second.into(), second_utxo)],
+            )
+            .unwrap();
+        let mut original = TransactionAdmissionPool::default();
+        original
+            .admit(&store, transaction.clone(), context())
+            .unwrap();
+        let mut cloned = original.clone();
+        assert!(Arc::ptr_eq(
+            &original.entries[0].transaction,
+            &cloned.entries[0].transaction
+        ));
+        let mut snapshot = cloned.snapshot();
+        snapshot[0].input[0].witness = Witness::new();
+        assert_eq!(original.snapshot(), vec![transaction.clone()]);
+        cloned.admit(&store, candidate, context()).unwrap();
+        assert_eq!(original.snapshot(), vec![transaction.clone()]);
+        assert!(Arc::ptr_eq(
+            &original.entries[0].transaction,
+            &cloned.entries[0].transaction
+        ));
+        assert_eq!(original.positions.len(), 1);
+        assert_eq!(cloned.positions.len(), 2);
+        cloned.remove_with_descendants(&BTreeSet::from([transaction.compute_txid()]));
+        assert!(original.entry(transaction.compute_txid()).is_some());
+        assert!(cloned.entry(transaction.compute_txid()).is_none());
+        assert_eq!(
+            cloned.positions.values().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+        original.reconcile(&store, context());
+        assert_eq!(original.snapshot(), vec![transaction]);
+        assert_eq!(original.positions.len(), 1);
+    }
+
+    fn scanned_closure(
+        transactions: &[Transaction],
+        root: Txid,
+        ancestors: bool,
+        descendants: bool,
+    ) -> BTreeSet<Txid> {
+        let entries = transactions
+            .iter()
+            .map(|tx| (tx.compute_txid(), tx))
+            .collect::<BTreeMap<_, _>>();
+        let mut closure = BTreeSet::from([root]);
+        loop {
+            let before = closure.len();
+            for (txid, tx) in &entries {
+                if ancestors && closure.contains(txid) {
+                    for input in &tx.input {
+                        if entries.contains_key(&input.previous_output.txid) {
+                            closure.insert(input.previous_output.txid);
+                        }
+                    }
+                }
+                if descendants
+                    && tx
+                        .input
+                        .iter()
+                        .any(|input| closure.contains(&input.previous_output.txid))
+                {
+                    closure.insert(*txid);
+                }
+            }
+            if before == closure.len() {
+                return closure;
+            }
+        }
+    }
+
+    fn assert_indexed_graph_matches_scan(pool: &TransactionAdmissionPool) {
+        let transactions = pool.snapshot();
+        assert_eq!(pool.positions.len(), transactions.len());
+        let mut spent = BTreeMap::new();
+        for (position, transaction) in transactions.iter().enumerate() {
+            let txid = transaction.compute_txid();
+            assert_eq!(pool.positions.get(&txid), Some(&position));
+            assert_eq!(pool.entries[position].txid, txid);
+            assert_eq!(pool.entries[position].wtxid, transaction.compute_wtxid());
+            for input in &transaction.input {
+                assert!(
+                    spent.insert(input.previous_output, txid).is_none(),
+                    "fixture must have no conflicting spends"
+                );
+            }
+        }
+        assert_eq!(spent, pool.spent);
+        let roots = transactions
+            .iter()
+            .flat_map(|tx| {
+                std::iter::once(tx.compute_txid())
+                    .chain(tx.input.iter().map(|input| input.previous_output.txid))
+            })
+            .collect::<BTreeSet<_>>();
+        for root in roots {
+            assert_eq!(
+                pool.ancestor_closure(root),
+                scanned_closure(&transactions, root, true, false)
+            );
+            assert_eq!(
+                pool.descendant_closure(root),
+                scanned_closure(&transactions, root, false, true)
+            );
+            let cluster = scanned_closure(&transactions, root, true, true);
+            assert_eq!(pool.cluster_closure(root), cluster);
+            let vbytes = transactions
+                .iter()
+                .filter(|tx| cluster.contains(&tx.compute_txid()))
+                .map(Transaction::vsize)
+                .sum::<usize>();
+            assert_eq!(pool.closure_vbytes(&cluster), vbytes);
+        }
+    }
+
+    #[test]
+    fn indexed_graph_matches_full_scan_across_branches_shared_parents_and_removals() {
+        for seed in 0..24_usize {
+            let mut transactions = Vec::<Transaction>::new();
+            for index in 0..24_usize {
+                let (_, _, mut tx) = spend(u8::try_from(index + 1).unwrap());
+                tx.output = vec![tx.output[0].clone(); 48];
+                if index > 0 && (seed + index) % 4 != 0 {
+                    let count = 1 + (seed + index) % 2;
+                    tx.input = (0..count)
+                        .map(|edge| {
+                            let parent = (seed * 13 + index * 7 + edge * 5) % index;
+                            let mut input = tx.input[0].clone();
+                            input.previous_output = OutPoint::new(
+                                transactions[parent].compute_txid(),
+                                u32::try_from(index * 2 + edge).unwrap(),
+                            );
+                            input
+                        })
+                        .collect();
+                }
+                transactions.push(tx);
+            }
+            let mut pool = unchecked_pool(transactions.clone());
+            assert_indexed_graph_matches_scan(&pool);
+            let untouched = pool.clone();
+            let root = transactions[(seed + 3) % transactions.len()].compute_txid();
+            let removed = scanned_closure(&transactions, root, false, true);
+            pool.remove_with_descendants(&BTreeSet::from([root]));
+            assert_eq!(
+                pool.snapshot(),
+                transactions
+                    .iter()
+                    .filter(|tx| !removed.contains(&tx.compute_txid()))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+            assert_indexed_graph_matches_scan(&pool);
+            assert_indexed_graph_matches_scan(&untouched);
+        }
     }
 
     #[test]

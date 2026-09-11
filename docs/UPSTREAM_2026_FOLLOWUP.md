@@ -6,27 +6,44 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-10)
 
-The implementation through content-bound incumbent SCRIPT reuse was pushed as
-`f3c2e9e`, `1a54604` and `51aee2a`. This continuation completes real Tor/I2P
-transport and wallet-wave tests, a real Tor name-proxy handshake, generated
-storage benchmarks, and million-UTXO compaction/restart equivalence. The live
-wallet test found and fixed premature private-session teardown by waiting for a
-matching post-transaction pong. Header retention, total admission resource
-budgets, full mainnet scale and the seven-day soak remain open.
+The earlier SCRIPT reuse and operational acceptance were pushed through
+`2630a2d`. This continuation shares immutable admitted transaction payloads across
+candidate pools, caches their IDs and indexes dependency traversal. Two new
+regressions, full-suite acceptance and live Core replacement/pressure checks pass;
+a baseline comparison measures clone, cluster-query and admission costs.
+Header retention, total admission resource budgets, full mainnet scale and the
+seven-day soak remain open.
 
 | Follow-up item | Current implementation / acceptance | Remaining work |
 | --- | --- | --- |
 | P0 BIP30/BIP34 | Historical exceptions, activation anchors and overwrite undo have passing regressions and live Core block fixtures. | No new defect found in the covered boundaries. |
 | P0 script lifetime | Owned jobs, bounded pending work, cancellation, inline backpressure and rollback regressions pass. | Whole-pipeline RSS/work accounting is still separate from the pending-queue limit. |
 | P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
-| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. Incumbent SCRIPT results now reuse an entry-owned content commitment after fresh contextual/policy checks. | Pool cloning, input lookup, hashing, policy checks and graph work still need end-to-end resource budgets. |
+| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. Incumbent SCRIPT reuse follows fresh contextual/policy checks. Candidate clones now share immutable transaction payloads; cached IDs and indexed dependency queries remove repeated unrelated-payload hashing. | Metadata cloning, fresh input lookup, replay hashing, policy checks and graph work still need end-to-end resource budgets. |
 | P1 cluster mempool | Chunk membership, topological order, exact totals and 64-entry components are now fuzzed alongside diagrams; selection/eviction regressions pass. | Exact Core optimizer parity remains unclaimed. |
 | P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed again on 2026-09-10. | Broader rolling-floor and optimizer differential coverage remains open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
 | P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Current operational acceptance
+### Current admission resource work
+
+See [the admission resource report](UPSTREAM_ADMISSION_RESOURCE_GATE.md) for the
+baseline workload, repeated measurements and limits of these results. Candidate
+clones share only immutable admitted payloads; indices and verification stamps
+remain independently owned. Public snapshots still return owned transactions.
+The dependency traversal reuses the existing spent-outpoint index and adds one
+txid-to-position index, rebuilt after removals. Chunk ordering and replacement
+policy are unchanged.
+
+All-feature acceptance: **916 passed**, 0 failed, **28 ignored** (877 library +
+39 integration, excluding duplicate subprocess-helper output). Both live Core 31
+replacement/package-pressure tests pass, as do strict all-target/all-feature
+Clippy and formatting checks. The first full run had one failover-test nonce
+mismatch; its isolated rerun and the complete second run passed without a source
+change. The first failure is retained in the evidence, with cause unconfirmed.
+
+### Prior operational acceptance (`2630a2d`)
 
 See [the operational report](UPSTREAM_OPERATIONAL_ACCEPTANCE_2026-09-10.md) for
 versions, workload sizes, raw evidence paths and reproduction commands.
@@ -214,8 +231,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 - Implement and measure valid competing-header retention, bounded recovery
   and durable eviction as specified in [the resource gate](UPSTREAM_HEADER_RESOURCE_GATE.md).
 - Bound and measure the remaining admission replay and whole-pipeline allocations.
-  Content-bound SCRIPT reuse removes repeated interpreter work for incumbents;
-  it does not bound total admission work or process RSS.
+  Content-bound SCRIPT reuse, immutable payload sharing and dependency indexing
+  remove measured repeated work, but do not bound total admission work or process
+  RSS. See [the admission resource gate](UPSTREAM_ADMISSION_RESOURCE_GATE.md).
 - Complete sustained public-network and resource-pressure workloads, longer fuzz
   campaigns, cold-disk and full mainnet storage-scale gates. Real Tor/I2P and the
   selected generated benchmarks now pass; the 160-million-UTXO workload and
