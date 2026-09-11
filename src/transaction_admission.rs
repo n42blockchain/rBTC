@@ -3959,6 +3959,75 @@ mod tests {
     }
 
     #[test]
+    fn refined_cluster_diagram_keeps_the_shared_parent_package_ahead_of_a_lower_rate_branch() {
+        let (_directory, store) = store();
+        let (parent_outpoint, mut parent_utxo, mut parent) = spend(153);
+        parent_utxo.value_sats = 1_000_000;
+        parent.output[0].value = Amount::from_sat(499_900);
+        parent.output.push(parent.output[0].clone());
+        let mut data = vec![opcodes::all::OP_RETURN.to_u8()];
+        data.extend(vec![opcodes::OP_0.to_u8(); 900]);
+        parent.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(data),
+        });
+        let first = child(&parent, 498_900);
+        let mut second = first.clone();
+        second.input[0].previous_output.vout = 1;
+        let (other_outpoint, other_utxo, mut other) = spend(154);
+        other.output[0].value = Amount::from_sat(99_870);
+        let mut join = child(&second, 498_900 + 99_870 - 100);
+        join.input.push(child(&other, 99_000).input[0].clone());
+        store
+            .apply(
+                &[],
+                &[
+                    (parent_outpoint.into(), parent_utxo),
+                    (other_outpoint.into(), other_utxo),
+                ],
+            )
+            .unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+        for transaction in [&parent, &first, &second, &other, &join] {
+            pool.admit(&store, transaction.clone(), context()).unwrap();
+        }
+        assert_eq!(pool.cluster_of(parent.compute_txid()).unwrap().0.len(), 5);
+        let metadata = pool.relay_snapshot();
+        let shared_size = [&parent, &first, &second]
+            .iter()
+            .map(|transaction| pool.entry(transaction.compute_txid()).unwrap().policy_vsize)
+            .sum::<usize>();
+        assert_eq!(
+            pool.cluster_feerate_diagram(parent.compute_txid()).unwrap(),
+            vec![
+                crate::feerate_diagram::FeeFrac::new(2_200, i32::try_from(shared_size).unwrap()),
+                crate::feerate_diagram::FeeFrac::new(
+                    130,
+                    i32::try_from(pool.entry(other.compute_txid()).unwrap().policy_vsize).unwrap()
+                ),
+                crate::feerate_diagram::FeeFrac::new(
+                    100,
+                    i32::try_from(pool.entry(join.compute_txid()).unwrap().policy_vsize).unwrap()
+                ),
+            ]
+        );
+        assert_eq!(metadata[0].transaction, parent);
+        assert_eq!(
+            metadata[..3]
+                .iter()
+                .map(|entry| entry.transaction.compute_txid())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                parent.compute_txid(),
+                first.compute_txid(),
+                second.compute_txid()
+            ])
+        );
+        assert_eq!(metadata[3].transaction, other);
+        assert_eq!(metadata[4].transaction, join);
+    }
+
+    #[test]
     fn cluster_virtual_size_limit_rejects_atomically() {
         fn pad(transaction: &mut Transaction) {
             let mut script = vec![opcodes::all::OP_RETURN.to_u8()];

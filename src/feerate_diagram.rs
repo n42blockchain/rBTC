@@ -18,12 +18,24 @@
 //! The types mirror Core's `cluster_linearize.h`: [`FeeFrac`] is its
 //! `FeeFrac`, [`chunk_linearization`] is its `ChunkLinearization`, and
 //! [`compare_diagrams`] is its `CompareChunks`/feerate-diagram comparison.
-//! The linearization here is the ancestor-set greedy baseline; Core's
-//! optimal search and post-linearisation are refinements deferred to the
-//! admission-integration phase, where a live differential against Core's
-//! `cluster_linearize` is the acceptance gate.
+//! Linearization starts with the ancestor-set greedy baseline, then applies
+//! Core's backward/forward postlinearization refinement to clusters of at most
+//! 64 transactions. The full work-budgeted optimal search remains separate;
+//! matching this refinement does not establish complete optimizer parity.
 
 use std::cmp::Ordering;
+
+/// The production cluster bound; larger pure-function inputs keep the baseline.
+const POSTLINEARIZE_LIMIT: usize = 64;
+
+#[derive(Clone, Copy)]
+struct PostGroup {
+    members: u64,
+    dependencies: u64,
+    fraction: FeeFrac,
+    first: usize,
+    last: usize,
+}
 
 /// A fee amount paired with a virtual size, compared by feerate.
 ///
@@ -301,21 +313,30 @@ impl Cluster {
 
     /// Linearizes the cluster into a topologically valid order.
     ///
-    /// Ancestor-set greedy, Core's baseline lineariser: repeatedly select the
-    /// remaining transaction whose still-remaining ancestor set has the
-    /// highest feerate, then emit that whole set in topological order. Ties
-    /// are broken deterministically by the smaller ancestor-set size and then
-    /// the smaller anchor index, so the output depends only on the input.
+    /// Starts with ancestor-set greedy ordering, then performs a backward and
+    /// a forward postlinearization pass for clusters of at most 64 entries.
+    /// The refinement preserves topology and cannot worsen the feerate diagram.
+    /// It makes chunks connected and is optimal for one-parent/one-child trees;
+    /// it does not replace Core's full optimizer for arbitrary DAGs.
     ///
-    /// Worst case is O(n³) in the cluster size; admission enforces a
-    /// 64-transaction cluster bound, where that is microseconds. The
-    /// function stays total for larger inputs (fuzzing feeds them), just not
-    /// fast.
+    /// The baseline repeatedly traverses ancestor edges. The additional two
+    /// passes use fixed 64-bit dependency sets and O(n²) group operations,
+    /// without recursive or unbounded search. Larger pure-function inputs
+    /// retain the total baseline.
     ///
     /// The result is a permutation of `0..len` in which every parent precedes
     /// its children.
     #[must_use]
     pub fn linearize(&self) -> Vec<usize> {
+        let mut order = self.linearize_ancestors();
+        if self.len() <= POSTLINEARIZE_LIMIT {
+            self.post_linearize(&mut order);
+        }
+        order
+    }
+
+    /// Greedy baseline, breaking fee ties by ancestor count then anchor index.
+    fn linearize_ancestors(&self) -> Vec<usize> {
         let count = self.entries.len();
         let mut remaining = vec![true; count];
         let mut order = Vec::with_capacity(count);
@@ -339,9 +360,9 @@ impl Cluster {
                             Ordering::Greater => true,
                             Ordering::Less => false,
                             // Deterministic tie-break: fewer transactions,
-                            // then the smaller anchor index (the anchor is the
-                            // largest index in a set closed under ancestry, so
-                            // comparing anchors is stable).
+                            // then the smaller anchor index, retained by
+                            // scanning anchors in ascending order. Canonical
+                            // indices need not themselves be topological.
                             Ordering::Equal => candidate_len < *best_len,
                         }
                     }
@@ -358,6 +379,106 @@ impl Cluster {
             }
         }
         order
+    }
+
+    /// Refines a known topological permutation using Core's two-pass algorithm.
+    /// Reference: Bitcoin Core v31.0, cluster_linearize.h, PostLinearize.
+    /// Group ordering is explicit here; member chains avoid per-group vectors.
+    fn post_linearize(&self, order: &mut [usize]) {
+        debug_assert_eq!(order.len(), self.len());
+        debug_assert!(self.len() <= POSTLINEARIZE_LIMIT);
+        let mut ancestors = [0_u64; POSTLINEARIZE_LIMIT];
+        let mut descendants = [0_u64; POSTLINEARIZE_LIMIT];
+        for &index in order.iter() {
+            ancestors[index] = 1_u64 << index;
+            for &parent in &self.parents[index] {
+                ancestors[index] |= ancestors[parent];
+            }
+        }
+        for &index in order.iter().rev() {
+            descendants[index] |= 1_u64 << index;
+            for &parent in &self.parents[index] {
+                descendants[parent] |= descendants[index];
+            }
+        }
+        let empty = PostGroup {
+            members: 0,
+            dependencies: 0,
+            fraction: FeeFrac::ZERO,
+            first: 0,
+            last: 0,
+        };
+        let mut groups = [empty; POSTLINEARIZE_LIMIT];
+        let mut next_member = [usize::MAX; POSTLINEARIZE_LIMIT];
+        let mut group_order = Vec::with_capacity(order.len());
+        let mut output = Vec::with_capacity(order.len());
+        for reverse in [true, false] {
+            group_order.clear();
+            for offset in 0..order.len() {
+                let index = order[if reverse {
+                    order.len() - 1 - offset
+                } else {
+                    offset
+                }];
+                groups[index] = PostGroup {
+                    members: 1_u64 << index,
+                    dependencies: if reverse {
+                        descendants[index]
+                    } else {
+                        ancestors[index]
+                    },
+                    fraction: self.entries[index],
+                    first: index,
+                    last: index,
+                };
+                next_member[index] = usize::MAX;
+                group_order.push(index);
+                let mut position = group_order.len() - 1;
+                while position > 0 {
+                    let previous = groups[group_order[position - 1]];
+                    let current = groups[index];
+                    let comparison = current.fraction.feerate_cmp(previous.fraction);
+                    if comparison
+                        != if reverse {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    {
+                        break;
+                    }
+                    if current.dependencies & previous.members != 0 {
+                        next_member[previous.last] = current.first;
+                        groups[index] = PostGroup {
+                            members: current.members | previous.members,
+                            dependencies: current.dependencies | previous.dependencies,
+                            fraction: current.fraction.combined(previous.fraction),
+                            first: previous.first,
+                            last: current.last,
+                        };
+                        group_order.remove(position - 1);
+                    } else {
+                        group_order.swap(position - 1, position);
+                    }
+                    position -= 1;
+                }
+            }
+            output.clear();
+            for &group in &group_order {
+                let mut member = groups[group].first;
+                loop {
+                    output.push(member);
+                    if member == groups[group].last {
+                        break;
+                    }
+                    member = next_member[member];
+                }
+            }
+            if reverse {
+                output.reverse();
+            }
+            order.copy_from_slice(&output);
+        }
     }
 
     /// Orders a subset closed under ancestry so every parent precedes its
@@ -583,11 +704,44 @@ pub fn cluster_diagram(cluster: &Cluster) -> Vec<FeeFrac> {
 }
 
 #[cfg(test)]
+#[path = "feerate_diagram/refinement_tests.rs"]
+mod refinement_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn frac(fee: i64, size: i32) -> FeeFrac {
         FeeFrac::new(fee, size)
+    }
+
+    #[test]
+    fn postlinearization_separates_a_profitable_shared_parent_package() {
+        // The low-fee final child connects the independent 100/100 transaction
+        // to the shared-parent branch, so this is one mempool cluster.
+        let cluster = Cluster::new(
+            vec![
+                frac(0, 1_000),
+                frac(1_000, 100),
+                frac(1_000, 100),
+                frac(100, 100),
+                frac(0, 1),
+            ],
+            vec![vec![], vec![0], vec![0], vec![], vec![2, 3]],
+        )
+        .unwrap();
+        let greedy = chunk_linearization(cluster.fractions(), &[3, 0, 1, 2, 4]);
+        let refined = cluster_diagram(&cluster);
+        assert_eq!(
+            compare_diagrams(&refined, &greedy),
+            DiagramComparison::Better
+        );
+        assert_eq!(
+            refined,
+            vec![frac(2_000, 1_200), frac(100, 100), frac(0, 1)]
+        );
+        // Direct output of Core 31.0 PostLinearize on the greedy order above.
+        assert_eq!(cluster.linearize(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

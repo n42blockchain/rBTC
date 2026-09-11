@@ -63,13 +63,36 @@ fn check_members(entries: &[FeeFrac], parents: &[Vec<usize>], chunks: &[Lineariz
     }
 }
 
+fn check_connected_chunks(parents: &[Vec<usize>], chunks: &[LinearizedChunk]) {
+    for chunk in chunks {
+        let mut reached = vec![false; parents.len()];
+        reached[chunk.members[0]] = true;
+        loop {
+            let mut changed = false;
+            for &child in &chunk.members {
+                for &parent in &parents[child] {
+                    if chunk.members.contains(&parent) && reached[child] != reached[parent] {
+                        reached[child] = true;
+                        reached[parent] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        assert!(chunk.members.iter().all(|&index| reached[index]));
+    }
+}
+
 fuzz_target!(|input: &[u8]| {
     if input.len() < 2 {
         return;
     }
     let mut data = input;
     // Twice the enforced 64-transaction cluster bound: totality beyond the
-    // bound is asserted, at a size the O(n^3) greedy still fuzzes quickly.
+    // bound is asserted, at a size the greedy baseline still fuzzes quickly.
     let count = usize::from(data[0] % 129);
     let raw_parents_mode = data[1] & 1 == 1;
     data = &data[2..];
@@ -108,6 +131,7 @@ fuzz_target!(|input: &[u8]| {
     // whose independent components each remain within the 64-entry cap.
     if let Ok(chunks) = linearize_components(&entries, &parents, 64) {
         check_members(&entries, &parents, &chunks);
+        check_connected_chunks(&parents, &chunks);
         assert!(chunks.iter().all(|chunk| chunk.members.len() <= 64));
     }
     let Ok(cluster) = Cluster::new(entries, parents.clone()) else {
@@ -128,6 +152,9 @@ fuzz_target!(|input: &[u8]| {
     let chunks = chunk_linearization(cluster.fractions(), &order);
     let with_members = chunk_linearization_with_members(cluster.fractions(), &order);
     check_members(cluster.fractions(), &parents, &with_members);
+    if cluster.len() <= 64 {
+        check_connected_chunks(&parents, &with_members);
+    }
     assert_eq!(
         chunks,
         with_members
