@@ -353,7 +353,7 @@ impl TransactionAdmissionError {
 pub struct PackageAdmissionOutcome {
     /// Newly accepted transaction IDs in parent-before-child order.
     pub accepted: Vec<Txid>,
-    /// Exact witness transactions already present in the pool.
+    /// Submitted txids already retained, including alternate witness variants.
     pub already_present: usize,
     /// Existing oldest transactions and descendants evicted for capacity.
     pub evicted: Vec<Txid>,
@@ -1216,11 +1216,11 @@ impl TransactionAdmissionPool {
         context: TransactionAdmissionContext,
         now: u32,
     ) -> Result<TransactionAdmissionOutcome, TransactionAdmissionError> {
+        let txid = transaction.compute_txid();
         let wtxid = transaction.compute_wtxid();
-        if self.entries.iter().any(|entry| entry.wtxid == wtxid) {
+        if self.entry(txid).is_some_and(|entry| entry.wtxid == wtxid) {
             return Ok(TransactionAdmissionOutcome::AlreadyPresent(wtxid));
         }
-        let txid = transaction.compute_txid();
         let outcome = self.admit_package_at(store, vec![transaction], context, now)?;
         Ok(TransactionAdmissionOutcome::Accepted {
             txid,
@@ -1234,7 +1234,8 @@ impl TransactionAdmissionPool {
     /// Package order is untrusted: entries are deduplicated and topologically
     /// ordered before a private UTXO overlay applies parents ahead of children.
     /// Any consensus, policy, missing-parent, conflict, or resource failure
-    /// leaves the pool byte-for-byte unchanged.
+    /// leaves admitted entries and candidate metadata unchanged. Time-driven
+    /// rolling-fee decay is applied independently before candidate validation.
     pub fn admit_package<S: UtxoStore>(
         &mut self,
         store: &S,
@@ -1254,18 +1255,8 @@ impl TransactionAdmissionPool {
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
         validate_package_bounds(&transactions)?;
         self.decay_rolling_minimum_fee(now);
-        let mut candidate = self.clone();
-        let outcome = candidate.admit_package_inner(store, transactions, context)?;
-        *self = candidate;
-        Ok(outcome)
-    }
-
-    fn admit_package_inner<S: UtxoStore>(
-        &mut self,
-        store: &S,
-        transactions: Vec<Transaction>,
-        context: TransactionAdmissionContext,
-    ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        // Membership and package shape do not mutate admission state. Resolve
+        // them before copying retained indices, request caches and orphan data.
         let (already_present, package) = self.collect_new_package(transactions)?;
         if package.is_empty() {
             return Ok(PackageAdmissionOutcome {
@@ -1277,6 +1268,21 @@ impl TransactionAdmissionPool {
         }
 
         let ordered = topological_package_order(package)?;
+        #[cfg(test)]
+        CANDIDATE_POOL_CLONES.with(|clones| clones.set(clones.get() + 1));
+        let mut candidate = self.clone();
+        let outcome = candidate.admit_package_inner(store, ordered, already_present, context)?;
+        *self = candidate;
+        Ok(outcome)
+    }
+
+    fn admit_package_inner<S: UtxoStore>(
+        &mut self,
+        store: &S,
+        ordered: Vec<Transaction>,
+        already_present: usize,
+        context: TransactionAdmissionContext,
+    ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
         let child_with_parents = is_child_with_parents_tree(&ordered);
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
         let use_package_feerate = child_with_parents && replacement.txids.is_empty();
@@ -1348,11 +1354,6 @@ impl TransactionAdmissionPool {
             let txid = transaction.compute_txid();
             if !submitted_txids.insert(txid) {
                 return Err(TransactionAdmissionError::DuplicatePackageTransaction(txid));
-            }
-            let wtxid = transaction.compute_wtxid();
-            if self.entries.iter().any(|entry| entry.wtxid == wtxid) {
-                already_present += 1;
-                continue;
             }
             if self.positions.contains_key(&txid) {
                 // Core package submission substitutes the already-admitted
@@ -2476,6 +2477,7 @@ thread_local! {
     static SCRIPT_VERIFICATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ADMISSION_VALIDATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static POLICY_INDEX_ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANDIDATE_POOL_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct AppliedAdmission {
@@ -2805,6 +2807,7 @@ pub fn dependency_packages(mut transactions: Vec<Transaction>) -> Vec<Vec<Transa
 
 #[cfg(test)]
 mod tests {
+    mod package_preflight;
     mod reconciliation_growth;
 
     use bitcoin::{

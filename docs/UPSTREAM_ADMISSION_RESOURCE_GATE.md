@@ -13,6 +13,10 @@ exceptional size-growth policy work to individual retained clusters. The
 measurements and implementation description below record the earlier
 `568772a` acceptance.
 
+The subsequent [package-preflight review](UPSTREAM_PROGRESS_REVIEW_2026-09-11.md)
+also removes candidate cloning for known/duplicate packages and uses indexed
+membership. New-package replay and aggregate budgets remain separate.
+
 ## Implementation and invariants
 
 Previously, every candidate pool clone copied the complete admitted transaction

@@ -1,9 +1,11 @@
 # Open-item review, 2026-09-11
 
-Reviewed the current code, acceptance ledgers and local evidence at baseline
-`568772abefcabf65446e3fcdefbd5cb0f30d801e`. The directly reproducible rolling-fee
-decay defect is fixed in this continuation. The broader resource and operational
-gates below still need their own implementation or evidence.
+Latest review baseline: `c63a8761254a90d4ea4a4acce306560334b60885`.
+The [progress review](UPSTREAM_PROGRESS_REVIEW_2026-09-11.md) reconciles recent
+commits, source manifests and acceptance evidence. The table reflects the
+subsequent fixes; the fee-decay narrative and its 919-test result below remain
+historical acceptance at baseline `568772a`. The broader resource and operational
+gates still require their own implementation or evidence.
 
 ## Item-by-item disposition
 
@@ -11,7 +13,7 @@ gates below still need their own implementation or evidence.
 | --- | --- | --- |
 | Rolling-fee fractional decay and query cadence | **Closed for the covered behavior in this continuation.** A failing baseline regression and live Core mismatch reproduce the defect; the corrected implementation passes both. | Broader fee-policy equivalence is separate: occupancy accounting, eviction selection and optimizer parity are not established by this check. |
 | Core cluster optimizer and broader fee-floor parity | **Partially completed in the subsequent continuation.** Greedy ordering now receives the two-pass refinement, with 4,096 exact Core comparisons and a fixed shared-parent counterexample; see [acceptance](UPSTREAM_CLUSTER_POSTLINEARIZE_GATE.md). | Full work-budgeted optimizer search and incremental-order reuse remain open. Compare pressure and decay under equivalent occupancy regimes; rBTC counts retained serialized bytes while Core's threshold uses dynamic memory usage. |
-| Whole-pipeline admission CPU and allocation budget | **Partially completed; aggregate limits remain.** SCRIPT reuse, immutable payload sharing and indexed traversal are measured improvements. Reconciliation performs one contextual validation per entry and preserves paid zero-fee parents; [exceptional growth checks](UPSTREAM_RECONCILIATION_GROWTH_GATE.md) now use bounded cluster views instead of repeated whole-pool indices. | Account for ordinary package replay, fresh UTXO lookup, hashing, other policy checks, metadata copies and snapshots; impose aggregate work/allocation limits across accepted/rejected packages, concurrent peers and repeated chain changes. Preserve contextual validation and atomic admission. |
+| Whole-pipeline admission CPU and allocation budget | **Partially completed; aggregate limits remain.** SCRIPT reuse, immutable payload sharing and indexed traversal are measured improvements. Reconciliation performs one contextual validation per entry and preserves paid zero-fee parents; [exceptional growth checks](UPSTREAM_RECONCILIATION_GROWTH_GATE.md) now use bounded cluster views instead of repeated whole-pool indices. Known/duplicate package preflight now avoids candidate cloning; see [review](UPSTREAM_PROGRESS_REVIEW_2026-09-11.md). | Account for new-package replay, fresh UTXO lookup, hashing, other policy checks, metadata copies and snapshots; impose aggregate work/allocation limits across accepted/rejected packages, concurrent peers and repeated chain changes. Preserve contextual validation and atomic admission. |
 | Valid competing-header memory/disk limits | **Partially completed; retention limits remain.** The serving copy is bounded to active ancestors. Within-session polls now reuse the validated DAG, eliminating historical replay and a temporary replacement graph; see [acceptance](UPSTREAM_HEADER_RESYNC_GATE.md). | Reserve capacity at both peer and local-block ingress; implement resource deferral, resumable stronger-fork recovery, durable eviction and bounded restart/failover loading. Prove retention plateaus without preventing a valid reorg. |
 | 160M-UTXO / 900,000-transition storage lifecycle | **Full run remains.** The million-UTXO compaction/restart/reference lane is accepted at its documented scale. | Run both 64/256 lanes on a suitable volume, retain copy-space/peak-RSS evidence and satisfy the MDBX lifecycle criteria. A smaller run cannot close this gate. |
 | Cold-disk and full mainnet replay | **Data and execution evidence remain.** Historical external corpus-window results are documented; the current local generated tests do not replace them. | Supply the immutable corpus and matched starting state, then run comparable engines/configurations with canonical content and I/O evidence. |
@@ -74,7 +76,7 @@ The full 17-point fixed trace is retained. This establishes the covered temporal
 behavior under matched occupancy, not exact Core memory accounting or optimizer
 equivalence.
 
-## Local prerequisites checked
+## Local prerequisites checked during the original review
 
 The workspace filesystem had approximately 222 GiB free. It is a shared home
 volume, and that free space is below the two storage lanes' combined configured

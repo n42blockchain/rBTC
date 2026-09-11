@@ -6,29 +6,70 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-11)
 
-The prior reconciliation fix was pushed as `fdf3cbf`. This continuation removes
-full durable-header replay on ordinary within-session polls. The serving loop
-transfers ownership of its validated DAG across polls, preserving all competing
-branches and the existing atomic validate/persist/commit path. At 100,000
-competing siblings, eight empty polls replay zero historical headers instead of
-820,000; median elapsed time falls from 2,246.737 ms to 10.882 ms in the repeated
-loopback probe. See [header resync acceptance](UPSTREAM_HEADER_RESYNC_GATE.md).
-Full optimizer search, header retention, total admission resource budgets, full
-mainnet scale and the seven-day soak remain open.
+The latest progress review starts from `c63a876`. It reconciles the summary
+with the detailed acceptance reports and verifies all 41 recorded file hashes
+across the six 2026-09-11 publication manifests against their Git commits.
+The prior summary omitted the `c01c2ad` refused-port fixture isolation and the
+`c63a876` component-based reconciliation growth checks; both are now included.
+This continuation also moves package deduplication and topological ordering
+before candidate-pool cloning. All-known and duplicate-txid packages avoid
+copying retained indices, request caches and orphan payloads; fresh packages
+still receive complete contextual validation and atomic publication.
+
+The three original P0 boundaries have their documented bounded acceptance.
+The six P1 rows remain partially complete. The principal remaining gates are
+full optimizer/occupancy parity, aggregate admission work/allocation budgets,
+durable competing-header retention/recovery, full storage scale, cold/mainnet
+replay and seven-day public-network evidence. See the
+[progress review](UPSTREAM_PROGRESS_REVIEW_2026-09-11.md) and
+[item-by-item ledger](UPSTREAM_OPEN_ITEMS_2026-09-11.md).
 
 | Follow-up item | Current implementation / acceptance | Remaining work |
 | --- | --- | --- |
 | P0 BIP30/BIP34 | Historical exceptions, activation anchors and overwrite undo have passing regressions and live Core block fixtures. | No new defect found in the covered boundaries. |
 | P0 script lifetime | Owned jobs, bounded pending work, cancellation, inline backpressure and rollback regressions pass. | Whole-pipeline RSS/work accounting is still separate from the pending-queue limit. |
 | P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
-| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. SCRIPT reuse, shared immutable payloads and indexed dependency queries remove repeated work. Reconciliation now validates each retained entry once without cloning payloads. | Ordinary package replay, metadata cloning, fresh input lookup, hashing, policy checks, snapshots and exceptional graph work still need end-to-end resource budgets. |
+| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. SCRIPT reuse, shared immutable payloads and indexed dependency queries remove repeated work. Reconciliation validates each retained entry once; exceptional growth uses bounded component views. Known/duplicate packages now avoid candidate cloning. | New-package replay, metadata cloning, fresh input lookup, hashing, other policy checks and snapshots still need end-to-end resource budgets. |
 | P1 cluster mempool | Greedy ordering now receives the bounded two-pass refinement; 4,096 exact Core comparisons, connected-chunk properties and actual admission/relay regressions pass. | Core's full work-budgeted optimizer and incremental-order reuse remain open. |
 | P1 fees/package relay | Zero-fee sponsorship now also survives reconciliation, including ephemeral dust and confirmed-parent transitions. Fractional rolling-fee decay survives frequent queries; Core replacement/pressure/decay and sponsored-package fixtures cover these paths. | Covered temporal behavior is accepted; occupancy-accounting, eviction and broader optimizer equivalence remain open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving retains only active ancestors. Ordinary within-session polls now reuse the full validated DAG and avoid historical replay/replacement allocation. | Primary DAG/disk retention, bounded candidate recovery, startup/failover replay bounds and persistent eviction remain open. |
 | P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Current header resync acceptance
+### Latest progress review and package preflight
+
+The preflight regressions establish zero candidate-pool clones for all-known
+packages and duplicate-txid rejection, while mixed known/new packages retain one
+private candidate and complete contextual validation. Allocation identity,
+rolling-fee decay, incumbent-witness substitution and rejected-child rollback
+are covered. All **83 admission tests** pass. Full all-feature regression:
+**943 passed**, 0 failed, **33 ignored** (904 library + 39 integration, excluding
+duplicate subprocess helpers), using four threads. All **four live Core 31
+differentials**, strict all-target/all-feature Clippy, formatting and diff
+checks pass. Evidence is under
+`target/upstream-followup/2026-09-11/progress-review/`.
+
+### Prior exceptional growth acceptance (`c63a876`)
+
+All-feature regression: **940 passed**, 0 failed, **33 ignored** (901 library +
+39 integration, excluding duplicate subprocess helpers). All four live Core
+replacement/pressure/decay/reconciliation fixtures pass. Ninety-six generated
+policy graphs match the old reverse-pruning result exactly. At 4,096 independent
+pairs, the measured growth phase falls from 7,408.651 ms to 9.502 ms; whole-process
+peak RSS medians rise from 18,520 to 20,568 KiB. This is a phase-specific CPU
+improvement, with a documented allocation cost, not a whole-node RSS result.
+See [growth acceptance](UPSTREAM_RECONCILIATION_GROWTH_GATE.md).
+
+### Prior failover fixture isolation (`c01c2ad`)
+
+A controlled schedule reproduces the deficient-peer nonce failure when a
+parallel failed-endpoint fixture releases its port before dialing. Test fixtures
+now retain bound, unlistened sockets. The original failover nonce assertions
+remain intact; all-feature regression passed **937 tests**, with **32 ignored**.
+The historical log cannot identify the original foreign client. See
+[the investigation](UPSTREAM_FAILOVER_TEST_ISOLATION.md).
+
+### Prior header resync acceptance (`dff94ba`)
 
 All-feature regression: **936 passed**, 0 failed, **32 ignored** (897 library +
 39 integration, excluding duplicate subprocess helpers). Five new production-path
@@ -95,7 +136,10 @@ All-feature acceptance: **916 passed**, 0 failed, **28 ignored** (877 library +
 replacement/package-pressure tests pass, as do strict all-target/all-feature
 Clippy and formatting checks. The first full run had one failover-test nonce
 mismatch; its isolated rerun and the complete second run passed without a source
-change. The first failure is retained in the evidence, with cause unconfirmed.
+change. The first failure remains in the evidence; the later
+[fixture-isolation investigation](UPSTREAM_FAILOVER_TEST_ISOLATION.md) reproduces
+and closes the unreserved-port route, while the historical sender remains
+unidentified.
 
 ### Prior operational acceptance (`2630a2d`)
 
