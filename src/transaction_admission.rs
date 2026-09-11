@@ -1654,23 +1654,63 @@ impl TransactionAdmissionPool {
         });
         drop(overlay);
         self.rebuild_indexes();
+        self.enforce_reconciled_growth(larger);
+        before.saturating_sub(self.entries.len())
+    }
+
+    fn enforce_reconciled_growth(&mut self, larger: Vec<Txid>) {
         // Deletion cannot violate the retained graph's count, version or dust
         // topology rules. A flag change can, however, increase sigop-adjusted
-        // sizes. Recheck those entries against the surviving graph and drop
-        // their descendant closures if a size bound no longer holds.
-        // Consider later entries first, allowing each removal to recover
-        // capacity before deciding whether an earlier entry must also leave.
-        for txid in larger.into_iter().rev() {
-            if self.entry(txid).is_none() {
+        // sizes. Different clusters cannot affect each other's size or TRUC
+        // decisions. Recheck a private component at a time, then publish all
+        // removals together instead of rebuilding whole-pool indices per entry.
+        // Retained clusters contain at most 64 entries, and reconciliation only
+        // deletes graph edges. Payloads are shared; unrelated pool state is not
+        // copied into these temporary policy views.
+        let mut pending = larger.into_iter().collect::<BTreeSet<_>>();
+        let mut removed = BTreeSet::new();
+        while let Some(&txid) = pending.first() {
+            if !self.positions.contains_key(&txid) {
+                pending.remove(&txid);
                 continue;
             }
-            if self.validate_cluster_limits(&[txid]).is_err()
-                || self.validate_truc_policy(&[txid]).is_err()
-            {
-                self.remove_with_descendants(&BTreeSet::from([txid]));
+            let cluster = self.cluster_closure(txid);
+            let mut positions = cluster
+                .iter()
+                .map(|member| self.positions[member])
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            let mut component = Self {
+                entries: positions
+                    .into_iter()
+                    .map(|position| self.entries[position].clone())
+                    .collect(),
+                ..Self::default()
+            };
+            component.rebuild_indexes();
+            // Preserve reverse insertion order within this original component,
+            // including when an earlier removal splits it into smaller pieces.
+            let changed = component
+                .entries
+                .iter()
+                .rev()
+                .filter_map(|entry| pending.remove(&entry.txid).then_some(entry.txid))
+                .collect::<Vec<_>>();
+            for member in changed {
+                if !component.positions.contains_key(&member) {
+                    continue;
+                }
+                if component.validate_cluster_limits(&[member]).is_err()
+                    || component.validate_truc_policy(&[member]).is_err()
+                {
+                    removed.extend(component.remove_with_descendants(&BTreeSet::from([member])));
+                }
             }
         }
-        before.saturating_sub(self.entries.len())
+        if !removed.is_empty() {
+            self.entries.retain(|entry| !removed.contains(&entry.txid));
+            self.rebuild_indexes();
+        }
     }
 
     /// Removes selected transactions and every retained descendant atomically.
@@ -2039,6 +2079,8 @@ impl TransactionAdmissionPool {
     }
 
     fn validate_truc_policy(&self, accepted: &[Txid]) -> Result<(), TransactionAdmissionError> {
+        #[cfg(test)]
+        POLICY_INDEX_ENTRY_VISITS.with(|visits| visits.set(visits.get() + self.entries.len()));
         let versions = self
             .entries
             .iter()
@@ -2248,6 +2290,8 @@ impl TransactionAdmissionPool {
     }
 
     fn rebuild_indexes(&mut self) {
+        #[cfg(test)]
+        POLICY_INDEX_ENTRY_VISITS.with(|visits| visits.set(visits.get() + self.entries.len()));
         self.spent.clear();
         self.positions.clear();
         self.retained_bytes = 0;
@@ -2431,6 +2475,7 @@ impl ScriptVerificationStamp {
 thread_local! {
     static SCRIPT_VERIFICATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ADMISSION_VALIDATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static POLICY_INDEX_ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct AppliedAdmission {
@@ -2760,6 +2805,8 @@ pub fn dependency_packages(mut transactions: Vec<Transaction>) -> Vec<Vec<Transa
 
 #[cfg(test)]
 mod tests {
+    mod reconciliation_growth;
+
     use bitcoin::{
         Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
         absolute::LockTime,

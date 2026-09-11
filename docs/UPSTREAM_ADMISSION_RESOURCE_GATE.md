@@ -7,8 +7,11 @@ end-to-end admission CPU/RSS gate.
 Subsequent work at baseline `b320752` also removes repeated-prefix validation
 and deep payload copying from reconciliation, while preserving sponsored
 packages across chain updates. See the separate
-[reconciliation acceptance](UPSTREAM_RECONCILIATION_GATE.md). The measurements
-and implementation description below record the earlier `568772a` acceptance.
+[reconciliation acceptance](UPSTREAM_RECONCILIATION_GATE.md). The later
+[growth pass](UPSTREAM_RECONCILIATION_GROWTH_GATE.md) also confines
+exceptional size-growth policy work to individual retained clusters. The
+measurements and implementation description below record the earlier
+`568772a` acceptance.
 
 ## Implementation and invariants
 

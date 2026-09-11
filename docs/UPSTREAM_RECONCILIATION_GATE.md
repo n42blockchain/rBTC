@@ -5,6 +5,11 @@ This closes the repeated-prefix validation and sponsored-package loss defects
 in `TransactionAdmissionPool::reconcile`. Whole-pipeline admission CPU and
 allocation limits remain open.
 
+Subsequent work also confines exceptional size-growth policy checks and
+intermediate index rebuilds to individual retained clusters; see the
+[growth-pass acceptance](UPSTREAM_RECONCILIATION_GROWTH_GATE.md). The baseline
+algorithm and measurements below describe the earlier one-pass change.
+
 ## Reproduced failures
 
 The old reconciliation drained the pool into owned transactions and called
