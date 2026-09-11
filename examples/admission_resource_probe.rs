@@ -1,4 +1,4 @@
-//! Compares admission, small-cluster lookup and simultaneous pool-clone costs.
+//! Compares admission, reconciliation, small-cluster lookup and pool-clone costs.
 //! Usage: cargo run --release --example admission_resource_probe -- [entries] [clone-count]
 //! Synthetic regtest UTXOs and transactions; no peer traffic or whole-node cap claim.
 
@@ -129,6 +129,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     pool.admit(&store, candidate, context())?;
     let admission_micros = started.elapsed().as_micros();
+    let before_reconcile = pool.snapshot();
+    let rss_before_reconcile = rss_kib();
+    let started = Instant::now();
+    let reconciled_removed = pool.reconcile(&store, context());
+    let reconcile_micros = started.elapsed().as_micros();
+    let rss_after_reconcile = rss_kib();
+    assert_eq!(reconciled_removed, 0);
+    assert_eq!(pool.snapshot(), before_reconcile);
     println!(
         "{}",
         serde_json::json!({
@@ -137,6 +145,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "allocator": if cfg!(feature = "mimalloc") { "mimalloc" } else { "system" },
             "seed_micros": seed_micros, "query_micros": query_micros, "clone_micros": clone_micros,
             "admission_micros": admission_micros, "rss_before_clones_kib": rss_before_clones,
+            "reconcile_micros": reconcile_micros, "reconciled_removed": reconciled_removed,
+            "rss_before_reconcile_kib": rss_before_reconcile,
+            "rss_after_reconcile_kib": rss_after_reconcile,
             "rss_with_clones_kib": rss_with_clones, "retained_bytes_after_admission": pool.retained_bytes(),
         })
     );

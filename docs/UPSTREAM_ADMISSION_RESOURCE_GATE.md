@@ -4,6 +4,12 @@ Measured 2026-09-10 against baseline `2630a2d89c0cc279b4ff9d7b2769d74cb22504b6`.
 This closes two concrete sources of repeated work. It does not close the
 end-to-end admission CPU/RSS gate.
 
+Subsequent work at baseline `b320752` also removes repeated-prefix validation
+and deep payload copying from reconciliation, while preserving sponsored
+packages across chain updates. See the separate
+[reconciliation acceptance](UPSTREAM_RECONCILIATION_GATE.md). The measurements
+and implementation description below record the earlier `568772a` acceptance.
+
 ## Implementation and invariants
 
 Previously, every candidate pool clone copied the complete admitted transaction

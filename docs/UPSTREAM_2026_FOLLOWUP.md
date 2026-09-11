@@ -6,11 +6,14 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-11)
 
-The prior rolling-fee fix was pushed as `f9650a1`. This continuation adds the
-bounded backward/forward cluster refinement and closes its reference-comparison
-gate: 4,096 generated orders exactly match Core's PostLinearize implementation.
-A shared-parent counterexample and actual admission/relay regression demonstrate
-the improvement. See [cluster acceptance](UPSTREAM_CLUSTER_POSTLINEARIZE_GATE.md).
+The prior cluster refinement was pushed as `b320752`. This continuation fixes
+reconciliation losing already-paid zero-fee parents and eliminates repeated
+prefix validation. Each retained entry receives one fresh contextual validation
+in a shared overlay, retaining immutable payloads and reusable SCRIPT results.
+The live Core fixture agrees across ordinary/dust packages and three block
+transitions. At 257 entries the synthetic workload's median reconciliation time
+falls from 2,676.069 ms to 21.883 ms. See
+[reconciliation acceptance](UPSTREAM_RECONCILIATION_GATE.md).
 Full optimizer search, header retention, total admission resource budgets, full
 mainnet scale and the seven-day soak remain open.
 
@@ -19,14 +22,27 @@ mainnet scale and the seven-day soak remain open.
 | P0 BIP30/BIP34 | Historical exceptions, activation anchors and overwrite undo have passing regressions and live Core block fixtures. | No new defect found in the covered boundaries. |
 | P0 script lifetime | Owned jobs, bounded pending work, cancellation, inline backpressure and rollback regressions pass. | Whole-pipeline RSS/work accounting is still separate from the pending-queue limit. |
 | P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
-| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. Incumbent SCRIPT reuse follows fresh contextual/policy checks. Candidate clones now share immutable transaction payloads; cached IDs and indexed dependency queries remove repeated unrelated-payload hashing. | Metadata cloning, fresh input lookup, replay hashing, policy checks and graph work still need end-to-end resource budgets. |
+| P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. SCRIPT reuse, shared immutable payloads and indexed dependency queries remove repeated work. Reconciliation now validates each retained entry once without cloning payloads. | Ordinary package replay, metadata cloning, fresh input lookup, hashing, policy checks, snapshots and exceptional graph work still need end-to-end resource budgets. |
 | P1 cluster mempool | Greedy ordering now receives the bounded two-pass refinement; 4,096 exact Core comparisons, connected-chunk properties and actual admission/relay regressions pass. | Core's full work-budgeted optimizer and incremental-order reuse remain open. |
-| P1 fees/package relay | Zero-fee parent replay, TRUC and package fixtures pass. Fractional rolling-fee decay now survives frequent queries; three Core replacement/pressure/decay fixtures pass on 2026-09-11. | Covered temporal behavior is accepted; occupancy-accounting, eviction and broader optimizer equivalence remain open. |
+| P1 fees/package relay | Zero-fee sponsorship now also survives reconciliation, including ephemeral dust and confirmed-parent transitions. Fractional rolling-fee decay survives frequent queries; Core replacement/pressure/decay and sponsored-package fixtures cover these paths. | Covered temporal behavior is accepted; occupancy-accounting, eviction and broader optimizer equivalence remain open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
 | P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Current cluster-refinement acceptance
+### Current reconciliation acceptance
+
+All-feature regression: **931 passed**, 0 failed, **31 ignored** (892 library +
+39 integration, excluding duplicate subprocess helpers). All four explicitly
+enabled live Core replacement/package-pressure/fee-decay/reconciliation tests
+pass. Six new unit regressions cover single-pass work, payload sharing, CPFP/dust,
+confirmed/missing parents, fresh contextual failures, SCRIPT cache invalidation
+and sigop-size growth. Strict all-target/all-feature Clippy, formatting and diff
+checks pass. Three fresh-process samples per revision/size show identical retained
+transactions and approximately 64×/122× median reconciliation speedups on the
+129/257-entry synthetic probe. This does not close aggregate admission resource
+limits. Evidence is in `target/upstream-followup/2026-09-11/admission-reconcile/`.
+
+### Prior cluster-refinement acceptance (`b320752`)
 
 All-feature regression: **925 passed**, 0 failed, **30 ignored** (886 library +
 39 integration, excluding duplicate subprocess helpers). The native Core gate

@@ -508,6 +508,99 @@ fn core_31_and_rbtc_agree_on_replacement_decisions() {
     );
 }
 
+/// Reconciliation must keep fee sponsorship across unrelated blocks and
+/// resolve confirmed parent outputs without discarding the still-unmined child.
+#[test]
+#[ignore = "requires RBTC_BITCOIND pointing to Bitcoin Core 31.0"]
+fn core_31_and_rbtc_keep_sponsored_packages_across_blocks() {
+    for dust in [false, true] {
+        let mut d = Differential::set_up(1);
+        let mut parent = build_spend(d.fundings[0], FUNDING_SATS, 0, 0);
+        if dust {
+            parent.output[0].value = Amount::from_sat(FUNDING_SATS - 1);
+            parent.output.push(TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true_script(),
+            });
+        }
+        let mut child = build_spend(
+            OutPoint::new(parent.compute_txid(), 0),
+            FUNDING_SATS,
+            10_000,
+            0,
+        );
+        if dust {
+            child
+                .input
+                .push(rbf_input(OutPoint::new(parent.compute_txid(), 1)));
+        }
+        let package =
+            serde_json::json!([serialize_hex(&parent), serialize_hex(&child)]).to_string();
+        let result = d.core.rpc(&["submitpackage", &package]).unwrap();
+        assert!(d.in_core_mempool(parent.compute_txid()), "{result}");
+        assert!(d.in_core_mempool(child.compute_txid()), "{result}");
+        d.pool
+            .admit_package(&d.store, vec![child.clone(), parent.clone()], context())
+            .unwrap();
+        let miner = d.core.rpc(&["getnewaddress"]).unwrap();
+        let mut next = context();
+        for (phase, mined) in [
+            ("empty", None),
+            ("parent", Some(&parent)),
+            ("child", Some(&child)),
+        ] {
+            let ids = mined.map_or_else(
+                || serde_json::json!([]),
+                |tx| serde_json::json!([tx.compute_txid().to_string()]),
+            );
+            d.core
+                .rpc(&["generateblock", &miner, &ids.to_string()])
+                .unwrap();
+            next.height += 1;
+            if let Some(tx) = mined {
+                let spent = tx
+                    .input
+                    .iter()
+                    .map(|input| OutPointKey::from(input.previous_output))
+                    .collect::<Vec<_>>();
+                let created = tx
+                    .output
+                    .iter()
+                    .enumerate()
+                    .map(|(vout, output)| {
+                        (
+                            OutPoint::new(tx.compute_txid(), u32::try_from(vout).unwrap()).into(),
+                            Utxo {
+                                value_sats: output.value.to_sat(),
+                                height: next.height - 1,
+                                is_coinbase: false,
+                                last_touched: 0,
+                                creation_mtp: next.parent_mtp,
+                                script_pubkey: output.script_pubkey.to_bytes(),
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                d.store.apply(&spent, &created).unwrap();
+            }
+            let removed = d.pool.reconcile(&d.store, next);
+            let core_ids: std::collections::BTreeSet<String> =
+                serde_json::from_str(&d.core.rpc(&["getrawmempool"]).unwrap()).unwrap();
+            let rbtc_ids = d
+                .pool
+                .snapshot()
+                .iter()
+                .map(|tx| tx.compute_txid().to_string())
+                .collect::<std::collections::BTreeSet<_>>();
+            eprintln!(
+                "reconcile dust={dust} phase={phase} removed={removed} core={core_ids:?} rbtc={rbtc_ids:?}"
+            );
+            assert_eq!(rbtc_ids, core_ids, "dust={dust} phase={phase}");
+            assert_eq!(removed, usize::from(mined.is_some()));
+        }
+    }
+}
+
 /// Funds independent pressure transactions without a wallet ancestor chain.
 fn pressure_fundings(core: &CoreNode, count: usize, input_sats: u64) -> (String, Vec<OutPoint>) {
     let info: serde_json::Value =

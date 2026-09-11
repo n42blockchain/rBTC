@@ -1618,27 +1618,58 @@ impl TransactionAdmissionPool {
     /// Revalidates every entry after an active-chain change.
     ///
     /// Transactions mined, conflicted, made immature, or otherwise invalid in
-    /// the new context are removed. Surviving insertion order is preserved.
+    /// the new context are removed. One private overlay validates entries in
+    /// insertion order, preserving already-admitted package fee sponsorship.
+    /// SCRIPT results are reused only when their fresh content commitment
+    /// matches; all contextual and standardness checks run again.
     pub fn reconcile<S: UtxoStore>(
         &mut self,
         store: &S,
         context: TransactionAdmissionContext,
     ) -> usize {
-        let rolling_minimum_fee_sat_kvb = self.rolling_minimum_fee_sat_kvb;
-        self.rolling_minimum_fee_sat_kvb = 0.0;
-        let previous = self
-            .entries
-            .drain(..)
-            .map(|entry| Arc::unwrap_or_clone(entry.transaction))
-            .collect::<Vec<_>>();
-        self.spent.clear();
-        self.positions.clear();
-        self.retained_bytes = 0;
-        let before = previous.len();
-        for transaction in previous {
-            let _ = self.admit(store, transaction, context);
+        let before = self.entries.len();
+        let overlay = AdmissionUtxoOverlay::new(store);
+        let mut larger = Vec::new();
+        self.entries.retain_mut(|entry| {
+            let Ok(applied) = apply_to_overlay(
+                &overlay,
+                &entry.transaction,
+                context,
+                0,
+                entry.script_verification,
+            ) else {
+                // A failed application leaves the overlay unchanged. Children
+                // may still resolve this parent's confirmed outputs from the
+                // base store, so do not blindly discard its descendants.
+                return false;
+            };
+            if applied.policy_vsize > entry.policy_vsize {
+                larger.push(entry.txid);
+            }
+            entry.fee_sats = applied.fee_sats;
+            entry.policy_vsize = applied.policy_vsize;
+            entry.sigop_cost = applied.sigop_cost;
+            entry.script_verification = Some(applied.script_verification);
+            true
+        });
+        drop(overlay);
+        self.rebuild_indexes();
+        // Deletion cannot violate the retained graph's count, version or dust
+        // topology rules. A flag change can, however, increase sigop-adjusted
+        // sizes. Recheck those entries against the surviving graph and drop
+        // their descendant closures if a size bound no longer holds.
+        // Consider later entries first, allowing each removal to recover
+        // capacity before deciding whether an earlier entry must also leave.
+        for txid in larger.into_iter().rev() {
+            if self.entry(txid).is_none() {
+                continue;
+            }
+            if self.validate_cluster_limits(&[txid]).is_err()
+                || self.validate_truc_policy(&[txid]).is_err()
+            {
+                self.remove_with_descendants(&BTreeSet::from([txid]));
+            }
         }
-        self.rolling_minimum_fee_sat_kvb = rolling_minimum_fee_sat_kvb;
         before.saturating_sub(self.entries.len())
     }
 
@@ -2399,6 +2430,7 @@ impl ScriptVerificationStamp {
 #[cfg(test)]
 thread_local! {
     static SCRIPT_VERIFICATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ADMISSION_VALIDATION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct AppliedAdmission {
@@ -2415,6 +2447,8 @@ fn apply_to_overlay<S: UtxoStore>(
     minimum_relay_fee_sat_kvb: u64,
     cached_scripts: Option<ScriptVerificationStamp>,
 ) -> Result<AppliedAdmission, TransactionAdmissionError> {
+    #[cfg(test)]
+    ADMISSION_VALIDATION_RUNS.with(|runs| runs.set(runs.get() + 1));
     let legacy_sigops = transaction_legacy_sigops(transaction);
     if legacy_sigops > MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS {
         return Err(TransactionAdmissionError::TooManyLegacySigops {
@@ -5687,6 +5721,284 @@ mod tests {
             pool.rolling_minimum_fee_sat_kvb.to_bits(),
             1_000_000.25_f64.to_bits()
         );
+    }
+
+    #[test]
+    fn reconciliation_validates_each_entry_once_and_keeps_shared_payloads() {
+        for count in [8, 32, 64] {
+            let (_directory, store) = store();
+            let mut pool = TransactionAdmissionPool::default();
+            for index in 1..=count {
+                let (outpoint, utxo, transaction) = spend(index);
+                store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+                pool.admit(&store, transaction, context()).unwrap();
+            }
+            let original = pool.clone();
+            let base = store.snapshot_entries().unwrap();
+            ADMISSION_VALIDATION_RUNS.with(|runs| runs.set(0));
+            SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
+            assert_eq!(pool.reconcile(&store, context()), 0);
+            assert_eq!(
+                ADMISSION_VALIDATION_RUNS.with(std::cell::Cell::get),
+                usize::from(count),
+                "one contextual validation per retained transaction"
+            );
+            assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 0);
+            assert_eq!(pool.snapshot(), original.snapshot());
+            assert_eq!(pool.positions, original.positions);
+            assert_eq!(pool.spent, original.spent);
+            assert_eq!(pool.retained_bytes(), original.retained_bytes());
+            assert_eq!(store.snapshot_entries().unwrap(), base);
+            for (before, after) in original.entries.iter().zip(&pool.entries) {
+                assert!(Arc::ptr_eq(&before.transaction, &after.transaction));
+                assert_eq!(before.script_verification, after.script_verification);
+            }
+        }
+    }
+
+    #[test]
+    fn reconciliation_preserves_paid_zero_fee_parents_and_ephemeral_dust() {
+        for dust in [false, true] {
+            let (_directory, store) = store();
+            let (outpoint, utxo, mut parent) = spend(1);
+            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            parent.output[0].value = Amount::from_sat(100_000 - u64::from(dust));
+            if dust {
+                parent.output.push(TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: parent.output[0].script_pubkey.clone(),
+                });
+            }
+            let mut child = child(&parent, 90_000);
+            if dust {
+                let mut input = child.input[0].clone();
+                input.previous_output.vout = 1;
+                child.input.push(input);
+            }
+            let mut pool = TransactionAdmissionPool::default();
+            pool.admit_package(&store, vec![child, parent], context())
+                .unwrap();
+            let before = pool.snapshot();
+            let next = TransactionAdmissionContext {
+                height: 201,
+                ..context()
+            };
+            assert_eq!(pool.reconcile(&store, next), 0, "dust={dust}");
+            assert_eq!(pool.snapshot(), before);
+            pool.validate_ephemeral_dust(&txids(&pool)).unwrap();
+        }
+    }
+
+    #[test]
+    fn reconciliation_keeps_children_of_confirmed_parents_and_refreshes_locks() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, parent) = spend(1);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let child = child(&parent, 80_000);
+        let grandchild = self::child(&child, 70_000);
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, parent.clone(), context()).unwrap();
+        pool.admit(&store, child.clone(), context()).unwrap();
+        pool.admit(&store, grandchild.clone(), context()).unwrap();
+        let confirmed = Utxo {
+            value_sats: parent.output[0].value.to_sat(),
+            height: 200,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: context().parent_mtp,
+            script_pubkey: parent.output[0].script_pubkey.to_bytes(),
+        };
+        store
+            .apply(
+                &[outpoint.into()],
+                &[(OutPoint::new(parent.compute_txid(), 0).into(), confirmed)],
+            )
+            .unwrap();
+        assert_eq!(pool.reconcile(&store, context()), 1);
+        assert_eq!(pool.snapshot(), vec![child.clone(), grandchild]);
+        assert_eq!(pool.positions[&child.compute_txid()], 0);
+        assert_eq!(pool.ancestor_closure(child.compute_txid()).len(), 1);
+        // If a later chain change removes that confirmed parent output, the
+        // child and grandchild must both disappear on the next fresh lookup.
+        store
+            .apply(&[OutPoint::new(parent.compute_txid(), 0).into()], &[])
+            .unwrap();
+        assert_eq!(pool.reconcile(&store, context()), 2);
+        assert!(pool.is_empty());
+        assert!(pool.positions.is_empty());
+        assert!(pool.spent.is_empty());
+        assert_eq!(pool.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn reconciliation_rechecks_context_and_prevouts_without_touching_base_state() {
+        for scenario in [
+            "maturity",
+            "height",
+            "mtp",
+            "relative-height",
+            "relative-time",
+            "amount",
+            "script",
+        ] {
+            let (_directory, store) = store();
+            let (outpoint, mut utxo, mut parent) = spend(1);
+            let mut next = context();
+            match scenario {
+                "maturity" => {
+                    utxo.is_coinbase = true;
+                    utxo.height = 100;
+                    next.height = 199;
+                }
+                "height" => {
+                    parent.lock_time = LockTime::from_height(199).unwrap();
+                    parent.input[0].sequence = Sequence::ENABLE_LOCKTIME_NO_RBF;
+                    next.height = 199;
+                }
+                "mtp" => {
+                    parent.lock_time = LockTime::from_time(context().parent_mtp - 1).unwrap();
+                    parent.input[0].sequence = Sequence::ENABLE_LOCKTIME_NO_RBF;
+                    next.parent_mtp -= 1;
+                }
+                "relative-height" => {
+                    utxo.height = 198;
+                    parent.input[0].sequence = Sequence::from_height(2);
+                    next.height = 199;
+                }
+                "relative-time" => {
+                    utxo.creation_mtp = context().parent_mtp - 512;
+                    parent.input[0].sequence = Sequence::from_512_second_intervals(1);
+                    next.parent_mtp -= 1;
+                }
+                "amount" | "script" => {}
+                _ => unreachable!(),
+            }
+            store
+                .apply(&[], &[(outpoint.into(), utxo.clone())])
+                .unwrap();
+            let child = child(&parent, 80_000);
+            let (other, other_utxo, unrelated) = spend(2);
+            store.apply(&[], &[(other.into(), other_utxo)]).unwrap();
+            let mut pool = TransactionAdmissionPool::default();
+            pool.admit(&store, parent.clone(), context()).unwrap();
+            pool.admit(&store, child, context()).unwrap();
+            pool.admit(&store, unrelated.clone(), context()).unwrap();
+            if scenario == "amount" || scenario == "script" {
+                if scenario == "amount" {
+                    utxo.value_sats = 1;
+                } else {
+                    utxo.script_pubkey =
+                        ScriptBuf::new_p2wsh(&ScriptBuf::new().wscript_hash()).into_bytes();
+                }
+                store.apply(&[outpoint.into()], &[]).unwrap();
+                store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            }
+            let failure =
+                apply_to_overlay(&AdmissionUtxoOverlay::new(&store), &parent, next, 0, None)
+                    .err()
+                    .expect("fixture must invalidate the parent");
+            match (scenario, failure) {
+                (
+                    "maturity",
+                    TransactionAdmissionError::Chainstate(ChainstateError::ImmatureCoinbase {
+                        ..
+                    }),
+                )
+                | (
+                    "height" | "mtp",
+                    TransactionAdmissionError::Chainstate(ChainstateError::NonFinalLockTime {
+                        ..
+                    }),
+                )
+                | (
+                    "relative-height",
+                    TransactionAdmissionError::Chainstate(ChainstateError::RelativeHeightLock {
+                        ..
+                    }),
+                )
+                | (
+                    "relative-time",
+                    TransactionAdmissionError::Chainstate(ChainstateError::RelativeTimeLock {
+                        ..
+                    }),
+                )
+                | ("amount", TransactionAdmissionError::Chainstate(ChainstateError::Inflation))
+                | ("script", TransactionAdmissionError::Chainstate(ChainstateError::Script(_))) => {
+                }
+                (_, error) => panic!("unexpected {scenario} failure: {error}"),
+            }
+            let base = store.snapshot_entries().unwrap();
+            assert_eq!(pool.reconcile(&store, next), 2, "{scenario}");
+            assert_eq!(pool.snapshot(), vec![unrelated], "{scenario}");
+            assert_eq!(store.snapshot_entries().unwrap(), base, "{scenario}");
+        }
+    }
+
+    #[test]
+    fn reconciliation_refreshes_script_commitments_when_flags_change() {
+        let (_directory, store) = store();
+        let (outpoint, utxo, transaction) = spend(1);
+        store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+        let mut pool = TransactionAdmissionPool::default();
+        pool.admit(&store, transaction.clone(), context()).unwrap();
+        let stamp = pool.entries[0].script_verification;
+        let next = TransactionAdmissionContext {
+            script_flags: context().script_flags | bitcoinconsensus::VERIFY_DERSIG,
+            ..context()
+        };
+        SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
+        assert_eq!(pool.reconcile(&store, next), 0);
+        assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 1);
+        assert_ne!(pool.entries[0].script_verification, stamp);
+        assert_eq!(pool.reconcile(&store, next), 0);
+        assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 1);
+        assert_eq!(pool.snapshot(), vec![transaction]);
+    }
+
+    #[test]
+    fn reconciliation_enforces_larger_sigop_sizes_after_flag_activation() {
+        // Unexecuted multisigs still count for policy vsize once witness
+        // sigop accounting is active. Both flag sets execute successfully.
+        let mut builder = Builder::new().push_int(0).push_opcode(opcodes::all::OP_IF);
+        for _ in 0..190 {
+            builder = builder.push_opcode(opcodes::all::OP_CHECKMULTISIG);
+        }
+        let witness_script = builder
+            .push_opcode(opcodes::all::OP_ENDIF)
+            .push_opcode(opcodes::OP_TRUE)
+            .into_script();
+        let script = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        let earlier = TransactionAdmissionContext {
+            script_flags: bitcoinconsensus::VERIFY_P2SH,
+            ..context()
+        };
+        for truc in [true, false] {
+            let (_directory, store) = store();
+            let (outpoint, utxo, mut parent) = spend(1);
+            store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+            parent.output[0].script_pubkey = script.clone();
+            if truc {
+                parent.version = Version(TRUC_VERSION);
+            }
+            let parent_txid = parent.compute_txid();
+            let mut pool = TransactionAdmissionPool::default();
+            pool.admit(&store, parent.clone(), earlier).unwrap();
+            for index in 1..=if truc { 1 } else { 6 } {
+                let mut next = child(&parent, 90_000 - index * 10_000);
+                next.version = parent.version;
+                next.input[0].witness = Witness::from_slice(&[witness_script.as_bytes()]);
+                next.output[0].script_pubkey = script.clone();
+                pool.admit(&store, next.clone(), earlier).unwrap();
+                parent = next;
+            }
+            assert_eq!(pool.reconcile(&store, earlier), 0);
+            assert_eq!(pool.reconcile(&store, context()), 1);
+            assert_eq!(pool.len(), if truc { 1 } else { 6 });
+            assert_eq!(txids(&pool)[0], parent_txid);
+            pool.validate_cluster_limits(&[parent_txid]).unwrap();
+            pool.validate_truc_policy(&txids(&pool)).unwrap();
+            assert_eq!(pool.reconcile(&store, context()), 0);
+        }
     }
 
     #[test]
