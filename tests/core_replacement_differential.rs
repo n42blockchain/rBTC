@@ -23,8 +23,8 @@ use std::{
 };
 
 use bitcoin::{
-    Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, WScriptHash,
-    Witness,
+    Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    WScriptHash, Witness,
     absolute::LockTime,
     consensus::encode::{deserialize, serialize_hex},
     hashes::{Hash, hex::FromHex},
@@ -508,21 +508,11 @@ fn core_31_and_rbtc_agree_on_replacement_decisions() {
     );
 }
 
-/// Distinguishes the rich-parent package-feerate question under real
-/// rolling-minimum pressure: with the mempool minimum raised above the
-/// child's own feerate, an above-minimum parent must not subsidise a
-/// below-minimum child, while a below-minimum parent may be lifted by a
-/// rich child. Both mempools are pressured with the same ascending-feerate
-/// filler stream; the scenario fees sit far from either implementation's
-/// exact minimum so the verdicts do not depend on the minimums matching
-/// numerically.
-#[test]
-#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
-#[allow(clippy::too_many_lines)]
-fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
-    const FILLERS: usize = 90;
-    const FILLER_INPUT_SATS: u64 = 20_000_000;
-    let core = CoreNode::start_with_args(&core_31_bitcoind(), &["-maxmempool=5"]);
+/// Funds independent pressure transactions without a wallet ancestor chain.
+fn pressure_fundings(core: &CoreNode, count: usize, input_sats: u64) -> (String, Vec<OutPoint>) {
+    let info: serde_json::Value =
+        serde_json::from_str(&core.rpc(&["getnetworkinfo"]).unwrap()).unwrap();
+    assert_eq!(info["version"].as_u64(), Some(310_000));
     core.rpc(&["createwallet", "pressure"]).unwrap();
     let miner = core.rpc(&["getnewaddress"]).unwrap();
     core.rpc(&["generatetoaddress", "101", &miner]).unwrap();
@@ -549,19 +539,48 @@ fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
             seed.compute_txid(),
             u32::try_from(seed_vout).unwrap(),
         ))],
-        output: (0..FILLERS + 4)
+        output: (0..count)
             .map(|_| TxOut {
-                value: Amount::from_sat(FILLER_INPUT_SATS),
+                value: Amount::from_sat(input_sats),
                 script_pubkey: script.clone(),
             })
             .collect(),
     };
     core.rpc(&["sendrawtransaction", &serialize_hex(&fan), "0"])
         .unwrap();
-    let fundings = (0..FILLERS + 4)
+    let fundings = (0..count)
         .map(|vout| OutPoint::new(fan.compute_txid(), u32::try_from(vout).unwrap()))
         .collect::<Vec<_>>();
     core.rpc(&["generatetoaddress", "1", &miner]).unwrap();
+
+    (miner, fundings)
+}
+
+fn core_mempool_minimum(core: &CoreNode) -> u64 {
+    let info: serde_json::Value =
+        serde_json::from_str(&core.rpc(&["getmempoolinfo"]).unwrap()).unwrap();
+    Amount::from_btc(info["mempoolminfee"].as_f64().unwrap())
+        .unwrap()
+        .to_sat()
+}
+
+/// Distinguishes the rich-parent package-feerate question under real
+/// rolling-minimum pressure: with the mempool minimum raised above the
+/// child's own feerate, an above-minimum parent must not subsidise a
+/// below-minimum child, while a below-minimum parent may be lifted by a
+/// rich child. Both mempools are pressured with the same ascending-feerate
+/// filler stream; the scenario fees sit far from either implementation's
+/// exact minimum so the verdicts do not depend on the minimums matching
+/// numerically.
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+#[allow(clippy::too_many_lines)]
+fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
+    const FILLERS: usize = 90;
+    const FILLER_INPUT_SATS: u64 = 20_000_000;
+    let core = CoreNode::start_with_args(&core_31_bitcoind(), &["-maxmempool=5"]);
+    let (_, fundings) = pressure_fundings(&core, FILLERS + 4, FILLER_INPUT_SATS);
+    let script = op_true_script();
 
     let store_dir = TempDir::new().unwrap();
     let store = RedbUtxoStore::open(store_dir.path().join("chainstate.redb")).unwrap();
@@ -586,7 +605,7 @@ fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
     // evictions and raises the rolling minimum, as Core's 5 MB cap does.
     let mut pool = TransactionAdmissionPool::with_capacity(10_000, 4_500_000);
 
-    // Fill both mempools with identical ~95 kvB fillers at ascending
+    // Fill both mempools with identical ~60 kvB fillers at ascending
     // feerates until both minimums clear 2 sat/vB.
     let mut raised = false;
     for (index, funding) in fundings.iter().take(FILLERS).enumerate() {
@@ -730,4 +749,115 @@ fn core_31_and_rbtc_agree_on_package_feerate_under_pressure() {
         .expect("B: rBTC's 1p1c package feerate lifts the poor parent");
     assert_eq!(outcome.accepted.len(), 2);
     println!("pressure differential: A (no subsidy) and B (1p1c lift) agree per transaction");
+}
+
+/// Compares actual integer fee floors at controlled timestamps. Uniform-rate
+/// evictions establish an identical starting floor despite different memory
+/// accounting. Mining then empties both pools into the same occupancy regime.
+#[test]
+#[ignore = "set RBTC_BITCOIND to a Bitcoin Core 31 bitcoind and run explicitly"]
+#[allow(clippy::too_many_lines)]
+fn core_31_and_rbtc_agree_on_rolling_fee_decay_between_polls() {
+    const START: u32 = 1_700_001_000;
+    const INPUT_SATS: u64 = 20_000_000;
+    let core = CoreNode::start_with_args(
+        &core_31_bitcoind(),
+        &[
+            "-maxmempool=5",
+            "-mocktime=1700000000",
+            "-blockmintxfee=0.000001",
+        ],
+    );
+    let (miner, fundings) = pressure_fundings(&core, 90, INPUT_SATS);
+    core.rpc(&["setmocktime", &START.to_string()]).unwrap();
+    let initial_tip: BlockHash = core.rpc(&["getbestblockhash"]).unwrap().parse().unwrap();
+    let vsize = u64::try_from(build_spend(fundings[0], INPUT_SATS, 0, 60_000).vsize()).unwrap();
+    // 500 sat/kvB after integer fee-rate division, then a 100 sat/kvB
+    // eviction increment. A retained 600 integer would stall under 11s polls.
+    let fee = vsize.div_ceil(2);
+    let mut pressured = false;
+    for (index, funding) in fundings.iter().enumerate() {
+        let filler = build_spend(*funding, INPUT_SATS, fee, 60_000);
+        let sent = core.rpc_with_stdin(&["sendrawtransaction"], &[&serialize_hex(&filler), "0"]);
+        if core_mempool_minimum(&core) > 100 {
+            // With equal fees Core may evict the just-submitted transaction.
+            // The resulting floor, not that tie's selected member, is under test.
+            pressured = true;
+            println!("uniform pressure reached after {} fillers", index + 1);
+            break;
+        }
+        sent.unwrap();
+    }
+    assert!(pressured, "uniform fillers must cause a real Core eviction");
+    assert_eq!(core_mempool_minimum(&core), 600);
+
+    let store_dir = TempDir::new().unwrap();
+    let store = RedbUtxoStore::open(store_dir.path().join("chainstate.redb")).unwrap();
+    let seeded = fundings[..2]
+        .iter()
+        .map(|outpoint| {
+            (
+                OutPointKey::from(*outpoint),
+                Utxo {
+                    value_sats: INPUT_SATS,
+                    height: 102,
+                    is_coinbase: false,
+                    last_touched: 0,
+                    creation_mtp: 0,
+                    script_pubkey: op_true_script().to_bytes(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    store.apply(&[], &seeded).unwrap();
+    let mut pool = TransactionAdmissionPool::with_capacity(1, 4_500_000);
+    pool.observe_chain_tip(initial_tip, START);
+    pool.admit_at(
+        &store,
+        build_spend(fundings[0], INPUT_SATS, fee, 60_000),
+        context(),
+        START,
+    )
+    .unwrap();
+    pool.admit_at(
+        &store,
+        build_spend(fundings[1], INPUT_SATS, fee + 10_000, 60_000),
+        context(),
+        START,
+    )
+    .unwrap();
+    assert_eq!(pool.rolling_minimum_fee_sat_kvb(START), 600);
+
+    let block_time = START + 3_600;
+    core.rpc(&["setmocktime", &block_time.to_string()]).unwrap();
+    assert_eq!(core_mempool_minimum(&core), 600);
+    assert_eq!(pool.rolling_minimum_fee_sat_kvb(block_time), 600);
+    core.rpc(&["generatetoaddress", "10", &miner]).unwrap();
+    let remaining: Vec<String> =
+        serde_json::from_str(&core.rpc(&["getrawmempool"]).unwrap()).unwrap();
+    assert!(remaining.is_empty(), "mining must empty the Core mempool");
+    let confirmed = pool
+        .snapshot()
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect();
+    pool.remove_with_descendants(&confirmed);
+    assert!(pool.is_empty());
+    let mined_tip = core.rpc(&["getbestblockhash"]).unwrap().parse().unwrap();
+    pool.observe_chain_tip(mined_tip, block_time);
+
+    for elapsed in [
+        0, 10, 11, 21, 22, 33, 44, 55, 110, 600, 1_800, 5_400, 10_800, 21_600, 32_400, 43_200,
+        86_400,
+    ] {
+        let now = block_time + elapsed;
+        core.rpc(&["setmocktime", &now.to_string()]).unwrap();
+        let core_rate = core_mempool_minimum(&core);
+        // Core's RPC includes its static relay floor when the rolling floor
+        // falls below it or clears. The rBTC accessor reports only rolling state.
+        let rate = pool.rolling_minimum_fee_sat_kvb(now).max(100);
+        println!("decay +{elapsed}s: Core {core_rate}, rBTC {rate} sat/kvB");
+        assert_eq!(rate, core_rate, "rolling fee at +{elapsed}s");
+    }
+    assert_eq!(pool.rolling_minimum_fee_sat_kvb(block_time + 86_400), 0);
 }

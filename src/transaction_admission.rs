@@ -467,7 +467,8 @@ pub struct TransactionAdmissionPool {
     recent_confirmed_id_set: BTreeSet<sha256d::Hash>,
     transaction_request_announcements: VecDeque<TransactionRequestAnnouncement>,
     next_transaction_request_sequence: u64,
-    rolling_minimum_fee_sat_kvb: u64,
+    // Keep fractional decay across polls; round only at the fee-policy boundary.
+    rolling_minimum_fee_sat_kvb: f64,
     rolling_fee_last_update: u32,
     rolling_fee_decay_enabled: bool,
     observed_chain_tip: Option<BlockHash>,
@@ -493,7 +494,7 @@ impl Default for TransactionAdmissionPool {
             recent_confirmed_id_set: BTreeSet::new(),
             transaction_request_announcements: VecDeque::new(),
             next_transaction_request_sequence: 0,
-            rolling_minimum_fee_sat_kvb: 0,
+            rolling_minimum_fee_sat_kvb: 0.0,
             rolling_fee_last_update: 0,
             rolling_fee_decay_enabled: false,
             observed_chain_tip: None,
@@ -578,12 +579,15 @@ impl TransactionAdmissionPool {
         self.effective_rolling_minimum_fee_sat_kvb()
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn effective_rolling_minimum_fee_sat_kvb(&self) -> u64 {
-        if self.rolling_minimum_fee_sat_kvb == 0 || !self.rolling_fee_decay_enabled {
-            self.rolling_minimum_fee_sat_kvb
+        // The private state starts at zero, is bumped from nonnegative integer
+        // rates, and only decays toward zero.
+        let rounded = self.rolling_minimum_fee_sat_kvb.round() as u64;
+        if self.rolling_minimum_fee_sat_kvb == 0.0 || !self.rolling_fee_decay_enabled {
+            rounded
         } else {
-            self.rolling_minimum_fee_sat_kvb
-                .max(DEFAULT_MIN_RELAY_FEE_SAT_KVB)
+            rounded.max(INCREMENTAL_RELAY_FEE_SAT_KVB)
         }
     }
 
@@ -1621,7 +1625,7 @@ impl TransactionAdmissionPool {
         context: TransactionAdmissionContext,
     ) -> usize {
         let rolling_minimum_fee_sat_kvb = self.rolling_minimum_fee_sat_kvb;
-        self.rolling_minimum_fee_sat_kvb = 0;
+        self.rolling_minimum_fee_sat_kvb = 0.0;
         let previous = self
             .entries
             .drain(..)
@@ -1720,10 +1724,7 @@ impl TransactionAdmissionPool {
             )
             .unwrap_or(u64::MAX)
             .saturating_add(INCREMENTAL_RELAY_FEE_SAT_KVB);
-            if removed_rate > self.rolling_minimum_fee_sat_kvb {
-                self.rolling_minimum_fee_sat_kvb = removed_rate;
-                self.rolling_fee_decay_enabled = false;
-            }
+            self.track_removed_fee(removed_rate);
             self.entries.retain(|entry| {
                 let txid = entry.txid;
                 if removed.contains(&txid) {
@@ -1738,14 +1739,19 @@ impl TransactionAdmissionPool {
         Ok(evicted)
     }
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss
-    )]
+    #[allow(clippy::cast_precision_loss)]
+    fn track_removed_fee(&mut self, rate: u64) {
+        let rate = rate as f64;
+        if rate > self.rolling_minimum_fee_sat_kvb {
+            self.rolling_minimum_fee_sat_kvb = rate;
+            self.rolling_fee_decay_enabled = false;
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
     fn decay_rolling_minimum_fee(&mut self, now: u32) {
         if !self.rolling_fee_decay_enabled
-            || self.rolling_minimum_fee_sat_kvb == 0
+            || self.rolling_minimum_fee_sat_kvb == 0.0
             || now <= self.rolling_fee_last_update.saturating_add(10)
         {
             return;
@@ -1757,14 +1763,12 @@ impl TransactionAdmissionPool {
             half_life /= 2.0;
         }
         let elapsed = f64::from(now.saturating_sub(self.rolling_fee_last_update));
-        // Core performs this exponential decay in double precision. Both operands
-        // are non-negative and the quotient cannot exceed the original u64 rate.
-        self.rolling_minimum_fee_sat_kvb = ((self.rolling_minimum_fee_sat_kvb as f64)
-            / 2_f64.powf(elapsed / half_life))
-        .round() as u64;
+        // Core retains the double-precision result. Rounding here would let
+        // frequent queries indefinitely prevent small downward adjustments.
+        self.rolling_minimum_fee_sat_kvb /= 2_f64.powf(elapsed / half_life);
         self.rolling_fee_last_update = now;
-        if self.rolling_minimum_fee_sat_kvb < DEFAULT_MIN_RELAY_FEE_SAT_KVB / 2 {
-            self.rolling_minimum_fee_sat_kvb = 0;
+        if self.rolling_minimum_fee_sat_kvb < INCREMENTAL_RELAY_FEE_SAT_KVB as f64 / 2.0 {
+            self.rolling_minimum_fee_sat_kvb = 0.0;
         }
     }
 
@@ -4416,7 +4420,7 @@ mod tests {
         assert!(parent_fee < fee_for_rate(5_000, parent_vbytes));
 
         let mut pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: 5_000,
+            rolling_minimum_fee_sat_kvb: 5_000.0,
             ..TransactionAdmissionPool::default()
         };
         let outcome = pool
@@ -4428,7 +4432,7 @@ mod tests {
         insufficient_child.output[0].value =
             Amount::from_sat(insufficient_child.output[0].value.to_sat() + 1);
         let mut insufficient_pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: 5_000,
+            rolling_minimum_fee_sat_kvb: 5_000.0,
             ..TransactionAdmissionPool::default()
         };
         assert!(matches!(
@@ -4460,7 +4464,7 @@ mod tests {
         assert!(whole_package_fee >= whole_package_minimum);
 
         let mut pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: rolling_rate,
+            rolling_minimum_fee_sat_kvb: 5_000.0,
             ..TransactionAdmissionPool::default()
         };
         assert!(matches!(
@@ -4487,7 +4491,7 @@ mod tests {
             parent.output[0].value.to_sat().saturating_sub(10_000),
         );
         let mut pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: 5_000,
+            rolling_minimum_fee_sat_kvb: 5_000.0,
             ..TransactionAdmissionPool::default()
         };
 
@@ -4732,7 +4736,7 @@ mod tests {
             middle.output[0].value.to_sat().saturating_sub(5_000),
         );
         let mut pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: 5_000,
+            rolling_minimum_fee_sat_kvb: 5_000.0,
             ..TransactionAdmissionPool::default()
         };
 
@@ -4786,7 +4790,7 @@ mod tests {
         let child_fee = u64::try_from(later_child.vsize()).unwrap();
         later_child.output[0].value =
             Amount::from_sat(existing_parent.output[0].value.to_sat() - child_fee);
-        partial_pool.rolling_minimum_fee_sat_kvb = 5_000;
+        partial_pool.rolling_minimum_fee_sat_kvb = 5_000.0;
 
         assert!(matches!(
             partial_pool.admit(&store, later_child, context()),
@@ -4807,7 +4811,7 @@ mod tests {
         replacement_pool
             .admit(&store, original.clone(), context())
             .unwrap();
-        replacement_pool.rolling_minimum_fee_sat_kvb = 200_000;
+        replacement_pool.rolling_minimum_fee_sat_kvb = 200_000.0;
         let mut replacement = original;
         replacement.output[0].value = Amount::from_sat(89_000);
         let replacement_child = child(&replacement, 40_000);
@@ -5500,11 +5504,89 @@ mod tests {
     }
 
     #[test]
+    fn rolling_fee_decay_keeps_fractional_progress_between_polls() {
+        let start = 1_000;
+        let mut frequent = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 600.0,
+            rolling_fee_decay_enabled: true,
+            rolling_fee_last_update: start,
+            ..TransactionAdmissionPool::default()
+        };
+        let mut sparse = frequent.clone();
+        // At 600 sat/kvB, every eleven-second decay is less than half a
+        // sat/kvB. Rounding the retained state would pin it at 600 forever.
+        for elapsed in (11..10_800).step_by(11) {
+            frequent.rolling_minimum_fee_sat_kvb(start + elapsed);
+        }
+        assert_eq!(frequent.rolling_minimum_fee_sat_kvb(start + 10_800), 300);
+        assert_eq!(
+            frequent.rolling_minimum_fee_sat_kvb(start + 10_800),
+            sparse.rolling_minimum_fee_sat_kvb(start + 10_800)
+        );
+        for elapsed in (10_813..43_200).step_by(11) {
+            frequent.rolling_minimum_fee_sat_kvb(start + elapsed);
+        }
+        assert_eq!(frequent.rolling_minimum_fee_sat_kvb(start + 43_200), 0);
+        assert_eq!(sparse.rolling_minimum_fee_sat_kvb(start + 43_200), 0);
+    }
+
+    #[test]
+    fn rolling_fee_decay_obeys_occupancy_thresholds_and_block_gates() {
+        for (bytes, half_life) in [
+            (0, 10_800),
+            (255, 10_800),
+            (256, 21_600),
+            (511, 21_600),
+            (512, 43_200),
+            (1_024, 43_200),
+        ] {
+            let mut pool = TransactionAdmissionPool {
+                rolling_minimum_fee_sat_kvb: 8_000.0,
+                retained_bytes: bytes,
+                max_bytes: 1_024,
+                ..TransactionAdmissionPool::default()
+            };
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(100_000), 8_000);
+            pool.observe_chain_tip(BlockHash::from_byte_array([1; 32]), 100);
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(100_000), 8_000);
+            pool.observe_chain_tip(BlockHash::from_byte_array([2; 32]), 200);
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(210), 8_000);
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(200 + half_life), 4_000);
+            // A lower/equal eviction rate must not freeze existing decay;
+            // a higher one must await another block before decaying again.
+            pool.track_removed_fee(3_999);
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(200 + 2 * half_life), 2_000);
+            pool.track_removed_fee(2_000);
+            assert_eq!(pool.rolling_minimum_fee_sat_kvb(200 + 3 * half_life), 1_000);
+            pool.track_removed_fee(3_000);
+            assert_eq!(
+                pool.rolling_minimum_fee_sat_kvb(200 + 10 * half_life),
+                3_000
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_fee_clears_on_fractional_threshold_without_waiting_for_rounding() {
+        let mut pool = TransactionAdmissionPool {
+            rolling_minimum_fee_sat_kvb: 50.0,
+            rolling_fee_decay_enabled: true,
+            rolling_fee_last_update: 1_000,
+            ..TransactionAdmissionPool::default()
+        };
+        // Equality stays clamped to the incremental relay fee. The first
+        // eligible decay falls below half that fee, even though it rounds to 50.
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(1_010), 100);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(1_011), 0);
+        assert_eq!(pool.rolling_minimum_fee_sat_kvb(1_022), 0);
+    }
+
+    #[test]
     fn rolling_fee_uses_accelerated_half_life_below_quarter_capacity() {
         assert_eq!(fee_for_rate(1_001, 100), 101);
         assert_eq!(fee_for_rate(1, 1), 1);
         let mut pool = TransactionAdmissionPool {
-            rolling_minimum_fee_sat_kvb: 8_000,
+            rolling_minimum_fee_sat_kvb: 8_000.0,
             ..TransactionAdmissionPool::default()
         };
         let first_tip = BlockHash::from_byte_array([3; 32]);
@@ -5515,7 +5597,7 @@ mod tests {
             pool.rolling_minimum_fee_sat_kvb(200 + ROLLING_FEE_HALFLIFE_SECS / 4),
             4_000
         );
-        pool.rolling_minimum_fee_sat_kvb = 600;
+        pool.rolling_minimum_fee_sat_kvb = 600.0;
         assert_eq!(pool.rolling_minimum_fee_sat_kvb(11_001), 600);
     }
 
@@ -5527,11 +5609,15 @@ mod tests {
         let txid = transaction.compute_txid();
         let mut pool = TransactionAdmissionPool::default();
         pool.admit(&store, transaction, context()).unwrap();
-        pool.rolling_minimum_fee_sat_kvb = 1_000_000;
+        pool.rolling_minimum_fee_sat_kvb = 1_000_000.25;
 
         assert_eq!(pool.reconcile(&store, context()), 0);
         assert_eq!(txids(&pool), vec![txid]);
         assert_eq!(pool.rolling_minimum_fee_sat_kvb(0), 1_000_000);
+        assert_eq!(
+            pool.rolling_minimum_fee_sat_kvb.to_bits(),
+            1_000_000.25_f64.to_bits()
+        );
     }
 
     #[test]
@@ -5647,7 +5733,7 @@ mod tests {
             ]
         );
         // Isolate capacity admission from the separately tested rolling floor.
-        pool.rolling_minimum_fee_sat_kvb = 0;
+        pool.rolling_minimum_fee_sat_kvb = 0.0;
         let before = txids(&pool);
         assert!(matches!(
             pool.admit(&store, transactions[3].clone(), context()),

@@ -4,15 +4,16 @@ Tracking started 2026-09-08 for releases/disclosures from 2025-09-08 through
 2026-09-08. This is an active implementation and acceptance ledger, not a
 claim that the older P1 roadmap or every item below has passed this checkout.
 
-## Current progress (2026-09-10)
+## Current progress (2026-09-11)
 
-The earlier SCRIPT reuse and operational acceptance were pushed through
-`2630a2d`. This continuation shares immutable admitted transaction payloads across
-candidate pools, caches their IDs and indexes dependency traversal. Two new
-regressions, full-suite acceptance and live Core replacement/pressure checks pass;
-a baseline comparison measures clone, cluster-query and admission costs.
-Header retention, total admission resource budgets, full mainnet scale and the
-seven-day soak remain open.
+The implementation and measured admission optimizations were pushed through
+`568772a`. This continuation reviews every remaining gate and fixes a reproduced
+rolling-fee defect: rounding each update could prevent decay under frequent
+queries. Retaining fractional progress now matches the live Core trace at all
+17 tested timestamps. See the [open-item review](UPSTREAM_OPEN_ITEMS_2026-09-11.md)
+for explicit closure scopes and prerequisites. Header retention, total admission
+resource budgets, optimizer parity, full mainnet scale and the seven-day soak
+remain open.
 
 | Follow-up item | Current implementation / acceptance | Remaining work |
 | --- | --- | --- |
@@ -21,12 +22,27 @@ seven-day soak remain open.
 | P0 parsing/crypto | WIF/Schnorr/BIP350 and wallet integration tests pass. Fuzzing now reaches the private PSBT base64/map/witness checker and repairs P2P frame checksums to exercise inner parsers. | Longer fuzz campaigns remain useful; the bounded run below is not exhaustive. |
 | P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. Incumbent SCRIPT reuse follows fresh contextual/policy checks. Candidate clones now share immutable transaction payloads; cached IDs and indexed dependency queries remove repeated unrelated-payload hashing. | Metadata cloning, fresh input lookup, replay hashing, policy checks and graph work still need end-to-end resource budgets. |
 | P1 cluster mempool | Chunk membership, topological order, exact totals and 64-entry components are now fuzzed alongside diagrams; selection/eviction regressions pass. | Exact Core optimizer parity remains unclaimed. |
-| P1 fees/package relay | Zero-fee parent replay, TRUC and existing package fixtures pass; Core replacement/pressure fixtures passed again on 2026-09-10. | Broader rolling-floor and optimizer differential coverage remains open. |
+| P1 fees/package relay | Zero-fee parent replay, TRUC and package fixtures pass. Fractional rolling-fee decay now survives frequent queries; three Core replacement/pressure/decay fixtures pass on 2026-09-11. | Covered temporal behavior is accepted; occupancy-accounting, eviction and broader optimizer equivalence remain open. |
 | P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
 | P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Current admission resource work
+### Current fee-decay acceptance
+
+Three new regressions cover polling cadence, occupancy/block gates and fractional
+clear thresholds; reconciliation also preserves fractional state. All **70**
+admission tests pass. Baseline `568772a` fails the same added live differential
+at +22 seconds (rBTC 600 versus Core 599 sat/kvB); the fixed trace agrees through
+86,400 seconds of simulated time. The comparison empties both pools after real
+eviction and mining so their occupancy regimes match.
+
+Final all-feature suite: **919 passed**, 0 failed, **29 ignored** (880 library +
+39 integration; subprocess helpers not counted twice), with four test threads.
+All **three** explicitly enabled Core 31 replacement/package-pressure/decay tests
+pass. Strict all-target/all-feature Clippy, formatting and diff checks pass.
+Evidence is in `target/upstream-followup/2026-09-11/fee-decay/`.
+
+### Prior admission resource work (`568772a`)
 
 See [the admission resource report](UPSTREAM_ADMISSION_RESOURCE_GATE.md) for the
 baseline workload, repeated measurements and limits of these results. Candidate
@@ -238,9 +254,9 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
   campaigns, cold-disk and full mainnet storage-scale gates. Real Tor/I2P and the
   selected generated benchmarks now pass; the 160-million-UTXO workload and
   seven-day public-network finalizer have not been run in this continuation.
-- Broaden live cluster optimizer/fee-floor differential coverage before claiming
-  complete Core policy parity. Existing successful fixtures establish only
-  their tested scenarios.
+- Broaden live cluster optimizer, occupancy-accounting and fee-floor differential
+  coverage before claiming complete Core policy parity. Fractional temporal
+  decay is now covered; successful fixtures establish only their tested scenarios.
 
 The entries below preserve the original findings and earlier blocked runs.
 Their pending-test statements are historical and are superseded by the current
