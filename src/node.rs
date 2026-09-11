@@ -10838,6 +10838,7 @@ async fn run_connected_peer(
             &options.deployments,
             path.clone(),
             network_time,
+            None,
         )
         .await?;
         let status = options
@@ -11513,15 +11514,34 @@ async fn sync_headers(
     deployments: &DeploymentConfig,
     path: PathBuf,
     network_time: &NetworkTime,
+    existing: Option<HeaderDag>,
 ) -> Result<HeaderDag, PeerRunError> {
     let store =
         RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
-    let mut dag = store
-        .load_dag_with_deployments(
-            deployments.clone(),
-            unix_time().map_err(PeerRunError::transient)?,
-        )
-        .map_err(|error| PeerRunError::transient(error.to_string()))?;
+    // The serving loop owns this DAG and serializes header writes, including
+    // local submissions, to the same database. Transfer that ownership across
+    // polls instead of replaying and temporarily duplicating every retained
+    // fork. Startup and peer failover still validate the complete durable log.
+    let mut dag = if let Some(dag) = existing {
+        let persisted = store
+            .len()
+            .map_err(|error| PeerRunError::local(error.to_string()))?;
+        if !dag.uses_deployments(deployments)
+            || u64::try_from(dag.retained_header_count()).ok() != persisted.checked_add(1)
+        {
+            return Err(PeerRunError::local(
+                "retained header DAG does not match the persistence count or deployment configuration",
+            ));
+        }
+        dag
+    } else {
+        store
+            .load_dag_with_deployments(
+                deployments.clone(),
+                unix_time().map_err(PeerRunError::transient)?,
+            )
+            .map_err(|error| PeerRunError::transient(error.to_string()))?
+    };
     let time = network_time.snapshot();
     rbtc_info!(
         "resuming headers-first sync from {}:{} (network_time_samples={} offset_seconds={} usable={})",
@@ -11599,6 +11619,7 @@ async fn sync_snapshot_overlay_node(
         &options.deployments,
         data_dir.join("headers.redb"),
         network_time,
+        None,
     )
     .await?;
 
@@ -13468,6 +13489,7 @@ async fn sync_validating_node(
         deployment_config,
         headers_path.clone(),
         network_time,
+        None,
     )
     .await?;
     let inbound_headers = Arc::new(RwLock::new(headers.active_chain_snapshot()));
@@ -14011,6 +14033,7 @@ async fn sync_validating_node(
                     deployment_config,
                     headers_path.clone(),
                     network_time,
+                    Some(headers),
                 )
                 .await?;
                 headers.refresh_active_chain_snapshot(
@@ -19002,6 +19025,7 @@ fn print_version() {
 
 #[cfg(test)]
 mod tests {
+    mod header_resync;
     mod private_broadcast_interop;
 
     use super::*;
@@ -19682,8 +19706,8 @@ mod tests {
             "the RPC-side snapshot must advance too, or the next submission cannot see its own parent"
         );
 
-        // Persisted, so the resync that follows every caught-up poll reloads the
-        // header instead of silently dropping back to the previous tip.
+        // Persistence preserves this header on startup/failover, while ordinary
+        // caught-up polls retain the same in-memory DAG.
         let reloaded = RedbHeaderStore::open(&headers_path)
             .unwrap()
             .load_dag_with_deployments(

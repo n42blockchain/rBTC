@@ -1,8 +1,14 @@
 # Competing-header resource gate
 
-Status: updated 2026-09-10. The active-only serving projection is implemented
-and measured. Primary DAG/candidate/disk retention limits are **not implemented
-or accepted**.
+Status: updated 2026-09-11. The active-only serving projection and reuse of the
+validated DAG across within-session polls are implemented and measured. Primary
+DAG/candidate/disk retention limits are **not implemented or accepted**.
+
+The [resync acceptance](UPSTREAM_HEADER_RESYNC_GATE.md) removes historical
+header replay and temporary replacement graphs on ordinary caught-up polls.
+At 100,000 competing siblings, eight empty polls perform zero historical
+validations instead of 820,000. Startup and peer failover still reload the
+durable graph; this does not close the retention/recovery sequence below.
 
 ## Findings in this checkout
 

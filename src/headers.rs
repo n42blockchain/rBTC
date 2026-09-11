@@ -248,6 +248,10 @@ impl HeaderDag {
         self.params.network
     }
 
+    pub(crate) fn uses_deployments(&self, deployments: &DeploymentConfig) -> bool {
+        &self.deployments == deployments
+    }
+
     /// Returns the highest cumulative-work header.
     #[must_use]
     pub fn active_tip(&self) -> HeaderInfo {

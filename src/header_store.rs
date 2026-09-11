@@ -24,6 +24,11 @@ const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("heade
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("header_metadata");
 const NEXT_SEQUENCE_KEY: &str = "next_sequence";
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REPLAYED_HEADERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Failures from header persistence and replay.
 #[derive(Debug, Error)]
 pub enum HeaderStoreError {
@@ -189,6 +194,8 @@ impl RedbHeaderStore {
             if header.block_hash() != hash {
                 return Err(HeaderStoreError::Malformed("header hash mismatch"));
             }
+            #[cfg(test)]
+            REPLAYED_HEADERS.with(|count| count.set(count.get() + 1));
             dag.insert_contextual(header, adjusted_time)?;
         }
         Ok(dag)

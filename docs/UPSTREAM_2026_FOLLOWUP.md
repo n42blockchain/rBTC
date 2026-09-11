@@ -6,14 +6,13 @@ claim that the older P1 roadmap or every item below has passed this checkout.
 
 ## Current progress (2026-09-11)
 
-The prior cluster refinement was pushed as `b320752`. This continuation fixes
-reconciliation losing already-paid zero-fee parents and eliminates repeated
-prefix validation. Each retained entry receives one fresh contextual validation
-in a shared overlay, retaining immutable payloads and reusable SCRIPT results.
-The live Core fixture agrees across ordinary/dust packages and three block
-transitions. At 257 entries the synthetic workload's median reconciliation time
-falls from 2,676.069 ms to 21.883 ms. See
-[reconciliation acceptance](UPSTREAM_RECONCILIATION_GATE.md).
+The prior reconciliation fix was pushed as `fdf3cbf`. This continuation removes
+full durable-header replay on ordinary within-session polls. The serving loop
+transfers ownership of its validated DAG across polls, preserving all competing
+branches and the existing atomic validate/persist/commit path. At 100,000
+competing siblings, eight empty polls replay zero historical headers instead of
+820,000; median elapsed time falls from 2,246.737 ms to 10.882 ms in the repeated
+loopback probe. See [header resync acceptance](UPSTREAM_HEADER_RESYNC_GATE.md).
 Full optimizer search, header retention, total admission resource budgets, full
 mainnet scale and the seven-day soak remain open.
 
@@ -25,11 +24,24 @@ mainnet scale and the seven-day soak remain open.
 | P1 orphan/CPU/disk DoS | Orphan input-work bounds and hostile-input/log tests pass. SCRIPT reuse, shared immutable payloads and indexed dependency queries remove repeated work. Reconciliation now validates each retained entry once without cloning payloads. | Ordinary package replay, metadata cloning, fresh input lookup, hashing, policy checks, snapshots and exceptional graph work still need end-to-end resource budgets. |
 | P1 cluster mempool | Greedy ordering now receives the bounded two-pass refinement; 4,096 exact Core comparisons, connected-chunk properties and actual admission/relay regressions pass. | Core's full work-budgeted optimizer and incremental-order reuse remain open. |
 | P1 fees/package relay | Zero-fee sponsorship now also survives reconciliation, including ephemeral dust and confirmed-parent transitions. Fractional rolling-fee decay survives frequent queries; Core replacement/pressure/decay and sponsored-package fixtures cover these paths. | Covered temporal behavior is accepted; occupancy-accounting, eviction and broader optimizer equivalence remain open. |
-| P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving now retains only active ancestors and refreshes the changed suffix. | Primary DAG/disk retention, bounded candidate recovery and persistent eviction remain open. |
+| P1 headers-first IBD | Staging, failover and rollback tests pass. Inbound serving retains only active ancestors. Ordinary within-session polls now reuse the full validated DAG and avoid historical replay/replacement allocation. | Primary DAG/disk retention, bounded candidate recovery, startup/failover replay bounds and persistent eviction remain open. |
 | P1 chainstate I/O | Recovery/write-back tests, generated benchmarks in both engine orders, and million-UTXO compaction/restart/reference equivalence pass. | Full mainnet scale, cold-disk and sustained I/O acceptance remain separate; no engine default changed. |
 | P1 low-work/reorg DoS | Contextual rejection and suffix rebuild regressions pass; serving projection growth under valid sibling floods is removed and measured. | Valid competing headers still accumulate in the primary DAG and survive reopen. |
 
-### Current reconciliation acceptance
+### Current header resync acceptance
+
+All-feature regression: **936 passed**, 0 failed, **32 ignored** (897 library +
+39 integration, excluding duplicate subprocess helpers). Five new production-path
+tests cover unchanged polls, local submissions and stronger forks, invalid-batch
+rollback, cancellation/restart, and local consistency checks. The release probe
+passed twelve fresh-process samples across 50k/100k sibling counts and reload/reuse
+modes, preserving every header and the same database file lengths. Both live
+Core 31 BIP34 and BIP66/BIP65 header-boundary tests pass, as do strict
+all-target/all-feature Clippy, formatting and diff checks. Primary retention,
+startup/failover loading and durable eviction limits remain open. Evidence is in
+`target/upstream-followup/2026-09-11/header-resync/`.
+
+### Prior reconciliation acceptance (`fdf3cbf`)
 
 All-feature regression: **931 passed**, 0 failed, **31 ignored** (892 library +
 39 integration, excluding duplicate subprocess helpers). All four explicitly
