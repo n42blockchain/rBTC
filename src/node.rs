@@ -20920,9 +20920,7 @@ mod tests {
         // The other half, without which the assertion above would also pass if
         // the wave simply never ran: once nothing viable is left, the
         // authorities are contacted.
-        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let refused = dead.local_addr().unwrap();
-        drop(dead);
+        let (_reservation, refused) = crate::test_support::refused_tcp_endpoint();
 
         let name_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let name_proxy = name_listener.local_addr().unwrap();
@@ -20949,7 +20947,9 @@ mod tests {
             .unwrap();
 
         session.abort();
+        let _ = session.await;
         name_server.abort();
+        let _ = name_server.await;
     }
 
     #[tokio::test]
@@ -20958,9 +20958,7 @@ mod tests {
 
         // A port nothing listens on, so the wave fails at the proxy rather
         // than anywhere that could disguise a fallback as success.
-        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let name_proxy = dead.local_addr().unwrap();
-        drop(dead);
+        let (_reservation, name_proxy) = crate::test_support::refused_tcp_endpoint();
 
         let mut options = peer_retry_test_options(true, Arc::new(RuntimeControl::default()));
         options.resources.name_proxy = Some(name_proxy);
@@ -30010,12 +30008,8 @@ mod tests {
     async fn daemon_uses_persisted_fallback_and_cools_failed_learned_peer() {
         let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_remote = live_listener.local_addr().unwrap();
-        let explicit_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let explicit_remote = explicit_listener.local_addr().unwrap();
-        let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let failed_remote = failed_listener.local_addr().unwrap();
-        drop(explicit_listener);
-        drop(failed_listener);
+        let (_explicit_reservation, explicit_remote) = crate::test_support::refused_tcp_endpoint();
+        let (_failed_reservation, failed_remote) = crate::test_support::refused_tcp_endpoint();
 
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(live_listener, peer_version(25)).await;
@@ -30115,10 +30109,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dns_remote = listener.local_addr().unwrap();
         let mut failed_explicit = Vec::with_capacity(MAX_CONFIGURED_PEERS);
+        let mut failed_reservations = Vec::with_capacity(MAX_CONFIGURED_PEERS);
         for _ in 0..MAX_CONFIGURED_PEERS {
-            let failed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            failed_explicit.push(failed_listener.local_addr().unwrap());
-            drop(failed_listener);
+            let (reservation, address) = crate::test_support::refused_tcp_endpoint();
+            failed_explicit.push(address);
+            failed_reservations.push(reservation);
         }
 
         let server = tokio::spawn(async move {

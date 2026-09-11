@@ -59,10 +59,12 @@ The first full-suite run had one failure in
 `daemon_fails_over_and_resumes_persisted_ibd_with_the_next_peer`: the deficient
 peer observed a random-looking local version nonce instead of the test's `99`.
 Its isolated rerun and the entire second run passed without any source change.
-The cause remains unconfirmed; the initial failure is retained in
-`all-features-tests.log`, alongside `failover-focused.log` and
-`all-features-final.log`. This continuation does not claim to have fixed that
-intermittent failure.
+The initial failure is retained in `all-features-tests.log`, alongside
+`failover-focused.log` and `all-features-final.log`. That continuation did not
+identify its cause. A later [fixture-isolation investigation](UPSTREAM_FAILOVER_TEST_ISOLATION.md)
+reproduces the same assertion through port reuse and fixes the unreserved
+failed-endpoint fixtures. The original foreign client's identity remains
+unavailable from the historical log.
 
 ## Reproducible payload-stress comparison
 

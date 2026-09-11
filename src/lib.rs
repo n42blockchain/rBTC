@@ -6,6 +6,9 @@
 
 extern crate self as rbtc;
 
+#[cfg(test)]
+mod test_support;
+
 pub mod api;
 pub mod archive;
 pub mod asmap;

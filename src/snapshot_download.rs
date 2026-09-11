@@ -487,9 +487,7 @@ mod tests {
 
     #[test]
     fn failed_https_range_is_bounded_and_preserves_resume_state() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let (_reservation, address) = crate::test_support::refused_tcp_endpoint();
         let directory = TempDir::new().unwrap();
         let config = SnapshotDownloadConfig {
             source: format!("https://{address}/snapshot"),
