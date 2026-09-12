@@ -93,6 +93,13 @@ ratios were wrong.
 
 ## Run the full 64/256 gate
 
+The [2026-09-12 execution runbook](ACCEPTANCE_EXECUTION_2026-09-12.md)
+documents Mac requirements, conservative capacity preflight, timing estimates,
+and the runner's new `--preflight`, `--status`, and `--resume` modes. The runner
+now freezes and directly times the test binaries, preserves separate attempts,
+checks fresh-process reopen and cross-lane content, and reports excessive RSS
+ratios with a nonzero exit. A completed small matrix is not full-scale acceptance.
+
 Use a dedicated volume. The output directory must not exist; the runner keeps
 both databases, reports, logs, host identity, filesystem snapshots, revision,
 dirty state, and a combined report hash. It prebuilds outside the timed lanes
@@ -109,9 +116,16 @@ RBTC_MDBX_GATE_MIN_RECLAIM_PERCENT=10 \
 contrib/run_mdbx_replacement_gate.sh /dedicated-volume/rbtc-mdbx-gate
 ```
 
-An interrupted individual lane can be resumed directly against its existing
-database. Keep every workload variable identical and raise only the target
-height when intentionally extending the run:
+Prefer resuming the whole matrix with its frozen binaries and workload:
+
+```sh
+contrib/run_mdbx_replacement_gate.sh /dedicated-volume/rbtc-mdbx-gate --resume
+```
+
+The low-level test below remains available for a separately documented manual
+experiment. It does not provide the runner's binary/workload identity checks
+or aggregate evidence. Keep every workload variable identical and use a new
+report path; intentional extensions are separate experiments:
 
 ```sh
 RBTC_MDBX_GATE_DIR=/dedicated-volume/rbtc-mdbx-gate/batch-256/chainstate.mdbx \

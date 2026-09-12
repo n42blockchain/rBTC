@@ -1,5 +1,14 @@
 # Public-network soak
 
+2026-09-12 finalizer correction: calendar age plus sparse historical samples
+could previously pass. The finalizer now verifies coverage from the caught-up
+baseline through recent samples for both networks, rejects stale, regressing
+or out-of-window rows and failed exercises, and requires paired bounded restart
+events before excusing a process-sampling gap. It uses Python 3 embedded in the
+frozen report script. New runs must freeze this updated script; the regression
+fixtures do not provide seven-day public-network evidence. See the
+[execution runbook](ACCEPTANCE_EXECUTION_2026-09-12.md).
+
 Status date: 2026-08-11.
 
 The minimum seven-day boundary has passed, but this repository does not contain
@@ -165,6 +174,24 @@ recorded identity. Its report retains the final hashes, peak RSS, peer
 diversity, freezer/data-directory growth, minimum free space, persistent
 mempool size, and measured restart durations rather than reducing acceptance
 to a single pass/fail bit.
+
+Coverage uses the default monitor cadence: at most 180 seconds between live
+process samples, 900 seconds for state/peer samples, and 10,800 seconds for disk
+samples. Initial/final coverage is checked too; the first caught-up tip sample
+must anchor the baseline timestamp exactly. A paired controlled restart lasting
+at most one hour may explain a process gap with one process-gap allowance on
+each side, but does not excuse absent state collection. Sampling tolerances
+are explicit, not proof of uninterrupted execution between samples. Every
+failed exercise or recorded outage with `status=failed` prevents acceptance.
+The follow-up audit also ties restart old/new PIDs to nearby observed process
+samples, checks mode and duration against the paired events, requires an abrupt
+restart behind each fault completion, and rejects duplicate event keys,
+malformed tip fields and empty mempool/peer-store evidence. For a formal
+seven-day run, recovery exercises must begin after the first day.
+Custom monitor cadences need a separately reviewed evidence policy; increasing
+the monitor interval does not silently relax this finalizer. Incomplete progress
+mode retains `Acceptance status: INCOMPLETE` even when the minimum calendar age
+has passed.
 
 ## Remaining scheduled exercises
 

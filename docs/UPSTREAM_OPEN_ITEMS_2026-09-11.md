@@ -1,5 +1,10 @@
 # Open-item review, 2026-09-11
 
+The [2026-09-12 execution runbook](ACCEPTANCE_EXECUTION_2026-09-12.md) adds
+Mac/capacity/time planning and a verified frozen-binary storage runner with
+resume, cross-lane content and restart checks. It does not close any of the six
+principal gates below; the new small-scale RSS measurement also exceeds 1.5.
+
 Latest review baseline: `c63a8761254a90d4ea4a4acce306560334b60885`.
 The [progress review](UPSTREAM_PROGRESS_REVIEW_2026-09-11.md) reconciles recent
 commits, source manifests and acceptance evidence. The table reflects the

@@ -83,8 +83,149 @@ if (( duration_seconds < minimum_seconds )); then
   failures+=("duration ${duration_seconds}s is below ${minimum_seconds}s")
 fi
 
+# Keep this validator in the frozen finalizer itself, not an unfrozen helper.
+# Calendar age cannot substitute for live process samples across the window.
+if coverage_result=$(python3 - "$metrics_dir" "$started_epoch" "$ended_epoch" "$minimum_seconds" <<'PY'
+import csv
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+import re
+
+root = Path(sys.argv[1])
+start, end, minimum = map(int, sys.argv[2:])
+
+def epoch(value):
+    return int(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+
+try:
+    events = {network: [] for network in ("bitcoin", "testnet4")}
+    for line in (root / "events.log").read_text().splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3 or fields[1] not in events:
+            raise ValueError("malformed event row")
+        stamp = epoch(fields[0])
+        if not start <= stamp <= end:
+            raise ValueError("event outside the baseline window")
+        pairs = [item.split("=", 1) for item in fields[2].split() if "=" in item]
+        values = dict(pairs)
+        if len(values) != len(pairs):
+            raise ValueError("duplicate event fields")
+        if values.get("status") == "failed":
+            raise ValueError(f"{fields[1]} contains a failed exercise or outage")
+        events[fields[1]].append((stamp, values))
+
+    planned = {network: [] for network in events}
+    for network, rows in events.items():
+        pending = None
+        last_stamp = start
+        for stamp, values in rows:
+            if stamp < last_stamp:
+                raise ValueError(f"{network} event timestamps regress")
+            last_stamp = stamp
+            if values.get("scenario") != "controlled-restart":
+                continue
+            if values.get("status") == "started":
+                if pending is not None:
+                    raise ValueError(f"{network} overlapping restart exercises")
+                pending = (stamp, values)
+            elif values.get("status") == "completed":
+                if pending is None:
+                    raise ValueError(f"{network} restart completion has no start")
+                began, original = pending
+                old_pid, new_pid = values.get("old_pid", ""), values.get("new_pid", "")
+                mode = values.get("mode")
+                duration = int(values.get("duration_seconds", ""))
+                if (not 0 <= stamp - began <= 3600 or old_pid != original.get("old_pid")
+                        or not old_pid.isdigit() or not new_pid.isdigit() or old_pid == new_pid
+                        or int(old_pid) <= 0 or int(new_pid) <= 0
+                        or mode not in ("graceful", "abrupt") or mode != original.get("mode")
+                        or duration < 0 or abs(duration - (stamp - began)) > 1):
+                    raise ValueError(f"{network} restart identity/duration invalid")
+                if minimum >= 604800 and began - start < 86400:
+                    raise ValueError(f"{network} restart exercise started before one day")
+                planned[network].append((began, stamp, old_pid, new_pid, mode))
+                pending = None
+        if pending is not None:
+            raise ValueError(f"{network} restart exercise is unfinished")
+        for stamp, values in rows:
+            if not values.get("scenario", "").startswith("fault-"):
+                continue
+            if (values.get("scenario") != "fault-abrupt-kill" or values.get("status") != "completed"
+                    or not any(stamp == finished and mode == "abrupt"
+                               and values.get("old_pid") == old_pid and values.get("new_pid") == new_pid
+                               for _, finished, old_pid, new_pid, mode in planned[network])):
+                raise ValueError(f"{network} fault completion has no matching abrupt restart")
+
+    # Default collector: processes every minute, state every five minutes,
+    # disk every hour. Three sample periods accommodate collection jitter.
+    for name, gap_limit in (("process.tsv", 180), ("tips.tsv", 900),
+                            ("freezer.tsv", 900), ("persistent.tsv", 900),
+                            ("peers.tsv", 900), ("disk.tsv", 10800)):
+        samples = {network: [] for network in events}
+        process_ids = {network: {} for network in events}
+        with (root / name).open() as stream:
+            for row in csv.DictReader(stream, delimiter="\t"):
+                network = row.get("network")
+                if network not in samples:
+                    raise ValueError(f"{name} has an unknown network")
+                stamp = epoch(row["timestamp_utc"])
+                if not start <= stamp <= end:
+                    raise ValueError(f"{name} sample outside baseline window")
+                if name == "process.tsv":
+                    if int(row["pid"]) <= 0 or int(row["rss_kib"]) <= 0:
+                        raise ValueError(f"{network} non-live process sample")
+                    if stamp in process_ids[network]:
+                        raise ValueError(f"{network} duplicate process timestamp")
+                    process_ids[network][stamp] = row["pid"]
+                if name == "tips.tsv" and (not row["header_height"].isdigit()
+                        or not row["execution_height"].isdigit()
+                        or not re.fullmatch(r"[0-9a-f]{64}", row["header_hash"])):
+                    raise ValueError(f"{network} malformed tip evidence")
+                if name == "persistent.tsv" and (int(row["mempool_bytes"]) <= 0
+                        or int(row["peer_store_bytes"]) <= 0):
+                    raise ValueError(f"{network} empty persistent-store evidence")
+                if name == "tips.tsv" and not samples[network]:
+                    if stamp != start:
+                        raise ValueError(f"{network} caught-up tip sample does not anchor the baseline")
+                    if row["header_height"] != row["execution_height"]:
+                        raise ValueError(f"{network} was not caught up at baseline")
+                samples[network].append(stamp)
+        for network, stamps in samples.items():
+            if not stamps or stamps[0] - start > gap_limit or end - stamps[-1] > gap_limit:
+                raise ValueError(f"{network} {name} does not cover the baseline window (late/missing/stale)")
+            if name == "process.tsv":
+                for began, finished, old_pid, new_pid, _ in planned[network]:
+                    old_seen = any(began-gap_limit <= stamp <= began and pid == old_pid
+                                   for stamp, pid in process_ids[network].items())
+                    new_seen = any(finished <= stamp <= finished+gap_limit and pid == new_pid
+                                   for stamp, pid in process_ids[network].items())
+                    if not old_seen or not new_seen:
+                        raise ValueError(f"{network} restart PID transition is not observed")
+            for left, right in zip(stamps, stamps[1:]):
+                if right < left:
+                    raise ValueError(f"{network} {name} timestamps regress")
+                if right - left > gap_limit:
+                    controlled = name == "process.tsv" and any(
+                        began - gap_limit <= left <= began and finished <= right <= finished + gap_limit
+                        for began, finished, _, _, _ in planned[network])
+                    if not controlled:
+                        raise ValueError(f"{network} {name} has an uncovered {right-left}s gap")
+    print("continuous sample coverage verified")
+except (ValueError, KeyError, TypeError, OSError) as error:
+    print(str(error))
+    sys.exit(1)
+PY
+); then
+  coverage_status=PASS
+else
+  coverage_status=INCOMPLETE
+  failures+=("continuous evidence: $coverage_result")
+fi
+
 printf '# rBTC public-network soak report\n\n'
 printf -- '- Duration status: `%s`\n' "$status"
+printf -- '- Sample coverage status: `%s`\n' "$coverage_status"
 printf -- '- Window: `%s` through `%s` (%s seconds)\n' \
   "$started_utc" "$ended_utc" "$duration_seconds"
 printf -- '- Commit: `%s`\n' "$commit"
@@ -292,6 +433,7 @@ printf -- '- Testnet4 controlled restart completions: `%s`\n' "$testnet4_restart
 printf -- '- Fault scenarios completed: `%s`\n' "$fault_scenarios"
 
 if (( ${#failures[@]} != 0 )); then
+  printf '\n- Acceptance status: `INCOMPLETE`\n'
   printf '\n## Open gates\n\n'
   for failure in "${failures[@]}"; do
     printf -- '- %s\n' "$failure"
@@ -299,4 +441,6 @@ if (( ${#failures[@]} != 0 )); then
   if [[ "${RBTC_SOAK_ALLOW_INCOMPLETE:-0}" != 1 ]]; then
     exit 1
   fi
+else
+  printf '\n- Acceptance status: `PASS`\n'
 fi
