@@ -130,7 +130,15 @@ impl Drop for CoreNode {
                 let _ = child.wait();
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
+        if thread::panicking() {
+            eprintln!(
+                "retained failed Core RPC evidence: {} (port {})",
+                self.data_dir.display(),
+                self.rpc_port
+            );
+        } else {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
     }
 }
 

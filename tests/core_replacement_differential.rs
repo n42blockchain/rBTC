@@ -145,8 +145,17 @@ impl CoreNode {
     }
 
     fn rpc(&self, arguments: &[&str]) -> Result<String, String> {
+        // Funding mines 101 blocks and synchronizes a wallet on real storage.
+        // On APFS that can exceed 15 seconds while Core is still progressing.
+        // Give only fixture mining a larger bounded deadline; do not retry a
+        // timed-out mutation or relax admission/relay RPC deadlines.
+        let timeout = if arguments.first() == Some(&"generatetoaddress") {
+            "-rpcclienttimeout=120"
+        } else {
+            "-rpcclienttimeout=15"
+        };
         let output = Command::new(&self.cli)
-            .args(["-regtest", "-rpcclienttimeout=15"])
+            .args(["-regtest", timeout])
             .arg(format!("-datadir={}", self.data_dir.display()))
             .arg(format!("-rpcport={}", self.rpc_port))
             .args(arguments)
@@ -179,7 +188,15 @@ impl Drop for CoreNode {
                 let _ = child.wait();
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
+        if thread::panicking() {
+            eprintln!(
+                "retained failed Core RPC evidence: {} (port {})",
+                self.data_dir.display(),
+                self.rpc_port
+            );
+        } else {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
     }
 }
 

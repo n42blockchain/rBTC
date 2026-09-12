@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn failed_https_range_is_bounded_and_preserves_resume_state() {
-        let (_reservation, address) = crate::test_support::refused_tcp_endpoint();
+        let (_reservation, address) = crate::test_support::failed_tcp_endpoint();
         let directory = TempDir::new().unwrap();
         let config = SnapshotDownloadConfig {
             source: format!("https://{address}/snapshot"),
