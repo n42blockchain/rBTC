@@ -1,5 +1,25 @@
 # Failed-peer fixture isolation, 2026-09-11
 
+## macOS correction, 2026-09-12
+
+The bound-but-unlistened fixture below was accepted on Linux. On the M1 Max
+running macOS 26.6.2, a connection to that reserved port times out instead of
+returning `ConnectionRefused`. This reproduced both the fixture regression and
+the name-wave exhaustion test failure at `ae73758`.
+
+The shared fixture now owns a listening socket and closes each accepted stream
+before any protocol bytes are sent. A standard worker thread supports both the
+synchronous HTTPS test and current-thread Tokio tests; dropping the fixture
+stops and joins the worker. This tests a failed transport/handshake, not a SYN
+refusal. The regression still proves exclusive port ownership across three
+attempts, additionally proves prompt EOF/reset, and verifies release on drop.
+All existing failover, privacy and nonce assertions remain in place.
+
+The Mac all-feature rerun passed 943 tests, with 0 failures and 33 ignored.
+See [the Mac continuation report](MAC_ACCEPTANCE_2026-09-12.md) for evidence and
+remaining acceptance gates. The rest of this document records the earlier
+Linux experiment and its original refusal fixture.
+
 The failed-peer fixtures released their ephemeral loopback ports before dialing
 them. Another parallel test could acquire one of those ports and receive a
 connection intended for the failed endpoint. The DNS fallback fixture released
