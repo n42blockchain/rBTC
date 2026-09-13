@@ -11,16 +11,17 @@ use bitcoin::{
     consensus::{deserialize, encode::Error as EncodeError, serialize},
     hashes::Hash,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use thiserror::Error;
 
 use crate::{
     deployments::DeploymentConfig,
-    headers::{HeaderDag, HeaderError},
+    headers::{HeaderDag, HeaderError, StagedHeaderEviction},
 };
 
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("header_insertion_order");
+const HASH_SEQUENCE: TableDefinition<&[u8], u64> = TableDefinition::new("header_hash_sequence");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("header_metadata");
 const NEXT_SEQUENCE_KEY: &str = "next_sequence";
 
@@ -59,9 +60,17 @@ pub enum HeaderStoreError {
     /// A header failed contextual proof-of-work chain validation during replay.
     #[error("header replay validation: {0}")]
     Header(#[from] HeaderError),
+    /// A local reopen allowance was exceeded before any DAG replay or allocation.
+    #[error("header replay resource deferred: {retained} headers exceed allowance {limit}")]
+    ResourceDeferred {
+        /// Persisted non-genesis header count.
+        retained: u64,
+        /// Caller-supplied retained-header allowance, excluding genesis.
+        limit: usize,
+    },
 }
 
-/// Append-only redb storage for headers already accepted by [`HeaderDag`].
+/// Transactional redb storage for headers already accepted by [`HeaderDag`].
 ///
 /// Header insertion order is persisted separately from the hash lookup table,
 /// so all known branches can be rebuilt parent-first after a restart. The
@@ -80,6 +89,7 @@ impl RedbHeaderStore {
         {
             let _headers = transaction.open_table(HEADERS)?;
             let _order = transaction.open_table(INSERTION_ORDER)?;
+            let _sequence = transaction.open_table(HASH_SEQUENCE)?;
             let mut meta = transaction.open_table(META)?;
             if meta.get(NEXT_SEQUENCE_KEY)?.is_none() {
                 meta.insert(NEXT_SEQUENCE_KEY, 0_u64.to_le_bytes().as_slice())?;
@@ -118,6 +128,7 @@ impl RedbHeaderStore {
                     .map(redb::AccessGuard::value),
             )?;
             let mut order = transaction.open_table(INSERTION_ORDER)?;
+            let mut reverse = transaction.open_table(HASH_SEQUENCE)?;
             for header in batch {
                 let hash = header.block_hash();
                 let hash_bytes = hash.to_byte_array();
@@ -130,6 +141,7 @@ impl RedbHeaderStore {
                 }
                 headers.insert(hash_bytes.as_slice(), encoded.as_slice())?;
                 order.insert(sequence, hash_bytes.as_slice())?;
+                reverse.insert(hash_bytes.as_slice(), sequence)?;
                 sequence = sequence
                     .checked_add(1)
                     .ok_or(HeaderStoreError::Malformed("header sequence overflow"))?;
@@ -143,12 +155,65 @@ impl RedbHeaderStore {
     /// Returns the number of non-genesis headers persisted in this store.
     pub fn len(&self) -> Result<u64, HeaderStoreError> {
         let transaction = self.db.begin_read()?;
-        let meta = transaction.open_table(META)?;
-        read_sequence(
-            meta.get(NEXT_SEQUENCE_KEY)?
-                .as_ref()
-                .map(redb::AccessGuard::value),
-        )
+        Ok(transaction.open_table(HEADERS)?.len()?)
+    }
+
+    /// Atomically persists an explicitly staged in-memory retention operation.
+    ///
+    /// The stage must come from the complete DAG corresponding to this store,
+    /// with execution/recovery tips pinned. The caller commits its guard only
+    /// after this method succeeds. A legacy reverse index is filled by streaming
+    /// insertion rows inside this same transaction; no historical DAG is copied.
+    /// Redb reuses freed pages, but this method does not shrink the file or claim
+    /// a physical disk budget. No automatic ingress eviction policy is enabled.
+    pub fn persist_eviction(
+        &self,
+        stage: &StagedHeaderEviction<'_>,
+    ) -> Result<(), HeaderStoreError> {
+        if stage.evicted().is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut headers = transaction.open_table(HEADERS)?;
+            let mut order = transaction.open_table(INSERTION_ORDER)?;
+            let mut reverse = transaction.open_table(HASH_SEQUENCE)?;
+            if reverse.len()? != order.len()? {
+                for row in order.iter()? {
+                    let (sequence, hash) = row?;
+                    reverse.insert(hash.value(), sequence.value())?;
+                }
+            }
+            for info in stage.evicted() {
+                let hash = info.hash.to_byte_array();
+                let sequence = reverse
+                    .get(hash.as_slice())?
+                    .ok_or(HeaderStoreError::Malformed("evicted header lacks sequence"))?
+                    .value();
+                let encoded = headers
+                    .get(hash.as_slice())?
+                    .ok_or(HeaderStoreError::Malformed("evicted header missing"))?;
+                if encoded.value() != serialize(&info.header) {
+                    return Err(HeaderStoreError::Malformed(
+                        "evicted header differs from DAG",
+                    ));
+                }
+                drop(encoded);
+                let ordered = order.get(sequence)?.ok_or(HeaderStoreError::Malformed(
+                    "evicted header lacks ordered row",
+                ))?;
+                if ordered.value() != hash {
+                    return Err(HeaderStoreError::Malformed("evicted header order mismatch"));
+                }
+                drop(ordered);
+                headers.remove(hash.as_slice())?;
+                order.remove(sequence)?;
+                reverse.remove(hash.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Returns whether no non-genesis headers have been persisted.
@@ -176,9 +241,35 @@ impl RedbHeaderStore {
         deployments: DeploymentConfig,
         adjusted_time: u32,
     ) -> Result<HeaderDag, HeaderStoreError> {
+        self.load_dag_with_limit(deployments, adjusted_time, usize::MAX)
+    }
+
+    /// Checks retained row count before materializing any historical DAG entries.
+    ///
+    /// The allowance excludes genesis. Exceeding it is a local resource deferral,
+    /// not corrupt or invalid chain data. This primitive does not select entries
+    /// to discard, and automatic bounded node startup awaits the recovery policy.
+    pub fn load_dag_with_limit(
+        &self,
+        deployments: DeploymentConfig,
+        adjusted_time: u32,
+        max_headers: usize,
+    ) -> Result<HeaderDag, HeaderStoreError> {
         let transaction = self.db.begin_read()?;
         let order = transaction.open_table(INSERTION_ORDER)?;
         let headers = transaction.open_table(HEADERS)?;
+        let retained = headers.len()?;
+        if order.len()? != retained {
+            return Err(HeaderStoreError::Malformed(
+                "header and insertion counts differ",
+            ));
+        }
+        if retained > u64::try_from(max_headers).unwrap_or(u64::MAX) {
+            return Err(HeaderStoreError::ResourceDeferred {
+                retained,
+                limit: max_headers,
+            });
+        }
         let mut dag = HeaderDag::with_deployments(deployments);
         for row in order.iter()? {
             let (_sequence, hash) = row?;
@@ -216,6 +307,7 @@ fn read_sequence(value: Option<&[u8]>) -> Result<u64, HeaderStoreError> {
 
 #[cfg(test)]
 mod tests {
+    mod retention;
     use bitcoin::{
         TxMerkleNode,
         block::{Header, Version},

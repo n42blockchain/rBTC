@@ -16,6 +16,9 @@ use thiserror::Error;
 
 use crate::deployments::DeploymentConfig;
 
+mod retention;
+pub use retention::{HeaderRetentionError, StagedHeaderEviction};
+
 /// Bitcoin Core's maximum permitted future block timestamp offset.
 pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
 /// BIP94 maximum backward timestamp movement at a Testnet4 retarget boundary.
@@ -158,6 +161,9 @@ pub struct HeaderDag {
     params: Params,
     deployments: DeploymentConfig,
     headers: HashMap<BlockHash, HeaderInfo>,
+    // Built once on the first explicit retention operation. Serving projections
+    // do not need this index, and automatic retention is not enabled yet.
+    child_counts: Option<HashMap<BlockHash, usize>>,
     active_tip: BlockHash,
     active_chain: Vec<BlockHash>,
 }
@@ -187,7 +193,7 @@ impl StagedHeaderBatch<'_> {
 
     fn rollback(&mut self) {
         for hash in self.inserted.drain(..).rev() {
-            self.dag.headers.remove(&hash);
+            self.dag.remove_retained_header(hash);
         }
         let original = self
             .dag
@@ -237,6 +243,7 @@ impl HeaderDag {
             params: core_params(network),
             deployments,
             headers,
+            child_counts: None,
             active_tip: hash,
             active_chain: vec![hash],
         }
@@ -280,6 +287,7 @@ impl HeaderDag {
                 .collect(),
             active_tip: self.active_tip,
             active_chain: self.active_chain.clone(),
+            child_counts: None,
         }
     }
 
@@ -298,6 +306,7 @@ impl HeaderDag {
         }
         snapshot.params = self.params.clone();
         snapshot.deployments = self.deployments.clone();
+        snapshot.child_counts = None;
         let mut shared_len = snapshot.active_chain.len().min(self.active_chain.len());
         while shared_len > 0
             && snapshot.active_chain[shared_len - 1] != self.active_chain[shared_len - 1]
@@ -601,7 +610,7 @@ impl HeaderDag {
             height,
             chainwork: parent.chainwork + target.to_work(),
         };
-        self.headers.insert(hash, info);
+        self.restore_retained_header(info);
         if info.chainwork > self.active_tip().chainwork {
             self.promote_active_tip(info);
         }
