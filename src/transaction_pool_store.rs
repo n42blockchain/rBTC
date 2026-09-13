@@ -13,7 +13,7 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::Hash,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition};
 use thiserror::Error;
 
 use crate::transaction_admission::{
@@ -118,6 +118,82 @@ pub struct RedbTransactionPoolStore {
     db: Database,
     write_guard: Mutex<()>,
     limits: PoolLimits,
+}
+
+/// Pins one durable version from sizing through admission decoding. Writers may
+/// commit concurrently, but cannot replace the rows this read will materialize.
+pub(crate) struct AdmissionSnapshotRead {
+    read: ReadTransaction,
+    limits: PoolLimits,
+}
+
+pub(crate) struct AdmissionSnapshot {
+    pub transactions: Vec<Transaction>,
+    pub disconnected: Vec<Transaction>,
+    pub expired: BTreeSet<Txid>,
+}
+
+impl AdmissionSnapshotRead {
+    pub(crate) fn payload_bytes(&self) -> Result<usize, TransactionPoolStoreError> {
+        let snapshots = self.read.open_table(SNAPSHOTS)?;
+        let mut bytes = 0_usize;
+        for key in [
+            SNAPSHOT_KEY,
+            DISCONNECTED_KEY,
+            RELAY_ATTEMPTS_KEY,
+            ADMISSION_TIMES_KEY,
+        ] {
+            let row = snapshots
+                .get(key)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction-pool snapshot",
+                ))?;
+            bytes = bytes.checked_add(row.value().len()).ok_or(
+                TransactionPoolStoreError::Malformed("snapshot byte count overflow"),
+            )?;
+        }
+        Ok(bytes)
+    }
+
+    /// Consume the pinned read after the caller has reserved its payload budget.
+    /// Decode active transactions once, and validate expiry against that same set.
+    pub(crate) fn load(
+        self,
+        now: u32,
+        expiry_secs: u32,
+        include_disconnected: bool,
+    ) -> Result<AdmissionSnapshot, TransactionPoolStoreError> {
+        let snapshots = self.read.open_table(SNAPSHOTS)?;
+        let active = snapshots
+            .get(SNAPSHOT_KEY)?
+            .ok_or(TransactionPoolStoreError::Malformed(
+                "missing transaction-pool snapshot",
+            ))?;
+        let transactions = decode_snapshot(active.value(), self.limits)?;
+        let times =
+            snapshots
+                .get(ADMISSION_TIMES_KEY)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction admission times",
+                ))?;
+        let active_txids = transactions.iter().map(Transaction::compute_txid).collect();
+        let expired =
+            expired_snapshot_txids(&active_txids, times.value(), self.limits, now, expiry_secs)?;
+        let disconnected =
+            if include_disconnected {
+                let row = snapshots.get(DISCONNECTED_KEY)?.ok_or(
+                    TransactionPoolStoreError::Malformed("missing transaction-pool snapshot"),
+                )?;
+                decode_snapshot(row.value(), self.limits)?
+            } else {
+                Vec::new()
+            };
+        Ok(AdmissionSnapshot {
+            transactions,
+            disconnected,
+            expired,
+        })
+    }
 }
 
 /// Validates one raw persisted transaction-pool snapshot without opening a database.
@@ -285,23 +361,17 @@ impl RedbTransactionPoolStore {
     /// payloads. This is a point-in-time estimate for admission reservations,
     /// not a lease preventing a later writer from replacing the snapshots.
     pub fn snapshot_payload_bytes(&self) -> Result<usize, TransactionPoolStoreError> {
-        let read = self.db.begin_read()?;
-        let snapshots = read.open_table(SNAPSHOTS)?;
-        let mut bytes = 0_usize;
-        for key in [
-            SNAPSHOT_KEY,
-            DISCONNECTED_KEY,
-            RELAY_ATTEMPTS_KEY,
-            ADMISSION_TIMES_KEY,
-        ] {
-            let row = snapshots
-                .get(key)?
-                .ok_or(TransactionPoolStoreError::Malformed(
-                    "missing transaction-pool snapshot",
-                ))?;
-            bytes = bytes.saturating_add(row.value().len());
-        }
-        Ok(bytes)
+        self.admission_snapshot_read()?.payload_bytes()
+    }
+
+    /// Retains one MVCC version until the caller has sized, reserved and decoded it.
+    pub(crate) fn admission_snapshot_read(
+        &self,
+    ) -> Result<AdmissionSnapshotRead, TransactionPoolStoreError> {
+        Ok(AdmissionSnapshotRead {
+            read: self.db.begin_read()?,
+            limits: self.limits,
+        })
     }
 
     /// Loads bounded transactions recovered from disconnected active-chain blocks.
@@ -545,30 +615,18 @@ impl RedbTransactionPoolStore {
                 ))?
                 .value(),
             self.limits,
-        )?
-        .into_iter()
-        .map(|transaction| transaction.compute_txid())
-        .collect::<BTreeSet<_>>();
-        let admission_times = decode_admission_times(
+        )?;
+        let active = active
+            .into_iter()
+            .map(|transaction| transaction.compute_txid())
+            .collect();
+        let times =
             snapshots
                 .get(ADMISSION_TIMES_KEY)?
                 .ok_or(TransactionPoolStoreError::Malformed(
                     "missing transaction admission times",
-                ))?
-                .value(),
-            self.limits,
-        )?;
-        if admission_times.keys().copied().collect::<BTreeSet<_>>() != active {
-            return Err(TransactionPoolStoreError::Malformed(
-                "admission times do not match active transactions",
-            ));
-        }
-        Ok(admission_times
-            .into_iter()
-            .filter_map(|(txid, admitted_at)| {
-                (now.saturating_sub(admitted_at) > expiry_secs).then_some(txid)
-            })
-            .collect())
+                ))?;
+        expired_snapshot_txids(&active, times.value(), self.limits, now, expiry_secs)
     }
 
     /// Atomically records successful publication attempts for active pool transactions.
@@ -660,6 +718,29 @@ fn encode_snapshot(
         ));
     }
     Ok(encoded)
+}
+
+fn expired_snapshot_txids(
+    active: &BTreeSet<Txid>,
+    encoded_times: &[u8],
+    limits: PoolLimits,
+    now: u32,
+    expiry_secs: u32,
+) -> Result<BTreeSet<Txid>, TransactionPoolStoreError> {
+    let admission_times = decode_admission_times(encoded_times, limits)?;
+    if admission_times.len() != active.len()
+        || !admission_times.keys().all(|txid| active.contains(txid))
+    {
+        return Err(TransactionPoolStoreError::Malformed(
+            "admission times do not match active transactions",
+        ));
+    }
+    Ok(admission_times
+        .into_iter()
+        .filter_map(|(txid, admitted_at)| {
+            (now.saturating_sub(admitted_at) > expiry_secs).then_some(txid)
+        })
+        .collect())
 }
 
 fn decode_snapshot(
@@ -1074,6 +1155,68 @@ mod tests {
             csv_active: true,
             full_rbf: false,
         }
+    }
+
+    #[test]
+    fn admission_snapshot_pins_sizing_transactions_and_expiry_across_writer_commit() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbTransactionPoolStore::open(directory.path().join("mempool.redb"), Network::Regtest)
+                .unwrap();
+        let old = transaction(1);
+        let old_disconnected = transaction(2);
+        store.replace_at(std::slice::from_ref(&old), 10).unwrap();
+        store
+            .replace_disconnected(std::slice::from_ref(&old_disconnected))
+            .unwrap();
+        let pinned = store.admission_snapshot_read().unwrap();
+        let reserved_bytes = pinned.payload_bytes().unwrap();
+        let new = transaction(3);
+        let new_child = child(&new);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    store
+                        .replace_at(&[new.clone(), new_child.clone()], 100)
+                        .unwrap();
+                    store.replace_disconnected(&[]).unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(pinned.payload_bytes().unwrap(), reserved_bytes);
+        let snapshot = pinned.load(100, 50, true).unwrap();
+        assert_eq!(snapshot.transactions, vec![old.clone()]);
+        assert_eq!(snapshot.disconnected, vec![old_disconnected]);
+        assert_eq!(snapshot.expired, BTreeSet::from([old.compute_txid()]));
+        let fresh = store
+            .admission_snapshot_read()
+            .unwrap()
+            .load(100, 50, true)
+            .unwrap();
+        assert_eq!(fresh.transactions, vec![new, new_child]);
+        assert!(fresh.disconnected.is_empty());
+        assert!(fresh.expired.is_empty());
+    }
+
+    #[test]
+    fn admission_snapshot_keeps_empty_reservation_after_store_growth() {
+        let directory = TempDir::new().unwrap();
+        let store =
+            RedbTransactionPoolStore::open(directory.path().join("mempool.redb"), Network::Regtest)
+                .unwrap();
+        let pinned = store.admission_snapshot_read().unwrap();
+        let bytes = pinned.payload_bytes().unwrap();
+        let parent = transaction(1);
+        store
+            .replace_at(&[parent.clone(), child(&parent)], 10)
+            .unwrap();
+        assert!(store.snapshot_payload_bytes().unwrap() > bytes);
+        assert_eq!(pinned.payload_bytes().unwrap(), bytes);
+        let snapshot = pinned.load(100, 50, true).unwrap();
+        assert!(snapshot.transactions.is_empty());
+        assert!(snapshot.disconnected.is_empty());
+        assert!(snapshot.expired.is_empty());
     }
 
     #[test]

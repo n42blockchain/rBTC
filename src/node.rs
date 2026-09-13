@@ -13055,8 +13055,13 @@ fn admit_pending_peer_transactions(
         .tip()
         .map_err(|error| error.to_string())?
         .hash;
-    let persisted_bytes = transaction_store
-        .map(RedbTransactionPoolStore::snapshot_payload_bytes)
+    let persisted_read = transaction_store
+        .map(RedbTransactionPoolStore::admission_snapshot_read)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let persisted_bytes = persisted_read
+        .as_ref()
+        .map(crate::transaction_pool_store::AdmissionSnapshotRead::payload_bytes)
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or(0);
@@ -13104,16 +13109,26 @@ fn admit_pending_peer_transactions(
     };
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let now = unix_time()?;
-    let expired = transaction_store
-        .map(|store| store.expired_txids(now, DEFAULT_MEMPOOL_EXPIRY_SECS))
+    let persisted_snapshot = persisted_read
+        .map(|read| {
+            read.load(
+                now,
+                DEFAULT_MEMPOOL_EXPIRY_SECS,
+                disconnected_transactions.is_empty(),
+            )
+        })
         .transpose()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
-    let persisted = transaction_store
-        .map(RedbTransactionPoolStore::transactions)
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .unwrap_or_default();
+        .map_err(|error| error.to_string())?;
+    let (persisted, persisted_disconnected, expired) = persisted_snapshot.map_or_else(
+        || (Vec::new(), Vec::new(), BTreeSet::new()),
+        |snapshot| {
+            (
+                snapshot.transactions,
+                snapshot.disconnected,
+                snapshot.expired,
+            )
+        },
+    );
     let expired_with_descendants = transaction_descendant_closure(&persisted, &expired);
     let persisted = persisted
         .into_iter()
@@ -13125,13 +13140,7 @@ fn admit_pending_peer_transactions(
         .collect::<HashSet<_>>();
     let mut pending = persisted;
     if disconnected_transactions.is_empty() {
-        pending.extend(
-            transaction_store
-                .map(RedbTransactionPoolStore::disconnected_transactions)
-                .transpose()
-                .map_err(|error| error.to_string())?
-                .unwrap_or_default(),
-        );
+        pending.extend(persisted_disconnected);
     } else {
         pending.extend(disconnected_transactions.iter().cloned());
     }
