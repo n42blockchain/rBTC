@@ -1,5 +1,8 @@
 # Mac implementation and acceptance follow-up, 2026-09-13
 
+Follow-up: [Linux authentication, regression and snapshot preparation](LINUX_ACCEPTANCE_2026-09-13.md).
+SSH is now working; the access failure below describes the earlier attempt.
+
 Continues [the Mac baseline](MAC_ACCEPTANCE_2026-09-12.md) on
 `audit/mac-acceptance-20260912`. The storage evidence remains frozen at
 `c525ee768cb2f4ebdeca64f4779ae7fb383e9553`; subsequent optimizer, admission and
