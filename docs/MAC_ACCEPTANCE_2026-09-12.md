@@ -1,5 +1,8 @@
 # Mac acceptance continuation, 2026-09-12
 
+Latest implementation and completed Mac measurements: [2026-09-13 follow-up](MAC_FOLLOWUP_2026-09-13.md).
+The dated findings below are historical; the six acceptance gates remain open.
+
 Continuation of the audit at `ae73758`, in the independent
 `audit/mac-acceptance-20260912` worktree. Read this together with
 [AUDIT_2026-09-12.md](AUDIT_2026-09-12.md) and

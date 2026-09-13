@@ -1,5 +1,8 @@
 # Admission resource gate: shared payloads and indexed dependencies
 
+Latest implementation and completed Mac measurements: [2026-09-13 follow-up](MAC_FOLLOWUP_2026-09-13.md).
+The dated findings below are historical; the six acceptance gates remain open.
+
 Measured 2026-09-10 against baseline `2630a2d89c0cc279b4ff9d7b2769d74cb22504b6`.
 This closes two concrete sources of repeated work. It does not close the
 end-to-end admission CPU/RSS gate.

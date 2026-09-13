@@ -1,5 +1,8 @@
 # Competing-header resource gate
 
+Latest implementation and completed Mac measurements: [2026-09-13 follow-up](MAC_FOLLOWUP_2026-09-13.md).
+The dated findings below are historical; the six acceptance gates remain open.
+
 Status: updated 2026-09-11. The active-only serving projection and reuse of the
 validated DAG across within-session polls are implemented and measured. Primary
 DAG/candidate/disk retention limits are **not implemented or accepted**.

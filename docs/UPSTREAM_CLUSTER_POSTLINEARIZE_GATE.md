@@ -1,5 +1,8 @@
 # Cluster postlinearization acceptance, 2026-09-11
 
+Latest implementation and completed Mac measurements: [2026-09-13 follow-up](MAC_FOLLOWUP_2026-09-13.md).
+The dated findings below are historical; the six acceptance gates remain open.
+
 Status: the backward/forward refinement is implemented and accepted for the
 production 64-transaction bound. Full Core optimizer parity remains open.
 Baseline: `f9650a14113d2374d9828cf702da8ca498d3e9ef`.
