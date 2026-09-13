@@ -18,6 +18,9 @@ use rand::RngExt;
 use thiserror::Error;
 
 use crate::{
+    admission_resources::{
+        AdmissionBudget, AdmissionDeferred, AdmissionStage, CandidateReservation,
+    },
     chainstate::{
         ChainstateError, check_sequence_lock, enforces_bip68, prepare_transaction_for_block,
         transaction_legacy_sigops,
@@ -28,6 +31,8 @@ use crate::{
     },
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
+
+mod linearization_cache;
 
 /// Maximum number of locally admitted peer transactions.
 pub const MAX_ADMITTED_TRANSACTIONS: usize = 64;
@@ -128,6 +133,9 @@ pub enum TransactionAdmissionOutcome {
 /// A transaction failed local admission.
 #[derive(Debug, Error)]
 pub enum TransactionAdmissionError {
+    /// Local resource exhaustion; retry without caching transaction invalidity.
+    #[error(transparent)]
+    ResourceDeferred(#[from] AdmissionDeferred),
     /// Consensus, finality, maturity, or chainstate lookup failed.
     #[error("chainstate validation: {0}")]
     Chainstate(#[from] ChainstateError),
@@ -452,6 +460,9 @@ struct PoolChunk {
 /// Wire-ordered, conflict-indexed, hard-bounded local transaction pool.
 #[derive(Clone)]
 pub struct TransactionAdmissionPool {
+    validation_pending: bool,
+    budget: AdmissionBudget,
+    linearization_cache: linearization_cache::LinearizationCache,
     entries: VecDeque<AdmittedTransaction>,
     positions: BTreeMap<Txid, usize>,
     spent: BTreeMap<OutPoint, Txid>,
@@ -479,6 +490,9 @@ pub struct TransactionAdmissionPool {
 impl Default for TransactionAdmissionPool {
     fn default() -> Self {
         Self {
+            validation_pending: false,
+            budget: AdmissionBudget::default(),
+            linearization_cache: linearization_cache::LinearizationCache::default(),
             entries: VecDeque::new(),
             positions: BTreeMap::new(),
             spent: BTreeMap::new(),
@@ -505,6 +519,53 @@ impl Default for TransactionAdmissionPool {
 }
 
 impl TransactionAdmissionPool {
+    /// Replaces the node ledger before use; all later candidates share it.
+    #[must_use]
+    pub fn with_admission_budget(mut self, budget: AdmissionBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Withholds owned serving/relay views until the changed chain is validated.
+    /// Retained payloads stay available for an atomic retry after resource deferral.
+    pub fn require_revalidation(&mut self, tip: BlockHash) {
+        if self.observed_chain_tip != Some(tip) && !self.entries.is_empty() {
+            self.validation_pending = true;
+        }
+    }
+
+    /// Whether public payload views are withheld pending fresh validation.
+    #[must_use]
+    pub const fn requires_revalidation(&self) -> bool {
+        self.validation_pending
+    }
+
+    /// Returns the shared work ledger for surrounding node pipeline stages.
+    #[must_use]
+    pub fn admission_budget(&self) -> AdmissionBudget {
+        self.budget.clone()
+    }
+
+    /// Reserves metadata construction before copying a candidate. The estimate
+    /// includes bounded request/orphan caches and cluster-order history.
+    pub fn admission_candidate(
+        &self,
+    ) -> Result<(Self, CandidateReservation), TransactionAdmissionError> {
+        let metadata = self
+            .entries
+            .len()
+            .saturating_mul(512)
+            .saturating_add(self.spent.len().saturating_mul(128))
+            .saturating_add(self.orphan_bytes)
+            .saturating_add(4 * 1024 * 1024);
+        self.budget.charge(
+            AdmissionStage::Metadata,
+            u64::try_from(metadata).unwrap_or(u64::MAX),
+        )?;
+        let reservation = self.budget.reserve_candidate(metadata)?;
+        Ok((self.clone(), reservation))
+    }
+
     /// Creates an empty pool with node-validated resource ceilings.
     ///
     /// Public for the live differential harness, which needs a pool small
@@ -1003,6 +1064,9 @@ impl TransactionAdmissionPool {
         transaction: &Transaction,
         error: &TransactionAdmissionError,
     ) -> bool {
+        if matches!(error, TransactionAdmissionError::ResourceDeferred(_)) {
+            return false;
+        }
         let txid = transaction.compute_txid();
         let witness_independent = txid.to_raw_hash() == transaction.compute_wtxid().to_raw_hash()
             || matches!(
@@ -1125,6 +1189,9 @@ impl TransactionAdmissionPool {
     /// Clones admitted transactions in oldest-to-newest order.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Transaction> {
+        if self.validation_pending {
+            return Vec::new();
+        }
         self.entries
             .iter()
             .map(|entry| (*entry.transaction).clone())
@@ -1170,6 +1237,9 @@ impl TransactionAdmissionPool {
     /// Clones the active pool with exact fee and policy-vsize relay metadata.
     #[must_use]
     pub fn relay_snapshot(&self) -> Vec<AdmittedTransactionRelay> {
+        if self.validation_pending {
+            return Vec::new();
+        }
         let all = self.positions.keys().copied().collect();
         // Ordering is a relay optimization, not an additional validity gate.
         // If an invariant fails, retain the original dependency-ordered view.
@@ -1253,6 +1323,26 @@ impl TransactionAdmissionPool {
         context: TransactionAdmissionContext,
         now: u32,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        self.budget.charge(
+            AdmissionStage::Payload,
+            u64::try_from(transactions.len()).unwrap_or(u64::MAX),
+        )?;
+        for transaction in &transactions {
+            let traversal = transaction
+                .input
+                .len()
+                .saturating_add(transaction.output.len());
+            self.budget.charge(
+                AdmissionStage::Payload,
+                u64::try_from(traversal).unwrap_or(u64::MAX),
+            )?;
+            self.budget.charge(
+                AdmissionStage::Payload,
+                u64::try_from(transaction.total_size())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(3),
+            )?;
+        }
         validate_package_bounds(&transactions)?;
         self.decay_rolling_minimum_fee(now);
         // Membership and package shape do not mutate admission state. Resolve
@@ -1270,8 +1360,9 @@ impl TransactionAdmissionPool {
         let ordered = topological_package_order(package)?;
         #[cfg(test)]
         CANDIDATE_POOL_CLONES.with(|clones| clones.set(clones.get() + 1));
-        let mut candidate = self.clone();
+        let (mut candidate, _reservation) = self.admission_candidate()?;
         let outcome = candidate.admit_package_inner(store, ordered, already_present, context)?;
+        candidate.validation_pending = false;
         *self = candidate;
         Ok(outcome)
     }
@@ -1283,11 +1374,17 @@ impl TransactionAdmissionPool {
         already_present: usize,
         context: TransactionAdmissionContext,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        self.budget.charge(
+            AdmissionStage::Graph,
+            u64::try_from(self.entries.len().saturating_add(ordered.len()))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4096),
+        )?;
         let child_with_parents = is_child_with_parents_tree(&ordered);
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
         let use_package_feerate = child_with_parents && replacement.txids.is_empty();
 
-        let overlay = AdmissionUtxoOverlay::new(store);
+        let overlay = AdmissionUtxoOverlay::new(store, &self.budget);
         for entry in &mut self.entries {
             let applied = apply_to_overlay(
                 &overlay,
@@ -1627,22 +1724,51 @@ impl TransactionAdmissionPool {
         &mut self,
         store: &S,
         context: TransactionAdmissionContext,
-    ) -> usize {
+    ) -> Result<usize, TransactionAdmissionError> {
+        let (mut candidate, _reservation) = self.admission_candidate()?;
+        let removed = candidate.reconcile_inner(store, context)?;
+        candidate.validation_pending = false;
+        *self = candidate;
+        Ok(removed)
+    }
+
+    fn reconcile_inner<S: UtxoStore>(
+        &mut self,
+        store: &S,
+        context: TransactionAdmissionContext,
+    ) -> Result<usize, TransactionAdmissionError> {
+        self.budget.charge(
+            AdmissionStage::Graph,
+            u64::try_from(self.entries.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4096),
+        )?;
         let before = self.entries.len();
-        let overlay = AdmissionUtxoOverlay::new(store);
+        let overlay = AdmissionUtxoOverlay::new(store, &self.budget);
         let mut larger = Vec::new();
+        let mut deferred = None;
         self.entries.retain_mut(|entry| {
-            let Ok(applied) = apply_to_overlay(
+            if deferred.is_some() {
+                return true;
+            }
+            let applied = match apply_to_overlay(
                 &overlay,
                 &entry.transaction,
                 context,
                 0,
                 entry.script_verification,
-            ) else {
-                // A failed application leaves the overlay unchanged. Children
-                // may still resolve this parent's confirmed outputs from the
-                // base store, so do not blindly discard its descendants.
-                return false;
+            ) {
+                Ok(applied) => applied,
+                Err(TransactionAdmissionError::ResourceDeferred(error)) => {
+                    deferred = Some(error);
+                    return true;
+                }
+                Err(_) => {
+                    // A failed application leaves the overlay unchanged. Children
+                    // may still resolve this parent's confirmed outputs from the
+                    // base store, so do not blindly discard its descendants.
+                    return false;
+                }
             };
             if applied.policy_vsize > entry.policy_vsize {
                 larger.push(entry.txid);
@@ -1654,9 +1780,12 @@ impl TransactionAdmissionPool {
             true
         });
         drop(overlay);
+        if let Some(error) = deferred {
+            return Err(error.into());
+        }
         self.rebuild_indexes();
         self.enforce_reconciled_growth(larger);
-        before.saturating_sub(self.entries.len())
+        Ok(before.saturating_sub(self.entries.len()))
     }
 
     fn enforce_reconciled_growth(&mut self, larger: Vec<Txid>) {
@@ -1682,6 +1811,7 @@ impl TransactionAdmissionPool {
                 .collect::<Vec<_>>();
             positions.sort_unstable();
             let mut component = Self {
+                budget: self.budget.clone(),
                 entries: positions
                     .into_iter()
                     .map(|position| self.entries[position].clone())
@@ -2011,7 +2141,10 @@ impl TransactionAdmissionPool {
             }
             let cluster = Cluster::new(fractions, parents)
                 .map_err(|_| unavailable("affected cluster is not representable"))?;
-            let order = cluster.linearize();
+            let order = self
+                .linearization_cache
+                .linearize(&ordered_members, &cluster, &self.budget)?
+                .order;
             chunks.extend(
                 chunk_linearization_with_members(cluster.fractions(), &order)
                     .into_iter()
@@ -2496,6 +2629,7 @@ fn apply_to_overlay<S: UtxoStore>(
 ) -> Result<AppliedAdmission, TransactionAdmissionError> {
     #[cfg(test)]
     ADMISSION_VALIDATION_RUNS.with(|runs| runs.set(runs.get() + 1));
+    overlay.charge_preparation(transaction)?;
     let legacy_sigops = transaction_legacy_sigops(transaction);
     if legacy_sigops > MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS {
         return Err(TransactionAdmissionError::TooManyLegacySigops {
@@ -2519,6 +2653,19 @@ fn apply_to_overlay<S: UtxoStore>(
     )?;
     let prevouts = &prepared.prevouts;
     let applied = &prepared.validated;
+    let prevout_bytes = prevouts.iter().fold(0_u64, |total, utxo| {
+        total.saturating_add(u64::try_from(utxo.script_pubkey.len()).unwrap_or(u64::MAX))
+    });
+    overlay
+        .budget
+        .charge(AdmissionStage::Prevout, prevout_bytes.saturating_mul(3))?;
+    overlay.budget.charge(
+        AdmissionStage::Script,
+        applied
+            .sigop_cost
+            .saturating_mul(10_000)
+            .saturating_add(prevout_bytes),
+    )?;
     if !context.csv_active && enforces_bip68(transaction) {
         for (input, utxo) in transaction.input.iter().zip(prevouts) {
             check_sequence_lock(
@@ -2588,15 +2735,30 @@ fn transaction_policy_vsize(transaction: &Transaction, sigop_cost: u64) -> usize
 
 struct AdmissionUtxoOverlay<'a, S> {
     base: &'a S,
+    budget: AdmissionBudget,
     current: Mutex<BTreeMap<OutPointKey, Option<Utxo>>>,
 }
 
 impl<'a, S> AdmissionUtxoOverlay<'a, S> {
-    fn new(base: &'a S) -> Self {
+    fn new(base: &'a S, budget: &AdmissionBudget) -> Self {
         Self {
             base,
+            budget: budget.clone(),
             current: Mutex::new(BTreeMap::new()),
         }
+    }
+    fn charge_preparation(&self, transaction: &Transaction) -> Result<(), AdmissionDeferred> {
+        self.budget.charge(
+            AdmissionStage::Prevout,
+            u64::try_from(transaction.input.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1024)
+                .saturating_add(
+                    u64::try_from(transaction.total_size())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(3),
+                ),
+        )
     }
 }
 
@@ -2809,6 +2971,7 @@ pub fn dependency_packages(mut transactions: Vec<Transaction>) -> Vec<Vec<Transa
 mod tests {
     mod package_preflight;
     mod reconciliation_growth;
+    mod resource_budget;
 
     use bitcoin::{
         Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
@@ -2891,7 +3054,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let overlay = AdmissionUtxoOverlay::new(&store);
+        let overlay = AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default());
         let third = OutPointKey::from(OutPoint::new(Txid::from_byte_array([3; 32]), 0));
         overlay
             .apply(&[first.into()], &[(third, first_utxo)])
@@ -3041,7 +3204,7 @@ mod tests {
             cloned.positions.values().copied().collect::<Vec<_>>(),
             vec![0]
         );
-        original.reconcile(&store, context());
+        original.reconcile(&store, context()).unwrap();
         assert_eq!(original.snapshot(), vec![transaction]);
         assert_eq!(original.positions.len(), 1);
     }
@@ -3260,7 +3423,7 @@ mod tests {
             .apply(&[], &[(outpoint.into(), utxo.clone())])
             .unwrap();
         let applied = apply_to_overlay(
-            &AdmissionUtxoOverlay::new(&store),
+            &AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default()),
             &transaction,
             context(),
             0,
@@ -3271,7 +3434,7 @@ mod tests {
         invalid.input[0].witness = Witness::new();
         assert!(matches!(
             apply_to_overlay(
-                &AdmissionUtxoOverlay::new(&store),
+                &AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default()),
                 &invalid,
                 context(),
                 0,
@@ -3289,7 +3452,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             apply_to_overlay(
-                &AdmissionUtxoOverlay::new(&changed_store),
+                &AdmissionUtxoOverlay::new(&changed_store, &AdmissionBudget::default()),
                 &transaction,
                 context(),
                 0,
@@ -3404,7 +3567,7 @@ mod tests {
                 .apply(&[], &[(outpoint.into(), utxo.clone())])
                 .unwrap();
             let applied = apply_to_overlay(
-                &AdmissionUtxoOverlay::new(&store),
+                &AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default()),
                 &transaction,
                 current,
                 0,
@@ -3435,7 +3598,7 @@ mod tests {
             SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
             let rate = if case == 6 { 1_000_000_000 } else { 0 };
             let error = apply_to_overlay(
-                &AdmissionUtxoOverlay::new(&changed_store),
+                &AdmissionUtxoOverlay::new(&changed_store, &AdmissionBudget::default()),
                 &transaction,
                 current,
                 rate,
@@ -5764,7 +5927,7 @@ mod tests {
         pool.admit(&store, transaction, context()).unwrap();
         pool.rolling_minimum_fee_sat_kvb = 1_000_000.25;
 
-        assert_eq!(pool.reconcile(&store, context()), 0);
+        assert_eq!(pool.reconcile(&store, context()).unwrap(), 0);
         assert_eq!(txids(&pool), vec![txid]);
         assert_eq!(pool.rolling_minimum_fee_sat_kvb(0), 1_000_000);
         assert_eq!(
@@ -5787,7 +5950,7 @@ mod tests {
             let base = store.snapshot_entries().unwrap();
             ADMISSION_VALIDATION_RUNS.with(|runs| runs.set(0));
             SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
-            assert_eq!(pool.reconcile(&store, context()), 0);
+            assert_eq!(pool.reconcile(&store, context()).unwrap(), 0);
             assert_eq!(
                 ADMISSION_VALIDATION_RUNS.with(std::cell::Cell::get),
                 usize::from(count),
@@ -5833,7 +5996,7 @@ mod tests {
                 height: 201,
                 ..context()
             };
-            assert_eq!(pool.reconcile(&store, next), 0, "dust={dust}");
+            assert_eq!(pool.reconcile(&store, next).unwrap(), 0, "dust={dust}");
             assert_eq!(pool.snapshot(), before);
             pool.validate_ephemeral_dust(&txids(&pool)).unwrap();
         }
@@ -5864,7 +6027,7 @@ mod tests {
                 &[(OutPoint::new(parent.compute_txid(), 0).into(), confirmed)],
             )
             .unwrap();
-        assert_eq!(pool.reconcile(&store, context()), 1);
+        assert_eq!(pool.reconcile(&store, context()).unwrap(), 1);
         assert_eq!(pool.snapshot(), vec![child.clone(), grandchild]);
         assert_eq!(pool.positions[&child.compute_txid()], 0);
         assert_eq!(pool.ancestor_closure(child.compute_txid()).len(), 1);
@@ -5873,7 +6036,7 @@ mod tests {
         store
             .apply(&[OutPoint::new(parent.compute_txid(), 0).into()], &[])
             .unwrap();
-        assert_eq!(pool.reconcile(&store, context()), 2);
+        assert_eq!(pool.reconcile(&store, context()).unwrap(), 2);
         assert!(pool.is_empty());
         assert!(pool.positions.is_empty());
         assert!(pool.spent.is_empty());
@@ -5881,6 +6044,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Keep the seven context regressions in one scenario table.
     fn reconciliation_rechecks_context_and_prevouts_without_touching_base_state() {
         for scenario in [
             "maturity",
@@ -5943,10 +6107,15 @@ mod tests {
                 store.apply(&[outpoint.into()], &[]).unwrap();
                 store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
             }
-            let failure =
-                apply_to_overlay(&AdmissionUtxoOverlay::new(&store), &parent, next, 0, None)
-                    .err()
-                    .expect("fixture must invalidate the parent");
+            let failure = apply_to_overlay(
+                &AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default()),
+                &parent,
+                next,
+                0,
+                None,
+            )
+            .err()
+            .expect("fixture must invalidate the parent");
             match (scenario, failure) {
                 (
                     "maturity",
@@ -5978,7 +6147,7 @@ mod tests {
                 (_, error) => panic!("unexpected {scenario} failure: {error}"),
             }
             let base = store.snapshot_entries().unwrap();
-            assert_eq!(pool.reconcile(&store, next), 2, "{scenario}");
+            assert_eq!(pool.reconcile(&store, next).unwrap(), 2, "{scenario}");
             assert_eq!(pool.snapshot(), vec![unrelated], "{scenario}");
             assert_eq!(store.snapshot_entries().unwrap(), base, "{scenario}");
         }
@@ -5997,10 +6166,10 @@ mod tests {
             ..context()
         };
         SCRIPT_VERIFICATION_RUNS.with(|runs| runs.set(0));
-        assert_eq!(pool.reconcile(&store, next), 0);
+        assert_eq!(pool.reconcile(&store, next).unwrap(), 0);
         assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 1);
         assert_ne!(pool.entries[0].script_verification, stamp);
-        assert_eq!(pool.reconcile(&store, next), 0);
+        assert_eq!(pool.reconcile(&store, next).unwrap(), 0);
         assert_eq!(SCRIPT_VERIFICATION_RUNS.with(std::cell::Cell::get), 1);
         assert_eq!(pool.snapshot(), vec![transaction]);
     }
@@ -6041,13 +6210,13 @@ mod tests {
                 pool.admit(&store, next.clone(), earlier).unwrap();
                 parent = next;
             }
-            assert_eq!(pool.reconcile(&store, earlier), 0);
-            assert_eq!(pool.reconcile(&store, context()), 1);
+            assert_eq!(pool.reconcile(&store, earlier).unwrap(), 0);
+            assert_eq!(pool.reconcile(&store, context()).unwrap(), 1);
             assert_eq!(pool.len(), if truc { 1 } else { 6 });
             assert_eq!(txids(&pool)[0], parent_txid);
             pool.validate_cluster_limits(&[parent_txid]).unwrap();
             pool.validate_truc_policy(&txids(&pool)).unwrap();
-            assert_eq!(pool.reconcile(&store, context()), 0);
+            assert_eq!(pool.reconcile(&store, context()).unwrap(), 0);
         }
     }
 
@@ -6133,7 +6302,7 @@ mod tests {
 
         let mined = transactions.last().unwrap().0;
         store.apply(&[mined.into()], &[]).unwrap();
-        assert_eq!(pool.reconcile(&store, context()), 1);
+        assert_eq!(pool.reconcile(&store, context()).unwrap(), 1);
         assert!(
             !pool
                 .snapshot()

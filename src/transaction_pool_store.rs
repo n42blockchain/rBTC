@@ -279,6 +279,31 @@ impl RedbTransactionPoolStore {
         self.read_snapshot(SNAPSHOT_KEY)
     }
 
+    /// Encoded bytes of the current active, disconnected and metadata snapshots.
+    ///
+    /// Reads row lengths without decoding transactions or allocating owned
+    /// payloads. This is a point-in-time estimate for admission reservations,
+    /// not a lease preventing a later writer from replacing the snapshots.
+    pub fn snapshot_payload_bytes(&self) -> Result<usize, TransactionPoolStoreError> {
+        let read = self.db.begin_read()?;
+        let snapshots = read.open_table(SNAPSHOTS)?;
+        let mut bytes = 0_usize;
+        for key in [
+            SNAPSHOT_KEY,
+            DISCONNECTED_KEY,
+            RELAY_ATTEMPTS_KEY,
+            ADMISSION_TIMES_KEY,
+        ] {
+            let row = snapshots
+                .get(key)?
+                .ok_or(TransactionPoolStoreError::Malformed(
+                    "missing transaction-pool snapshot",
+                ))?;
+            bytes = bytes.saturating_add(row.value().len());
+        }
+        Ok(bytes)
+    }
+
     /// Loads bounded transactions recovered from disconnected active-chain blocks.
     pub fn disconnected_transactions(&self) -> Result<Vec<Transaction>, TransactionPoolStoreError> {
         self.read_snapshot(DISCONNECTED_KEY)

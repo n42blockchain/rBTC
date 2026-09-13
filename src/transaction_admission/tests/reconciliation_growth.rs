@@ -54,7 +54,7 @@ fn activation_fixture(
         ..context()
     };
     // Populate fresh validation metadata without quadratic fixture admission.
-    assert_eq!(pool.reconcile(&store, earlier), 0);
+    assert_eq!(pool.reconcile(&store, earlier).unwrap(), 0);
     let ids = txids(&pool);
     pool.validate_cluster_limits(&ids).unwrap();
     pool.validate_truc_policy(&ids).unwrap();
@@ -69,7 +69,7 @@ fn assert_activation_work_is_local(truc: bool) {
         POLICY_INDEX_ENTRY_VISITS.with(|visits| visits.set(0));
         ADMISSION_VALIDATION_RUNS.with(|runs| runs.set(0));
         assert_eq!(
-            pool.reconcile(&store, context()),
+            pool.reconcile(&store, context()).unwrap(),
             if truc { count } else { 0 }
         );
         let visits = POLICY_INDEX_ENTRY_VISITS.with(std::cell::Cell::get);
@@ -95,7 +95,7 @@ fn assert_activation_work_is_local(truc: bool) {
             .collect::<Vec<_>>();
         assert_eq!(txids(&pool), expected);
         assert_eq!(store.snapshot_entries().unwrap(), base);
-        assert_eq!(pool.reconcile(&store, context()), 0);
+        assert_eq!(pool.reconcile(&store, context()).unwrap(), 0);
     }
 }
 
@@ -204,7 +204,7 @@ fn reconciliation_growth_resource_probe() {
     assert!(mode == "local" || mode == "reference");
     let (_directory, store, mut pool) = activation_fixture(count, true);
     // Perform the real contextual validation before timing the growth phase.
-    let overlay = AdmissionUtxoOverlay::new(&store);
+    let overlay = AdmissionUtxoOverlay::new(&store, &AdmissionBudget::default());
     let mut larger = Vec::new();
     for entry in &mut pool.entries {
         let applied = apply_to_overlay(

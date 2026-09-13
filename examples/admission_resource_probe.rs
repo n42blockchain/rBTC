@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let before_reconcile = pool.snapshot();
     let rss_before_reconcile = rss_kib();
     let started = Instant::now();
-    let reconciled_removed = pool.reconcile(&store, context());
+    let reconciled_removed = pool.reconcile(&store, context()).unwrap();
     let reconcile_micros = started.elapsed().as_micros();
     let rss_after_reconcile = rss_kib();
     assert_eq!(reconciled_removed, 0);

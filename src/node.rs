@@ -5717,11 +5717,26 @@ impl NodeInboundSource {
     /// Evaluates candidates as one package against a throwaway pool clone.
     ///
     /// The clone is discarded on every path, so neither a success nor a
-    /// failure can alter the live mempool, chainstate, or relay state.
+    /// failure can alter the live mempool, chainstate, or relay state. Work
+    /// accounting is shared and intentionally survives candidate rollback.
     fn dry_run_admission(
         &self,
         transactions: Vec<Transaction>,
     ) -> Result<Vec<TestAcceptResult>, String> {
+        let budget = self
+            .transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admission_budget();
+        let bytes = transactions.iter().fold(0_u64, |total, transaction| {
+            total.saturating_add(u64::try_from(transaction.total_size()).unwrap_or(u64::MAX))
+        });
+        budget
+            .charge(
+                crate::admission_resources::AdmissionStage::Payload,
+                bytes.saturating_mul(2),
+            )
+            .map_err(|error| error.to_string())?;
         let identities = transactions
             .iter()
             .map(|transaction| (transaction.compute_txid(), transaction.compute_wtxid()))
@@ -5738,15 +5753,30 @@ impl NodeInboundSource {
         )?;
         drop(headers);
         let now = unix_time()?;
-        let mut candidate = self
+        let (mut candidate, _reservation) = self
             .transaction_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .admission_candidate()
+            .map_err(|error| error.to_string())?;
         let outcome =
             candidate.admit_package_at(self.chainstate.as_ref(), transactions, context, now);
+        if let Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(
+            error,
+        )) = &outcome
+        {
+            return Err(error.to_string());
+        }
         Ok(match outcome {
             Ok(outcome) => {
+                budget
+                    .charge(
+                        crate::admission_resources::AdmissionStage::Snapshot,
+                        u64::try_from(candidate.retained_bytes())
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(2),
+                    )
+                    .map_err(|error| error.to_string())?;
                 let admitted = candidate
                     .relay_snapshot()
                     .into_iter()
@@ -12882,6 +12912,7 @@ fn unavailable_parent_txids(
 }
 
 struct PeerAdmissionProgress {
+    resource_deferred: bool,
     more_orphan_work: bool,
     parent_requests: Vec<bitcoin::Txid>,
 }
@@ -12985,6 +13016,24 @@ async fn fetch_orphan_parent_transactions(
     .map_err(|error| PeerRunError::p2p(&error))
 }
 
+fn defer_resource_limited_peer_admission(
+    session: &mut PeerSession<tokio::net::TcpStream>,
+    pending: Vec<Transaction>,
+    error: crate::admission_resources::AdmissionDeferred,
+) -> Result<PeerAdmissionProgress, String> {
+    for transaction in pending {
+        session
+            .queue_pending_transaction(transaction)
+            .map_err(|error| error.to_string())?;
+    }
+    rbtc_info!("{error}; retained peer transactions for a later context-validated attempt");
+    Ok(PeerAdmissionProgress {
+        resource_deferred: true,
+        more_orphan_work: false,
+        parent_requests: Vec::new(),
+    })
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn admit_pending_peer_transactions(
     session: &mut PeerSession<tokio::net::TcpStream>,
@@ -12999,6 +13048,60 @@ fn admit_pending_peer_transactions(
     full_rbf: bool,
     zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<PeerAdmissionProgress, String> {
+    // Reserve before reading persisted payloads or draining the peer queue.
+    // Every peer and chain-change pass draws from the same pool ledger.
+    let current_tip = chainstate
+        .execution()
+        .tip()
+        .map_err(|error| error.to_string())?
+        .hash;
+    let persisted_bytes = transaction_store
+        .map(RedbTransactionPoolStore::snapshot_payload_bytes)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    let disconnected_bytes = disconnected_transactions
+        .iter()
+        .fold(0_usize, |total, transaction| {
+            total.saturating_add(transaction.total_size())
+        });
+    let (budget, snapshot_bound) = {
+        let mut pool = transaction_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pool.require_revalidation(current_tip);
+        (
+            pool.admission_budget(),
+            pool.retained_bytes()
+                .saturating_add(persisted_bytes)
+                .saturating_add(disconnected_bytes)
+                .saturating_add(crate::p2p::MAX_PROTOCOL_MESSAGE_LEN as usize)
+                .saturating_mul(6)
+                .saturating_add(pool.len().saturating_mul(512)),
+        )
+    };
+    if let Err(error) = budget.charge(
+        crate::admission_resources::AdmissionStage::Snapshot,
+        u64::try_from(snapshot_bound).unwrap_or(u64::MAX),
+    ) {
+        rbtc_info!("{error}");
+        return Ok(PeerAdmissionProgress {
+            resource_deferred: true,
+            more_orphan_work: false,
+            parent_requests: Vec::new(),
+        });
+    }
+    let _pipeline_memory = match budget.reserve_candidate(snapshot_bound) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            rbtc_info!("{error}");
+            return Ok(PeerAdmissionProgress {
+                resource_deferred: true,
+                more_orphan_work: false,
+                parent_requests: Vec::new(),
+            });
+        }
+    };
     let context = transaction_admission_context(chainstate, headers, deployment_config, full_rbf)?;
     let now = unix_time()?;
     let expired = transaction_store
@@ -13033,6 +13136,7 @@ fn admit_pending_peer_transactions(
         pending.extend(disconnected_transactions.iter().cloned());
     }
     let peer_pending = session.take_pending_transactions();
+    let retry_peer_pending = peer_pending.clone();
     let peer_txids = peer_pending
         .iter()
         .map(Transaction::compute_txid)
@@ -13041,7 +13145,13 @@ fn admit_pending_peer_transactions(
     let mut pool = transaction_pool
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut candidate = pool.clone();
+    let (mut candidate, _candidate_memory) = match pool.admission_candidate() {
+        Ok(candidate) => candidate,
+        Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(error)) => {
+            return defer_resource_limited_peer_admission(session, retry_peer_pending, error);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     candidate.observe_chain_tip(
         chainstate
             .execution()
@@ -13052,7 +13162,13 @@ fn admit_pending_peer_transactions(
     );
     let mut removed_for_notification = candidate.remove_with_descendants(&expired);
     let expired_removed = removed_for_notification.len();
-    let reconciled_removed = candidate.reconcile(chainstate, context);
+    let reconciled_removed = match candidate.reconcile(chainstate, context) {
+        Ok(removed) => removed,
+        Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(error)) => {
+            return defer_resource_limited_peer_admission(session, retry_peer_pending, error);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let expired_orphans = candidate.prune_orphans(now);
     let mut accepted_messages = Vec::new();
     let mut deferred_messages = Vec::new();
@@ -13135,6 +13251,15 @@ fn admit_pending_peer_transactions(
                 }
                 Ok(_) => {
                     candidate.remove_orphans(&txid_set);
+                }
+                Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(
+                    error,
+                )) => {
+                    return defer_resource_limited_peer_admission(
+                        session,
+                        retry_peer_pending,
+                        error,
+                    );
                 }
                 Err(error) if error.is_missing_input() => {
                     let rejected_parent = source_package
@@ -13286,6 +13411,7 @@ fn admit_pending_peer_transactions(
         rbtc_warn!("{message}");
     }
     Ok(PeerAdmissionProgress {
+        resource_deferred: false,
         more_orphan_work,
         parent_requests: parent_requests.into_iter().collect(),
     })
@@ -13939,6 +14065,7 @@ async fn sync_validating_node(
                     }
                     fetch_announced_peer_transactions(session, transaction_pool, wallet_runtime)
                         .await?;
+                    let mut admission_deferred = false;
                     loop {
                         let progress = admit_pending_peer_transactions(
                             session,
@@ -13953,6 +14080,10 @@ async fn sync_validating_node(
                             mempool_full_rbf,
                             zmq_notifier,
                         )?;
+                        if progress.resource_deferred {
+                            admission_deferred = true;
+                            break;
+                        }
                         let requested_parents = !progress.parent_requests.is_empty();
                         if requested_parents {
                             let received =
@@ -13970,25 +14101,27 @@ async fn sync_validating_node(
                         }
                         tokio::task::yield_now().await;
                     }
-                    if let Some(store) = transaction_store.as_ref() {
-                        let active = transaction_pool
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .relay_snapshot();
-                        let relayed = relay_due_peer_transactions(
-                            store,
-                            &active,
-                            transaction_relay,
-                            unix_time()?,
-                        )?;
-                        if relayed > 0 {
-                            rbtc_info!(
-                                "republished {relayed} due peer transaction{} to hot standbys",
-                                if relayed == 1 { "" } else { "s" }
-                            );
+                    if !admission_deferred {
+                        if let Some(store) = transaction_store.as_ref() {
+                            let active = transaction_pool
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .relay_snapshot();
+                            let relayed = relay_due_peer_transactions(
+                                store,
+                                &active,
+                                transaction_relay,
+                                unix_time()?,
+                            )?;
+                            if relayed > 0 {
+                                rbtc_info!(
+                                    "republished {relayed} due peer transaction{} to hot standbys",
+                                    if relayed == 1 { "" } else { "s" }
+                                );
+                            }
                         }
+                        disconnected_transactions.clear();
                     }
-                    disconnected_transactions.clear();
                     rbtc_info!(
                         "minimum chainwork reached; full script validation remains enabled{}",
                         ibd_status
@@ -19025,6 +19158,7 @@ fn print_version() {
 
 #[cfg(test)]
 mod tests {
+    mod admission_resources;
     mod header_resync;
     mod private_broadcast_interop;
 

@@ -19,11 +19,14 @@
 //! `FeeFrac`, [`chunk_linearization`] is its `ChunkLinearization`, and
 //! [`compare_diagrams`] is its `CompareChunks`/feerate-diagram comparison.
 //! Linearization starts with the ancestor-set greedy baseline, then applies
-//! Core's backward/forward postlinearization refinement to clusters of at most
-//! 64 transactions. The full work-budgeted optimal search remains separate;
-//! matching this refinement does not establish complete optimizer parity.
+//! a budgeted maximum-density closure optimizer for clusters of at most 64
+//! transactions. Backward/forward postlinearization provides a non-worsening
+//! fallback when the search allowance is exhausted.
 
 use std::cmp::Ordering;
+
+mod optimizer;
+pub use optimizer::{DEFAULT_OPTIMIZER_WORK, LinearizationResult};
 
 /// The production cluster bound; larger pure-function inputs keep the baseline.
 const POSTLINEARIZE_LIMIT: usize = 64;
@@ -311,28 +314,13 @@ impl Cluster {
         collected
     }
 
-    /// Linearizes the cluster into a topologically valid order.
-    ///
-    /// Starts with ancestor-set greedy ordering, then performs a backward and
-    /// a forward postlinearization pass for clusters of at most 64 entries.
-    /// The refinement preserves topology and cannot worsen the feerate diagram.
-    /// It makes chunks connected and is optimal for one-parent/one-child trees;
-    /// it does not replace Core's full optimizer for arbitrary DAGs.
-    ///
-    /// The baseline repeatedly traverses ancestor edges. The additional two
-    /// passes use fixed 64-bit dependency sets and O(n²) group operations,
-    /// without recursive or unbounded search. Larger pure-function inputs
-    /// retain the total baseline.
-    ///
-    /// The result is a permutation of `0..len` in which every parent precedes
-    /// its children.
+    /// Linearizes with the default bounded optimizer, retaining a valid fallback
+    /// if search exhausts its allowance. Use [`Self::linearize_with_budget`] for
+    /// the proof status, search accounting and previous-order reuse.
     #[must_use]
     pub fn linearize(&self) -> Vec<usize> {
-        let mut order = self.linearize_ancestors();
-        if self.len() <= POSTLINEARIZE_LIMIT {
-            self.post_linearize(&mut order);
-        }
-        order
+        self.linearize_with_budget(None, DEFAULT_OPTIMIZER_WORK)
+            .order
     }
 
     /// Greedy baseline, breaking fee ties by ancestor count then anchor index.

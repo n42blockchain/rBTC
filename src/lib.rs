@@ -9,6 +9,7 @@ extern crate self as rbtc;
 #[cfg(test)]
 mod test_support;
 
+pub mod admission_resources;
 pub mod api;
 pub mod archive;
 pub mod asmap;

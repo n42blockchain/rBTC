@@ -600,7 +600,7 @@ fn core_31_and_rbtc_keep_sponsored_packages_across_blocks() {
                     .collect::<Vec<_>>();
                 d.store.apply(&spent, &created).unwrap();
             }
-            let removed = d.pool.reconcile(&d.store, next);
+            let removed = d.pool.reconcile(&d.store, next).unwrap();
             let core_ids: std::collections::BTreeSet<String> =
                 serde_json::from_str(&d.core.rpc(&["getrawmempool"]).unwrap()).unwrap();
             let rbtc_ids = d
