@@ -69,7 +69,7 @@ tampered reports and invalid soak claims. Fixtures are never release evidence.
 
 Binary smoke now also executes `--check-config` without creating a data
 directory. After assembly and attestation, five fresh native runner jobs
-download assets, verify the manifest and signer workflow, execute the binary
+download assets, verify the manifest, signer workflow, source commit/ref, execute the binary
 and recheck macOS/Windows trust before publication. They do not build or import
 signing keys. An actual signed run remains due; hosted-runner smoke is not
 public deployment, upgrade, backup/restore or seven-day acceptance.
@@ -78,3 +78,27 @@ Immutability was enabled using the documented
 [GitHub repository API](https://docs.github.com/en/rest/repos/repos#enable-immutable-releases).
 Recheck it before tagging. Draft-upload-publish allows complete asset assembly
 before publication makes assets immutable.
+
+## Native validation follow-up
+
+The main CI run `34886107084` at `3cf1ea8` passed Linux test/coverage and
+supply-chain jobs, but Windows timed out in
+`host_observes_typed_peer_header_execution_and_freezer_state` after its
+three-second startup guard. The earlier branch run at the same commit passed.
+The Windows log does not identify which startup operation consumed the time.
+
+On Mac, a temporary four-second delay before the fixture accepted its peer
+reproduced that exact timeout at 3.02 seconds. The same delayed scenario passed
+at 5.03 seconds with the existing twenty-second startup guard used elsewhere in
+this test file. Embedded startup waits now share that guard; protocol-frame and
+shutdown deadlines and all state/event assertions remain. Timeout diagnostics
+include the node status/lifecycle and whether the fixture peer exited.
+The injected delay was removed. The seven-test file then passed ten consecutive
+runs (70 tests); default and all-feature strict Clippy also passed.
+The final Mac all-feature suite passed: **976 passed, 0 failed, 34 ignored**.
+Ignored external/scale gates retain their existing opt-in requirements.
+
+The schema-source reader accepts both LF and Windows CRLF Rust checkouts;
+generated manifests still require canonical LF records. Both checkout styles
+are covered by the future-schema fixture. Same-ref release runs are serialized
+so signing and publication jobs cannot interleave uploads to one draft.

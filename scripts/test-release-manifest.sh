@@ -92,10 +92,12 @@ manifest = fixture / 'future.tsv'
 command = ['bash', str(checkout / 'scripts/generate-release-manifest.sh'), str(fixture),
            str(manifest), 'v0.0.0-test', '0.0.0-test', '0123456789abcdef0123456789abcdef01234567',
            'rustc fixture', '1']
-subprocess.run(command, check=True)
-assert manifest.read_text().splitlines()[6] == 'data_schema\t123'
-subprocess.run(['bash', str(checkout / 'scripts/verify-release-manifest.sh'),
-                str(manifest), str(fixture)], check=True)
+for newline in (b'\n', b'\r\n'):
+    source.write_bytes(b'const DATA_FORMAT_SCHEMA_VERSION: u32 = 123;' + newline)
+    subprocess.run(command, check=True)
+    assert manifest.read_text().splitlines()[6] == 'data_schema\t123'
+    subprocess.run(['bash', str(checkout / 'scripts/verify-release-manifest.sh'),
+                    str(manifest), str(fixture)], check=True)
 rejected(manifest.read_text(), 'schema from a different source revision')
 for declaration in ('', 'const DATA_FORMAT_SCHEMA_VERSION: u32 = 123;\n' * 2):
     source.write_text(declaration)

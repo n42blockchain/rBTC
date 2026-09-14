@@ -11,6 +11,10 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REQUIRED_APPLE_TEAM_ID: CFRXH38L48
 
@@ -522,6 +526,7 @@ jobs:
           gh attestation verify dist/RELEASE-MANIFEST.tsv \
             --bundle dist/RELEASE-MANIFEST.sigstore.json \
             --repo "$GITHUB_REPOSITORY" \
+            --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
       - name: Run installed binary without building or importing signing keys

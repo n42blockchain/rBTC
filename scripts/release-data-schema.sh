@@ -5,6 +5,7 @@ set -euo pipefail
 # Refuse an absent/ambiguous declaration when the Rust source is reorganized.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 awk '
+  { sub(/\r$/, "") }
   /^const DATA_FORMAT_SCHEMA_VERSION: u32 = [1-9][0-9]*;$/ {
     count++
     value=$5

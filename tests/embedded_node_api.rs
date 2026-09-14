@@ -18,6 +18,11 @@ use std::{
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 
+// Startup includes durable-store creation and peer negotiation on shared CI
+// hosts. This is a hang guard, not a three-second startup performance contract.
+// Keep protocol-frame and shutdown deadlines separate below.
+const NODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+
 async fn hold_one_connection() -> (SocketAddr, oneshot::Receiver<()>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
@@ -179,7 +184,7 @@ async fn serve_one_block_regtest_node(
 /// requested prefix subscriptions.
 async fn zmtp_subscribe(address: SocketAddr, subscriptions: &[&[u8]]) -> tokio::net::TcpStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = timeout(Duration::from_secs(5), async {
+    let mut stream = timeout(NODE_STARTUP_TIMEOUT, async {
         loop {
             match tokio::net::TcpStream::connect(address).await {
                 Ok(stream) => break stream,
@@ -412,7 +417,7 @@ async fn host_can_run_two_isolated_nodes_in_one_runtime() {
     // Both nodes must handshake, but the deadline only guards against a hang:
     // a tight one turns ordinary scheduling delay on a loaded machine into a
     // failure, which this test did twice while the suite ran in parallel.
-    timeout(Duration::from_secs(20), async {
+    timeout(NODE_STARTUP_TIMEOUT, async {
         first_accepted.await.unwrap();
         second_accepted.await.unwrap();
     })
@@ -449,7 +454,7 @@ async fn host_observes_typed_peer_header_execution_and_freezer_state() {
     let mut status = controller.subscribe_status();
     let mut events = controller.subscribe_events();
 
-    timeout(Duration::from_secs(3), async {
+    timeout(NODE_STARTUP_TIMEOUT, async {
         loop {
             let current = status.borrow_and_update().clone();
             if current.active_peer == Some(remote)
@@ -462,7 +467,15 @@ async fn host_observes_typed_peer_header_execution_and_freezer_state() {
         }
     })
     .await
-    .expect("typed node status must advance without enabling the HTTP API");
+    .unwrap_or_else(|error| {
+        panic!(
+            "typed node status must advance without enabling the HTTP API: {error}; \
+             status={:?}, lifecycle={:?}, peer_finished={}",
+            controller.status(),
+            controller.lifecycle(),
+            peer.is_finished(),
+        )
+    });
 
     let current = controller.status();
     assert_eq!(current.network, Network::Regtest);
@@ -524,7 +537,7 @@ async fn host_configured_zmq_endpoint_accepts_a_subscriber() {
         .unwrap();
     let controller = handle.controller();
 
-    let mut stream = timeout(Duration::from_secs(5), async {
+    let mut stream = timeout(NODE_STARTUP_TIMEOUT, async {
         loop {
             match tokio::net::TcpStream::connect(zmq_address).await {
                 Ok(stream) => break stream,
@@ -638,7 +651,7 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     assert_eq!(body[32], b'C');
 
     let mut status = controller.subscribe_status();
-    timeout(Duration::from_secs(5), async {
+    timeout(NODE_STARTUP_TIMEOUT, async {
         loop {
             if status
                 .borrow_and_update()
