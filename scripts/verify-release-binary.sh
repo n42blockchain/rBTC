@@ -25,4 +25,11 @@ if [[ "$actual_version" != "rbtcd $expected_version" ]]; then
 fi
 
 "$binary" --help >/dev/null
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/rbtc-release-smoke.XXXXXX")
+trap 'rm -rf "$fixture"' EXIT
+"$binary" --check-config --network regtest --data-dir "$fixture/data" >/dev/null
+[[ ! -e "$fixture/data" ]] || {
+    echo "configuration smoke unexpectedly created a data directory" >&2
+    exit 1
+}
 echo "release binary verified: $actual_version"

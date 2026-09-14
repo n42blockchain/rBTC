@@ -1,6 +1,6 @@
 # Backup, restore, and disaster recovery
 
-Status date: 2026-07-27.
+Status date: 2026-09-14.
 
 This procedure applies to the standalone daemon and to an embedded rBTC node.
 Each network must have its own data directory. The directory contains consensus
@@ -58,12 +58,16 @@ backup mechanism.
 
 `.rbtc-data-format.json` is a strict, owner-only inventory of the root schema,
 minimum reader, network, and every persistent subsystem schema. A directory
-without it is legacy v0; rBTC publishes v1 only after the existing database
+without it is legacy v0; rBTC publishes the current schema only after the existing database
 preflight succeeds. An unknown future version, higher minimum reader, different
 network, unknown field, or component mismatch fails before mutable database
 open and is never rewritten.
 
-The current root inventory is v3. Version 2 used basic-filter component schema
+The current root inventory and minimum reader are **v4**. The inventory also
+binds the chainstate backend (`redb` for supported default-feature releases).
+An exact v3 inventory can migrate forward after startup preflight; changing
+its backend field is not a content migration. A v3-only reader cannot open a
+v4 directory. Version 2 used basic-filter component schema
 1, whose filter-header chain omitted the genesis filter. A v2 directory without
 that optional database migrates forward normally. A directory containing the
 old filter database fails closed and must rebuild that projection from complete

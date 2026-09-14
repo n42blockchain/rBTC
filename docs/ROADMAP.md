@@ -1,6 +1,6 @@
 # rBTC production roadmap
 
-Status date: 2026-08-13.
+Status date: 2026-09-14.
 
 This file is the forward-looking plan. A checked item means that the code,
 restart/failure tests, and an acceptance run all exist. Historical implementation
@@ -129,6 +129,15 @@ Primary references:
 
 ## P0 — remaining release blockers
 
+- [ ] **Close production resource acceptance.** Finish admission preallocation
+  and resumable scheduling, automatic bounded header ingress with safe stronger
+  fork reacquisition, and adversarial optimizer budget acceptance. Existing
+  ledgers and eviction primitives do not close these gates.
+- [ ] **Freeze and bind final acceptance.** Preserve successful historical replay
+  evidence and record final reviewed acceptance under `release/acceptance/`.
+  Preflight rejects open gates and source identities that differ from the
+  tested revision. See [the current inventory](RELEASE_READINESS_2026-09-14.md).
+
 - [x] **Move the maintained consensus/reference baseline from Core 26 to Core
   31.** DNS seeds, minimum-chainwork, assume-valid, checkpoints, Testnet4, and
   AssumeUTXO identities are refreshed. The Core 27–31 consensus, policy, P2P,
@@ -221,7 +230,7 @@ Primary references:
   the SBOM, upgrade/rollback notes, data-format compatibility, and
   disaster-recovery procedure. The workflow now fails closed on missing or
   wrong-team credentials; applies and verifies Developer ID/notarization and
-  Authenticode/RFC3161 signatures; produces a strict root-data-schema-v3
+  Authenticode/RFC3161 signatures; produces a strict daemon-derived root-data-schema-v4
   manifest, CycloneDX SBOM, per-artifact provenance, and offline
   repository/organization-bound Sigstore manifest bundle; and publishes only
   after the complete draft is assembled. Tag, Cargo package, CLI/P2P/RPC, and
@@ -230,8 +239,9 @@ Primary references:
   `n42appv2` Android/Apple
   signing inventory and exact protected-environment contract are recorded in
   [RELEASE_SIGNING.md](RELEASE_SIGNING.md). A Developer ID Application identity,
-  Windows Authenticode identity, release-immutability setting, and real tagged
-  clean-host run remain external execution gates.
+  Windows Authenticode identity, protected signing environment and real tagged
+  clean-host run remain external execution gates. Release immutability was
+  enabled and read back on 2026-09-14.
 
 These are the only blockers to the first production **outbound-only,
 watch-only/external-signer validating-node** claim. Inbound service, an

@@ -1,0 +1,32 @@
+{
+  "format": 1,
+  "tested_commit": null,
+  "source_sha256": null,
+  "gates": {
+    "optimizer-budget": {
+      "status": "open",
+      "reason": "Core differential samples pass; broader adversarial and budget-exhaustion acceptance remains open.",
+      "evidence": []
+    },
+    "admission-resources": {
+      "status": "open",
+      "reason": "Shared budgets exist; prevout preallocation, escaped allocations and resumable scheduling are not accepted.",
+      "evidence": []
+    },
+    "header-resources": {
+      "status": "open",
+      "reason": "Eviction primitives exist; safe automatic ingress, fork reacquisition and sustained resource acceptance remain open.",
+      "evidence": []
+    },
+    "storage-replay": {
+      "status": "open",
+      "reason": "The 935001-963350 replay passed at b078798; final frozen release source acceptance is pending.",
+      "evidence": []
+    },
+    "public-soak": {
+      "status": "open",
+      "reason": "No accepted 604800-second Bitcoin and Testnet4 report exists for frozen release source.",
+      "evidence": []
+    }
+  }
+}

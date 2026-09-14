@@ -1,22 +1,25 @@
 # Product maturity gate
 
-Status date: 2026-08-08.
+Status date: 2026-09-14.
 
 This is the release-facing maturity view. Detailed implementation history stays
 in [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).
+Current blockers and evidence preflight are in
+[RELEASE_READINESS_2026-09-14.md](RELEASE_READINESS_2026-09-14.md).
 
 | Area | Repository status | Release evidence |
 | --- | --- | --- |
 | Consensus and chainstate | Complete | Core-derived vectors, historical blocks, live Core 31 differential tests, atomic recovery tests |
 | Fast bootstrap | Complete | Maximum-work headers, pinned Core AssumeUTXO identity, live catch-up, independent genesis replay |
 | Storage lifecycle | Complete | Bounded freezer/undo retention, hot/cold data-backed policy, disk forecasts, audit/reindex/backup procedures |
-| Snapshot-backed overlay | Experimental and bounded | Txid-group v2 index, MDBX/redb overlay catch-up, bounded undo decoding, compaction/rebase, crash-safe swap recovery |
-| Network contribution | Complete | Bounded outbound failover and optional inbound service with resource accounting; real Core 31/btcd interoperability tests include BIP324 v2 transport fallback and bounded ZMQ publishing |
+| Snapshot-backed overlay | Experimental; maintenance resource gate open | Replay/content and recovery tests pass; MDBX maintenance peak RSS still exceeds the replacement target |
+| Network contribution | Functional; retention gate open | Interoperability tests pass; safe automatic competing-header retention/reacquisition remains open |
+| Admission and policy resources | Acceptance open | Shared budgets and indexed dependencies exist; whole-pipeline resource and adversarial optimizer acceptance remain open |
 | Operations | Complete | Strict config, `--check-config`, version identity, structured logs, health/readiness/metrics, authenticated stop, recovery runbook |
 | Embedding | Complete technically | Library-owned runtime and `n42-26` executor fixture; combined distribution still requires a GPL-compatible policy decision |
 | Security | Complete for release candidate | Four audit passes integrated, dependency/fuzz/dynamic-analysis gates, private reporting policy |
-| Cross-platform packaging | Automation complete | Full native all-feature tests, binary `--version`/`--help` smoke, native signatures, SBOM, provenance, manifest v2 |
-| Public operations | In progress | The minimum seven-day window has elapsed, but no fail-closed accepted final report is versioned in this repository |
+| Cross-platform packaging | Automation implemented; signed run pending | Native suites, downloaded-artifact smoke, native trust, SBOM, provenance and manifest v2 bound to daemon schema 4 |
+| Public operations | Acceptance open | No accepted seven-day Bitcoin/Testnet4 report for frozen release source; historical elapsed time does not close this gate |
 | Signed release | Externally blocked | Developer ID Application and Windows Authenticode identities plus a real protected tagged run |
 
 ## Non-negotiable release invariants
@@ -32,6 +35,9 @@ in [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).
 5. No release claim may convert an incomplete soak, unavailable credential,
    accepted platform limitation, or deployment-specific P2 feature into a
    repository-complete checkbox.
+6. Preflight requires reviewed reports bound to frozen source and successful
+   main CI for the exact release commit. Only evidence-only commits may follow
+   the tested source without invalidating its identity.
 
 ## Deliberate product boundaries
 

@@ -15,7 +15,35 @@ env:
   REQUIRED_APPLE_TEAM_ID: CFRXH38L48
 
 jobs:
+  acceptance-preflight:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Require accepted evidence for the frozen release source
+        run: python3 scripts/verify-release-readiness.py
+      - name: Require successful CI on this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f per_page=100 >ci-runs.json
+          python3 - <<'PY'
+          import json, os
+          runs = json.load(open('ci-runs.json'))['workflow_runs']
+          eligible = [run for run in runs if run['head_sha'] == os.environ['GITHUB_SHA']
+                      and run['event'] == 'push' and run['head_branch'] == 'main']
+          if not eligible or max(eligible, key=lambda run: run['id'])['conclusion'] != 'success':
+              raise SystemExit('the latest main CI run for this exact commit must succeed before release')
+          PY
+
   signing-preflight:
+    needs: acceptance-preflight
     runs-on: ubuntu-24.04
     environment: release-signing
     outputs:
@@ -460,11 +488,74 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  install-smoke:
+    needs: [signing-preflight, canonical-release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            binary: rbtcd-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            binary: rbtcd-aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            binary: rbtcd-x86_64-apple-darwin
+          - runner: macos-15
+            binary: rbtcd-aarch64-apple-darwin
+          - runner: windows-2025
+            binary: rbtcd-x86_64-pc-windows-msvc.exe
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: rbtc-${{ needs.signing-preflight.outputs.release_ref }}
+          path: dist
+      - name: Verify downloaded bytes and workflow identity on a fresh runner
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify dist/RELEASE-MANIFEST.tsv \
+            --bundle dist/RELEASE-MANIFEST.sigstore.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          scripts/verify-release-manifest.sh dist/RELEASE-MANIFEST.tsv dist
+      - name: Run installed binary without building or importing signing keys
+        shell: bash
+        env:
+          RELEASE_BINARY: ${{ matrix.binary }}
+          RELEASE_VERSION: ${{ needs.signing-preflight.outputs.package_version }}
+        run: |
+          chmod +x "dist/$RELEASE_BINARY"
+          scripts/verify-release-binary.sh "dist/$RELEASE_BINARY" "$RELEASE_VERSION"
+      - name: Verify macOS native trust after download
+        if: runner.os == 'macOS'
+        env:
+          RELEASE_BINARY: ${{ matrix.binary }}
+        run: |
+          codesign --verify --deep --strict --verbose=2 "dist/$RELEASE_BINARY"
+          spctl --assess --type execute --verbose=4 "dist/$RELEASE_BINARY"
+      - name: Verify Windows native trust after download
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_BINARY: ${{ matrix.binary }}
+        run: |
+          $signature = Get-AuthenticodeSignature (Join-Path dist $env:RELEASE_BINARY)
+          if ($signature.Status -ne 'Valid' -or $null -eq $signature.TimeStamperCertificate) {
+            throw 'Downloaded release requires valid Authenticode and timestamp certificates'
+          }
+
   publish-draft-then-freeze:
     if: needs.signing-preflight.outputs.publish == 'true'
     needs:
       - signing-preflight
       - canonical-release
+      - install-smoke
     runs-on: ubuntu-24.04
     permissions:
       contents: write

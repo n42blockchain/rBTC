@@ -10,6 +10,8 @@ usage() {
 
 manifest=$1
 asset_dir=${2:-$(dirname "$manifest")}
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+data_schema=$(bash "$repo_root/scripts/release-data-schema.sh")
 
 [[ -f "$manifest" && ! -L "$manifest" ]] || {
     echo "manifest is missing or is not a regular file: $manifest" >&2
@@ -31,11 +33,15 @@ expected_metadata=(
     $'commit\t'
     $'rustc\t'
     $'source_date_epoch\t'
-    $'data_schema\t3'
+    $'data_schema\t'"$data_schema"
 )
 
 lines=()
 while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" != *$'\r'* ]] || {
+        echo "manifest must not contain carriage returns" >&2
+        exit 1
+    }
     lines[${#lines[@]}]=$line
 done <"$manifest"
 [[ ${#lines[@]} -eq 17 ]] || {
@@ -49,6 +55,11 @@ done <"$manifest"
 for index in 1 2 3 4 5; do
     [[ "${lines[$index]}" == "${expected_metadata[$index]}"* ]] || {
         echo "invalid metadata record at line $((index + 1))" >&2
+        exit 1
+    }
+    value=${lines[$index]#*$'\t'}
+    [[ -n "$value" && "$value" != *$'\t'* ]] || {
+        echo "metadata must contain exactly two non-empty fields" >&2
         exit 1
     }
 done
@@ -108,6 +119,10 @@ expected_paths=(
 for offset in "${!expected_paths[@]}"; do
     line=${lines[$((offset + 7))]}
     IFS=$'\t' read -r record digest bytes kind target trust relative extra <<<"$line"
+    [[ "$line" == "$record"$'\t'"$digest"$'\t'"$bytes"$'\t'"$kind"$'\t'"$target"$'\t'"$trust"$'\t'"$relative" ]] || {
+        echo "file records must contain exactly seven non-empty fields" >&2
+        exit 1
+    }
     [[ "$record" == "file" && -z "${extra:-}" ]] || {
         echo "invalid file record at line $((offset + 8))" >&2
         exit 1

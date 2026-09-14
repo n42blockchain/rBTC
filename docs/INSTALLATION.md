@@ -1,6 +1,6 @@
 # Installation and first start
 
-Status date: 2026-07-29.
+Status date: 2026-09-14.
 
 rBTC is pre-release. Build from the reviewed source commit for development, or
 use a future signed release artifact only after completing every verification
@@ -24,14 +24,19 @@ authenticated `getnetworkinfo` response derive from the same value.
 
 ## Verify a signed release
 
-Download the platform binary, `RELEASE-MANIFEST.tsv`,
-`RELEASE-MANIFEST.sigstore.json`, `SHA256SUMS`, and the relevant native
-signature/notarization evidence. Then:
+Use verification scripts from the reviewed release tag's checkout. The schema
+check reads that checkout's daemon declaration; scripts from different releases
+are not interchangeable. Download **all release assets** into a separate empty
+directory. The canonical manifest verifies all ten required assets, while
+`SHA256SUMS` also covers provenance bundles. Downloading one platform binary
+is insufficient for these full-release checks. Once a real tag is published,
+`gh release download TAG -R n42blockchain/rBTC --dir ASSET_DIR` fetches the full
+set. From that directory, using the reviewed checkout path:
 
 ```text
-scripts/verify-release-manifest.sh RELEASE-MANIFEST.tsv .
+gh attestation verify RELEASE-MANIFEST.tsv -R n42blockchain/rBTC --bundle RELEASE-MANIFEST.sigstore.json --signer-workflow n42blockchain/rBTC/.github/workflows/release.yml
+/path/to/reviewed-checkout/scripts/verify-release-manifest.sh RELEASE-MANIFEST.tsv .
 sha256sum -c SHA256SUMS
-gh attestation verify RELEASE-MANIFEST.tsv -R n42blockchain/rBTC
 ./rbtcd-PLATFORM --version
 ./rbtcd-PLATFORM --help
 ```
@@ -39,6 +44,9 @@ gh attestation verify RELEASE-MANIFEST.tsv -R n42blockchain/rBTC
 The manifest's `tag` must equal `v` plus its `version`, and its commit must be
 the reviewed release commit. On macOS also require `codesign --verify --deep
 --strict` and Gatekeeper; on Windows require `signtool verify /pa /all`.
+On macOS, use `shasum -a 256 -c SHA256SUMS` when `sha256sum` is unavailable.
+The current root schema is 4; review minimum-reader and migration rules in
+[DISASTER_RECOVERY.md](DISASTER_RECOVERY.md) before opening an existing directory.
 
 ## Prepare an operator account
 

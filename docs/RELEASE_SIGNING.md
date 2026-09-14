@@ -1,6 +1,12 @@
 # Cross-platform release signing
 
-Status date: 2026-08-15.
+Status date: 2026-09-14.
+
+Current blockers are tracked in
+[RELEASE_READINESS_2026-09-14.md](RELEASE_READINESS_2026-09-14.md).
+The Mac still has no matching Developer ID Application identity. On this date
+the `release-signing` environment API returned 404 under an admin account;
+repository release immutability was enabled and read back successfully.
 
 ## Local signing inventory
 
@@ -64,7 +70,9 @@ provenance, not a substitute for native OS signatures.
 
 ## Implemented workflow
 
-`.github/workflows/release.yml` now fails closed before building unless all
+`.github/workflows/release.yml` first requires acceptance reports for frozen
+source and successful main CI on the exact release commit. It then fails
+closed before building unless all
 native signing credentials are present in the protected `release-signing`
 environment. A semantic `v*` tag must point at the workflow commit. Manual runs
 exercise the identical signed matrix but do not publish.
@@ -85,19 +93,21 @@ The matrix:
 - generates a CycloneDX 1.5 SBOM and per-platform signed provenance bundles;
 - generates a deterministic, strictly ordered `RELEASE-MANIFEST.tsv` containing
   the tag, package version, commit, exact Rust version, source epoch, root data
-  schema v3, target, native trust type, byte length, and SHA-256 of all ten
+  schema v4 (read from the daemon declaration), target, native trust type, byte length, and SHA-256 of all ten
   required release assets;
 - verifies the manifest before and after producing its offline Sigstore bundle,
-  uploads a complete draft release, and publishes only after every gate passes.
+  checks downloaded assets on five fresh native runners, uploads a complete
+  draft release, and publishes only after every gate passes.
 
 The v2 manifest generator accepts no symlinks, requires the exact supported
 platform set, uses fixed record ordering, and rejects a release tag that is not
 exactly `v` plus the package version. The preflight independently reads the
 version through locked Cargo metadata, and every native job runs the complete
 all-feature test suite before executing the built binary's `--version` and
-`--help` paths. `scripts/test-release-manifest.sh` is run in ordinary CI and
-proves valid assembly, tag/version mismatch rejection, and rejection after asset
-tampering.
+`--help` and side-effect-free `--check-config` paths.
+`scripts/test-release-manifest.sh` and `scripts/test-release-readiness.py` run
+in ordinary CI, including malformed-field, schema-drift and stale-evidence
+regressions.
 
 ## Protected environment inputs
 
@@ -157,7 +167,8 @@ plus Gatekeeper on macOS, and `signtool verify /pa /all` on Windows.
 8. Verify upgrade, rollback, snapshot compatibility, backup, and recovery
    instructions before publishing.
 
-The automation and local preflight are complete. The signed-release P0 gate
-remains open only until the missing Developer ID Application and Windows
-signing identities are provisioned, release immutability is enabled, and one
-real tagged matrix run publishes and clean-host verifies the artifacts.
+Automation is implemented; no real signed matrix is claimed complete.
+Production acceptance reports, the protected environment and organization-owned
+Apple/notary and Windows identities remain prerequisites. Immutability is
+enabled; recheck it before tagging. Fresh-runner smoke checks executable/config
+behavior and native trust. Real deployment, upgrade and recovery remain due.

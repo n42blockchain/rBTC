@@ -15,6 +15,8 @@ package_version=$4
 commit=$5
 rustc_version=$6
 source_date_epoch=$7
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+data_schema=$(bash "$repo_root/scripts/release-data-schema.sh")
 
 [[ -d "$dist_dir" ]] || {
     echo "release directory does not exist: $dist_dir" >&2
@@ -38,7 +40,7 @@ if [[ "$release_tag" == v* && "$release_tag" != "v$package_version" ]]; then
 fi
 
 for value in "$release_tag" "$package_version" "$rustc_version"; do
-    [[ "$value" != *$'\t'* && "$value" != *$'\n'* && -n "$value" ]] || {
+    [[ "$value" != *$'\t'* && "$value" != *$'\n'* && "$value" != *$'\r'* && -n "$value" ]] || {
         echo "manifest metadata must be non-empty single-line text without tabs" >&2
         exit 1
     }
@@ -80,7 +82,7 @@ trap 'rm -f "$tmp_output"' EXIT
     printf 'commit\t%s\n' "$commit"
     printf 'rustc\t%s\n' "$rustc_version"
     printf 'source_date_epoch\t%s\n' "$source_date_epoch"
-    printf 'data_schema\t3\n'
+    printf 'data_schema\t%s\n' "$data_schema"
 
     for specification in "${expected[@]}"; do
         IFS='|' read -r relative kind target trust <<<"$specification"
