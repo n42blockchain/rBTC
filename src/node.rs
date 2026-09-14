@@ -19169,6 +19169,10 @@ fn print_version() {
 mod tests {
     mod admission_resources;
     mod header_resync;
+    mod inbound_projection;
+    mod index_recovery;
+    #[cfg(feature = "mdbx")]
+    mod overlay_replay;
     mod private_broadcast_interop;
 
     use super::*;

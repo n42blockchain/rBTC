@@ -533,3 +533,146 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{Block, Network, consensus::serialize, hashes::Hash};
+
+    fn child(parent: BlockHash, height: u32) -> Block {
+        rbtc::block_assembly::assemble_block(&rbtc::block_assembly::BlockTemplate::regtest(
+            parent,
+            height,
+            1_300_000_000 + height,
+        ))
+        .unwrap()
+    }
+
+    fn framed(block: &Block) -> Vec<u8> {
+        let raw = serialize(block);
+        let mut bytes = MAINNET_MAGIC.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&u32::try_from(raw.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&raw);
+        let checksum = crc32c(&[&bytes]);
+        bytes.extend_from_slice(&checksum.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn imports_longest_continuation_and_verifies_the_retained_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::create_dir(&src).unwrap();
+        let base = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let first = child(base, 1);
+        let second = child(first.block_hash(), 2);
+        let third = child(second.block_hash(), 3);
+        let stale = child(base, 11);
+        let mut bytes = framed(&stale);
+        bytes.extend(framed(&first));
+        bytes.extend(framed(&second));
+        fs::write(src.join("00000.fdb"), &bytes).unwrap();
+        fs::write(src.join("00001.fdb"), framed(&third)).unwrap();
+        fs::write(src.join("ignored.txt"), b"not a block file").unwrap();
+        let mut options = Options {
+            src: src.clone(),
+            out: dir.path().join("ledger"),
+            base_hash: base,
+            base_height: 0,
+            max_height: None,
+            segment_blocks: 2,
+            slots: 4,
+            summary: Some(dir.path().join("summary.json")),
+            verify_existing: false,
+        };
+        run(&options).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(options.summary.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(report["blocks"], 3);
+        assert_eq!(report["source_records"], 4);
+        assert_eq!(report["last_hash"], third.block_hash().to_string());
+        let ledger = PrunedBlockLedger::open_persisted(&options.out).unwrap();
+        assert_eq!(
+            ledger
+                .read_block_batch(1, 3, VERIFY_BUDGET_BYTES)
+                .unwrap()
+                .blocks,
+            [serialize(&first), serialize(&second), serialize(&third)]
+        );
+        verify_existing(&options).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(options.summary.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(report["verify_reports"][0]["blocks"], 3);
+        assert!(
+            run(&options)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(fs::read(src.join("00000.fdb")).unwrap(), bytes);
+        options.out = dir.path().join("bounded");
+        options.max_height = Some(2);
+        run(&options).unwrap();
+        assert_eq!(
+            PrunedBlockLedger::open_persisted(&options.out)
+                .unwrap()
+                .stats()
+                .unwrap()
+                .blocks,
+            2
+        );
+        options.out = dir.path().join("too-small");
+        options.max_height = None;
+        options.slots = 1;
+        assert!(
+            run(&options)
+                .unwrap_err()
+                .to_string()
+                .contains("exceed 1 slots")
+        );
+        assert!(!options.out.exists());
+        options.base_hash = BlockHash::all_zeros();
+        assert!(run(&options).unwrap_err().to_string().contains("no block"));
+    }
+
+    #[test]
+    fn rejects_corrupt_frames_checksums_and_changed_headers() {
+        assert_eq!(crc32c(&[b"123", b"456789"]), 0xe306_9283);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            block_files(dir.path()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let path = dir.path().join("00000.fdb");
+        let block = child(BlockHash::all_zeros(), 1);
+        let valid = framed(&block);
+        let paths = vec![path.clone()];
+        for (offset, value) in [(0, 1_u32), (4, 79), (4, MAX_BLOCK_BYTES + 1)] {
+            let mut bytes = valid.clone();
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            fs::write(&path, bytes).unwrap();
+            assert!(scan(&paths).is_err());
+        }
+        fs::write(&path, &valid).unwrap();
+        let mut records = scan(&paths).unwrap();
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(
+            read_block(&mut [None], &paths, &records[0])
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        fs::write(&path, &valid).unwrap();
+        records[0].hash = BlockHash::all_zeros();
+        assert!(
+            read_block(&mut [None], &paths, &records[0])
+                .unwrap_err()
+                .to_string()
+                .contains("hash changed")
+        );
+        fs::write(&path, [0; 8]).unwrap();
+        assert!(scan(&paths).unwrap().is_empty());
+    }
+}

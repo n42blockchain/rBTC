@@ -1411,6 +1411,155 @@ mod tests {
         bytes
     }
 
+    fn indexed_snapshot(groups: u8) -> Vec<u8> {
+        let anchor = core31_assumeutxo_anchors(Network::Bitcoin)[0];
+        let mut bytes = metadata_bytes(
+            Network::Bitcoin,
+            anchor.block_hash.parse().unwrap(),
+            u64::from(groups) * 2,
+        );
+        for group in 1..=groups {
+            bytes.extend_from_slice(&[group; 32]);
+            bytes.push(2);
+            // Core's database order need not be numeric vout order.
+            for vout in [256, 1] {
+                write_compact_size(&mut bytes, vout);
+                write_core_varint(&mut bytes, 3); // height 1, coinbase
+                write_core_varint(&mut bytes, compress_amount(5_000));
+                bytes.extend_from_slice(&[7, 0x51]);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn mph_index_roundtrips_colliding_groups_and_rejects_nonmembers() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.dat");
+        let sidecar = dir.path().join("nested/index.mph");
+        let bytes = indexed_snapshot(200);
+        fs::write(&snapshot, &bytes).unwrap();
+        let metadata = CoreSnapshotIndex::build(&snapshot, &sidecar, Network::Bitcoin).unwrap();
+        assert_eq!(metadata.coins_count, 400);
+        let mut index = CoreSnapshotIndex::open(&snapshot, &sidecar, Network::Bitcoin).unwrap();
+        assert!(index.levels.len() > 1, "exercise collision resolution");
+        assert_eq!(index.group_count(), 200);
+        assert_eq!(index.serialized_key_bytes(), 200 * 37);
+        assert!((index.average_serialized_key_bytes() - 18.5).abs() < f64::EPSILON);
+        assert_eq!(index.snapshot_sha256(), sha256_file(&snapshot).unwrap());
+        let headers = HeaderDag::new(Network::Bitcoin);
+        for group in 1..=200 {
+            for vout in [1, 256] {
+                let key =
+                    OutPointKey::from(OutPoint::new(Txid::from_byte_array([group; 32]), vout));
+                let coin = index.get(key, &headers, 123).unwrap().unwrap();
+                assert_eq!(coin.value_sats, 5_000);
+                assert_eq!(coin.height, 1);
+                assert!(coin.is_coinbase);
+                assert_eq!(coin.last_touched, 123);
+                assert_eq!(coin.creation_mtp, headers.active_tip().header.time);
+                assert_eq!(coin.script_pubkey, [0x51]);
+            }
+        }
+        for (group, vout) in [(1, 0), (201, 1), (0, 256)] {
+            let key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([group; 32]), vout));
+            assert!(index.get(key, &headers, 0).unwrap().is_none());
+        }
+        let key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([1; 32]), 1));
+        assert!(matches!(
+            index.get(key, &HeaderDag::new(Network::Regtest), 0),
+            Err(CoreSnapshotError::NetworkMismatch)
+        ));
+        let slot = bbhash_slot(&index.levels, &[1; 32]).unwrap();
+        index.offsets[slot] = 0;
+        assert!(matches!(
+            index.get(key, &headers, 0),
+            Err(CoreSnapshotError::Invalid("MPHF offset"))
+        ));
+    }
+
+    #[test]
+    fn mph_index_revalidates_changed_source_and_rejects_corrupt_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.dat");
+        let sidecar = dir.path().join("index.mph");
+        let bytes = indexed_snapshot(1);
+        fs::write(&snapshot, &bytes).unwrap();
+        CoreSnapshotIndex::build(&snapshot, &sidecar, Network::Bitcoin).unwrap();
+        let original = fs::read(&sidecar).unwrap();
+        // Force a stale mtime in the sidecar without relying on filesystem clock resolution.
+        let mut stale = original.clone();
+        stale[62..74].fill(0);
+        fs::write(&sidecar, stale).unwrap();
+        CoreSnapshotIndex::open(&snapshot, &sidecar, Network::Bitcoin).unwrap();
+        assert_eq!(fs::read(&sidecar).unwrap(), original);
+        for (offset, replacement) in [
+            (0, vec![0]),
+            (8, vec![0, 0]),
+            (10, vec![0; 4]),
+            (70, 1_000_000_000_u32.to_le_bytes().to_vec()),
+            (106, 0_u64.to_le_bytes().to_vec()),
+            (114, 0_u64.to_le_bytes().to_vec()),
+            (122, 65_u32.to_le_bytes().to_vec()),
+            (134, 1_u64.to_le_bytes().to_vec()),
+            (142, 0_u64.to_le_bytes().to_vec()),
+            (original.len(), vec![1]),
+        ] {
+            let mut corrupt = original.clone();
+            if offset == corrupt.len() {
+                corrupt.extend_from_slice(&replacement);
+            } else {
+                corrupt[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            }
+            fs::write(&sidecar, corrupt).unwrap();
+            assert!(
+                CoreSnapshotIndex::open(&snapshot, &sidecar, Network::Bitcoin).is_err(),
+                "accepted mutation at {offset}"
+            );
+        }
+        let mut stale = original;
+        stale[62..74].fill(0);
+        fs::write(&sidecar, stale).unwrap();
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() = 0x52;
+        fs::write(&snapshot, changed).unwrap();
+        assert!(matches!(
+            CoreSnapshotIndex::open(&snapshot, &sidecar, Network::Bitcoin),
+            Err(CoreSnapshotError::Invalid(
+                "MPHF source snapshot SHA-256 mismatch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn mph_builder_refuses_malformed_groups_without_publishing_an_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.dat");
+        let sidecar = dir.path().join("index.mph");
+        let valid = indexed_snapshot(1);
+        // Both vouts become 1 with canonical encoding by replacing the first group body.
+        let mut duplicate = valid[..METADATA_BYTES + 33].to_vec();
+        duplicate.extend_from_slice(&[1, 3, 0, 6, 1, 3, 0, 6]);
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        let mut zero_group = valid.clone();
+        zero_group[METADATA_BYTES + 32] = 0;
+        let mut unordered = indexed_snapshot(2);
+        let second = METADATA_BYTES + (valid.len() - METADATA_BYTES);
+        unordered[second..second + 32].fill(1);
+        for bytes in [
+            duplicate,
+            trailing,
+            zero_group,
+            unordered,
+            valid[..valid.len() - 1].to_vec(),
+        ] {
+            fs::write(&snapshot, bytes).unwrap();
+            assert!(CoreSnapshotIndex::build(&snapshot, &sidecar, Network::Bitcoin).is_err());
+            assert!(!sidecar.exists());
+        }
+    }
+
     #[test]
     fn parses_core_v2_metadata() {
         let base = BlockHash::from_byte_array([7_u8; 32]);

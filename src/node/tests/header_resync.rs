@@ -1,6 +1,120 @@
 use super::*;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn block_window_fallback_preserves_order_and_only_refetches_missing_slots() {
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let blocks = (1..=3)
+        .map(|height| {
+            regtest_block_at_height(genesis.block_hash(), genesis.header.time + height, height)
+        })
+        .collect::<Vec<_>>();
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_address = primary_listener.local_addr().unwrap();
+    let auxiliary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let auxiliary_address = auxiliary_listener.local_addr().unwrap();
+    let responses = vec![
+        vec![blocks[0].clone()],
+        blocks[1..].to_vec(),
+        vec![blocks[2].clone()],
+    ];
+    let primary_server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(primary_listener, peer_version(9_031)).await;
+        for response in responses {
+            let NetworkMessage::GetData(request) =
+                peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected primary block request");
+            };
+            assert_eq!(
+                request,
+                response
+                    .iter()
+                    .map(|block| Inventory::WitnessBlock(block.block_hash()))
+                    .collect::<Vec<_>>()
+            );
+            for block in response.into_iter().rev() {
+                peer.write_message(NetworkMessage::Block(block))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let auxiliary_server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(auxiliary_listener, peer_version(9_032)).await;
+        let NetworkMessage::GetData(request) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected auxiliary block request");
+        };
+        peer.write_message(NetworkMessage::NotFound(request))
+            .await
+            .unwrap();
+    });
+    let (primary, auxiliary) = tokio::join!(
+        connect_outbound(
+            primary_address,
+            Network::Regtest.magic(),
+            9_033,
+            "/rbtc:fallback-test/".to_owned(),
+            0
+        ),
+        connect_outbound(
+            auxiliary_address,
+            Network::Regtest.magic(),
+            9_034,
+            "/rbtc:fallback-test/".to_owned(),
+            0
+        ),
+    );
+    let mut primary = primary.unwrap();
+    let mut auxiliary = auxiliary.unwrap();
+    let hashes = blocks[1..]
+        .iter()
+        .map(Block::block_hash)
+        .collect::<Vec<_>>();
+    let (first, recovered, keep_auxiliary) = timeout(
+        Duration::from_secs(10),
+        download_parallel_block_pair(
+            &mut primary,
+            &[blocks[0].block_hash()],
+            &mut auxiliary,
+            &hashes,
+            &[],
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first, blocks[..1]);
+    assert_eq!(recovered, blocks[1..]);
+    assert!(!keep_auxiliary);
+    let recovered = timeout(
+        Duration::from_secs(10),
+        recover_lagging_auxiliary_window(
+            &mut primary,
+            &hashes,
+            &[],
+            vec![Some(blocks[1].clone()), None],
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(recovered, blocks[1..]);
+    let already_complete = recover_lagging_auxiliary_window(
+        &mut primary,
+        &hashes,
+        &[],
+        recovered.into_iter().map(Some).collect(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(already_complete, blocks[1..]);
+    primary_server.await.unwrap();
+    auxiliary_server.await.unwrap();
+}
+
+#[tokio::test]
 async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("headers.redb");
