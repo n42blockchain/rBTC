@@ -80,13 +80,16 @@ def verify_soak(report, tested_commit):
     for name in ("Duration status", "Sample coverage status", "Acceptance status"):
         if field(r"^- " + name + r": `([^`]+)`$") != "PASS":
             raise ValueError(f"soak {name} is not PASS")
+    minimum = int(field(r"^- Required minimum seconds: `([0-9]+)`$"))
+    if minimum < 604800:
+        raise ValueError("soak finalizer must enforce a minimum of at least 604800 seconds")
     if field(r"^- Commit: `([0-9a-f]{40})`$") != tested_commit:
         raise ValueError("soak report tested a different commit")
     field(r"^- Binary SHA-256: `([0-9a-f]{64})`$")
     start, end, seconds = field(r"^- Window: `([^`]+)` through `([^`]+)` \(([0-9]+) seconds\)$")
     start, end = [datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                   for value in (start, end)]
-    if int(seconds) < 604800 or (end - start).total_seconds() != int(seconds):
+    if int(seconds) < minimum or (end - start).total_seconds() != int(seconds):
         raise ValueError("soak must cover at least 604800 real seconds")
     if end > datetime.now(timezone.utc):
         raise ValueError("soak window ends in the future")

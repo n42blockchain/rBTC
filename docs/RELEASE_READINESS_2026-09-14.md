@@ -33,7 +33,8 @@ directory. The tested commit must be an ancestor of the release commit.
 For public soak, preserve the unedited final report produced by
 `scripts/public-network-soak-report.sh SOAK_DIR` with its default seven-day
 minimum. Preflight checks its tested commit, binary digest, three PASS fields,
-exact UTC duration, non-future end, both network rows and completed restart/fault
+the finalizer's required minimum (at least 604,800 seconds), exact UTC duration,
+non-future end, both network rows and completed restart/fault
 counts. A short fixture or INCOMPLETE report cannot close the gate. These are
 reviewed acceptance records, not independent cryptographic proof of a workload:
 reviewers must inspect the immutable baseline, raw metrics and fault records

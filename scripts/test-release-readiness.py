@@ -36,6 +36,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         stamp = lambda value: value.strftime("%Y-%m-%dT%H:%M:%SZ")
         self.report.write_text(
             "# Synthetic validator fixture, never release evidence\n"
+            "- Required minimum seconds: `604800`\n"
             "- Duration status: `PASS`\n- Sample coverage status: `PASS`\n"
             f"- Window: `{stamp(start)}` through `{stamp(end)}` (604800 seconds)\n"
             f"- Commit: `{self.tested}`\n- Binary SHA-256: `{'0' * 64}`\n"
@@ -145,6 +146,8 @@ class ReleaseReadinessTests(unittest.TestCase):
             original.replace("Acceptance status: `PASS`", "Acceptance status: `INCOMPLETE`"),
             original.replace("Sample coverage status: `PASS`", "Sample coverage status: `INCOMPLETE`"),
             original.replace("(604800 seconds)", "(1 seconds)"),
+            original.replace("Required minimum seconds: `604800`", "Required minimum seconds: `1`"),
+            original.replace("- Required minimum seconds: `604800`\n", ""),
             original.replace(self.tested, "0" * 40),
             original.replace("| testnet4 | synthetic |\n", ""),
             original.replace("Fault scenarios completed: `1`", "Fault scenarios completed: `0`"),

@@ -58,6 +58,7 @@ for name, values in rows.items():
 PY
 
 "$report" "$fixture" 1 >"$fixture/report.md"
+grep -q -- '- Required minimum seconds: `1`' "$fixture/report.md"
 grep -q -- '- Duration status: `PASS`' "$fixture/report.md"
 grep -q -- '- Fault scenarios completed: `1`' "$fixture/report.md"
 cp -R "$fixture/metrics" "$fixture/pristine"

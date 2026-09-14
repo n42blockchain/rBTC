@@ -224,6 +224,7 @@ else
 fi
 
 printf '# rBTC public-network soak report\n\n'
+printf -- '- Required minimum seconds: `%s`\n' "$minimum_seconds"
 printf -- '- Duration status: `%s`\n' "$status"
 printf -- '- Sample coverage status: `%s`\n' "$coverage_status"
 printf -- '- Window: `%s` through `%s` (%s seconds)\n' \
