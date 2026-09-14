@@ -1,5 +1,7 @@
 # MDBX replacement gate
 
+Latest Mac follow-up: [batch allocation reduction and retained RSS failure](MAC_STORAGE_ALLOCATIONS_2026-09-14.md). The reduced maintenance case still exceeds 1.5; no gate closure is claimed.
+
 The external full-mainnet replay assignment, including exact transaction-rate
 definitions, comparable btcdmdbx revisions, evidence retention, and rules for
 avoiding a 771 GB corpus copy on the Mac, is maintained in

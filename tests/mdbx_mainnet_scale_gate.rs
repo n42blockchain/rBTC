@@ -456,6 +456,8 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
         store.commit_connect_batch(&transitions).unwrap();
         let previous_tip = tip.height;
         tip = transitions.last().expect("non-empty batch").next;
+        // Keep maintenance from overlapping the already committed input batch.
+        drop(transitions);
         let previous_prune = previous_tip.saturating_sub(undo_retention);
         let prune_through = tip.height.saturating_sub(undo_retention);
         if prune_through > previous_prune {

@@ -6,6 +6,7 @@
 //! MDBX transaction rather than split storage.
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
@@ -42,7 +43,7 @@ const FORMAT_VERSION: u32 = 2;
 const UNDO_FORMAT_VERSION: u32 = 1;
 /// The IBD checkpoint size whose net UTXO effect is folded into one write.
 pub const MAX_ATOMIC_IBD_BATCH_BLOCKS: usize = 256;
-type FoldedBatchChanges = (Vec<OutPointKey>, Vec<(OutPointKey, Utxo)>);
+type FoldedBatchChanges<'a> = (Vec<OutPointKey>, Vec<(OutPointKey, &'a Utxo)>);
 /// Three years at Bitcoin's target ten-minute spacing.
 pub const DEFAULT_HOT_WINDOW_BLOCKS: u32 = 3 * 365 * 24 * 6;
 /// Default hard geometry ceiling for a complete MDBX chainstate.
@@ -973,19 +974,25 @@ impl MdbxUtxoStore {
         Ok(())
     }
 
+    // Batch callers already carry per-transaction undo. They must still decode
+    // spent records to reject corruption, but need not retain a second undo.
     #[allow(clippy::too_many_arguments)]
-    fn apply_net_changes(
+    fn apply_net_changes<const RECORD_UNDO: bool>(
         transaction: &Transaction<'_, libmdbx::RW, NoWriteMap>,
         hot: &Table<'_>,
         cold: &Table<'_>,
         meta: &Table<'_>,
         spent: &[OutPointKey],
-        created: &[(OutPointKey, Utxo)],
+        created: &[(OutPointKey, impl Borrow<Utxo>)],
         tip_height: u32,
         hot_window_blocks: u32,
     ) -> Result<UtxoUndo, UtxoError> {
         let mut seen_spent = BTreeSet::new();
-        let mut undo_spent = Vec::with_capacity(spent.len());
+        let mut undo_spent = if RECORD_UNDO {
+            Vec::with_capacity(spent.len())
+        } else {
+            Vec::new()
+        };
         for key in spent {
             if !seen_spent.insert(*key) {
                 return Err(UtxoError::DuplicateSpend(*key));
@@ -995,7 +1002,10 @@ impl MdbxUtxoStore {
                 .get::<Vec<u8>>(hot, storage_key.as_slice())?
                 .or(transaction.get::<Vec<u8>>(cold, storage_key.as_slice())?)
                 .ok_or(UtxoError::Missing(*key))?;
-            undo_spent.push((*key, Self::decode_coin(transaction, meta, &value)?));
+            let coin = Self::decode_coin(transaction, meta, &value)?;
+            if RECORD_UNDO {
+                undo_spent.push((*key, coin));
+            }
         }
         let mut seen_created = BTreeSet::new();
         let mut mtp_by_height = BTreeMap::new();
@@ -1016,6 +1026,7 @@ impl MdbxUtxoStore {
             }
         }
         for (_, coin) in created {
+            let coin = coin.borrow();
             if mtp_by_height
                 .insert(coin.height, coin.creation_mtp)
                 .is_some_and(|mtp| mtp != coin.creation_mtp)
@@ -1031,6 +1042,7 @@ impl MdbxUtxoStore {
             transaction.del(cold, storage_key.as_slice(), None)?;
         }
         for (key, coin) in created {
+            let coin = coin.borrow();
             Self::register_creation_mtp(transaction, meta, coin)?;
             let age = tip_height
                 .checked_sub(coin.height)
@@ -1048,13 +1060,17 @@ impl MdbxUtxoStore {
         }
         Ok(UtxoUndo::new(
             undo_spent,
-            created.iter().map(|(key, _)| *key).collect(),
+            if RECORD_UNDO {
+                created.iter().map(|(key, _)| *key).collect()
+            } else {
+                Vec::new()
+            },
         ))
     }
 
     fn fold_batch_changes(
         transitions: &[ConnectTransition],
-    ) -> Result<FoldedBatchChanges, UtxoError> {
+    ) -> Result<FoldedBatchChanges<'_>, UtxoError> {
         let mut spent = BTreeSet::new();
         let mut created = BTreeMap::new();
         for transition in transitions {
@@ -1064,7 +1080,7 @@ impl MdbxUtxoStore {
                 }
             }
             for (key, coin) in &transition.created {
-                if created.insert(*key, coin.clone()).is_some() {
+                if created.insert(*key, coin).is_some() {
                     return Err(UtxoError::Duplicate(*key));
                 }
             }
@@ -1810,7 +1826,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
         let current = Self::read_tip(&transaction, &meta)?
             .ok_or(UtxoError::Malformed("MDBX execution tip is uninitialized"))?;
         Self::validate_tip_advance(current, expected_parent, next)?;
-        let aggregate = Self::apply_net_changes(
+        let aggregate = Self::apply_net_changes::<true>(
             &transaction,
             &hot,
             &cold,
@@ -1867,7 +1883,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
             Self::validate_tip_advance(current, transition.expected_parent, transition.next)?;
             current = transition.next;
         }
-        Self::apply_net_changes(
+        Self::apply_net_changes::<false>(
             &transaction,
             &hot,
             &cold,
@@ -1877,6 +1893,8 @@ impl ExecutionChainStore for MdbxUtxoStore {
             current.height,
             DEFAULT_HOT_WINDOW_BLOCKS,
         )?;
+        // The net-change index is no longer needed while encoding durable undo.
+        drop((spent, created));
         for transition in transitions {
             let hash = transition.next.hash.to_byte_array();
             if transaction
@@ -1923,7 +1941,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
         if Self::read_tip(&transaction, &meta)? != Some(expected_current) {
             return Err(UtxoError::Malformed("MDBX disconnect tip mismatch").into());
         }
-        let aggregate = Self::apply_net_changes(
+        let aggregate = Self::apply_net_changes::<true>(
             &transaction,
             &hot,
             &cold,
@@ -2207,6 +2225,133 @@ mod tests {
         assert!(store.get(first_output).unwrap().is_none());
         assert!(store.block_undo(one.hash).unwrap().is_none());
         assert!(store.block_undo(two.hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_preserves_sequential_content_and_per_block_disconnects() {
+        let directory = TempDir::new().unwrap();
+        let batch = MdbxUtxoStore::open(directory.path().join("batch")).unwrap();
+        let sequential = MdbxUtxoStore::open(directory.path().join("sequential")).unwrap();
+        let tips = [0_u8, 1, 2].map(|height| ExecutionTip {
+            height: u32::from(height),
+            hash: block_hash(height),
+        });
+        for store in [&batch, &sequential] {
+            store.initialize_execution_tip(tips[0]).unwrap();
+            store.apply(&[], &[(key(1), coin(0))]).unwrap();
+        }
+        let transitions = [
+            ConnectTransition {
+                expected_parent: tips[0].hash,
+                next: tips[1],
+                spent: vec![key(1)],
+                created: vec![(key(2), coin(1)), (key(3), coin(1))],
+                transaction_undos: vec![UtxoUndo::new(
+                    vec![(key(1), coin(0))],
+                    vec![key(2), key(3)],
+                )],
+            },
+            ConnectTransition {
+                expected_parent: tips[1].hash,
+                next: tips[2],
+                spent: vec![key(2)],
+                created: vec![(key(4), coin(2))],
+                transaction_undos: vec![UtxoUndo::new(vec![(key(2), coin(1))], vec![key(4)])],
+            },
+        ];
+        batch.commit_connect_batch(&transitions).unwrap();
+        for transition in &transitions {
+            let undo = sequential
+                .commit_connect(
+                    transition.expected_parent,
+                    transition.next,
+                    &transition.spent,
+                    &transition.created,
+                    &transition.transaction_undos,
+                )
+                .unwrap();
+            assert_eq!(undo, transition.transaction_undos[0]);
+        }
+        assert_eq!(
+            batch.audit().unwrap().content_sha256,
+            sequential.audit().unwrap().content_sha256
+        );
+        for index in (1..tips.len()).rev() {
+            for store in [&batch, &sequential] {
+                let undos = store.block_undo(tips[index].hash).unwrap().unwrap();
+                assert_eq!(undos, transitions[index - 1].transaction_undos);
+                store
+                    .commit_disconnect(
+                        tips[index],
+                        tips[index - 1],
+                        undos[0].created(),
+                        undos[0].spent(),
+                        &undos,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                batch.audit().unwrap().content_sha256,
+                sequential.audit().unwrap().content_sha256
+            );
+        }
+        assert_eq!(batch.execution_tip().unwrap(), tips[0]);
+        assert_eq!(
+            batch.snapshot_page(None, 10).unwrap(),
+            vec![(key(1), coin(0))]
+        );
+    }
+
+    #[test]
+    fn batch_without_aggregate_undo_still_rejects_corrupt_spent_coins() {
+        for missing_mtp in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let store = MdbxUtxoStore::open(directory.path().join("mdbx")).unwrap();
+            let genesis = ExecutionTip {
+                height: 0,
+                hash: block_hash(0),
+            };
+            let next = ExecutionTip {
+                height: 1,
+                hash: block_hash(1),
+            };
+            store.initialize_execution_tip(genesis).unwrap();
+            store.apply(&[], &[(key(1), coin(0))]).unwrap();
+            let transaction = store.db().begin_rw_txn().unwrap();
+            let hot = transaction.open_table(Some(HOT)).unwrap();
+            // One case has a broken compact encoding; the other decodes but
+            // has no creation-MTP metadata. Both must abort the whole batch.
+            let corrupt = if missing_mtp {
+                coin(99).encode_compact().unwrap()
+            } else {
+                vec![0xff]
+            };
+            transaction
+                .put(
+                    &hot,
+                    encode_mdbx_key(key(2)).as_slice(),
+                    corrupt,
+                    WriteFlags::empty(),
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            let before = store.audit().unwrap().content_sha256;
+            let result = store.commit_connect_batch(&[ConnectTransition {
+                expected_parent: genesis.hash,
+                next,
+                spent: vec![key(1), key(2)],
+                created: vec![(key(3), coin(1))],
+                transaction_undos: Vec::new(),
+            }]);
+            assert!(matches!(
+                result,
+                Err(ChainStoreError::Utxo(UtxoError::Malformed(_)))
+            ));
+            assert_eq!(store.audit().unwrap().content_sha256, before);
+            assert_eq!(store.execution_tip().unwrap(), genesis);
+            assert!(store.block_undo(next.hash).unwrap().is_none());
+            assert_eq!(store.get(key(1)).unwrap(), Some(coin(0)));
+        }
     }
 
     #[test]
