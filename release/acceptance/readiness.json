@@ -1,12 +1,15 @@
 {
   "format": 1,
-  "tested_commit": null,
-  "source_sha256": null,
+  "tested_commit": "3cf44ae68003ceb78e9f0c77042667b475091716",
+  "source_sha256": "41531cb896eba13a13fabde1170e519ab3b90c4b0940232c45125120bfdc0431",
   "gates": {
     "optimizer-budget": {
-      "status": "open",
-      "reason": "Core differential samples pass; broader adversarial and budget-exhaustion acceptance remains open.",
-      "evidence": []
+      "status": "accepted",
+      "reason": "Full Core 31 optimizer differential and explicit exhausted-budget non-worsening acceptance passed on the frozen source.",
+      "evidence": [{
+        "path": "release/acceptance/optimizer-budget-20260915.md",
+        "sha256": "a6c9d4fc8087ee6b2c2bced5ab72e9896b0266989d22d96271b9768939f2b18b"
+      }]
     },
     "admission-resources": {
       "status": "open",
