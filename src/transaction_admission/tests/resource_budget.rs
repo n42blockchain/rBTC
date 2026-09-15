@@ -82,3 +82,39 @@ fn deferred_reconciliation_keeps_candidates_and_withholds_stale_payload_views() 
     assert!(!pool.requires_revalidation());
     assert_eq!(pool.snapshot(), vec![second]);
 }
+
+#[test]
+fn prevout_materialization_is_reserved_before_lookup_and_overlay_delta_is_retained() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, transaction) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+
+    let required = transaction_materialization_reservation_bytes(&transaction);
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: 1_000_000,
+        work_per_second: 0,
+        candidate_bytes: required.saturating_sub(1),
+    });
+    let overlay = AdmissionUtxoOverlay::new(&store, &budget);
+    let error = match apply_to_overlay(&overlay, &transaction, context(), 0, None) {
+        Ok(_) => panic!("materialization reservation must defer before lookup"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        TransactionAdmissionError::ResourceDeferred(_)
+    ));
+    assert_eq!(budget.snapshot().candidate_bytes, 0);
+    assert!(overlay.get(outpoint.into()).unwrap().is_some());
+
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: 1_000_000,
+        work_per_second: 0,
+        candidate_bytes: required + 1_024,
+    });
+    let overlay = AdmissionUtxoOverlay::new(&store, &budget);
+    apply_to_overlay(&overlay, &transaction, context(), 0, None).unwrap();
+    assert!(budget.snapshot().candidate_bytes > 0);
+    drop(overlay);
+    assert_eq!(budget.snapshot().candidate_bytes, 0);
+}

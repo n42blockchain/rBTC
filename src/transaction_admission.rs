@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    mem::size_of,
     sync::{Arc, Mutex},
 };
 
@@ -22,8 +23,8 @@ use crate::{
         AdmissionBudget, AdmissionDeferred, AdmissionStage, CandidateReservation,
     },
     chainstate::{
-        ChainstateError, check_sequence_lock, enforces_bip68, prepare_transaction_for_block,
-        transaction_legacy_sigops,
+        ChainstateError, MAX_SCRIPT_SIZE, check_sequence_lock, enforces_bip68,
+        prepare_transaction_for_block, transaction_legacy_sigops,
     },
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
@@ -2620,6 +2621,38 @@ struct AppliedAdmission {
     script_verification: ScriptVerificationStamp,
 }
 
+// Core drops unspendable outputs whose script is larger than 10,000 bytes.
+// Admission still reserves the bound before resolving prevouts so a hostile
+// package cannot allocate an unbounded collection of owned UTXO/script copies
+// before the shared candidate-memory check runs.
+const ADMISSION_OVERLAY_ENTRY_OVERHEAD: usize = 128;
+
+fn transaction_materialization_reservation_bytes(transaction: &Transaction) -> usize {
+    let inputs = transaction.input.len();
+    let outputs = transaction.output.len();
+    let input_bytes = inputs
+        .saturating_mul(
+            size_of::<Utxo>()
+                .saturating_add(ADMISSION_OVERLAY_ENTRY_OVERHEAD)
+                .saturating_add(MAX_SCRIPT_SIZE.saturating_mul(3)),
+        )
+        .saturating_add(
+            inputs.saturating_mul(size_of::<OutPointKey>() + ADMISSION_OVERLAY_ENTRY_OVERHEAD),
+        );
+    let output_bytes = outputs
+        .saturating_mul(
+            size_of::<Utxo>()
+                .saturating_add(ADMISSION_OVERLAY_ENTRY_OVERHEAD)
+                .saturating_add(MAX_SCRIPT_SIZE),
+        )
+        .saturating_add(
+            outputs.saturating_mul(size_of::<OutPointKey>() + ADMISSION_OVERLAY_ENTRY_OVERHEAD),
+        );
+    input_bytes
+        .saturating_add(output_bytes)
+        .saturating_add(transaction.total_size())
+}
+
 fn apply_to_overlay<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
@@ -2637,6 +2670,9 @@ fn apply_to_overlay<S: UtxoStore>(
             limit: MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS,
         });
     }
+    let _materialization_reservation = overlay
+        .budget
+        .reserve_candidate(transaction_materialization_reservation_bytes(transaction))?;
     // Resolve inputs and check contextual accounting once, without running
     // scripts or mutating the overlay. Cheap policy failures must not consume
     // script-verification work or leave partially applied admission state.
@@ -2714,9 +2750,11 @@ fn apply_to_overlay<S: UtxoStore>(
             .map_err(TransactionAdmissionError::StandardScript)?;
         }
     }
+    let transition_reservation = overlay.reserve_transition(&prepared.spent, &prepared.created)?;
     overlay
         .apply_with_undo(&prepared.spent, &prepared.created)
         .map_err(ChainstateError::from)?;
+    transition_reservation.commit();
     Ok(AppliedAdmission {
         fee_sats,
         policy_vsize: transaction_policy_vsize(transaction, applied.sigop_cost),
@@ -2737,6 +2775,23 @@ struct AdmissionUtxoOverlay<'a, S> {
     base: &'a S,
     budget: AdmissionBudget,
     current: Mutex<BTreeMap<OutPointKey, Option<Utxo>>>,
+    reservations: Mutex<Vec<CandidateReservation>>,
+}
+
+struct OverlayReservation<'a> {
+    destination: &'a Mutex<Vec<CandidateReservation>>,
+    lease: Option<CandidateReservation>,
+}
+
+impl OverlayReservation<'_> {
+    fn commit(mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.destination
+                .lock()
+                .expect("admission overlay reservation lock not poisoned")
+                .push(lease);
+        }
+    }
 }
 
 impl<'a, S> AdmissionUtxoOverlay<'a, S> {
@@ -2745,7 +2800,42 @@ impl<'a, S> AdmissionUtxoOverlay<'a, S> {
             base,
             budget: budget.clone(),
             current: Mutex::new(BTreeMap::new()),
+            reservations: Mutex::new(Vec::new()),
         }
+    }
+
+    fn reserve_transition(
+        &self,
+        spent: &[OutPointKey],
+        created: &[(OutPointKey, Utxo)],
+    ) -> Result<OverlayReservation<'_>, AdmissionDeferred> {
+        let current = self
+            .current
+            .lock()
+            .expect("admission overlay lock not poisoned");
+        let mut new_keys = BTreeSet::new();
+        new_keys.extend(spent.iter().copied());
+        new_keys.extend(created.iter().map(|(outpoint, _)| *outpoint));
+        let bytes = new_keys
+            .iter()
+            .filter(|outpoint| !current.contains_key(outpoint))
+            .map(|outpoint| {
+                let script_bytes = created
+                    .iter()
+                    .find(|(created_outpoint, _)| created_outpoint == outpoint)
+                    .map_or(0, |(_, utxo)| utxo.script_pubkey.len());
+                ADMISSION_OVERLAY_ENTRY_OVERHEAD
+                    .saturating_add(size_of::<OutPointKey>())
+                    .saturating_add(size_of::<Option<Utxo>>())
+                    .saturating_add(script_bytes)
+            })
+            .sum();
+        drop(current);
+        let lease = self.budget.reserve_candidate(bytes)?;
+        Ok(OverlayReservation {
+            destination: &self.reservations,
+            lease: Some(lease),
+        })
     }
     fn charge_preparation(&self, transaction: &Transaction) -> Result<(), AdmissionDeferred> {
         self.budget.charge(

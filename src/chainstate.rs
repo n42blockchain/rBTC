@@ -18,7 +18,7 @@ use crate::{
 pub const COINBASE_MATURITY: u32 = 100;
 /// Total bitcoin supply cap in satoshis.
 pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
-const MAX_SCRIPT_SIZE: usize = 10_000;
+pub(crate) const MAX_SCRIPT_SIZE: usize = 10_000;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_FFFF;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 /// Keys charged for an `OP_CHECKMULTISIG` whose key count is not a known push.
@@ -446,12 +446,25 @@ fn prepare_transaction_with_context<S: UtxoStore>(
         }
     }
 
+    let outpoints = transaction
+        .input
+        .iter()
+        .map(|input| OutPointKey::from(input.previous_output))
+        .collect::<Vec<_>>();
+    let fetched = store.get_many(&outpoints)?;
+    if fetched.len() != outpoints.len() {
+        return Err(UtxoError::Malformed("UTXO prefetch result length").into());
+    }
+
     let mut spent = Vec::with_capacity(transaction.input.len());
     let mut prevouts = Vec::with_capacity(transaction.input.len());
     let mut input_value = 0_u64;
-    for input in &transaction.input {
+    for (input, (fetched_outpoint, fetched_utxo)) in transaction.input.iter().zip(fetched) {
         let outpoint = OutPointKey::from(input.previous_output);
-        let utxo = store.get(outpoint)?.ok_or(UtxoError::Missing(outpoint))?;
+        if fetched_outpoint != outpoint {
+            return Err(UtxoError::Malformed("UTXO prefetch result order").into());
+        }
+        let utxo = fetched_utxo.ok_or(UtxoError::Missing(outpoint))?;
         if utxo.value_sats > MAX_MONEY_SATS {
             return Err(ChainstateError::MoneyRange);
         }
