@@ -22,9 +22,12 @@
       "evidence": []
     },
     "storage-replay": {
-      "status": "open",
-      "reason": "The 935001-963350 replay passed at b078798; final frozen release source acceptance is pending.",
-      "evidence": []
+      "status": "accepted",
+      "reason": "The 935001-963350 snapshot replay passed on the frozen source in both redb and MDBX with matching canonical content and fresh-process audits.",
+      "evidence": [{
+        "path": "release/acceptance/storage-replay-20260915.md",
+        "sha256": "feac60dd67a52f680643905aadbfa85cab3ab11180712e88505d67994e46dbde"
+      }]
     },
     "public-soak": {
       "status": "open",
