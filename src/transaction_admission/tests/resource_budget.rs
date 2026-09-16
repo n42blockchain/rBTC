@@ -2,6 +2,34 @@ use super::*;
 use crate::admission_resources::AdmissionResourceLimits;
 
 #[test]
+fn indexed_measures_match_relay_and_withhold_stale_chain_values() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, transaction) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+    let txid = transaction.compute_txid();
+    let mut pool = TransactionAdmissionPool::default();
+    pool.admit(&store, transaction, context()).unwrap();
+    let relay = pool.relay_snapshot();
+    let before = pool.admission_budget().snapshot().charged;
+    assert_eq!(
+        pool.validated_measures(txid),
+        Some((relay[0].policy_vsize, relay[0].fee_sats))
+    );
+    assert_eq!(
+        pool.validated_measures(Txid::from_byte_array([99; 32])),
+        None
+    );
+    assert_eq!(pool.admission_budget().snapshot().charged, before);
+    pool.require_revalidation(BlockHash::from_byte_array([42; 32]));
+    assert_eq!(pool.validated_measures(txid), None);
+    pool.reconcile(&store, context()).unwrap();
+    assert_eq!(
+        pool.validated_measures(txid),
+        Some((relay[0].policy_vsize, relay[0].fee_sats))
+    );
+}
+
+#[test]
 fn rejection_and_pool_clones_cannot_reset_the_shared_allowance() {
     let (_directory, store) = store();
     let (_, _, tx) = spend(1);

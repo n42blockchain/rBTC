@@ -5772,32 +5772,24 @@ impl NodeInboundSource {
                 budget
                     .charge(
                         crate::admission_resources::AdmissionStage::Snapshot,
-                        u64::try_from(candidate.retained_bytes())
+                        u64::try_from(identities.len())
                             .unwrap_or(u64::MAX)
-                            .saturating_mul(2),
+                            .saturating_mul(512),
                     )
                     .map_err(|error| error.to_string())?;
-                let admitted = candidate
-                    .relay_snapshot()
-                    .into_iter()
-                    .map(|entry| {
-                        (
-                            entry.transaction.compute_txid(),
-                            (entry.policy_vsize, entry.fee_sats),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>();
                 identities
                     .into_iter()
                     .map(|(txid, wtxid)| {
                         let accepted = outcome.accepted.contains(&txid);
-                        let measures = accepted.then(|| admitted.get(&txid)).flatten();
+                        let measures = accepted
+                            .then(|| candidate.validated_measures(txid))
+                            .flatten();
                         TestAcceptResult {
                             txid,
                             wtxid,
                             allowed: accepted,
-                            vsize: measures.map(|(vsize, _)| *vsize),
-                            fee_sats: measures.map(|(_, fee_sats)| *fee_sats),
+                            vsize: measures.map(|(vsize, _)| vsize),
+                            fee_sats: measures.map(|(_, fee_sats)| fee_sats),
                             reject_reason: (!accepted).then(|| {
                                 "transaction was already present or not accepted by the package"
                                     .to_owned()

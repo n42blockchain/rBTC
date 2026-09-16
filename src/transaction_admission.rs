@@ -1187,6 +1187,16 @@ impl TransactionAdmissionPool {
             });
     }
 
+    /// Reads validated policy size and fee without cloning payloads or computing
+    /// relay order. A changed chain view withholds these values until revalidated.
+    pub(crate) fn validated_measures(&self, txid: Txid) -> Option<(usize, u64)> {
+        if self.validation_pending {
+            return None;
+        }
+        self.entry(txid)
+            .map(|entry| (entry.policy_vsize, entry.fee_sats))
+    }
+
     /// Clones admitted transactions in oldest-to-newest order.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Transaction> {
