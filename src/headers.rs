@@ -16,7 +16,9 @@ use thiserror::Error;
 
 use crate::deployments::DeploymentConfig;
 
+mod resources;
 mod retention;
+pub use resources::{HeaderBatchLimits, HeaderWorkBudget};
 pub use retention::{HeaderRetentionError, StagedHeaderEviction};
 
 /// Bitcoin Core's maximum permitted future block timestamp offset.
@@ -58,6 +60,16 @@ pub struct HeaderInfo {
 /// Rejection reason for a header DAG insertion.
 #[derive(Debug, Error)]
 pub enum HeaderError {
+    /// A local staging-byte or validation-work allowance was exhausted.
+    #[error("header resource deferred: {resource} requires {required}, remaining {remaining}")]
+    BudgetDeferred {
+        /// Accounting domain; never a consensus rejection.
+        resource: &'static str,
+        /// Units needed before starting the operation.
+        required: u64,
+        /// Units available to this operation.
+        remaining: u64,
+    },
     /// A local capacity limit was reached before staging allocations or writes.
     #[error(
         "header resource deferred: {retained} retained + {requested} requested exceeds {limit}"
@@ -441,6 +453,29 @@ impl HeaderDag {
         adjusted_time: u32,
         max_headers: usize,
     ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        self.stage_batch_contextual_with_budget(
+            headers,
+            adjusted_time,
+            HeaderBatchLimits {
+                max_headers,
+                ..HeaderBatchLimits::default()
+            },
+            &mut HeaderWorkBudget::default(),
+        )
+    }
+
+    /// Stages within explicit metadata-byte, retained-entry and work allowances.
+    /// Reusing `work` across calls also bounds failed attempts; work is never refunded.
+    /// The byte limit covers the two staging vectors, not the DAG or process RSS.
+    pub fn stage_batch_contextual_with_budget(
+        &mut self,
+        headers: &[Header],
+        adjusted_time: u32,
+        limits: HeaderBatchLimits,
+        work: &mut HeaderWorkBudget,
+    ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        limits.check_staging_bytes(headers.len())?;
+        let max_headers = limits.max_headers;
         let retained = self.headers.len().saturating_sub(1);
         if retained
             .checked_add(headers.len())
@@ -464,6 +499,7 @@ impl HeaderDag {
             committed: false,
         };
         for header in headers {
+            staged.dag.reserve_validation_work(header, work)?;
             let rebuilds_active_chain = staged.dag.insertion_rebuilds_active_chain(header);
             let info = staged.dag.insert_contextual(*header, adjusted_time)?;
             staged.rebuilt_active_chain |= rebuilds_active_chain;
@@ -724,7 +760,11 @@ impl HeaderDag {
         let Some(height) = parent.height.checked_add(1) else {
             return false;
         };
-        let chainwork = parent.chainwork + header.target().to_work();
+        let target = header.target();
+        if target == bitcoin::pow::Target::ZERO || target > self.params.max_attainable_target {
+            return false;
+        }
+        let chainwork = parent.chainwork + target.to_work();
         chainwork > self.active_tip().chainwork
             && !(parent.hash == self.active_tip
                 && usize::try_from(height).ok() == Some(self.active_chain.len()))
@@ -867,7 +907,7 @@ mod tests {
         assert!(!HeaderError::UnknownParent(BlockHash::all_zeros()).is_peer_invalid());
     }
 
-    fn mine_child(parent: BlockHash, time: u32) -> Header {
+    pub(super) fn mine_child(parent: BlockHash, time: u32) -> Header {
         let target = Params::new(Network::Regtest).max_attainable_target;
         let mut header = Header {
             version: Version::from_consensus(4),

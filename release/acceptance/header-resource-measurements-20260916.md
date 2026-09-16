@@ -66,3 +66,9 @@ Independent byte/work budgets, disk-backed candidate spill with resumable
 consensus context, capacity-aware startup recovery, full-block reorg/failover
 coverage, and long-running whole-node memory/disk measurements remain open.
 The emergency count ceiling cannot substitute for that recovery architecture.
+
+## Subsequent Mac continuation
+
+See [batch budgets and Mac measurements](header-budget-continuation-20260916.md).
+Its source and workload differ from the Linux measurements above; the original
+results are unchanged and the production gate remains open.

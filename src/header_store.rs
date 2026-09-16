@@ -19,6 +19,10 @@ use crate::{
     headers::{HeaderDag, HeaderError, StagedHeaderEviction},
 };
 
+/// Header-store page-cache allowance, independent of retained DAG entries.
+/// Redb transaction/repair buffers and the OS page cache are separate resources.
+pub const HEADER_STORE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("header_insertion_order");
 const HASH_SEQUENCE: TableDefinition<&[u8], u64> = TableDefinition::new("header_hash_sequence");
@@ -90,7 +94,9 @@ pub struct RedbHeaderStore {
 impl RedbHeaderStore {
     /// Opens or creates a header database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HeaderStoreError> {
-        let db = Database::create(path)?;
+        let db = Database::builder()
+            .set_cache_size(HEADER_STORE_CACHE_BYTES)
+            .create(path)?;
         let transaction = db.begin_write()?;
         {
             let _headers = transaction.open_table(HEADERS)?;
