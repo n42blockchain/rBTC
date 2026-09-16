@@ -25,6 +25,11 @@ const HASH_SEQUENCE: TableDefinition<&[u8], u64> = TableDefinition::new("header_
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("header_metadata");
 const NEXT_SEQUENCE_KEY: &str = "next_sequence";
 
+/// Default ceiling on persisted non-genesis entries before DAG materialization.
+/// This is an entry-count safety limit, not a measured process-RSS guarantee.
+/// Offline callers can supply a reviewed allowance through load_dag_with_limit.
+pub const DEFAULT_MAX_REPLAY_HEADERS: usize = crate::headers::DEFAULT_MAX_RETAINED_HEADERS;
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static REPLAYED_HEADERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -242,7 +247,7 @@ impl RedbHeaderStore {
         deployments: DeploymentConfig,
         adjusted_time: u32,
     ) -> Result<HeaderDag, HeaderStoreError> {
-        self.load_dag_with_limit(deployments, adjusted_time, usize::MAX)
+        self.load_dag_with_limit(deployments, adjusted_time, DEFAULT_MAX_REPLAY_HEADERS)
     }
 
     /// Checks retained row count before materializing any historical DAG entries.

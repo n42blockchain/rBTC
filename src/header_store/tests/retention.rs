@@ -26,6 +26,36 @@ fn leaf_first(side: &[Header]) -> Vec<BlockHash> {
 }
 
 #[test]
+fn ingress_capacity_defers_atomically_and_rollback_restores_capacity() {
+    let (mut dag, _, side) = branches();
+    let before = dag.active_tip();
+    let count = dag.retained_header_count();
+    let child = mine_child(side[1].block_hash(), side[1].time + 1);
+    let error = match dag.stage_batch_contextual_with_limit(&[child], child.time, count - 1) {
+        Ok(_) => panic!("full DAG must defer before mutation"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        crate::headers::HeaderError::ResourceDeferred { .. }
+    ));
+    assert!(!error.is_peer_invalid());
+    assert_eq!(dag.retained_header_count(), count);
+    assert_eq!(dag.active_tip(), before);
+    drop(
+        dag.stage_batch_contextual_with_limit(&[child], child.time, count)
+            .unwrap(),
+    );
+    assert_eq!(dag.retained_header_count(), count);
+    assert!(dag.get(&child.block_hash()).is_none());
+    let _ = dag
+        .stage_batch_contextual_with_limit(&[child], child.time, count)
+        .unwrap()
+        .commit();
+    assert_eq!(dag.retained_header_count(), count + 1);
+}
+
+#[test]
 fn retention_protects_context_and_rolls_back_partial_plans() {
     let (mut dag, active, side) = branches();
     let tip = dag.active_tip();

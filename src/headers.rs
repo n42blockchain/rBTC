@@ -24,6 +24,10 @@ pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
 /// BIP94 maximum backward timestamp movement at a Testnet4 retarget boundary.
 pub const MAX_TIMEWARP_SECS: u32 = 10 * 60;
 
+/// Emergency retained-entry ceiling, excluding genesis. This bounds DAG entry
+/// count, not whole-process RSS, and does not replace a disk-backed recovery path.
+pub const DEFAULT_MAX_RETAINED_HEADERS: usize = 2_000_000;
+
 /// Consensus parameters corrected where rust-bitcoin differs from Core.
 ///
 /// rust-bitcoin reuses mainnet's two-week target timespan for regtest, while
@@ -54,6 +58,18 @@ pub struct HeaderInfo {
 /// Rejection reason for a header DAG insertion.
 #[derive(Debug, Error)]
 pub enum HeaderError {
+    /// A local capacity limit was reached before staging allocations or writes.
+    #[error(
+        "header resource deferred: {retained} retained + {requested} requested exceeds {limit}"
+    )]
+    ResourceDeferred {
+        /// Existing non-genesis entries.
+        retained: usize,
+        /// Requested batch size.
+        requested: usize,
+        /// Non-genesis entry ceiling.
+        limit: usize,
+    },
     /// The header is already present in this DAG.
     #[error("duplicate header {0}")]
     Duplicate(BlockHash),
@@ -413,6 +429,29 @@ impl HeaderDag {
         headers: &[Header],
         adjusted_time: u32,
     ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        self.stage_batch_contextual_with_limit(headers, adjusted_time, DEFAULT_MAX_RETAINED_HEADERS)
+    }
+
+    /// Reserves the batch's entry capacity before allocating staging vectors.
+    /// Exclusive DAG ownership holds that capacity until commit or rollback.
+    /// Capacity exhaustion is local deferral, never consensus invalidity.
+    pub fn stage_batch_contextual_with_limit(
+        &mut self,
+        headers: &[Header],
+        adjusted_time: u32,
+        max_headers: usize,
+    ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        let retained = self.headers.len().saturating_sub(1);
+        if retained
+            .checked_add(headers.len())
+            .is_none_or(|total| total > max_headers)
+        {
+            return Err(HeaderError::ResourceDeferred {
+                retained,
+                requested: headers.len(),
+                limit: max_headers,
+            });
+        }
         let original_active_tip = self.active_tip;
         let original_active_len = self.active_chain.len();
         let mut staged = StagedHeaderBatch {

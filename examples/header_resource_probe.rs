@@ -1,12 +1,14 @@
 //! Measures retained valid sibling headers, serving projections and durable replay.
 //!
-//! Usage: cargo run --release --example header_resource_probe -- <active|full> <active-headers> <siblings>
+//! Usage: cargo run --release --example header_resource_probe -- <active|full|retained> <active-headers> <siblings>
 //!
 //! `full` reproduces the former serving-DAG clone; `active` uses the production
 //! active-chain projection. JSON lines report the process RSS (Linux only),
 //! logical retained entries and database file length separately. Reopen runs
 //! in the same process, so it is not a cold-start RSS measurement. This is a
 //! kernel/store workload, not an end-to-end peer or resource-cap acceptance.
+//! `retained` additionally runs idle eviction after each batch with a 50,000
+//! side-header target and reports both the pre- and post-maintenance samples.
 
 use std::{
     env, fs,
@@ -100,11 +102,24 @@ fn report(
     Ok(())
 }
 
+fn retain_side_headers(
+    dag: &mut HeaderDag,
+    store: &RedbHeaderStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_tip = dag.active_tip();
+    let hashes = dag.side_chain_eviction_plan(50_000, 2_000);
+    let stage = dag.stage_leaf_evictions(&hashes, &[expected_tip.hash], 2_000)?;
+    store.persist_eviction(&stage)?;
+    stage.commit();
+    assert!(dag.retained_header_count() <= usize::try_from(expected_tip.height)? + 1 + 50_000);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    let mode = args.next().ok_or("expected active or full")?;
-    if mode != "active" && mode != "full" {
-        return Err("expected active or full".into());
+    let mode = args.next().ok_or("expected active, full or retained")?;
+    if mode != "active" && mode != "full" && mode != "retained" {
+        return Err("expected active, full or retained".into());
     }
     let active: u32 = args.next().ok_or("expected active-header count")?.parse()?;
     let siblings: u32 = args.next().ok_or("expected sibling count")?.parse()?;
@@ -136,6 +151,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if batch.len() == 2_000 || tag == siblings {
             persist(&mut dag, &store, &batch, now)?;
             batch.clear();
+            if mode == "retained" {
+                report(
+                    &mode,
+                    "before-retention",
+                    &dag,
+                    &snapshot,
+                    &path,
+                    started,
+                    0,
+                )?;
+                retain_side_headers(&mut dag, &store)?;
+            }
             let update = Instant::now();
             if mode == "full" {
                 snapshot = dag.clone();
@@ -148,7 +175,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let update_micros = update.elapsed().as_micros();
             assert_eq!(snapshot.active_tip(), expected_tip);
-            assert_eq!(store.len()?, u64::from(active) + u64::from(tag));
+            let retained_siblings = if mode == "retained" {
+                tag.min(50_000)
+            } else {
+                tag
+            };
+            assert_eq!(
+                store.len()?,
+                u64::from(active) + u64::from(retained_siblings)
+            );
             std::hint::black_box(&snapshot);
             report(
                 &mode,
