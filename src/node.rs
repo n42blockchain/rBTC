@@ -11531,6 +11531,36 @@ fn stage_submitted_blocks(
     Ok(())
 }
 
+// Idle maintenance targets, not hard ingress or physical database byte limits.
+const IDLE_SIDE_HEADER_TARGET: usize = 50_000;
+const IDLE_HEADER_EVICTION_BATCH: usize = 2_000;
+
+fn retain_idle_headers(
+    headers: &mut HeaderDag,
+    path: &std::path::Path,
+    execution_tip: BlockHash,
+    target: usize,
+    max_removals: usize,
+) -> Result<usize, PeerRunError> {
+    if execution_tip != headers.active_tip().hash {
+        return Ok(0);
+    }
+    let hashes = headers.side_chain_eviction_plan(target, max_removals);
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let store =
+        RedbHeaderStore::open(path).map_err(|error| PeerRunError::local(error.to_string()))?;
+    let stage = headers
+        .stage_leaf_evictions(&hashes, &[execution_tip], max_removals)
+        .map_err(|error| PeerRunError::local(error.to_string()))?;
+    store
+        .persist_eviction(&stage)
+        .map_err(|error| PeerRunError::local(error.to_string()))?;
+    stage.commit();
+    Ok(hashes.len())
+}
+
 async fn sync_headers(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployments: &DeploymentConfig,
@@ -11574,8 +11604,13 @@ async fn sync_headers(
         time.usable
     );
 
+    let mut recovery_tip = dag.active_tip().hash;
+    let mut recovering = false;
     loop {
-        request_headers(session, dag.block_locator()).await?;
+        let locator = dag.block_locator_from(recovery_tip).ok_or_else(|| {
+            PeerRunError::local("header recovery cursor lost its retained ancestry")
+        })?;
+        request_headers(session, locator).await?;
         let headers = receive_headers(session).await?;
         let response_count = headers.len();
         if response_count == 0 {
@@ -11583,8 +11618,24 @@ async fn sync_headers(
         }
         let unseen =
             unseen_header_suffix(&dag, &headers).map_err(|error| PeerRunError::header(&error))?;
+        // A full known prefix may still precede an unknown stronger suffix.
+        // Advance on the peer's validated branch, even while it loses work.
+        let response_tip = headers
+            .last()
+            .expect("nonempty header response")
+            .block_hash();
         if unseen.is_empty() {
-            break;
+            if response_count < MAX_HEADERS_PER_RESPONSE
+                || response_tip == recovery_tip
+                || (recovering
+                    && dag.get(&response_tip).map(|info| info.height)
+                        <= dag.get(&recovery_tip).map(|info| info.height))
+            {
+                break;
+            }
+            recovery_tip = response_tip;
+            recovering = true;
+            continue;
         }
         let staged = dag
             .stage_batch_contextual(
@@ -11596,6 +11647,8 @@ async fn sync_headers(
             .append_batch(unseen)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         let _ = staged.commit();
+        recovery_tip = response_tip;
+        recovering = true;
         rbtc_info!(
             "validated and persisted {} headers; active tip {}:{}",
             unseen.len(),
@@ -14044,6 +14097,16 @@ async fn sync_validating_node(
                 }
             }
             if tip.height >= headers.active_tip().height {
+                let evicted = retain_idle_headers(
+                    &mut headers,
+                    &headers_path,
+                    tip.hash,
+                    IDLE_SIDE_HEADER_TARGET,
+                    IDLE_HEADER_EVICTION_BATCH,
+                )?;
+                if evicted > 0 {
+                    rbtc_info!("persisted idle retention of {evicted} side-chain headers");
+                }
                 rbtc_info!("block execution caught up at height {}", tip.height);
                 if let Some(estimator) = fee_estimator.as_ref() {
                     reconcile_fee_estimator(estimator, &headers, tip, &ledger)?;

@@ -165,7 +165,8 @@ impl RedbHeaderStore {
     /// after this method succeeds. A legacy reverse index is filled by streaming
     /// insertion rows inside this same transaction; no historical DAG is copied.
     /// Redb reuses freed pages, but this method does not shrink the file or claim
-    /// a physical disk budget. No automatic ingress eviction policy is enabled.
+    /// a physical disk budget. Caught-up idle maintenance uses this operation;
+    /// ingress does not yet impose a hard resource budget.
     pub fn persist_eviction(
         &self,
         stage: &StagedHeaderEviction<'_>,

@@ -162,7 +162,7 @@ pub struct HeaderDag {
     deployments: DeploymentConfig,
     headers: HashMap<BlockHash, HeaderInfo>,
     // Built once on the first explicit retention operation. Serving projections
-    // do not need this index, and automatic retention is not enabled yet.
+    // do not need this index. Idle maintenance initializes it on first eviction.
     child_counts: Option<HashMap<BlockHash, usize>>,
     active_tip: BlockHash,
     active_chain: Vec<BlockHash>,
@@ -371,6 +371,33 @@ impl HeaderDag {
             }
         }
         locator
+    }
+
+    /// Builds a locator starting at a retained fork tip. Ancestors remain on
+    /// that fork until it joins the active chain; no chain selection is changed.
+    /// Returns None when the requested tip or its ancestry is unavailable.
+    #[must_use]
+    pub fn block_locator_from(&self, tip: BlockHash) -> Option<Vec<BlockHash>> {
+        let mut current = self.get(&tip)?;
+        let mut locator = Vec::new();
+        let mut step = 1_u32;
+        loop {
+            locator.push(current.hash);
+            if current.height == 0 {
+                return Some(locator);
+            }
+            let target = current.height.saturating_sub(step);
+            while current.height > target {
+                if self.active_height_of(current.hash).is_some() {
+                    current = self.active_header_at(target)?;
+                    break;
+                }
+                current = self.get(&current.header.prev_blockhash)?;
+            }
+            if locator.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
     }
 
     /// Contextually validates and stages a contiguous header batch in place.

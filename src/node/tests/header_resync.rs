@@ -2,6 +2,121 @@ use super::*;
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
+    for evict in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("headers.redb");
+        let deployments = DeploymentConfig::for_network(Network::Regtest);
+        let mut dag = HeaderDag::with_deployments(deployments.clone());
+        let genesis = dag.active_tip();
+        let mut parent = genesis.header;
+        let mut active = Vec::new();
+        for _ in 0..2001 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+            active.push(parent);
+        }
+        let mut fork = Vec::new();
+        parent = genesis.header;
+        for _ in 0..2002 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+            fork.push(parent);
+        }
+        let now = unix_time().unwrap();
+        let _ = dag.stage_batch_contextual(&active, now).unwrap().commit();
+        let _ = dag
+            .stage_batch_contextual(&fork[..2000], now)
+            .unwrap()
+            .commit();
+        let store = RedbHeaderStore::open(&path).unwrap();
+        store.append_batch(&active).unwrap();
+        store.append_batch(&fork[..2000]).unwrap();
+        drop(store);
+        if evict {
+            assert_eq!(
+                retain_idle_headers(&mut dag, &path, genesis.hash, 0, 2000).unwrap(),
+                0
+            );
+            let executed = dag.active_tip().hash;
+            assert_eq!(
+                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
+                1000
+            );
+            assert!(dag.get(&fork[999].block_hash()).is_some());
+            assert!(dag.get(&fork[1000].block_hash()).is_none());
+            assert_eq!(
+                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
+                1000
+            );
+            assert_eq!(
+                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
+                0
+            );
+        }
+        let expected = fork[2001].block_hash();
+        let cursor = fork[1999].block_hash();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(9551)).await;
+            assert!(matches!(
+                peer.read_message().await.unwrap().into_payload(),
+                NetworkMessage::GetHeaders(_)
+            ));
+            peer.write_message(NetworkMessage::Headers(fork[..2000].to_vec()))
+                .await
+                .unwrap();
+            let NetworkMessage::GetHeaders(request) =
+                peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected continuation on losing fork");
+            };
+            assert_eq!(request.locator_hashes[0], cursor);
+            assert_eq!(request.locator_hashes.last(), Some(&genesis.hash));
+            peer.write_message(NetworkMessage::Headers(fork[2000..].to_vec()))
+                .await
+                .unwrap();
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            9550,
+            "/rbtc:recovery-test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let recovered = timeout(
+            Duration::from_secs(20),
+            sync_headers(
+                &mut session,
+                &deployments,
+                path.clone(),
+                &NetworkTime::default(),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.active_tip().hash, expected);
+        assert_eq!(
+            recovered.block_locator_from(expected),
+            Some(recovered.block_locator())
+        );
+        let reopened = RedbHeaderStore::open(&path)
+            .unwrap()
+            .load_dag(Network::Regtest, now)
+            .unwrap();
+        assert_eq!(reopened.active_tip(), recovered.active_tip());
+        timeout(Duration::from_secs(20), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn block_window_fallback_preserves_order_and_only_refetches_missing_slots() {
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
     let blocks = (1..=3)
