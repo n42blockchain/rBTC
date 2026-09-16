@@ -11561,20 +11561,16 @@ fn retain_idle_headers(
     Ok(hashes.len())
 }
 
-async fn sync_headers(
-    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+fn resume_header_dag(
+    store: &RedbHeaderStore,
     deployments: &DeploymentConfig,
-    path: PathBuf,
-    network_time: &NetworkTime,
     existing: Option<HeaderDag>,
 ) -> Result<HeaderDag, PeerRunError> {
-    let store =
-        RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
     // The serving loop owns this DAG and serializes header writes, including
     // local submissions, to the same database. Transfer that ownership across
     // polls instead of replaying and temporarily duplicating every retained
     // fork. Startup and peer failover still validate the complete durable log.
-    let mut dag = if let Some(dag) = existing {
+    if let Some(dag) = existing {
         let persisted = store
             .len()
             .map_err(|error| PeerRunError::local(error.to_string()))?;
@@ -11585,15 +11581,27 @@ async fn sync_headers(
                 "retained header DAG does not match the persistence count or deployment configuration",
             ));
         }
-        dag
+        Ok(dag)
     } else {
         store
             .load_dag_with_deployments(
                 deployments.clone(),
                 unix_time().map_err(PeerRunError::transient)?,
             )
-            .map_err(|error| PeerRunError::transient(error.to_string()))?
-    };
+            .map_err(|error| PeerRunError::transient(error.to_string()))
+    }
+}
+
+async fn sync_headers(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    deployments: &DeploymentConfig,
+    path: PathBuf,
+    network_time: &NetworkTime,
+    existing: Option<HeaderDag>,
+) -> Result<HeaderDag, PeerRunError> {
+    let store =
+        RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
+    let mut dag = resume_header_dag(&store, deployments, existing)?;
     let time = network_time.snapshot();
     rbtc_info!(
         "resuming headers-first sync from {}:{} (network_time_samples={} offset_seconds={} usable={})",
@@ -11604,7 +11612,15 @@ async fn sync_headers(
         time.usable
     );
 
-    let mut recovery_tip = dag.active_tip().hash;
+    // This is only a locator hint: replay above has validated its ancestry.
+    // A missing/stale hint must never override work-based chain selection.
+    let mut recovery_tip = store
+        .recovery_tip()
+        .map_err(|error| PeerRunError::local(error.to_string()))?
+        .filter(|hash| dag.get(hash).is_some())
+        .unwrap_or(dag.active_tip().hash);
+    // A different peer may first return a lower known prefix of another fork.
+    // Permit that first switch even when resuming a saved cursor.
     let mut recovering = false;
     loop {
         let locator = dag.block_locator_from(recovery_tip).ok_or_else(|| {
@@ -11633,6 +11649,9 @@ async fn sync_headers(
             {
                 break;
             }
+            store
+                .append_recovery_batch(&[], response_tip)
+                .map_err(|error| PeerRunError::local(error.to_string()))?;
             recovery_tip = response_tip;
             recovering = true;
             continue;
@@ -11644,7 +11663,7 @@ async fn sync_headers(
             )
             .map_err(|error| PeerRunError::header(&error))?;
         store
-            .append_batch(unseen)
+            .append_recovery_batch(unseen, response_tip)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         let _ = staged.commit();
         recovery_tip = response_tip;
@@ -11659,6 +11678,9 @@ async fn sync_headers(
             break;
         }
     }
+    store
+        .clear_recovery_tip()
+        .map_err(|error| PeerRunError::local(error.to_string()))?;
     rbtc_info!(
         "peer returned no more headers at {}:{}",
         dag.active_tip().height,

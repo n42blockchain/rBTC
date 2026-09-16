@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
-    for evict in [false, true] {
+    for (evict, interrupted) in [(false, false), (true, false), (false, true), (true, true)] {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("headers.redb");
         let deployments = DeploymentConfig::for_network(Network::Regtest);
@@ -54,22 +54,83 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
         }
         let expected = fork[2001].block_hash();
         let cursor = fork[1999].block_hash();
+        if interrupted {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote = listener.local_addr().unwrap();
+            let prefix = fork[..2000].to_vec();
+            let server = tokio::spawn(async move {
+                let (mut peer, _) = accept_peer(listener, peer_version(9561)).await;
+                assert!(matches!(
+                    peer.read_message().await.unwrap().into_payload(),
+                    NetworkMessage::GetHeaders(_)
+                ));
+                peer.write_message(NetworkMessage::Headers(prefix))
+                    .await
+                    .unwrap();
+                let NetworkMessage::GetHeaders(request) =
+                    peer.read_message().await.unwrap().into_payload()
+                else {
+                    panic!("expected recovery continuation");
+                };
+                assert_eq!(request.locator_hashes[0], cursor);
+                // Disconnect after the committed prefix, before the winning suffix.
+            });
+            let mut session = connect_outbound(
+                remote,
+                Network::Regtest.magic(),
+                9560,
+                "/rbtc:interrupted-recovery/".to_owned(),
+                0,
+            )
+            .await
+            .unwrap();
+            assert!(
+                timeout(
+                    Duration::from_secs(20),
+                    sync_headers(
+                        &mut session,
+                        &deployments,
+                        path.clone(),
+                        &NetworkTime::default(),
+                        None,
+                    )
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            timeout(Duration::from_secs(20), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let store = RedbHeaderStore::open(&path).unwrap();
+            assert_eq!(store.recovery_tip().unwrap(), Some(cursor));
+            assert_eq!(store.len().unwrap(), 4001);
+            assert_eq!(
+                store.load_dag(Network::Regtest, now).unwrap().active_tip(),
+                dag.active_tip()
+            );
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(listener, peer_version(9551)).await;
-            assert!(matches!(
-                peer.read_message().await.unwrap().into_payload(),
-                NetworkMessage::GetHeaders(_)
-            ));
-            peer.write_message(NetworkMessage::Headers(fork[..2000].to_vec()))
-                .await
-                .unwrap();
-            let NetworkMessage::GetHeaders(request) =
+            let NetworkMessage::GetHeaders(mut request) =
                 peer.read_message().await.unwrap().into_payload()
             else {
                 panic!("expected continuation on losing fork");
             };
+            if !interrupted {
+                peer.write_message(NetworkMessage::Headers(fork[..2000].to_vec()))
+                    .await
+                    .unwrap();
+                let NetworkMessage::GetHeaders(next) =
+                    peer.read_message().await.unwrap().into_payload()
+                else {
+                    panic!("expected continuation on losing fork");
+                };
+                request = next;
+            }
             assert_eq!(request.locator_hashes[0], cursor);
             assert_eq!(request.locator_hashes.last(), Some(&genesis.hash));
             peer.write_message(NetworkMessage::Headers(fork[2000..].to_vec()))
@@ -103,10 +164,9 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
             recovered.block_locator_from(expected),
             Some(recovered.block_locator())
         );
-        let reopened = RedbHeaderStore::open(&path)
-            .unwrap()
-            .load_dag(Network::Regtest, now)
-            .unwrap();
+        let store = RedbHeaderStore::open(&path).unwrap();
+        assert_eq!(store.recovery_tip().unwrap(), None);
+        let reopened = store.load_dag(Network::Regtest, now).unwrap();
         assert_eq!(reopened.active_tip(), recovered.active_tip());
         timeout(Duration::from_secs(20), server)
             .await
@@ -471,6 +531,7 @@ async fn header_resync_rejects_an_invalid_batch_without_persisting_its_prefix() 
     assert!(error.message.contains("median time past"));
     let store = RedbHeaderStore::open(&path).unwrap();
     assert_eq!(store.len().unwrap(), 0);
+    assert_eq!(store.recovery_tip().unwrap(), None);
     assert_eq!(
         store
             .load_dag(Network::Regtest, unix_time().unwrap())
@@ -540,6 +601,7 @@ async fn header_resync_cancellation_keeps_committed_batches_for_restart() {
     drop(finish);
     server.await.unwrap();
     let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(last));
     assert_eq!(
         store.len().unwrap(),
         u64::try_from(MAX_HEADERS_PER_RESPONSE).unwrap()

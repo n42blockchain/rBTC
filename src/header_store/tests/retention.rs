@@ -26,6 +26,51 @@ fn leaf_first(side: &[Header]) -> Vec<BlockHash> {
 }
 
 #[test]
+fn recovery_cursor_is_atomic_durable_and_cleared_by_eviction() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    let (mut dag, active, side) = branches();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    store
+        .append_recovery_batch(&active, active[2].block_hash())
+        .unwrap();
+    // Failure after inserting every row must abort both the rows and cursor.
+    assert!(
+        store
+            .append_recovery_batch(&side, BlockHash::all_zeros())
+            .is_err()
+    );
+    assert_eq!(store.len().unwrap(), 3);
+    assert_eq!(store.recovery_tip().unwrap(), Some(active[2].block_hash()));
+    store
+        .append_recovery_batch(&side, side[1].block_hash())
+        .unwrap();
+    drop(store);
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
+    assert!(
+        store
+            .append_recovery_batch(&active, active[2].block_hash())
+            .is_err()
+    );
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
+    let stage = dag
+        .stage_leaf_evictions(&leaf_first(&side), &[], 2)
+        .unwrap();
+    store.persist_eviction(&stage).unwrap();
+    stage.commit();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    store
+        .append_recovery_batch(&[], active[2].block_hash())
+        .unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(active[2].block_hash()));
+    store.clear_recovery_tip().unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    assert_eq!(store.len().unwrap(), 3);
+}
+
+#[test]
 fn ingress_capacity_defers_atomically_and_rollback_restores_capacity() {
     let (mut dag, _, side) = branches();
     let before = dag.active_tip();
@@ -181,7 +226,9 @@ fn failed_durable_eviction_aborts_every_row_and_restores_the_dag() {
     let store = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
     let (mut dag, active, side) = branches();
     store.append_batch(&active).unwrap();
-    store.append_batch(&side).unwrap();
+    store
+        .append_recovery_batch(&side, side[1].block_hash())
+        .unwrap();
     // Inject a stale reverse index for the second removal. The first removal
     // has already happened inside the uncommitted redb transaction when it fails.
     let transaction = store.db.begin_write().unwrap();
@@ -200,6 +247,7 @@ fn failed_durable_eviction_aborts_every_row_and_restores_the_dag() {
     assert_eq!(dag.active_tip(), before);
     assert_eq!(dag.retained_header_count(), 6);
     assert_eq!(store.len().unwrap(), 5);
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
     let transaction = store.db.begin_read().unwrap();
     let headers = transaction.open_table(HEADERS).unwrap();
     for header in &side {

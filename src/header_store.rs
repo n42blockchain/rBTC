@@ -24,6 +24,7 @@ const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("heade
 const HASH_SEQUENCE: TableDefinition<&[u8], u64> = TableDefinition::new("header_hash_sequence");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("header_metadata");
 const NEXT_SEQUENCE_KEY: &str = "next_sequence";
+const RECOVERY_TIP_KEY: &str = "recovery_tip";
 
 /// Default ceiling on persisted non-genesis entries before DAG materialization.
 /// This is an entry-count safety limit, not a measured process-RSS guarantee.
@@ -119,7 +120,52 @@ impl RedbHeaderStore {
     /// A duplicate or malformed header aborts the complete batch, leaving the
     /// durable prefix unchanged.
     pub fn append_batch(&self, batch: &[Header]) -> Result<(), HeaderStoreError> {
-        if batch.is_empty() {
+        self.append_batch_with_cursor(batch, None)
+    }
+
+    /// Atomically persists validated headers and the next recovery locator tip.
+    /// The tip must be a persisted non-genesis header, including one in `batch`.
+    /// An empty batch checkpoints an already validated, retained prefix.
+    pub fn append_recovery_batch(
+        &self,
+        batch: &[Header],
+        tip: BlockHash,
+    ) -> Result<(), HeaderStoreError> {
+        self.append_batch_with_cursor(batch, Some(tip))
+    }
+
+    /// Returns the durable recovery hint, never a trusted consensus checkpoint.
+    /// Callers must replay validation and resolve it in their DAG before use.
+    pub fn recovery_tip(&self) -> Result<Option<BlockHash>, HeaderStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        let value = meta.get(RECOVERY_TIP_KEY)?;
+        value
+            .map(|value| {
+                let bytes = value
+                    .value()
+                    .try_into()
+                    .map_err(|_| HeaderStoreError::Malformed("header recovery tip encoding"))?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .transpose()
+    }
+
+    /// Clears a completed recovery hint without changing any retained headers.
+    pub fn clear_recovery_tip(&self) -> Result<(), HeaderStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        transaction.open_table(META)?.remove(RECOVERY_TIP_KEY)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_batch_with_cursor(
+        &self,
+        batch: &[Header],
+        tip: Option<BlockHash>,
+    ) -> Result<(), HeaderStoreError> {
+        if batch.is_empty() && tip.is_none() {
             return Ok(());
         }
         let _guard = self.lock();
@@ -152,6 +198,13 @@ impl RedbHeaderStore {
                     .ok_or(HeaderStoreError::Malformed("header sequence overflow"))?;
             }
             meta.insert(NEXT_SEQUENCE_KEY, sequence.to_le_bytes().as_slice())?;
+            if let Some(tip) = tip {
+                let bytes = tip.to_byte_array();
+                if headers.get(bytes.as_slice())?.is_none() {
+                    return Err(HeaderStoreError::Malformed("unretained recovery tip"));
+                }
+                meta.insert(RECOVERY_TIP_KEY, bytes.as_slice())?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -185,6 +238,7 @@ impl RedbHeaderStore {
             let mut headers = transaction.open_table(HEADERS)?;
             let mut order = transaction.open_table(INSERTION_ORDER)?;
             let mut reverse = transaction.open_table(HASH_SEQUENCE)?;
+            let mut meta = transaction.open_table(META)?;
             if reverse.len()? != order.len()? {
                 for row in order.iter()? {
                     let (sequence, hash) = row?;
@@ -216,6 +270,12 @@ impl RedbHeaderStore {
                 headers.remove(hash.as_slice())?;
                 order.remove(sequence)?;
                 reverse.remove(hash.as_slice())?;
+                let removes_cursor = meta
+                    .get(RECOVERY_TIP_KEY)?
+                    .is_some_and(|cursor| cursor.value() == hash);
+                if removes_cursor {
+                    meta.remove(RECOVERY_TIP_KEY)?;
+                }
             }
         }
         transaction.commit()?;

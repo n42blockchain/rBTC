@@ -18,7 +18,7 @@
     },
     "header-resources": {
       "status": "open",
-      "reason": "Idle retention, fork continuation and emergency staging/replay entry ceilings exist; calibrated byte/work budgets, disk-backed oversized-fork recovery and sustained whole-node acceptance remain open.",
+      "reason": "Idle retention, atomic durable fork cursors and emergency staging/replay entry ceilings exist; calibrated byte/work budgets, disk-backed oversized-fork recovery and sustained whole-node acceptance remain open.",
       "evidence": []
     },
     "storage-replay": {
