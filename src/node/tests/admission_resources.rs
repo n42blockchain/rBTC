@@ -193,11 +193,17 @@ async fn peer_resource_deferral_preserves_queue_before_and_after_draining() {
         .remove(0);
     transaction.input[0].previous_output = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
     let (relay, _) = broadcast::channel(8);
-    for allowance in [0, 24_000_000] {
+    for (allowance, memory_limit) in [
+        (0, 512 * 1024 * 1024),
+        (24_000_000, 512 * 1024 * 1024),
+        // Work succeeds but pipeline memory cannot be reserved. The pool
+        // guard must be released and the undrained queue must remain intact.
+        (24_000_000, 0),
+    ] {
         let budget = AdmissionBudget::new(AdmissionResourceLimits {
             work_burst: allowance,
             work_per_second: 0,
-            candidate_bytes: 512 * 1024 * 1024,
+            candidate_bytes: memory_limit,
         });
         // A large configured ceiling must not reserve a full empty pool. The
         // second allowance covers actual snapshot estimates, then runs out
@@ -230,7 +236,9 @@ async fn peer_resource_deferral_preserves_queue_before_and_after_draining() {
             session.take_pending_transactions(),
             vec![transaction.clone()]
         );
-        let pool = pool.lock().unwrap();
+        let pool = pool
+            .try_lock()
+            .expect("deferral must release the pool guard");
         assert!(pool.is_empty());
         assert!(!pool.is_recently_rejected(transaction.compute_txid()));
         assert_eq!(budget.snapshot().candidate_bytes, 0);

@@ -13070,21 +13070,21 @@ fn admit_pending_peer_transactions(
         .fold(0_usize, |total, transaction| {
             total.saturating_add(transaction.total_size())
         });
-    let (budget, snapshot_bound) = {
-        let mut pool = transaction_pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pool.require_revalidation(current_tip);
-        (
-            pool.admission_budget(),
-            pool.retained_bytes()
-                .saturating_add(persisted_bytes)
-                .saturating_add(disconnected_bytes)
-                .saturating_add(crate::p2p::MAX_PROTOCOL_MESSAGE_LEN as usize)
-                .saturating_mul(6)
-                .saturating_add(pool.len().saturating_mul(512)),
-        )
-    };
+    // Keep the sized in-memory view stable through reservation and candidate
+    // construction. Releasing this guard here would let another admission
+    // grow the pool beyond the pipeline reservation before it is cloned.
+    let mut pool = transaction_pool
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pool.require_revalidation(current_tip);
+    let budget = pool.admission_budget();
+    let snapshot_bound = pool
+        .retained_bytes()
+        .saturating_add(persisted_bytes)
+        .saturating_add(disconnected_bytes)
+        .saturating_add(crate::p2p::MAX_PROTOCOL_MESSAGE_LEN as usize)
+        .saturating_mul(6)
+        .saturating_add(pool.len().saturating_mul(512));
     if let Err(error) = budget.charge(
         crate::admission_resources::AdmissionStage::Snapshot,
         u64::try_from(snapshot_bound).unwrap_or(u64::MAX),
@@ -13151,9 +13151,6 @@ fn admit_pending_peer_transactions(
         .map(Transaction::compute_txid)
         .collect::<HashSet<_>>();
     pending.extend(peer_pending);
-    let mut pool = transaction_pool
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut candidate, _candidate_memory) = match pool.admission_candidate() {
         Ok(candidate) => candidate,
         Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(error)) => {
