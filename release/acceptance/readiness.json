@@ -18,7 +18,7 @@
     },
     "header-resources": {
       "status": "open",
-      "reason": "Automatic idle retention and network fork continuation are implemented; hard ingress/staging budgets, bounded startup and sustained resource acceptance remain open.",
+      "reason": "Idle retention, fork continuation and emergency staging/replay entry ceilings exist; calibrated byte/work budgets, disk-backed oversized-fork recovery and sustained whole-node acceptance remain open.",
       "evidence": []
     },
     "storage-replay": {
