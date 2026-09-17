@@ -24,7 +24,9 @@ not change acceptance statuses or weaken thresholds.
    now connects chainstate/Header caches and admission candidates with configurable
    startup preflight. The user-selected default is now 32 GiB;
    [bounded coin queries](bounded-coin-reads-20260917.md) check scripts before
-   copying in ordinary stores and mutable snapshot overlays. [Supporting database caches](supporting-cache-memory-20260917.md)
+   copying in ordinary stores and mutable snapshot overlays.
+   [Snapshot-base group queries](snapshot-group-streaming-20260917.md) now
+   stream with fixed scratch instead of allocating a complete large group. [Supporting database caches](supporting-cache-memory-20260917.md)
    and maintenance opens now share that owner too; remaining allocations and
    whole-node acceptance are still open. [FIFO work admission and cancellable
    standby waits](header-work-scheduling-20260917.md) now prevent asynchronous

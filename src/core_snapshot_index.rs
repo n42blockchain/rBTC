@@ -154,9 +154,10 @@ fn load_fingerprint_sidecar(
     )
 }
 /// First-attempt read width for one txid group: its 32-byte header, the
-/// coin count, and a coin of standard shape. Groups needing more are re-read
-/// four times wider until they fit.
+/// coin count, and a coin of standard shape. Larger groups stream through
+/// a fixed-size buffer instead of materializing the complete group.
 const GROUP_PROBE_WINDOW: u64 = 192;
+const GROUP_STREAM_BUFFER_BYTES: usize = 16 * 1024;
 
 /// Failures while building, opening, or querying a snapshot access index.
 #[derive(Debug, Error)]
@@ -928,8 +929,8 @@ impl CoreSnapshotUtxoIndex {
             .collect();
         by_offset.sort_unstable_by_key(|index| entries[*index]);
         let mut coins: Vec<Option<CoreSnapshotCoin>> = vec![None; outpoints.len()];
-        // One buffer for the whole batch: the per-coin window is bounded by
-        // Core's script ceiling, so reusing it avoids an allocation per input.
+        // Reuse the narrow probe buffer; large groups use a fixed streaming
+        // buffer, independent of the group length recorded in the index.
         let mut buffer = Vec::new();
         for index in by_offset {
             let entry = entries[index].expect("filtered to located entries");
@@ -963,44 +964,41 @@ impl CoreSnapshotUtxoIndex {
             return Err(CoreSnapshotIndexError::Invalid("offset out of range"));
         }
         let available = self.snapshot_bytes - group_offset;
-        // Start narrow: a single-coin group is a txid, a one-byte count and a
-        // record that the standard templates keep well under fifty bytes.
-        // Anything larger fails to parse out of the probe and is re-read wider,
-        // so the outcome does not depend on the window.
-        // Widening stops at the widest group this snapshot actually contains,
-        // recorded when the index was built. Without that ceiling a damaged
-        // group count could drive the read toward the size of the whole file.
+        // Keep the common single-coin lookup to one narrow positioned read.
+        // A large group must never size a heap buffer from its recorded length.
         let ceiling = self.max_group_bytes.min(available);
-        let mut window = GROUP_PROBE_WINDOW.min(ceiling);
-        loop {
-            let length = usize::try_from(window).expect("bounded window fits usize");
-            buffer.clear();
-            buffer.resize(length, 0);
-            read_exact_at(&self.snapshot, buffer, group_offset)?;
-            match self.parse_group(buffer, key, vout) {
-                Ok(found) => return Ok(found),
-                Err(error) if window >= ceiling => return Err(error),
-                Err(_) => {
-                    window = window.saturating_mul(4).min(ceiling);
-                }
+        let window = GROUP_PROBE_WINDOW.min(ceiling);
+        buffer.clear();
+        buffer.resize(usize::try_from(window).expect("probe fits usize"), 0);
+        read_exact_at(&self.snapshot, buffer, group_offset)?;
+        match self.parse_group(&mut Cursor::new(buffer.as_slice()), key, vout) {
+            Err(CoreSnapshotIndexError::Io(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && window < ceiling =>
+            {
+                let positioned = SnapshotGroupReader {
+                    file: &self.snapshot,
+                    offset: group_offset,
+                    remaining: ceiling,
+                };
+                let mut reader = BufReader::with_capacity(GROUP_STREAM_BUFFER_BYTES, positioned);
+                self.parse_group(&mut reader, key, vout)
             }
+            result => result,
         }
     }
 
-    /// Decodes a group read from the snapshot and returns the requested coin.
+    /// Decodes one group without retaining scripts of preceding coins.
     fn parse_group(
         &self,
-        bytes: &[u8],
+        mut cursor: &mut impl Read,
         key: &OutPointKey,
         vout: u32,
     ) -> Result<Option<CoreSnapshotCoin>, CoreSnapshotIndexError> {
-        if bytes.len() < 32 {
-            return Err(CoreSnapshotIndexError::Invalid("truncated group header"));
-        }
-        if bytes[..32] != key.as_bytes()[..32] {
+        let mut txid = [0; 32];
+        cursor.read_exact(&mut txid)?;
+        if txid != key.as_bytes()[..32] {
             return Ok(None);
         }
-        let mut cursor = Cursor::new(&bytes[32..]);
         let count = read_compact_size(&mut cursor).map_err(corrupt)?;
         if count == 0 || count > MAX_COINS_PER_TXID {
             return Err(CoreSnapshotIndexError::Invalid(
@@ -1103,6 +1101,29 @@ fn corrupt(error: CoreSnapshotError) -> CoreSnapshotIndexError {
     match error {
         CoreSnapshotError::Io(error) => CoreSnapshotIndexError::Io(error),
         other => CoreSnapshotIndexError::Snapshot(other),
+    }
+}
+
+/// A positioned, length-limited reader: concurrent queries never share a seek
+/// cursor, and damaged group counts cannot read past the authenticated ceiling.
+struct SnapshotGroupReader<'a> {
+    file: &'a File,
+    offset: u64,
+    remaining: u64,
+}
+
+impl Read for SnapshotGroupReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let length = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if length == 0 {
+            return Ok(0);
+        }
+        read_exact_at(self.file, &mut buffer[..length], self.offset)?;
+        self.offset += u64::try_from(length).expect("read length fits u64");
+        self.remaining -= u64::try_from(length).expect("read length fits u64");
+        Ok(length)
     }
 }
 
@@ -1423,6 +1444,64 @@ mod tests {
             panic!("expected a UTXO-set hash mismatch, got {error}");
         };
         identity_with(base_hash, &actual)
+    }
+
+    #[test]
+    fn large_group_lookup_streams_with_bounded_scratch_and_honors_ceiling() {
+        let directory = TempDir::new().unwrap();
+        let txid = [9; 32];
+        let coins = (0..64)
+            .map(|vout| TestCoin {
+                vout,
+                height: 1,
+                coinbase: false,
+                amount: 42,
+                script: TestScript::Raw(vec![0x61; 10_000]),
+            })
+            .collect();
+        let (bytes, expected) = synthetic_snapshot([7; 32], &[(txid, coins)]);
+        let snapshot = directory.path().join("large.dat");
+        fs::write(&snapshot, &bytes).unwrap();
+        let identity = authenticated_identity(&snapshot, [7; 32], directory.path());
+        let index_path = directory.path().join("large.idx");
+        build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
+        let mut index = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
+        let last = OutPoint::new(Txid::from_byte_array(txid), 63);
+        let key = OutPointKey::from(last);
+        let slot = index.mphf.index(&txid).unwrap();
+        let offset = index.read_table_entry(slot).unwrap();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            index
+                .decode_located_coin(&key, last.vout, offset, &mut scratch)
+                .unwrap(),
+            Some(expected[&last].clone())
+        );
+        assert!(scratch.capacity() <= usize::try_from(GROUP_PROBE_WINDOW).unwrap());
+        let missing = OutPoint::new(last.txid, 64);
+        assert_eq!(
+            index.get_many(&[last, missing, last]).unwrap(),
+            vec![
+                Some(expected[&last].clone()),
+                None,
+                Some(expected[&last].clone())
+            ]
+        );
+        // A too-short indexed ceiling must fail, even though the remaining
+        // coin bytes are present in the file and a positioned read could find them.
+        index.max_group_bytes -= 1;
+        assert!(index.get(&last).is_err());
+        // Invalid complete data is rejected directly rather than triggering
+        // progressively larger reads. The count is one byte for this fixture.
+        let mut damaged = bytes;
+        damaged[METADATA_BYTES + 32] = 0;
+        fs::write(&snapshot, damaged).unwrap();
+        assert!(matches!(
+            index.get(&last),
+            Err(CoreSnapshotIndexError::Invalid(
+                "invalid coins-per-txid count"
+            ))
+        ));
     }
 
     #[test]
