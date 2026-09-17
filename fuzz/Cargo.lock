@@ -877,6 +877,7 @@ dependencies = [
  "fs2",
  "mimalloc",
  "rand 0.10.2",
+ "rbtc-codec-memory",
  "redb",
  "serde",
  "serde_json",
@@ -887,6 +888,13 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "zstd",
+]
+
+[[package]]
+name = "rbtc-codec-memory"
+version = "0.1.0"
+dependencies = [
+ "zstd-sys",
 ]
 
 [[package]]
