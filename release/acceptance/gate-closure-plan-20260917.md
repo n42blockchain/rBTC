@@ -34,6 +34,8 @@ not change acceptance statuses or weaken thresholds.
    tracked separately from supported default redb release behavior.
    [Redb journal materialization](journal-materialization-memory-20260917.md) now
    applies one decoded shard at a time; this is not the failed MDBX RSS rerun.
+   [MDBX owned-batch consumption](mdbx-consumed-batches-20260917.md) is being
+   measured against the unchanged reduced maintenance workload.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact
    source identity after production changes stop.

@@ -41,7 +41,7 @@ const MAINTENANCE_STATE_FILE: &str = ".rbtc-mdbx-maintenance.json";
 const MAINTENANCE_STATE_SCHEMA: u32 = 1;
 const FORMAT_VERSION: u32 = 2;
 const UNDO_FORMAT_VERSION: u32 = 1;
-/// The IBD checkpoint size whose net UTXO effect is folded into one write.
+/// Maximum blocks published by one atomic IBD checkpoint.
 pub const MAX_ATOMIC_IBD_BATCH_BLOCKS: usize = 256;
 type FoldedBatchChanges<'a> = (Vec<OutPointKey>, Vec<(OutPointKey, &'a Utxo)>);
 /// Three years at Bitcoin's target ten-minute spacing.
@@ -1068,6 +1068,69 @@ impl MdbxUtxoStore {
         ))
     }
 
+    fn commit_transition_iter<T: std::borrow::Borrow<ConnectTransition>>(
+        &self,
+        transitions: impl ExactSizeIterator<Item = T>,
+        final_height: u32,
+    ) -> Result<(), ChainStoreError> {
+        if transitions.len() == 0 {
+            return Ok(());
+        }
+        if transitions.len() > MAX_ATOMIC_IBD_BATCH_BLOCKS {
+            return Err(UtxoError::Malformed("MDBX IBD batch exceeds 256 blocks").into());
+        }
+        let _guard = self.lock();
+        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
+        let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
+        let cold = transaction
+            .open_table(Some(COLD))
+            .map_err(UtxoError::from)?;
+        let undo = transaction
+            .open_table(Some(UNDO))
+            .map_err(UtxoError::from)?;
+        let meta = transaction
+            .open_table(Some(META))
+            .map_err(UtxoError::from)?;
+        let mut current = Self::read_tip(&transaction, &meta)?
+            .ok_or(UtxoError::Malformed("MDBX execution tip is uninitialized"))?;
+        for owned in transitions {
+            let transition = owned.borrow();
+            Self::validate_tip_advance(current, transition.expected_parent, transition.next)?;
+            let (spent, created) = Self::fold_batch_changes(std::slice::from_ref(transition))?;
+            Self::apply_net_changes::<false>(
+                &transaction,
+                &hot,
+                &cold,
+                &meta,
+                &spent,
+                &created,
+                final_height,
+                DEFAULT_HOT_WINDOW_BLOCKS,
+            )?;
+            drop((spent, created));
+            let hash = transition.next.hash.to_byte_array();
+            if transaction
+                .get::<()>(&undo, &hash)
+                .map_err(UtxoError::from)?
+                .is_some()
+            {
+                return Err(UtxoError::Malformed("duplicate MDBX block undo").into());
+            }
+            Self::register_undo_creation_mtps(&transaction, &meta, &transition.transaction_undos)?;
+            let encoded = encode_mdbx_block_undo(&transition.transaction_undos)?;
+            transaction
+                .put(&undo, hash, encoded, WriteFlags::empty())
+                .map_err(UtxoError::from)?;
+            current = transition.next;
+            // An owned iterator drops this transition and its undo here, before
+            // building the next block's temporary index. The transaction is
+            // still unpublished until the final tip and commit below.
+        }
+        Self::write_tip(&transaction, &meta, current)?;
+        transaction.commit().map_err(UtxoError::from)?;
+        Ok(())
+    }
+
     fn fold_batch_changes(
         transitions: &[ConnectTransition],
     ) -> Result<FoldedBatchChanges<'_>, UtxoError> {
@@ -1858,61 +1921,22 @@ impl ExecutionChainStore for MdbxUtxoStore {
         &self,
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError> {
-        if transitions.is_empty() {
-            return Ok(());
-        }
-        if transitions.len() > MAX_ATOMIC_IBD_BATCH_BLOCKS {
-            return Err(UtxoError::Malformed("MDBX IBD batch exceeds 256 blocks").into());
-        }
-        let (spent, created) = Self::fold_batch_changes(transitions)?;
-        let _guard = self.lock();
-        let transaction = self.db().begin_rw_txn().map_err(UtxoError::from)?;
-        let hot = transaction.open_table(Some(HOT)).map_err(UtxoError::from)?;
-        let cold = transaction
-            .open_table(Some(COLD))
-            .map_err(UtxoError::from)?;
-        let undo = transaction
-            .open_table(Some(UNDO))
-            .map_err(UtxoError::from)?;
-        let meta = transaction
-            .open_table(Some(META))
-            .map_err(UtxoError::from)?;
-        let mut current = Self::read_tip(&transaction, &meta)?
-            .ok_or(UtxoError::Malformed("MDBX execution tip is uninitialized"))?;
-        for transition in transitions {
-            Self::validate_tip_advance(current, transition.expected_parent, transition.next)?;
-            current = transition.next;
-        }
-        Self::apply_net_changes::<false>(
-            &transaction,
-            &hot,
-            &cold,
-            &meta,
-            &spent,
-            &created,
-            current.height,
-            DEFAULT_HOT_WINDOW_BLOCKS,
-        )?;
-        // The net-change index is no longer needed while encoding durable undo.
-        drop((spent, created));
-        for transition in transitions {
-            let hash = transition.next.hash.to_byte_array();
-            if transaction
-                .get::<()>(&undo, &hash)
-                .map_err(UtxoError::from)?
-                .is_some()
-            {
-                return Err(UtxoError::Malformed("duplicate MDBX block undo").into());
-            }
-            Self::register_undo_creation_mtps(&transaction, &meta, &transition.transaction_undos)?;
-            let encoded = encode_mdbx_block_undo(&transition.transaction_undos)?;
-            transaction
-                .put(&undo, hash, encoded, WriteFlags::empty())
-                .map_err(UtxoError::from)?;
-        }
-        Self::write_tip(&transaction, &meta, current)?;
-        transaction.commit().map_err(UtxoError::from)?;
-        Ok(())
+        self.commit_transition_iter(
+            transitions.iter(),
+            transitions
+                .last()
+                .map_or(0, |transition| transition.next.height),
+        )
+    }
+
+    fn commit_connect_batch_owned(
+        &self,
+        transitions: Vec<ConnectTransition>,
+    ) -> Result<(), ChainStoreError> {
+        let final_height = transitions
+            .last()
+            .map_or(0, |transition| transition.next.height);
+        self.commit_transition_iter(transitions.into_iter(), final_height)
     }
 
     fn commit_disconnect(
@@ -2259,7 +2283,9 @@ mod tests {
                 transaction_undos: vec![UtxoUndo::new(vec![(key(2), coin(1))], vec![key(4)])],
             },
         ];
-        batch.commit_connect_batch(&transitions).unwrap();
+        batch
+            .commit_connect_batch_owned(transitions.to_vec())
+            .unwrap();
         for transition in &transitions {
             let undo = sequential
                 .commit_connect(
