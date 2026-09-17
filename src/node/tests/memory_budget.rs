@@ -172,7 +172,7 @@ fn staged_prefix_validation_is_ordered_bounded_and_never_publishes() {
 #[test]
 fn archive_admission_failure_reaches_the_node_as_a_local_resource_error() {
     let directory = tempfile::tempdir().unwrap();
-    let memory = crate::node_memory::MemoryBudget::new(1024);
+    let memory = crate::node_memory::MemoryBudget::new(128 * 1024);
     memory.bind(&[directory.path().to_path_buf()]).unwrap();
     let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
     let pressure = memory.reserve_spool(memory.spool_snapshot().limit).unwrap();

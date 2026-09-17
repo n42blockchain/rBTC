@@ -15,6 +15,7 @@ const MAGIC: &[u8; 8] = b"RBTCBLK1";
 const FORMAT_VERSION: u16 = 2;
 const LEGACY_FORMAT_VERSION: u16 = 1;
 const PIECE_SIZE: usize = 4 * 1024 * 1024;
+const PIECE_SCRATCH_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_BYTES: usize = 4_000_000;
 const MAX_BLOCKS_PER_ARCHIVE: u32 = 100_000;
@@ -147,21 +148,10 @@ fn finish_archive_file(
     mut compressed: File,
 ) -> Result<ArchiveManifest, ArchiveError> {
     compressed.seek(SeekFrom::Start(0))?;
-    let mut piece = vec![0_u8; PIECE_SIZE];
+    let mut scratch = PieceScratch::new(path)?;
     let mut piece_sha256 = Vec::new();
-    loop {
-        let mut filled = 0;
-        while filled < piece.len() {
-            let read = compressed.read(&mut piece[filled..])?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        if filled == 0 {
-            break;
-        }
-        piece_sha256.push(hash_hex(&piece[..filled]));
+    while let Some(hash) = scratch.next_hash(&mut compressed)? {
+        piece_sha256.push(hash);
     }
     let manifest = ArchiveManifest {
         format_version: FORMAT_VERSION,
@@ -438,6 +428,7 @@ fn scan_archive_selection(
     max_record_bytes: u64,
     mut visit: Option<ArchiveVisitor<'_>>,
 ) -> Result<(ArchiveManifest, Vec<Vec<u8>>, bool), ArchiveError> {
+    let path = path.as_ref();
     let mut file = File::open(path)?;
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
@@ -446,7 +437,7 @@ fn scan_archive_selection(
     if expected.is_some_and(|expected| expected != &manifest) {
         return Err(ArchiveError::Invalid("archive identity changed"));
     }
-    verify_compressed_pieces_from(&mut file, payload_offset, &manifest)?;
+    verify_compressed_pieces_from(path, &mut file, payload_offset, &manifest)?;
     file.seek(SeekFrom::Start(payload_offset))?;
     let mut decoder = zstd::stream::Decoder::new(file)?;
     decoder.window_log_max(zstd_window_log(records_limit))?;
@@ -574,12 +565,13 @@ pub fn decode_archive(file: &[u8]) -> Result<(ArchiveManifest, Vec<Vec<u8>>), Ar
 /// ledger slot. Full reads still validate the decompressed length, digest, and
 /// individual block framing.
 pub(crate) fn verify_archive(path: impl AsRef<Path>) -> Result<ArchiveManifest, ArchiveError> {
+    let path = path.as_ref();
     let mut file = File::open(path)?;
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
     }
     let (manifest, _, payload_offset) = read_manifest_header_from(&mut file)?;
-    verify_compressed_pieces_from(&mut file, payload_offset, &manifest)?;
+    verify_compressed_pieces_from(path, &mut file, payload_offset, &manifest)?;
     Ok(manifest)
 }
 
@@ -716,36 +708,66 @@ fn read_manifest_header_from(file: &mut File) -> Result<(ArchiveManifest, u64, u
     Ok((manifest, records_limit, payload_offset))
 }
 
+// Keep the reservation after the owned buffer so drop releases memory first.
+// Returned digest strings and manifests require separate ownership accounting.
+struct PieceScratch {
+    bytes: Box<[u8]>,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+
+impl PieceScratch {
+    fn new(path: &Path) -> Result<Self, ArchiveError> {
+        let reservation = crate::node_memory::for_path(path)?
+            .map(|budget| {
+                budget
+                    .reserve(PIECE_SCRATCH_BYTES as u64)
+                    .map_err(ArchiveError::ResourceBudget)
+            })
+            .transpose()?;
+        Ok(Self {
+            bytes: vec![0; PIECE_SCRATCH_BYTES].into_boxed_slice(),
+            _reservation: reservation,
+        })
+    }
+
+    fn next_hash(&mut self, reader: &mut impl Read) -> Result<Option<String>, ArchiveError> {
+        let mut digest = Sha256::new();
+        let mut filled = 0;
+        while filled < PIECE_SIZE {
+            let take = self.bytes.len().min(PIECE_SIZE - filled);
+            let read = match reader.read(&mut self.bytes[..take]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                break;
+            }
+            digest.update(&self.bytes[..read]);
+            filled += read;
+        }
+        Ok((filled != 0).then(|| crate::utxo::hex_lower(&digest.finalize())))
+    }
+}
+
 fn verify_compressed_pieces(
     path: &Path,
     payload_offset: u64,
     manifest: &ArchiveManifest,
 ) -> Result<(), ArchiveError> {
     let mut file = File::open(path)?;
-    verify_compressed_pieces_from(&mut file, payload_offset, manifest)
+    verify_compressed_pieces_from(path, &mut file, payload_offset, manifest)
 }
 
 fn verify_compressed_pieces_from(
+    path: &Path,
     file: &mut File,
     payload_offset: u64,
     manifest: &ArchiveManifest,
 ) -> Result<(), ArchiveError> {
     file.seek(SeekFrom::Start(payload_offset))?;
-    let mut piece = vec![0_u8; PIECE_SIZE];
+    let mut scratch = PieceScratch::new(path)?;
     let mut piece_index = 0_usize;
-    loop {
-        let mut filled = 0_usize;
-        while filled < piece.len() {
-            let read = file.read(&mut piece[filled..])?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        if filled == 0 {
-            break;
-        }
-        let actual = hash_hex(&piece[..filled]);
+    while let Some(actual) = scratch.next_hash(file)? {
         if manifest.piece_sha256.get(piece_index) != Some(&actual) {
             return Err(ArchiveError::Invalid("piece checksum"));
         }
@@ -987,6 +1009,62 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn piece_scratch_admission_lifetime_and_short_reads() {
+        struct ShortReads(Cursor<Vec<u8>>, bool);
+        impl Read for ShortReads {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.1 {
+                    self.1 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = buffer.len().min(997);
+                self.0.read(&mut buffer[..count])
+            }
+        }
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scratch.rblk");
+        let manifest = write_archive(&path, 10, &[vec![3; 128]]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(PIECE_SCRATCH_BYTES as u64);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let occupied = budget.reserve(1).unwrap();
+        assert!(matches!(
+            verify_archive(&path),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert!(matches!(
+            write_archive(&path, 11, &[vec![4]]),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        drop(occupied);
+        let mut scratch = PieceScratch::new(&path).unwrap();
+        assert_eq!(budget.snapshot().used, PIECE_SCRATCH_BYTES as u64);
+        assert!(matches!(
+            PieceScratch::new(&path),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        let data = vec![17; PIECE_SIZE + 13];
+        let mut input = ShortReads(Cursor::new(data.clone()), false);
+        assert_eq!(
+            scratch.next_hash(&mut input).unwrap(),
+            Some(hash_hex(&data[..PIECE_SIZE]))
+        );
+        assert_eq!(
+            scratch.next_hash(&mut input).unwrap(),
+            Some(hash_hex(&data[PIECE_SIZE..]))
+        );
+        assert_eq!(scratch.next_hash(&mut input).unwrap(), None);
+        drop(scratch);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(verify_archive(&path).unwrap(), manifest);
+        assert_eq!(write_archive(&path, 10, &[vec![3; 128]]).unwrap(), manifest);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
     fn streamed_prefix_matches_encoding_and_rejects_corrupt_source_before_output() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source.rblk");
@@ -1037,7 +1115,7 @@ mod tests {
         assert_eq!(write_archive(&path, 20, &blocks).unwrap(), expected);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(verify_archive(&path).unwrap(), expected);
-        let budget = crate::node_memory::MemoryBudget::new(1024);
+        let budget = crate::node_memory::MemoryBudget::new(128 * 1024);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let occupied = budget
             .reserve_spool(budget.spool_snapshot().limit - MAX_CONTAINER_BYTES + 1)
