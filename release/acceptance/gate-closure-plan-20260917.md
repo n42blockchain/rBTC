@@ -23,6 +23,8 @@ not change acceptance statuses or weaken thresholds.
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared
    ledger are not sufficient evidence of closure.
+   [Runtime ownership](admission-runtime-budget-20260917.md) now preserves the
+   ledger across session retries and shares it with background validation.
 3. Storage maintenance: repair the measured approximately 3.2–3.4 RSS ratio
    failure during maintenance; bound transitions, folded changes, undo and dirty
    pages together, then rerun the failed workload and required scale acceptance.

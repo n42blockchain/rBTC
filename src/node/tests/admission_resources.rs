@@ -247,3 +247,40 @@ async fn peer_resource_deferral_preserves_queue_before_and_after_draining() {
     done.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[test]
+fn reconstructed_runtime_pools_preserve_work_and_outstanding_memory_leases() {
+    use crate::admission_resources::AdmissionStage;
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: 1,
+        work_per_second: 0,
+        candidate_bytes: 64,
+    });
+    let resources = NodeResourceConfig::default();
+    let first = runtime_transaction_pool(&resources, &budget);
+    let previous = first.lock().unwrap().admission_budget();
+    previous.charge(AdmissionStage::Payload, 1).unwrap();
+    let outstanding = previous.reserve_candidate(40).unwrap();
+    drop(first);
+    drop(previous);
+    // Session teardown must neither refill work nor free allocations that
+    // escaped into still-live work from the previous session.
+    let second = runtime_transaction_pool(&resources, &budget);
+    let resumed = second.lock().unwrap().admission_budget();
+    assert!(resumed.charge(AdmissionStage::Payload, 1).is_err());
+    assert!(resumed.reserve_candidate(25).is_err());
+    drop(outstanding);
+    let whole = resumed.reserve_candidate(64).unwrap();
+    // A concurrent background pipeline cannot obtain a second allowance.
+    let background = runtime_transaction_pool(&resources, &budget);
+    assert!(
+        background
+            .lock()
+            .unwrap()
+            .admission_budget()
+            .reserve_candidate(1)
+            .is_err()
+    );
+    drop(whole);
+    assert_eq!(budget.snapshot().candidate_bytes, 0);
+}

@@ -186,10 +186,27 @@ fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
 }
 
 /// Pins one aggregate allowance across active and background header stores.
-/// Every spawned pipeline retains a clone, including on caller cancellation.
+/// Each pipeline pins its own directory owner while sharing aggregate usage.
 #[derive(Clone)]
 pub(crate) struct HeaderBudgetGroup {
-    _budgets: Vec<Arc<Budget>>,
+    budgets: Vec<Arc<Budget>>,
+}
+impl HeaderBudgetGroup {
+    /// Separate owner lifetimes so completed validation can be removed while
+    /// the active pipeline continues to retain the aggregate ledger.
+    pub(crate) fn into_pipelines(self, active: &Path) -> io::Result<(Self, Self)> {
+        let active = active.canonicalize()?;
+        let (active, validation) = self
+            .budgets
+            .into_iter()
+            .partition(|budget| budget.directory.as_ref() == Some(&active));
+        Ok((
+            Self { budgets: active },
+            Self {
+                budgets: validation,
+            },
+        ))
+    }
 }
 pub(crate) fn bind_background(active: &Path, validation: &Path) -> io::Result<HeaderBudgetGroup> {
     bind_with_limits(active, validation, CACHE_LIMIT, FILE_LIMIT)
@@ -249,7 +266,7 @@ fn bind_with_limits(
         registry.insert(root, Arc::downgrade(&budget));
         budgets.push(budget);
     }
-    Ok(HeaderBudgetGroup { _budgets: budgets })
+    Ok(HeaderBudgetGroup { budgets })
 }
 
 #[derive(Debug)]
@@ -607,6 +624,30 @@ mod tests {
             Backend::open(&root.path().join("next"), false, 8, Arc::clone(&pool)).unwrap();
         assert_eq!(pool.usage.lock().unwrap().files, 0);
         drop(recovered);
+    }
+    #[test]
+    fn completed_pipeline_releases_only_its_directory_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("active");
+        let validation = root.path().join("validation");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::create_dir_all(&validation).unwrap();
+        let group = bind_with_limits(&active, &validation, 16, 100).unwrap();
+        let (active_owner, validation_owner) = group.into_pipelines(&active).unwrap();
+        let left = shared(&active).unwrap();
+        let right = shared(&validation).unwrap();
+        assert!(Arc::ptr_eq(&left.usage, &right.usage));
+        drop(left);
+        drop(right);
+        assert!(inventory::lock(&validation).is_err());
+        drop(validation_owner);
+        drop(inventory::lock(&validation).unwrap());
+        assert!(inventory::lock(&active).is_err());
+        let quarantine = root.path().join("completed");
+        std::fs::rename(&validation, &quarantine).unwrap();
+        std::fs::remove_dir_all(quarantine).unwrap();
+        drop(active_owner);
+        assert!(inventory::lock(&active).is_ok());
     }
     #[test]
     fn background_directories_share_one_allowance_and_keep_separate_catalogs() {

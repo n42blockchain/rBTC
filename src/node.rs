@@ -8589,6 +8589,23 @@ async fn run_peer_pool(
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
 ) -> Result<(), String> {
+    run_peer_pool_with_budget(
+        options,
+        local_nonce,
+        background_validation,
+        validation_scheduler,
+        crate::admission_resources::AdmissionBudget::default(),
+    )
+    .await
+}
+
+async fn run_peer_pool_with_budget(
+    options: &Options,
+    local_nonce: u64,
+    background_validation: Option<&BackgroundValidationStatus>,
+    validation_scheduler: Option<&BackgroundValidationStatus>,
+    admission_budget: crate::admission_resources::AdmissionBudget,
+) -> Result<(), String> {
     let mut retry_attempt = 0_u32;
     loop {
         match run_peer_pool_session(
@@ -8596,6 +8613,7 @@ async fn run_peer_pool(
             local_nonce,
             background_validation,
             validation_scheduler,
+            &admission_budget,
         )
         .await
         {
@@ -8620,12 +8638,26 @@ async fn run_peer_pool(
     }
 }
 
+fn runtime_transaction_pool(
+    resources: &NodeResourceConfig,
+    budget: &crate::admission_resources::AdmissionBudget,
+) -> Arc<Mutex<TransactionAdmissionPool>> {
+    Arc::new(Mutex::new(
+        TransactionAdmissionPool::with_capacity(
+            resources.mempool_max_transactions,
+            resources.mempool_max_bytes,
+        )
+        .with_admission_budget(budget.clone()),
+    ))
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_peer_pool_session(
     options: &Options,
     local_nonce: u64,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
+    admission_budget: &crate::admission_resources::AdmissionBudget,
 ) -> Result<(), String> {
     let network_time = Arc::new(NetworkTime::default());
     let api_runtime = prepare_api_runtime(options)?;
@@ -8640,10 +8672,7 @@ async fn run_peer_pool_session(
     let zmq_notifier = zmq_publisher
         .as_ref()
         .map(|publisher| ZmqNotifier::new(publisher.handle()));
-    let transaction_pool = Arc::new(Mutex::new(TransactionAdmissionPool::with_capacity(
-        options.resources.mempool_max_transactions,
-        options.resources.mempool_max_bytes,
-    )));
+    let transaction_pool = runtime_transaction_pool(&options.resources, admission_budget);
     let mempool_pool = Arc::clone(&transaction_pool);
     let mempool_relay_source = MempoolRelaySource::new(move || {
         mempool_pool
@@ -9007,6 +9036,7 @@ async fn run_peer_pool_session(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_background_assumeutxo(
     options: Options,
     validation_dir: PathBuf,
@@ -9018,6 +9048,9 @@ async fn run_background_assumeutxo(
         .expect("background validation parser requires active data directory");
     let header_budget = crate::header_storage_budget::bind_background(active_dir, &validation_dir)
         .map_err(|error| format!("background header resource admission: {error}"))?;
+    let (active_headers, validation_headers) = header_budget
+        .into_pipelines(active_dir)
+        .map_err(|error| error.to_string())?;
     let active = RedbChainStore::open(active_dir.join("chainstate.redb"), options.network)
         .map_err(|error| error.to_string())?;
     let assumed = active
@@ -9062,14 +9095,16 @@ async fn run_background_assumeutxo(
         assumed.base.height,
         assumed.base.hash
     );
-    let validation_headers = header_budget.clone();
+    let admission_budget = crate::admission_resources::AdmissionBudget::default();
+    let validation_admission = admission_budget.clone();
     let validation_status = status.clone();
     let validation = tokio::spawn(async move {
-        let result = run_peer_pool(
+        let result = run_peer_pool_with_budget(
             &validation_options,
             local_nonce,
             None,
             Some(&validation_status),
+            validation_admission,
         )
         .await;
         drop(validation_headers);
@@ -9083,9 +9118,15 @@ async fn run_background_assumeutxo(
     });
     let finalize_options = active_options.clone();
     let active_status = status;
-    let active_headers = header_budget.clone();
     let active = tokio::spawn(async move {
-        let result = run_peer_pool(&active_options, local_nonce, Some(&active_status), None).await;
+        let result = run_peer_pool_with_budget(
+            &active_options,
+            local_nonce,
+            Some(&active_status),
+            None,
+            admission_budget,
+        )
+        .await;
         drop(active_headers);
         result
     });
@@ -21102,7 +21143,14 @@ mod tests {
             port: 18_444,
         }]);
         let session = tokio::spawn(async move {
-            let _ = run_peer_pool_session(&options, 1, None, None).await;
+            let _ = run_peer_pool_session(
+                &options,
+                1,
+                None,
+                None,
+                &crate::admission_resources::AdmissionBudget::default(),
+            )
+            .await;
         });
 
         timeout(Duration::from_secs(5), was_dialed)
@@ -21144,7 +21192,14 @@ mod tests {
             port: 18_444,
         }]);
         let session = tokio::spawn(async move {
-            let _ = run_peer_pool_session(&options, 1, None, None).await;
+            let _ = run_peer_pool_session(
+                &options,
+                1,
+                None,
+                None,
+                &crate::admission_resources::AdmissionBudget::default(),
+            )
+            .await;
         });
 
         timeout(Duration::from_secs(5), was_submitted)
@@ -21177,9 +21232,15 @@ mod tests {
         }]);
 
         let before = dns_lookups_started();
-        let error = run_peer_pool_session(&options, 909, None, None)
-            .await
-            .expect_err("a dead name proxy exhausts the wave");
+        let error = run_peer_pool_session(
+            &options,
+            909,
+            None,
+            None,
+            &crate::admission_resources::AdmissionBudget::default(),
+        )
+        .await
+        .expect_err("a dead name proxy exhausts the wave");
         assert!(
             error.starts_with(PEER_CANDIDATE_EXHAUSTED_PREFIX),
             "{error}"
