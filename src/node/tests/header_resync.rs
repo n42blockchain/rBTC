@@ -796,3 +796,191 @@ async fn header_resync_resource_probe() {
         })
     );
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
+    use crate::node::header_sync::{HeaderSyncPolicy, candidate_path, sync_headers_with_policy};
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let mut dag = HeaderDag::new(Network::Regtest);
+    let genesis = dag.active_tip();
+    let mut parent = genesis.header;
+    let mut active = Vec::new();
+    for _ in 0..2001 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+        active.push(parent);
+    }
+    parent = genesis.header;
+    let mut fork = Vec::new();
+    for _ in 0..2002 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+        fork.push(parent);
+    }
+    let _ = dag
+        .stage_batch_contextual(&active, u32::MAX)
+        .unwrap()
+        .commit();
+    let _ = dag
+        .stage_batch_contextual(&fork[..1], u32::MAX)
+        .unwrap()
+        .commit();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.append_batch(&active).unwrap();
+    store.append_batch(&fork[..1]).unwrap();
+    drop(store);
+    let original = dag.active_tip();
+    let cursor = fork[1999].block_hash();
+    let winner = fork[2001].block_hash();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let prefix = fork[..2000].to_vec();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9711)).await;
+        peer.read_message().await.unwrap();
+        peer.write_message(NetworkMessage::Headers(prefix))
+            .await
+            .unwrap();
+        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected continuation");
+        };
+        assert_eq!(request.locator_hashes[0], cursor);
+        // Disconnect with a complete, losing prefix persisted only on disk.
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9710,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let policy = HeaderSyncPolicy {
+        spill_side_headers: 0,
+        promotion_bytes: 1,
+    };
+    assert!(
+        sync_headers_with_policy(
+            &mut peer,
+            &deployments,
+            path.clone(),
+            &NetworkTime::default(),
+            Some(dag),
+            policy
+        )
+        .await
+        .is_err()
+    );
+    server.await.unwrap();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2002);
+    let mut restored = store.load_dag(Network::Regtest, u32::MAX).unwrap();
+    drop(store);
+    assert_eq!(restored.active_tip(), original);
+    // The candidate is anchored on a retained side header. Idle eviction must
+    // not remove it even when the execution tip matches the active tip.
+    assert_eq!(
+        retain_idle_headers(&mut restored, &path, original.hash, 0, 1).unwrap(),
+        0
+    );
+    assert!(restored.get(&fork[0].block_hash()).is_some());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let suffix = fork[2000..].to_vec();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9721)).await;
+        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected disk cursor");
+        };
+        assert_eq!(request.locator_hashes[0], cursor);
+        peer.write_message(NetworkMessage::Headers(suffix))
+            .await
+            .unwrap();
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9720,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let error = match sync_headers_with_policy(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        Some(restored),
+        policy,
+    )
+    .await
+    {
+        Ok(_) => panic!("promotion byte allowance must defer"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind, PeerFailureKind::LocalResource);
+    server.await.unwrap();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2002);
+    assert_eq!(
+        store
+            .load_dag(Network::Regtest, u32::MAX)
+            .unwrap()
+            .active_tip(),
+        original
+    );
+    drop(store);
+    assert!(candidate_path(&path).exists());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9731)).await;
+        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected winning tip");
+        };
+        assert_eq!(request.locator_hashes[0], winner);
+        peer.write_message(NetworkMessage::Headers(Vec::new()))
+            .await
+            .unwrap();
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9730,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let result = sync_headers_with_policy(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        None,
+        HeaderSyncPolicy {
+            spill_side_headers: 0,
+            promotion_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(result.active_tip().hash, winner);
+    assert!(!candidate_path(&path).exists());
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 4003);
+    assert_eq!(
+        store
+            .load_dag(Network::Regtest, u32::MAX)
+            .unwrap()
+            .active_tip(),
+        result.active_tip()
+    );
+}

@@ -43,6 +43,9 @@ thread_local! {
 /// Failures from header persistence and replay.
 #[derive(Debug, Error)]
 pub enum HeaderStoreError {
+    /// Disk candidate validation or local resource deferral.
+    #[error("header candidate: {0}")]
+    Candidate(#[from] crate::header_candidate::HeaderCandidateError),
     /// Database open/create failed.
     #[error("redb database: {0}")]
     Database(#[from] redb::DatabaseError),
@@ -90,6 +93,8 @@ pub struct RedbHeaderStore {
     db: Database,
     write_guard: Mutex<()>,
 }
+
+mod candidate;
 
 impl RedbHeaderStore {
     /// Opens or creates a header database at `path`.

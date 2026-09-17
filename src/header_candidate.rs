@@ -78,6 +78,26 @@ pub struct DiskHeaderCandidate {
 }
 
 impl DiskHeaderCandidate {
+    /// Reads an untrusted anchor hint without loading candidate history.
+    /// The caller must resolve it in a validated DAG and replay the journal.
+    pub fn stored_anchor(
+        path: impl AsRef<Path>,
+    ) -> Result<Option<BlockHash>, HeaderCandidateError> {
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut prefix = [0; PREFIX_LEN];
+        file.read_exact(&mut prefix)?;
+        if &prefix[..8] != MAGIC {
+            return Err(HeaderCandidateError::Malformed("journal identity"));
+        }
+        Ok(Some(BlockHash::from_byte_array(
+            prefix[8..40].try_into().expect("fixed hash width"),
+        )))
+    }
+
     /// Opens/creates a candidate and streams contextual revalidation from its
     /// pinned anchor. The supplied work allowance also bounds startup replay.
     /// Work deferral leaves the existing journal, including any tail, untouched.

@@ -1,6 +1,8 @@
 //! Embeddable node runtime and command-line adapter.
 
 mod config_file;
+mod header_sync;
+use header_sync::sync_headers;
 
 use crate::i2p_sam::{I2pAddress, I2pSamSession};
 use crate::seed_name::{SeedName, SeedNameError, seed_name_wave};
@@ -10118,7 +10120,7 @@ async fn maintain_standby(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn maintain_standby_with_time(
     mut connected: ConnectedPeer,
     mut activate: tokio::sync::oneshot::Receiver<()>,
@@ -10174,16 +10176,31 @@ async fn maintain_standby_with_time(
                     .map_err(|error| PeerRunError::p2p(&error))?;
                 ping_nonce = ping_nonce.wrapping_add(1);
                 if let Some(dag) = header_dag.as_mut() {
-                    request_headers(&mut connected.session, dag.block_locator()).await?;
+                    let locator = {
+                        let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+                        lease
+                            .budget
+                            .consume(2 * dag.retained_header_count() as u64 + 128)
+                            .map_err(|error| PeerRunError::local(error.to_string()))?;
+                        dag.block_locator()
+                    };
+                    request_headers(&mut connected.session, locator).await?;
                     let headers = receive_headers(&mut connected.session).await?;
+                    let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+                    lease
+                        .budget
+                        .consume(4 * headers.len() as u64)
+                        .map_err(|error| PeerRunError::local(error.to_string()))?;
                     let unseen = unseen_header_suffix(dag, &headers)
                         .map_err(|error| PeerRunError::header(&error))?;
                     if !unseen.is_empty() {
                         let staged = dag
-                            .stage_batch_contextual(
+                            .stage_batch_contextual_with_budget(
                                 unseen,
                                 network_time
                                     .adjusted_time(unix_time().map_err(PeerRunError::transient)?),
+                                crate::headers::HeaderBatchLimits::default(),
+                                &mut lease.budget,
                             )
                             .map_err(|error| PeerRunError::header(&error))?;
                         let _ = staged.commit();
@@ -11475,6 +11492,10 @@ fn stage_submitted_blocks(
     if !prefetched_blocks.serialized.is_empty() {
         return Ok(());
     }
+    // Reservation failure leaves queued bodies and reply channels intact.
+    let Ok(mut header_work) = header_sync::try_header_work() else {
+        return Ok(());
+    };
     let submitted = pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11490,7 +11511,12 @@ fn stage_submitted_blocks(
     let mut staged_any = false;
     for PendingBlock { block, verdict } in submitted {
         let hash = block.block_hash();
-        let staged = match headers.stage_batch_contextual(&[block.header], adjusted) {
+        let staged = match headers.stage_batch_contextual_with_budget(
+            &[block.header],
+            adjusted,
+            crate::headers::HeaderBatchLimits::default(),
+            &mut header_work.budget,
+        ) {
             Ok(staged) => staged,
             Err(error) => {
                 rbtc_warn!("rejected submitted block {hash}: {error}");
@@ -11545,6 +11571,14 @@ fn retain_idle_headers(
     if execution_tip != headers.active_tip().hash {
         return Ok(0);
     }
+    // An unfinished disk candidate depends on its retained anchor's ancestry.
+    // Until selection can pin individual disk anchors, preserve that context.
+    if header_sync::candidate_path(path)
+        .try_exists()
+        .map_err(|e| PeerRunError::local(e.to_string()))?
+    {
+        return Ok(0);
+    }
     let hashes = headers.side_chain_eviction_plan(target, max_removals);
     if hashes.is_empty() {
         return Ok(0);
@@ -11590,103 +11624,6 @@ fn resume_header_dag(
             )
             .map_err(|error| PeerRunError::transient(error.to_string()))
     }
-}
-
-async fn sync_headers(
-    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
-    deployments: &DeploymentConfig,
-    path: PathBuf,
-    network_time: &NetworkTime,
-    existing: Option<HeaderDag>,
-) -> Result<HeaderDag, PeerRunError> {
-    let store =
-        RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
-    let mut dag = resume_header_dag(&store, deployments, existing)?;
-    let time = network_time.snapshot();
-    rbtc_info!(
-        "resuming headers-first sync from {}:{} (network_time_samples={} offset_seconds={} usable={})",
-        dag.active_tip().height,
-        dag.active_tip().hash,
-        time.samples,
-        time.offset_seconds,
-        time.usable
-    );
-
-    // This is only a locator hint: replay above has validated its ancestry.
-    // A missing/stale hint must never override work-based chain selection.
-    let mut recovery_tip = store
-        .recovery_tip()
-        .map_err(|error| PeerRunError::local(error.to_string()))?
-        .filter(|hash| dag.get(hash).is_some())
-        .unwrap_or(dag.active_tip().hash);
-    // A different peer may first return a lower known prefix of another fork.
-    // Permit that first switch even when resuming a saved cursor.
-    let mut recovering = false;
-    loop {
-        let locator = dag.block_locator_from(recovery_tip).ok_or_else(|| {
-            PeerRunError::local("header recovery cursor lost its retained ancestry")
-        })?;
-        request_headers(session, locator).await?;
-        let headers = receive_headers(session).await?;
-        let response_count = headers.len();
-        if response_count == 0 {
-            break;
-        }
-        let unseen =
-            unseen_header_suffix(&dag, &headers).map_err(|error| PeerRunError::header(&error))?;
-        // A full known prefix may still precede an unknown stronger suffix.
-        // Advance on the peer's validated branch, even while it loses work.
-        let response_tip = headers
-            .last()
-            .expect("nonempty header response")
-            .block_hash();
-        if unseen.is_empty() {
-            if response_count < MAX_HEADERS_PER_RESPONSE
-                || response_tip == recovery_tip
-                || (recovering
-                    && dag.get(&response_tip).map(|info| info.height)
-                        <= dag.get(&recovery_tip).map(|info| info.height))
-            {
-                break;
-            }
-            store
-                .append_recovery_batch(&[], response_tip)
-                .map_err(|error| PeerRunError::local(error.to_string()))?;
-            recovery_tip = response_tip;
-            recovering = true;
-            continue;
-        }
-        let staged = dag
-            .stage_batch_contextual(
-                unseen,
-                network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?),
-            )
-            .map_err(|error| PeerRunError::header(&error))?;
-        store
-            .append_recovery_batch(unseen, response_tip)
-            .map_err(|error| PeerRunError::transient(error.to_string()))?;
-        let _ = staged.commit();
-        recovery_tip = response_tip;
-        recovering = true;
-        rbtc_info!(
-            "validated and persisted {} headers; active tip {}:{}",
-            unseen.len(),
-            dag.active_tip().height,
-            dag.active_tip().hash
-        );
-        if response_count < MAX_HEADERS_PER_RESPONSE {
-            break;
-        }
-    }
-    store
-        .clear_recovery_tip()
-        .map_err(|error| PeerRunError::local(error.to_string()))?;
-    rbtc_info!(
-        "peer returned no more headers at {}:{}",
-        dag.active_tip().height,
-        dag.active_tip().hash
-    );
-    Ok(dag)
 }
 
 /// Runs a bounded snapshot-overlay catch-up: headers first, then block

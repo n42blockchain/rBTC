@@ -214,6 +214,10 @@ pub struct StagedHeaderBatch<'a> {
 }
 
 impl StagedHeaderBatch<'_> {
+    pub(crate) fn active_tip(&self) -> HeaderInfo {
+        self.dag.active_tip()
+    }
+
     /// Makes the staged headers visible permanently and returns their metadata.
     #[must_use]
     pub fn commit(mut self) -> Vec<HeaderInfo> {
