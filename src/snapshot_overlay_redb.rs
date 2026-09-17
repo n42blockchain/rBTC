@@ -43,7 +43,7 @@ use crate::{
         write_core_varint,
     },
     core_snapshot_index::{
-        CoreSnapshotUtxoIndex, SnapshotBaseIdentity, build_core_snapshot_index_with_identity,
+        CoreSnapshotUtxoIndex, SnapshotBaseIdentity, build_with_identity_and_memory,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
     headers::HeaderView,
@@ -684,9 +684,13 @@ impl SnapshotOverlayRedbChainstate {
         // sidecar. Own both paths before either publication can fail.
         cleanup.track(new_index_path.to_owned());
         cleanup.track(fingerprint_path);
-        let report =
-            build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
         let memory = crate::node_memory::for_path(&self.database_path)?;
+        let report = build_with_identity_and_memory(
+            new_snapshot_path,
+            new_index_path,
+            &identity,
+            memory.as_ref(),
+        )?;
         let new_base = CoreSnapshotUtxoIndex::open_with_memory(
             new_index_path,
             new_snapshot_path,

@@ -29,10 +29,11 @@ not change acceptance statuses or weaken thresholds.
    stream with fixed scratch instead of allocating a complete large group.
    [Snapshot index opens](snapshot-index-memory-20260917.md) now admit decode
    buffers and retain shared reservations for MPHF/fingerprint caches, including
-   overlapping old/new bases during rebase; index building remains unadmitted.
+   overlapping old/new bases during rebase.
    [Streamed index publication](snapshot-index-streamed-output-20260917.md)
-   removes whole encoded output copies; scan groups, location and MPHF/table
-   construction still require bounded storage and shared admission. [Supporting database caches](supporting-cache-memory-20260917.md)
+   removes whole encoded output copies. [Build array admission](snapshot-build-tables-memory-20260917.md)
+   now charges MPHF scratch/retained arrays and slot tables through the database
+   owner; scanned groups and locations still need bounded storage and admission. [Supporting database caches](supporting-cache-memory-20260917.md)
    and maintenance opens now share that owner too; remaining allocations and
    whole-node acceptance are still open.
    [AS-map payloads](asmap-memory-20260917.md) now reserve before startup reads

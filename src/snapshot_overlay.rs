@@ -60,7 +60,7 @@ use crate::{
     },
     core_snapshot_index::{
         CoreSnapshotIndexError, CoreSnapshotUtxoIndex, SnapshotBaseIdentity,
-        build_core_snapshot_index_with_identity,
+        build_with_identity_and_memory,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
     headers::HeaderView,
@@ -892,9 +892,13 @@ impl SnapshotOverlayChainstate {
         // sidecar. Own both paths before either publication can fail.
         cleanup.track(new_index_path.to_owned());
         cleanup.track(fingerprint_path);
-        let report =
-            build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
         let memory = crate::node_memory::for_path(&self.database_dir)?;
+        let report = build_with_identity_and_memory(
+            new_snapshot_path,
+            new_index_path,
+            &identity,
+            memory.as_ref(),
+        )?;
         let new_base = CoreSnapshotUtxoIndex::open_with_memory(
             new_index_path,
             new_snapshot_path,
@@ -2459,7 +2463,12 @@ pub(crate) mod tests {
         let snapshot_path = directory.join(format!("utxo-{base_height}.dat"));
         let index_path = directory.join(format!("utxo-{base_height}.rbtcidx"));
         fs::write(&snapshot_path, &bytes).unwrap();
-        build_core_snapshot_index_with_identity(&snapshot_path, &index_path, &identity).unwrap();
+        crate::core_snapshot_index::build_core_snapshot_index_with_identity(
+            &snapshot_path,
+            &index_path,
+            &identity,
+        )
+        .unwrap();
         (snapshot_path, index_path, identity)
     }
 

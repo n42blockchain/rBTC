@@ -7,27 +7,22 @@
 //! file itself as the immutable, compressed data source and adds a sidecar
 //! index so a single coin can be decoded directly from the file:
 //!
-//! - A BBhash minimal perfect hash function ([`crate::mphf`]) maps each of the
-//!   snapshot's outpoints to a distinct slot.
-//! - A bit-packed table stores, per slot, the coin's byte offset and the
-//!   backward distance to its txid group header.
+//! - A BBhash minimal perfect hash function ([`crate::mphf`]) maps each
+//!   transaction id to a distinct slot.
+//! - A bit-packed table stores each group's byte offset; lookup scans that
+//!   group's coins with bounded scratch to find the requested output index.
 //!
-//! Lookups are exact, never probabilistic: the 32-byte txid at the group
-//! header and the coin's CompactSize vout are compared against the queried
-//! outpoint before any field is returned, so a foreign key that the minimal
-//! perfect hash function maps to an arbitrary slot is always rejected.
+//! Lookups are exact: the group txid and coin output index are checked against
+//! the requested outpoint. Foreign keys never become false positive coins.
+//! Building authenticates the snapshot against its supplied Core UTXO-set
+//! commitment. The index binds network, base hash, coin count, snapshot length
+//! and SHA-256, and has its own trailing SHA-256.
 //!
-//! Building authenticates the snapshot offline against a release-pinned Core
-//! 31 AssumeUTXO identity by recomputing Core's exact double-SHA256 UTXO-set
-//! commitment, so no header chain is required. The index binds the snapshot's
-//! network, base block hash, coin count, byte length, and full SHA-256; the
-//! container itself is covered by a trailing SHA-256 and fails closed on any
-//! damage. Peak build memory is one 52-byte location record per coin (about
-//! 8 GiB for the 935,000-height mainnet set). Lookups keep only the hash
-//! levels resident — about 68 MiB for that set — and read each packed table
-//! entry from the container at its computed bit position, so the roughly
-//! 1.02 GiB offset table costs one small positioned read per lookup instead
-//! of permanent memory.
+//! Hash levels and optional fingerprints remain resident at query time; packed
+//! offsets are read from disk. Node-bound builds admit MPHF arrays, slot tables
+//! and publication scratch through the shared memory owner. The scan still
+//! retains all group locations and one whole decoded coin group for canonical
+//! sorting; total build memory is not yet bounded by that owner.
 
 use std::{
     fs::File,
@@ -348,8 +343,21 @@ pub fn build_core_snapshot_index_with_identity(
     index_path: impl AsRef<Path>,
     identity: &SnapshotBaseIdentity,
 ) -> Result<CoreSnapshotIndexReport, CoreSnapshotIndexError> {
-    let snapshot_path = snapshot_path.as_ref();
-    let index_path = index_path.as_ref();
+    let memory = crate::node_memory::for_path(index_path.as_ref())?;
+    build_with_identity_and_memory(
+        snapshot_path.as_ref(),
+        index_path.as_ref(),
+        identity,
+        memory.as_ref(),
+    )
+}
+
+pub(crate) fn build_with_identity_and_memory(
+    snapshot_path: &Path,
+    index_path: &Path,
+    identity: &SnapshotBaseIdentity,
+    memory: Option<&crate::node_memory::MemoryBudget>,
+) -> Result<CoreSnapshotIndexReport, CoreSnapshotIndexError> {
     if index_path.exists() {
         return Err(CoreSnapshotIndexError::Invalid(
             "index output path already exists",
@@ -364,10 +372,11 @@ pub fn build_core_snapshot_index_with_identity(
     } = scan_snapshot(snapshot_path, identity)?;
 
     let groups = u64::try_from(locations.len()).expect("group count fits u64");
-    let mphf = Mphf::build(
+    let mphf = Mphf::build_with_memory(
         groups,
         |ordinal| locations[usize::try_from(ordinal).expect("group ordinal fits usize")].txid,
         INDEX_SEED,
+        memory,
     )?;
 
     let max_offset = locations
@@ -395,6 +404,7 @@ pub fn build_core_snapshot_index_with_identity(
             .div_ceil(64),
     )
     .expect("table words fit usize");
+    let _tables = reserve_build_tables(memory, table_words, groups)?;
     let mut table = vec![0_u64; table_words];
     let mut fingerprints = vec![0_u16; usize::try_from(groups).expect("group count fits usize")];
     let mut occupied =
@@ -455,6 +465,21 @@ pub fn build_core_snapshot_index_with_identity(
         mphf_levels: mphf.level_count(),
         mphf_bits: mphf.bit_len(),
     })
+}
+
+// Keep this lease through publication; MPHF and old-base owners remain live.
+fn reserve_build_tables(
+    memory: Option<&crate::node_memory::MemoryBudget>,
+    table_words: usize,
+    groups: u64,
+) -> std::io::Result<Option<crate::node_memory::MemoryLease>> {
+    let allowance = (table_words as u64)
+        .checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(groups.checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(groups.div_ceil(64).checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(128 * 1024))
+        .ok_or_else(|| std::io::Error::other("index table allowance overflow"))?;
+    memory.map(|budget| budget.reserve(allowance)).transpose()
 }
 
 /// Streams the snapshot once, enforcing the same canonical-form rules as the
@@ -1681,6 +1706,46 @@ mod tests {
         ));
         assert_eq!(budget.snapshot().used, retained);
         drop(first);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
+    fn build_table_pressure_preserves_live_index_and_refunds_before_retry() {
+        use crate::node_memory::MemoryBudget;
+        let directory = TempDir::new().unwrap();
+        let snapshot = directory.path().join("coins.dat");
+        let (bytes, _) = synthetic_snapshot([7; 32], &test_groups());
+        fs::write(&snapshot, bytes).unwrap();
+        let identity = authenticated_identity(&snapshot, [7; 32], directory.path());
+        let old_path = directory.path().join("old.idx");
+        build_core_snapshot_index_with_identity(&snapshot, &old_path, &identity).unwrap();
+        let budget = MemoryBudget::new(4 << 20);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let old = CoreSnapshotUtxoIndex::open(&old_path, &snapshot).unwrap();
+        let retained = budget.snapshot().used;
+        let pressure = budget
+            .reserve(budget.snapshot().limit - retained - 64 * 1024)
+            .unwrap();
+        let occupied = budget.snapshot().used;
+        let path = directory.path().join("new.idx");
+        // MPHF fits, but table/publication admission must fail before any output.
+        assert!(matches!(
+            build_core_snapshot_index_with_identity(&snapshot, &path, &identity),
+            Err(CoreSnapshotIndexError::Io(_))
+        ));
+        assert_eq!(budget.snapshot().used, occupied);
+        assert!(!path.exists());
+        assert!(!fingerprint_sidecar_path(&path).exists());
+        drop(pressure);
+        build_core_snapshot_index_with_identity(&snapshot, &path, &identity).unwrap();
+        assert_eq!(budget.snapshot().used, retained);
+        assert_eq!(fs::read(&old_path).unwrap(), fs::read(&path).unwrap());
+        assert!(
+            old.get(&OutPoint::new(Txid::from_byte_array([1; 32]), 0))
+                .unwrap()
+                .is_some()
+        );
+        drop(old);
         assert_eq!(budget.snapshot().used, 0);
     }
 
