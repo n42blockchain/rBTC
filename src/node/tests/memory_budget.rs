@@ -168,3 +168,26 @@ fn staged_prefix_validation_is_ordered_bounded_and_never_publishes() {
     assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
     assert!(ledger.retained_tip().unwrap().is_none());
 }
+
+#[test]
+fn archive_admission_failure_reaches_the_node_as_a_local_resource_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let memory = crate::node_memory::MemoryBudget::new(1024);
+    memory.bind(&[directory.path().to_path_buf()]).unwrap();
+    let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
+    let pressure = memory.reserve_spool(memory.spool_snapshot().limit).unwrap();
+    let error = ledger.stage(1, &[vec![1]]).unwrap_err();
+    assert!(matches!(
+        &error,
+        crate::ledger::LedgerError::Archive(crate::archive::ArchiveError::ResourceBudget(_))
+    ));
+    assert_eq!(
+        PeerRunError::ledger(&error).kind,
+        PeerFailureKind::LocalResource
+    );
+    assert!(ledger.staged_manifest().unwrap().is_none());
+    drop(pressure);
+    ledger.stage(1, &[vec![1]]).unwrap();
+    assert_eq!(memory.spool_snapshot().used, 0);
+    assert!(ledger.staged_manifest().unwrap().is_some());
+}

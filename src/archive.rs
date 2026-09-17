@@ -70,6 +70,9 @@ fn bounded_archive_prefix_len_from_lengths(
 /// Archive read/write failure.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
+    /// Shared local resource admission failed before allocation or file creation.
+    #[error("archive resource admission: {0}")]
+    ResourceBudget(std::io::Error),
     /// Filesystem or compression I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -110,7 +113,11 @@ pub fn write_archive(
     let path = path.as_ref();
     let records_bytes = archive_record_bytes(blocks)?;
     let _spool = crate::node_memory::for_path(path)?
-        .map(|budget| budget.reserve_spool(MAX_CONTAINER_BYTES))
+        .map(|budget| {
+            budget
+                .reserve_spool(MAX_CONTAINER_BYTES)
+                .map_err(ArchiveError::ResourceBudget)
+        })
         .transpose()?;
     let parent = path
         .parent()
@@ -316,7 +323,11 @@ pub(crate) fn write_archive_prefix(
         true
     })?;
     let _spool = crate::node_memory::for_path(destination)?
-        .map(|budget| budget.reserve_spool(MAX_CONTAINER_BYTES))
+        .map(|budget| {
+            budget
+                .reserve_spool(MAX_CONTAINER_BYTES)
+                .map_err(ArchiveError::ResourceBudget)
+        })
         .transpose()?;
     let parent = destination
         .parent()

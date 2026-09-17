@@ -2728,6 +2728,17 @@ impl PeerRunError {
         }
     }
 
+    fn ledger(error: &crate::ledger::LedgerError) -> Self {
+        if matches!(
+            error,
+            crate::ledger::LedgerError::Archive(crate::archive::ArchiveError::ResourceBudget(_))
+        ) {
+            Self::local(error.to_string())
+        } else {
+            Self::transient(error.to_string())
+        }
+    }
+
     fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: PeerFailureKind::Transient,
@@ -16099,7 +16110,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                 work()
             }
         };
-        stage_result.map_err(|error| error.to_string())?;
+        stage_result.map_err(|error| PeerRunError::ledger(&error))?;
         delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
@@ -16294,7 +16305,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                 )
             })
         });
-        stage_result.map_err(|error| error.to_string())?;
+        stage_result.map_err(|error| PeerRunError::ledger(&error))?;
         delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
@@ -16358,7 +16369,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                 shard_elapsed,
             )
         });
-        stage_result.map_err(|error| error.to_string())?;
+        stage_result.map_err(|error| PeerRunError::ledger(&error))?;
         delta_shard_migrations = shard_result.map_err(|error| error.to_string())?;
         delta_shard_elapsed = shard_elapsed;
         staged_at = branch_staged_at;
@@ -16451,7 +16462,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     validate_live_indexes_before_prune(explorer, wallet, auxiliary_indexes, last.height)?;
     ledger
         .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| PeerRunError::ledger(&error))?;
     if let Some(zmq) = zmq_notifier {
         for block in &blocks {
             zmq.block_connected(block);

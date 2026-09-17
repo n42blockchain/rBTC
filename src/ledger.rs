@@ -1342,7 +1342,11 @@ impl PrunedBlockLedger {
             return Err(LedgerError::Invalid("invalid staged comparison count"));
         }
         let _spool = crate::node_memory::for_path(&self.staged_path())?
-            .map(|budget| budget.reserve_spool(crate::archive::MAX_RECORDS_BYTES))
+            .map(|budget| {
+                budget
+                    .reserve_spool(crate::archive::MAX_RECORDS_BYTES)
+                    .map_err(ArchiveError::ResourceBudget)
+            })
             .transpose()?;
         let mut records = tempfile::tempfile_in(&self.root)?;
         let mut failure = None;
