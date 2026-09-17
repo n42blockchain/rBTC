@@ -1,9 +1,230 @@
 use super::*;
 
+#[derive(Debug, Default)]
+struct HeaderPeerProgress {
+    requests: std::sync::atomic::AtomicUsize,
+    pings: std::sync::atomic::AtomicUsize,
+}
+
+async fn next_header_request(
+    peer: &mut V1Transport<tokio::net::TcpStream>,
+    progress: &HeaderPeerProgress,
+) -> bitcoin::p2p::message_blockdata::GetHeadersMessage {
+    use std::sync::atomic::Ordering;
+    loop {
+        match peer.read_message().await.unwrap().into_payload() {
+            NetworkMessage::GetHeaders(request) => {
+                progress.requests.fetch_add(1, Ordering::Relaxed);
+                return request;
+            }
+            NetworkMessage::Ping(nonce) => {
+                progress.pings.fetch_add(1, Ordering::Relaxed);
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected GetHeaders or replay Ping, received {other:?}"),
+        }
+    }
+}
+
+async fn serve_replay_pings_until(
+    peer: &mut V1Transport<tokio::net::TcpStream>,
+    mut finished: tokio::sync::oneshot::Receiver<()>,
+    progress: &HeaderPeerProgress,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut finished => return,
+            message = peer.read_message() => {
+                match message.unwrap().into_payload() {
+                    NetworkMessage::Ping(nonce) => {
+                        progress.pings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        peer.write_message(NetworkMessage::Pong(nonce)).await.unwrap();
+                    }
+                    other => panic!("expected replay Ping after final headers, received {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_replay_keepalive_precedes_locator_without_breaking_peer_protocol() {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let progress = Arc::new(HeaderPeerProgress::default());
+    let peer_progress = Arc::clone(&progress);
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let (finish_peer, finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9733)).await;
+        let request = next_header_request(&mut peer, &peer_progress).await;
+        assert_eq!(request.locator_hashes, vec![genesis]);
+        peer.write_message(NetworkMessage::Headers(Vec::new()))
+            .await
+            .unwrap();
+        serve_replay_pings_until(&mut peer, finished, &peer_progress).await;
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9732,
+        "/rbtc:keepalive-test/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(5), keepalive.tick(Some(&mut peer)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 1);
+    assert_eq!(progress.requests.load(Ordering::Relaxed), 0);
+    keepalive.tick(Some(&mut peer)).await.unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 1);
+    request_headers(&mut peer, vec![genesis]).await.unwrap();
+    assert!(receive_headers(&mut peer).await.unwrap().is_empty());
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(5), keepalive.tick(Some(&mut peer)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 2);
+    finish_peer.send(()).unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn header_replay_polls_admission_while_finishing_keepalive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let (grant, granted) = tokio::sync::oneshot::channel();
+    let (polled, admission_polled) = tokio::sync::oneshot::channel();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9735)).await;
+        let message = peer.read_message().await.unwrap().into_payload();
+        let NetworkMessage::Ping(nonce) = message else {
+            panic!("expected replay ping, got {message:?}");
+        };
+        grant.send(42).unwrap();
+        // Withhold Pong until admission advances. Polling only ping here
+        // would stall the FIFO head and this bounded handshake would fail.
+        timeout(Duration::from_secs(5), admission_polled)
+            .await
+            .unwrap()
+            .unwrap();
+        peer.write_message(NetworkMessage::Pong(nonce))
+            .await
+            .unwrap();
+        let request = next_header_request(&mut peer, &HeaderPeerProgress::default()).await;
+        assert_eq!(request.locator_hashes, vec![genesis]);
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9734,
+        "/rbtc:admission-keepalive/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    let admission = async move {
+        let value = granted.await.unwrap();
+        polled.send(()).unwrap();
+        value
+    };
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            keepalive.wait(Some(&mut peer), admission)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        42
+    );
+    // The granted work did not cancel the ping exchange or leave its Pong
+    // for a later request to consume as an unexpected protocol message.
+    request_headers(&mut peer, vec![genesis]).await.unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn header_replay_disconnect_drops_pending_admission() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9737)).await;
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Ping(_)
+        ));
+        // Disconnect without Pong, while admission is still waiting.
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9736,
+        "/rbtc:admission-disconnect/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let (owned, released) = tokio::sync::oneshot::channel::<()>();
+    let admission = async move {
+        let _owned = owned;
+        std::future::pending::<()>().await;
+    };
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    let error = timeout(
+        Duration::from_secs(5),
+        keepalive.wait(Some(&mut peer), admission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind, PeerFailureKind::Transient);
+    assert!(
+        released.await.is_err(),
+        "pending admission retained its resources"
+    );
+    server.await.unwrap();
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
     for (evict, interrupted) in [(false, false), (true, false), (false, true), (true, true)] {
+        let peer_progress = Arc::new(HeaderPeerProgress::default());
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("headers.redb");
         let deployments = DeploymentConfig::for_network(Network::Regtest);
@@ -47,20 +268,14 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let remote = listener.local_addr().unwrap();
             let prefix = fork[..2000].to_vec();
+            let server_progress = Arc::clone(&peer_progress);
             let server = tokio::spawn(async move {
                 let (mut peer, _) = accept_peer(listener, peer_version(9561)).await;
-                assert!(matches!(
-                    peer.read_message().await.unwrap().into_payload(),
-                    NetworkMessage::GetHeaders(_)
-                ));
+                let _ = next_header_request(&mut peer, &server_progress).await;
                 peer.write_message(NetworkMessage::Headers(prefix))
                     .await
                     .unwrap();
-                let NetworkMessage::GetHeaders(request) =
-                    peer.read_message().await.unwrap().into_payload()
-                else {
-                    panic!("expected recovery continuation");
-                };
+                let request = next_header_request(&mut peer, &server_progress).await;
                 assert_eq!(request.locator_hashes[0], cursor);
                 // Disconnect after the committed prefix, before the winning suffix.
             });
@@ -102,22 +317,16 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
         }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = listener.local_addr().unwrap();
+        let (finish_peer, finished) = tokio::sync::oneshot::channel();
+        let server_progress = Arc::clone(&peer_progress);
         let server = tokio::spawn(async move {
             let (mut peer, _) = accept_peer(listener, peer_version(9551)).await;
-            let NetworkMessage::GetHeaders(mut request) =
-                peer.read_message().await.unwrap().into_payload()
-            else {
-                panic!("expected continuation on losing fork");
-            };
+            let mut request = next_header_request(&mut peer, &server_progress).await;
             if !interrupted {
                 peer.write_message(NetworkMessage::Headers(fork[..2000].to_vec()))
                     .await
                     .unwrap();
-                let NetworkMessage::GetHeaders(next) =
-                    peer.read_message().await.unwrap().into_payload()
-                else {
-                    panic!("expected continuation on losing fork");
-                };
+                let next = next_header_request(&mut peer, &server_progress).await;
                 request = next;
             }
             assert_eq!(request.locator_hashes[0], cursor);
@@ -125,6 +334,7 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
             peer.write_message(NetworkMessage::Headers(fork[2000..].to_vec()))
                 .await
                 .unwrap();
+            serve_replay_pings_until(&mut peer, finished, &server_progress).await;
         });
         let mut session = connect_outbound(
             remote,
@@ -146,8 +356,9 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
             ),
         )
         .await
-        .unwrap()
+        .unwrap_or_else(|error| panic!("header recovery timeout: evict={evict} interrupted={interrupted} peer={peer_progress:?}: {error}"))
         .unwrap();
+        finish_peer.send(()).unwrap();
         assert_eq!(recovered.active_tip().hash, expected);
         assert_eq!(
             recovered.branch_locator(expected).unwrap(),
@@ -792,6 +1003,7 @@ async fn header_resync_resource_probe() {
 #[allow(clippy::too_many_lines)]
 async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
     use crate::node::header_sync::{HeaderSyncPolicy, candidate_path, sync_headers_with_policy};
+    let peer_progress = Arc::new(HeaderPeerProgress::default());
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("headers.redb");
     let deployments = DeploymentConfig::for_network(Network::Regtest);
@@ -827,16 +1039,14 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
     let prefix = fork[..2000].to_vec();
+    let server_progress = Arc::clone(&peer_progress);
     let server = tokio::spawn(async move {
         let (mut peer, _) = accept_peer(listener, peer_version(9711)).await;
-        peer.read_message().await.unwrap();
+        let _ = next_header_request(&mut peer, &server_progress).await;
         peer.write_message(NetworkMessage::Headers(prefix))
             .await
             .unwrap();
-        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
-        else {
-            panic!("expected continuation");
-        };
+        let request = next_header_request(&mut peer, &server_progress).await;
         assert_eq!(request.locator_hashes[0], cursor);
         // Disconnect with a complete, losing prefix persisted only on disk.
     });
@@ -879,16 +1089,16 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
     let suffix = fork[2000..].to_vec();
+    let (finish_peer, finished) = tokio::sync::oneshot::channel();
+    let server_progress = Arc::clone(&peer_progress);
     let server = tokio::spawn(async move {
         let (mut peer, _) = accept_peer(listener, peer_version(9721)).await;
-        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
-        else {
-            panic!("expected disk cursor");
-        };
+        let request = next_header_request(&mut peer, &server_progress).await;
         assert_eq!(request.locator_hashes[0], cursor);
         peer.write_message(NetworkMessage::Headers(suffix))
             .await
             .unwrap();
+        serve_replay_pings_until(&mut peer, finished, &server_progress).await;
     });
     let mut peer = connect_outbound(
         remote,
@@ -912,6 +1122,7 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
         Ok(_) => panic!("promotion byte allowance must defer"),
         Err(error) => error,
     };
+    finish_peer.send(()).unwrap();
     assert_eq!(error.kind, PeerFailureKind::LocalResource);
     server.await.unwrap();
     let store = RedbHeaderStore::open(&path).unwrap();
@@ -927,12 +1138,10 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
     assert!(candidate_path(&path).exists());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
+    let server_progress = Arc::clone(&peer_progress);
     let server = tokio::spawn(async move {
         let (mut peer, _) = accept_peer(listener, peer_version(9731)).await;
-        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
-        else {
-            panic!("expected winning tip");
-        };
+        let request = next_header_request(&mut peer, &server_progress).await;
         assert_eq!(request.locator_hashes[0], winner);
         peer.write_message(NetworkMessage::Headers(Vec::new()))
             .await

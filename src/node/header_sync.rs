@@ -180,12 +180,46 @@ fn received_candidate(error: HeaderCandidateError) -> PeerRunError {
 // Recovery and import can outlast a peer's idle timeout on large journals.
 // Ping between bounded frames so unsolicited messages use the session's normal
 // bounded queue and network failures leave the durable cursor available.
-struct ReplayKeepalive(Instant);
+pub(super) struct ReplayKeepalive(Instant);
 impl ReplayKeepalive {
-    fn new() -> Self {
-        Self(Instant::now())
+    pub(super) fn new(last_ping: Instant) -> Self {
+        Self(last_ping)
     }
-    async fn tick(
+    /// Keep the same queued admission future alive while servicing the peer.
+    /// A granted lease does not cancel an in-flight ping: finish its exchange
+    /// before returning so the session never inherits a half-read response.
+    pub(super) async fn wait<T>(
+        &mut self,
+        session: Option<&mut rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
+        admission: impl std::future::Future<Output = T>,
+    ) -> Result<T, PeerRunError> {
+        let Some(session) = session else {
+            return Ok(admission.await);
+        };
+        tokio::pin!(admission);
+        loop {
+            let remaining = Duration::from_secs(20).saturating_sub(self.0.elapsed());
+            if !remaining.is_zero() {
+                tokio::select! {
+                    granted = &mut admission => return Ok(granted),
+                    () = tokio::time::sleep(remaining) => {}
+                }
+            }
+            let ping = self.tick(Some(session));
+            tokio::pin!(ping);
+            tokio::select! {
+                // Continue polling admission during ping I/O so a FIFO head
+                // cannot stall all following candidates while awaiting Pong.
+                granted = &mut admission => {
+                    ping.await?;
+                    return Ok(granted);
+                }
+                result = &mut ping => result?,
+            }
+        }
+    }
+
+    pub(super) async fn tick(
         &mut self,
         session: Option<&mut rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     ) -> Result<(), PeerRunError> {
@@ -196,7 +230,7 @@ impl ReplayKeepalive {
             tokio::time::timeout(super::PEER_TIMEOUT, session.ping(rand::random()))
                 .await
                 .map_err(|_| {
-                    PeerRunError::transient("peer keepalive timed out during candidate replay")
+                    PeerRunError::transient("peer keepalive timed out during header replay")
                 })?
                 .map_err(|error| PeerRunError::p2p(&error))?;
             self.0 = Instant::now();
@@ -214,8 +248,11 @@ async fn resume_candidate(
     let Some(anchor) = DiskHeaderCandidate::stored_anchor(path).map_err(local)? else {
         return Ok(None);
     };
+    let mut keepalive = ReplayKeepalive::new(Instant::now());
     let mut recovery = {
-        let mut lease = work(BATCH_WORK).await;
+        let mut lease = keepalive
+            .wait(session.as_deref_mut(), work(BATCH_WORK))
+            .await?;
         DiskHeaderCandidate::start_recovery(
             path,
             dag,
@@ -225,11 +262,11 @@ async fn resume_candidate(
         )
         .map_err(local)?
     };
-    let mut keepalive = ReplayKeepalive::new();
     loop {
-        keepalive.tick(session.as_deref_mut()).await?;
         let done = {
-            let mut lease = work(BATCH_WORK).await;
+            let mut lease = keepalive
+                .wait(session.as_deref_mut(), work(BATCH_WORK))
+                .await?;
             recovery.advance(1, now, &mut lease.budget).map_err(local)?
         };
         if done {
@@ -280,11 +317,12 @@ async fn promote(
         store.begin_candidate_promotion(tip.hash).map_err(local)?;
         {
             let mut reader = disk.reader().map_err(local)?;
-            let mut keepalive = ReplayKeepalive::new();
+            let mut keepalive = ReplayKeepalive::new(Instant::now());
             loop {
-                keepalive.tick(session.as_deref_mut()).await?;
                 {
-                    let mut lease = work(BATCH_WORK).await;
+                    let mut lease = keepalive
+                        .wait(session.as_deref_mut(), work(BATCH_WORK))
+                        .await?;
                     let Some(batch) = reader.next_batch(&mut lease.budget).map_err(local)? else {
                         break;
                     };

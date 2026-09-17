@@ -1,7 +1,7 @@
 //! Node ownership of a bounded derived index and its last committed read view.
 use super::{
-    DeploymentConfig, HeaderInfo, HeaderReadError, HeaderSnapshot, HeaderView, PEER_TIMEOUT,
-    PeerRunError, RedbHeaderStore, header_sync,
+    DeploymentConfig, HeaderInfo, HeaderReadError, HeaderSnapshot, HeaderView, PeerRunError,
+    RedbHeaderStore, header_sync,
 };
 use crate::{
     header_index::{DiskHeaderIndex, DiskHeaderView, HeaderIndexError},
@@ -10,7 +10,7 @@ use crate::{
 use bitcoin::{BlockHash, block::Header};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 type Session = crate::p2p::PeerSession<tokio::net::TcpStream>;
@@ -77,21 +77,15 @@ impl NodeHeaderState {
         )
         .map_err(local)?;
         let mut reader = store.replay_reader().map_err(local)?;
-        let mut ping = Instant::now();
+        let mut keepalive = header_sync::ReplayKeepalive::new(Instant::now());
         loop {
-            if ping.elapsed() >= Duration::from_secs(20) {
-                if let Some(session) = session.as_deref_mut() {
-                    tokio::time::timeout(PEER_TIMEOUT, session.ping(rand::random()))
-                        .await
-                        .map_err(|_| {
-                            PeerRunError::transient("peer keepalive timed out during header replay")
-                        })?
-                        .map_err(|error| PeerRunError::p2p(&error))?;
-                }
-                ping = Instant::now();
-            }
             {
-                let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+                let mut lease = keepalive
+                    .wait(
+                        session.as_deref_mut(),
+                        header_sync::work(header_sync::BATCH_WORK),
+                    )
+                    .await?;
                 let Some(batch) = reader.next_batch(&mut lease.budget).map_err(local)? else {
                     break;
                 };
