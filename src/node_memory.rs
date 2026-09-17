@@ -14,6 +14,13 @@ use std::{
 /// Default aggregate reservation allowance (16 GiB).
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Cache configured by redb 2.6 for stores without a caller-selected cache.
+pub(crate) const DEFAULT_REDB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+
+pub(crate) fn create_redb(path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+    open_redb(path.as_ref(), DEFAULT_REDB_CACHE_BYTES)
+}
+
 #[derive(Debug, Default)]
 struct Usage {
     used: u64,
@@ -191,11 +198,27 @@ impl StorageBackend for Backend {
     }
 }
 
+pub(crate) fn open_existing_redb(path: impl AsRef<Path>) -> Result<Database, DatabaseError> {
+    redb_with_mode(path.as_ref(), DEFAULT_REDB_CACHE_BYTES, false)
+}
+
 pub(crate) fn open_redb(path: &Path, cache_bytes: usize) -> Result<Database, DatabaseError> {
+    redb_with_mode(path, cache_bytes, true)
+}
+
+fn redb_with_mode(
+    path: &Path,
+    cache_bytes: usize,
+    create: bool,
+) -> Result<Database, DatabaseError> {
     let mut builder = Database::builder();
     builder.set_cache_size(cache_bytes);
     let Some(budget) = for_path(path)? else {
-        return builder.create(path);
+        return if create {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        };
     };
     // Reserve before creating the file or engine. FileBackend preserves redb's
     // platform-specific locking and I/O, and owns the lease until engine drop.
@@ -203,13 +226,16 @@ pub(crate) fn open_redb(path: &Path, cache_bytes: usize) -> Result<Database, Dat
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create(create)
         .truncate(false)
         .open(path)?;
-    builder.create_with_backend(Backend {
-        file: FileBackend::new(file)?,
-        cache,
-    })
+    let file = FileBackend::new(file)?;
+    // redb 2.6 only distinguishes open from create when the locked file is
+    // empty (page_manager.rs). Check after acquiring the same engine lock.
+    if !create && file.len()? == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+    }
+    builder.create_with_backend(Backend { file, cache })
 }
 
 #[cfg(test)]
@@ -307,6 +333,47 @@ mod tests {
         assert!(open_redb(&path, 1024 * 1024).is_err());
         assert_eq!(budget.snapshot().used, 1024 * 1024);
         drop(first);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+    #[test]
+    fn existing_open_never_creates_or_initializes_files_and_refunds_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(3 * DEFAULT_REDB_CACHE_BYTES as u64);
+        budget.bind(&[dir.path().to_owned()]).unwrap();
+        let path = dir.path().join("existing.redb");
+        assert!(open_existing_redb(&path).is_err());
+        assert!(!path.exists());
+        std::fs::write(&path, []).unwrap();
+        assert!(open_existing_redb(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(budget.snapshot().used, 0);
+        drop(create_redb(&path).unwrap());
+        let db = open_existing_redb(&path).unwrap();
+        assert_eq!(budget.snapshot().used, DEFAULT_REDB_CACHE_BYTES as u64);
+        drop(db);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
+    fn supporting_stores_compete_and_fail_before_file_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(DEFAULT_REDB_CACHE_BYTES as u64 + 1024 * 1024);
+        budget.bind(&[dir.path().to_owned()]).unwrap();
+        let peers = crate::peer_store::RedbPeerStore::open(
+            dir.path().join("peers.redb"),
+            bitcoin::Network::Regtest,
+        )
+        .unwrap();
+        let path = dir.path().join("fees.redb");
+        assert!(
+            crate::fee_estimator::RedbFeeEstimator::open(&path, bitcoin::Network::Regtest).is_err()
+        );
+        assert!(!path.exists());
+        drop(peers);
+        let fees =
+            crate::fee_estimator::RedbFeeEstimator::open(&path, bitcoin::Network::Regtest).unwrap();
+        assert_eq!(budget.snapshot().used, DEFAULT_REDB_CACHE_BYTES as u64);
+        drop(fees);
         assert_eq!(budget.snapshot().used, 0);
     }
 }

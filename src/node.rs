@@ -1616,7 +1616,27 @@ fn validate_memory_plan(options: &Options) -> Result<(), String> {
     } else {
         Some(chainstate_cache_bytes(options.network_execution, false, options.cache) as u64)
     };
-    let required = cache.and_then(|bytes| bytes.checked_add(1024 * 1024 * 1024));
+    // Persistent peer, mempool and estimator engines coexist with chainstate.
+    // Count optional serving databases and both pipelines' indexes as well.
+    // Offline modes conservatively retain this allowance because recovered
+    // auxiliary indexes can be opened even without an API listener.
+    let pipelines = if options.background_assumeutxo.is_some() {
+        2_u64
+    } else {
+        1
+    };
+    let indexes = u64::from(options.indexes.transaction)
+        + u64::from(options.indexes.spent_output)
+        + u64::from(options.indexes.basic_filter);
+    let supporting = 2
+        + pipelines
+        + pipelines * indexes
+        + u64::from(options.explorer_listen.is_some())
+        + u64::from(options.wallet_api_files.is_some());
+    let supporting_bytes = supporting * crate::node_memory::DEFAULT_REDB_CACHE_BYTES as u64;
+    let required = cache
+        .and_then(|bytes| bytes.checked_add(supporting_bytes))
+        .and_then(|bytes| bytes.checked_add(1024 * 1024 * 1024));
     if required.is_none_or(|bytes| bytes > limit) {
         return Err("startup cache plan plus header/candidate headroom exceeds node memory reservation budget".to_owned());
     }
@@ -6608,7 +6628,7 @@ pub async fn run_cli(arguments: impl Iterator<Item = String>) -> Result<(), CliE
             let wait_for_runtime_shutdown = runtime_control.shutdown_requested();
             tokio::pin!(wait_for_runtime_shutdown);
             let result = tokio::select! {
-                result = run(options) => {
+                result = Box::pin(run(options)) => {
                     signal_task.abort();
                     result
                 },

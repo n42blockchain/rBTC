@@ -747,7 +747,7 @@ impl RedbUtxoStore {
 
     /// Opens or creates a chainstate file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtxoError> {
-        Self::from_database(Arc::new(Database::create(path)?))
+        Self::from_database(Arc::new(crate::node_memory::create_redb(path)?))
     }
 
     pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, UtxoError> {

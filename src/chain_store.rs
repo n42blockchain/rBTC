@@ -1389,7 +1389,7 @@ impl RedbChainStore {
     /// protocol; a structurally damaged file is rejected rather than rewritten.
     pub fn compact_file(path: impl AsRef<Path>) -> Result<bool, ChainStoreError> {
         catch_unwind(AssertUnwindSafe(|| {
-            let mut database = Database::open(path)?;
+            let mut database = crate::node_memory::open_existing_redb(path)?;
             Ok(database.compact()?)
         }))
         .map_err(|_| ChainStoreError::Damaged)?

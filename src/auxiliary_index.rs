@@ -159,7 +159,7 @@ impl RedbAuxiliaryIndex {
         let genesis_block = bitcoin::blockdata::constants::genesis_block(network);
         let genesis = genesis_block.block_hash();
         let schema_version = kind.schema_version();
-        let db = Database::create(path)?;
+        let db = crate::node_memory::create_redb(path)?;
         restrict_database_permissions(path)?;
         let transaction = db.begin_write()?;
         {

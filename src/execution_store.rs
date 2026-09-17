@@ -168,7 +168,7 @@ pub struct RedbExecutionStore {
 impl RedbExecutionStore {
     /// Opens or initializes execution metadata at `path`.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, ExecutionStoreError> {
-        Self::from_database(Arc::new(Database::create(path)?), network)
+        Self::from_database(Arc::new(crate::node_memory::create_redb(path)?), network)
     }
 
     pub(crate) fn from_database(

@@ -272,10 +272,20 @@ level without restart. Embedded hosts do not install this process-global sink
 and instead consume the bounded typed status/event receivers.
 
 `memory_budget_bytes` (`--memory-budget-bytes`) caps shared reservations for
-chainstate caches, Headers caches/read buffers and admission candidates. The
-default is 16 GiB. Startup rejects a known simultaneous cache plan that cannot
+chainstate and supporting redb caches, Headers caches/read buffers and admission candidates. The
+default is 16 GiB. Startup counts persistent peer, mempool and fee-estimator caches, both background
+pipelines, optional indexes, explorer and wallet rebroadcast caches. It rejects
+a known simultaneous cache plan that cannot
 leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
 settings. The status API exposes `memory_reservations` (limit, used, peak).
 These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
-pages, additional databases and other unregistered allocations still require
+pages, SQLite, MDBX and other unregistered allocations still require
 integration and whole-node acceptance. The overall memory gate remains open.
+
+The supporting redb caches retain their existing 1 GiB defaults. A normal node
+without optional services therefore needs at least 5 GiB in this preflight
+(1 GiB chainstate + 3 GiB supporting caches + 1 GiB headroom). Two background
+pipelines need at least 13 GiB before optional services/indexes. Enabling all
+three indexes in both pipelines raises that plan to 19 GiB; configure a larger
+`memory_budget_bytes` explicitly. These are configured reservation plans, not
+measured resident memory minima.

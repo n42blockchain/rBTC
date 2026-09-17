@@ -92,7 +92,7 @@ pub struct RedbUndoStore {
 impl RedbUndoStore {
     /// Opens or creates an undo database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UndoStoreError> {
-        Self::from_database(Arc::new(Database::create(path)?))
+        Self::from_database(Arc::new(crate::node_memory::create_redb(path)?))
     }
 
     pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, UndoStoreError> {

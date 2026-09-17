@@ -24,19 +24,19 @@ fn cli_and_config_bind_the_same_memory_limit_and_validate_duplicates() {
     let config = root.path().join("node.conf");
     fs::write(
         &config,
-        "network=regtest\ndata_dir=unused\nmemory_budget_bytes=4294967296\n",
+        "network=regtest\ndata_dir=unused\nmemory_budget_bytes=8589934592\n",
     )
     .unwrap();
     let parsed = parse_options(["--config".to_owned(), config.display().to_string()].into_iter())
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.resources.memory_budget_bytes, 4 * 1024 * 1024 * 1024);
+    assert_eq!(parsed.resources.memory_budget_bytes, 8 * 1024 * 1024 * 1024);
     let overridden = parse_options(
         [
             "--config".to_owned(),
             config.display().to_string(),
             "--memory-budget-bytes".to_owned(),
-            "8589934592".to_owned(),
+            "17179869184".to_owned(),
         ]
         .into_iter(),
     )
@@ -44,7 +44,7 @@ fn cli_and_config_bind_the_same_memory_limit_and_validate_duplicates() {
     .unwrap();
     assert_eq!(
         overridden.resources.memory_budget_bytes,
-        8 * 1024 * 1024 * 1024
+        16 * 1024 * 1024 * 1024
     );
     assert!(
         parse_options(
@@ -90,7 +90,7 @@ fn background_startup_counts_both_caches_and_status_exposes_live_usage() {
     options.background_assumeutxo = Some(PathBuf::from("validation"));
     options.resources.memory_budget_bytes = 8 * 1024 * 1024 * 1024;
     assert!(validate_memory_plan(&options).is_err());
-    options.resources.memory_budget_bytes = 9 * 1024 * 1024 * 1024;
+    options.resources.memory_budget_bytes = 13 * 1024 * 1024 * 1024;
     validate_memory_plan(&options).unwrap();
     let memory = runtime_memory(&options);
     let mut status = ready_test_node_status(

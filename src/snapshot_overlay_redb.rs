@@ -112,7 +112,7 @@ impl SnapshotOverlayRedbChainstate {
         if let Some(parent) = config.database_dir.parent() {
             fs::create_dir_all(parent)?;
         }
-        let db = Database::create(&config.database_dir).map_err(overlay_redb)?;
+        let db = crate::node_memory::create_redb(&config.database_dir).map_err(overlay_redb)?;
         let identity = {
             let transaction = db.begin_write().map_err(overlay_redb)?;
             {
@@ -212,7 +212,7 @@ impl SnapshotOverlayRedbChainstate {
         if !database_path.exists() {
             return Ok(None);
         }
-        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let db = crate::node_memory::open_existing_redb(database_path).map_err(overlay_redb)?;
         let transaction = db.begin_read().map_err(overlay_redb)?;
         let meta = match transaction.open_table(META) {
             Ok(meta) => meta,
@@ -235,7 +235,7 @@ impl SnapshotOverlayRedbChainstate {
     pub fn audit_content(
         database_path: &Path,
     ) -> Result<crate::snapshot_overlay::OverlayContentAudit, SnapshotOverlayError> {
-        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let db = crate::node_memory::open_existing_redb(database_path).map_err(overlay_redb)?;
         let transaction = db.begin_read().map_err(overlay_redb)?;
         let meta = transaction.open_table(META).map_err(overlay_redb)?;
         let identity = meta
