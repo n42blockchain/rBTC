@@ -75,14 +75,15 @@ fn rss_kib() -> Result<u64, Box<dyn std::error::Error>> {
 }
 
 fn allocated_bytes(path: &Path) -> Result<Option<u64>, std::io::Error> {
+    let metadata = fs::metadata(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok(Some(fs::metadata(path)?.blocks() * 512))
+        Ok(Some(metadata.blocks() * 512))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = metadata;
         Ok(None)
     }
 }
