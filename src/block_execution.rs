@@ -112,6 +112,43 @@ fn reserve_execution_memory<C: ExecutionChainStore>(
         .map(Some)
         .map_err(ChainStoreError::ExecutionMemory)
 }
+// Locally computed identifiers survive all three execution phases. Keep their
+// lease beside the payload so errors and ordinary completion release storage
+// before returning its allowance. Caller-supplied identifiers have a separate
+// owner and must not be charged a second time here.
+struct ComputedBatchTransactionIds {
+    ids: Vec<ValidatedBlockTransactionIds>,
+    _memory: Option<crate::node_memory::MemoryLease>,
+}
+impl ComputedBatchTransactionIds {
+    fn new<C: ExecutionChainStore>(store: &C, blocks: &[Block]) -> Result<Self, ChainStoreError> {
+        let bytes = blocks.iter().fold(
+            (blocks.len() as u64).checked_mul(size_of::<ValidatedBlockTransactionIds>() as u64),
+            |total, block| {
+                total?
+                    .checked_add((block.txdata.len() as u64).checked_mul(size_of::<Txid>() as u64)?)
+            },
+        );
+        let memory = reserve_execution_memory(store, bytes)?;
+        let ids = blocks
+            .iter()
+            .map(|block| {
+                ValidatedBlockTransactionIds::from_computed(
+                    block
+                        .txdata
+                        .iter()
+                        .map(bitcoin::Transaction::compute_txid)
+                        .collect(),
+                )
+            })
+            .collect();
+        Ok(Self {
+            ids,
+            _memory: memory,
+        })
+    }
+}
+
 fn discovery_reservation<'a, C: ExecutionChainStore>(
     store: &C,
     blocks: impl Iterator<Item = &'a Block>,
@@ -941,19 +978,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let transaction_ids = if let Some(ids) = transaction_ids {
         ids
     } else {
-        computed_ids = blocks
-            .iter()
-            .map(|block| {
-                ValidatedBlockTransactionIds::from_computed(
-                    block
-                        .txdata
-                        .iter()
-                        .map(bitcoin::Transaction::compute_txid)
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        computed_ids.as_slice()
+        computed_ids = ComputedBatchTransactionIds::new(chainstate, blocks)?;
+        computed_ids.ids.as_slice()
     };
 
     let workers = std::thread::available_parallelism()
@@ -3219,6 +3245,48 @@ mod tests {
         );
         drop(prefetch);
         assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn computed_batch_ids_hold_shared_memory_until_the_payload_drops() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let mut block = height_block(genesis.hash, genesis.header.time + 1, 1);
+        // Exercise both the outer batch allocation and substantial inner arrays.
+        block.txdata.resize(4096, block.txdata[0].clone());
+        let blocks = [block.clone(), block];
+        let baseline = budget.snapshot().used;
+        let ids = ComputedBatchTransactionIds::new(&store, &blocks).unwrap();
+        for (computed, block) in ids.ids.iter().zip(&blocks) {
+            assert_eq!(computed.as_slice().len(), block.txdata.len());
+            for (id, tx) in computed.as_slice().iter().zip(&block.txdata) {
+                assert_eq!(*id, tx.compute_txid());
+            }
+        }
+        let retained = budget.snapshot().used - baseline;
+        assert!(retained >= 8192 * size_of::<Txid>() as u64);
+        let occupied = budget
+            .reserve(budget.snapshot().limit - budget.snapshot().used)
+            .unwrap();
+        assert!(matches!(
+            ComputedBatchTransactionIds::new(&store, &blocks),
+            Err(ChainStoreError::ExecutionMemory(_))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        drop(ids);
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - retained);
+        let retried = ComputedBatchTransactionIds::new(&store, &blocks).unwrap();
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        drop(retried);
+        drop(occupied);
+        assert_eq!(budget.snapshot().used, baseline);
+        assert_eq!(store.execution_tip().unwrap().height, 0);
     }
 
     #[test]
