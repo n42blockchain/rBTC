@@ -72,3 +72,19 @@ it. Older reports without the field are accepted only as borrowed. Both modes
 still construct the same full input batch and commit the same 64/256 blocks
 atomically. No threshold or maintenance setting changes. Ten runner evidence
 tests and strict all-feature driver Clippy passed before measurement.
+
+### Owned-input measured result
+
+Frozen source `1461241` used the explicitly recorded owned mode. Runner exited 1
+with `review_required`. Peak RSS was **606,961,664 / 1,311,490,048 bytes** for
+64/256; ratio **2.1607460994 > 1.5**, still failed. Content hashes matched the
+borrowed/historical workload and independent reopens passed. Both compaction
+counts were zero, so this does not provide actual maintenance-load acceptance.
+Evidence: `/Users/jieliu/Documents/n42/rBTC-storage-owned-inputs-20260917/`.
+
+The execution driver collects finished transitions before owned submission
+(`block_execution.rs`), and this diagnostic intentionally still generates the
+entire batch. Ownership transfer alone cannot bound that earlier peak. Further
+work must admit or spill generation results and include engine dirty pages in
+the same byte budget. The borrowed failure and original maintenance failure
+remain open; no original acceptance condition is replaced by this diagnostic.
