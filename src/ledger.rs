@@ -1312,12 +1312,9 @@ impl PrunedBlockLedger {
             if manifest.first_height >= height {
                 fs::remove_file(path)?;
             } else if end > height {
-                let (_, mut blocks) = read_archive(&path)?;
-                let keep = usize::try_from(height - manifest.first_height)
-                    .expect("retained block count fits usize");
-                blocks.truncate(keep);
+                let keep = height - manifest.first_height;
                 let temporary = path.with_extension("rblk.truncate");
-                write_archive(&temporary, manifest.first_height, &blocks)?;
+                crate::archive::write_archive_prefix(&path, &manifest, keep, &temporary)?;
                 self.sync(LedgerSyncPoint::TruncateArchive, &temporary)?;
                 fs::rename(temporary, path)?;
             }
@@ -2632,6 +2629,39 @@ mod tests {
             reopened.retained_ranges().unwrap(),
             vec![(10, 11), (12, 12)]
         );
+    }
+
+    #[test]
+    fn streamed_truncation_resumes_after_temporary_disk_admission_failure() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        let blocks = [vec![10; 70_000], vec![11; 80_000], vec![12; 90_000]];
+        ledger.append(10, &blocks).unwrap();
+        ledger.append(13, &[vec![13], vec![14]]).unwrap();
+        let old_bytes = fs::read(ledger.slot_path(0)).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
+        assert!(ledger.truncate_from(12).is_err());
+        assert_eq!(fs::read(ledger.slot_path(0)).unwrap(), old_bytes);
+        assert!(ledger.truncate_path().exists());
+        assert!(!ledger.slot_path(0).with_extension("rblk.truncate").exists());
+        drop(ledger);
+        assert!(PrunedBlockLedger::open(dir.path(), retention).is_err());
+        drop(pressure);
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert_eq!(recovered.read_block(11).unwrap(), Some(blocks[1].clone()));
+        assert!(recovered.read_block(12).unwrap().is_none());
+        assert!(!recovered.truncate_path().exists());
+        assert_eq!(budget.spool_snapshot().used, 0);
+        recovered.append(12, &[vec![42]]).unwrap();
+        assert_eq!(recovered.read_block(12).unwrap(), Some(vec![42]));
     }
 
     #[test]
