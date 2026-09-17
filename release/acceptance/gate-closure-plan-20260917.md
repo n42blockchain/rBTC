@@ -71,8 +71,10 @@ not change acceptance statuses or weaken thresholds.
    unchanged 1.5 threshold (1.53015), despite removing the full generated batch;
    none of these three reduced runs triggered automatic compaction.
    [Mapped-page investigation](mdbx-readahead-20260917.md) adds native memory
-   diagnostics and disables host-RAM-based read-ahead; RSS still requires a
-   passing measurement; [execution input lifetime](execution-input-lifetime-20260917.md)
+   diagnostics and disables host-RAM-based read-ahead. Source 257bd32 passes the
+   reduced 2M streamed RSS criterion (1.46980) and a separate 4M live-set run with
+   1/2 actual compactions (1.13624); full scale and sustained whole-node ownership
+   remain open, and historical failures remain preserved; [execution input lifetime](execution-input-lifetime-20260917.md)
    removes additional copies before commit, without claiming a total bound.
    [MDBX environment ownership](mdbx-memory-policy-20260917.md) now fixes spill
    policy across hosts and keeps shared reservations through compact/rebase
