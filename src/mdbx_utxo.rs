@@ -1959,7 +1959,9 @@ impl ExecutionChainStore for MdbxUtxoStore {
 
     fn commit_connect_batch_stream(
         &self,
-        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<crate::chain_store::LeasedConnectTransition, ChainStoreError>,
+        >,
         final_tip: Option<ExecutionTip>,
     ) -> Result<(), ChainStoreError> {
         self.commit_transition_iter(transitions, final_tip)

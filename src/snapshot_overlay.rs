@@ -1915,6 +1915,17 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         Ok(())
     }
 
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<crate::chain_store::LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let collected = crate::chain_store::collect_transition_stream(transitions, final_tip)?;
+        self.commit_connect_batch(&collected.transitions)
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,

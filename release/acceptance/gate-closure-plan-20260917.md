@@ -46,7 +46,9 @@ not change acceptance statuses or weaken thresholds.
    policy across hosts and keeps shared reservations through compact/rebase
    reopen. [Atomic transition consumption](atomic-transition-stream-20260917.md)
    removes the executor's second full transition vector for streaming engines;
-   preparation/spooling and other stores remain, as does RSS acceptance.
+   [transition leases](transition-memory-ownership-20260917.md) now follow
+   collecting and write-back owners through completion/failure. Reservation
+   producers, preparation/spooling and RSS acceptance remain.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact
    source identity after production changes stop.

@@ -1065,7 +1065,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                 };
                 applied_blocks.push(applied);
                 apply_elapsed += apply_started.elapsed();
-                Ok(transition)
+                Ok(transition.into())
             });
     let commit_started = Instant::now();
     chainstate.commit_connect_batch_stream(&mut transitions, tips.last().copied())?;

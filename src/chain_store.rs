@@ -441,6 +441,89 @@ pub struct ConnectTransition {
     pub transaction_undos: Vec<UtxoUndo>,
 }
 
+/// An owned transition whose optional memory reservation follows its payload.
+///
+/// A spool reader must acquire its lease before decoding. Streaming engines
+/// release the lease after consuming this block; compatibility collectors keep
+/// it until their buffered payload is committed or discarded.
+pub struct LeasedConnectTransition {
+    transition: ConnectTransition,
+    reservation: Option<crate::node_memory::MemoryLease>,
+}
+impl LeasedConnectTransition {
+    /// Attaches a reservation acquired before constructing/decoding the payload.
+    #[must_use]
+    pub fn with_reservation(
+        transition: ConnectTransition,
+        reservation: crate::node_memory::MemoryLease,
+    ) -> Self {
+        Self {
+            transition,
+            reservation: Some(reservation),
+        }
+    }
+}
+impl From<ConnectTransition> for LeasedConnectTransition {
+    /// Wraps an existing caller-owned transition without claiming it was budgeted.
+    fn from(transition: ConnectTransition) -> Self {
+        Self {
+            transition,
+            reservation: None,
+        }
+    }
+}
+impl std::ops::Deref for LeasedConnectTransition {
+    type Target = ConnectTransition;
+    fn deref(&self) -> &Self::Target {
+        &self.transition
+    }
+}
+impl std::ops::DerefMut for LeasedConnectTransition {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transition
+    }
+}
+impl std::borrow::Borrow<ConnectTransition> for LeasedConnectTransition {
+    fn borrow(&self) -> &ConnectTransition {
+        &self.transition
+    }
+}
+
+// Field order drops payloads before returning their reservation.
+pub(crate) struct CollectedTransitions {
+    pub(crate) transitions: Vec<ConnectTransition>,
+    pub(crate) leases: Vec<Arc<crate::node_memory::MemoryLease>>,
+}
+
+pub(crate) fn collect_transition_stream(
+    transitions: &mut dyn ExactSizeIterator<
+        Item = Result<LeasedConnectTransition, ChainStoreError>,
+    >,
+    final_tip: Option<ExecutionTip>,
+) -> Result<CollectedTransitions, ChainStoreError> {
+    let expected = transitions.len();
+    let mut collected = CollectedTransitions {
+        transitions: Vec::new(),
+        leases: Vec::new(),
+    };
+    for item in transitions {
+        let LeasedConnectTransition {
+            transition,
+            reservation,
+        } = item?;
+        collected.transitions.push(transition);
+        if let Some(reservation) = reservation {
+            collected.leases.push(Arc::new(reservation));
+        }
+    }
+    if collected.transitions.len() != expected
+        || collected.transitions.last().map(|item| item.next) != final_tip
+    {
+        return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+    }
+    Ok(collected)
+}
+
 /// Atomic chainstate surface block execution needs to connect and disconnect
 /// active blocks.
 ///
@@ -522,18 +605,24 @@ pub trait ExecutionChainStore: UtxoStore {
     /// A late source error must leave no committed prefix. `final_tip` binds
     /// the intended end and must be absent exactly for an empty stream.
     /// Implementations may materialize this compatibility fallback; stores
-    /// supporting bounded consumption override it.
+    /// supporting bounded consumption override it. Leased sources require an
+    /// override that retains their reservations for the actual payload lifetime.
     fn commit_connect_batch_stream(
         &self,
-        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
         final_tip: Option<ExecutionTip>,
     ) -> Result<(), ChainStoreError> {
-        let expected = transitions.len();
-        let transitions = transitions.collect::<Result<Vec<_>, _>>()?;
-        if transitions.len() != expected || transitions.last().map(|item| item.next) != final_tip {
-            return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+        let collected = collect_transition_stream(transitions, final_tip)?;
+        if !collected.leases.is_empty() {
+            // Unknown implementations may retain owned inputs after return.
+            // They must override this method to retain their leases as well.
+            return Err(
+                UtxoError::Malformed("store does not support leased transition streams").into(),
+            );
         }
-        self.commit_connect_batch_owned(transitions)
+        self.commit_connect_batch_owned(collected.transitions)
     }
     /// Commits a batch whose net coin change the caller already folded.
     ///
@@ -654,7 +743,9 @@ impl ExecutionChainStore for RedbChainStore {
 
     fn commit_connect_batch_stream(
         &self,
-        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
         final_tip: Option<ExecutionTip>,
     ) -> Result<(), ChainStoreError> {
         self.commit_transition_stream(transitions, final_tip)
@@ -2539,22 +2630,17 @@ impl RedbChainStore {
 
     fn commit_transition_stream(
         &self,
-        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
         final_tip: Option<ExecutionTip>,
     ) -> Result<(), ChainStoreError> {
         let expected = transitions.len();
         if self.validation_journal.is_some() {
             // Journal checkpoints still fold one net row. Retain that format
             // until its bounded spool path can preserve the same semantics.
-            let transitions = transitions.collect::<Result<Vec<_>, _>>()?;
-            if transitions.len() != expected
-                || transitions.last().map(|item| item.next) != final_tip
-            {
-                return Err(
-                    UtxoError::Malformed("atomic transition stream endpoint mismatch").into(),
-                );
-            }
-            return self.commit_connect_batch(&transitions);
+            let collected = collect_transition_stream(transitions, final_tip)?;
+            return self.commit_connect_batch(&collected.transitions);
         }
         if expected == 0 {
             return if final_tip.is_none() {
@@ -3142,7 +3228,7 @@ mod tests {
         }
     }
 
-    fn assert_atomic_transition_stream(store: &impl ExecutionChainStore) {
+    fn assert_atomic_transition_stream(store: &impl ExecutionChainStore, expected_peak: u64) {
         let genesis = store.execution_tip().unwrap();
         let one = ExecutionTip {
             height: 1,
@@ -3168,7 +3254,7 @@ mod tests {
             transaction_undos: vec![],
         };
         let mut failed = vec![
-            Ok(first.clone()),
+            Ok(first.clone().into()),
             Err(UtxoError::Malformed("late spool read failure").into()),
         ]
         .into_iter();
@@ -3186,7 +3272,7 @@ mod tests {
             hash: BlockHash::from_byte_array([83; 32]),
             ..two
         };
-        let mut wrong = vec![Ok(first.clone()), Ok(second.clone())].into_iter();
+        let mut wrong = vec![Ok(first.clone().into()), Ok(second.clone().into())].into_iter();
         assert!(
             store
                 .commit_connect_batch_stream(&mut wrong, Some(wrong_end))
@@ -3200,7 +3286,7 @@ mod tests {
         duplicate.created.push((key(1), coin(10)));
         assert!(
             store
-                .commit_connect_batch_stream(&mut vec![Ok(duplicate)].into_iter(), Some(one))
+                .commit_connect_batch_stream(&mut vec![Ok(duplicate.into())].into_iter(), Some(one))
                 .is_err()
         );
         assert_eq!(store.execution_tip().unwrap(), genesis);
@@ -3212,10 +3298,18 @@ mod tests {
         store
             .commit_connect_batch_stream(&mut std::iter::empty(), None)
             .unwrap();
-        let mut valid = vec![Ok(first), Ok(second)].into_iter();
+        let budget = crate::node_memory::MemoryBudget::new(200);
+        let mut valid = vec![first, second].into_iter().map(|transition| {
+            Ok(LeasedConnectTransition::with_reservation(
+                transition,
+                budget.reserve(100).unwrap(),
+            ))
+        });
         store
             .commit_connect_batch_stream(&mut valid, Some(two))
             .unwrap();
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.snapshot().peak, expected_peak);
         assert_eq!(store.execution_tip().unwrap(), two);
         assert!(store.get(key(1)).unwrap().is_none());
         assert_eq!(store.get(key(2)).unwrap().unwrap().value_sats, 20);
@@ -3237,7 +3331,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_atomic_transition_stream(&store);
+            assert_atomic_transition_stream(&store, if journal { 200 } else { 100 });
             let tip = store.execution_tip().unwrap();
             drop(store);
             let reopened = RedbChainStore::open_with_options(
@@ -3265,7 +3359,7 @@ mod tests {
                 hash: BlockHash::from_byte_array([80; 32]),
             })
             .unwrap();
-        assert_atomic_transition_stream(&store);
+        assert_atomic_transition_stream(&store, 100);
         let tip = store.execution_tip().unwrap();
         drop(store);
         let reopened = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("chain")).unwrap();

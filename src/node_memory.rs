@@ -127,6 +127,10 @@ pub struct MemoryLease {
     bytes: u64,
 }
 impl MemoryLease {
+    pub(crate) fn duplicate(&self) -> io::Result<Self> {
+        self.budget.reserve(self.bytes)
+    }
+
     pub(crate) fn reserve_additional(&self, bytes: u64) -> io::Result<Self> {
         self.budget.reserve(bytes)
     }
