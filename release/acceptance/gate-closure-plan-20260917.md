@@ -13,6 +13,7 @@ not change acceptance statuses or weaken thresholds.
    [the view report](header-views-20260917.md) and
    [node ownership report](header-node-disk-state-20260917.md). Main-node ownership
    is connected; [standby history is shared on disk](header-standby-sharing-20260917.md).
+   New marked scratch indexes have [bounded abandoned-owner cleanup](header-scratch-recovery-20260917.md).
    Aggregate resource admission and whole-node acceptance remain.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous

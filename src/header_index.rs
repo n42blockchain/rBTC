@@ -30,7 +30,9 @@ const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("validated_h
 const CHILDREN: TableDefinition<&[u8], u64> = TableDefinition::new("validated_header_children");
 const LEAVES: TableDefinition<&[u8], ()> = TableDefinition::new("validated_header_leaves");
 mod retention;
+mod scratch;
 pub use retention::StagedDiskHeaderEviction;
+use scratch::Scratch;
 const MAX_BATCH: usize = 2_000;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -98,7 +100,7 @@ pub struct DiskHeaderView {
     transaction: Arc<ReadTransaction>,
     deployments: DeploymentConfig,
     tip: HeaderInfo,
-    scratch: Option<Arc<tempfile::TempDir>>,
+    scratch: Option<Arc<Scratch>>,
     base: Option<Arc<DiskHeaderView>>,
     len: u64,
 }
@@ -205,7 +207,7 @@ pub struct DiskHeaderIndex {
     context: Option<CandidateContext>,
     len: u64,
     poisoned: bool,
-    scratch: Option<Arc<tempfile::TempDir>>,
+    scratch: Option<Arc<Scratch>>,
     base: Option<Arc<DiskHeaderView>>,
 }
 
@@ -306,12 +308,7 @@ impl DiskHeaderIndex {
         parent: impl AsRef<Path>,
         deployments: DeploymentConfig,
     ) -> Result<Self, HeaderIndexError> {
-        let scratch = Arc::new(
-            tempfile::Builder::new()
-                .prefix(".rbtc-header-index-")
-                .tempdir_in(parent)
-                .map_err(local)?,
-        );
+        let scratch = Arc::new(Scratch::create(parent.as_ref()).map_err(local)?);
         let mut index = Self::create(scratch.path().join("index.redb"), deployments)?;
         index.scratch = Some(scratch);
         Ok(index)

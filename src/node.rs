@@ -9619,6 +9619,7 @@ fn cleanup_completed_validation_dir(
                     | DATA_DIRECTORY_LOCK_OWNER_FILE
                     | "chainstate.redb"
                     | "headers.redb"
+                    | ".rbtc-header-scratch.lock"
                     | "peers.redb"
                     | "explorer.redb"
                     | "blocks"
