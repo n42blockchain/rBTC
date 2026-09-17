@@ -36,7 +36,7 @@ fn inbound_projection_hides_unexecuted_headers_and_rejects_mismatched_ledger_rec
     };
     let context = transaction_admission_context(
         &source.chainstate,
-        &source.headers.read().unwrap(),
+        &*source.headers.read().unwrap(),
         &source.deployments,
         true,
     )
@@ -51,7 +51,13 @@ fn inbound_projection_hides_unexecuted_headers_and_rejects_mismatched_ledger_rec
             context,
         )
         .unwrap();
-    source.headers.write().unwrap().insert(next.header).unwrap();
+    {
+        let mut published = source.headers.write().unwrap();
+        let HeaderSnapshot::Memory(dag) = &mut *published else {
+            panic!("memory fixture");
+        };
+        dag.insert(next.header).unwrap();
+    }
     let source = Arc::new(source);
     let advertised = "127.0.0.1:18444".parse().unwrap();
     let shared = Arc::new(SharedInboundSource::new(

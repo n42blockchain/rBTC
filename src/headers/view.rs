@@ -1,6 +1,6 @@
 //! Fallible, immutable header queries shared by memory and persistent views.
 
-use super::{BlockHash, HeaderDag, HeaderInfo, Network};
+use super::{BlockHash, CandidateContext, HeaderDag, HeaderError, HeaderInfo, Network};
 use crate::deployments::DeploymentConfig;
 use thiserror::Error;
 
@@ -92,6 +92,14 @@ pub trait HeaderView: Send + Sync {
         }
     }
 
+    /// Derives the next-work rule from a bounded window of this branch.
+    fn expected_next_bits(
+        &self,
+        candidate: &bitcoin::block::Header,
+    ) -> Result<bitcoin::pow::CompactTarget, HeaderError> {
+        CandidateContext::new(self, candidate.prev_blockhash)?.expected_next_bits(candidate)
+    }
+
     /// Computes MTP with a fixed eleven-entry stack buffer.
     fn median_time_past(&self, hash: BlockHash) -> Result<Option<u32>, HeaderReadError> {
         let Some(mut current) = self.header(&hash)? else {
@@ -173,5 +181,73 @@ impl HeaderView for HeaderDag {
     }
     fn active_header(&self, height: u32) -> Result<Option<HeaderInfo>, HeaderReadError> {
         Ok(self.active_header_at(height))
+    }
+}
+
+impl From<HeaderReadError> for String {
+    fn from(error: HeaderReadError) -> Self {
+        error.to_string()
+    }
+}
+
+/// A published node header view. Legacy memory serving is retained during
+/// migration; a disk version pins its database snapshot without copying history.
+pub enum HeaderSnapshot {
+    /// Active-only legacy in-memory serving projection.
+    Memory(Box<HeaderDag>),
+    /// Immutable validated persistent read version.
+    Disk(crate::header_index::DiskHeaderView),
+}
+impl HeaderSnapshot {
+    fn view(&self) -> &dyn HeaderView {
+        match self {
+            Self::Memory(view) => view.as_ref(),
+            Self::Disk(view) => view,
+        }
+    }
+}
+impl From<HeaderDag> for HeaderSnapshot {
+    fn from(view: HeaderDag) -> Self {
+        Self::Memory(Box::new(view))
+    }
+}
+impl From<crate::header_index::DiskHeaderView> for HeaderSnapshot {
+    fn from(view: crate::header_index::DiskHeaderView) -> Self {
+        Self::Disk(view)
+    }
+}
+impl HeaderView for HeaderSnapshot {
+    fn deployments(&self) -> &DeploymentConfig {
+        self.view().deployments()
+    }
+    fn active_tip(&self) -> HeaderInfo {
+        self.view().active_tip()
+    }
+    fn header(&self, hash: &BlockHash) -> Result<Option<HeaderInfo>, HeaderReadError> {
+        let Some(info) = self.view().header(hash)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .view()
+            .active_header(info.height)?
+            .filter(|active| active.hash == *hash))
+    }
+    fn active_header(&self, height: u32) -> Result<Option<HeaderInfo>, HeaderReadError> {
+        self.view().active_header(height)
+    }
+    fn ancestor(&self, tip: BlockHash, height: u32) -> Result<Option<HeaderInfo>, HeaderReadError> {
+        if self.header(&tip)?.is_none() {
+            return Ok(None);
+        }
+        self.view().ancestor(tip, height)
+    }
+    fn branch_locator(&self, tip: BlockHash) -> Result<Option<Vec<BlockHash>>, HeaderReadError> {
+        if self.header(&tip)?.is_none() {
+            return Ok(None);
+        }
+        self.view().branch_locator(tip)
+    }
+    fn block_locator(&self) -> Result<Vec<BlockHash>, HeaderReadError> {
+        self.view().block_locator()
     }
 }

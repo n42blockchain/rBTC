@@ -55,7 +55,7 @@ async fn peer_admission_recovers_orphans_persists_replacements_and_rejects_bad_s
             &VecDeque::new(),
             &relay,
             &source.chainstate,
-            &headers,
+            &*headers,
             &source.deployments,
             true,
             None,

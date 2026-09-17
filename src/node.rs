@@ -1,7 +1,9 @@
 //! Embeddable node runtime and command-line adapter.
 
 mod config_file;
+mod header_state;
 mod header_sync;
+use header_state::NodeHeaderState;
 use header_sync::sync_headers;
 
 use crate::i2p_sam::{I2pAddress, I2pSamSession};
@@ -117,7 +119,7 @@ use rbtc::{
     explorer_store::RedbExplorerIndex,
     fee_estimator::{FeeEstimatorError, FeeTrack, RedbFeeEstimator},
     header_store::RedbHeaderStore,
-    headers::{HeaderDag, HeaderError, HeaderInfo},
+    headers::{HeaderDag, HeaderError, HeaderInfo, HeaderReadError, HeaderSnapshot, HeaderView},
     ibd::IbdPolicy,
     inbound::{
         BlockSubmission, InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats,
@@ -2589,6 +2591,12 @@ struct PeerRunError {
     message: String,
 }
 
+impl From<HeaderReadError> for PeerRunError {
+    fn from(error: HeaderReadError) -> Self {
+        Self::local(error.to_string())
+    }
+}
+
 impl PeerRunError {
     fn local(message: impl Into<String>) -> Self {
         Self {
@@ -2624,6 +2632,9 @@ impl PeerRunError {
     }
 
     fn header(error: &HeaderError) -> Self {
+        if matches!(error, HeaderError::Read(_)) {
+            return Self::local(error.to_string());
+        }
         if error.is_peer_invalid() {
             Self::protocol(error.to_string())
         } else {
@@ -3719,7 +3730,10 @@ impl NodeRpcOperator {
         let height = tip.height.checked_add(1).ok_or_else(unavailable)?;
 
         // Core's rule: never below the median time past, never behind the clock.
-        let median_time_past = headers.median_time_past(tip.hash).ok_or_else(unavailable)?;
+        let median_time_past = headers
+            .median_time_past(tip.hash)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
         let minimum_time = median_time_past.checked_add(1).ok_or_else(unavailable)?;
         let now = unix_time().map_err(|_| unavailable())?;
         let current_time = now.max(minimum_time);
@@ -5404,7 +5418,7 @@ struct ApiServer {
 }
 
 struct NodeInboundSource {
-    headers: Arc<RwLock<HeaderDag>>,
+    headers: Arc<RwLock<HeaderSnapshot>>,
     chainstate: Arc<RedbChainStore>,
     ledger: Arc<PrunedBlockLedger>,
     transaction_pool: Arc<Mutex<TransactionAdmissionPool>>,
@@ -5602,7 +5616,7 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.submit_block(block)
     }
 
-    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderSnapshot>>, DeploymentConfig)> {
         self.current().ok()?.template_source()
     }
 
@@ -5750,7 +5764,7 @@ impl NodeInboundSource {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let context = transaction_admission_context(
             &self.chainstate,
-            &headers,
+            &*headers,
             &self.deployments,
             self.mempool_full_rbf,
         )?;
@@ -5840,7 +5854,7 @@ impl InboundDataSource for NodeInboundSource {
             .headers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_header_at(height)
+            .active_header(height)?
             .map(|info| info.header))
     }
 
@@ -5850,7 +5864,7 @@ impl InboundDataSource for NodeInboundSource {
             .headers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_height_of(hash)
+            .active_height(hash)?
             .filter(|height| *height <= executed))
     }
 
@@ -5899,7 +5913,7 @@ impl InboundDataSource for NodeInboundSource {
             }))
     }
 
-    fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
+    fn template_source(&self) -> Option<(Arc<RwLock<HeaderSnapshot>>, DeploymentConfig)> {
         Some((Arc::clone(&self.headers), self.deployments.clone()))
     }
 
@@ -5957,7 +5971,7 @@ impl InboundDataSource for NodeInboundSource {
             .headers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active_header_at(height)
+            .active_header(height)?
         else {
             return Ok(None);
         };
@@ -6189,7 +6203,7 @@ impl Drop for ApiServer {
 fn collect_node_status(
     network: Network,
     ibd_policy: IbdPolicy,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     explorer: &RedbExplorerIndex,
     ledger: &PrunedBlockLedger,
@@ -6277,7 +6291,7 @@ fn collect_node_status(
 struct RuntimeStatusSources<'a> {
     network: Network,
     ibd_policy: IbdPolicy,
-    headers: &'a HeaderDag,
+    headers: &'a dyn HeaderView,
     chainstate: &'a RedbChainStore,
     explorer: Option<&'a RedbExplorerIndex>,
     ledger: &'a PrunedBlockLedger,
@@ -7130,7 +7144,7 @@ fn run_local_reindex_batches(
     options: &Options,
     output: &std::path::Path,
     target: rbtc::execution_store::ExecutionTip,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     source_ledger: &PrunedBlockLedger,
     output_ledger: &PrunedBlockLedger,
@@ -7191,7 +7205,7 @@ fn run_local_reindex_batches(
 
 fn recover_local_reindex_indexes(
     options: &Options,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     source_ledger: &PrunedBlockLedger,
     indexes: &AuxiliaryIndexes,
@@ -7206,7 +7220,7 @@ fn recover_local_reindex_indexes(
             let tip = index.tip().map_err(|error| error.to_string())?;
             if tip.height <= execution_tip.height
                 && headers
-                    .active_header_at(tip.height)
+                    .active_header(tip.height)?
                     .is_some_and(|header| header.hash == tip.hash)
             {
                 break;
@@ -7240,7 +7254,7 @@ fn recover_local_reindex_indexes(
                         .checked_add(u32::try_from(offset).expect("index batch fits u32"))
                         .ok_or_else(|| format!("{label} index height overflow"))?;
                     headers
-                        .active_header_at(height)
+                        .active_header(height)?
                         .ok_or_else(|| format!("missing active header at height {height}"))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -7286,7 +7300,7 @@ fn finish_local_reindex(
     options: &Options,
     output: &std::path::Path,
     target: rbtc::execution_store::ExecutionTip,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     open_indexes: Option<&AuxiliaryIndexes>,
 ) -> Result<(), String> {
@@ -7625,7 +7639,7 @@ fn reject_unowned_reindex_entries(output: &std::path::Path) -> Result<(), String
 
 fn prepare_reindex_headers(
     output: &std::path::Path,
-    source: &HeaderDag,
+    source: &dyn HeaderView,
     deployments: &DeploymentConfig,
 ) -> Result<HeaderDag, String> {
     let store =
@@ -7637,8 +7651,8 @@ fn prepare_reindex_headers(
         return Err("reindex output headers contain an unexpected side branch".to_owned());
     }
     for height in 0..=current.active_tip().height {
-        if current.active_header_at(height).map(|info| info.hash)
-            != source.active_header_at(height).map(|info| info.hash)
+        if current.active_header(height)?.map(|info| info.hash)
+            != source.active_header(height)?.map(|info| info.hash)
         {
             return Err(format!(
                 "reindex output header prefix diverges from source at height {height}"
@@ -7652,12 +7666,16 @@ fn prepare_reindex_headers(
             .min(source.active_tip().height.saturating_add(1));
         let batch = (next..end)
             .map(|height| {
-                source
-                    .active_header_at(height)
-                    .expect("source active chain contains every height")
-                    .header
+                Ok::<_, HeaderReadError>(
+                    source
+                        .active_header(height)?
+                        .ok_or(HeaderReadError::Inconsistent(
+                            "missing reindex source header",
+                        ))?
+                        .header,
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let staged = current
             .stage_batch_contextual(&batch, unix_time()?)
             .map_err(|error| error.to_string())?;
@@ -7675,7 +7693,7 @@ fn prepare_reindex_headers(
 
 fn recover_local_reindex_staging(
     deployments: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
 ) -> Result<(), String> {
@@ -7715,7 +7733,7 @@ fn recover_local_reindex_staging(
         let block: Block = deserialize(raw)
             .map_err(|error| format!("decode staged reindex block at {height}: {error}"))?;
         let expected = headers
-            .active_header_at(height)
+            .active_header(height)?
             .ok_or_else(|| format!("missing active header at reindex height {height}"))?;
         validate_archive_block(deployments, headers, height, expected.hash, &block)?;
     }
@@ -7726,7 +7744,7 @@ fn recover_local_reindex_staging(
 
 fn execute_local_reindex_batch(
     options: &Options,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     auxiliary_indexes: &AuxiliaryIndexes,
@@ -7754,7 +7772,7 @@ fn execute_local_reindex_batch(
                 .checked_add(u32::try_from(offset).expect("reindex batch offset fits u32"))
                 .ok_or_else(|| "freezer reindex height overflow".to_owned())?;
             headers
-                .active_header_at(height)
+                .active_header(height)?
                 .ok_or_else(|| format!("missing active header at reindex height {height}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -8004,7 +8022,7 @@ fn verify_chain_offline(options: &Options, depth: u32, max_block_bytes: u64) -> 
     let mut issues = Vec::new();
     let mut repair_plan = Vec::new();
     if headers
-        .active_header_at(execution.height)
+        .active_header(execution.height)?
         .map(|info| info.hash)
         != Some(execution.hash)
     {
@@ -8090,7 +8108,7 @@ fn print_offline_verify_chain_report(report: &OfflineVerifyChainReport) {
 
 fn verify_freezer_cross_store(
     data_dir: &std::path::Path,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     execution_height: u32,
     depth: u32,
@@ -8146,7 +8164,7 @@ fn verify_freezer_cross_store(
 #[allow(clippy::too_many_arguments)]
 fn verify_retained_suffix(
     data_dir: &std::path::Path,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     first: u32,
     tip: u32,
@@ -8167,7 +8185,7 @@ fn verify_retained_suffix(
     let mut block_mismatch = false;
     let mut missing_undo = false;
     for (height, hash) in blocks.hashes {
-        block_mismatch |= headers.active_header_at(height).map(|info| info.hash) != Some(hash);
+        block_mismatch |= headers.active_header(height)?.map(|info| info.hash) != Some(hash);
         if chainstate
             .undos()
             .get(hash)
@@ -9299,7 +9317,7 @@ fn finalize_assumed_snapshot_with(
     deployments: &DeploymentConfig,
     active: &RedbChainStore,
     validation_dir: &std::path::Path,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
 ) -> Result<(), String> {
     let validation_path = validation_dir.join("chainstate.redb");
     let validation = RedbChainStore::open_with_options(
@@ -9347,7 +9365,7 @@ fn poll_background_validation(
     deployments: &DeploymentConfig,
     active: &RedbChainStore,
     active_dir: &std::path::Path,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
 ) -> Result<(), PeerRunError> {
     let Some(status) = status else {
         return Ok(());
@@ -10378,7 +10396,7 @@ async fn connect_and_maintain_standby(
     result
 }
 
-fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
+async fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
     let path = options
         .data_dir
         .as_ref()
@@ -10392,7 +10410,15 @@ fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
             options.deployments.clone(),
         )));
     }
-    let store = RedbHeaderStore::open(path).map_err(|error| error.to_string())?;
+    let store = RedbHeaderStore::open(&path).map_err(|error| error.to_string())?;
+    Box::pin(header_sync::recover_pending_promotion(
+        &store,
+        &path,
+        &options.deployments,
+        unix_time()?,
+    ))
+    .await
+    .map_err(|error| error.to_string())?;
     store
         .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
         .map(Some)
@@ -10400,7 +10426,7 @@ fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_peer_connections(
+async fn spawn_peer_connections(
     options: &Options,
     remotes: &[NodePeerTarget],
     local_nonce: u64,
@@ -10412,7 +10438,7 @@ fn spawn_peer_connections(
     i2p_session: Option<&Arc<I2pSamSession>>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
-    let header_seed = standby_header_seed(options)?;
+    let header_seed = standby_header_seed(options).await?;
     Ok(remotes
         .iter()
         .cloned()
@@ -10677,7 +10703,9 @@ async fn try_peer_candidates(
         advertised_onion.as_ref(),
         i2p_session,
         network_time,
-    ) {
+    )
+    .await
+    {
         Ok(pending) => pending,
         Err(error) => {
             failures.push(format!("standby header seed: {error}"));
@@ -11445,25 +11473,38 @@ async fn discover_peer_addresses(
 /// the first true and the second meaningless on its own.
 fn settle_submitted_blocks(
     awaiting: &mut AwaitingSubmissions,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     execution_height: u32,
-) {
+) -> Result<(), HeaderReadError> {
+    // Resolve every answer before taking ownership of reply channels. A failed
+    // disk read leaves the whole queue intact for a subsequent retry.
+    let answers = awaiting
+        .iter()
+        .map(|(hash, height, _)| {
+            if *height > execution_height {
+                return Ok(None);
+            }
+            Ok::<_, HeaderReadError>(Some(
+                headers
+                    .active_header(*height)?
+                    .is_some_and(|active| active.hash == *hash),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut still_pending = Vec::new();
-    for (hash, height, verdict) in std::mem::take(awaiting) {
-        if height > execution_height {
-            still_pending.push((hash, height, verdict));
+    for (entry, answer) in std::mem::take(awaiting).into_iter().zip(answers) {
+        let Some(connected) = answer else {
+            still_pending.push(entry);
             continue;
-        }
-        let connected = headers
-            .active_header_at(height)
-            .is_some_and(|active| active.hash == hash);
-        let _ = verdict.send(if connected {
+        };
+        let _ = entry.2.send(if connected {
             Ok(())
         } else {
             Err("the block was replaced on the active chain before it connected".to_owned())
         });
     }
     *awaiting = still_pending;
+    Ok(())
 }
 
 /// Stages locally submitted blocks so the ordinary execution path connects them.
@@ -11480,9 +11521,9 @@ fn settle_submitted_blocks(
 /// channel joins `awaiting` and is settled once execution has run.
 fn stage_submitted_blocks(
     pending: &Mutex<PendingBlockQueue>,
-    headers: &mut HeaderDag,
+    headers: &mut NodeHeaderState,
     headers_path: &std::path::Path,
-    inbound_headers: &RwLock<HeaderDag>,
+    inbound_headers: &RwLock<HeaderSnapshot>,
     network_time: &NetworkTime,
     prefetched_blocks: &mut PrefetchedBlocks,
     awaiting: &mut AwaitingSubmissions,
@@ -11497,6 +11538,18 @@ fn stage_submitted_blocks(
     let Ok(mut header_work) = header_sync::try_header_work() else {
         return Ok(());
     };
+    if pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .blocks
+        .is_empty()
+    {
+        return Ok(());
+    }
+    // Resolve fallible local prerequisites before taking reply channels.
+    let adjusted = network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?);
+    let store = RedbHeaderStore::open(headers_path)
+        .map_err(|error| PeerRunError::local(error.to_string()))?;
     let submitted = pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11504,35 +11557,30 @@ fn stage_submitted_blocks(
     if submitted.is_empty() {
         return Ok(());
     }
-    // Opened per drain rather than held across the loop: `sync_headers`
-    // reopens this same database on every resync, and redb admits one writer.
-    let store = RedbHeaderStore::open(headers_path)
-        .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    let adjusted = network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?);
     let mut staged_any = false;
-    for PendingBlock { block, verdict } in submitted {
+    let mut submitted = submitted.into_iter();
+    while let Some(PendingBlock { block, verdict }) = submitted.next() {
         let hash = block.block_hash();
-        let staged = match headers.stage_batch_contextual_with_budget(
+        if let Err(error) = headers.append(
+            &store,
             &[block.header],
             adjusted,
-            crate::headers::HeaderBatchLimits::default(),
             &mut header_work.budget,
+            false,
         ) {
-            Ok(staged) => staged,
-            Err(error) => {
-                rbtc_warn!("rejected submitted block {hash}: {error}");
-                let _ = verdict.send(Err(error.to_string()));
-                continue;
+            let message = error.to_string();
+            rbtc_warn!("could not stage submitted block {hash}: {message}");
+            let _ = verdict.send(Err(message.clone()));
+            if error.kind == PeerFailureKind::LocalResource {
+                // A canonical commit can precede a failed derived-index commit.
+                // Stop this writer and rebuild, never continue from a stale view.
+                for pending in submitted {
+                    let _ = pending.verdict.send(Err(message.clone()));
+                }
+                return Err(error);
             }
-        };
-        if let Err(error) = store.append_batch(&[block.header]) {
-            // Dropping the guard rolls the header back, so the in-memory DAG
-            // and the durable store cannot disagree about it.
-            rbtc_warn!("could not persist submitted block header {hash}: {error}");
-            let _ = verdict.send(Err(format!("could not persist the block header: {error}")));
             continue;
         }
-        let _ = staged.commit();
         staged_any = true;
         if headers.active_tip().hash == hash {
             let height = headers.active_tip().height;
@@ -11549,11 +11597,9 @@ fn stage_submitted_blocks(
         }
     }
     if staged_any {
-        headers.refresh_active_chain_snapshot(
-            &mut inbound_headers
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        *inbound_headers
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.published();
     }
     Ok(())
 }
@@ -11561,71 +11607,6 @@ fn stage_submitted_blocks(
 // Idle maintenance targets, not hard ingress or physical database byte limits.
 const IDLE_SIDE_HEADER_TARGET: usize = 50_000;
 const IDLE_HEADER_EVICTION_BATCH: usize = 2_000;
-
-fn retain_idle_headers(
-    headers: &mut HeaderDag,
-    path: &std::path::Path,
-    execution_tip: BlockHash,
-    target: usize,
-    max_removals: usize,
-) -> Result<usize, PeerRunError> {
-    if execution_tip != headers.active_tip().hash {
-        return Ok(0);
-    }
-    // An unfinished disk candidate depends on its retained anchor's ancestry.
-    // Until selection can pin individual disk anchors, preserve that context.
-    if header_sync::candidate_path(path)
-        .try_exists()
-        .map_err(|e| PeerRunError::local(e.to_string()))?
-    {
-        return Ok(0);
-    }
-    let hashes = headers.side_chain_eviction_plan(target, max_removals);
-    if hashes.is_empty() {
-        return Ok(0);
-    }
-    let store =
-        RedbHeaderStore::open(path).map_err(|error| PeerRunError::local(error.to_string()))?;
-    let stage = headers
-        .stage_leaf_evictions(&hashes, &[execution_tip], max_removals)
-        .map_err(|error| PeerRunError::local(error.to_string()))?;
-    store
-        .persist_eviction(&stage)
-        .map_err(|error| PeerRunError::local(error.to_string()))?;
-    stage.commit();
-    Ok(hashes.len())
-}
-
-fn resume_header_dag(
-    store: &RedbHeaderStore,
-    deployments: &DeploymentConfig,
-    existing: Option<HeaderDag>,
-) -> Result<HeaderDag, PeerRunError> {
-    // The serving loop owns this DAG and serializes header writes, including
-    // local submissions, to the same database. Transfer that ownership across
-    // polls instead of replaying and temporarily duplicating every retained
-    // fork. Startup and peer failover still validate the complete durable log.
-    if let Some(dag) = existing {
-        let persisted = store
-            .len()
-            .map_err(|error| PeerRunError::local(error.to_string()))?;
-        if !dag.uses_deployments(deployments)
-            || u64::try_from(dag.retained_header_count()).ok() != persisted.checked_add(1)
-        {
-            return Err(PeerRunError::local(
-                "retained header DAG does not match the persistence count or deployment configuration",
-            ));
-        }
-        Ok(dag)
-    } else {
-        store
-            .load_dag_with_deployments(
-                deployments.clone(),
-                unix_time().map_err(PeerRunError::transient)?,
-            )
-            .map_err(|error| PeerRunError::transient(error.to_string()))
-    }
-}
 
 /// Runs a bounded snapshot-overlay catch-up: headers first, then block
 /// execution on the immutable compressed base plus its MDBX overlay
@@ -11698,7 +11679,7 @@ async fn sync_snapshot_overlay_node(
         }
     };
     if headers
-        .active_header_at(identity.height)
+        .active_header(identity.height)?
         .is_none_or(|header| header.hash != identity.block_hash)
     {
         return Err(PeerRunError::transient(
@@ -11961,7 +11942,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     options: &Options,
     data_dir: &std::path::Path,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     mut chainstate: C,
 ) -> Result<(), PeerRunError> {
     let overlay = options
@@ -12089,7 +12070,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
                 .execution_tip()
                 .map_err(|error| error.to_string())?;
             if headers
-                .active_header_at(tip.height)
+                .active_header(tip.height)?
                 .is_some_and(|header| header.hash == tip.hash)
             {
                 break;
@@ -12335,7 +12316,7 @@ fn compiled_overlay_identity(
 /// from the validated active header chain.
 #[cfg(feature = "mdbx")]
 fn creation_mtp_range(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     from: u32,
     through: u32,
 ) -> Result<Vec<u32>, PeerRunError> {
@@ -12345,10 +12326,10 @@ fn creation_mtp_range(
             table.push(0);
             continue;
         }
-        let parent = headers.active_header_at(height - 1).ok_or_else(|| {
+        let parent = headers.active_header(height - 1)?.ok_or_else(|| {
             PeerRunError::transient(format!("missing active header at height {}", height - 1))
         })?;
-        let mtp = headers.median_time_past(parent.hash).ok_or_else(|| {
+        let mtp = headers.median_time_past(parent.hash)?.ok_or_else(|| {
             PeerRunError::transient(format!("missing median time past at height {}", height - 1))
         })?;
         table.push(mtp);
@@ -12370,18 +12351,20 @@ fn sync_snapshot_overlay_node(
 }
 
 fn unseen_header_suffix<'a>(
-    dag: &HeaderDag,
+    dag: &dyn HeaderView,
     headers: &'a [Header],
 ) -> Result<&'a [Header], HeaderError> {
-    let first_unseen = headers
-        .iter()
-        .position(|header| dag.get(&header.block_hash()).is_none())
-        .unwrap_or(headers.len());
-    if let Some(duplicate) = headers[first_unseen..]
-        .iter()
-        .find(|header| dag.get(&header.block_hash()).is_some())
-    {
-        return Err(HeaderError::Duplicate(duplicate.block_hash()));
+    let mut first_unseen = headers.len();
+    for (index, header) in headers.iter().enumerate() {
+        if dag.header(&header.block_hash())?.is_none() {
+            first_unseen = index;
+            break;
+        }
+    }
+    for header in &headers[first_unseen..] {
+        if dag.header(&header.block_hash())?.is_some() {
+            return Err(HeaderError::Duplicate(header.block_hash()));
+        }
     }
     Ok(&headers[first_unseen..])
 }
@@ -12695,7 +12678,7 @@ fn relay_due_peer_transactions(
 
 fn reconcile_fee_estimator(
     estimator: &RedbFeeEstimator,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     execution_tip: rbtc::execution_store::ExecutionTip,
     ledger: &PrunedBlockLedger,
 ) -> Result<(), String> {
@@ -12703,7 +12686,7 @@ fn reconcile_fee_estimator(
         let (height, hash) = estimator.tip().map_err(|error| error.to_string())?;
         if height <= execution_tip.height
             && headers
-                .active_header_at(height)
+                .active_header(height)?
                 .is_some_and(|header| header.hash == hash)
         {
             break;
@@ -12741,7 +12724,7 @@ fn reconcile_fee_estimator(
             .checked_add(1)
             .ok_or_else(|| "fee-estimator height overflow".to_owned())?;
         let expected = headers
-            .active_header_at(next_height)
+            .active_header(next_height)?
             .ok_or_else(|| format!("missing active fee-estimator header at {next_height}"))?;
         let Some(raw) = ledger
             .read_block(next_height)
@@ -12786,7 +12769,7 @@ fn reconcile_fee_estimator(
 
 fn transaction_admission_context(
     chainstate: &RedbChainStore,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     deployment_config: &DeploymentConfig,
     full_rbf: bool,
 ) -> Result<TransactionAdmissionContext, String> {
@@ -12803,7 +12786,7 @@ fn transaction_admission_context(
         .checked_add(1)
         .ok_or_else(|| "transaction admission height overflow".to_owned())?;
     let parent_mtp = headers
-        .median_time_past(tip.hash)
+        .median_time_past(tip.hash)?
         .ok_or_else(|| "transaction admission parent MTP is unavailable".to_owned())?;
     let deployments = block_deployment_context_for_headers(
         deployment_config,
@@ -13048,7 +13031,7 @@ fn admit_pending_peer_transactions(
     disconnected_transactions: &VecDeque<Transaction>,
     transaction_relay: &broadcast::Sender<TransactionRelay>,
     chainstate: &RedbChainStore,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     deployment_config: &DeploymentConfig,
     full_rbf: bool,
     zmq_notifier: Option<&ZmqNotifier>,
@@ -13629,10 +13612,10 @@ async fn sync_validating_node(
         None,
     )
     .await?;
-    let inbound_headers = Arc::new(RwLock::new(headers.active_chain_snapshot()));
+    let inbound_headers = Arc::new(RwLock::new(headers.published()));
     if network_execution.extends_validation_target() {
         let target = validation_target.expect("parser requires an explicit extension target");
-        let active = headers.active_header_at(target.height).ok_or_else(|| {
+        let active = headers.active_header(target.height)?.ok_or_else(|| {
             PeerRunError::transient(format!(
                 "validation target height {} is above the available active header chain",
                 target.height
@@ -13707,7 +13690,7 @@ async fn sync_validating_node(
             status.update_validation(current_tip.height);
         }
         if let Some(target) = validation_target {
-            let active = headers.active_header_at(target.height).ok_or_else(|| {
+            let active = headers.active_header(target.height)?.ok_or_else(|| {
                 PeerRunError::transient(format!(
                     "validation target height {} is above the available active header chain",
                     target.height
@@ -13748,7 +13731,7 @@ async fn sync_validating_node(
             )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             if headers
-                .active_header_at(tip.height)
+                .active_header(tip.height)?
                 .is_some_and(|header| header.hash == tip.hash)
             {
                 break;
@@ -13998,7 +13981,7 @@ async fn sync_validating_node(
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             // Settle before anything can return or park: a submission staged in
             // an earlier iteration is decided as soon as execution passes it.
-            settle_submitted_blocks(&mut awaiting_submissions, &headers, tip.height);
+            settle_submitted_blocks(&mut awaiting_submissions, &headers, tip.height)?;
             if let Some(status) = &node_status {
                 status.update(collect_node_status(
                     network,
@@ -14057,9 +14040,7 @@ async fn sync_validating_node(
                 }
             }
             if tip.height >= headers.active_tip().height {
-                let evicted = retain_idle_headers(
-                    &mut headers,
-                    &headers_path,
+                let evicted = headers.retain_idle(
                     tip.hash,
                     IDLE_SIDE_HEADER_TARGET,
                     IDLE_HEADER_EVICTION_BATCH,
@@ -14190,11 +14171,9 @@ async fn sync_validating_node(
                     Some(headers),
                 )
                 .await?;
-                headers.refresh_active_chain_snapshot(
-                    &mut inbound_headers
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                );
+                *inbound_headers
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = headers.published();
                 continue 'resync;
             }
             let effective_validation_limits = validation_scheduler
@@ -14318,7 +14297,7 @@ fn reconcile_rebroadcast_state(wallet: &WalletApiRuntime) -> Result<(), String> 
 async fn reconcile_wallet(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
     wallet: &EmbeddedWallet,
@@ -14330,16 +14309,21 @@ async fn reconcile_wallet(
         .ensure_scan_lookahead(scan.gap_limit)
         .map_err(|error| error.to_string())?;
     let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
-    let common = wallet
+    let mut common = None;
+    for checkpoint in wallet
         .chain_checkpoints()
         .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|checkpoint| {
-            checkpoint.height <= execution_tip.height
-                && headers
-                    .active_header_at(checkpoint.height)
-                    .is_some_and(|header| header.hash == checkpoint.hash)
-        })
+    {
+        if checkpoint.height <= execution_tip.height
+            && headers
+                .active_header(checkpoint.height)?
+                .is_some_and(|header| header.hash == checkpoint.hash)
+        {
+            common = Some(checkpoint);
+            break;
+        }
+    }
+    let common = common
         .ok_or_else(|| "wallet has no checkpoint in common with the active chain".to_owned())?;
     if common != wallet_tip {
         wallet
@@ -14363,7 +14347,7 @@ async fn reconcile_wallet(
     let wallet_tip = wallet.chain_tip().map_err(|error| error.to_string())?;
     if wallet_tip.height < skip_to {
         let header = headers
-            .active_header_at(skip_to)
+            .active_header(skip_to)?
             .ok_or_else(|| format!("missing active header at wallet birthday {skip_to}"))?;
         wallet
             .advance_checkpoint(WalletTip {
@@ -14442,7 +14426,7 @@ async fn reconcile_wallet(
 async fn replay_wallet_blocks(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     ledger: &PrunedBlockLedger,
     wallet: &EmbeddedWallet,
     mut next_height: u32,
@@ -14460,7 +14444,7 @@ async fn replay_wallet_blocks(
                     .checked_add(u32::try_from(offset).expect("wallet batch fits u32"))
                     .ok_or_else(|| "wallet height overflow".to_owned())?;
                 headers
-                    .active_header_at(height)
+                    .active_header(height)?
                     .ok_or_else(|| format!("missing active header at height {height}"))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -14524,7 +14508,7 @@ async fn replay_wallet_blocks(
 async fn reconcile_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     execution_store: &RedbExecutionStore,
     ledger: &PrunedBlockLedger,
     compact_candidates: &[Transaction],
@@ -14561,7 +14545,7 @@ async fn reconcile_ledger(
                 let block: Block = deserialize(bytes)
                     .map_err(|error| format!("decode staged block at height {height}: {error}"))?;
                 let expected = headers
-                    .active_header_at(height)
+                    .active_header(height)?
                     .ok_or_else(|| format!("missing active header at height {height}"))?;
                 if block.block_hash() != expected.hash {
                     on_active_chain = false;
@@ -14605,7 +14589,7 @@ async fn reconcile_ledger(
 
 fn prune_expired_block_undos<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     ledger: &PrunedBlockLedger,
 ) -> Result<u64, String> {
     let Some(retain_from_height) = ledger
@@ -14645,7 +14629,7 @@ fn prune_expired_auxiliary_index_undos(
 async fn backfill_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     ledger: &PrunedBlockLedger,
     target_height: u32,
     compact_candidates: &[Transaction],
@@ -14673,7 +14657,7 @@ async fn backfill_ledger(
                     .checked_add(u32::try_from(offset).expect("block batch fits u32"))
                     .ok_or_else(|| "ledger height overflow".to_owned())?;
                 headers
-                    .active_header_at(height)
+                    .active_header(height)?
                     .ok_or_else(|| format!("missing active header at height {height}"))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -14718,7 +14702,7 @@ async fn backfill_ledger(
 
 fn validate_archive_block(
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     height: u32,
     expected_hash: BlockHash,
     block: &Block,
@@ -14746,7 +14730,7 @@ fn validate_archive_block(
 async fn reconcile_explorer(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     explorer: &RedbExplorerIndex,
@@ -14799,7 +14783,7 @@ async fn reconcile_explorer(
         let explorer_tip = explorer.tip().map_err(|error| error.to_string())?;
         if explorer_tip.height <= execution_tip.height
             && headers
-                .active_header_at(explorer_tip.height)
+                .active_header(explorer_tip.height)?
                 .is_some_and(|header| header.hash == explorer_tip.hash)
         {
             break;
@@ -14846,7 +14830,7 @@ async fn reconcile_explorer(
                     .checked_add(u32::try_from(offset).expect("explorer batch fits u32"))
                     .ok_or_else(|| "explorer height overflow".to_owned())?;
                 headers
-                    .active_header_at(height)
+                    .active_header(height)?
                     .ok_or_else(|| format!("missing active header at height {height}"))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -14921,7 +14905,7 @@ async fn reconcile_explorer(
 async fn reconcile_auxiliary_indexes(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &RedbChainStore,
     ledger: &PrunedBlockLedger,
     indexes: &AuxiliaryIndexes,
@@ -14954,7 +14938,7 @@ async fn reconcile_auxiliary_indexes(
             let tip = index.tip().map_err(|error| error.to_string())?;
             if tip.height <= execution_tip.height
                 && headers
-                    .active_header_at(tip.height)
+                    .active_header(tip.height)?
                     .is_some_and(|header| header.hash == tip.hash)
             {
                 break;
@@ -14985,7 +14969,7 @@ async fn reconcile_auxiliary_indexes(
                         .checked_add(u32::try_from(offset).expect("index batch fits u32"))
                         .ok_or_else(|| format!("{label} index height overflow"))?;
                     headers
-                        .active_header_at(height)
+                        .active_header(height)?
                         .ok_or_else(|| format!("missing active header at height {height}"))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -15389,7 +15373,7 @@ fn shard_validation_delta_candidates<C: ExecutionChainStore>(
 async fn download_execute_batch<C: ExecutionChainStore>(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     chainstate: &C,
     ledger: &PrunedBlockLedger,
     explorer: Option<&RedbExplorerIndex>,
@@ -15442,7 +15426,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                 .checked_add(offset)
                 .ok_or_else(|| "execution height overflow".to_owned())?;
             headers
-                .active_header_at(height)
+                .active_header(height)?
                 .ok_or_else(|| format!("missing active header at height {height}"))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -15649,7 +15633,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                         .checked_add(u32::try_from(offset).expect("prefetch window fits u32"))
                         .ok_or_else(|| "prefetched block height overflow".to_owned())?;
                     headers
-                        .active_header_at(height)
+                        .active_header(height)?
                         .map(|header| header.hash)
                         .ok_or_else(|| format!("missing active header at height {height}"))
                 })
@@ -16254,7 +16238,7 @@ fn validate_live_indexes_before_prune(
 
 fn validate_downloaded_block(
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     height: u32,
     expected_hash: BlockHash,
     block: &Block,
@@ -16294,7 +16278,7 @@ fn validate_downloaded_block(
 /// keeping the bytes they came from for staging.
 fn prevalidate_replay_blocks(
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     first_height: u32,
     serialized: Vec<Vec<u8>>,
 ) -> Result<Vec<PrevalidatedBlock>, String> {
@@ -16304,7 +16288,7 @@ fn prevalidate_replay_blocks(
             .checked_add(u32::try_from(offset).map_err(|_| "read-ahead offset".to_owned())?)
             .ok_or_else(|| "read-ahead height overflow".to_owned())?;
         let expected_hash = headers
-            .active_header_at(height)
+            .active_header(height)?
             .map(|header| header.hash)
             .ok_or_else(|| format!("missing active header at height {height}"))?;
         let block = deserialize::<Block>(&bytes).map_err(|error| error.to_string())?;
@@ -16338,7 +16322,7 @@ fn prevalidate_replay_blocks(
 
 fn validate_downloaded_blocks(
     deployment_config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     expected: &[HeaderInfo],
     blocks: &[Block],
 ) -> Result<
@@ -19772,7 +19756,7 @@ mod tests {
             PrunedBlockLedger::open(directory.join("blocks"), LedgerRetention::default()).unwrap();
         (
             NodeInboundSource {
-                headers: Arc::new(RwLock::new(dag)),
+                headers: Arc::new(RwLock::new(HeaderSnapshot::from(dag))),
                 chainstate: Arc::new(chainstate),
                 ledger: Arc::new(ledger),
                 transaction_pool: Arc::new(Mutex::new(TransactionAdmissionPool::default())),
@@ -19830,9 +19814,11 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
-        let inbound_headers = RwLock::new(headers.clone());
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
+        let inbound_headers = RwLock::new(headers.published());
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
 
         let pending = Mutex::new(PendingBlockQueue::default());
@@ -19881,10 +19867,12 @@ mod tests {
     fn a_submitted_block_with_an_unknown_parent_leaves_the_chain_and_prefetch_untouched() {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
         let tip_before = headers.active_tip().hash;
-        let inbound_headers = RwLock::new(headers.clone());
+        let inbound_headers = RwLock::new(headers.published());
         // Height 2 on a parent nothing has ever seen.
         let orphan =
             submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
@@ -19914,9 +19902,11 @@ mod tests {
     async fn a_rejected_header_answers_its_submitter_instead_of_only_logging() {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
-        let inbound_headers = RwLock::new(headers.clone());
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
+        let inbound_headers = RwLock::new(headers.published());
         let orphan =
             submitted_regtest_block(BlockHash::from_byte_array([7; 32]), 2, unix_time().unwrap());
 
@@ -19953,9 +19943,11 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
-        let inbound_headers = RwLock::new(headers.clone());
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
+        let inbound_headers = RwLock::new(headers.published());
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
 
         let pending = Mutex::new(PendingBlockQueue::default());
@@ -19979,14 +19971,14 @@ mod tests {
         // Staged but not executed: answering now would claim a connection that
         // has not happened.
         assert_eq!(awaiting.len(), 1);
-        settle_submitted_blocks(&mut awaiting, &headers, 0);
+        settle_submitted_blocks(&mut awaiting, &headers, 0).unwrap();
         assert_eq!(awaiting.len(), 1);
         assert!(
             verdict.try_recv().is_err(),
             "a staged block must not be reported as connected before execution reaches it"
         );
 
-        settle_submitted_blocks(&mut awaiting, &headers, 1);
+        settle_submitted_blocks(&mut awaiting, &headers, 1).unwrap();
         assert!(awaiting.is_empty());
         assert_eq!(verdict.await.expect("the verdict is delivered"), Ok(()));
     }
@@ -19996,9 +19988,11 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
-        let inbound_headers = RwLock::new(headers.clone());
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
+        let inbound_headers = RwLock::new(headers.published());
         let now = unix_time().unwrap();
         let first = submitted_regtest_block(genesis.block_hash(), 1, now);
         // Same parent, same work: a valid header that does not win the active
@@ -20023,12 +20017,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(headers.active_tip().hash, first.block_hash());
-        assert!(headers.get(&competing.block_hash()).is_some());
+        assert!(headers.header(&competing.block_hash()).unwrap().is_some());
         {
             let serving = inbound_headers.read().unwrap();
             assert_eq!(serving.active_tip().hash, first.block_hash());
-            assert_eq!(serving.retained_header_count(), 2);
-            assert!(serving.get(&competing.block_hash()).is_none());
+            assert!(matches!(&*serving, HeaderSnapshot::Disk(_)));
+            assert_eq!(serving.active_tip().height, 1);
+            assert!(serving.header(&competing.block_hash()).unwrap().is_none());
         }
         assert_eq!(
             prefetched.serialized,
@@ -20042,9 +20037,11 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let headers_path = directory.path().join("headers.redb");
         let genesis = bitcoin::constants::genesis_block(Network::Regtest);
-        let mut headers =
-            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest));
-        let inbound_headers = RwLock::new(headers.clone());
+        let mut headers = NodeHeaderState::test_seed(
+            HeaderDag::with_deployments(DeploymentConfig::for_network(Network::Regtest)),
+            &headers_path,
+        );
+        let inbound_headers = RwLock::new(headers.published());
         let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
         let pending = Mutex::new(PendingBlockQueue::default());
         pending.lock().unwrap().push(block);
@@ -21310,6 +21307,7 @@ mod tests {
             None,
             &Arc::new(NetworkTime::default()),
         )
+        .await
         .unwrap();
 
         // Bounded so a misrouted target fails the test rather than hanging it
@@ -22386,6 +22384,7 @@ mod tests {
             None,
             &Arc::new(NetworkTime::default()),
         )
+        .await
         .unwrap();
         timeout(Duration::from_secs(2), ready_received)
             .await

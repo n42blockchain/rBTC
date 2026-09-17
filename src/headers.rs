@@ -20,7 +20,7 @@ mod candidate;
 pub(crate) use candidate::CandidateContext;
 mod resources;
 mod view;
-pub use view::{HeaderReadError, HeaderView};
+pub use view::{HeaderReadError, HeaderSnapshot, HeaderView};
 mod retention;
 pub use resources::{HeaderBatchLimits, HeaderWorkBudget};
 pub use retention::{HeaderRetentionError, StagedHeaderEviction};
@@ -294,8 +294,22 @@ impl HeaderDag {
         self.params.network
     }
 
-    pub(crate) fn uses_deployments(&self, deployments: &DeploymentConfig) -> bool {
-        &self.deployments == deployments
+    #[cfg(test)]
+    pub(crate) fn test_replay_headers(&self) -> Vec<Header> {
+        let mut records = self
+            .headers
+            .values()
+            .filter(|info| info.height != 0)
+            .copied()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|info| {
+            (
+                info.height,
+                self.active_height_of(info.hash).is_none(),
+                info.hash,
+            )
+        });
+        records.into_iter().map(|info| info.header).collect()
     }
 
     /// Returns the highest cumulative-work header.
@@ -634,6 +648,15 @@ impl HeaderDag {
         header: Header,
         adjusted_time: u32,
     ) -> Result<HeaderInfo, HeaderError> {
+        self.validate_contextual_replayed(header, adjusted_time, None)
+    }
+
+    fn validate_contextual_replayed(
+        &self,
+        header: Header,
+        adjusted_time: u32,
+        known: Option<HeaderInfo>,
+    ) -> Result<HeaderInfo, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Err(HeaderError::Duplicate(hash));
@@ -648,7 +671,7 @@ impl HeaderDag {
             .checked_add(1)
             .ok_or(HeaderError::HeightOverflow)?;
         if let Some(checkpoint_height) = self.last_known_checkpoint_height() {
-            if height < checkpoint_height {
+            if height < checkpoint_height && known.is_none() {
                 return Err(HeaderError::ForkBeforeCheckpoint {
                     height,
                     checkpoint_height,
@@ -688,7 +711,14 @@ impl HeaderDag {
                 actual: header.bits.to_consensus(),
             });
         }
-        self.validate_structure(header)
+        let info = self.validate_structure(header)?;
+        if known.is_some_and(|known| known != info) {
+            return Err(HeaderReadError::Inconsistent(
+                "replayed header differs from validated source",
+            )
+            .into());
+        }
+        Ok(info)
     }
 
     /// Adds a proof-of-work-valid child and promotes it if it has more chainwork.

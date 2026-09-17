@@ -539,7 +539,7 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn template_source(
         &self,
     ) -> Option<(
-        std::sync::Arc<std::sync::RwLock<crate::headers::HeaderDag>>,
+        std::sync::Arc<std::sync::RwLock<crate::headers::HeaderSnapshot>>,
         crate::deployments::DeploymentConfig,
     )> {
         None

@@ -19,7 +19,10 @@ pub(crate) struct CandidateContext {
 }
 
 impl CandidateContext {
-    pub(crate) fn new(source: &dyn HeaderView, anchor: BlockHash) -> Result<Self, HeaderError> {
+    pub(crate) fn new(
+        source: &(impl HeaderView + ?Sized),
+        anchor: BlockHash,
+    ) -> Result<Self, HeaderError> {
         let tip = source
             .header(&anchor)?
             .ok_or(HeaderError::UnknownParent(anchor))?;
@@ -57,6 +60,13 @@ impl CandidateContext {
         })
     }
 
+    pub(crate) fn expected_next_bits(
+        &self,
+        header: &Header,
+    ) -> Result<bitcoin::pow::CompactTarget, HeaderError> {
+        self.dag.expected_next_bits(header)
+    }
+
     pub(crate) const fn tip(&self) -> HeaderInfo {
         self.tip
     }
@@ -73,12 +83,30 @@ impl CandidateContext {
         now: u32,
         work: &mut HeaderWorkBudget,
     ) -> Result<HeaderInfo, HeaderError> {
+        self.accept_replayed(header, now, work, None)
+    }
+
+    // A source entry has already passed validation independently. During replay,
+    // its exact identity may pass below a checkpoint learned after journal
+    // creation. All PoW, difficulty, MTP, deployment and work checks still run.
+    pub(crate) fn accept_replayed(
+        &mut self,
+        header: Header,
+        now: u32,
+        work: &mut HeaderWorkBudget,
+        known: Option<HeaderInfo>,
+    ) -> Result<HeaderInfo, HeaderError> {
         // Includes bounded map maintenance as well as the difficulty/MTP walks.
         work.consume(4 * self.window as u64 + 128)?;
         if header.prev_blockhash != self.tip.hash {
             return Err(HeaderError::UnknownParent(header.prev_blockhash));
         }
-        let info = self.dag.validate_contextual(header, now)?;
+        let retained = known.and_then(|_| self.dag.headers.remove(&header.block_hash()));
+        let checked = self.dag.validate_contextual_replayed(header, now, known);
+        if let Some(retained) = retained {
+            self.dag.headers.insert(retained.hash, retained);
+        }
+        let info = checked?;
         self.dag.headers.insert(info.hash, info);
         self.recent.push_back(info.hash);
         if self.recent.len() > self.window {
@@ -97,6 +125,59 @@ impl CandidateContext {
 mod tests {
     use super::*;
     use bitcoin::{Network, block::Version, pow::CompactTarget};
+
+    #[test]
+    fn known_replay_rechecks_consensus_without_rejecting_a_later_checkpoint_floor() {
+        let mut source = HeaderDag::new(Network::Regtest);
+        let genesis = source.active_tip();
+        let header = super::super::tests::mine_child(genesis.hash, genesis.header.time + 1);
+        let known = source.insert_contextual(header, u32::MAX).unwrap();
+        let mut context = CandidateContext::new(&source, genesis.hash).unwrap();
+        // A synthetic future checkpoint isolates checkpoint-floor policy from
+        // expensive historical-network PoW; the replayed regtest header is mined.
+        context.dag.params.network = Network::Bitcoin;
+        let checkpoint = checkpoint_hash(Network::Bitcoin, 11_111).unwrap();
+        context.dag.headers.insert(
+            checkpoint,
+            HeaderInfo {
+                hash: checkpoint,
+                height: 11_111,
+                ..known
+            },
+        );
+        assert!(matches!(
+            context.accept(header, u32::MAX, &mut HeaderWorkBudget::default()),
+            Err(HeaderError::ForkBeforeCheckpoint { .. })
+        ));
+        let wrong = HeaderInfo {
+            chainwork: known.chainwork + header.target().to_work(),
+            ..known
+        };
+        assert!(matches!(
+            context.accept_replayed(
+                header,
+                u32::MAX,
+                &mut HeaderWorkBudget::default(),
+                Some(wrong)
+            ),
+            Err(HeaderError::Read(_))
+        ));
+        assert_eq!(context.tip(), genesis);
+        // A pinned source record at the replayed identity must not cause a
+        // duplicate error, but all metadata must still match the new derivation.
+        context.dag.headers.insert(known.hash, known);
+        assert_eq!(
+            context
+                .accept_replayed(
+                    header,
+                    u32::MAX,
+                    &mut HeaderWorkBudget::default(),
+                    Some(known)
+                )
+                .unwrap(),
+            known
+        );
+    }
 
     #[test]
     fn bounded_context_preserves_testnet_retarget_and_mtp_ancestors() {

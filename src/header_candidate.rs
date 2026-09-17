@@ -116,13 +116,13 @@ impl DiskHeaderCandidate {
 
     /// Opens the journal identity and bounded anchor context without replaying
     /// history. Drive `advance` in scheduler-sized slices before `finish`.
-    pub fn start_recovery(
+    pub fn start_recovery<'a>(
         path: impl AsRef<Path>,
-        source: &dyn HeaderView,
+        source: &'a dyn HeaderView,
         anchor: BlockHash,
         limits: HeaderCandidateLimits,
         work: &mut HeaderWorkBudget,
-    ) -> Result<HeaderCandidateRecovery, HeaderCandidateError> {
+    ) -> Result<HeaderCandidateRecovery<'a>, HeaderCandidateError> {
         if limits.max_batch_headers == 0
             || limits.max_batch_headers > MAX_BATCH
             || limits.max_file_bytes < PREFIX_BYTES
@@ -180,6 +180,7 @@ impl DiskHeaderCandidate {
         };
         Ok(HeaderCandidateRecovery {
             candidate: result,
+            source,
             end: length.max(PREFIX_BYTES),
         })
     }
@@ -289,40 +290,74 @@ impl DiskHeaderCandidate {
         Ok(())
     }
 
-    /// Streams committed frames without materializing the candidate chain.
-    /// The callback shares the reader's work ledger and may stop at any batch;
-    /// it is responsible for its own destination transaction/promotion policy.
-    pub fn visit_batches(
-        &mut self,
-        work: &mut HeaderWorkBudget,
-        mut visit: impl FnMut(&[Header], &mut HeaderWorkBudget) -> Result<(), HeaderCandidateError>,
-    ) -> Result<(), HeaderCandidateError> {
+    /// Opens a bounded read cursor over this already validated journal. Holding
+    /// the cursor prevents appends through this handle until it is dropped.
+    pub fn reader(&mut self) -> Result<HeaderCandidateReader<'_>, HeaderCandidateError> {
         if self.poisoned {
             return Err(HeaderCandidateError::Malformed(
                 "poisoned handle; reopen required",
             ));
         }
-        let mut offset = PREFIX_BYTES;
-        while offset < self.bytes {
-            let batch = read_frame(&mut self.file, offset, self.bytes, work)?.ok_or(
-                HeaderCandidateError::Malformed("committed frame is truncated"),
-            )?;
-            offset += 36 + batch.len() as u64 * 80;
+        Ok(HeaderCandidateReader {
+            candidate: self,
+            offset: PREFIX_BYTES,
+        })
+    }
+
+    /// Streams committed frames without materializing the candidate chain.
+    /// The callback shares the reader's work ledger and owns its publication policy.
+    pub fn visit_batches(
+        &mut self,
+        work: &mut HeaderWorkBudget,
+        mut visit: impl FnMut(&[Header], &mut HeaderWorkBudget) -> Result<(), HeaderCandidateError>,
+    ) -> Result<(), HeaderCandidateError> {
+        let mut reader = self.reader()?;
+        while let Some(batch) = reader.next_batch(work)? {
             visit(&batch, work)?;
         }
         Ok(())
     }
 }
 
+/// A read cursor whose position advances only after a complete checked frame.
+/// The caller may yield or replenish a shared lease between bounded frames.
+pub struct HeaderCandidateReader<'a> {
+    candidate: &'a mut DiskHeaderCandidate,
+    offset: u64,
+}
+impl HeaderCandidateReader<'_> {
+    /// Reads one committed frame. Failure leaves its read boundary unchanged.
+    pub fn next_batch(
+        &mut self,
+        work: &mut HeaderWorkBudget,
+    ) -> Result<Option<Vec<Header>>, HeaderCandidateError> {
+        if self.offset == self.candidate.bytes {
+            return Ok(None);
+        }
+        let batch = read_frame(
+            &mut self.candidate.file,
+            self.offset,
+            self.candidate.bytes,
+            work,
+        )?
+        .ok_or(HeaderCandidateError::Malformed(
+            "committed frame is truncated",
+        ))?;
+        self.offset += 36 + batch.len() as u64 * 80;
+        Ok(Some(batch))
+    }
+}
+
 /// Incremental startup revalidation. Only the successfully checked prefix's
 /// bounded context is retained between slices. No usable candidate is returned
 /// until every complete frame has passed contextual validation.
-pub struct HeaderCandidateRecovery {
+pub struct HeaderCandidateRecovery<'a> {
+    source: &'a dyn HeaderView,
     candidate: DiskHeaderCandidate,
     end: u64,
 }
 
-impl HeaderCandidateRecovery {
+impl HeaderCandidateRecovery<'_> {
     /// Validated header count so far, for scheduler progress reporting.
     pub const fn validated_headers(&self) -> u64 {
         self.candidate.count
@@ -373,7 +408,12 @@ impl HeaderCandidateRecovery {
             work.consume(self.candidate.context.entries() as u64)?;
             let mut next = self.candidate.context.clone();
             for header in &batch {
-                next.accept(*header, now, work)?;
+                work.consume(2)?;
+                let known = self
+                    .source
+                    .header(&header.block_hash())
+                    .map_err(HeaderError::from)?;
+                next.accept_replayed(*header, now, work, known)?;
             }
             self.candidate.context = next;
             self.candidate.bytes += 36 + batch.len() as u64 * 80;

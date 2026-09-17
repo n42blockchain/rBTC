@@ -419,3 +419,46 @@ fn disk_candidate_promotion_is_atomic_bounded_and_idempotent() {
     );
     assert_eq!(store.len().unwrap(), 7);
 }
+
+#[test]
+fn failed_raw_import_aborts_the_staged_disk_index() {
+    use crate::{
+        header_index::DiskHeaderIndex,
+        headers::{HeaderView, HeaderWorkBudget},
+    };
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = RedbHeaderStore::open(directory.path().join("headers")).unwrap();
+    let mut index = DiskHeaderIndex::create_scratch(
+        directory.path(),
+        DeploymentConfig::for_network(Network::Regtest),
+    )
+    .unwrap();
+    let old = index.snapshot().unwrap();
+    let first = mine_child(old.active_tip().hash, old.active_tip().header.time + 1);
+    let second = mine_child(first.block_hash(), first.time + 1);
+    let batch = [first, second];
+    let transaction = store.db.begin_write().unwrap();
+    transaction
+        .open_table(META)
+        .unwrap()
+        .insert(NEXT_SEQUENCE_KEY, (u64::MAX - 1).to_le_bytes().as_slice())
+        .unwrap();
+    transaction.commit().unwrap();
+    let stage = index
+        .stage(&batch, u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert!(store.append_batch(&batch).is_err());
+    drop(stage);
+    assert_eq!(store.len().unwrap(), 0);
+    assert!(index.is_empty());
+    assert_eq!(index.snapshot().unwrap().active_tip(), old.active_tip());
+    assert_eq!(
+        index
+            .snapshot()
+            .unwrap()
+            .header(&first.block_hash())
+            .unwrap(),
+        None
+    );
+    assert_eq!(old.header(&second.block_hash()).unwrap(), None);
+}

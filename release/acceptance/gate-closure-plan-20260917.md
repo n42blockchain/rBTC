@@ -10,7 +10,9 @@ not change acceptance statuses or weaken thresholds.
    work/bytes/disk and total startup-memory admission; measure actual whole-node
    concurrent-peer, execution, restart and fault workloads over sustained runs.
    The current disk-view and block-execution progress is described in
-   [the view report](header-views-20260917.md). Node ownership is the next step.
+   [the view report](header-views-20260917.md) and
+   [node ownership report](header-node-disk-state-20260917.md). Main-node ownership
+   is connected; standby copies and aggregate resource admission remain.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

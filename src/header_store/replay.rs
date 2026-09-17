@@ -75,6 +75,8 @@ impl HeaderReplayReader {
         if batch.len() != count {
             return Err(HeaderStoreError::Malformed("incomplete header order"));
         }
+        #[cfg(test)]
+        super::REPLAYED_HEADERS.with(|counter| counter.set(counter.get() + batch.len()));
         self.next_sequence = next;
         self.remaining -= count as u64;
         Ok(Some(batch))

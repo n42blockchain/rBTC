@@ -184,3 +184,100 @@ fn pinned_raw_replay_builds_disk_index_without_a_historical_dag() {
     assert_eq!(disk.len(), 2003);
     assert_eq!(disk.snapshot().unwrap().active_tip(), expected);
 }
+
+#[test]
+fn staged_index_abort_and_last_reader_cleanup_are_complete() {
+    let directory = TempDir::new().unwrap();
+    let mut index = DiskHeaderIndex::create_scratch(
+        directory.path(),
+        DeploymentConfig::for_network(Network::Regtest),
+    )
+    .unwrap();
+    let old = index.snapshot().unwrap();
+    let first = child(old.active_tip(), 1);
+    let stage = index
+        .stage(&[first], u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert_eq!(stage.active_tip().hash, first.block_hash());
+    assert!(old.header(&first.block_hash()).unwrap().is_none());
+    drop(stage);
+    assert!(index.is_empty());
+    assert!(
+        index
+            .snapshot()
+            .unwrap()
+            .header(&first.block_hash())
+            .unwrap()
+            .is_none()
+    );
+    index
+        .append(&[first], u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    let current = index.snapshot().unwrap();
+    let scratch = index.scratch.as_ref().unwrap().path().to_path_buf();
+    drop(index);
+    assert!(scratch.exists());
+    drop(old);
+    assert_eq!(current.active_tip().hash, first.block_hash());
+    drop(current);
+    assert!(!scratch.exists());
+}
+
+#[test]
+fn disk_leaf_eviction_preserves_pins_and_old_versions() {
+    let directory = TempDir::new().unwrap();
+    let mut index = DiskHeaderIndex::create(
+        directory.path().join("index"),
+        DeploymentConfig::for_network(Network::Regtest),
+    )
+    .unwrap();
+    let genesis = index.snapshot().unwrap().active_tip();
+    let active = child(genesis, 1);
+    let side = child(genesis, 2);
+    index
+        .append(&[active, side], u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    let old = index.snapshot().unwrap();
+    let pinned = index
+        .stage_eviction(
+            0,
+            2000,
+            &[side.block_hash()],
+            &mut HeaderWorkBudget::default(),
+        )
+        .unwrap();
+    assert!(pinned.evicted().is_empty());
+    drop(pinned);
+    let rollback = index
+        .stage_eviction(0, 2000, &[], &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert_eq!(rollback.evicted().len(), 1);
+    drop(rollback);
+    assert!(
+        index
+            .snapshot()
+            .unwrap()
+            .header(&side.block_hash())
+            .unwrap()
+            .is_some()
+    );
+    index
+        .stage_eviction(0, 2000, &[], &mut HeaderWorkBudget::default())
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(index.len(), 1);
+    assert!(
+        index
+            .snapshot()
+            .unwrap()
+            .header(&side.block_hash())
+            .unwrap()
+            .is_none()
+    );
+    assert!(old.header(&side.block_hash()).unwrap().is_some());
+    assert_eq!(
+        index.snapshot().unwrap().active_tip().hash,
+        active.block_hash()
+    );
+}

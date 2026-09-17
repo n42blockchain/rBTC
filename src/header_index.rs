@@ -14,7 +14,7 @@ use bitcoin::{
     hashes::Hash,
     pow::Work,
 };
-use redb::{Database, ReadTransaction, TableDefinition};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -27,6 +27,10 @@ use crate::{
 };
 
 const RECORDS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("validated_header_records");
+const CHILDREN: TableDefinition<&[u8], u64> = TableDefinition::new("validated_header_children");
+const LEAVES: TableDefinition<&[u8], ()> = TableDefinition::new("validated_header_leaves");
+mod retention;
+pub use retention::StagedDiskHeaderEviction;
 const MAX_BATCH: usize = 2_000;
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -94,6 +98,7 @@ pub struct DiskHeaderView {
     transaction: Arc<ReadTransaction>,
     deployments: DeploymentConfig,
     tip: HeaderInfo,
+    _scratch: Option<Arc<tempfile::TempDir>>,
 }
 
 impl DiskHeaderView {
@@ -193,7 +198,45 @@ pub struct DiskHeaderIndex {
     tip: HeaderInfo,
     context: Option<CandidateContext>,
     len: u64,
+    poisoned: bool,
+    scratch: Option<Arc<tempfile::TempDir>>,
 }
+
+/// An unpublished index transaction. Dropping aborts all inserted records;
+/// commit updates the writer's validated context only after durable success.
+pub struct StagedDiskHeaders<'a> {
+    index: &'a mut DiskHeaderIndex,
+    transaction: WriteTransaction,
+    context: Option<CandidateContext>,
+    tip: HeaderInfo,
+    count: u64,
+}
+impl StagedDiskHeaders<'_> {
+    /// Selected tip if this complete transaction commits.
+    pub const fn active_tip(&self) -> HeaderInfo {
+        self.tip
+    }
+    /// Publishes the complete validated batch. An ambiguous commit error poisons
+    /// the derived index, requiring rebuild from authoritative raw history.
+    pub fn commit(self) -> Result<(), HeaderIndexError> {
+        let Self {
+            index,
+            transaction,
+            context,
+            tip,
+            count,
+        } = self;
+        if let Err(error) = transaction.commit() {
+            index.poisoned = true;
+            return Err(local(error).into());
+        }
+        index.context = context;
+        index.tip = tip;
+        index.len = count;
+        Ok(())
+    }
+}
+
 impl DiskHeaderIndex {
     /// Creates a new file exclusively; never overwrites an existing index.
     /// The page cache is 8 MiB, separate from transaction and OS page buffers.
@@ -227,6 +270,16 @@ impl DiskHeaderIndex {
                 .as_slice(),
             )
             .map_err(local)?;
+        transaction
+            .open_table(CHILDREN)
+            .map_err(local)?
+            .insert(tip.hash.as_byte_array().as_slice(), 0)
+            .map_err(local)?;
+        transaction
+            .open_table(LEAVES)
+            .map_err(local)?
+            .insert(tip.hash.as_byte_array().as_slice(), ())
+            .map_err(local)?;
         transaction.commit().map_err(local)?;
         Ok(Self {
             db,
@@ -234,15 +287,38 @@ impl DiskHeaderIndex {
             tip,
             context: None,
             len: 0,
+            poisoned: false,
+            scratch: None,
         })
+    }
+
+    /// Creates an owned temporary index on the selected filesystem. Every
+    /// published read view retains its cleanup lease until the last reader exits.
+    pub fn create_scratch(
+        parent: impl AsRef<Path>,
+        deployments: DeploymentConfig,
+    ) -> Result<Self, HeaderIndexError> {
+        let scratch = Arc::new(
+            tempfile::Builder::new()
+                .prefix(".rbtc-header-index-")
+                .tempdir_in(parent)
+                .map_err(local)?,
+        );
+        let mut index = Self::create(scratch.path().join("index.redb"), deployments)?;
+        index.scratch = Some(scratch);
+        Ok(index)
     }
 
     /// Takes an immutable validated read version without copying history.
     pub fn snapshot(&self) -> Result<DiskHeaderView, HeaderIndexError> {
+        if self.poisoned {
+            return Err(local("derived header index requires rebuild").into());
+        }
         Ok(DiskHeaderView {
             transaction: Arc::new(self.db.begin_read().map_err(local)?),
             deployments: self.deployments.clone(),
             tip: self.tip,
+            _scratch: self.scratch.clone(),
         })
     }
 
@@ -264,12 +340,25 @@ impl DiskHeaderIndex {
         now: u32,
         work: &mut HeaderWorkBudget,
     ) -> Result<(), HeaderIndexError> {
+        self.stage(batch, now, work)?.commit()
+    }
+
+    /// Validates and prepares at most 2,000 records without publishing them.
+    /// This guard lets a node persist raw recovery history before committing
+    /// the derived index and publishing its next immutable read view.
+    pub fn stage<'a>(
+        &'a mut self,
+        batch: &[Header],
+        now: u32,
+        work: &mut HeaderWorkBudget,
+    ) -> Result<StagedDiskHeaders<'a>, HeaderIndexError> {
         if batch.len() > MAX_BATCH {
             return Err(HeaderIndexError::BatchLimit);
         }
-        if batch.is_empty() {
-            return Ok(());
-        }
+        work.consume(
+            2 * self.context.as_ref().map_or(0, CandidateContext::entries) as u64
+                + 2 * batch.len() as u64,
+        )?;
         let base = self.snapshot()?;
         let mut records = HashMap::with_capacity(batch.len());
         let mut context = self.context.clone();
@@ -318,17 +407,44 @@ impl DiskHeaderIndex {
         let transaction = self.db.begin_write().map_err(local)?;
         {
             let mut table = transaction.open_table(RECORDS).map_err(local)?;
-            for (hash, record) in records {
+            let mut children = transaction.open_table(CHILDREN).map_err(local)?;
+            let mut leaves = transaction.open_table(LEAVES).map_err(local)?;
+            for (hash, record) in &records {
                 table
                     .insert(hash.as_byte_array().as_slice(), record.encode().as_slice())
                     .map_err(local)?;
+                children
+                    .insert(hash.as_byte_array().as_slice(), 0)
+                    .map_err(local)?;
+                leaves
+                    .insert(hash.as_byte_array().as_slice(), ())
+                    .map_err(local)?;
+            }
+            for record in records.values() {
+                let parent = record.info.header.prev_blockhash;
+                let count = children
+                    .get(parent.as_byte_array().as_slice())
+                    .map_err(local)?
+                    .ok_or(HeaderReadError::Inconsistent("missing parent child count"))?
+                    .value();
+                let count = count
+                    .checked_add(1)
+                    .ok_or(HeaderReadError::Inconsistent("child count overflow"))?;
+                children
+                    .insert(parent.as_byte_array().as_slice(), count)
+                    .map_err(local)?;
+                leaves
+                    .remove(parent.as_byte_array().as_slice())
+                    .map_err(local)?;
             }
         }
-        transaction.commit().map_err(local)?;
-        self.context = context;
-        self.tip = tip;
-        self.len = count;
-        Ok(())
+        Ok(StagedDiskHeaders {
+            index: self,
+            transaction,
+            context,
+            tip,
+            count,
+        })
     }
 }
 

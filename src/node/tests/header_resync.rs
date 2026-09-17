@@ -31,26 +31,15 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
         store.append_batch(&active).unwrap();
         store.append_batch(&fork[..2000]).unwrap();
         drop(store);
+        let mut dag = NodeHeaderState::test_seed(dag, &path);
         if evict {
-            assert_eq!(
-                retain_idle_headers(&mut dag, &path, genesis.hash, 0, 2000).unwrap(),
-                0
-            );
+            assert_eq!(dag.retain_idle(genesis.hash, 0, 2000).unwrap(), 0);
             let executed = dag.active_tip().hash;
-            assert_eq!(
-                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
-                1000
-            );
-            assert!(dag.get(&fork[999].block_hash()).is_some());
-            assert!(dag.get(&fork[1000].block_hash()).is_none());
-            assert_eq!(
-                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
-                1000
-            );
-            assert_eq!(
-                retain_idle_headers(&mut dag, &path, executed, 0, 1000).unwrap(),
-                0
-            );
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 1000);
+            assert!(dag.header(&fork[999].block_hash()).unwrap().is_some());
+            assert!(dag.header(&fork[1000].block_hash()).unwrap().is_none());
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 1000);
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 0);
         }
         let expected = fork[2001].block_hash();
         let cursor = fork[1999].block_hash();
@@ -161,8 +150,8 @@ async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
         .unwrap();
         assert_eq!(recovered.active_tip().hash, expected);
         assert_eq!(
-            recovered.block_locator_from(expected),
-            Some(recovered.block_locator())
+            recovered.branch_locator(expected).unwrap(),
+            Some(recovered.block_locator().unwrap())
         );
         let store = RedbHeaderStore::open(&path).unwrap();
         assert_eq!(store.recovery_tip().unwrap(), None);
@@ -365,7 +354,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
         );
         for header in &batch {
             assert_eq!(
-                dag.get(&header.block_hash()),
+                dag.header(&header.block_hash()).unwrap(),
                 reference.get(&header.block_hash())
             );
         }
@@ -404,7 +393,10 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         pending.lock().unwrap().push(local.clone()),
         BlockSubmission::Queued(_)
     ));
-    let projection = RwLock::new(dag.active_chain_snapshot());
+    let mut reference = dag.clone();
+    reference.insert_contextual(local.header, now).unwrap();
+    let mut dag = NodeHeaderState::test_seed(dag, &path);
+    let projection = RwLock::new(dag.published());
     stage_submitted_blocks(
         &pending,
         &mut dag,
@@ -416,14 +408,13 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
     )
     .unwrap();
     assert_eq!(dag.active_tip().hash, local.block_hash());
-    let locator = dag.block_locator();
+    let locator = HeaderView::block_locator(&dag).unwrap();
     let mut extension = Vec::new();
     let mut parent = fork;
     for _ in 0..3 {
         parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
         extension.push(parent);
     }
-    let mut reference = dag.clone();
     let _ = reference
         .stage_batch_contextual(&extension, now)
         .unwrap()
@@ -467,10 +458,10 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         dag.retained_header_count(),
         reference.retained_header_count()
     );
-    assert!(dag.get(&local.block_hash()).is_some());
-    dag.refresh_active_chain_snapshot(&mut projection.write().unwrap());
+    assert!(dag.header(&local.block_hash()).unwrap().is_some());
+    *projection.write().unwrap() = dag.published();
     assert_eq!(projection.read().unwrap().active_tip(), dag.active_tip());
-    assert_eq!(projection.read().unwrap().retained_header_count(), 5);
+    assert_eq!(projection.read().unwrap().active_tip().height, 4);
     let restored = RedbHeaderStore::open(&path)
         .unwrap()
         .load_dag(Network::Regtest, now)
@@ -481,8 +472,8 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         dag.retained_header_count()
     );
     assert_eq!(
-        restored.get(&local.block_hash()),
-        dag.get(&local.block_hash())
+        restored.header(&local.block_hash()).unwrap(),
+        dag.header(&local.block_hash()).unwrap()
     );
     server.await.unwrap();
 }
@@ -522,7 +513,7 @@ async fn header_resync_rejects_an_invalid_batch_without_persisting_its_prefix() 
         &deployments,
         path.clone(),
         &NetworkTime::default(),
-        Some(dag),
+        Some(NodeHeaderState::test_seed(dag, &path)),
     )
     .await
     .err()
@@ -591,7 +582,7 @@ async fn header_resync_cancellation_keeps_committed_batches_for_restart() {
         &deployments,
         path.clone(),
         &clock,
-        Some(dag),
+        Some(NodeHeaderState::test_seed(dag, &path)),
     ));
     tokio::select! {
         result = &mut syncing => panic!("sync ended before cancellation: {:?}", result.err()),
@@ -657,9 +648,9 @@ async fn header_resync_rejects_local_count_or_configuration_mismatch() {
         let error = sync_headers(
             &mut session,
             &deployments,
-            path,
+            path.clone(),
             &NetworkTime::default(),
-            Some(dag),
+            Some(NodeHeaderState::test_seed(dag, &path)),
         )
         .await
         .err()
@@ -710,7 +701,7 @@ async fn header_resync_resource_probe() {
     }
     let expected = dag.active_tip();
     let count = dag.retained_header_count();
-    let locator = dag.block_locator();
+    let locator = HeaderView::block_locator(&dag).unwrap();
     drop(dag);
     drop(store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -868,7 +859,7 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
             &deployments,
             path.clone(),
             &NetworkTime::default(),
-            Some(dag),
+            Some(NodeHeaderState::test_seed(dag, &path)),
             policy
         )
         .await
@@ -877,16 +868,14 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
     server.await.unwrap();
     let store = RedbHeaderStore::open(&path).unwrap();
     assert_eq!(store.len().unwrap(), 2002);
-    let mut restored = store.load_dag(Network::Regtest, u32::MAX).unwrap();
+    let mut restored =
+        NodeHeaderState::test_seed(store.load_dag(Network::Regtest, u32::MAX).unwrap(), &path);
     drop(store);
     assert_eq!(restored.active_tip(), original);
     // The candidate is anchored on a retained side header. Idle eviction must
     // not remove it even when the execution tip matches the active tip.
-    assert_eq!(
-        retain_idle_headers(&mut restored, &path, original.hash, 0, 1).unwrap(),
-        0
-    );
-    assert!(restored.get(&fork[0].block_hash()).is_some());
+    assert_eq!(restored.retain_idle(original.hash, 0, 1).unwrap(), 0);
+    assert!(restored.header(&fork[0].block_hash()).unwrap().is_some());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
     let suffix = fork[2000..].to_vec();
@@ -982,5 +971,188 @@ async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
             .unwrap()
             .active_tip(),
         result.active_tip()
+    );
+}
+
+/// Exercise every durable boundary around the full-candidate completion marker.
+/// These are restart-state fixtures, not a process-kill acceptance measurement.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn candidate_import_restart_never_publishes_a_partial_winner() {
+    use crate::{
+        header_candidate::{DiskHeaderCandidate, HeaderCandidateLimits},
+        header_store::HeaderStoreError,
+        headers::HeaderWorkBudget,
+        node::header_sync::{candidate_path, sync_headers},
+    };
+    for (imported, finished, startup) in [
+        (0, false, false),
+        (3, false, false),
+        (4, false, false),
+        (4, true, false),
+        (3, false, true),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("headers.redb");
+        let deployments = DeploymentConfig::for_network(Network::Regtest);
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let mut active = Vec::new();
+        let mut parent = genesis.header;
+        for _ in 0..2 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+            active.push(parent);
+        }
+        let mut fork = Vec::new();
+        parent = genesis.header;
+        for _ in 0..4 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+            fork.push(parent);
+        }
+        let _ = dag
+            .stage_batch_contextual(&active, u32::MAX)
+            .unwrap()
+            .commit();
+        let original = dag.active_tip();
+        let mut budget = HeaderWorkBudget::default();
+        let journal = candidate_path(&path);
+        let mut candidate = DiskHeaderCandidate::open(
+            &journal,
+            &dag,
+            genesis.hash,
+            u32::MAX,
+            HeaderCandidateLimits::default(),
+            &mut budget,
+        )
+        .unwrap();
+        candidate.append(&fork, u32::MAX, &mut budget).unwrap();
+        let winner = candidate.tip();
+        drop(candidate);
+        let store = RedbHeaderStore::open(&path).unwrap();
+        store.append_batch(&active).unwrap();
+        store.begin_candidate_promotion(winner.hash).unwrap();
+        store.append_batch(&fork[..imported]).unwrap();
+        if finished {
+            store.finish_candidate_promotion(winner.hash).unwrap();
+        } else {
+            assert!(matches!(
+                store.load_dag(Network::Regtest, u32::MAX),
+                Err(HeaderStoreError::PendingCandidate)
+            ));
+        }
+        if startup {
+            // This runs before peer creation in the real standby seed path.
+            crate::node::header_sync::recover_pending_promotion(
+                &store,
+                &path,
+                &deployments,
+                u32::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .load_dag(Network::Regtest, u32::MAX)
+                    .unwrap()
+                    .active_tip(),
+                winner
+            );
+        }
+        drop(store);
+        assert_eq!(dag.active_tip(), original);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(9811)).await;
+            let NetworkMessage::GetHeaders(request) =
+                peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected fully recovered winner");
+            };
+            assert_eq!(request.locator_hashes[0], winner.hash);
+            peer.write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+        });
+        let mut peer = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            9810,
+            "/rbtc:restart/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let state = sync_headers(
+            &mut peer,
+            &deployments,
+            path.clone(),
+            &NetworkTime::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(state.active_tip(), winner);
+        assert!(!journal.exists());
+        let store = RedbHeaderStore::open(&path).unwrap();
+        assert_eq!(store.pending_candidate_tip().unwrap(), None);
+        assert_eq!(store.len().unwrap(), 6);
+        assert_eq!(
+            store
+                .load_dag(Network::Regtest, u32::MAX)
+                .unwrap()
+                .active_tip(),
+            winner
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_pending_candidate_fails_locally_before_network_request() {
+    use crate::node::header_sync::sync_headers;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let genesis = HeaderDag::new(Network::Regtest).active_tip();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.begin_candidate_promotion(genesis.hash).unwrap();
+    drop(store);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9821)).await;
+        // The client closes without sending any getheaders request.
+        assert!(peer.read_message().await.is_err());
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9820,
+        "/rbtc:missing/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let result = sync_headers(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        None,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("missing journal must fail");
+    };
+    assert_eq!(error.kind, PeerFailureKind::LocalResource);
+    drop(peer);
+    server.await.unwrap();
+    assert_eq!(
+        RedbHeaderStore::open(&path)
+            .unwrap()
+            .pending_candidate_tip()
+            .unwrap(),
+        Some(genesis.hash)
     );
 }

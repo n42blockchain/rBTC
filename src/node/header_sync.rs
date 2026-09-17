@@ -1,12 +1,12 @@
 //! Node-owned single-slot disk candidate scheduling and shared validation work.
 use super::{
-    DeploymentConfig, HeaderDag, IDLE_SIDE_HEADER_TARGET, MAX_HEADERS_PER_RESPONSE, NetworkTime,
-    PeerRunError, RedbHeaderStore, receive_headers, request_headers, resume_header_dag, unix_time,
+    DeploymentConfig, HeaderView, IDLE_SIDE_HEADER_TARGET, MAX_HEADERS_PER_RESPONSE, NetworkTime,
+    NodeHeaderState, PeerRunError, RedbHeaderStore, receive_headers, request_headers, unix_time,
     unseen_header_suffix,
 };
 use crate::{
     header_candidate::{DiskHeaderCandidate, HeaderCandidateError, HeaderCandidateLimits},
-    headers::{HeaderBatchLimits, HeaderWorkBudget},
+    headers::HeaderWorkBudget,
     rbtc_info,
 };
 use std::{
@@ -19,6 +19,7 @@ use std::{
 const WORK_CAPACITY: u64 = 1_000_000_000;
 const WORK_PER_SECOND: u64 = 64_000_000;
 pub(super) const BATCH_WORK: u64 = 32_000_000;
+#[cfg(test)]
 const PROMOTION_WORK: u64 = 256_000_000;
 
 struct WorkPool {
@@ -126,9 +127,38 @@ fn received_candidate(error: HeaderCandidateError) -> PeerRunError {
     }
 }
 
+// Recovery and import can outlast a peer's idle timeout on large journals.
+// Ping between bounded frames so unsolicited messages use the session's normal
+// bounded queue and network failures leave the durable cursor available.
+struct ReplayKeepalive(Instant);
+impl ReplayKeepalive {
+    fn new() -> Self {
+        Self(Instant::now())
+    }
+    async fn tick(
+        &mut self,
+        session: Option<&mut rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
+    ) -> Result<(), PeerRunError> {
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if self.0.elapsed() >= Duration::from_secs(20) {
+            tokio::time::timeout(super::PEER_TIMEOUT, session.ping(rand::random()))
+                .await
+                .map_err(|_| {
+                    PeerRunError::transient("peer keepalive timed out during candidate replay")
+                })?
+                .map_err(|error| PeerRunError::p2p(&error))?;
+            self.0 = Instant::now();
+        }
+        Ok(())
+    }
+}
+
 async fn resume_candidate(
+    mut session: Option<&mut rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     path: &std::path::Path,
-    dag: &HeaderDag,
+    dag: &dyn HeaderView,
     now: u32,
 ) -> Result<Option<DiskHeaderCandidate>, PeerRunError> {
     let Some(anchor) = DiskHeaderCandidate::stored_anchor(path).map_err(local)? else {
@@ -145,7 +175,9 @@ async fn resume_candidate(
         )
         .map_err(local)?
     };
+    let mut keepalive = ReplayKeepalive::new();
     loop {
+        keepalive.tick(session.as_deref_mut()).await?;
         let done = {
             let mut lease = work(BATCH_WORK).await;
             recovery.advance(1, now, &mut lease.budget).map_err(local)?
@@ -158,32 +190,95 @@ async fn resume_candidate(
 }
 
 async fn promote(
+    mut session: Option<&mut rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     candidate: &mut Option<DiskHeaderCandidate>,
     path: &std::path::Path,
-    dag: &mut HeaderDag,
+    state: &mut NodeHeaderState,
     store: &RedbHeaderStore,
     now: u32,
     policy: HeaderSyncPolicy,
 ) -> Result<(), PeerRunError> {
+    let pending = store.pending_candidate_tip().map_err(local)?;
     let Some(disk) = candidate.as_mut() else {
+        if pending.is_some() {
+            return Err(local("pending header promotion has no recoverable journal"));
+        }
         return Ok(());
     };
-    if disk.tip().chainwork <= dag.active_tip().chainwork && dag.get(&disk.tip().hash).is_none() {
-        return Ok(());
+    let tip = disk.tip();
+    if pending.is_some_and(|hash| hash != tip.hash) {
+        return Err(local("pending promotion and candidate journal disagree"));
     }
-    let promoted = {
-        let mut lease = work(PROMOTION_WORK).await;
-        store
-            .promote_candidate(dag, disk, now, policy.promotion_bytes, &mut lease.budget)
-            .map_err(local)?
-    };
-    if promoted {
-        // The redb commit precedes cleanup. On a crash here, replay sees the
-        // already-retained candidate tip and can idempotently finish cleanup.
-        drop(candidate.take());
-        fs::remove_file(path).map_err(local)?;
+    if state.header(&tip.hash)? == Some(tip) {
+        if pending.is_some() {
+            store.finish_candidate_promotion(tip.hash).map_err(local)?;
+        }
+    } else {
+        if pending.is_none() && tip.chainwork <= state.active_tip().chainwork {
+            return Ok(());
+        }
+        // This allowance now covers one bounded streaming frame, never the
+        // complete candidate. Engine cache and transaction memory are separate.
+        let frame_bytes = usize::try_from(disk.len().min(2_000)).expect("bounded count")
+            * (size_of::<bitcoin::block::Header>()
+                + size_of::<crate::headers::HeaderInfo>()
+                + size_of::<bitcoin::BlockHash>())
+            * 2;
+        if frame_bytes > policy.promotion_bytes {
+            return Err(local("candidate promotion frame allowance exhausted"));
+        }
+        store.begin_candidate_promotion(tip.hash).map_err(local)?;
+        {
+            let mut reader = disk.reader().map_err(local)?;
+            let mut keepalive = ReplayKeepalive::new();
+            loop {
+                keepalive.tick(session.as_deref_mut()).await?;
+                {
+                    let mut lease = work(BATCH_WORK).await;
+                    let Some(batch) = reader.next_batch(&mut lease.budget).map_err(local)? else {
+                        break;
+                    };
+                    let unseen = unseen_header_suffix(state, &batch).map_err(local)?;
+                    state.append(store, unseen, now, &mut lease.budget, true)?;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        if state.header(&tip.hash)? != Some(tip) || state.active_tip().chainwork < tip.chainwork {
+            return Err(local("candidate promotion did not reach its validated tip"));
+        }
+        store.finish_candidate_promotion(tip.hash).map_err(local)?;
     }
+    // Complete raw history and promotion completion are durable before unlink.
+    drop(candidate.take());
+    fs::remove_file(path).map_err(local)?;
     Ok(())
+}
+
+/// Startup must complete durable import intent before legacy seed readers run.
+/// No network is needed: the journal already contains the validated winner.
+pub(super) async fn recover_pending_promotion(
+    store: &RedbHeaderStore,
+    path: &std::path::Path,
+    deployments: &DeploymentConfig,
+    now: u32,
+) -> Result<(), PeerRunError> {
+    if store.pending_candidate_tip().map_err(local)?.is_none() {
+        return Ok(());
+    }
+    let mut state = NodeHeaderState::resume(store, path, deployments, now, None, None).await?;
+    let journal = candidate_path(path);
+    let mut candidate = resume_candidate(None, &journal, &state, now).await?;
+    promote(
+        None,
+        &mut candidate,
+        &journal,
+        &mut state,
+        store,
+        now,
+        HeaderSyncPolicy::default(),
+    )
+    .await
 }
 
 pub(super) async fn sync_headers(
@@ -191,8 +286,8 @@ pub(super) async fn sync_headers(
     deployments: &DeploymentConfig,
     path: PathBuf,
     network_time: &NetworkTime,
-    existing: Option<HeaderDag>,
-) -> Result<HeaderDag, PeerRunError> {
+    existing: Option<NodeHeaderState>,
+) -> Result<NodeHeaderState, PeerRunError> {
     sync_headers_with_policy(
         session,
         deployments,
@@ -210,12 +305,21 @@ pub(super) async fn sync_headers_with_policy(
     deployments: &DeploymentConfig,
     path: PathBuf,
     network_time: &NetworkTime,
-    existing: Option<HeaderDag>,
+    existing: Option<NodeHeaderState>,
     policy: HeaderSyncPolicy,
-) -> Result<HeaderDag, PeerRunError> {
+) -> Result<NodeHeaderState, PeerRunError> {
     let pending_path = candidate_path(&path);
-    let store = RedbHeaderStore::open(path).map_err(local)?;
-    let mut dag = resume_header_dag(&store, deployments, existing)?;
+    let store = RedbHeaderStore::open(&path).map_err(local)?;
+    let adjusted = network_time.adjusted_time(unix_time().map_err(PeerRunError::transient)?);
+    let mut dag = NodeHeaderState::resume(
+        &store,
+        &path,
+        deployments,
+        adjusted,
+        existing,
+        Some(session),
+    )
+    .await?;
     let time = network_time.snapshot();
     rbtc_info!(
         "resuming headers-first sync from {}:{} (network_time_samples={} offset_seconds={} usable={})",
@@ -231,8 +335,9 @@ pub(super) async fn sync_headers_with_policy(
             .map(|time| network_time.adjusted_time(time))
             .map_err(PeerRunError::transient)
     };
-    let mut candidate = resume_candidate(&pending_path, &dag, now()?).await?;
+    let mut candidate = resume_candidate(Some(session), &pending_path, &dag, now()?).await?;
     promote(
+        Some(session),
         &mut candidate,
         &pending_path,
         &mut dag,
@@ -241,11 +346,10 @@ pub(super) async fn sync_headers_with_policy(
         policy,
     )
     .await?;
-    let mut recovery_tip = store
-        .recovery_tip()
-        .map_err(local)?
-        .filter(|hash| dag.get(hash).is_some())
-        .unwrap_or(dag.active_tip().hash);
+    let mut recovery_tip = match store.recovery_tip().map_err(local)? {
+        Some(hash) if dag.header(&hash)?.is_some() => hash,
+        _ => dag.active_tip().hash,
+    };
     let mut following_candidate = candidate.is_some();
     let mut recovering = false;
     loop {
@@ -258,11 +362,8 @@ pub(super) async fn sync_headers_with_policy(
                 .map_err(local)?
         } else {
             let mut lease = work(BATCH_WORK).await;
-            lease
-                .budget
-                .consume(2 * dag.retained_header_count() as u64 + 128)
-                .map_err(local)?;
-            dag.block_locator_from(recovery_tip)
+            lease.budget.consume(90_000).map_err(local)?;
+            dag.branch_locator(recovery_tip)?
                 .ok_or_else(|| local("header recovery ancestry missing"))?
         };
         request_headers(session, locator).await?;
@@ -285,6 +386,7 @@ pub(super) async fn sync_headers_with_policy(
             }
             recovery_tip = headers.last().expect("nonempty response").block_hash();
             promote(
+                Some(session),
                 &mut candidate,
                 &pending_path,
                 &mut dag,
@@ -315,8 +417,8 @@ pub(super) async fn sync_headers_with_policy(
             if response_count < MAX_HEADERS_PER_RESPONSE
                 || response_tip == recovery_tip
                 || (recovering
-                    && dag.get(&response_tip).map(|info| info.height)
-                        <= dag.get(&recovery_tip).map(|info| info.height))
+                    && dag.header(&response_tip)?.map(|info| info.height)
+                        <= dag.header(&recovery_tip)?.map(|info| info.height))
             {
                 break;
             }
@@ -349,6 +451,7 @@ pub(super) async fn sync_headers_with_policy(
             candidate = Some(disk);
             drop(lease);
             promote(
+                Some(session),
                 &mut candidate,
                 &pending_path,
                 &mut dag,
@@ -360,18 +463,7 @@ pub(super) async fn sync_headers_with_policy(
             following_candidate = candidate.is_some();
         } else {
             let mut lease = work(BATCH_WORK).await;
-            let stage = dag
-                .stage_batch_contextual_with_budget(
-                    unseen,
-                    now()?,
-                    HeaderBatchLimits::default(),
-                    &mut lease.budget,
-                )
-                .map_err(|e| PeerRunError::header(&e))?;
-            store
-                .append_recovery_batch(unseen, response_tip)
-                .map_err(local)?;
-            let _ = stage.commit();
+            dag.append(&store, unseen, now()?, &mut lease.budget, true)?;
         }
         recovery_tip = response_tip;
         recovering = true;
