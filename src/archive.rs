@@ -17,6 +17,8 @@ const FORMAT_VERSION: u16 = 2;
 const LEGACY_FORMAT_VERSION: u16 = 1;
 const PIECE_SIZE: usize = 4 * 1024 * 1024;
 const PIECE_SCRATCH_BYTES: usize = 64 * 1024;
+// Fixed-schema JSON needs fewer than 512 + 261 * 67 bytes.
+const GENERATED_MANIFEST_BYTES: usize = 32 * 1024;
 const MAX_MANIFEST_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_BYTES: usize = 4_000_000;
 const MAX_BLOCKS_PER_ARCHIVE: u32 = 100_000;
@@ -401,6 +403,45 @@ fn deserialize_pieces<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_seq(PiecesVisitor)
 }
 
+struct ManifestWriteAdmission {
+    result: Option<crate::node_memory::MemoryLease>,
+    metadata: ManifestWriteBuffer,
+    piece: PieceScratch,
+}
+impl ManifestWriteAdmission {
+    fn new(path: &Path) -> Result<Self, ArchiveError> {
+        let result = reserve_archive_memory(path, MANIFEST_MEMORY_BYTES)?;
+        let reservation = reserve_archive_memory(path, GENERATED_MANIFEST_BYTES as u64)?;
+        let piece = PieceScratch::new(path)?;
+        Ok(Self {
+            result,
+            metadata: ManifestWriteBuffer {
+                bytes: Vec::with_capacity(GENERATED_MANIFEST_BYTES),
+                _reservation: reservation,
+            },
+            piece,
+        })
+    }
+}
+struct ManifestWriteBuffer {
+    bytes: Vec<u8>,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+impl Write for ManifestWriteBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > GENERATED_MANIFEST_BYTES - self.bytes.len() {
+            return Err(std::io::Error::other(
+                "generated archive manifest limit exceeded",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Creates a zstd archive whose compressed bytes can be safely piece-verified before import.
 pub fn write_archive(
     path: impl AsRef<Path>,
@@ -416,6 +457,7 @@ pub fn write_archive(
                 .map_err(ArchiveError::ResourceBudget)
         })
         .transpose()?;
+    let admission = ManifestWriteAdmission::new(path)?;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -432,6 +474,7 @@ pub fn write_archive(
         records_bytes,
         records_sha256,
         temporary.file,
+        admission,
     )
 }
 
@@ -442,14 +485,20 @@ fn finish_archive_file(
     records_bytes: u64,
     records_sha256: String,
     mut compressed: File,
+    mut admission: ManifestWriteAdmission,
 ) -> Result<ArchiveManifest, ArchiveError> {
     compressed.seek(SeekFrom::Start(0))?;
-    let mut scratch = PieceScratch::new(path)?;
-    let mut piece_sha256 = Vec::new();
-    while let Some(hash) = scratch.next_hash(&mut compressed)? {
+    let mut piece_sha256 = Vec::with_capacity(MAX_PIECES);
+    for _ in 0..MAX_PIECES {
+        let Some(hash) = admission.piece.next_hash(&mut compressed)? else {
+            break;
+        };
         piece_sha256.push(hash);
     }
-    let manifest: ArchiveManifest = ArchiveManifestFields {
+    if compressed.read(&mut [0])? != 0 {
+        return Err(ArchiveError::Invalid("too many archive pieces"));
+    }
+    let fields = ArchiveManifestFields {
         format_version: FORMAT_VERSION,
         first_height,
         block_count,
@@ -457,9 +506,10 @@ fn finish_archive_file(
         records_sha256,
         piece_size: PIECE_SIZE,
         piece_sha256,
-    }
-    .into();
-    let metadata = serde_json::to_vec(&manifest)?;
+    };
+    let manifest = ArchiveManifest::admitted(fields, admission.result);
+    serde_json::to_writer(&mut admission.metadata, &manifest)?;
+    let metadata = &admission.metadata.bytes;
     let compressed_bytes = compressed.metadata()?.len();
     if 12 + metadata.len() as u64 + compressed_bytes > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
@@ -472,7 +522,7 @@ fn finish_archive_file(
             .map_err(|_| ArchiveError::Invalid("manifest too large"))?
             .to_le_bytes(),
     )?;
-    output.write_all(&metadata)?;
+    output.write_all(metadata)?;
     std::io::copy(&mut compressed, &mut output)?;
     Ok(manifest)
 }
@@ -619,6 +669,7 @@ pub(crate) fn write_archive_prefix(
                 .map_err(ArchiveError::ResourceBudget)
         })
         .transpose()?;
+    let admission = ManifestWriteAdmission::new(destination)?;
     let parent = destination
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -656,6 +707,7 @@ pub(crate) fn write_archive_prefix(
         records_bytes,
         crate::utxo::hex_lower(&digest.finalize()),
         temporary.file,
+        admission,
     )
 }
 
@@ -1363,6 +1415,92 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn generated_manifest_admission_preserves_outputs_and_survives_prefix_aliases() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.rblk");
+        let target = dir.path().join("target.rblk");
+        let source_manifest = write_archive(&source, 1, &[vec![7], vec![8]]).unwrap();
+        fs::write(&target, b"preserve this destination").unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let peak =
+            MANIFEST_MEMORY_BYTES + GENERATED_MANIFEST_BYTES as u64 + PIECE_SCRATCH_BYTES as u64;
+        let pressure = budget.reserve(budget.snapshot().limit - peak + 1).unwrap();
+        assert!(matches!(
+            write_archive(&target, 3, &[vec![9]]),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve this destination");
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        drop(pressure);
+        assert_eq!(budget.snapshot().used, 0);
+        let manifest = write_archive(&target, 3, &[vec![9]]).unwrap();
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        let alias = manifest.clone();
+        drop(manifest);
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        assert_eq!(alias, encode_archive(3, &[vec![9]]).unwrap().0);
+        drop(alias);
+        assert_eq!(budget.snapshot().used, 0);
+        let prefix = write_archive_prefix(&source, &source_manifest, 1, &target).unwrap();
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            encode_archive(1, &[vec![7]]).unwrap().1
+        );
+        let alias = prefix.clone();
+        drop(prefix);
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        drop(alias);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.spool_snapshot().used, 0);
+    }
+
+    #[test]
+    fn generated_manifest_json_stays_within_fixed_capacity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("maximum.rblk");
+        let budget = crate::node_memory::MemoryBudget::new(1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let mut admission = ManifestWriteAdmission::new(&path).unwrap();
+        let fields = ArchiveManifestFields {
+            format_version: u16::MAX,
+            first_height: u32::MAX,
+            block_count: u32::MAX,
+            records_bytes: u64::MAX,
+            records_sha256: "f".repeat(64),
+            piece_size: usize::MAX,
+            piece_sha256: vec!["f".repeat(64); MAX_PIECES],
+        };
+        serde_json::to_writer(&mut admission.metadata, &fields).unwrap();
+        assert!(admission.metadata.bytes.len() < 512 + MAX_PIECES * 67);
+        assert_eq!(
+            admission.metadata.bytes,
+            serde_json::to_vec(&fields).unwrap()
+        );
+        assert_eq!(
+            admission.metadata.bytes.capacity(),
+            GENERATED_MANIFEST_BYTES
+        );
+        let length = admission.metadata.bytes.len();
+        assert!(
+            admission
+                .metadata
+                .write_all(&vec![0; GENERATED_MANIFEST_BYTES].into_boxed_slice())
+                .is_err()
+        );
+        assert_eq!(admission.metadata.bytes.len(), length);
+        assert_eq!(
+            admission.metadata.bytes.capacity(),
+            GENERATED_MANIFEST_BYTES
+        );
+        drop(fields);
+        drop(admission);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
     fn file_manifest_admission_survives_aliases_and_preserves_wire_identity() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("manifest.rblk");
@@ -1657,8 +1795,7 @@ mod tests {
         let path = dir.path().join("scratch.rblk");
         let manifest = write_archive(&path, 10, &[vec![3; 128]]).unwrap();
         let original = fs::read(&path).unwrap();
-        let json_bytes = u64::from(u32::from_le_bytes(original[8..12].try_into().unwrap()));
-        let metadata_peak = MANIFEST_MEMORY_BYTES + 8 * json_bytes;
+        let metadata_peak = MANIFEST_MEMORY_BYTES + GENERATED_MANIFEST_BYTES as u64;
         let budget =
             crate::node_memory::MemoryBudget::new(PIECE_SCRATCH_BYTES as u64 + metadata_peak);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
