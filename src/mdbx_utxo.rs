@@ -174,13 +174,15 @@ pub struct MdbxCompactionReport {
     pub content_sha256: [u8; 32],
 }
 
-/// Durable boundary reached by a compact-copy directory swap.
+/// Observable boundary reached by a compact-copy directory swap.
 ///
 /// Exposed so the crash gate can terminate a child process at every boundary;
 /// ordinary callers should use [`MdbxUtxoStore::compact`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MdbxCompactionPhase {
-    /// Verified copy and manifest are durable; the source is still active.
+    /// Source mapping is closed; its canonical path is intact and the copy is unverified.
+    SourceClosed,
+    /// Verified copy and manifest are durable; the source path is still intact.
     CopySynced,
     /// Source was renamed aside, before syncing the parent directory.
     SourceRenamed,
@@ -683,23 +685,19 @@ impl MdbxUtxoStore {
         remove_path_if_exists(&old_dir)?;
         fs::create_dir_all(&fresh_dir)?;
         self.db().copy_compact(&fresh_dir.join("mdbx.dat"))?;
-        let copied = crate::mdbx_memory::Environment::open_reserved(
-            &fresh_dir,
-            self.capacity_bytes,
-            copy_allowance,
-        )?;
-        validate_compacted_environment(&copied)?;
-        let copied_audit = audit_environment(&copied, &fresh_dir, self.capacity_bytes)?;
-        if CompactionManifest::from_audit(before) != CompactionManifest::from_audit(copied_audit) {
-            return Err(UtxoError::Malformed("compacted MDBX content identity"));
+        // The copy owns independent files. Release the source mapping before
+        // faulting the copy into memory for verification, retaining its lease
+        // so a failed verification can reopen the unchanged canonical source.
+        drop(self.db.take());
+        phase_hook(MdbxCompactionPhase::SourceClosed);
+        if let Err(error) = prepare_compaction_copy(&fresh_dir, capacity, copy_allowance, before) {
+            self.db = Some(reopen()?);
+            remove_path_if_exists(&fresh_dir)?;
+            sync_database_parent(&self.database_dir)?;
+            return Err(error);
         }
-        drop(copied);
-        write_maintenance_state(&fresh_dir, copied_audit.high_water_bytes)?;
-        write_compaction_manifest(&fresh_dir, before)?;
-        sync_directory(&fresh_dir)?;
         phase_hook(MdbxCompactionPhase::CopySynced);
 
-        drop(self.db.take());
         if let Err(error) = fs::rename(&self.database_dir, &old_dir) {
             self.db = Some(reopen()?);
             return Err(error.into());
@@ -1534,6 +1532,24 @@ fn remove_compaction_manifest(database_dir: &Path) -> Result<(), UtxoError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn prepare_compaction_copy(
+    fresh_dir: &Path,
+    capacity: u64,
+    allowance: crate::mdbx_memory::Allowance,
+    before: MdbxChainstateAudit,
+) -> Result<(), UtxoError> {
+    let copied = crate::mdbx_memory::Environment::open_reserved(fresh_dir, capacity, allowance)?;
+    validate_compacted_environment(&copied)?;
+    let copied_audit = audit_environment(&copied, fresh_dir, capacity)?;
+    if CompactionManifest::from_audit(before) != CompactionManifest::from_audit(copied_audit) {
+        return Err(UtxoError::Malformed("compacted MDBX content identity"));
+    }
+    drop(copied);
+    write_maintenance_state(fresh_dir, copied_audit.high_water_bytes)?;
+    write_compaction_manifest(fresh_dir, before)?;
+    sync_directory(fresh_dir)
 }
 
 fn validate_compacted_environment(db: &Database<NoWriteMap>) -> Result<(), UtxoError> {
@@ -2596,6 +2612,75 @@ mod tests {
             reopened.audit().unwrap().content_sha256,
             report.content_sha256
         );
+    }
+
+    #[test]
+    fn failed_copy_open_or_verification_restores_the_closed_source_and_budget() {
+        use crate::mdbx_memory::RESERVATION_BYTES;
+        use crate::node_memory::MemoryBudget;
+        for block_open in [true, false] {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("mdbx");
+            let budget = MemoryBudget::new(2 * RESERVATION_BYTES);
+            budget.bind(std::slice::from_ref(&path)).unwrap();
+            let mut store = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+            store
+                .initialize_execution_tip(ExecutionTip {
+                    height: 0,
+                    hash: block_hash(0),
+                })
+                .unwrap();
+            store.apply(&[], &[(key(1), coin(0))]).unwrap();
+            store
+                .commit_connect(
+                    block_hash(0),
+                    ExecutionTip {
+                        height: 1,
+                        hash: block_hash(1),
+                    },
+                    &[key(1)],
+                    &[(key(2), coin(1))],
+                    &[UtxoUndo::from_parts(vec![(key(1), coin(0))], vec![key(2)])],
+                )
+                .unwrap();
+            let before = store.audit().unwrap();
+            let fresh = compaction_path(&path);
+            let mut injected = false;
+            let result = store.compact_with_phase_hook(|phase| {
+                if phase == MdbxCompactionPhase::SourceClosed {
+                    injected = true;
+                    assert_eq!(budget.snapshot().used, 2 * RESERVATION_BYTES);
+                    if block_open {
+                        fs::remove_dir_all(&fresh).unwrap();
+                        fs::write(&fresh, b"blocked copy directory").unwrap();
+                    } else {
+                        // Mutate only the private candidate through a separate
+                        // test handle, leaving a well-formed but incorrect copy.
+                        let copy =
+                            MdbxUtxoStore::open_with_capacity(&fresh, 64 * 1024 * 1024).unwrap();
+                        copy.apply(&[], &[(key(3), coin(1))]).unwrap();
+                    }
+                }
+            });
+            assert!(injected);
+            assert!(result.is_err());
+            assert_eq!(budget.snapshot().used, RESERVATION_BYTES);
+            assert_eq!(store.audit().unwrap().content_sha256, before.content_sha256);
+            assert_eq!(store.block_undo(block_hash(1)).unwrap().unwrap().len(), 1);
+            assert!(store.db().info().unwrap().read_ahead_disabled());
+            assert!(!fresh.exists());
+            store.apply(&[], &[(key(4), coin(1))]).unwrap();
+            let expected = store.audit().unwrap().content_sha256;
+            assert_eq!(
+                store.compact_with_reserve(0).unwrap().content_sha256,
+                expected
+            );
+            assert_eq!(budget.snapshot().used, RESERVATION_BYTES);
+            drop(store);
+            assert_eq!(budget.snapshot().used, 0);
+            let reopened = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+            assert_eq!(reopened.audit().unwrap().content_sha256, expected);
+        }
     }
 
     #[test]
