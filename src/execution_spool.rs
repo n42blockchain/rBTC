@@ -94,7 +94,7 @@ fn sizes(transition: &ConnectTransition) -> io::Result<(usize, u64)> {
     }
     for undo in &transition.transaction_undos {
         add(&mut wire, 8 + 8)?; // encoded length, two u32 counts
-        add(&mut heap, size_of::<UtxoUndo>())?;
+        add(&mut heap, UtxoUndo::allocation_overhead())?;
         for (_, coin) in undo.spent() {
             add(&mut wire, 36 + 4)?;
             add(&mut wire, coin_size(coin)?)?;

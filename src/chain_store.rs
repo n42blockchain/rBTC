@@ -458,7 +458,7 @@ pub struct ConnectTransition {
 /// it until their buffered payload is committed or discarded.
 pub struct LeasedConnectTransition {
     transition: ConnectTransition,
-    reservation: Option<crate::node_memory::MemoryLease>,
+    reservation: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 impl LeasedConnectTransition {
     /// Attaches a reservation acquired before constructing/decoding the payload.
@@ -467,6 +467,10 @@ impl LeasedConnectTransition {
         transition: ConnectTransition,
         reservation: crate::node_memory::MemoryLease,
     ) -> Self {
+        let reservation = Arc::new(reservation);
+        for undo in &transition.transaction_undos {
+            undo.retain_memory(Arc::clone(&reservation));
+        }
         Self {
             transition,
             reservation: Some(reservation),
@@ -523,7 +527,7 @@ pub(crate) fn collect_transition_stream(
         } = item?;
         collected.transitions.push(transition);
         if let Some(reservation) = reservation {
-            collected.leases.push(Arc::new(reservation));
+            collected.leases.push(reservation);
         }
     }
     if collected.transitions.len() != expected
@@ -3408,6 +3412,39 @@ mod tests {
         assert_eq!(store.get(key(3)).unwrap().unwrap().value_sats, 10);
         assert!(store.block_undo(one.hash).unwrap().is_some());
         assert!(store.block_undo(two.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_undo_keeps_transition_admission_after_its_container_drops() {
+        let memory = crate::node_memory::MemoryBudget::new(100);
+        let undo = UtxoUndo::from_parts(vec![(key(1), coin(10))], vec![key(2)]);
+        let escaped = undo.clone();
+        let transition = ConnectTransition {
+            expected_parent: BlockHash::all_zeros(),
+            next: ExecutionTip {
+                height: 1,
+                hash: BlockHash::all_zeros(),
+            },
+            spent: vec![],
+            created: vec![],
+            transaction_undos: vec![undo],
+        };
+        let leased =
+            LeasedConnectTransition::with_reservation(transition, memory.reserve(100).unwrap());
+        let returned = leased.transaction_undos.clone();
+        drop(leased);
+        assert_eq!(memory.snapshot().used, 100);
+        assert!(memory.reserve(1).is_err());
+        assert_eq!(escaped.spent(), returned[0].spent());
+        drop(returned);
+        assert_eq!(
+            memory.snapshot().used,
+            100,
+            "even a pre-existing alias retains the admitted payload"
+        );
+        drop(escaped);
+        assert_eq!(memory.snapshot().used, 0);
+        assert!(memory.reserve(100).is_ok());
     }
 
     #[test]

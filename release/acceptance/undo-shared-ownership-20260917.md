@@ -1,0 +1,11 @@
+# Shared immutable undo ownership
+
+`UtxoUndo::clone` previously copied every spent coin and script. Indexed execution clones undo when it both returns applied blocks and commits a transition; write-back lookups also clone undo. Attaching a reservation only to the original container would not account for those independent copies.
+
+Undo now uses one immutable `Arc` payload, preserving the existing public constructors, slice accessors, content equality and durable encoding. Cloning shares the payload. A leased transition attaches its pre-admitted reservation to that payload through a one-time owner slot; an existing owner remains pinned rather than being replaced. Collected transitions retain the same shared reservation. Even an alias created before attachment now keeps the admitted payload alive and charged after the transition container disappears. This conservatively retains the whole transition allowance until the last undo alias disappears; it is not a per-component shrinking policy.
+
+The spool decoder's preallocation estimate now includes the undo handle, shared payload, owner slot and Arc counters, as well as its existing vectors/scripts and codec scratch. Shrinking the handle alone must not silently reduce the allowance below the moved heap metadata.
+
+Regressions independently construct the established undo encoding with a maximum-size script, verify clones share payload/array storage, drop the original and verify the survivor, then decode and compare content independently. A leased-transition regression retains aliases across container destruction and proves pressure persists until the final alias drops, after which the complete allowance is reusable.
+
+This is ownership groundwork for complete preparation admission. Original worker preparation and unleased decoded/caller-created undo still need admission before allocation; outer returned vectors, native verifier scratch, worker stacks and total startup/mapped RSS remain separate gaps. No full-scale or long-duration gate is closed by this change. Final all-feature library suite: 1,044 passed, 0 failed, 12 ignored (71.00 s). Strict all-target/all-feature Clippy passed (27.06 s); formatting and diff checks passed.

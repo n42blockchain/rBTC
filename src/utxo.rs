@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     thread,
 };
 
@@ -563,18 +563,48 @@ impl HeightRetierState {
 /// The information required to reverse one successful atomic UTXO mutation.
 ///
 /// Undo records must be applied in reverse transaction/block order during a
-/// chain reorganization.
+/// chain reorganization. Clones share immutable payload storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UtxoUndo {
-    spent: Vec<(OutPointKey, Utxo)>,
-    created: Vec<OutPointKey>,
+    payload: Arc<UndoPayload>,
 }
 
+// Undo is immutable once published. Cloning a handle must not duplicate its
+// potentially large scripts outside the original payload's resource owner.
+#[derive(Debug)]
+struct UndoPayload {
+    spent: Vec<(OutPointKey, Utxo)>,
+    created: Vec<OutPointKey>,
+    memory: OnceLock<Arc<crate::node_memory::MemoryLease>>,
+}
+impl PartialEq for UndoPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.spent == other.spent && self.created == other.created
+    }
+}
+impl Eq for UndoPayload {}
+
 impl UtxoUndo {
+    // Attach the pre-admitted transition owner to immutable data, so an undo
+    // handle escaping a write-back lookup cannot outlive its accounting.
+    pub(crate) fn retain_memory(&self, memory: Arc<crate::node_memory::MemoryLease>) {
+        let _ = self.payload.memory.set(memory);
+    }
+
+    pub(crate) const fn allocation_overhead() -> usize {
+        size_of::<Self>() + size_of::<UndoPayload>() + 2 * size_of::<usize>()
+    }
+
     /// Constructs logical undo data for one atomic mutation.
     #[must_use]
     pub(crate) fn new(spent: Vec<(OutPointKey, Utxo)>, created: Vec<OutPointKey>) -> Self {
-        Self { spent, created }
+        Self {
+            payload: Arc::new(UndoPayload {
+                spent,
+                created,
+                memory: OnceLock::new(),
+            }),
+        }
     }
 
     /// Constructs logical undo data for an external [`UtxoStore`] implementation.
@@ -584,30 +614,36 @@ impl UtxoUndo {
     /// missing/duplicate mutations before constructing this value.
     #[must_use]
     pub fn from_parts(spent: Vec<(OutPointKey, Utxo)>, created: Vec<OutPointKey>) -> Self {
-        Self { spent, created }
+        Self {
+            payload: Arc::new(UndoPayload {
+                spent,
+                created,
+                memory: OnceLock::new(),
+            }),
+        }
     }
 
     /// Returns the spent outputs that must be restored on disconnect.
     #[must_use]
     pub fn spent(&self) -> &[(OutPointKey, Utxo)] {
-        &self.spent
+        &self.payload.spent
     }
 
     /// Returns outputs that must be removed on disconnect.
     #[must_use]
     pub fn created(&self) -> &[OutPointKey] {
-        &self.created
+        &self.payload.created
     }
 
     /// Encodes undo data for durable block-disconnect storage.
     pub(crate) fn encode(&self) -> Result<Vec<u8>, UtxoError> {
-        let spent_count = u32::try_from(self.spent.len())
+        let spent_count = u32::try_from(self.payload.spent.len())
             .map_err(|_| UtxoError::Malformed("undo spent count"))?;
-        let created_count = u32::try_from(self.created.len())
+        let created_count = u32::try_from(self.payload.created.len())
             .map_err(|_| UtxoError::Malformed("undo created count"))?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&spent_count.to_le_bytes());
-        for (outpoint, utxo) in &self.spent {
+        for (outpoint, utxo) in &self.payload.spent {
             let utxo = utxo.encode()?;
             let utxo_len =
                 u32::try_from(utxo.len()).map_err(|_| UtxoError::Malformed("undo UTXO length"))?;
@@ -616,7 +652,7 @@ impl UtxoUndo {
             bytes.extend_from_slice(&utxo);
         }
         bytes.extend_from_slice(&created_count.to_le_bytes());
-        for outpoint in &self.created {
+        for outpoint in &self.payload.created {
             bytes.extend_from_slice(outpoint.as_bytes());
         }
         Ok(bytes)
@@ -655,7 +691,13 @@ impl UtxoUndo {
         if cursor != bytes.len() {
             return Err(UtxoError::Malformed("trailing undo bytes"));
         }
-        Ok(Self { spent, created })
+        Ok(Self {
+            payload: Arc::new(UndoPayload {
+                spent,
+                created,
+                memory: OnceLock::new(),
+            }),
+        })
     }
 }
 
@@ -1218,11 +1260,12 @@ impl UtxoStore for RedbUtxoStore {
             let mut hot = transaction.open_table(HOT_TABLE)?;
             let mut cold = transaction.open_table(COLD_TABLE)?;
             let recreated = undo
+                .payload
                 .created
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
-            for (key, _) in &undo.spent {
+            for (key, _) in &undo.payload.spent {
                 if !recreated.contains(key)
                     && (hot.get(key.as_bytes().as_slice())?.is_some()
                         || cold.get(key.as_bytes().as_slice())?.is_some())
@@ -1230,11 +1273,11 @@ impl UtxoStore for RedbUtxoStore {
                     return Err(UtxoError::Duplicate(*key));
                 }
             }
-            for key in &undo.created {
+            for key in &undo.payload.created {
                 hot.remove(key.as_bytes().as_slice())?;
                 cold.remove(key.as_bytes().as_slice())?;
             }
-            for (key, utxo) in &undo.spent {
+            for (key, utxo) in &undo.payload.spent {
                 let encoded = utxo.encode()?;
                 if utxo.last_touched < cutoff {
                     cold.insert(key.as_bytes().as_slice(), encoded.as_slice())?;
@@ -1513,10 +1556,10 @@ pub(crate) fn apply_with_undo_transaction(
             return Err(UtxoError::Duplicate(*key));
         }
     }
-    Ok(UtxoUndo {
-        spent: undo_spent,
-        created: created.iter().map(|(key, _)| *key).collect(),
-    })
+    Ok(UtxoUndo::new(
+        undo_spent,
+        created.iter().map(|(key, _)| *key).collect(),
+    ))
 }
 
 /// Applies a sorted, unique net transition already validated against this
@@ -1610,6 +1653,35 @@ pub(crate) fn apply_validated_changes_transaction(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn undo_clones_share_immutable_payload_and_preserve_wire_encoding() {
+        let coin = Utxo {
+            script_pubkey: vec![0x51; 10_000],
+            ..Utxo::decode(ENCODED_FIXTURE_UTXO).unwrap()
+        };
+        let key = OutPointKey::from_bytes(&[7; 36]).unwrap();
+        let original = UtxoUndo::from_parts(vec![(key, coin.clone())], vec![key]);
+        let cloned = original.clone();
+        assert!(Arc::ptr_eq(&original.payload, &cloned.payload));
+        assert_eq!(original.spent().as_ptr(), cloned.spent().as_ptr());
+        assert_eq!(original.created().as_ptr(), cloned.created().as_ptr());
+        // Build the established wire layout independently of the undo encoder.
+        let encoded_coin = coin.encode().unwrap();
+        let mut expected = 1_u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(key.as_bytes());
+        expected.extend_from_slice(&u32::try_from(encoded_coin.len()).unwrap().to_le_bytes());
+        expected.extend_from_slice(&encoded_coin);
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.extend_from_slice(key.as_bytes());
+        assert_eq!(original.encode().unwrap(), expected);
+        drop(original);
+        assert_eq!(cloned.spent(), &[(key, coin)]);
+        assert_eq!(cloned.encode().unwrap(), expected);
+        let decoded = UtxoUndo::decode(&expected).unwrap();
+        assert_eq!(decoded, cloned);
+        assert!(!Arc::ptr_eq(&decoded.payload, &cloned.payload));
+    }
+
     use bitcoin::{OutPoint, Txid, hashes::Hash};
     use tempfile::TempDir;
 
