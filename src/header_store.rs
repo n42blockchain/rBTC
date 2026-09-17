@@ -105,9 +105,13 @@ pub use replay::HeaderReplayReader;
 impl RedbHeaderStore {
     /// Opens or creates a header database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HeaderStoreError> {
-        let db = Database::builder()
-            .set_cache_size(HEADER_STORE_CACHE_BYTES)
-            .create(path)?;
+        let path = path.as_ref();
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let db =
+            crate::header_storage_budget::open(path, directory, HEADER_STORE_CACHE_BYTES, false)?;
         let transaction = db.begin_write()?;
         {
             let _headers = transaction.open_table(HEADERS)?;

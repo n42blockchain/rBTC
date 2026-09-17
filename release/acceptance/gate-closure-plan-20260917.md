@@ -14,7 +14,9 @@ not change acceptance statuses or weaken thresholds.
    [node ownership report](header-node-disk-state-20260917.md). Main-node ownership
    is connected; [standby history is shared on disk](header-standby-sharing-20260917.md).
    New marked scratch indexes have [bounded abandoned-owner cleanup](header-scratch-recovery-20260917.md).
-   Aggregate resource admission and whole-node acceptance remain.
+   [Live Header storage admission](header-shared-storage-budget-20260917.md) now
+   shares cache/read and open-file growth allowances. Aggregate node resources,
+   closed-file inventory and whole-node acceptance remain.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

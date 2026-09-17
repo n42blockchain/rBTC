@@ -253,16 +253,20 @@ impl DiskHeaderIndex {
         path: impl AsRef<Path>,
         deployments: DeploymentConfig,
     ) -> Result<Self, HeaderIndexError> {
-        drop(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path.as_ref())
-                .map_err(local)?,
-        );
-        let db = Database::builder()
-            .set_cache_size(CACHE_BYTES)
-            .create(path)
+        let path = path.as_ref();
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Self::create_in_budget(path, directory, deployments)
+    }
+
+    fn create_in_budget(
+        path: &Path,
+        directory: &Path,
+        deployments: DeploymentConfig,
+    ) -> Result<Self, HeaderIndexError> {
+        let db = crate::header_storage_budget::open(path, directory, CACHE_BYTES, true)
             .map_err(local)?;
         let tip = HeaderDag::with_deployments(deployments.clone()).active_tip();
         let transaction = db.begin_write().map_err(local)?;
@@ -309,7 +313,11 @@ impl DiskHeaderIndex {
         deployments: DeploymentConfig,
     ) -> Result<Self, HeaderIndexError> {
         let scratch = Arc::new(Scratch::create(parent.as_ref()).map_err(local)?);
-        let mut index = Self::create(scratch.path().join("index.redb"), deployments)?;
+        let mut index = Self::create_in_budget(
+            &scratch.path().join("index.redb"),
+            parent.as_ref(),
+            deployments,
+        )?;
         index.scratch = Some(scratch);
         Ok(index)
     }
