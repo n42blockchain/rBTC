@@ -1,5 +1,5 @@
-//! Shared admission for live header database caches and logical file lengths.
-//! This excludes closed files, filesystem metadata and other node subsystems;
+//! Shared admission for header caches and registered database file lengths.
+//! This excludes filesystem metadata and other node subsystems;
 //! it is not a claim about aggregate physical disk usage or process RSS.
 use fs2::FileExt;
 use redb::{Database, DatabaseError, StorageBackend};
@@ -11,6 +11,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
+mod inventory;
+
 const CACHE_LIMIT: u64 = 512 * 1024 * 1024;
 const FILE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 
@@ -18,12 +20,15 @@ const FILE_LIMIT: u64 = 16 * 1024 * 1024 * 1024;
 struct Usage {
     cache: u64,
     files: u64,
+    paths: HashMap<PathBuf, u64>,
 }
 #[derive(Debug)]
 struct Budget {
     usage: Mutex<Usage>,
     cache_limit: u64,
     file_limit: u64,
+    directory: Option<PathBuf>,
+    _owner: Option<File>,
 }
 impl Budget {
     fn reserve(&self, cache: u64, files: u64) -> io::Result<()> {
@@ -40,6 +45,97 @@ impl Budget {
         }
         used.cache += cache;
         used.files += files;
+        Ok(())
+    }
+    fn register(&self, path: &Path) -> io::Result<PathBuf> {
+        let key = path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .canonicalize()?
+            .join(
+                path.file_name()
+                    .ok_or_else(|| io::Error::other("missing header filename"))?,
+            );
+        let mut used = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A closed file remains charged. Only observed deletion retires it.
+        let mut missing = Vec::new();
+        for old in used.paths.keys() {
+            if !old.try_exists()? {
+                missing.push(old.clone());
+            }
+        }
+        for old in missing {
+            used.files -= used.paths.remove(&old).expect("registered path");
+        }
+        if !used.paths.contains_key(&key) {
+            if used.paths.len() >= inventory::MAX_FILES {
+                return Err(io::Error::other("header file inventory is full"));
+            }
+            let existing = inventory::file_len(&key)?.unwrap_or(0);
+            let total = used
+                .files
+                .checked_add(existing)
+                .ok_or_else(|| io::Error::other("header inventory length overflow"))?;
+            used.paths.insert(key.clone(), existing);
+            used.files = total;
+            if let Some(directory) = &self.directory {
+                if let Err(error) = inventory::save(directory, used.paths.keys()) {
+                    used.paths.remove(&key);
+                    used.files -= existing;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(key)
+    }
+    fn observe(&self, path: &Path, len: u64) -> io::Result<()> {
+        let mut used = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = *used
+            .paths
+            .get(path)
+            .ok_or_else(|| io::Error::other("unregistered header file"))?;
+        let total = (used.files - old)
+            .checked_add(len)
+            .ok_or_else(|| io::Error::other("header inventory length overflow"))?;
+        // Existing oversized data must remain charged even when opening it is
+        // refused. Otherwise a failed open would hide its disk occupancy.
+        used.files = total;
+        used.paths.insert(path.to_path_buf(), len);
+        if total > self.file_limit {
+            return Err(io::Error::other(
+                "existing header inventory exceeds file allowance",
+            ));
+        }
+        Ok(())
+    }
+    fn resize(&self, path: &Path, len: u64, shrink: bool) -> io::Result<()> {
+        let mut used = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = *used
+            .paths
+            .get(path)
+            .ok_or_else(|| io::Error::other("unregistered header file"))?;
+        if len > old {
+            let growth = len - old;
+            if growth > self.file_limit.saturating_sub(used.files) {
+                return Err(io::Error::other(
+                    "shared header file byte allowance exhausted",
+                ));
+            }
+            used.files += growth;
+            used.paths.insert(path.to_path_buf(), len);
+        } else if shrink {
+            used.files -= old - len;
+            used.paths.insert(path.to_path_buf(), len);
+        }
         Ok(())
     }
     fn release(&self, cache: u64, files: u64) {
@@ -62,10 +158,22 @@ fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
     if let Some(pool) = pools.get(&key).and_then(Weak::upgrade) {
         return Ok(pool);
     }
+    let owner = inventory::lock(&key)?;
+    let paths = inventory::load(&key)?;
+    let files = paths
+        .values()
+        .try_fold(0_u64, |sum, len| sum.checked_add(*len))
+        .ok_or_else(|| io::Error::other("header inventory length overflow"))?;
     let pool = Arc::new(Budget {
-        usage: Mutex::default(),
+        usage: Mutex::new(Usage {
+            cache: 0,
+            files,
+            paths,
+        }),
         cache_limit: CACHE_LIMIT,
         file_limit: FILE_LIMIT,
+        directory: Some(key.clone()),
+        _owner: Some(owner),
     });
     pools.insert(key, Arc::downgrade(&pool));
     Ok(pool)
@@ -74,7 +182,7 @@ fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
 #[derive(Debug)]
 struct Backend {
     file: Mutex<File>,
-    reserved_len: Mutex<u64>,
+    path: PathBuf,
     pool: Arc<Budget>,
     cache: u64,
 }
@@ -83,6 +191,8 @@ impl Backend {
         // Reserve before opening a file or allocating an engine cache.
         pool.reserve(cache, 0)?;
         let opened = (|| {
+            let _ = inventory::file_len(path)?;
+            let key = pool.register(path)?;
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -92,13 +202,13 @@ impl Backend {
                 .open(path)?;
             file.try_lock_exclusive()?;
             let len = file.metadata()?.len();
-            pool.reserve(0, len)?;
-            Ok::<_, io::Error>((file, len))
+            pool.observe(&key, len)?;
+            Ok::<_, io::Error>((file, key))
         })();
         match opened {
-            Ok((file, len)) => Ok(Self {
+            Ok((file, path)) => Ok(Self {
                 file: Mutex::new(file),
-                reserved_len: Mutex::new(len),
+                path,
                 pool,
                 cache,
             }),
@@ -111,11 +221,7 @@ impl Backend {
 }
 impl Drop for Backend {
     fn drop(&mut self) {
-        let len = *self
-            .reserved_len
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.pool.release(self.cache, len);
+        self.pool.release(self.cache, 0);
     }
 }
 struct ReadReservation<'a> {
@@ -170,19 +276,11 @@ impl StorageBackend for Backend {
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut reserved = self
-            .reserved_len
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if len > *reserved {
-            self.pool.reserve(0, len - *reserved)?;
-            *reserved = len;
-        }
-        // A failed resize conservatively keeps its reservation until success
-        // or backend close; it can never make an ambiguous write free.
+        self.pool.resize(&self.path, len, false)?;
+        // A failed resize remains charged until an observed successful shrink,
+        // reopen under the file lock, or actual deletion.
         file.set_len(len)?;
-        self.pool.release(0, *reserved - len);
-        *reserved = len;
+        self.pool.resize(&self.path, len, true)?;
         Ok(())
     }
     fn sync_data(&self, _eventual: bool) -> io::Result<()> {
@@ -210,6 +308,31 @@ impl StorageBackend for Backend {
     }
 }
 
+/// Reservation for a journal whose owner already holds its exclusive file lock.
+pub(crate) struct RegisteredFile {
+    pool: Arc<Budget>,
+    path: PathBuf,
+}
+impl RegisteredFile {
+    pub(crate) fn open(path: &Path, len: u64) -> io::Result<Self> {
+        let _ = inventory::file_len(path)?;
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let pool = shared(directory)?;
+        let path = pool.register(path)?;
+        pool.observe(&path, len)?;
+        Ok(Self { pool, path })
+    }
+    pub(crate) fn reserve(&self, len: u64) -> io::Result<()> {
+        self.pool.resize(&self.path, len, false)
+    }
+    pub(crate) fn truncated(&self, len: u64) -> io::Result<()> {
+        self.pool.resize(&self.path, len, true)
+    }
+}
+
 pub(crate) fn open(
     path: &Path,
     budget_directory: &Path,
@@ -232,6 +355,8 @@ mod tests {
             usage: Mutex::default(),
             cache_limit: cache,
             file_limit: files,
+            directory: None,
+            _owner: None,
         })
     }
     #[test]
@@ -255,10 +380,10 @@ mod tests {
         left.set_len(59).unwrap();
         right.set_len(41).unwrap();
         drop(left);
-        assert_eq!(pool.usage.lock().unwrap().files, 41);
+        assert_eq!(pool.usage.lock().unwrap().files, 100);
         drop(right);
         assert_eq!(pool.usage.lock().unwrap().cache, 0);
-        assert_eq!(pool.usage.lock().unwrap().files, 0);
+        assert!(pool.usage.lock().unwrap().files > 0);
     }
     #[test]
     fn read_versions_keep_the_engine_reservation_after_writer_exit() {
@@ -281,7 +406,7 @@ mod tests {
         assert!(pool.usage.lock().unwrap().files > 0);
         drop(read);
         assert_eq!(pool.usage.lock().unwrap().cache, 0);
-        assert_eq!(pool.usage.lock().unwrap().files, 0);
+        assert!(pool.usage.lock().unwrap().files > 0);
     }
     #[test]
     fn engine_growth_failure_reopens_at_the_last_committed_version() {
@@ -335,5 +460,79 @@ mod tests {
         for key in 0..committed {
             assert_eq!(table.get(key).unwrap().unwrap().value(), payload);
         }
+    }
+    #[test]
+    fn closed_files_remain_charged_across_pool_recreation_until_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = root.join("custom-headers.redb");
+        let pool = shared(&root).unwrap();
+        let file = Backend::open(&path, true, 8, Arc::clone(&pool)).unwrap();
+        file.set_len(60).unwrap();
+        drop(file);
+        assert_eq!(pool.usage.lock().unwrap().cache, 0);
+        assert_eq!(pool.usage.lock().unwrap().files, 60);
+        drop(pool);
+        let reopened = shared(&root).unwrap();
+        assert_eq!(reopened.usage.lock().unwrap().files, 60);
+        let file = Backend::open(&path, false, 8, Arc::clone(&reopened)).unwrap();
+        assert_eq!(
+            reopened.usage.lock().unwrap().files,
+            60,
+            "reopen must not double charge"
+        );
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        let next = Backend::open(&root.join("next"), true, 8, Arc::clone(&reopened)).unwrap();
+        assert_eq!(reopened.usage.lock().unwrap().files, 0);
+        drop(next);
+    }
+    #[test]
+    fn candidate_journal_and_database_share_persistent_file_accounting() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let pool = shared(&root).unwrap();
+        let database =
+            Backend::open(&root.join("headers.redb"), true, 8, Arc::clone(&pool)).unwrap();
+        database.set_len(60).unwrap();
+        let source = crate::headers::HeaderDag::new(bitcoin::Network::Regtest);
+        let journal_path = root.join("headers.candidate");
+        let journal = crate::header_candidate::DiskHeaderCandidate::open(
+            &journal_path,
+            &source,
+            source.active_tip().hash,
+            u32::MAX,
+            crate::header_candidate::HeaderCandidateLimits::default(),
+            &mut crate::headers::HeaderWorkBudget::default(),
+        )
+        .unwrap();
+        let length = journal_path.metadata().unwrap().len();
+        assert_eq!(pool.usage.lock().unwrap().files, 60 + length);
+        drop(journal);
+        drop(database);
+        drop(pool);
+        let reopened = shared(&root).unwrap();
+        assert_eq!(reopened.usage.lock().unwrap().files, 60 + length);
+        std::fs::remove_file(journal_path).unwrap();
+        let file =
+            Backend::open(&root.join("headers.redb"), false, 8, Arc::clone(&reopened)).unwrap();
+        assert_eq!(reopened.usage.lock().unwrap().files, 60);
+        drop(file);
+    }
+    #[test]
+    fn refused_oversized_existing_file_stays_in_the_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("existing");
+        std::fs::write(&path, [0; 101]).unwrap();
+        let pool = budget(16, 100);
+        assert!(Backend::open(&path, false, 8, Arc::clone(&pool)).is_err());
+        assert_eq!(pool.usage.lock().unwrap().files, 101);
+        assert_eq!(pool.usage.lock().unwrap().cache, 0);
+        assert!(Backend::open(&root.path().join("next"), true, 8, Arc::clone(&pool)).is_err());
+        std::fs::remove_file(path).unwrap();
+        let recovered =
+            Backend::open(&root.path().join("next"), false, 8, Arc::clone(&pool)).unwrap();
+        assert_eq!(pool.usage.lock().unwrap().files, 0);
+        drop(recovered);
     }
 }

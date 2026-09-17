@@ -69,6 +69,7 @@ pub enum HeaderCandidateError {
 /// handle. A crash may expose the old or new complete batch, never a prefix of it.
 pub struct DiskHeaderCandidate {
     file: File,
+    storage: crate::header_storage_budget::RegisteredFile,
     context: CandidateContext,
     anchor: BlockHash,
     limits: HeaderCandidateLimits,
@@ -141,6 +142,7 @@ impl DiskHeaderCandidate {
             .open(path)?;
         file.try_lock_exclusive()?;
         let length = file.metadata()?.len();
+        let storage = crate::header_storage_budget::RegisteredFile::open(path, length)?;
         if length > limits.max_file_bytes {
             return Err(HeaderCandidateError::Deferred(
                 "existing file exceeds byte allowance",
@@ -151,6 +153,7 @@ impl DiskHeaderCandidate {
         prefix.extend_from_slice(anchor.as_byte_array());
         prefix.extend_from_slice(&Sha256::digest(context.consensus_id()));
         if length == 0 {
+            storage.reserve(PREFIX_BYTES)?;
             file.write_all(&prefix)?;
             file.sync_all()?;
             #[cfg(unix)]
@@ -171,6 +174,7 @@ impl DiskHeaderCandidate {
         }
         let result = Self {
             file,
+            storage,
             context,
             anchor,
             limits,
@@ -271,6 +275,7 @@ impl DiskHeaderCandidate {
                 "journal changed outside locked handle",
             ));
         }
+        self.storage.reserve(end)?;
         self.file.seek(SeekFrom::Start(self.bytes))?;
         self.poisoned = true;
         if let Err(error) = self
@@ -280,6 +285,7 @@ impl DiskHeaderCandidate {
         {
             self.file.set_len(self.bytes)?;
             self.file.sync_data()?;
+            self.storage.truncated(self.bytes)?;
             self.poisoned = false;
             return Err(error.into());
         }
@@ -401,6 +407,7 @@ impl HeaderCandidateRecovery<'_> {
                 self.candidate.poisoned = true;
                 self.candidate.file.set_len(self.candidate.bytes)?;
                 self.candidate.file.sync_data()?;
+                self.candidate.storage.truncated(self.candidate.bytes)?;
                 self.end = self.candidate.bytes;
                 self.candidate.poisoned = false;
                 return Ok(true);
