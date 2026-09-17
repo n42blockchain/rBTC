@@ -66,7 +66,10 @@ not change acceptance statuses or weaken thresholds.
    applies one decoded shard at a time; this is not the failed MDBX RSS rerun.
    [MDBX owned-batch consumption](mdbx-consumed-batches-20260917.md) is being
    measured against the unchanged reduced maintenance workload.
-   Both borrowed and owned reduced runs still fail RSS; [execution input lifetime](execution-input-lifetime-20260917.md)
+   Both borrowed and owned reduced runs still fail RSS.
+   [Streamed-input measurement](mdbx-streamed-inputs-20260917.md) also fails the
+   unchanged 1.5 threshold (1.53015), despite removing the full generated batch;
+   none of these three reduced runs triggered automatic compaction; [execution input lifetime](execution-input-lifetime-20260917.md)
    removes additional copies before commit, without claiming a total bound.
    [MDBX environment ownership](mdbx-memory-policy-20260917.md) now fixes spill
    policy across hosts and keeps shared reservations through compact/rebase
