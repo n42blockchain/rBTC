@@ -5,7 +5,7 @@
 //! and block execution. Reopen revalidates raw headers; disk chainwork is never
 //! trusted. Only a final incomplete frame is discarded after successful replay.
 
-use crate::headers::{CandidateContext, HeaderDag, HeaderError, HeaderInfo, HeaderWorkBudget};
+use crate::headers::{CandidateContext, HeaderError, HeaderInfo, HeaderView, HeaderWorkBudget};
 use bitcoin::{
     BlockHash,
     block::Header,
@@ -103,7 +103,7 @@ impl DiskHeaderCandidate {
     /// Work deferral leaves the existing journal, including any tail, untouched.
     pub fn open(
         path: impl AsRef<Path>,
-        source: &HeaderDag,
+        source: &dyn HeaderView,
         anchor: BlockHash,
         adjusted_time: u32,
         limits: HeaderCandidateLimits,
@@ -118,7 +118,7 @@ impl DiskHeaderCandidate {
     /// history. Drive `advance` in scheduler-sized slices before `finish`.
     pub fn start_recovery(
         path: impl AsRef<Path>,
-        source: &HeaderDag,
+        source: &dyn HeaderView,
         anchor: BlockHash,
         limits: HeaderCandidateLimits,
         work: &mut HeaderWorkBudget,
@@ -209,15 +209,17 @@ impl DiskHeaderCandidate {
     /// anchor's original ancestry. No full candidate ancestry vector is built.
     pub fn block_locator(
         &self,
-        source: &HeaderDag,
+        source: &dyn HeaderView,
         work: &mut HeaderWorkBudget,
     ) -> Result<Vec<BlockHash>, HeaderCandidateError> {
         let anchor = source
-            .get(&self.anchor)
+            .header(&self.anchor)
+            .map_err(HeaderError::from)?
             .ok_or(HeaderError::UnknownParent(self.anchor))?;
         work.consume(u64::from(anchor.height) + 64)?;
         let mut locator = source
-            .block_locator_from(self.anchor)
+            .branch_locator(self.anchor)
+            .map_err(HeaderError::from)?
             .ok_or(HeaderError::UnknownParent(self.anchor))?;
         if self.tip().hash != self.anchor {
             locator.insert(0, self.tip().hash);
@@ -426,5 +428,7 @@ fn read_frame(
     Ok(Some(batch))
 }
 
+#[cfg(test)]
+use crate::headers::HeaderDag;
 #[cfg(test)]
 mod tests;

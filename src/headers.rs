@@ -19,6 +19,8 @@ use crate::deployments::DeploymentConfig;
 mod candidate;
 pub(crate) use candidate::CandidateContext;
 mod resources;
+mod view;
+pub use view::{HeaderReadError, HeaderView};
 mod retention;
 pub use resources::{HeaderBatchLimits, HeaderWorkBudget};
 pub use retention::{HeaderRetentionError, StagedHeaderEviction};
@@ -38,7 +40,7 @@ pub const DEFAULT_MAX_RETAINED_HEADERS: usize = 2_000_000;
 /// Core uses one day. Regtest still disables retargeting and leaves BIP94 off
 /// by default; the 144-block interval is nevertheless consensus-observable to
 /// callers and must match Core.
-fn core_params(network: Network) -> Params {
+pub(crate) fn core_params(network: Network) -> Params {
     let mut params = Params::new(network);
     if network == Network::Regtest {
         params.pow_target_timespan = 24 * 60 * 60;
@@ -62,6 +64,9 @@ pub struct HeaderInfo {
 /// Rejection reason for a header DAG insertion.
 #[derive(Debug, Error)]
 pub enum HeaderError {
+    /// A local validated-header source could not be read.
+    #[error("header lookup: {0}")]
+    Read(#[from] HeaderReadError),
     /// A local staging-byte or validation-work allowance was exhausted.
     #[error("header resource deferred: {resource} requires {required}, remaining {remaining}")]
     BudgetDeferred {

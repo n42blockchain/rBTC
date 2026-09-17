@@ -36,7 +36,7 @@ use crate::{
     OutPointKey, Utxo,
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     utxo::{TierStats, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -859,7 +859,7 @@ impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainsta
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         // Buffered undo belongs to the newest blocks, which sit above any

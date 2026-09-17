@@ -24,7 +24,7 @@ use crate::{
     chainstate::{PreparedTransaction, is_unspendable},
     consensus::ConsensusError,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
-    headers::HeaderDag,
+    headers::{HeaderReadError, HeaderView},
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -72,6 +72,9 @@ impl ActiveBlockUtxoPrefetch {
 /// Failures while connecting one downloaded active-chain block.
 #[derive(Debug, Error)]
 pub enum BlockExecutionError {
+    /// Reading validated local header history failed before execution publication.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// The persisted execution tip is no longer on the selected active header chain.
     #[error("execution tip {height}:{hash} is not on the active header chain")]
     TipNotActive {
@@ -305,7 +308,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_active_block<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &Block,
     now: u64,
     hot_window_secs: u64,
@@ -345,7 +348,7 @@ pub fn connect_active_block<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_active_blocks<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     hot_window_secs: u64,
@@ -374,7 +377,7 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     hot_window_secs: u64,
@@ -401,7 +404,7 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     now: u64,
@@ -483,7 +486,7 @@ pub fn prefetch_active_block_utxos_from<'a, C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     prefetched_utxos: ActiveBlockUtxoPrefetch,
@@ -519,7 +522,7 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     prefetched_utxos: ActiveBlockUtxoPrefetch,
@@ -665,7 +668,7 @@ fn external_batch_input_outpoints(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_active_blocks_inner<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     _hot_window_secs: u64,
@@ -731,7 +734,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let mut tips = Vec::with_capacity(blocks.len());
     let mut parent_mtps = Vec::with_capacity(blocks.len());
     let mut parent_hash = base.hash;
-    let active_base = headers.active_header_at(base.height);
+    let active_base = headers.active_header(base.height)?;
     if active_base.is_none_or(|header| header.hash != base.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: base.height,
@@ -745,7 +748,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             .and_then(|height| height.checked_add(1))
             .ok_or(BlockExecutionError::NoNextHeader(base.height))?;
         let expected = headers
-            .active_header_at(height)
+            .active_header(height)?
             .ok_or(BlockExecutionError::NoNextHeader(height.saturating_sub(1)))?;
         let actual = block.block_hash();
         if actual != expected.hash {
@@ -755,7 +758,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             });
         }
         let parent_mtp = headers
-            .median_time_past(parent_hash)
+            .median_time_past(parent_hash)?
             .ok_or(BlockExecutionError::MissingParentMtp(parent_hash))?;
         tips.push(ExecutionTip {
             height,
@@ -1098,7 +1101,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 fn validate_active_block<S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &Block,
     current: ExecutionTip,
     now: u64,
@@ -1132,7 +1135,7 @@ fn validate_active_block<S: UtxoStore>(
 #[allow(clippy::too_many_arguments)]
 fn prepare_active_block_inner<'a, S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &'a Block,
     current: ExecutionTip,
     now: u64,
@@ -1148,7 +1151,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
     BlockExecutionError,
 > {
     let checks_started = Instant::now();
-    let active_current = headers.active_header_at(current.height);
+    let active_current = headers.active_header(current.height)?;
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: current.height,
@@ -1160,7 +1163,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         .checked_add(1)
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let expected = headers
-        .active_header_at(next_height)
+        .active_header(next_height)?
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let actual = block.block_hash();
     if actual != expected.hash {
@@ -1170,7 +1173,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         });
     }
     let parent_mtp = headers
-        .median_time_past(current.hash)
+        .median_time_past(current.hash)?
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let capacity = block
         .txdata
@@ -1253,7 +1256,7 @@ fn prepare_bip30_rules<S: UtxoStore>(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_active_block_inner<'a, S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &'a Block,
     current: ExecutionTip,
     now: u64,
@@ -1264,7 +1267,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     transaction_ids: Option<&[Txid]>,
 ) -> Result<(AppliedBlock, BlockDelta, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
     let checks_started = Instant::now();
-    let active_current = headers.active_header_at(current.height);
+    let active_current = headers.active_header(current.height)?;
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: current.height,
@@ -1276,7 +1279,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         .checked_add(1)
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let expected = headers
-        .active_header_at(next_height)
+        .active_header(next_height)?
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let actual = block.block_hash();
     if actual != expected.hash {
@@ -1286,7 +1289,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         });
     }
     let parent_mtp = headers
-        .median_time_past(current.hash)
+        .median_time_past(current.hash)?
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let overlay = UtxoOverlay::new(chainstate);
     let exception_undo = apply_bip30_rules(&overlay, block, deployments)?;
@@ -2273,7 +2276,7 @@ fn apply_bip30_rules<S: UtxoStore>(
 /// common ancestor before connecting a stronger branch.
 pub fn disconnect_execution_tip<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     now: u64,
     hot_window_secs: u64,
 ) -> Result<ExecutionTip, BlockExecutionError> {
@@ -2288,11 +2291,11 @@ pub fn disconnect_execution_tip<C: ExecutionChainStore>(
         });
     }
     let current_header = headers
-        .get(&current.hash)
+        .header(&current.hash)?
         .ok_or(BlockExecutionError::MissingExecutedHeader(current.hash))?;
     let parent_hash = current_header.header.prev_blockhash;
     let parent = headers
-        .get(&parent_hash)
+        .header(&parent_hash)?
         .ok_or(BlockExecutionError::MissingExecutedHeader(parent_hash))?;
     if parent.height.checked_add(1) != Some(current.height) {
         return Err(BlockExecutionError::MissingExecutedHeader(parent_hash));
@@ -2613,6 +2616,130 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn disk_header_views_execute_reorg_and_fail_closed_on_read_errors() {
+        use crate::deployments::DeploymentConfig;
+        use crate::header_index::DiskHeaderIndex;
+        use crate::headers::{HeaderInfo, HeaderReadError, HeaderView, HeaderWorkBudget};
+        struct FailedRead<'a>(&'a dyn HeaderView);
+        impl HeaderView for FailedRead<'_> {
+            fn deployments(&self) -> &DeploymentConfig {
+                self.0.deployments()
+            }
+            fn active_tip(&self) -> HeaderInfo {
+                self.0.active_tip()
+            }
+            fn header(&self, _: &BlockHash) -> Result<Option<HeaderInfo>, HeaderReadError> {
+                Err(HeaderReadError::Unavailable(
+                    "injected header read failure".into(),
+                ))
+            }
+            fn active_header(&self, _: u32) -> Result<Option<HeaderInfo>, HeaderReadError> {
+                Err(HeaderReadError::Unavailable(
+                    "injected active read failure".into(),
+                ))
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate"), Network::Regtest).unwrap();
+        let mut headers = DiskHeaderIndex::create(
+            directory.path().join("index"),
+            DeploymentConfig::for_network(Network::Regtest),
+        )
+        .unwrap();
+        let genesis = headers.snapshot().unwrap().active_tip();
+        let first = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .append(&[first.header], u32::MAX, &mut HeaderWorkBudget::default())
+            .unwrap();
+        let original = headers.snapshot().unwrap();
+        let error = connect_active_block(
+            &chainstate,
+            &FailedRead(&original),
+            &first,
+            1,
+            60,
+            &deployments(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BlockExecutionError::HeaderRead(_)));
+        assert!(!error.is_peer_invalid());
+        assert_eq!(chainstate.execution().tip().unwrap().hash, genesis.hash);
+        assert!(
+            chainstate
+                .undos()
+                .get(first.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        connect_active_block(&chainstate, &original, &first, 1, 60, &deployments(1)).unwrap();
+        let side_one = height_block(genesis.hash, genesis.header.time + 2, 1);
+        let side_two = height_block(side_one.block_hash(), side_one.header.time + 1, 2);
+        headers
+            .append(
+                &[side_one.header, side_two.header],
+                u32::MAX,
+                &mut HeaderWorkBudget::default(),
+            )
+            .unwrap();
+        let winner = headers.snapshot().unwrap();
+        assert_eq!(original.active_tip().hash, first.block_hash());
+        assert_eq!(winner.active_tip().hash, side_two.block_hash());
+        let error = disconnect_execution_tip(&chainstate, &FailedRead(&winner), 2, 60).unwrap_err();
+        assert!(matches!(error, BlockExecutionError::HeaderRead(_)));
+        assert_eq!(
+            chainstate.execution().tip().unwrap().hash,
+            first.block_hash()
+        );
+        disconnect_execution_tip(&chainstate, &winner, 2, 60).unwrap();
+        connect_active_blocks(
+            &chainstate,
+            &winner,
+            &[side_one, side_two],
+            3,
+            60,
+            &[deployments(1), deployments(2)],
+        )
+        .unwrap();
+        assert_eq!(
+            chainstate.execution().tip().unwrap().hash,
+            winner.active_tip().hash
+        );
+        assert!(
+            chainstate
+                .undos()
+                .get(first.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        let first_winner = winner.active_header(1).unwrap().unwrap().hash;
+        assert!(matches!(
+            chainstate.prune_block_undos_before(&FailedRead(&winner), 2),
+            Err(crate::chain_store::ChainStoreError::HeaderRead(_))
+        ));
+        assert!(chainstate.undos().get(first_winner).unwrap().is_some());
+        assert_eq!(chainstate.prune_block_undos_before(&winner, 2).unwrap(), 1);
+        assert!(chainstate.undos().get(first_winner).unwrap().is_none());
+        let mut policy = crate::ibd::IbdPolicy::for_network(Network::Regtest);
+        policy
+            .set_assume_valid(&winner.active_tip().hash.to_string())
+            .unwrap();
+        assert!(matches!(
+            policy.status(&FailedRead(&winner)),
+            Err(crate::ibd::IbdPolicyError::HeaderRead(_))
+        ));
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        config
+            .apply_vbparams("taproot:0:9223372036854775807")
+            .unwrap();
+        assert!(matches!(
+            crate::deployments::taproot_active(&FailedRead(&winner), 144, &config),
+            Err(crate::deployments::DeploymentConfigError::HeaderRead(_))
+        ));
     }
 
     #[test]

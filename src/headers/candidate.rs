@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use super::{
-    BlockHash, Header, HeaderDag, HeaderError, HeaderInfo, HeaderWorkBudget, checkpoint_hash,
-    checkpoint_heights,
+    BlockHash, Header, HeaderDag, HeaderError, HeaderInfo, HeaderView, HeaderWorkBudget,
+    checkpoint_hash, checkpoint_heights,
 };
 
 #[derive(Clone)]
@@ -19,14 +19,15 @@ pub(crate) struct CandidateContext {
 }
 
 impl CandidateContext {
-    pub(crate) fn new(source: &HeaderDag, anchor: BlockHash) -> Result<Self, HeaderError> {
+    pub(crate) fn new(source: &dyn HeaderView, anchor: BlockHash) -> Result<Self, HeaderError> {
         let tip = source
-            .get(&anchor)
+            .header(&anchor)?
             .ok_or(HeaderError::UnknownParent(anchor))?;
-        let window = usize::try_from(source.params.difficulty_adjustment_interval())
-            .expect("network interval fits usize")
-            .max(11);
-        let mut dag = HeaderDag::with_deployments(source.deployments.clone());
+        let window =
+            usize::try_from(super::core_params(source.network()).difficulty_adjustment_interval())
+                .expect("network interval fits usize")
+                .max(11);
+        let mut dag = HeaderDag::with_deployments(source.deployments().clone());
         let mut recent = VecDeque::with_capacity(window + 1);
         let mut current = tip;
         for _ in 0..window {
@@ -36,16 +37,16 @@ impl CandidateContext {
                 break;
             }
             current = source
-                .get(&current.header.prev_blockhash)
+                .header(&current.header.prev_blockhash)?
                 .ok_or(HeaderError::UnknownParent(current.header.prev_blockhash))?;
         }
         // Preserve the source's checkpoint floor even when the fork anchor is
         // older than it. These few pinned entries are not a second chain copy.
         for height in checkpoint_heights(source.network()) {
-            if let Some(info) =
-                checkpoint_hash(source.network(), *height).and_then(|h| source.get(&h))
-            {
-                dag.headers.insert(info.hash, info);
+            if let Some(hash) = checkpoint_hash(source.network(), *height) {
+                if let Some(info) = source.header(&hash)? {
+                    dag.headers.insert(info.hash, info);
+                }
             }
         }
         Ok(Self {

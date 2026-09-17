@@ -11,7 +11,7 @@ use std::str::FromStr;
 use bitcoin::{BlockHash, Network, pow::Work};
 use thiserror::Error;
 
-use crate::headers::HeaderDag;
+use crate::headers::{HeaderReadError, HeaderView};
 
 /// Initial-block-download policy pinned to a selected network.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +39,9 @@ pub struct IbdStatus {
 /// Invalid IBD policy or an unsatisfied trust floor.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum IbdPolicyError {
+    /// Local history could not be read; no trust-floor decision was made.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// The policy and header DAG select different networks.
     #[error("IBD policy network does not match header network")]
     NetworkMismatch,
@@ -130,18 +133,15 @@ impl IbdPolicy {
     }
 
     /// Evaluates the active header chain without changing consensus validity.
-    pub fn status(&self, headers: &HeaderDag) -> Result<IbdStatus, IbdPolicyError> {
+    pub fn status(&self, headers: &dyn HeaderView) -> Result<IbdStatus, IbdPolicyError> {
         if headers.network() != self.network {
             return Err(IbdPolicyError::NetworkMismatch);
         }
         let tip = headers.active_tip();
-        let active_assume_valid_height = self.assume_valid.and_then(|hash| {
-            let anchor = headers.get(&hash)?;
-            headers
-                .active_header_at(anchor.height)
-                .is_some_and(|active| active.hash == hash)
-                .then_some(anchor.height)
-        });
+        let active_assume_valid_height = match self.assume_valid {
+            Some(hash) => headers.active_height(hash)?,
+            None => None,
+        };
         Ok(IbdStatus {
             height: tip.height,
             chainwork: tip.chainwork,
@@ -154,7 +154,7 @@ impl IbdPolicy {
     /// Requires the active chain to meet the work floor before leaving IBD.
     pub fn ensure_minimum_chainwork(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
     ) -> Result<IbdStatus, IbdPolicyError> {
         let status = self.status(headers)?;
         if !status.minimum_chainwork_reached {
@@ -185,6 +185,7 @@ fn parse_work(value: &str) -> Result<Work, ()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::headers::HeaderDag;
     use bitcoin::{
         TxMerkleNode,
         block::{Header, Version},

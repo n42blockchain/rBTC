@@ -15,8 +15,10 @@ use bitcoin::{BlockHash, Network, consensus::serialize, hashes::Hash, p2p::Magic
 use thiserror::Error;
 
 use crate::{
-    block_execution::BlockDeploymentContext, blockchain::block_subsidy_with_interval,
-    headers::HeaderDag, signet::DEFAULT_SIGNET_CHALLENGE,
+    block_execution::BlockDeploymentContext,
+    blockchain::block_subsidy_with_interval,
+    headers::{HeaderReadError, HeaderView},
+    signet::DEFAULT_SIGNET_CHALLENGE,
 };
 
 const VERSION_BITS_TOP_MASK: u32 = 0xE000_0000;
@@ -106,6 +108,9 @@ impl Eq for DeploymentConfig {}
 /// Invalid deployment configuration.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum DeploymentConfigError {
+    /// A local validated-header read failed; no deployment decision was made.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// Core-compatible version-bits overrides are a regtest-only facility.
     #[error("--vbparams is only supported with --network regtest")]
     RegtestOnly,
@@ -421,7 +426,7 @@ impl TemplateVersionBits {
 ///
 /// Returns an error when `headers` describes a different network than `config`.
 pub fn template_version_bits(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     candidate_height: u32,
     config: &DeploymentConfig,
 ) -> Result<TemplateVersionBits, DeploymentConfigError> {
@@ -435,7 +440,7 @@ pub fn template_version_bits(
             candidate_height,
             config.taproot,
             &config.taproot_state_cache,
-        );
+        )?;
         match state {
             ThresholdState::Started => deployments.push(TemplateDeployment {
                 name: "taproot",
@@ -498,18 +503,19 @@ pub fn block_deployment_context_with_config(
 /// Derives candidate flags using the active header chain for Core's BIP30 optimization.
 pub fn block_deployment_context_for_headers(
     config: &DeploymentConfig,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     height: u32,
     block_hash: BlockHash,
 ) -> Result<BlockDeploymentContext, DeploymentConfigError> {
     if headers.network() != config.network {
         return Err(DeploymentConfigError::NetworkMismatch);
     }
-    let bip34_anchor_matches = bip34_anchor(config.network).is_some_and(|(anchor_height, hash)| {
-        headers
-            .active_header_at(anchor_height)
-            .is_some_and(|header| header.hash == hash)
-    });
+    let bip34_anchor_matches = match bip34_anchor(config.network) {
+        Some((anchor_height, hash)) => headers
+            .active_header(anchor_height)?
+            .is_some_and(|header| header.hash == hash),
+        None => false,
+    };
     Ok(block_deployment_context_with_bip34_anchor(
         config,
         height,
@@ -597,7 +603,7 @@ pub fn taproot_always_active(network: Network) -> bool {
 /// as the version-bits machinery that a future deployment needs, and for
 /// reporting a deployment's status.
 pub fn taproot_active(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     candidate_height: u32,
     config: &DeploymentConfig,
 ) -> Result<bool, DeploymentConfigError> {
@@ -615,12 +621,12 @@ pub fn taproot_active(
         candidate_height,
         config.taproot,
         &config.taproot_state_cache,
-    ) == ThresholdState::Active)
+    )? == ThresholdState::Active)
 }
 
 #[cfg(test)]
 fn threshold_state(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     candidate_height: u32,
     params: VersionBitsParams,
 ) -> ThresholdState {
@@ -640,26 +646,26 @@ fn threshold_state(
         if period_end > parent_height {
             break;
         }
-        if headers.active_header_at(period_end).is_none() {
+        if headers.active_header(period_end).unwrap().is_none() {
             return ThresholdState::Defined;
         }
-        state = next_threshold_state(headers, period_end, params, state);
+        state = next_threshold_state(headers, period_end, params, state).unwrap();
     }
     state
 }
 
 fn threshold_state_cached(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     candidate_height: u32,
     params: VersionBitsParams,
     cache: &RwLock<HashMap<BlockHash, ThresholdState>>,
-) -> ThresholdState {
+) -> Result<ThresholdState, HeaderReadError> {
     let Some(parent_height) = candidate_height.checked_sub(1) else {
-        return ThresholdState::Defined;
+        return Ok(ThresholdState::Defined);
     };
     let completed_periods = candidate_height / params.period;
     if completed_periods == 0 {
-        return ThresholdState::Defined;
+        return Ok(ThresholdState::Defined);
     }
 
     // Walk back only to the newest cached period on this exact branch. The
@@ -675,8 +681,8 @@ fn threshold_state_cached(
         if period_end > parent_height {
             continue;
         }
-        let Some(period_end_header) = headers.active_header_at(period_end) else {
-            return ThresholdState::Defined;
+        let Some(period_end_header) = headers.active_header(period_end)? else {
+            return Ok(ThresholdState::Defined);
         };
         if let Some(cached) = cache
             .read()
@@ -691,37 +697,46 @@ fn threshold_state_cached(
     }
 
     for (period_end, period_end_hash) in pending.into_iter().rev() {
-        state = next_threshold_state(headers, period_end, params, state);
+        state = next_threshold_state(headers, period_end, params, state)?;
         cache
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(period_end_hash, state);
     }
-    state
+    Ok(state)
 }
 
 fn next_threshold_state(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     period_end: u32,
     params: VersionBitsParams,
     state: ThresholdState,
-) -> ThresholdState {
-    let period_end_header = headers
-        .active_header_at(period_end)
-        .expect("completed active-chain period has an end header");
+) -> Result<ThresholdState, HeaderReadError> {
+    let period_end_header =
+        headers
+            .active_header(period_end)?
+            .ok_or(HeaderReadError::Inconsistent(
+                "missing deployment period end",
+            ))?;
     let period_mtp = i64::from(
         headers
-            .median_time_past(period_end_header.hash)
-            .expect("active header has median time past"),
+            .median_time_past(period_end_header.hash)?
+            .ok_or(HeaderReadError::Inconsistent("missing deployment MTP"))?,
     );
-    match state {
+    Ok(match state {
         ThresholdState::Defined if period_mtp >= params.start_time => ThresholdState::Started,
         ThresholdState::Started => {
             let period_start = period_end + 1 - params.period;
-            let signals = (period_start..=period_end)
-                .filter_map(|height| headers.active_header_at(height))
-                .filter(|header| signals_taproot(header.header.version.to_consensus()))
-                .count();
+            let mut signals = 0;
+            for height in period_start..=period_end {
+                let header =
+                    headers
+                        .active_header(height)?
+                        .ok_or(HeaderReadError::Inconsistent(
+                            "missing deployment period header",
+                        ))?;
+                signals += usize::from(signals_taproot(header.header.version.to_consensus()));
+            }
             if signals >= usize::try_from(params.threshold).expect("threshold fits usize") {
                 ThresholdState::LockedIn
             } else if period_mtp >= params.timeout {
@@ -737,7 +752,7 @@ fn next_threshold_state(
             ThresholdState::Active
         }
         other => other,
-    }
+    })
 }
 
 fn signals_taproot(version: i32) -> bool {
@@ -872,6 +887,7 @@ fn parse_hash(hash: &str) -> BlockHash {
 #[cfg(test)]
 mod tests {
     use super::{TemplateVersionBits, template_version_bits};
+    use crate::headers::HeaderDag;
 
     #[test]
     fn a_regtest_template_version_is_derived_rather_than_assumed() {
@@ -1288,7 +1304,7 @@ mod tests {
         let cache = RwLock::new(HashMap::new());
         for height in 0..=32 {
             assert_eq!(
-                threshold_state_cached(&headers, height, params, &cache),
+                threshold_state_cached(&headers, height, params, &cache).unwrap(),
                 threshold_state(&headers, height, params),
                 "candidate height {height}"
             );
@@ -1297,7 +1313,7 @@ mod tests {
 
         for height in (0..=32).rev() {
             assert_eq!(
-                threshold_state_cached(&headers, height, params, &cache),
+                threshold_state_cached(&headers, height, params, &cache).unwrap(),
                 threshold_state(&headers, height, params)
             );
         }
@@ -1332,11 +1348,11 @@ mod tests {
         }
 
         assert_eq!(
-            threshold_state_cached(&signalling, 8, params, &cache),
+            threshold_state_cached(&signalling, 8, params, &cache).unwrap(),
             ThresholdState::LockedIn
         );
         assert_eq!(
-            threshold_state_cached(&silent, 8, params, &cache),
+            threshold_state_cached(&silent, 8, params, &cache).unwrap(),
             ThresholdState::Started
         );
         assert_eq!(cache.read().unwrap().len(), 3);

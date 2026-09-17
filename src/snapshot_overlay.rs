@@ -62,7 +62,7 @@ use crate::{
         build_core_snapshot_index_with_identity,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     undo_store::{decode_block_undo, encode_block_undo},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -1785,7 +1785,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let _guard = self.lock();
@@ -1803,7 +1803,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
                 let hash = BlockHash::from_byte_array(key);
                 let header =
                     headers
-                        .get(&hash)
+                        .header(&hash)?
                         .ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
                             "block undo references an unknown header",
                         )))?;

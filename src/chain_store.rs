@@ -19,7 +19,7 @@ use crate::{
         advance_transaction, assume_snapshot_transaction, clear_assumed_snapshot_transaction,
         metadata_exists as execution_metadata_exists, rewind_transaction,
     },
-    headers::HeaderDag,
+    headers::HeaderView,
     undo_store::{
         RedbUndoStore, UndoStoreError, clear_block_undos_database,
         insert_transaction as insert_undo_transaction,
@@ -81,6 +81,9 @@ impl Default for ChainStoreOptions {
 /// Errors from the unified chain-state database.
 #[derive(Debug, Error)]
 pub enum ChainStoreError {
+    /// A validated local header could not be read; the operation is not published.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] crate::headers::HeaderReadError),
     /// The database is structurally damaged and could not be opened safely.
     #[error("chainstate database is truncated or structurally damaged")]
     Damaged,
@@ -561,7 +564,7 @@ pub trait ExecutionChainStore: UtxoStore {
     /// override this so the retained-ledger floor also bounds undo growth.
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let (_, _) = (headers, retain_from_height);
@@ -647,7 +650,7 @@ impl ExecutionChainStore for RedbChainStore {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         RedbChainStore::prune_block_undos_before(self, headers, retain_from_height)
@@ -1597,7 +1600,7 @@ impl RedbChainStore {
     /// unknown record fails closed before a write transaction begins.
     pub fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         if !self.options.retain_block_undo {
@@ -1608,12 +1611,10 @@ impl RedbChainStore {
             .hashes()?
             .into_iter()
             .map(|hash| {
-                headers
-                    .get(&hash)
-                    .map(|header| (header.height, hash))
-                    .ok_or(UndoStoreError::Malformed(
-                        "block undo references an unknown header",
-                    ))
+                let header = headers.header(&hash)?.ok_or(UndoStoreError::Malformed(
+                    "block undo references an unknown header",
+                ))?;
+                Ok::<_, ChainStoreError>((header.height, hash))
             })
             .collect::<Result<Vec<_>, _>>()?;
         expired.retain(|(height, _)| *height < retain_from_height);
@@ -2202,7 +2203,7 @@ impl RedbChainStore {
     pub fn finalize_assumed_snapshot(
         &self,
         validation: &Self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
     ) -> Result<AssumedSnapshot, ChainStoreError> {
         let _guard = self.lock();
         let assumed = self
@@ -2234,7 +2235,7 @@ impl RedbChainStore {
             return Err(ChainStoreError::ValidationConsensusMismatch);
         }
         if headers
-            .active_header_at(assumed.base.height)
+            .active_header(assumed.base.height)?
             .is_none_or(|header| header.hash != assumed.base.hash)
         {
             return Err(ChainStoreError::SnapshotBaseNotActive {
@@ -2244,7 +2245,7 @@ impl RedbChainStore {
         }
         let active_tip = self.execution.tip()?;
         if headers
-            .active_header_at(active_tip.height)
+            .active_header(active_tip.height)?
             .is_none_or(|header| header.hash != active_tip.hash)
         {
             return Err(ChainStoreError::ExecutionTipNotActive {
@@ -2959,6 +2960,7 @@ impl UtxoStore for RedbChainStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::headers::HeaderDag;
     use std::{
         fmt, io,
         sync::{

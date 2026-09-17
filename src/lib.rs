@@ -30,6 +30,7 @@ pub mod explorer_store;
 pub mod fee_estimator;
 pub mod feerate_diagram;
 pub mod header_candidate;
+pub mod header_index;
 pub mod header_store;
 pub mod headers;
 pub mod i2p_sam;

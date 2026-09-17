@@ -3724,8 +3724,9 @@ impl NodeRpcOperator {
         let now = unix_time().map_err(|_| unavailable())?;
         let current_time = now.max(minimum_time);
 
-        let version_bits = rbtc::deployments::template_version_bits(&headers, height, &deployments)
-            .map_err(|_| unavailable())?;
+        let version_bits =
+            rbtc::deployments::template_version_bits(&*headers, height, &deployments)
+                .map_err(|_| unavailable())?;
         let candidate = bitcoin::block::Header {
             version: bitcoin::block::Version::from_consensus(version_bits.version),
             prev_blockhash: tip.hash,
@@ -3737,7 +3738,7 @@ impl NodeRpcOperator {
         let bits = headers
             .expected_next_bits(&candidate)
             .map_err(|_| unavailable())?;
-        let taproot = rbtc::deployments::taproot_active(&headers, height, &deployments)
+        let taproot = rbtc::deployments::taproot_active(&*headers, height, &deployments)
             .map_err(|_| unavailable())?;
         drop(headers);
 

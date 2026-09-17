@@ -95,6 +95,8 @@ pub struct RedbHeaderStore {
 }
 
 mod candidate;
+mod replay;
+pub use replay::HeaderReplayReader;
 
 impl RedbHeaderStore {
     /// Opens or creates a header database at `path`.

@@ -46,7 +46,7 @@ use crate::{
         CoreSnapshotUtxoIndex, SnapshotBaseIdentity, build_core_snapshot_index_with_identity,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     snapshot_overlay::{
         BaseGroupReader, META_IDENTITY, META_TIP, OverlayCapacity, RebaseReport, RemoveFilesOnDrop,
         SnapshotOverlayConfig, SnapshotOverlayError, chain_store_to_utxo, decode_identity,
@@ -1118,7 +1118,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let _guard = self.lock();
@@ -1135,7 +1135,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
                 let hash = BlockHash::from_byte_array(key);
                 let header =
                     headers
-                        .get(&hash)
+                        .header(&hash)?
                         .ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
                             "block undo references an unknown header",
                         )))?;

@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     execution_store::ExecutionTip,
-    headers::HeaderDag,
+    headers::HeaderView,
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -890,7 +890,7 @@ impl MdbxUtxoStore {
     /// record whose chain position was never established.
     pub fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let transaction = self.db().begin_ro_txn().map_err(UtxoError::from)?;
@@ -908,7 +908,7 @@ impl MdbxUtxoStore {
             );
             let height =
                 headers
-                    .get(&hash)
+                    .header(&hash)?
                     .map(|header| header.height)
                     .ok_or(UtxoError::Malformed(
                         "MDBX block undo references an unknown header",
@@ -1797,7 +1797,7 @@ impl ExecutionChainStore for MdbxUtxoStore {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         MdbxUtxoStore::prune_block_undos_before(self, headers, retain_from_height)
