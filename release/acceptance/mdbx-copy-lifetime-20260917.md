@@ -37,3 +37,35 @@ Final local validation: all-feature library suite 1,040 passed, 0 failed,
 12 ignored (67.03 s); strict all-target/all-feature Clippy passed (18.12 s).
 The six-boundary subprocess crash matrix passed (1.55 s), with its worker ignored
 as a standalone test. Formatting and diff checks passed.
+
+## Frozen-source maintenance measurement
+
+Source `9907c8e1e101b0f1086662ed4d2224ec255053fd`; frozen binaries and source hashes,
+Mac, no concurrent local compilation. The same 4M-UTXO maintenance workload as
+257bd32 was used: 4,096 transitions, 5,000 updates, seed 100,000, 1 GiB geometry,
+288 undo retention, compact 55%, minimum reclaim 10%, repeat growth 50%, serial
+64/256, reports every 256, STREAM_INPUTS=1.
+
+| Batch | Peak RSS bytes | Final checkpoint seconds | Automatic compactions |
+| --- | ---: | ---: | ---: |
+| 64 | 652,509,184 | 48.9844 | 1 |
+| 256 | 846,053,376 | 55.5364 | 2 |
+
+**1.2966152765 <= 1.5: this maintenance RSS criterion passed.** Both peaks are
+below the prior source's 1,115,963,392 / 1,268,006,912 bytes. The ratio increased
+because both absolute peaks fell by different amounts; neither threshold nor
+batch size was changed. The runner exited 0 with state measured. Independent
+reopens and the six-boundary compaction crash matrix passed. Both content hashes
+match each other and the prior 4M workload:
+`b70539db61ad7be1848418150ecaa1e3cca6c2996be04a2cdb4409f9c5b48bdb`.
+
+Artifacts/databases remain at
+`/Users/jieliu/Documents/n42/rBTC-storage-copy-lifetime-4m-20260917`; small evidence
+is copied under session-state/2026-09-17/mdbx-copy-lifetime. Old results retain
+their original source identities and statuses. This is not full 160M/900,000
+scale, a complete-node reservation proof or long-duration acceptance.
+
+Prior CI 35204429046/257bd32 finished with Linux (including 90% coverage) and
+supply-chain success, and the documented Windows flag-type compile failure.
+The normalization commit d39ea9c is included in 9907c8e; a new CI run must verify
+that platform rather than treating Mac tests as Windows evidence.

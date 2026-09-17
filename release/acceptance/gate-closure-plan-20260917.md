@@ -76,7 +76,10 @@ not change acceptance statuses or weaken thresholds.
    1/2 actual compactions (1.13624); full scale and sustained whole-node ownership
    remain open, and historical failures remain preserved.
    [Compaction mapping lifetime](mdbx-copy-lifetime-20260917.md) now closes the
-   source before opening/validating the copy, retaining recovery reservations; [execution input lifetime](execution-input-lifetime-20260917.md)
+   source before opening/validating the copy, retaining recovery reservations.
+   Source 9907c8e repeats the 4M maintenance workload with lower absolute peaks
+   (652.5/846.1 MB), ratio 1.29662 and the same 1/2 compactions; full-node gates
+   remain open; [execution input lifetime](execution-input-lifetime-20260917.md)
    removes additional copies before commit, without claiming a total bound.
    [MDBX environment ownership](mdbx-memory-policy-20260917.md) now fixes spill
    policy across hosts and keeps shared reservations through compact/rebase
