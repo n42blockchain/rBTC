@@ -441,6 +441,7 @@ fn scan_archive_selection(
     file.seek(SeekFrom::Start(payload_offset))?;
     let decoder = ArchiveDecoder::new(path, file, records_limit)?;
     let mut bounded = decoder.take(records_limit.saturating_add(1));
+    let _scratch_reservation = reserve_archive_memory(path, 64 * 1024)?;
     let mut scratch = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut digest = Sha256::new();
     let mut records_bytes = 0_u64;
@@ -472,6 +473,13 @@ fn scan_archive_selection(
             .ok_or(ArchiveError::Invalid("height overflow"))?;
         let wanted = !stopped && height >= first_height && selected_count < max_blocks;
         if wanted && bytes <= max_record_bytes.saturating_sub(selected_bytes) {
+            // Visitor payloads cannot escape the callback. Returned batches
+            // need a separate owning API before their allocation can be leased.
+            let _block_reservation = if visit.is_some() {
+                reserve_archive_memory(path, length as u64)?
+            } else {
+                None
+            };
             let mut block = vec![0_u8; length];
             bounded
                 .read_exact(&mut block)
@@ -787,6 +795,7 @@ fn verify_record_stream(
     file.seek(SeekFrom::Start(payload_offset))?;
     let decoder = ArchiveDecoder::new(path, file, records_limit)?;
     let mut bounded = decoder.take(records_limit.saturating_add(1));
+    let _scratch_reservation = reserve_archive_memory(path, 64 * 1024)?;
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut verifier = RecordStreamVerifier::default();
     let mut digest = Sha256::new();
@@ -995,6 +1004,15 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+fn reserve_archive_memory(
+    path: &Path,
+    bytes: u64,
+) -> Result<Option<crate::node_memory::MemoryLease>, ArchiveError> {
+    crate::node_memory::for_path(path)?
+        .map(|budget| budget.reserve(bytes).map_err(ArchiveError::ResourceBudget))
+        .transpose()
+}
+
 // The native decoder and Rust input buffer must die before their allowance.
 struct ArchiveDecoder {
     inner: zstd::stream::Decoder<'static, BufReader<File>>,
@@ -1046,6 +1064,56 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn visitor_scratch_denial_precedes_callback_and_early_stop_refunds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("visitor.rblk");
+        let manifest = write_archive(&path, 1, &[vec![7; 70_000], vec![8; 80_000]]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let native = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
+        let limit = native + 64 * 1024 + 70_000;
+        let budget = crate::node_memory::MemoryBudget::new(limit);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        // Native context fits, but the scan buffer cannot be allocated.
+        let pressure = budget.reserve(limit - native).unwrap();
+        assert!(matches!(
+            verify_archive_streaming(&path),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(budget.snapshot().used, limit - native);
+        drop(pressure);
+        // Scan buffer fits, but the first callback payload misses by one byte.
+        let pressure = budget.reserve(1).unwrap();
+        let mut calls = 0;
+        assert!(matches!(
+            visit_archive_prefix(&path, &manifest, 2, &mut |_, _| {
+                calls += 1;
+                true
+            }),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(calls, 0);
+        assert_eq!(budget.snapshot().used, 1);
+        drop(pressure);
+        // Stopping after the first record must verify/skip the larger suffix
+        // without admitting or materializing that record's callback payload.
+        assert!(
+            !visit_archive_prefix(&path, &manifest, 2, &mut |height, raw| {
+                calls += 1;
+                assert_eq!(height, 1);
+                assert_eq!(raw.len(), 70_000);
+                assert_eq!(budget.snapshot().used, limit);
+                false
+            })
+            .unwrap()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(verify_archive_streaming(&path).unwrap(), manifest);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     fn native_decoder_admission_survives_callbacks_and_refunds_failures() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("decoder.rblk");
@@ -1055,16 +1123,17 @@ mod tests {
         assert!(ArchiveDecoder::allowance(MAX_RECORDS_BYTES).unwrap() > 128 * 1024 * 1024);
         assert!(rbtc_codec_memory::decoder_bytes(22).is_none());
         assert!(rbtc_codec_memory::decoder_bytes(28).is_none());
-        let budget = crate::node_memory::MemoryBudget::new(allowance);
+        let total = allowance + 64 * 1024 + 512 * 1024;
+        let budget = crate::node_memory::MemoryBudget::new(total);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
-        let pressure = budget.reserve(1).unwrap();
+        let pressure = budget.reserve(total - allowance + 1).unwrap();
         for result in [
             read_archive_batch(&path, 20, 1, MAX_RECORDS_BYTES).map(|_| ()),
             verify_archive_streaming(&path).map(|_| ()),
             verify_archive_block_hashes_streaming(&path).map(|_| ()),
         ] {
             assert!(matches!(result, Err(ArchiveError::ResourceBudget(_))));
-            assert_eq!(budget.snapshot().used, 1);
+            assert_eq!(budget.snapshot().used, total - allowance + 1);
         }
         drop(pressure);
         let mut calls = 0;
@@ -1072,7 +1141,7 @@ mod tests {
             visit_archive_prefix(&path, &manifest, 1, &mut |_, raw| {
                 calls += 1;
                 assert_eq!(raw.len(), 512 * 1024);
-                assert_eq!(budget.snapshot().used, allowance);
+                assert_eq!(budget.snapshot().used, total);
                 assert!(budget.reserve(1).is_err());
                 true
             })
