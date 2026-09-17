@@ -702,7 +702,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         return Err(BlockExecutionError::TransactionIdCount);
     }
 
-    let mut current = chainstate.execution_tip()?;
+    let current = chainstate.execution_tip()?;
     let output_count = blocks
         .iter()
         .flat_map(|block| &block.txdata)
@@ -1033,73 +1033,44 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }));
     }
 
-    // Phase three: transitions and undo records, again in parallel per
-    // block, collected in block order.
-    let apply_started = Instant::now();
-    let finished_slots: Vec<std::sync::OnceLock<FinishedSlot>> = (0..prepared_blocks.len())
-        .map(|_| std::sync::OnceLock::new())
-        .collect();
-    let next_finish = std::sync::atomic::AtomicUsize::new(0);
-    let prepared_blocks = Mutex::new(prepared_blocks.into_iter().map(Some).collect::<Vec<_>>());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let next = &next_finish;
-            let finished_slots = &finished_slots;
-            let prepared_blocks = &prepared_blocks;
-            let tips = &tips;
-            scope.spawn(move || {
-                loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(slot) = finished_slots.get(index) else {
-                        break;
-                    };
-                    let (prepared, delta) = {
-                        let mut prepared_blocks =
-                            prepared_blocks.lock().expect("prepared lock not poisoned");
-                        prepared_blocks[index]
-                            .take()
-                            .expect("each block index is claimed once")
-                    };
-                    let changes = delta.into_net_changes();
-                    let mut applied = prepared.into_applied(retains_undo);
-                    let expected_parent = if index == 0 {
+    // Phase three consumes prepared blocks in order. A streaming store keeps
+    // only the current transition alive inside its atomic transaction; source
+    // errors abort the entire checkpoint. Scripts have already drained.
+    let mut applied_blocks = Vec::with_capacity(prepared_blocks.len());
+    let mut apply_elapsed = Duration::ZERO;
+    let mut transitions =
+        prepared_blocks
+            .into_iter()
+            .enumerate()
+            .map(|(index, (prepared, delta))| {
+                let apply_started = Instant::now();
+                let changes = delta.into_net_changes();
+                let mut applied = prepared.into_applied(retains_undo);
+                let transition = ConnectTransition {
+                    expected_parent: if index == 0 {
                         base.hash
                     } else {
                         tips[index - 1].hash
-                    };
-                    let transition = ConnectTransition {
-                        expected_parent,
-                        next: tips[index],
-                        spent: changes.spent,
-                        created: changes.created,
-                        transaction_undos: match (retains_undo, applied_undos) {
-                            (false, _) => Vec::new(),
-                            (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
-                            (true, AppliedUndos::Drop) => {
-                                std::mem::take(&mut applied.transaction_undos)
-                            }
-                        },
-                    };
-                    slot.set((transition, applied))
-                        .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
-                }
+                    },
+                    next: tips[index],
+                    spent: changes.spent,
+                    created: changes.created,
+                    transaction_undos: match (retains_undo, applied_undos) {
+                        (false, _) => Vec::new(),
+                        (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                        (true, AppliedUndos::Drop) => {
+                            std::mem::take(&mut applied.transaction_undos)
+                        }
+                    },
+                };
+                applied_blocks.push(applied);
+                apply_elapsed += apply_started.elapsed();
+                Ok(transition)
             });
-        }
-    });
-    let mut applied_blocks = Vec::with_capacity(finished_slots.len());
-    let mut transitions = Vec::with_capacity(finished_slots.len());
-    for slot in finished_slots {
-        let (transition, applied) = slot.into_inner().expect("phase three covered every block");
-        transitions.push(transition);
-        applied_blocks.push(applied);
-    }
-    breakdown.apply += apply_started.elapsed();
-    current = *tips.last().expect("non-empty batch has a final tip");
-    let _ = current;
-
     let commit_started = Instant::now();
-    chainstate.commit_connect_batch_owned(transitions)?;
-    breakdown.commit = commit_started.elapsed();
+    chainstate.commit_connect_batch_stream(&mut transitions, tips.last().copied())?;
+    breakdown.apply += apply_elapsed;
+    breakdown.commit = commit_started.elapsed().saturating_sub(apply_elapsed);
     Ok((applied_blocks, breakdown))
 }
 
@@ -1458,9 +1429,6 @@ pub(crate) fn drain_script_batches(
 /// One block's parallel-preparation result, in batch order; its deferred
 /// script checks were already handed to the pool by the preparing worker.
 type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
-/// One block's transition and applied record.
-type FinishedSlot = (ConnectTransition, AppliedBlock);
-
 /// The whole batch's coin history as of one block: every version each key
 /// takes across the batch, tagged with the block that wrote it. A block reads
 /// the latest version an *earlier* block left and never a later one, so every

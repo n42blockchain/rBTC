@@ -517,6 +517,24 @@ pub trait ExecutionChainStore: UtxoStore {
     ) -> Result<(), ChainStoreError> {
         self.commit_connect_batch(&transitions)
     }
+    /// Consumes transitions while preserving one atomic publication boundary.
+    ///
+    /// A late source error must leave no committed prefix. `final_tip` binds
+    /// the intended end and must be absent exactly for an empty stream.
+    /// Implementations may materialize this compatibility fallback; stores
+    /// supporting bounded consumption override it.
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let expected = transitions.len();
+        let transitions = transitions.collect::<Result<Vec<_>, _>>()?;
+        if transitions.len() != expected || transitions.last().map(|item| item.next) != final_tip {
+            return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+        }
+        self.commit_connect_batch_owned(transitions)
+    }
     /// Commits a batch whose net coin change the caller already folded.
     ///
     /// `transitions` carry the per-block tips and undo records; their own
@@ -632,6 +650,14 @@ impl ExecutionChainStore for RedbChainStore {
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError> {
         RedbChainStore::commit_connect_batch(self, transitions)
+    }
+
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        self.commit_transition_stream(transitions, final_tip)
     }
 
     fn commit_disconnect(
@@ -2511,6 +2537,87 @@ impl RedbChainStore {
         Ok(())
     }
 
+    fn commit_transition_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let expected = transitions.len();
+        if self.validation_journal.is_some() {
+            // Journal checkpoints still fold one net row. Retain that format
+            // until its bounded spool path can preserve the same semantics.
+            let transitions = transitions.collect::<Result<Vec<_>, _>>()?;
+            if transitions.len() != expected
+                || transitions.last().map(|item| item.next) != final_tip
+            {
+                return Err(
+                    UtxoError::Malformed("atomic transition stream endpoint mismatch").into(),
+                );
+            }
+            return self.commit_connect_batch(&transitions);
+        }
+        if expected == 0 {
+            return if final_tip.is_none() {
+                Ok(())
+            } else {
+                Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into())
+            };
+        }
+        let _bulk_guard = bulk_commit_guard();
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let mut count = 0;
+        let mut last = None;
+        for transition in transitions {
+            let mut transition = transition?;
+            transition.spent.sort_unstable();
+            transition.created.sort_unstable_by_key(|(key, _)| *key);
+            if let Some(keys) = transition.spent.windows(2).find(|keys| keys[0] == keys[1]) {
+                return Err(UtxoError::DuplicateSpend(keys[0]).into());
+            }
+            if let Some(rows) = transition
+                .created
+                .windows(2)
+                .find(|rows| rows[0].0 == rows[1].0)
+            {
+                return Err(UtxoError::Duplicate(rows[0].0).into());
+            }
+            // Validate and apply one block inside the still-unpublished write.
+            // The next block can spend outputs this block just created.
+            let ages = spent_age_counts([(
+                transition.next.height,
+                transition.transaction_undos.as_slice(),
+            )])?;
+            apply_validated_changes_transaction(
+                &transaction,
+                &transition.spent,
+                &transition.created,
+            )?;
+            if self.options.retain_block_undo {
+                insert_undo_transaction(
+                    &transaction,
+                    transition.next.hash,
+                    &transition.transaction_undos,
+                )?;
+            }
+            advance_transaction(&transaction, transition.expected_parent, transition.next)?;
+            connect_spent_ages_transaction(
+                &transaction,
+                &ages,
+                transition.next.height,
+                transition.next.height,
+            )?;
+            count += 1;
+            last = Some(transition.next);
+        }
+        if count != expected || last != final_tip {
+            return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Atomically applies a reverse UTXO transition, removes undo, and rewinds the tip.
     pub fn commit_disconnect(
         &self,
@@ -3033,6 +3140,137 @@ mod tests {
             creation_mtp: 0,
             script_pubkey: vec![0x51],
         }
+    }
+
+    fn assert_atomic_transition_stream(store: &impl ExecutionChainStore) {
+        let genesis = store.execution_tip().unwrap();
+        let one = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([81; 32]),
+        };
+        let two = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([82; 32]),
+        };
+        let first = ConnectTransition {
+            expected_parent: genesis.hash,
+            next: one,
+            spent: vec![],
+            // The public stream accepts unsorted caller changes too.
+            created: vec![(key(2), coin(20)), (key(1), coin(10))],
+            transaction_undos: vec![],
+        };
+        let second = ConnectTransition {
+            expected_parent: one.hash,
+            next: two,
+            spent: vec![key(1)],
+            created: vec![(key(3), coin(10))],
+            transaction_undos: vec![],
+        };
+        let mut failed = vec![
+            Ok(first.clone()),
+            Err(UtxoError::Malformed("late spool read failure").into()),
+        ]
+        .into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut failed, Some(two))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert!(store.get(key(2)).unwrap().is_none());
+        assert!(store.block_undo(one.hash).unwrap().is_none());
+
+        let wrong_end = ExecutionTip {
+            hash: BlockHash::from_byte_array([83; 32]),
+            ..two
+        };
+        let mut wrong = vec![Ok(first.clone()), Ok(second.clone())].into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut wrong, Some(wrong_end))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.get(key(3)).unwrap().is_none());
+        assert!(store.block_undo(two.hash).unwrap().is_none());
+
+        let mut duplicate = first.clone();
+        duplicate.created.push((key(1), coin(10)));
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut vec![Ok(duplicate)].into_iter(), Some(one))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut std::iter::empty(), Some(one))
+                .is_err()
+        );
+        store
+            .commit_connect_batch_stream(&mut std::iter::empty(), None)
+            .unwrap();
+        let mut valid = vec![Ok(first), Ok(second)].into_iter();
+        store
+            .commit_connect_batch_stream(&mut valid, Some(two))
+            .unwrap();
+        assert_eq!(store.execution_tip().unwrap(), two);
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert_eq!(store.get(key(2)).unwrap().unwrap().value_sats, 20);
+        assert_eq!(store.get(key(3)).unwrap().unwrap().value_sats, 10);
+        assert!(store.block_undo(one.hash).unwrap().is_some());
+        assert!(store.block_undo(two.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn redb_transition_stream_is_atomic_on_late_source_and_endpoint_errors() {
+        for journal in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let store = RedbChainStore::open_with_options(
+                dir.path().join("chain.redb"),
+                Network::Regtest,
+                ChainStoreOptions {
+                    validation_delta_journal: journal,
+                    ..ChainStoreOptions::default()
+                },
+            )
+            .unwrap();
+            assert_atomic_transition_stream(&store);
+            let tip = store.execution_tip().unwrap();
+            drop(store);
+            let reopened = RedbChainStore::open_with_options(
+                dir.path().join("chain.redb"),
+                Network::Regtest,
+                ChainStoreOptions {
+                    validation_delta_journal: journal,
+                    ..ChainStoreOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reopened.execution_tip().unwrap(), tip);
+            assert_eq!(reopened.get(key(3)).unwrap().unwrap().value_sats, 10);
+        }
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn mdbx_transition_stream_is_atomic_on_late_source_and_endpoint_errors() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("chain")).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([80; 32]),
+            })
+            .unwrap();
+        assert_atomic_transition_stream(&store);
+        let tip = store.execution_tip().unwrap();
+        drop(store);
+        let reopened = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("chain")).unwrap();
+        assert_eq!(reopened.execution_tip().unwrap(), tip);
+        assert_eq!(reopened.get(key(3)).unwrap().unwrap().value_sats, 10);
     }
 
     fn snapshot_digest(entries: &BTreeMap<OutPointKey, Utxo>) -> [u8; 32] {

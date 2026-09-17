@@ -44,7 +44,9 @@ not change acceptance statuses or weaken thresholds.
    removes additional copies before commit, without claiming a total bound.
    [MDBX environment ownership](mdbx-memory-policy-20260917.md) now fixes spill
    policy across hosts and keeps shared reservations through compact/rebase
-   reopen; application allocation bounds and RSS acceptance remain open.
+   reopen. [Atomic transition consumption](atomic-transition-stream-20260917.md)
+   removes the executor's second full transition vector for streaming engines;
+   preparation/spooling and other stores remain, as does RSS acceptance.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact
    source identity after production changes stop.

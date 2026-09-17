@@ -1092,12 +1092,20 @@ impl MdbxUtxoStore {
 
     fn commit_transition_iter<T: std::borrow::Borrow<ConnectTransition>>(
         &self,
-        transitions: impl ExactSizeIterator<Item = T>,
-        final_height: u32,
+        transitions: impl ExactSizeIterator<Item = Result<T, ChainStoreError>>,
+        final_tip: Option<ExecutionTip>,
     ) -> Result<(), ChainStoreError> {
-        if transitions.len() == 0 {
-            return Ok(());
+        let expected = transitions.len();
+        if expected == 0 {
+            return if final_tip.is_none() {
+                Ok(())
+            } else {
+                Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into())
+            };
         }
+        let final_height = final_tip
+            .ok_or(UtxoError::Malformed("missing transition stream endpoint"))?
+            .height;
         if transitions.len() > MAX_ATOMIC_IBD_BATCH_BLOCKS {
             return Err(UtxoError::Malformed("MDBX IBD batch exceeds 256 blocks").into());
         }
@@ -1115,8 +1123,11 @@ impl MdbxUtxoStore {
             .map_err(UtxoError::from)?;
         let mut current = Self::read_tip(&transaction, &meta)?
             .ok_or(UtxoError::Malformed("MDBX execution tip is uninitialized"))?;
+        let mut count = 0;
         for owned in transitions {
+            let owned = owned?;
             let transition = owned.borrow();
+            count += 1;
             Self::validate_tip_advance(current, transition.expected_parent, transition.next)?;
             let (spent, created) = Self::fold_batch_changes(std::slice::from_ref(transition))?;
             Self::apply_net_changes::<false>(
@@ -1147,6 +1158,9 @@ impl MdbxUtxoStore {
             // An owned iterator drops this transition and its undo here, before
             // building the next block's temporary index. The transaction is
             // still unpublished until the final tip and commit below.
+        }
+        if count != expected || Some(current) != final_tip {
+            return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
         }
         Self::write_tip(&transaction, &meta, current)?;
         transaction.commit().map_err(UtxoError::from)?;
@@ -1930,10 +1944,8 @@ impl ExecutionChainStore for MdbxUtxoStore {
         transitions: &[ConnectTransition],
     ) -> Result<(), ChainStoreError> {
         self.commit_transition_iter(
-            transitions.iter(),
-            transitions
-                .last()
-                .map_or(0, |transition| transition.next.height),
+            transitions.iter().map(Ok),
+            transitions.last().map(|transition| transition.next),
         )
     }
 
@@ -1941,10 +1953,16 @@ impl ExecutionChainStore for MdbxUtxoStore {
         &self,
         transitions: Vec<ConnectTransition>,
     ) -> Result<(), ChainStoreError> {
-        let final_height = transitions
-            .last()
-            .map_or(0, |transition| transition.next.height);
-        self.commit_transition_iter(transitions.into_iter(), final_height)
+        let final_tip = transitions.last().map(|transition| transition.next);
+        self.commit_transition_iter(transitions.into_iter().map(Ok), final_tip)
+    }
+
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<Item = Result<ConnectTransition, ChainStoreError>>,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        self.commit_transition_iter(transitions, final_tip)
     }
 
     fn commit_disconnect(
