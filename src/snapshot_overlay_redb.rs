@@ -848,10 +848,15 @@ impl<'txn> OverlayGroupReader<'txn> {
 
 impl UtxoStore for SnapshotOverlayRedbChainstate {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db.begin_read()?;
         let overlay = transaction.open_table(OVERLAY)?;
         if let Some(value) = overlay.get(outpoint.as_bytes().as_slice())? {
-            return Utxo::decode(value.value()).map(Some);
+            return Utxo::decode_with_script_limit(value.value(), limit).map(Some);
         }
         let tombstone = transaction.open_table(TOMBSTONE)?;
         if tombstone.get(outpoint.as_bytes().as_slice())?.is_some() {
@@ -867,6 +872,11 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db.begin_read()?;
         let overlay = transaction.open_table(OVERLAY)?;
         let tombstone = transaction.open_table(TOMBSTONE)?;
@@ -877,7 +887,10 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
         let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
             if let Some(value) = overlay.get(outpoint.as_bytes().as_slice())? {
-                results.push((*outpoint, Some(Utxo::decode(value.value())?)));
+                results.push((
+                    *outpoint,
+                    Some(Utxo::decode_with_script_limit(value.value(), limit)?),
+                ));
             } else if tombstone.get(outpoint.as_bytes().as_slice())?.is_some() {
                 results.push((*outpoint, None));
             } else {

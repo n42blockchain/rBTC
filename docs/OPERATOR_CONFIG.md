@@ -48,7 +48,7 @@ minimum_free_bytes=5368709120
 chainstate_cache_bytes=1073741824
 background_chainstate_cache_bytes=4294967296
 bulk_validation_cache_bytes=8589934592
-memory_budget_bytes=17179869184
+memory_budget_bytes=34359738368
 
 [bitcoin]
 connect=203.0.113.10:8333
@@ -273,7 +273,7 @@ and instead consume the bounded typed status/event receivers.
 
 `memory_budget_bytes` (`--memory-budget-bytes`) caps shared reservations for
 chainstate and supporting redb caches, Headers caches/read buffers and admission candidates. The
-default is 16 GiB. Startup counts persistent peer, mempool and fee-estimator caches, both background
+default is 32 GiB. Startup counts persistent peer, mempool and fee-estimator caches, both background
 pipelines, optional indexes, explorer and wallet rebroadcast caches. It rejects
 a known simultaneous cache plan that cannot
 leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
@@ -290,8 +290,10 @@ blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.
 Input discovery and batch overlay maps reserve before construction; prefetch
 reads use 128-key chunks and retain actual returned script allowances through
-read-ahead refresh and overlay ownership transfer. Engine-internal read
-allocations (especially malformed records), preparation copies, script queues,
+read-ahead refresh and overlay ownership transfer. Node-bound ordinary Redb/MDBX
+and mutable snapshot-overlay coin queries reject scripts over 10,000 bytes
+before copying them; MDBX read-only queries borrow raw records. Immutable
+snapshot-base and journal reads, other engine-internal allocations, preparation copies, script queues,
 thread stacks and indexed undo copies still require further accounting.
 These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
 pages, SQLite, MDBX and other unregistered allocations still require
@@ -301,6 +303,6 @@ The supporting redb caches retain their existing 1 GiB defaults. A normal node
 without optional services therefore needs at least 5 GiB in this preflight
 (1 GiB chainstate + 3 GiB supporting caches + 1 GiB headroom). Two background
 pipelines need at least 13 GiB before optional services/indexes. Enabling all
-three indexes in both pipelines raises that plan to 19 GiB; configure a larger
-`memory_budget_bytes` explicitly. These are configured reservation plans, not
+three indexes in both pipelines raises that plan to 19 GiB, within the default
+32 GiB allowance. Smaller hosts can override `memory_budget_bytes` explicitly. These are configured reservation plans, not
 measured resident memory minima.

@@ -6,7 +6,7 @@
 //! MDBX transaction rather than split storage.
 
 use std::{
-    borrow::Borrow,
+    borrow::{Borrow, Cow},
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
@@ -765,7 +765,16 @@ impl MdbxUtxoStore {
         meta: &Table<'_>,
         bytes: &[u8],
     ) -> Result<Utxo, UtxoError> {
-        let mut coin = Utxo::decode_compact_with_creation_mtp(bytes, 0)?;
+        Self::decode_coin_with_limit(transaction, meta, bytes, usize::MAX)
+    }
+
+    fn decode_coin_with_limit<K: TransactionKind, E: DatabaseKind>(
+        transaction: &Transaction<'_, K, E>,
+        meta: &Table<'_>,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<Utxo, UtxoError> {
+        let mut coin = Utxo::decode_compact_with_script_limit(bytes, 0, limit)?;
         coin.creation_mtp = Self::read_creation_mtp(transaction, meta, coin.height)?;
         Ok(coin)
     }
@@ -777,14 +786,10 @@ impl MdbxUtxoStore {
     ) -> Result<u32, UtxoError> {
         let key = creation_mtp_key(height);
         let mtp = transaction
-            .get::<Vec<u8>>(meta, &key)?
+            .get::<[u8; 4]>(meta, &key)?
             .ok_or(UtxoError::Malformed(
                 "missing creation MTP for compact coin",
             ))?;
-        let mtp: [u8; 4] = mtp
-            .as_slice()
-            .try_into()
-            .map_err(|_| UtxoError::Malformed("creation MTP metadata"))?;
         Ok(u32::from_be_bytes(mtp))
     }
 
@@ -793,8 +798,9 @@ impl MdbxUtxoStore {
         meta: &Table<'_>,
         mtp_by_height: &mut BTreeMap<u32, u32>,
         bytes: &[u8],
+        limit: usize,
     ) -> Result<Utxo, UtxoError> {
-        let mut coin = Utxo::decode_compact_with_creation_mtp(bytes, 0)?;
+        let mut coin = Utxo::decode_compact_with_script_limit(bytes, 0, limit)?;
         coin.creation_mtp = if let Some(mtp) = mtp_by_height.get(&coin.height) {
             *mtp
         } else {
@@ -1633,17 +1639,22 @@ fn sync_directory(path: &Path) -> Result<(), UtxoError> {
 
 impl UtxoStore for MdbxUtxoStore {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let meta = transaction.open_table(Some(META))?;
         let storage_key = encode_mdbx_key(outpoint);
-        if let Some(value) = transaction.get::<Vec<u8>>(&hot, storage_key.as_slice())? {
-            return Self::decode_coin(&transaction, &meta, &value).map(Some);
+        if let Some(value) = transaction.get::<Cow<'_, [u8]>>(&hot, storage_key.as_slice())? {
+            return Self::decode_coin_with_limit(&transaction, &meta, &value, limit).map(Some);
         }
         let cold = transaction.open_table(Some(COLD))?;
         transaction
-            .get::<Vec<u8>>(&cold, storage_key.as_slice())?
-            .map(|value| Self::decode_coin(&transaction, &meta, &value))
+            .get::<Cow<'_, [u8]>>(&cold, storage_key.as_slice())?
+            .map(|value| Self::decode_coin_with_limit(&transaction, &meta, &value, limit))
             .transpose()
     }
 
@@ -1651,6 +1662,11 @@ impl UtxoStore for MdbxUtxoStore {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let hot = transaction.open_table(Some(HOT))?;
         let cold = transaction.open_table(Some(COLD))?;
@@ -1660,11 +1676,20 @@ impl UtxoStore for MdbxUtxoStore {
             .iter()
             .map(|outpoint| {
                 let storage_key = encode_mdbx_key(*outpoint);
-                let coin = transaction
-                    .get::<Vec<u8>>(&hot, storage_key.as_slice())?
-                    .or(transaction.get::<Vec<u8>>(&cold, storage_key.as_slice())?)
+                let encoded =
+                    match transaction.get::<Cow<'_, [u8]>>(&hot, storage_key.as_slice())? {
+                        Some(value) => Some(value),
+                        None => transaction.get::<Cow<'_, [u8]>>(&cold, storage_key.as_slice())?,
+                    };
+                let coin = encoded
                     .map(|value| {
-                        Self::decode_coin_cached(&transaction, &meta, &mut mtp_by_height, &value)
+                        Self::decode_coin_cached(
+                            &transaction,
+                            &meta,
+                            &mut mtp_by_height,
+                            &value,
+                            limit,
+                        )
                     })
                     .transpose()?;
                 Ok((*outpoint, coin))

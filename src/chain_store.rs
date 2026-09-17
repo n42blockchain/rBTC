@@ -81,6 +81,9 @@ impl Default for ChainStoreOptions {
 /// Errors from the unified chain-state database.
 #[derive(Debug, Error)]
 pub enum ChainStoreError {
+    /// Reading local execution inputs failed independently of peer validity.
+    #[error("execution input read: {0}")]
+    ExecutionRead(UtxoError),
     /// Execution preparation could not obtain its shared allocation allowance.
     #[error("execution memory admission: {0}")]
     ExecutionMemory(std::io::Error),
@@ -1514,6 +1517,9 @@ impl RedbChainStore {
         store.execution_spool =
             crate::execution_spool::ExecutionSpoolContext::for_path(path.as_ref())
                 .map_err(ChainStoreError::ExecutionSpool)?;
+        if store.execution_spool.is_some() {
+            store.utxos.constrain_script_reads();
+        }
         Ok(store)
     }
 

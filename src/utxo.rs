@@ -198,6 +198,13 @@ impl Utxo {
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, UtxoError> {
+        Self::decode_with_script_limit(bytes, usize::MAX)
+    }
+
+    pub(crate) fn decode_with_script_limit(bytes: &[u8], limit: usize) -> Result<Self, UtxoError> {
+        if bytes.len().saturating_sub(29) > limit {
+            return Err(UtxoError::Malformed("script exceeds configured read limit"));
+        }
         Self::validate_encoded(bytes)?;
         let value_sats = u64::from_le_bytes(bytes[..8].try_into().expect("checked length"));
         let height = u32::from_le_bytes(bytes[8..12].try_into().expect("checked length"));
@@ -220,6 +227,15 @@ impl Utxo {
         bytes: &[u8],
         creation_mtp: u32,
     ) -> Result<Self, UtxoError> {
+        Self::decode_compact_with_script_limit(bytes, creation_mtp, usize::MAX)
+    }
+
+    #[cfg(any(test, feature = "mdbx"))]
+    pub(crate) fn decode_compact_with_script_limit(
+        bytes: &[u8],
+        creation_mtp: u32,
+        limit: usize,
+    ) -> Result<Self, UtxoError> {
         let mut cursor = 0;
         let header_code = decode_vlq(bytes, &mut cursor, "UTXO header code")?;
         let height = u32::try_from(header_code >> 1)
@@ -227,7 +243,7 @@ impl Utxo {
         let is_coinbase = header_code & 1 != 0;
         let compressed_amount = decode_vlq(bytes, &mut cursor, "compressed amount")?;
         let value_sats = decompress_amount(compressed_amount)?;
-        let script_pubkey = decode_script(bytes, &mut cursor)?;
+        let script_pubkey = decode_script(bytes, &mut cursor, limit)?;
         if cursor != bytes.len() {
             return Err(UtxoError::Malformed("trailing UTXO bytes"));
         }
@@ -391,8 +407,19 @@ fn encode_script(target: &mut Vec<u8>, script: &[u8]) -> Result<(), UtxoError> {
 }
 
 #[cfg(any(test, feature = "mdbx"))]
-fn decode_script(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, UtxoError> {
+fn decode_script(bytes: &[u8], cursor: &mut usize, limit: usize) -> Result<Vec<u8>, UtxoError> {
     let encoded_size = decode_vlq(bytes, cursor, "compressed script type")?;
+    let decoded_len = match encoded_size {
+        0 => 25,
+        1 => 23,
+        2 | 3 => 35,
+        4 | 5 => 67,
+        length => usize::try_from(length - SPECIAL_SCRIPT_COUNT)
+            .map_err(|_| UtxoError::Malformed("script length exceeds usize"))?,
+    };
+    if decoded_len > limit {
+        return Err(UtxoError::Malformed("script exceeds configured read limit"));
+    }
     match encoded_size {
         0 => {
             let hash = take(bytes, cursor, 20, "compressed P2PKH")?;
@@ -738,6 +765,7 @@ pub trait UtxoStore: Send + Sync {
 /// redb-backed UTXO store. Its copy-on-write B-trees offer crash-safe ACID transactions without a C/C++ toolchain.
 pub struct RedbUtxoStore {
     db: Arc<Database>,
+    script_read_limit: usize,
     /// Coordinates logically related operations spanning both physical tables.
     write_guard: Mutex<()>,
 }
@@ -747,7 +775,12 @@ impl RedbUtxoStore {
 
     /// Opens or creates a chainstate file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, UtxoError> {
-        Self::from_database(Arc::new(crate::node_memory::create_redb(path)?))
+        let bound = crate::node_memory::for_path(path.as_ref())?.is_some();
+        let mut store = Self::from_database(Arc::new(crate::node_memory::create_redb(path)?))?;
+        if bound {
+            store.constrain_script_reads();
+        }
+        Ok(store)
     }
 
     pub(crate) fn from_database(db: Arc<Database>) -> Result<Self, UtxoError> {
@@ -760,8 +793,17 @@ impl RedbUtxoStore {
         transaction.commit()?;
         Ok(Self {
             db,
+            script_read_limit: usize::MAX,
             write_guard: Mutex::new(()),
         })
+    }
+
+    pub(crate) fn constrain_script_reads(&mut self) {
+        self.script_read_limit = crate::chainstate::MAX_SCRIPT_SIZE;
+    }
+
+    fn decode_read_coin(&self, bytes: &[u8]) -> Result<Utxo, UtxoError> {
+        Utxo::decode_with_script_limit(bytes, self.script_read_limit)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -780,10 +822,10 @@ impl RedbUtxoStore {
             .map(|outpoint| {
                 let key = outpoint.as_bytes();
                 let utxo = match hot.get(key.as_slice())? {
-                    Some(value) => Some(Utxo::decode(value.value())?),
+                    Some(value) => Some(self.decode_read_coin(value.value())?),
                     None => cold
                         .get(key.as_slice())?
-                        .map(|value| Utxo::decode(value.value()))
+                        .map(|value| self.decode_read_coin(value.value()))
                         .transpose()?,
                 };
                 Ok((*outpoint, utxo))
@@ -803,10 +845,10 @@ impl RedbUtxoStore {
             .map(|(outpoint, original_index)| {
                 let key = outpoint.as_bytes();
                 let utxo = match hot.get(key.as_slice())? {
-                    Some(value) => Some(Utxo::decode(value.value())?),
+                    Some(value) => Some(self.decode_read_coin(value.value())?),
                     None => cold
                         .get(key.as_slice())?
-                        .map(|value| Utxo::decode(value.value()))
+                        .map(|value| self.decode_read_coin(value.value()))
                         .transpose()?,
                 };
                 Ok((*original_index, *outpoint, utxo))
@@ -1100,11 +1142,11 @@ impl UtxoStore for RedbUtxoStore {
         let transaction = self.db.begin_read()?;
         let hot = transaction.open_table(HOT_TABLE)?;
         if let Some(value) = hot.get(outpoint.as_bytes().as_slice())? {
-            return Utxo::decode(value.value()).map(Some);
+            return self.decode_read_coin(value.value()).map(Some);
         }
         let cold = transaction.open_table(COLD_TABLE)?;
         cold.get(outpoint.as_bytes().as_slice())?
-            .map(|value| Utxo::decode(value.value()))
+            .map(|value| self.decode_read_coin(value.value()))
             .transpose()
     }
 
@@ -1735,6 +1777,38 @@ mod tests {
                 last_touched: 0,
                 ..coin
             }
+        );
+    }
+
+    #[test]
+    fn bounded_coin_decoders_reject_scripts_before_copying() {
+        let mut value = coin(1);
+        value.script_pubkey = vec![0x61; 10_001];
+        let legacy = value.encode().unwrap();
+        assert!(matches!(
+            Utxo::decode_with_script_limit(&legacy, 10_000),
+            Err(UtxoError::Malformed("script exceeds configured read limit"))
+        ));
+        assert_eq!(Utxo::decode(&legacy).unwrap(), value);
+        let compact = value.encode_compact().unwrap();
+        assert!(matches!(
+            Utxo::decode_compact_with_script_limit(&compact, 0, 10_000),
+            Err(UtxoError::Malformed("script exceeds configured read limit"))
+        ));
+        // The declared raw script length is rejected even with no script body.
+        let truncated = &compact[..compact.len() - value.script_pubkey.len()];
+        assert!(matches!(
+            Utxo::decode_compact_with_script_limit(truncated, 0, 10_000),
+            Err(UtxoError::Malformed("script exceeds configured read limit"))
+        ));
+        let p2pkh = decode_hex("8cf316800900b8025be1b3efc63b0ad48e7f9f10e87544528d58");
+        assert!(Utxo::decode_compact_with_script_limit(&p2pkh, 0, 24).is_err());
+        assert_eq!(
+            Utxo::decode_compact_with_script_limit(&p2pkh, 0, 25)
+                .unwrap()
+                .script_pubkey
+                .len(),
+            25
         );
     }
 

@@ -522,6 +522,33 @@ mod tests {
     }
 
     #[cfg(feature = "mdbx")]
+    fn assert_bound_reads_reject_oversized_scripts(store: &impl crate::utxo::UtxoStore) {
+        let key = OutPointKey::from_bytes(&[0xee; 36]).unwrap();
+        let coin = Utxo {
+            value_sats: 42,
+            height: 0,
+            is_coinbase: false,
+            last_touched: 0,
+            creation_mtp: 0,
+            script_pubkey: vec![0x61; 10_001],
+        };
+        store.apply(&[], &[(key, coin)]).unwrap();
+        assert!(matches!(
+            store.get(key),
+            Err(crate::utxo::UtxoError::Malformed(
+                "script exceeds configured read limit"
+            ))
+        ));
+        assert!(matches!(
+            store.get_many(&[key]),
+            Err(crate::utxo::UtxoError::Malformed(
+                "script exceeds configured read limit"
+            ))
+        ));
+        store.apply(&[key], &[]).unwrap();
+    }
+
+    #[cfg(feature = "mdbx")]
     #[test]
     fn mdbx_backend_spool_survives_compaction_with_the_shared_owner() {
         let directory = tempfile::tempdir().unwrap();
@@ -538,8 +565,10 @@ mod tests {
                 hash: BlockHash::from_byte_array([0; 32]),
             })
             .unwrap();
+        assert_bound_reads_reject_oversized_scripts(&store);
         assert_backend_spool(&store, &budget);
         store.compact_with_reserve(0).unwrap();
+        assert_bound_reads_reject_oversized_scripts(&store);
         assert_backend_spool(&store, &budget);
         drop(store);
         assert_eq!(budget.snapshot().used, 0);
@@ -578,10 +607,14 @@ mod tests {
             Some(&identity),
         )
         .unwrap();
+        assert_bound_reads_reject_oversized_scripts(&mdbx);
+        assert_bound_reads_reject_oversized_scripts(&redb);
         assert_backend_spool(&mdbx, &budget);
         assert_backend_spool(&redb, &budget);
         mdbx.compact().unwrap();
         redb.compact().unwrap();
+        assert_bound_reads_reject_oversized_scripts(&mdbx);
+        assert_bound_reads_reject_oversized_scripts(&redb);
         assert_backend_spool(&mdbx, &budget);
         assert_backend_spool(&redb, &budget);
         drop(mdbx);

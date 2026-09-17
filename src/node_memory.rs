@@ -11,8 +11,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 
-/// Default aggregate reservation allowance (16 GiB).
-pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Default aggregate reservation allowance (32 GiB).
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 /// Aggregate logical byte allowance for ephemeral execution results (16 GiB).
 pub const DEFAULT_EXECUTION_SPOOL_BYTES: u64 = 16 * 1024 * 1024 * 1024;

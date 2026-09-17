@@ -1648,10 +1648,17 @@ impl<'txn, K: TransactionKind> OverlayGroupReader<'txn, K> {
 
 impl UtxoStore for SnapshotOverlayChainstate {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
-        if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
-            return Utxo::decode(&value).map(Some);
+        if let Some(value) =
+            transaction.get::<std::borrow::Cow<'_, [u8]>>(&overlay, outpoint.as_bytes())?
+        {
+            return Utxo::decode_with_script_limit(&value, limit).map(Some);
         }
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         if transaction
@@ -1668,6 +1675,11 @@ impl UtxoStore for SnapshotOverlayChainstate {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
@@ -1678,8 +1690,13 @@ impl UtxoStore for SnapshotOverlayChainstate {
         let mut base_wanted: Vec<OutPoint> = Vec::new();
         let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
-            if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
-                results.push((*outpoint, Some(Utxo::decode(&value)?)));
+            if let Some(value) =
+                transaction.get::<std::borrow::Cow<'_, [u8]>>(&overlay, outpoint.as_bytes())?
+            {
+                results.push((
+                    *outpoint,
+                    Some(Utxo::decode_with_script_limit(&value, limit)?),
+                ));
             } else if transaction
                 .get::<()>(&tombstone, outpoint.as_bytes())?
                 .is_some()

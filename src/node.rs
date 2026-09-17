@@ -2771,6 +2771,7 @@ impl PeerRunError {
             BlockExecutionError::ChainStore(
                 crate::chain_store::ChainStoreError::ExecutionSpool(_)
                     | crate::chain_store::ChainStoreError::ExecutionMemory(_)
+                    | crate::chain_store::ChainStoreError::ExecutionRead(_)
             )
         ) {
             return Self::local(error.to_string());
@@ -19510,6 +19511,7 @@ mod tests {
         for source in [
             ChainStoreError::ExecutionSpool(std::io::Error::other("allowance exhausted")),
             ChainStoreError::ExecutionMemory(std::io::Error::other("allowance exhausted")),
+            ChainStoreError::ExecutionRead(crate::utxo::UtxoError::Malformed("bad record")),
         ] {
             let error = BlockExecutionError::ChainStore(source);
             assert!(!error.is_peer_invalid());

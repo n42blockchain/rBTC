@@ -5,6 +5,21 @@ fn memory_plan_rejects_overcommit_before_creating_data_directory() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("not-created");
     let mut config = NodeConfig::new(Network::Regtest, &path);
+    assert_eq!(
+        config.resources.memory_budget_bytes,
+        32 * 1024 * 1024 * 1024
+    );
+    let defaults = parse_options(
+        ["--network", "regtest", "--connect", "127.0.0.1:18444"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        defaults.resources.memory_budget_bytes,
+        config.resources.memory_budget_bytes
+    );
     config.resources.memory_budget_bytes = 1024 * 1024 * 1024;
     assert!(
         config

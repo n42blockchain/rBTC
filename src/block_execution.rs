@@ -145,7 +145,9 @@ fn read_prefetch<C: ExecutionChainStore>(
 ) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
     const CHUNK: usize = 128;
     let Some(resources) = store.execution_spool() else {
-        let entries = store.get_many(keys)?;
+        let entries = store
+            .get_many(keys)
+            .map_err(ChainStoreError::ExecutionRead)?;
         if entries.len() != keys.len()
             || entries
                 .iter()
@@ -184,7 +186,9 @@ fn read_prefetch<C: ExecutionChainStore>(
         let lease = resources
             .reserve_memory(allowance)
             .map_err(ChainStoreError::ExecutionMemory)?;
-        let current = store.get_many(wanted)?;
+        let current = store
+            .get_many(wanted)
+            .map_err(ChainStoreError::ExecutionRead)?;
         if current.len() != wanted.len()
             || current
                 .iter()
@@ -3140,7 +3144,7 @@ mod tests {
         assert!(matches!(
             prefetch.refresh(&store),
             Err(BlockExecutionError::ChainStore(
-                ChainStoreError::ExecutionMemory(_)
+                ChainStoreError::ExecutionRead(_)
             ))
         ));
         assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
