@@ -24,7 +24,9 @@ not change acceptance statuses or weaken thresholds.
    now connects chainstate/Header caches and admission candidates with configurable
    startup preflight. [Supporting database caches](supporting-cache-memory-20260917.md)
    and maintenance opens now share that owner too; remaining allocations and
-   whole-node acceptance are still open.
+   whole-node acceptance are still open. [FIFO work admission and cancellable
+   standby waits](header-work-scheduling-20260917.md) now prevent asynchronous
+   waiters from being bypassed; full resumable candidate scheduling remains.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

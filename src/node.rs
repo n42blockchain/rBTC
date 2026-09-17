@@ -10368,6 +10368,9 @@ async fn maintain_standby(
     header_dag: Option<HeaderDag>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
 ) -> Result<ConnectedPeer, PeerRunError> {
+    // Independent fixtures must not serialize scratch GC through the OS-wide
+    // temp directory's parent lock. Keep this owner through the awaited call.
+    let directory = header_dag.as_ref().map(|_| tempfile::tempdir().unwrap());
     maintain_standby_with_time(
         connected,
         activate,
@@ -10375,13 +10378,32 @@ async fn maintain_standby(
         ping_nonce,
         transaction_relay,
         header_dag.map(|dag| {
-            NodeHeaderState::test_seed(dag, &std::env::temp_dir().join("rbtc-standby-test-headers"))
-                .shared_disk_view()
+            NodeHeaderState::test_seed(
+                dag,
+                &directory.as_ref().unwrap().path().join("headers.redb"),
+            )
+            .shared_disk_view()
         }),
         transaction_pool,
         &NetworkTime::default(),
     )
     .await
+}
+
+// Activation cancels only queued Header work. No header mutation begins until
+// a lease is granted; a later active sync can request any unprocessed headers.
+async fn standby_header_work(
+    activate: &mut tokio::sync::oneshot::Receiver<()>,
+    work: impl std::future::Future<Output = header_sync::HeaderWorkLease>,
+) -> Result<Option<header_sync::HeaderWorkLease>, PeerRunError> {
+    tokio::select! {
+        biased;
+        activated = activate => {
+            activated.map_err(|_| PeerRunError::transient("peer standby activation channel closed"))?;
+            Ok(None)
+        }
+        lease = work => Ok(Some(lease)),
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -10453,7 +10475,14 @@ async fn maintain_standby_with_time(
                         .snapshot()
                         .map_err(|error| PeerRunError::local(error.to_string()))?;
                     let locator = {
-                        let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+                        let Some(mut lease) = standby_header_work(
+                            &mut activate,
+                            header_sync::work(header_sync::BATCH_WORK),
+                        )
+                        .await?
+                        else {
+                            return Ok(connected);
+                        };
                         lease
                             .budget
                             .consume(180_000)
@@ -10462,7 +10491,14 @@ async fn maintain_standby_with_time(
                     };
                     request_headers(&mut connected.session, locator).await?;
                     let headers = receive_headers(&mut connected.session).await?;
-                    let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+                    let Some(mut lease) = standby_header_work(
+                        &mut activate,
+                        header_sync::work(header_sync::BATCH_WORK),
+                    )
+                    .await?
+                    else {
+                        return Ok(connected);
+                    };
                     lease
                         .budget
                         .consume(4 * headers.len() as u64)

@@ -12,7 +12,7 @@ use crate::{
 use std::{
     fs,
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -56,49 +56,99 @@ impl WorkPool {
         Ok(())
     }
 }
-fn work_pool() -> &'static Mutex<WorkPool> {
-    static POOL: OnceLock<Mutex<WorkPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        Mutex::new(WorkPool {
-            available: WORK_CAPACITY,
-            updated: Instant::now(),
+// Queue only asynchronous admission, never a live work lease. Tokio's mutex
+// hands the head position to waiters in FIFO order; cancelling a future removes
+// its queue entry and drops any head guard it acquired.
+struct WorkScheduler {
+    pool: Mutex<WorkPool>,
+    admission: tokio::sync::Mutex<()>,
+    returned: tokio::sync::Notify,
+}
+impl WorkScheduler {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pool: Mutex::new(WorkPool {
+                available: WORK_CAPACITY,
+                updated: Instant::now(),
+            }),
+            admission: tokio::sync::Mutex::new(()),
+            returned: tokio::sync::Notify::new(),
         })
-    })
+    }
+    fn reserve(self: &Arc<Self>, units: u64) -> Result<HeaderWorkLease, Duration> {
+        assert!(
+            units <= WORK_CAPACITY,
+            "header work request exceeds pool capacity"
+        );
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve(units, Instant::now())?;
+        Ok(HeaderWorkLease {
+            budget: HeaderWorkBudget::new(units),
+            reserved: units,
+            scheduler: Arc::clone(self),
+        })
+    }
+    fn try_work(self: &Arc<Self>, units: u64) -> Result<HeaderWorkLease, Duration> {
+        // Synchronous callers defer rather than jumping ahead of queued work.
+        let _head = self
+            .admission
+            .try_lock()
+            .map_err(|_| Duration::from_millis(10))?;
+        self.reserve(units)
+    }
+    async fn work(self: &Arc<Self>, units: u64) -> HeaderWorkLease {
+        assert!(
+            units <= WORK_CAPACITY,
+            "header work request exceeds pool capacity"
+        );
+        let _head = self.admission.lock().await;
+        loop {
+            let returned = self.returned.notified();
+            match self.reserve(units) {
+                Ok(lease) => return lease,
+                Err(delay) => {
+                    // One queue head waits on this notification. notify_one
+                    // retains a permit if a lease returns before we poll it.
+                    tokio::select! {
+                        () = returned => {},
+                        () = tokio::time::sleep(delay) => {},
+                    }
+                }
+            }
+        }
+    }
+}
+fn work_scheduler() -> &'static Arc<WorkScheduler> {
+    static SCHEDULER: OnceLock<Arc<WorkScheduler>> = OnceLock::new();
+    SCHEDULER.get_or_init(WorkScheduler::new)
 }
 
 pub(super) struct HeaderWorkLease {
     pub(super) budget: HeaderWorkBudget,
     reserved: u64,
+    scheduler: Arc<WorkScheduler>,
 }
 impl Drop for HeaderWorkLease {
     fn drop(&mut self) {
-        let mut pool = work_pool()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Only unspent reservations return. Failed validation consumes work.
-        pool.release(self.budget.remaining(), self.reserved, Instant::now());
+        {
+            let mut pool = self
+                .scheduler
+                .pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Only unspent reservations return. Failed validation consumes work.
+            pool.release(self.budget.remaining(), self.reserved, Instant::now());
+        }
+        self.scheduler.returned.notify_one();
     }
-}
-fn try_work(units: u64) -> Result<HeaderWorkLease, Duration> {
-    work_pool()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .reserve(units, Instant::now())?;
-    Ok(HeaderWorkLease {
-        budget: HeaderWorkBudget::new(units),
-        reserved: units,
-    })
 }
 pub(super) fn try_header_work() -> Result<HeaderWorkLease, Duration> {
-    try_work(BATCH_WORK)
+    work_scheduler().try_work(BATCH_WORK)
 }
 pub(super) async fn work(units: u64) -> HeaderWorkLease {
-    loop {
-        match try_work(units) {
-            Ok(lease) => return lease,
-            Err(delay) => tokio::time::sleep(delay).await,
-        }
-    }
+    work_scheduler().work(units).await
 }
 
 #[derive(Clone, Copy)]
@@ -511,5 +561,91 @@ mod tests {
         // Distinct consumers cannot each claim the same remaining allowance.
         pool.reserve(WORK_CAPACITY - 1234, later).unwrap();
         assert!(pool.reserve(1, later).is_err());
+    }
+    async fn assert_waiting<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut future = future;
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn queued_work_cannot_be_bypassed_and_returned_work_wakes_the_head() {
+        let scheduler = WorkScheduler::new();
+        let held = scheduler.try_work(WORK_CAPACITY).unwrap();
+        let mut first = Box::pin(scheduler.work(WORK_CAPACITY));
+        assert_waiting(first.as_mut()).await;
+        let mut second = Box::pin(scheduler.work(1));
+        assert_waiting(second.as_mut()).await;
+        assert!(scheduler.try_work(1).is_err());
+        drop(held);
+        // Even with the full balance returned, neither the second waiter nor
+        // synchronous admission can steal the first waiter's queue position.
+        assert_waiting(second.as_mut()).await;
+        assert!(scheduler.try_work(1).is_err());
+        let mut first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap();
+        first.budget.consume(1234).unwrap();
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap();
+        drop(second);
+        assert!(scheduler.try_work(BATCH_WORK).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelling_head_and_queued_waiters_preserves_progress_and_credit() {
+        let scheduler = WorkScheduler::new();
+        let held = scheduler.try_work(WORK_CAPACITY).unwrap();
+        let mut first = Box::pin(scheduler.work(WORK_CAPACITY));
+        assert_waiting(first.as_mut()).await;
+        let mut cancelled = Box::pin(scheduler.work(WORK_CAPACITY));
+        assert_waiting(cancelled.as_mut()).await;
+        let mut survivor = Box::pin(scheduler.work(WORK_CAPACITY));
+        assert_waiting(survivor.as_mut()).await;
+        drop(cancelled);
+        drop(first);
+        // No work was reserved by any cancelled future.
+        drop(held);
+        let survivor = tokio::time::timeout(Duration::from_secs(5), survivor)
+            .await
+            .unwrap();
+        assert_eq!(survivor.budget.remaining(), WORK_CAPACITY);
+        drop(survivor);
+        assert!(scheduler.try_work(WORK_CAPACITY).is_ok());
+    }
+    #[tokio::test]
+    async fn activation_cancels_a_standby_work_wait_without_leaking_queue_position() {
+        let scheduler = WorkScheduler::new();
+        let held = scheduler.try_work(WORK_CAPACITY).unwrap();
+        let (activate, mut activation) = tokio::sync::oneshot::channel();
+        let mut waiting = Box::pin(super::super::standby_header_work(
+            &mut activation,
+            scheduler.work(WORK_CAPACITY),
+        ));
+        assert_waiting(waiting.as_mut()).await;
+        activate.send(()).unwrap();
+        assert!(waiting.await.unwrap().is_none());
+        drop(held);
+        assert!(scheduler.try_work(WORK_CAPACITY).is_ok());
+
+        let (activate, mut activation) = tokio::sync::oneshot::channel();
+        let granted =
+            super::super::standby_header_work(&mut activation, scheduler.work(BATCH_WORK))
+                .await
+                .unwrap();
+        assert!(granted.is_some());
+        drop(granted);
+        drop(activate);
+        assert!(
+            super::super::standby_header_work(&mut activation, scheduler.work(BATCH_WORK))
+                .await
+                .is_err()
+        );
+        assert!(scheduler.try_work(WORK_CAPACITY).is_ok());
     }
 }
