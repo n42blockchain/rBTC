@@ -1156,3 +1156,49 @@ async fn missing_pending_candidate_fails_locally_before_network_request() {
         Some(genesis.hash)
     );
 }
+
+#[tokio::test]
+async fn disk_reindex_resumes_a_multi_frame_prefix_and_rejects_divergence() {
+    let directory = TempDir::new().unwrap();
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let mut source = HeaderDag::with_deployments(deployments.clone());
+    let genesis = source.active_tip().header;
+    let mut parent = genesis;
+    let mut headers = Vec::new();
+    for _ in 0..2001 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+        headers.push(parent);
+    }
+    let _ = source
+        .stage_batch_contextual(&headers, unix_time().unwrap())
+        .unwrap()
+        .commit();
+    let path = directory.path().join("headers.redb");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.append_batch(&headers[..2000]).unwrap();
+    drop(store);
+    let state = prepare_reindex_headers(directory.path(), &source, &deployments)
+        .await
+        .unwrap();
+    assert_eq!(state.active_tip(), source.active_tip());
+    drop(state);
+    let state = prepare_reindex_headers(directory.path(), &source, &deployments)
+        .await
+        .unwrap();
+    assert_eq!(state.active_tip(), source.active_tip());
+    drop(state);
+    let mut other = HeaderDag::with_deployments(deployments.clone());
+    other
+        .insert_contextual(
+            mine_regtest_child(genesis.block_hash(), genesis.time + 2),
+            unix_time().unwrap(),
+        )
+        .unwrap();
+    let error = prepare_reindex_headers(directory.path(), &other, &deployments)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("prefix diverges"), "{error}");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2001);
+}

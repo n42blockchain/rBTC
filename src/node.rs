@@ -1,5 +1,8 @@
 //! Embeddable node runtime and command-line adapter.
 
+#[cfg(test)]
+use crate::headers::HeaderDag;
+
 mod config_file;
 mod header_state;
 mod header_sync;
@@ -120,7 +123,7 @@ use rbtc::{
     explorer_store::RedbExplorerIndex,
     fee_estimator::{FeeEstimatorError, FeeTrack, RedbFeeEstimator},
     header_store::RedbHeaderStore,
-    headers::{HeaderDag, HeaderError, HeaderInfo, HeaderReadError, HeaderSnapshot, HeaderView},
+    headers::{HeaderError, HeaderInfo, HeaderReadError, HeaderSnapshot, HeaderView},
     ibd::IbdPolicy,
     inbound::{
         BlockSubmission, InboundBasicFilter, InboundDataSource, InboundLimits, InboundStats,
@@ -6921,7 +6924,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         return Ok(());
     }
     if let Some(OfflineAction::ReindexFromFreezer { output }) = &options.offline_action {
-        return reindex_from_complete_freezer(&options, output);
+        return reindex_from_complete_freezer(&options, output).await;
     }
     if let Some(OfflineAction::ReindexChainstate { output }) = &options.offline_action {
         return reindex_chainstate_from_peers(&options, output, local_nonce).await;
@@ -7002,7 +7005,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
         Some(OfflineAction::VerifyChain {
             depth,
             max_block_bytes,
-        }) => return verify_chain_offline(&options, *depth, *max_block_bytes),
+        }) => return verify_chain_offline(&options, *depth, *max_block_bytes).await,
         Some(
             OfflineAction::DownloadCoreSnapshot(_)
             | OfflineAction::BuildCoreSnapshotIndex { .. }
@@ -7037,7 +7040,7 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
     run_peer_pool(&options, local_nonce, None, None).await
 }
 
-fn reindex_from_complete_freezer(
+async fn reindex_from_complete_freezer(
     options: &Options,
     output: &std::path::Path,
 ) -> Result<(), String> {
@@ -7048,14 +7051,12 @@ fn reindex_from_complete_freezer(
         .expect("freezer reindex parser requires source data directory");
     require_existing_reindex_source(source, options.network)?;
     let _source_lock = DataDirectoryLock::acquire(source, options.network)?;
-    let header_store =
-        RedbHeaderStore::open(source.join("headers.redb")).map_err(|error| error.to_string())?;
-    let headers = header_store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
+    let headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "reindex requires a header database".to_owned())?;
     options
         .ibd_policy
-        .ensure_minimum_chainwork(&headers)
+        .ensure_minimum_chainwork(headers.as_ref())
         .map_err(|error| error.to_string())?;
     let active_tip = headers.active_tip();
     let source_audit = PrunedBlockLedger::audit(
@@ -7071,7 +7072,8 @@ fn reindex_from_complete_freezer(
         hash: active_tip.hash,
     };
     let (output, _output_lock) = prepare_reindex_output(source, output, options.network, target)?;
-    let output_headers = prepare_reindex_headers(&output, &headers, &options.deployments)?;
+    let output_headers =
+        prepare_reindex_headers(&output, headers.as_ref(), &options.deployments).await?;
     let chainstate = RedbChainStore::open_with_options(
         output.join("chainstate.redb"),
         options.network,
@@ -7390,13 +7392,12 @@ async fn reindex_chainstate_from_peers(
         .expect("peer reindex parser requires source data directory");
     require_existing_reindex_header_source(source, options.network)?;
     let _source_lock = DataDirectoryLock::acquire(source, options.network)?;
-    let source_headers = RedbHeaderStore::open(source.join("headers.redb"))
-        .map_err(|error| error.to_string())?
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
+    let source_headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "reindex requires a header database".to_owned())?;
     options
         .ibd_policy
-        .ensure_minimum_chainwork(&source_headers)
+        .ensure_minimum_chainwork(source_headers.as_ref())
         .map_err(|error| error.to_string())?;
     let active_tip = source_headers.active_tip();
     let target = rbtc::execution_store::ExecutionTip {
@@ -7404,7 +7405,7 @@ async fn reindex_chainstate_from_peers(
         hash: active_tip.hash,
     };
     let (output, _output_lock) = prepare_reindex_output(source, output, options.network, target)?;
-    prepare_reindex_headers(&output, &source_headers, &options.deployments)?;
+    prepare_reindex_headers(&output, source_headers.as_ref(), &options.deployments).await?;
     if validate_data_format_manifest(&output, options.network)? {
         publish_data_format_manifest(&output, options.network)?;
     }
@@ -7429,10 +7430,9 @@ async fn reindex_chainstate_from_peers(
         initialize_empty_reindex_output(&validation_options, &output)?;
     }
 
-    let output_headers = RedbHeaderStore::open(output.join("headers.redb"))
-        .map_err(|error| error.to_string())?
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
+    let output_headers = load_disk_header_view(&validation_options)
+        .await?
+        .ok_or_else(|| "reindex requires an output header database".to_owned())?;
     let chainstate = RedbChainStore::open_with_options(
         output.join("chainstate.redb"),
         options.network,
@@ -7443,7 +7443,14 @@ async fn reindex_chainstate_from_peers(
         },
     )
     .map_err(|error| error.to_string())?;
-    finish_local_reindex(options, &output, target, &output_headers, &chainstate, None)?;
+    finish_local_reindex(
+        options,
+        &output,
+        target,
+        output_headers.as_ref(),
+        &chainstate,
+        None,
+    )?;
     let report = PeerReindexReport {
         schema_version: 1,
         network: options.network.to_string(),
@@ -7638,33 +7645,51 @@ fn reject_unowned_reindex_entries(output: &std::path::Path) -> Result<(), String
     Ok(())
 }
 
-fn prepare_reindex_headers(
+async fn prepare_reindex_headers(
     output: &std::path::Path,
     source: &dyn HeaderView,
     deployments: &DeploymentConfig,
-) -> Result<HeaderDag, String> {
-    let store =
-        RedbHeaderStore::open(output.join("headers.redb")).map_err(|error| error.to_string())?;
-    let mut current = store
-        .load_dag_with_deployments(deployments.clone(), unix_time()?)
+) -> Result<NodeHeaderState, String> {
+    let path = output.join("headers.redb");
+    let store = RedbHeaderStore::open(&path).map_err(|error| error.to_string())?;
+    header_sync::recover_pending_promotion(&store, &path, deployments, unix_time()?)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut current = NodeHeaderState::resume(&store, &path, deployments, unix_time()?, None, None)
+        .await
         .map_err(|error| error.to_string())?;
     if store.len().map_err(|error| error.to_string())? != u64::from(current.active_tip().height) {
         return Err("reindex output headers contain an unexpected side branch".to_owned());
     }
-    for height in 0..=current.active_tip().height {
-        if current.active_header(height)?.map(|info| info.hash)
-            != source.active_header(height)?.map(|info| info.hash)
+    for base in (0..=current.active_tip().height).step_by(MAX_HEADERS_PER_RESPONSE) {
+        let end = base
+            .saturating_add(u32::try_from(MAX_HEADERS_PER_RESPONSE - 1).expect("batch fits u32"))
+            .min(current.active_tip().height);
         {
-            return Err(format!(
-                "reindex output header prefix diverges from source at height {height}"
-            ));
+            let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+            for height in base..=end {
+                lease.budget.consume(2).map_err(|error| error.to_string())?;
+                if current.active_header(height)?.map(|info| info.hash)
+                    != source.active_header(height)?.map(|info| info.hash)
+                {
+                    return Err(format!(
+                        "reindex output header prefix diverges from source at height {height}"
+                    ));
+                }
+            }
         }
+        tokio::task::yield_now().await;
     }
     let mut next = current.active_tip().height.saturating_add(1);
     while next <= source.active_tip().height {
         let end = next
             .saturating_add(u32::try_from(MAX_HEADERS_PER_RESPONSE).expect("header bound fits u32"))
             .min(source.active_tip().height.saturating_add(1));
+        let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
+        lease
+            .budget
+            .consume(u64::from(end - next))
+            .map_err(|error| error.to_string())?;
         let batch = (next..end)
             .map(|height| {
                 Ok::<_, HeaderReadError>(
@@ -7677,13 +7702,9 @@ fn prepare_reindex_headers(
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let staged = current
-            .stage_batch_contextual(&batch, unix_time()?)
+        current
+            .append(&store, &batch, unix_time()?, &mut lease.budget, false)
             .map_err(|error| error.to_string())?;
-        store
-            .append_batch(&batch)
-            .map_err(|error| error.to_string())?;
-        let _ = staged.commit();
         next = end;
     }
     if current.active_tip().hash != source.active_tip().hash {
@@ -7997,16 +8018,23 @@ fn require_existing_verify_chain_data(
     Ok(())
 }
 
-fn verify_chain_offline(options: &Options, depth: u32, max_block_bytes: u64) -> Result<(), String> {
+#[allow(clippy::too_many_lines)]
+async fn verify_chain_offline(
+    options: &Options,
+    depth: u32,
+    max_block_bytes: u64,
+) -> Result<(), String> {
     let data_dir = options
         .data_dir
         .as_ref()
         .expect("chain verification parser requires data directory");
-    let header_store =
-        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
-    let header_records = header_store.len().map_err(|error| error.to_string())?;
-    let headers = header_store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
+    let headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "chain verification requires a header database".to_owned())?;
+    // Recovery may append a pending winner; report the recovered raw count.
+    let header_records = RedbHeaderStore::open(data_dir.join("headers.redb"))
+        .map_err(|error| error.to_string())?
+        .len()
         .map_err(|error| error.to_string())?;
     let header = headers.active_tip();
     let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
@@ -8053,7 +8081,7 @@ fn verify_chain_offline(options: &Options, depth: u32, max_block_bytes: u64) -> 
     }
     let freezer = verify_freezer_cross_store(
         data_dir,
-        &headers,
+        headers.as_ref(),
         &chainstate,
         execution.height,
         depth,

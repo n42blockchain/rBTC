@@ -32,3 +32,6 @@ closed by this change.
 Mac validation: full all-feature library tests passed (982 passed, 0 failed,
 12 ignored; 65.93 seconds). Strict all-target/all-feature Clippy and format/diff
 checks passed. No large-history RSS or disk acceptance was run in this checkpoint.
+
+Follow-up: [offline header migration](offline-header-memory-20260917.md) removes
+the remaining production node reindex/verification DAG loads described above.
