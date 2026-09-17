@@ -205,6 +205,91 @@ pub fn read_archive(
     decode_archive(&bytes)
 }
 
+/// Reads a contiguous byte/count-bounded selection while verifying the whole
+/// archive. Skipped records use fixed scratch, never a whole-record allocation.
+/// An empty selection means the requested start is absent or its first record
+/// exceeds the caller's byte allowance. Records include their four-byte length.
+pub(crate) fn read_archive_batch(
+    path: impl AsRef<Path>,
+    first_height: u32,
+    max_blocks: u32,
+    max_record_bytes: u64,
+) -> Result<(ArchiveManifest, Vec<Vec<u8>>), ArchiveError> {
+    if max_blocks == 0 || max_record_bytes == 0 {
+        return Err(ArchiveError::Invalid("archive batch bound"));
+    }
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+    let (manifest, records_limit, payload_offset) = read_manifest_header_from(&mut file)?;
+    verify_compressed_pieces_from(&mut file, payload_offset, &manifest)?;
+    file.seek(SeekFrom::Start(payload_offset))?;
+    let mut decoder = zstd::stream::Decoder::new(file)?;
+    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let mut bounded = decoder.take(records_limit.saturating_add(1));
+    let mut scratch = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut digest = Sha256::new();
+    let mut records_bytes = 0_u64;
+    let mut selected_bytes = 0_u64;
+    let mut stopped = first_height < manifest.first_height;
+    let mut blocks = Vec::new();
+    for offset in 0..manifest.block_count {
+        let mut length = [0_u8; 4];
+        bounded
+            .read_exact(&mut length)
+            .map_err(|error| map_record_read_error(error, "block length"))?;
+        digest.update(length);
+        let length = usize::try_from(u32::from_le_bytes(length)).expect("u32 fits usize");
+        if length > MAX_BLOCK_BYTES {
+            return Err(ArchiveError::Invalid("block length"));
+        }
+        let bytes = 4 + length as u64;
+        records_bytes = records_bytes
+            .checked_add(bytes)
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if records_bytes > records_limit {
+            return Err(ArchiveError::Invalid("records too large"));
+        }
+        let height = manifest
+            .first_height
+            .checked_add(offset)
+            .ok_or(ArchiveError::Invalid("height overflow"))?;
+        let wanted = !stopped && height >= first_height && blocks.len() < max_blocks as usize;
+        if wanted && bytes <= max_record_bytes.saturating_sub(selected_bytes) {
+            let mut block = vec![0_u8; length];
+            bounded
+                .read_exact(&mut block)
+                .map_err(|error| map_record_read_error(error, "block length"))?;
+            digest.update(&block);
+            selected_bytes += bytes;
+            blocks.push(block);
+        } else {
+            stopped |= wanted;
+            let mut remaining = length;
+            while remaining > 0 {
+                let take = remaining.min(scratch.len());
+                bounded
+                    .read_exact(&mut scratch[..take])
+                    .map_err(|error| map_record_read_error(error, "block length"))?;
+                digest.update(&scratch[..take]);
+                remaining -= take;
+            }
+        }
+    }
+    let mut trailing = [0_u8; 1];
+    if bounded.read(&mut trailing)? != 0 {
+        return Err(ArchiveError::Invalid("block count"));
+    }
+    if manifest.format_version == FORMAT_VERSION && records_bytes != manifest.records_bytes {
+        return Err(ArchiveError::Invalid("records length"));
+    }
+    if crate::utxo::hex_lower(&digest.finalize()) != manifest.records_sha256 {
+        return Err(ArchiveError::Invalid("records checksum"));
+    }
+    Ok((manifest, blocks))
+}
+
 /// Checks a bounded in-memory archive and returns its consensus-serialized blocks.
 ///
 /// This is the parser used by file imports and deterministic fuzz regression.
@@ -374,6 +459,11 @@ fn map_record_read_error(error: std::io::Error, field: &'static str) -> ArchiveE
 
 fn read_manifest_header(path: &Path) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
     let mut file = File::open(path)?;
+    read_manifest_header_from(&mut file)
+}
+
+fn read_manifest_header_from(file: &mut File) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
+    file.seek(SeekFrom::Start(0))?;
     let mut header = [0_u8; 12];
     file.read_exact(&mut header)?;
     if &header[..8] != MAGIC {
@@ -402,6 +492,14 @@ fn verify_compressed_pieces(
     manifest: &ArchiveManifest,
 ) -> Result<(), ArchiveError> {
     let mut file = File::open(path)?;
+    verify_compressed_pieces_from(&mut file, payload_offset, manifest)
+}
+
+fn verify_compressed_pieces_from(
+    file: &mut File,
+    payload_offset: u64,
+    manifest: &ArchiveManifest,
+) -> Result<(), ArchiveError> {
     file.seek(SeekFrom::Start(payload_offset))?;
     let mut piece = vec![0_u8; PIECE_SIZE];
     let mut piece_index = 0_usize;
@@ -657,6 +755,46 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn bounded_archive_selection_checks_skipped_records_and_keeps_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("batch.rblk");
+        let blocks = [vec![1], vec![2; 256 * 1024], vec![3]];
+        let manifest = write_archive(&file, 10, &blocks).unwrap();
+        assert_eq!(
+            read_archive_batch(&file, 10, 1, 5).unwrap().1,
+            vec![vec![1]]
+        );
+        assert!(
+            read_archive_batch(&file, 11, 2, 5).unwrap().1.is_empty(),
+            "an oversized first record cannot be skipped in favor of a later small one"
+        );
+        assert_eq!(
+            read_archive_batch(&file, 12, 1, 5).unwrap().1,
+            vec![vec![3]]
+        );
+        assert!(read_archive_batch(&file, 9, 1, 5).unwrap().1.is_empty());
+        assert!(read_archive_batch(&file, 13, 1, 5).unwrap().1.is_empty());
+        assert_eq!(read_archive_batch(&file, 10, 3, 300_000).unwrap().1, blocks);
+        // Keep compressed piece hashes valid, but invalidate the full record
+        // commitment. Even a one-record selection must reject this archive.
+        let bytes = fs::read(&file).unwrap();
+        let offset =
+            12 + usize::try_from(u32::from_le_bytes(bytes[8..12].try_into().unwrap())).unwrap();
+        let mut invalid = manifest;
+        invalid.records_sha256 = "00".repeat(32);
+        let metadata = serde_json::to_vec(&invalid).unwrap();
+        let mut changed = MAGIC.to_vec();
+        changed.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+        changed.extend_from_slice(&metadata);
+        changed.extend_from_slice(&bytes[offset..]);
+        fs::write(&file, changed).unwrap();
+        assert!(matches!(
+            read_archive_batch(&file, 10, 1, 5),
+            Err(ArchiveError::Invalid("records checksum"))
+        ));
+    }
 
     #[test]
     fn archive_roundtrips_and_detects_piece_tampering() {

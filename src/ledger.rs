@@ -802,15 +802,30 @@ impl PrunedBlockLedger {
             if segment.first_height > next_height {
                 break;
             }
-            let (manifest, segment_blocks) = read_archive(self.slot_path(segment.slot))?;
+            let remaining_bytes = max_record_bytes.saturating_sub(record_bytes);
+            if remaining_bytes == 0 {
+                break;
+            }
+            let (manifest, segment_blocks) = crate::archive::read_archive_batch(
+                self.slot_path(segment.slot),
+                next_height,
+                max_blocks - u32::try_from(blocks.len()).expect("bounded batch length fits u32"),
+                remaining_bytes,
+            )?;
             if manifest.first_height != segment.first_height
                 || manifest.block_count != segment.block_count
             {
                 return Err(LedgerError::Invalid("archive does not match ledger index"));
             }
-            let offset = usize::try_from(next_height - segment.first_height)
-                .expect("archive offset fits usize");
-            for block in segment_blocks.into_iter().skip(offset) {
+            if segment_blocks.is_empty() {
+                if blocks.is_empty() {
+                    return Err(LedgerError::Invalid(
+                        "retained block batch byte budget was exhausted",
+                    ));
+                }
+                break;
+            }
+            for block in segment_blocks {
                 let next_record_bytes = record_bytes
                     .checked_add(4)
                     .and_then(|bytes| {
