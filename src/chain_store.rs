@@ -81,6 +81,9 @@ impl Default for ChainStoreOptions {
 /// Errors from the unified chain-state database.
 #[derive(Debug, Error)]
 pub enum ChainStoreError {
+    /// Execution preparation could not obtain its shared allocation allowance.
+    #[error("execution memory admission: {0}")]
+    ExecutionMemory(std::io::Error),
     /// Temporary execution results could not be admitted, written or read locally.
     #[error("execution spool: {0}")]
     ExecutionSpool(std::io::Error),

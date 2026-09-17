@@ -30,6 +30,10 @@ impl ExecutionSpoolContext {
             memory,
         }))
     }
+    pub(crate) fn reserve_memory(&self, bytes: u64) -> io::Result<MemoryLease> {
+        self.memory.reserve(bytes)
+    }
+
     pub(crate) fn open(&self) -> io::Result<ExecutionSpool> {
         Ok(ExecutionSpool {
             // Anonymous/delete-on-close file: a crash discards preparation and

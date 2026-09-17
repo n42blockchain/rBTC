@@ -795,6 +795,15 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // transactions alone — created outputs carry their final values and
     // scripts, spends are the inputs. Built in parallel per block, merged in
     // block order into one versioned view of the whole batch.
+    let execution_resources = chainstate.execution_spool();
+    let version_reservation = execution_resources
+        .as_ref()
+        .map(|resources| {
+            resources
+                .reserve_memory(version_index_memory(blocks)?)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let phase_one_started = Instant::now();
     let tx_deltas: Vec<std::sync::OnceLock<TxDelta>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
@@ -875,9 +884,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // Indexed callers still retain applied undo vectors. The ordinary node
     // path drops those copies and can evict completed preparation to disk.
     let spool = if applied_undos == AppliedUndos::Drop {
-        chainstate
-            .execution_spool()
-            .map(|context| context.open())
+        execution_resources
+            .as_ref()
+            .map(crate::execution_spool::ExecutionSpoolContext::open)
             .transpose()
             .map_err(ChainStoreError::ExecutionSpool)?
     } else {
@@ -981,6 +990,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }
     });
     drop(versions);
+    drop(version_reservation);
     // Preparation has copied every needed input into its result/script work.
     // The prefetch cache must not overlap transition construction or commit.
     drop(cumulative);
@@ -1439,6 +1449,58 @@ const PREPARE_WORKERS: usize = 8;
 type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
 /// Every version each key takes across a batch, tagged by the block index
 /// that wrote it, in block order.
+// Account the version index before creating any of its slots, vectors, hash
+// buckets or output script copies. This estimate is deliberately conservative:
+// eight bucket slots per logical key cover load-factor rounding and simultaneous
+// old/new tables during growth; three vector elements cover geometric growth
+// and relocation. Original block inputs, prefetch, worker stacks and prepared
+// results are separate owners and are not included in this reservation.
+fn version_index_memory(blocks: &[Block]) -> Result<u64, ChainStoreError> {
+    let overflow = || {
+        ChainStoreError::ExecutionMemory(std::io::Error::other(
+            "version index allocation estimate overflow",
+        ))
+    };
+    let mut outputs = 0_u64;
+    let mut inputs = 0_u64;
+    let mut scripts = 0_u64;
+    for block in blocks {
+        for transaction in &block.txdata {
+            outputs = outputs
+                .checked_add(u64::try_from(transaction.output.len()).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            inputs = inputs
+                .checked_add(u64::try_from(transaction.input.len()).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            for output in &transaction.output {
+                scripts = scripts
+                    .checked_add(u64::try_from(output.script_pubkey.len()).map_err(|_| overflow())?)
+                    .ok_or_else(overflow)?;
+            }
+        }
+    }
+    let entries = inputs
+        .checked_add(outputs)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(overflow)?;
+    let hash_slot = size_of::<(OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>)>() as u64 + 1;
+    let history_slot = size_of::<(u32, Option<Arc<Utxo>>)>() as u64;
+    let created_slot = size_of::<(OutPointKey, Arc<Utxo>)>() as u64;
+    let coin = (size_of::<Utxo>() + 2 * size_of::<usize>() + 64) as u64;
+    let terms = [
+        entries.checked_mul(8 * hash_slot + 3 * history_slot),
+        outputs.checked_mul(3 * created_slot + coin),
+        inputs.checked_mul(3 * size_of::<OutPointKey>() as u64),
+        scripts.checked_mul(2),
+        (blocks.len() as u64).checked_mul(size_of::<std::sync::OnceLock<TxDelta>>() as u64),
+    ];
+    terms.into_iter().try_fold(0_u64, |total, term| {
+        total
+            .checked_add(term.ok_or_else(overflow)?)
+            .ok_or_else(overflow)
+    })
+}
+
 type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
 /// Waits for every script batch and returns the first failure by batch
 /// order, verifying any serially collected checks as block zero.
@@ -2886,13 +2948,13 @@ mod tests {
             .insert_contextual(second.header, second.header.time)
             .unwrap();
         let blocks = [first, second];
-        // With the common node owner exhausted, the first spool write fails
-        // locally. Neither block nor a durable prefix can be published.
+        // Both indexed and non-indexed execution must obtain the version
+        // allowance before workers or spool writes can begin.
         let occupied = budget
             .reserve(budget.snapshot().limit - cache_used)
             .unwrap();
-        assert!(
-            connect_active_blocks_inner(
+        for applied_undos in [AppliedUndos::Keep, AppliedUndos::Drop] {
+            let result = connect_active_blocks_inner(
                 &store,
                 &headers,
                 &blocks,
@@ -2902,14 +2964,20 @@ mod tests {
                 false,
                 None,
                 None,
-                AppliedUndos::Drop,
-                None
-            )
-            .is_err()
-        );
-        assert_eq!(store.execution_tip().unwrap().height, 0);
-        assert_eq!(store.pending_blocks(), 0);
-        assert_eq!(budget.spool_snapshot().used, 0);
+                applied_undos,
+                None,
+            );
+            assert!(matches!(
+                result,
+                Err(BlockExecutionError::ChainStore(
+                    ChainStoreError::ExecutionMemory(_)
+                ))
+            ));
+            assert_eq!(store.execution_tip().unwrap().height, 0);
+            assert_eq!(store.pending_blocks(), 0);
+            assert_eq!(budget.spool_snapshot().peak, 0);
+            assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        }
         drop(occupied);
         let (applied, _) = connect_active_blocks_inner(
             &store,

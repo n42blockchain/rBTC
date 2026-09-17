@@ -2768,7 +2768,10 @@ impl PeerRunError {
     fn block(error: &BlockExecutionError) -> Self {
         if matches!(
             error,
-            BlockExecutionError::ChainStore(crate::chain_store::ChainStoreError::ExecutionSpool(_))
+            BlockExecutionError::ChainStore(
+                crate::chain_store::ChainStoreError::ExecutionSpool(_)
+                    | crate::chain_store::ChainStoreError::ExecutionMemory(_)
+            )
         ) {
             return Self::local(error.to_string());
         }
@@ -19506,15 +19509,18 @@ mod tests {
     mod memory_budget;
     #[test]
     fn execution_spool_failure_is_local_not_peer_misbehavior() {
-        let error =
-            BlockExecutionError::ChainStore(crate::chain_store::ChainStoreError::ExecutionSpool(
-                std::io::Error::other("allowance exhausted"),
-            ));
-        assert!(!error.is_peer_invalid());
-        assert_eq!(
-            PeerRunError::block(&error).kind,
-            PeerFailureKind::LocalResource
-        );
+        use crate::chain_store::ChainStoreError;
+        for source in [
+            ChainStoreError::ExecutionSpool(std::io::Error::other("allowance exhausted")),
+            ChainStoreError::ExecutionMemory(std::io::Error::other("allowance exhausted")),
+        ] {
+            let error = BlockExecutionError::ChainStore(source);
+            assert!(!error.is_peer_invalid());
+            assert_eq!(
+                PeerRunError::block(&error).kind,
+                PeerFailureKind::LocalResource
+            );
+        }
     }
 
     #[cfg(feature = "mdbx")]
