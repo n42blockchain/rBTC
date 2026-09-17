@@ -61,7 +61,7 @@ impl HeaderWorkBudget {
         self.remaining
     }
 
-    fn consume(&mut self, units: u64) -> Result<(), HeaderError> {
+    pub(crate) fn consume(&mut self, units: u64) -> Result<(), HeaderError> {
         if units > self.remaining {
             return Err(HeaderError::BudgetDeferred {
                 resource: "validation work",

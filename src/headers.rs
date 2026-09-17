@@ -16,6 +16,8 @@ use thiserror::Error;
 
 use crate::deployments::DeploymentConfig;
 
+mod candidate;
+pub(crate) use candidate::CandidateContext;
 mod resources;
 mod retention;
 pub use resources::{HeaderBatchLimits, HeaderWorkBudget};
@@ -613,6 +615,16 @@ impl HeaderDag {
         header: Header,
         adjusted_time: u32,
     ) -> Result<HeaderInfo, HeaderError> {
+        let info = self.validate_contextual(header, adjusted_time)?;
+        self.publish_header(info);
+        Ok(info)
+    }
+
+    fn validate_contextual(
+        &self,
+        header: Header,
+        adjusted_time: u32,
+    ) -> Result<HeaderInfo, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Err(HeaderError::Duplicate(hash));
@@ -667,7 +679,7 @@ impl HeaderDag {
                 actual: header.bits.to_consensus(),
             });
         }
-        self.insert(header)
+        self.validate_structure(header)
     }
 
     /// Adds a proof-of-work-valid child and promotes it if it has more chainwork.
@@ -677,6 +689,12 @@ impl HeaderDag {
     /// Returns an error for duplicates, missing parents, invalid targets, invalid
     /// proof of work, or unrepresentable heights.
     pub fn insert(&mut self, header: Header) -> Result<HeaderInfo, HeaderError> {
+        let info = self.validate_structure(header)?;
+        self.publish_header(info);
+        Ok(info)
+    }
+
+    fn validate_structure(&self, header: Header) -> Result<HeaderInfo, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Err(HeaderError::Duplicate(hash));
@@ -712,11 +730,14 @@ impl HeaderDag {
             height,
             chainwork: parent.chainwork + target.to_work(),
         };
+        Ok(info)
+    }
+
+    fn publish_header(&mut self, info: HeaderInfo) {
         self.restore_retained_header(info);
         if info.chainwork > self.active_tip().chainwork {
             self.promote_active_tip(info);
         }
-        Ok(info)
     }
 
     fn promote_active_tip(&mut self, info: HeaderInfo) {
