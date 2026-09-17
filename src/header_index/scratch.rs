@@ -121,7 +121,14 @@ fn collect(parent: &Path) -> io::Result<()> {
         let mut owner = OpenOptions::new().read(true).write(true).open(&marker)?;
         match owner.try_lock_exclusive() {
             Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error().is_some_and(|code| {
+                        Some(code) == fs2::lock_contended_error().raw_os_error()
+                    }) =>
+            {
+                continue;
+            }
             Err(error) => return Err(error),
         }
         let mut magic = [0; MAGIC.len()];
