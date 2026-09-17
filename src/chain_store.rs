@@ -206,6 +206,10 @@ pub struct RedbChainStore {
     write_guard: Mutex<()>,
 }
 
+// Exists only inside an uncommitted materialization transaction. Distinct-key
+// accounting must not grow a process-resident set across the whole journal.
+const MATERIALIZATION_KEYS: TableDefinition<&[u8], ()> =
+    TableDefinition::new("validation_materialization_keys");
 const VALIDATION_DELTA_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_deltas");
 const VALIDATION_DELTA_SHARD_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -880,15 +884,36 @@ fn validation_delta_record_header(
 
 fn decode_validation_delta_record<F>(
     encoded: &[u8],
-    mut load_shard: F,
+    load_shard: F,
 ) -> Result<(u64, ValidationDeltaUpdates), UtxoError>
 where
     F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
 {
+    let mut updates = Vec::new();
+    let utxo_count = visit_validation_delta_record(encoded, load_shard, |shard| {
+        updates.extend(shard);
+        Ok(())
+    })?;
+    Ok((utxo_count, updates))
+}
+
+fn visit_validation_delta_record<F, V>(
+    encoded: &[u8],
+    mut load_shard: F,
+    mut visit: V,
+) -> Result<u64, UtxoError>
+where
+    F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
+    V: FnMut(ValidationDeltaUpdates) -> Result<(), UtxoError>,
+{
     match validation_delta_record_header(encoded)? {
-        ValidationDeltaRecordHeader::Legacy { .. } => decode_validation_delta(encoded),
+        ValidationDeltaRecordHeader::Legacy { .. } => {
+            let (utxo_count, updates) = decode_validation_delta(encoded)?;
+            visit(updates)?;
+            Ok(utxo_count)
+        }
         ValidationDeltaRecordHeader::Sharded(header) => {
-            let mut updates = Vec::with_capacity(header.update_count);
+            let mut update_count = 0_usize;
             for shard in 0..header.shard_count {
                 let shard = u8::try_from(shard).expect("validation shard fits u8");
                 if !validation_shard_is_populated(header, shard) {
@@ -906,14 +931,20 @@ where
                         "validation delta shard content mismatch",
                     ));
                 }
-                updates.extend(shard_updates);
+                update_count =
+                    update_count
+                        .checked_add(shard_updates.len())
+                        .ok_or(UtxoError::Malformed(
+                            "validation delta shard count overflow",
+                        ))?;
+                visit(shard_updates)?;
             }
-            if updates.len() != header.update_count {
+            if update_count != header.update_count {
                 return Err(UtxoError::Malformed(
                     "validation delta shard count mismatch",
                 ));
             }
-            Ok((header.utxo_count, updates))
+            Ok(header.utxo_count)
         }
     }
 }
@@ -1711,6 +1742,8 @@ impl RedbChainStore {
     /// The journal, base tables, and execution metadata share this database,
     /// so either the complete materialized state or the complete journal-backed
     /// state survives a crash. The store remains in journal mode afterward.
+    /// Application allocations retain only one decoded shard (or legacy row)
+    /// at a time; engine dirty pages remain part of the atomic transaction.
     pub fn materialize_validation_deltas(&self) -> Result<u64, ChainStoreError> {
         let Some(validation_journal) = &self.validation_journal else {
             return Ok(0);
@@ -1723,47 +1756,56 @@ impl RedbChainStore {
         if journal.rows.is_empty() {
             return Ok(0);
         }
-        let updates = {
-            let transaction = self.db.begin_read()?;
-            let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
-            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
-            let mut updates: AHashMap<OutPointKey, ValidationUpdate> = AHashMap::new();
+        let source = self.db.begin_read()?;
+        let deltas = source.open_table(VALIDATION_DELTA_TABLE)?;
+        let delta_shards = source.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let mut count = 0_u64;
+        {
+            let mut seen = transaction.open_table(MATERIALIZATION_KEYS)?;
+            if !seen.is_empty()? {
+                return Err(
+                    UtxoError::Malformed("unexpected materialization scratch records").into(),
+                );
+            }
             for row in &journal.rows {
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                let decoded = decode_validation_delta_record(encoded.value(), |shard| {
-                    let key = validation_delta_shard_key(row.height, shard);
-                    delta_shards
-                        .get(key.as_slice())?
-                        .map(|encoded| encoded.value().to_vec())
-                        .ok_or(UtxoError::Malformed("missing validation delta shard"))
-                })?;
-                for (outpoint, update) in decoded.1 {
-                    if let Some(current) = updates.get_mut(&outpoint) {
-                        current.utxo = update.utxo;
-                    } else {
-                        updates.insert(outpoint, update);
-                    }
-                }
-            }
-            updates
-        };
-        let mut spent = Vec::new();
-        let mut created = Vec::new();
-        let mut ordered = updates.iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(outpoint, _)| **outpoint);
-        for (outpoint, update) in ordered {
-            if update.spent_in_batch {
-                spent.push(*outpoint);
-            }
-            if let Some(utxo) = &update.utxo {
-                created.push((*outpoint, utxo.clone()));
+                visit_validation_delta_record(
+                    encoded.value(),
+                    |shard| {
+                        let key = validation_delta_shard_key(row.height, shard);
+                        delta_shards
+                            .get(key.as_slice())?
+                            .map(|encoded| encoded.value().to_vec())
+                            .ok_or(UtxoError::Malformed("missing validation delta shard"))
+                    },
+                    |updates| {
+                        // Applying rows in journal order preserves intra-journal spends
+                        // without retaining every historical update or cloning UTXOs.
+                        let mut spent = Vec::new();
+                        let mut created = Vec::new();
+                        for (outpoint, update) in updates {
+                            if seen.insert(outpoint.as_bytes().as_slice(), ())?.is_none() {
+                                count += 1;
+                            }
+                            if update.spent_in_batch {
+                                spent.push(outpoint);
+                            }
+                            if let Some(utxo) = update.utxo {
+                                created.push((outpoint, utxo));
+                            }
+                        }
+                        spent.sort_unstable();
+                        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+                        apply_validated_changes_transaction(&transaction, &spent, &created)
+                    },
+                )?;
             }
         }
-        let mut transaction = self.db.begin_write()?;
-        self.configure(&mut transaction);
-        apply_validated_changes_transaction(&transaction, &spent, &created)?;
+        transaction.delete_table(MATERIALIZATION_KEYS)?;
         {
             let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
             deltas.retain(|_, _| false)?;
@@ -1775,7 +1817,6 @@ impl RedbChainStore {
             groups.retain(|_, _| false)?;
         }
         transaction.commit()?;
-        let count = u64::try_from(updates.len()).expect("usize fits u64");
         journal.rows.clear();
         journal.groups.clear();
         Ok(count)
@@ -3930,6 +3971,94 @@ mod tests {
         assert_eq!(
             partition_validation_bloom_matches(&bloom, &outpoints, indices),
             expected
+        );
+    }
+
+    #[test]
+    fn materialization_rolls_back_prior_rows_when_a_late_row_is_missing() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let base = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        base.apply(&[], &[(key(1), coin(10))]).unwrap();
+        drop(base);
+        let store = RedbChainStore::open_with_options(
+            &path,
+            Network::Regtest,
+            ChainStoreOptions {
+                validation_delta_journal: true,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let mut tip = store.execution().tip().unwrap();
+        for height in 1..=2_u8 {
+            let next = ExecutionTip {
+                height: u32::from(height),
+                hash: BlockHash::from_byte_array([height; 32]),
+            };
+            store
+                .commit_connect_batch(&[ConnectTransition {
+                    expected_parent: tip.hash,
+                    next,
+                    spent: vec![key(height)],
+                    created: vec![(key(height + 1), coin(10))],
+                    transaction_undos: vec![],
+                }])
+                .unwrap();
+            tip = next;
+        }
+        let write = store.db.begin_write().unwrap();
+        let encoded = write
+            .open_table(VALIDATION_DELTA_TABLE)
+            .unwrap()
+            .remove(2)
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        write.commit().unwrap();
+        assert!(store.materialize_validation_deltas().is_err());
+        // Row one was applied inside the failed transaction, never published.
+        assert_eq!(store.utxos.get(key(1)).unwrap(), Some(coin(10)));
+        assert!(store.utxos.get(key(2)).unwrap().is_none());
+        assert!(store.utxos.get(key(3)).unwrap().is_none());
+        assert_eq!(store.execution().tip().unwrap(), tip);
+        assert_eq!(
+            store
+                .validation_journal
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(MATERIALIZATION_KEYS)
+                .is_err()
+        );
+        let write = store.db.begin_write().unwrap();
+        write
+            .open_table(VALIDATION_DELTA_TABLE)
+            .unwrap()
+            .insert(2, encoded.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(store.materialize_validation_deltas().unwrap(), 3);
+        assert_eq!(store.utxos.get(key(3)).unwrap(), Some(coin(10)));
+        assert!(store.utxos.get(key(1)).unwrap().is_none());
+        assert!(
+            store
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(MATERIALIZATION_KEYS)
+                .is_err()
         );
     }
 

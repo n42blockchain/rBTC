@@ -32,6 +32,8 @@ not change acceptance statuses or weaken thresholds.
    pages together, then rerun the failed workload and required scale acceptance.
    Keep the failed historical measurements. Experimental MDBX replacement is
    tracked separately from supported default redb release behavior.
+   [Redb journal materialization](journal-materialization-memory-20260917.md) now
+   applies one decoded shard at a time; this is not the failed MDBX RSS rerun.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact
    source identity after production changes stop.
