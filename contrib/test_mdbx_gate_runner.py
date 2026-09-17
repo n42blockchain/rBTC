@@ -54,6 +54,30 @@ class GateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate.workload(legacy)
 
+    def test_stream_mode_is_distinct_and_cannot_replace_historical_results(self):
+        report, values = fixture()
+        stream = dict(values, STREAM_INPUTS=1)
+        with self.assertRaises(ValueError):
+            gate.validate_report(report, stream, 64)
+        report['workload']['stream_inputs'] = True
+        gate.validate_report(report, stream, 64)
+        with self.assertRaises(ValueError):
+            gate.validate_report(report, values, 64)
+        legacy = dict(values)
+        legacy.pop('STREAM_INPUTS')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gate.workload(legacy)['STREAM_INPUTS'], 0)
+        for environment in [
+            {gate.PREFIX + 'STREAM_INPUTS': '1'},
+            {gate.PREFIX + 'STREAM_INPUTS': '2'},
+        ]:
+            with patch.dict(os.environ, environment, clear=True), self.assertRaises(ValueError):
+                gate.workload(legacy)
+        with patch.dict(os.environ, {
+            gate.PREFIX + 'STREAM_INPUTS': '1', gate.PREFIX + 'CONSUME_INPUTS': '1'
+        }, clear=True), self.assertRaises(ValueError):
+            gate.workload()
+
     def test_resuming_completed_lanes_preserves_the_original_rss_failure(self):
         report, values = fixture()
         with tempfile.TemporaryDirectory() as tmp:
