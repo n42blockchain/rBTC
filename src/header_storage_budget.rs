@@ -24,7 +24,7 @@ struct Usage {
 }
 #[derive(Debug)]
 struct Budget {
-    usage: Mutex<Usage>,
+    usage: Arc<Mutex<Usage>>,
     cache_limit: u64,
     file_limit: u64,
     directory: Option<PathBuf>,
@@ -82,7 +82,10 @@ impl Budget {
             used.paths.insert(key.clone(), existing);
             used.files = total;
             if let Some(directory) = &self.directory {
-                if let Err(error) = inventory::save(directory, used.paths.keys()) {
+                if let Err(error) = inventory::save(
+                    directory,
+                    used.paths.keys().filter(|path| path.starts_with(directory)),
+                ) {
                     used.paths.remove(&key);
                     used.files -= existing;
                     return Err(error);
@@ -147,11 +150,14 @@ impl Budget {
         used.files -= files;
     }
 }
+type Pools = HashMap<PathBuf, Weak<Budget>>;
+fn pools() -> &'static Mutex<Pools> {
+    static POOLS: OnceLock<Mutex<Pools>> = OnceLock::new();
+    POOLS.get_or_init(Mutex::default)
+}
 fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
-    static POOLS: OnceLock<Mutex<HashMap<PathBuf, Weak<Budget>>>> = OnceLock::new();
     let key = parent.canonicalize()?;
-    let mut pools = POOLS
-        .get_or_init(Mutex::default)
+    let mut pools = pools()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     pools.retain(|_, pool| pool.strong_count() != 0);
@@ -165,11 +171,11 @@ fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
         .try_fold(0_u64, |sum, len| sum.checked_add(*len))
         .ok_or_else(|| io::Error::other("header inventory length overflow"))?;
     let pool = Arc::new(Budget {
-        usage: Mutex::new(Usage {
+        usage: Arc::new(Mutex::new(Usage {
             cache: 0,
             files,
             paths,
-        }),
+        })),
         cache_limit: CACHE_LIMIT,
         file_limit: FILE_LIMIT,
         directory: Some(key.clone()),
@@ -177,6 +183,73 @@ fn shared(parent: &Path) -> io::Result<Arc<Budget>> {
     });
     pools.insert(key, Arc::downgrade(&pool));
     Ok(pool)
+}
+
+/// Pins one aggregate allowance across active and background header stores.
+/// Every spawned pipeline retains a clone, including on caller cancellation.
+#[derive(Clone)]
+pub(crate) struct HeaderBudgetGroup {
+    _budgets: Vec<Arc<Budget>>,
+}
+pub(crate) fn bind_background(active: &Path, validation: &Path) -> io::Result<HeaderBudgetGroup> {
+    bind_with_limits(active, validation, CACHE_LIMIT, FILE_LIMIT)
+}
+fn bind_with_limits(
+    active: &Path,
+    validation: &Path,
+    cache_limit: u64,
+    file_limit: u64,
+) -> io::Result<HeaderBudgetGroup> {
+    let mut roots = [active.canonicalize()?, validation.canonicalize()?];
+    if roots[0].starts_with(&roots[1]) || roots[1].starts_with(&roots[0]) {
+        return Err(io::Error::other(
+            "header budget directories must be disjoint",
+        ));
+    }
+    roots.sort();
+    let mut registry = pools()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry.retain(|_, pool| pool.strong_count() != 0);
+    if roots
+        .iter()
+        .any(|root| registry.get(root).and_then(Weak::upgrade).is_some())
+    {
+        return Err(io::Error::other("cannot rebind a live header budget"));
+    }
+    let mut owners = Vec::with_capacity(2);
+    let mut paths = HashMap::new();
+    for root in &roots {
+        owners.push(inventory::lock(root)?);
+        paths.extend(inventory::load(root)?);
+    }
+    let files = paths
+        .values()
+        .try_fold(0_u64, |sum, len| sum.checked_add(*len))
+        .ok_or_else(|| io::Error::other("combined header inventory length overflow"))?;
+    if files > file_limit || paths.len() > inventory::MAX_FILES {
+        return Err(io::Error::other(
+            "combined startup header inventory exceeds allowance",
+        ));
+    }
+    let usage = Arc::new(Mutex::new(Usage {
+        cache: 0,
+        files,
+        paths,
+    }));
+    let mut budgets = Vec::with_capacity(2);
+    for (root, owner) in roots.into_iter().zip(owners) {
+        let budget = Arc::new(Budget {
+            usage: Arc::clone(&usage),
+            cache_limit,
+            file_limit,
+            directory: Some(root.clone()),
+            _owner: Some(owner),
+        });
+        registry.insert(root, Arc::downgrade(&budget));
+        budgets.push(budget);
+    }
+    Ok(HeaderBudgetGroup { _budgets: budgets })
 }
 
 #[derive(Debug)]
@@ -352,7 +425,7 @@ mod tests {
     use redb::ReadableTableMetadata;
     fn budget(cache: u64, files: u64) -> Arc<Budget> {
         Arc::new(Budget {
-            usage: Mutex::default(),
+            usage: Arc::default(),
             cache_limit: cache,
             file_limit: files,
             directory: None,
@@ -534,5 +607,60 @@ mod tests {
             Backend::open(&root.path().join("next"), false, 8, Arc::clone(&pool)).unwrap();
         assert_eq!(pool.usage.lock().unwrap().files, 0);
         drop(recovered);
+    }
+    #[test]
+    fn background_directories_share_one_allowance_and_keep_separate_catalogs() {
+        let active = tempfile::tempdir().unwrap();
+        let validation = tempfile::tempdir().unwrap();
+        let group = bind_with_limits(active.path(), validation.path(), 16, 100).unwrap();
+        let left_pool = shared(active.path()).unwrap();
+        let right_pool = shared(validation.path()).unwrap();
+        assert!(Arc::ptr_eq(&left_pool.usage, &right_pool.usage));
+        let left_path = active.path().join("headers.redb");
+        let right_path = validation.path().join("headers.redb");
+        let left = Backend::open(&left_path, true, 8, Arc::clone(&left_pool)).unwrap();
+        let right = Backend::open(&right_path, true, 8, Arc::clone(&right_pool)).unwrap();
+        assert!(
+            Backend::open(
+                &active.path().join("extra"),
+                true,
+                1,
+                Arc::clone(&left_pool)
+            )
+            .is_err()
+        );
+        left.set_len(60).unwrap();
+        right.set_len(40).unwrap();
+        assert!(right.set_len(41).is_err());
+        assert!(left.set_len(61).is_err());
+        drop(left);
+        drop(right);
+        drop(left_pool);
+        drop(right_pool);
+        let child_guard = group.clone();
+        drop(group);
+        assert!(bind_background(active.path(), validation.path()).is_err());
+        drop(child_guard);
+        assert_eq!(
+            inventory::load(&active.path().canonicalize().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            inventory::load(&validation.path().canonicalize().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(bind_with_limits(active.path(), validation.path(), 16, 99).is_err());
+        let restored = bind_with_limits(active.path(), validation.path(), 16, 100).unwrap();
+        let pool = shared(active.path()).unwrap();
+        assert_eq!(pool.usage.lock().unwrap().files, 100);
+        drop(restored);
+        // An already-open directory cannot have its allowance silently reset.
+        assert!(bind_background(active.path(), validation.path()).is_err());
+        drop(pool);
+        assert!(bind_background(active.path(), validation.path()).is_ok());
     }
 }

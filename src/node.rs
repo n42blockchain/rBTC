@@ -9016,6 +9016,8 @@ async fn run_background_assumeutxo(
         .data_dir
         .as_ref()
         .expect("background validation parser requires active data directory");
+    let header_budget = crate::header_storage_budget::bind_background(active_dir, &validation_dir)
+        .map_err(|error| format!("background header resource admission: {error}"))?;
     let active = RedbChainStore::open(active_dir.join("chainstate.redb"), options.network)
         .map_err(|error| error.to_string())?;
     let assumed = active
@@ -9060,6 +9062,7 @@ async fn run_background_assumeutxo(
         assumed.base.height,
         assumed.base.hash
     );
+    let validation_headers = header_budget.clone();
     let validation_status = status.clone();
     let validation = tokio::spawn(async move {
         let result = run_peer_pool(
@@ -9069,6 +9072,7 @@ async fn run_background_assumeutxo(
             Some(&validation_status),
         )
         .await;
+        drop(validation_headers);
         match &result {
             Ok(()) => validation_status.set(BackgroundValidationState::Complete),
             Err(error) => {
@@ -9079,8 +9083,11 @@ async fn run_background_assumeutxo(
     });
     let finalize_options = active_options.clone();
     let active_status = status;
+    let active_headers = header_budget.clone();
     let active = tokio::spawn(async move {
-        run_peer_pool(&active_options, local_nonce, Some(&active_status), None).await
+        let result = run_peer_pool(&active_options, local_nonce, Some(&active_status), None).await;
+        drop(active_headers);
+        result
     });
     tokio::pin!(active);
     tokio::pin!(validation);
@@ -27775,7 +27782,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_background_pipelines_share_a_bounded_bulk_cache_budget() {
+    fn background_and_bulk_modes_select_distinct_cache_allowances() {
         let cache = NodeCacheConfig::default();
         assert_eq!(
             chainstate_cache_bytes(NetworkExecutionMode::Persistent, true, cache),
