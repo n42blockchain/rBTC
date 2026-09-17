@@ -629,35 +629,32 @@ pub trait ExecutionChainStore: UtxoStore {
     /// `transitions` carry the per-block tips and undo records; their own
     /// coin lists are ignored (a write-back buffer drains them as it folds).
     /// `spent` and `created` are the batch's net change in key order. The
-    /// default walks the blocks with [`Self::commit_connect`], landing the
-    /// coins with the final block — correct but not atomic across blocks;
-    /// engines with an atomic batch commit override it.
+    /// default builds one atomic batch with the net coins on its final block.
+    /// This compatibility fallback clones undo records and net coins; engines
+    /// can override it to avoid materializing those copies.
     fn commit_connect_folded(
         &self,
         transitions: &[ConnectTransition],
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<(), ChainStoreError> {
-        let Some((last, rest)) = transitions.split_last() else {
+        if transitions.is_empty() {
             return Ok(());
-        };
-        for transition in rest {
-            self.commit_connect(
-                transition.expected_parent,
-                transition.next,
-                &[],
-                &[],
-                &transition.transaction_undos,
-            )?;
         }
-        self.commit_connect(
-            last.expected_parent,
-            last.next,
-            spent,
-            created,
-            &last.transaction_undos,
-        )?;
-        Ok(())
+        let mut batch: Vec<_> = transitions
+            .iter()
+            .map(|transition| ConnectTransition {
+                expected_parent: transition.expected_parent,
+                next: transition.next,
+                spent: Vec::new(),
+                created: Vec::new(),
+                transaction_undos: transition.transaction_undos.clone(),
+            })
+            .collect();
+        let last = batch.last_mut().expect("nonempty transitions");
+        last.spent = spent.to_vec();
+        last.created = created.to_vec();
+        self.commit_connect_batch_owned(batch)
     }
     /// Reverses the tip block and removes its undo in one transaction.
     fn commit_disconnect(
@@ -3226,6 +3223,73 @@ mod tests {
             creation_mtp: 0,
             script_pubkey: vec![0x51],
         }
+    }
+
+    fn assert_atomic_folded_failure(store: &impl ExecutionChainStore) {
+        let genesis = store.execution_tip().unwrap();
+        let one = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([91; 32]),
+        };
+        let two = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([92; 32]),
+        };
+        let transitions = vec![
+            ConnectTransition {
+                expected_parent: genesis.hash,
+                next: one,
+                spent: vec![],
+                created: vec![],
+                transaction_undos: vec![],
+            },
+            ConnectTransition {
+                expected_parent: one.hash,
+                next: two,
+                spent: vec![],
+                created: vec![],
+                transaction_undos: vec![],
+            },
+        ];
+        // Missing base coin is discovered when the folded changes reach the
+        // engine. It must not leave a tip/undo prefix from earlier blocks.
+        assert!(
+            store
+                .commit_connect_folded(&transitions, &[key(90)], &[(key(91), coin(20))])
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.block_undo(one.hash).unwrap().is_none());
+        assert!(store.block_undo(two.hash).unwrap().is_none());
+        assert!(store.get(key(91)).unwrap().is_none());
+        store
+            .commit_connect_folded(&transitions, &[], &[(key(91), coin(20))])
+            .unwrap();
+        assert_eq!(store.execution_tip().unwrap(), two);
+        assert_eq!(store.get(key(91)).unwrap().unwrap().value_sats, 20);
+        assert!(store.block_undo(one.hash).unwrap().is_some());
+        assert!(store.block_undo(two.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn redb_folded_failure_never_publishes_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = RedbChainStore::open(dir.path().join("folded.redb"), Network::Regtest).unwrap();
+        assert_atomic_folded_failure(&store);
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn mdbx_folded_failure_never_publishes_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("folded")).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([90; 32]),
+            })
+            .unwrap();
+        assert_atomic_folded_failure(&store);
     }
 
     fn assert_atomic_transition_stream(store: &impl ExecutionChainStore, expected_peak: u64) {

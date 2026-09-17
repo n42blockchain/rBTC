@@ -48,7 +48,9 @@ not change acceptance statuses or weaken thresholds.
    removes the executor's second full transition vector for streaming engines;
    [transition leases](transition-memory-ownership-20260917.md) now follow
    collecting and write-back owners through completion/failure. Reservation
-   producers, preparation/spooling and RSS acceptance remain.
+   producers, preparation/spooling and RSS acceptance remain. The default
+   [folded commit now preserves atomicity](folded-commit-atomicity-20260917.md)
+   on late engine failures; its compatibility copies remain to be bounded.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact
    source identity after production changes stop.
