@@ -39,3 +39,26 @@ Mac checks: 15 MDBX tests passed; full all-feature library tests passed 984
 (0 failed, 12 ignored; 67.26 seconds). Strict all-target/all-feature Clippy,
 format and diff checks passed. Prior e69421d CI 35184076573 passed all jobs;
 that CI result does not cover this new implementation.
+
+## Measured reduced result
+
+Frozen source: `1f437325cef47032fec4cb015c2c4264c69aac34`. Both lanes completed
+and passed independent-process reopen audits. The runner exited 1 with
+`review_required`; RSS acceptance **failed**.
+
+| Batch | Peak RSS bytes | Final checkpoint seconds | Compactions |
+| --- | ---: | ---: | ---: |
+| 64 | 663,109,632 | 47.78 | 0 |
+| 256 | 1,473,953,792 | 48.97 | 0 |
+
+256/64 RSS ratio: **2.2227905023**, exceeding 1.5. Both final content hashes are
+`d1a9badf1e78d8bdd07324579437b95480db9034da539b610ff7bce43588acdb`, matching the
+historical reduced workload. Neither lane reached the unchanged compaction
+trigger, so this run supplies no churn-triggered maintenance evidence. It does
+not replace the old maintenance failure or constitute full-scale acceptance.
+
+Evidence remains in `/Users/jieliu/Documents/n42/rBTC-storage-consumed-20260917/`
+(matrix, frozen executables, source hashes, attempts and reopen logs); small
+copies are under the primary workspace's session-state directory. No database
+was copied. This run used the original borrowed-input driver; the production
+owned-input route still needs separately identified measurement.
