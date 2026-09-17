@@ -43,6 +43,18 @@ pins known-stable assignments (AS15169, AS13335, AS19281), so a silently
 regenerated or truncated data file fails the suite instead of passing as
 equivalent.
 
+Node memory update (2026-09-17): each node load reserves the byte payload plus
+64 KiB of validation headroom before reading an operator file or copying the
+embedded bytes. After validation, only the payload capacity and object allowance
+remain reserved; shared `Arc` views retain that charge until their last owner
+is gone. Node loads validate their own owned copy. The standalone library's
+`Asmap::embedded()` compatibility cache remains process-global.
+
+Operator files are opened once, size-checked on that handle, and read into a
+fixed-length buffer followed by a one-byte EOF check. Concurrent growth cannot
+increase the allocation; truncation, detected growth or invalid content fails
+closed and refunds the reservation.
+
 ## Operator surface
 
 | Configuration | Effect |

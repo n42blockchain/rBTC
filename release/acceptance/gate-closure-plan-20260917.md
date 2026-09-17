@@ -31,7 +31,9 @@ not change acceptance statuses or weaken thresholds.
    buffers and retain shared reservations for MPHF/fingerprint caches, including
    overlapping old/new bases during rebase; index building remains unadmitted. [Supporting database caches](supporting-cache-memory-20260917.md)
    and maintenance opens now share that owner too; remaining allocations and
-   whole-node acceptance are still open. [FIFO work admission and cancellable
+   whole-node acceptance are still open.
+   [AS-map payloads](asmap-memory-20260917.md) now reserve before startup reads
+   and embedded copies and retain their charge through shared map ownership. [FIFO work admission and cancellable
    standby waits](header-work-scheduling-20260917.md) now prevent asynchronous
    waiters from being bypassed; full resumable candidate scheduling remains.
    [Replay keepalive during work admission](header-replay-keepalive-20260917.md)

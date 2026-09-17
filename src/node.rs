@@ -8943,14 +8943,14 @@ async fn run_peer_pool_session(
         // on a store-less node.
         let asmap = match &options.resources.asmap {
             NodeAsmapSource::Off => None,
-            NodeAsmapSource::Embedded => {
-                Some(Asmap::embedded().map_err(|error| error.to_string())?)
-            }
-            NodeAsmapSource::File(path) => {
-                Some(Arc::new(Asmap::from_file(path).map_err(|error| {
-                    format!("--asmap {}: {error}", path.display())
-                })?))
-            }
+            NodeAsmapSource::Embedded => Some(
+                Asmap::embedded_with_memory(&runtime_memory(options))
+                    .map_err(|error| error.to_string())?,
+            ),
+            NodeAsmapSource::File(path) => Some(Arc::new(
+                Asmap::from_file_with_memory(path, Some(&runtime_memory(options)))
+                    .map_err(|error| format!("--asmap {}: {error}", path.display()))?,
+            )),
         };
         let peer_store = if let Some(data_dir) = &options.data_dir {
             Some(Arc::new(
