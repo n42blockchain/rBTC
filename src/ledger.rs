@@ -597,9 +597,14 @@ impl PrunedBlockLedger {
             if block_count == manifest.block_count {
                 return self.publish_staged_locked(&manifest, index);
             }
-            let (_, blocks) = read_archive(self.staged_path())?;
-            let count = usize::try_from(block_count).expect("staged block count fits usize");
-            self.append_locked(manifest.first_height, &blocks[..count])?;
+            self.append_generated_locked(manifest.first_height, block_count, |temporary| {
+                crate::archive::write_archive_prefix(
+                    &self.staged_path(),
+                    &manifest,
+                    block_count,
+                    temporary,
+                )
+            })?;
         } else if manifest.first_height.checked_add(block_count) == retained_next {
             let (_, blocks) = read_archive(self.staged_path())?;
             let count = usize::try_from(block_count).expect("staged block count fits usize");
@@ -664,9 +669,20 @@ impl PrunedBlockLedger {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty segment"));
         }
-        let mut index = self.read_index()?;
         let block_count =
             u32::try_from(blocks.len()).map_err(|_| LedgerError::Invalid("too many blocks"))?;
+        self.append_generated_locked(first_height, block_count, |temporary| {
+            write_archive(temporary, first_height, blocks)
+        })
+    }
+
+    fn append_generated_locked(
+        &self,
+        first_height: u32,
+        block_count: u32,
+        generate: impl FnOnce(&Path) -> Result<ArchiveManifest, ArchiveError>,
+    ) -> Result<ArchiveManifest, LedgerError> {
+        let mut index = self.read_index()?;
         if block_count > self.retention.max_blocks {
             return Err(LedgerError::Invalid(
                 "single segment exceeds maximum blocks",
@@ -686,7 +702,7 @@ impl PrunedBlockLedger {
         index.segments.retain(|segment| segment.slot != slot);
         let destination = self.slot_path(slot);
         let temporary = destination.with_extension("rblk.new");
-        let manifest = write_archive(&temporary, first_height, blocks)?;
+        let manifest = generate(&temporary)?;
         let bytes = fs::metadata(&temporary)?.len();
         if bytes > self.retention.max_bytes {
             fs::remove_file(temporary)?;

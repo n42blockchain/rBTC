@@ -121,7 +121,24 @@ pub fn write_archive(
         remaining: MAX_CONTAINER_BYTES,
     };
     let (temporary, records_sha256) = compress_archive(temporary, blocks, records_bytes)?;
-    let mut compressed = temporary.file;
+    finish_archive_file(
+        path,
+        first_height,
+        u32::try_from(blocks.len()).expect("validated block count"),
+        records_bytes,
+        records_sha256,
+        temporary.file,
+    )
+}
+
+fn finish_archive_file(
+    path: &Path,
+    first_height: u32,
+    block_count: u32,
+    records_bytes: u64,
+    records_sha256: String,
+    mut compressed: File,
+) -> Result<ArchiveManifest, ArchiveError> {
     compressed.seek(SeekFrom::Start(0))?;
     let mut piece = vec![0_u8; PIECE_SIZE];
     let mut piece_sha256 = Vec::new();
@@ -142,7 +159,7 @@ pub fn write_archive(
     let manifest = ArchiveManifest {
         format_version: FORMAT_VERSION,
         first_height,
-        block_count: u32::try_from(blocks.len()).expect("validated block count"),
+        block_count,
         records_bytes,
         records_sha256,
         piece_size: PIECE_SIZE,
@@ -246,6 +263,25 @@ fn compress_archive<W: Write>(
     blocks: &[Vec<u8>],
     records_bytes: u64,
 ) -> Result<(W, String), ArchiveError> {
+    let mut encoder = archive_encoder(output, records_bytes)?;
+    let mut records_hash = Sha256::new();
+    for block in blocks {
+        let len =
+            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
+        let len = len.to_le_bytes();
+        records_hash.update(len);
+        records_hash.update(block);
+        encoder.write_all(&len)?;
+        encoder.write_all(block)?;
+    }
+    let output = encoder.finish()?;
+    Ok((output, crate::utxo::hex_lower(&records_hash.finalize())))
+}
+
+fn archive_encoder<W: Write>(
+    output: W,
+    records_bytes: u64,
+) -> Result<zstd::stream::Encoder<'static, W>, ArchiveError> {
     let mut encoder = zstd::stream::Encoder::new(output, ARCHIVE_COMPRESSION_LEVEL)?;
     let useful_workers = usize::try_from(
         records_bytes
@@ -260,18 +296,66 @@ fn compress_archive<W: Write>(
     if workers > 1 {
         encoder.multithread(u32::try_from(workers).expect("compression worker bound fits u32"))?;
     }
-    let mut records_hash = Sha256::new();
-    for block in blocks {
-        let len =
-            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
-        let len = len.to_le_bytes();
-        records_hash.update(len);
-        records_hash.update(block);
-        encoder.write_all(&len)?;
-        encoder.write_all(block)?;
+    Ok(encoder)
+}
+
+/// Re-encodes a verified prefix without retaining the source blocks. The
+/// destination is opened only after both complete source verification passes.
+pub(crate) fn write_archive_prefix(
+    source: &Path,
+    expected: &ArchiveManifest,
+    count: u32,
+    destination: &Path,
+) -> Result<ArchiveManifest, ArchiveError> {
+    if count == 0 || count > expected.block_count {
+        return Err(ArchiveError::Invalid("archive prefix count"));
     }
-    let output = encoder.finish()?;
-    Ok((output, crate::utxo::hex_lower(&records_hash.finalize())))
+    let mut records_bytes = 0_u64;
+    visit_archive_prefix(source, expected, count, &mut |_, block| {
+        records_bytes += 4 + block.len() as u64;
+        true
+    })?;
+    let _spool = crate::node_memory::for_path(destination)?
+        .map(|budget| budget.reserve_spool(MAX_CONTAINER_BYTES))
+        .transpose()?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = BoundedArchiveFile {
+        file: tempfile::tempfile_in(parent)?,
+        remaining: MAX_CONTAINER_BYTES,
+    };
+    let mut encoder = archive_encoder(temporary, records_bytes)?;
+    let mut digest = Sha256::new();
+    let mut failure = None;
+    visit_archive_prefix(source, expected, count, &mut |_, block| {
+        let length = u32::try_from(block.len())
+            .expect("verified record size")
+            .to_le_bytes();
+        digest.update(length);
+        digest.update(block);
+        if let Err(error) = encoder
+            .write_all(&length)
+            .and_then(|()| encoder.write_all(block))
+        {
+            failure = Some(error);
+            return false;
+        }
+        true
+    })?;
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    let temporary = encoder.finish()?;
+    finish_archive_file(
+        destination,
+        expected.first_height,
+        count,
+        records_bytes,
+        crate::utxo::hex_lower(&digest.finalize()),
+        temporary.file,
+    )
 }
 
 struct BoundedArchiveFile {
@@ -890,6 +974,35 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn streamed_prefix_matches_encoding_and_rejects_corrupt_source_before_output() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.rblk");
+        let target = dir.path().join("prefix.rblk");
+        let blocks = [vec![1; 1000], vec![2; 5000], vec![3; 256 * 1024]];
+        let original = write_archive(&source, 10, &blocks).unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        let (expected, encoded) = encode_archive(10, &blocks[..2]).unwrap();
+        assert_eq!(
+            write_archive_prefix(&source, &original, 2, &target).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(&target).unwrap(), encoded);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert!(write_archive_prefix(&source, &original, 0, &target).is_err());
+        assert!(write_archive_prefix(&source, &original, 4, &target).is_err());
+        let mut corrupt = source_bytes;
+        *corrupt.last_mut().unwrap() ^= 1;
+        fs::write(&source, corrupt).unwrap();
+        assert!(write_archive_prefix(&source, &original, 1, &target).is_err());
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            encoded,
+            "failed source verification must not truncate output"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn streamed_archive_write_matches_encoding_and_admits_temporary_disk_first() {
