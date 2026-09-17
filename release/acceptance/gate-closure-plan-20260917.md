@@ -28,7 +28,7 @@ not change acceptance statuses or weaken thresholds.
    now shares payloads and retains existing admission through escaped undo handles. [Original block preparation](block-preparation-memory-20260917.md)
    now reserves before worker payload allocation and transfers ownership through net changes and undo. [Retained archive batches](archive-batch-streaming-20260917.md)
    now verify the full stream while retaining only the bounded requested prefix. [Staged recovery reads](staged-batch-recovery-20260917.md)
-   are now identity-bound and used by startup/reindex validation. [A single record traversal](staged-single-pass-20260917.md) removes repeated batch verification; publication allocations remain open. The user-selected default is now 32 GiB;
+   are now identity-bound and used by startup/reindex validation. [A single record traversal](staged-single-pass-20260917.md) removes repeated batch verification. [Archive file writes and publication verification](archive-streamed-write-20260917.md) now stream compressed bytes; partial-prefix source materialization remains open. The user-selected default is now 32 GiB;
    [bounded coin queries](bounded-coin-reads-20260917.md) check scripts before
    copying in ordinary stores and mutable snapshot overlays.
    [Snapshot-base group queries](snapshot-group-streaming-20260917.md) now

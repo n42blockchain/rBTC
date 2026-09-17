@@ -107,8 +107,62 @@ pub fn write_archive(
     first_height: u32,
     blocks: &[Vec<u8>],
 ) -> Result<ArchiveManifest, ArchiveError> {
-    let (manifest, output) = encode_archive(first_height, blocks)?;
-    fs::write(path, output)?;
+    let path = path.as_ref();
+    let records_bytes = archive_record_bytes(blocks)?;
+    let _spool = crate::node_memory::for_path(path)?
+        .map(|budget| budget.reserve_spool(MAX_CONTAINER_BYTES))
+        .transpose()?;
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = BoundedArchiveFile {
+        file: tempfile::tempfile_in(parent)?,
+        remaining: MAX_CONTAINER_BYTES,
+    };
+    let (temporary, records_sha256) = compress_archive(temporary, blocks, records_bytes)?;
+    let mut compressed = temporary.file;
+    compressed.seek(SeekFrom::Start(0))?;
+    let mut piece = vec![0_u8; PIECE_SIZE];
+    let mut piece_sha256 = Vec::new();
+    loop {
+        let mut filled = 0;
+        while filled < piece.len() {
+            let read = compressed.read(&mut piece[filled..])?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+        piece_sha256.push(hash_hex(&piece[..filled]));
+    }
+    let manifest = ArchiveManifest {
+        format_version: FORMAT_VERSION,
+        first_height,
+        block_count: u32::try_from(blocks.len()).expect("validated block count"),
+        records_bytes,
+        records_sha256,
+        piece_size: PIECE_SIZE,
+        piece_sha256,
+    };
+    let metadata = serde_json::to_vec(&manifest)?;
+    let compressed_bytes = compressed.metadata()?.len();
+    if 12 + metadata.len() as u64 + compressed_bytes > MAX_CONTAINER_BYTES {
+        return Err(ArchiveError::Invalid("archive too large"));
+    }
+    compressed.seek(SeekFrom::Start(0))?;
+    let mut output = File::create(path)?;
+    output.write_all(MAGIC)?;
+    output.write_all(
+        &u32::try_from(metadata.len())
+            .map_err(|_| ArchiveError::Invalid("manifest too large"))?
+            .to_le_bytes(),
+    )?;
+    output.write_all(&metadata)?;
+    std::io::copy(&mut compressed, &mut output)?;
     Ok(manifest)
 }
 
@@ -117,64 +171,21 @@ pub fn encode_archive(
     first_height: u32,
     blocks: &[Vec<u8>],
 ) -> Result<(ArchiveManifest, Vec<u8>), ArchiveError> {
-    if blocks.is_empty() {
-        return Err(ArchiveError::Invalid("empty archive"));
-    }
-    if blocks.len() > usize::try_from(MAX_BLOCKS_PER_ARCHIVE).expect("u32 fits usize") {
-        return Err(ArchiveError::Invalid("too many blocks"));
-    }
-    let mut records_bytes = 0_u64;
-    for block in blocks {
-        if block.len() > MAX_BLOCK_BYTES {
-            return Err(ArchiveError::Invalid("block too large"));
-        }
-        records_bytes = records_bytes
-            .checked_add(4)
-            .and_then(|bytes| {
-                bytes.checked_add(u64::try_from(block.len()).expect("block length fits u64"))
-            })
-            .ok_or(ArchiveError::Invalid("records too large"))?;
-        if records_bytes > MAX_RECORDS_BYTES {
-            return Err(ArchiveError::Invalid("records too large"));
-        }
-    }
+    let records_bytes = archive_record_bytes(blocks)?;
     let compressed_capacity =
         usize::try_from(records_bytes).expect("bounded record length fits usize");
-    let mut encoder = zstd::stream::Encoder::new(
+    let (compressed, records_sha256) = compress_archive(
         Vec::with_capacity(compressed_capacity),
-        ARCHIVE_COMPRESSION_LEVEL,
+        blocks,
+        records_bytes,
     )?;
-    let useful_workers = usize::try_from(
-        records_bytes
-            .div_ceil(MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER)
-            .max(1),
-    )
-    .unwrap_or(usize::MAX);
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(MAX_ARCHIVE_COMPRESSION_WORKERS)
-        .min(useful_workers);
-    if workers > 1 {
-        encoder.multithread(u32::try_from(workers).expect("compression worker bound fits u32"))?;
-    }
-    let mut records_hash = Sha256::new();
-    for block in blocks {
-        let len =
-            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
-        let len = len.to_le_bytes();
-        records_hash.update(len);
-        records_hash.update(block);
-        encoder.write_all(&len)?;
-        encoder.write_all(block)?;
-    }
-    let compressed = encoder.finish()?;
     let manifest = ArchiveManifest {
         format_version: FORMAT_VERSION,
         first_height,
         block_count: u32::try_from(blocks.len())
             .map_err(|_| ArchiveError::Invalid("too many blocks"))?,
         records_bytes,
-        records_sha256: crate::utxo::hex_lower(&records_hash.finalize()),
+        records_sha256,
         piece_size: PIECE_SIZE,
         piece_sha256: compressed.chunks(PIECE_SIZE).map(hash_hex).collect(),
     };
@@ -203,6 +214,84 @@ pub fn read_archive(
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     decode_archive(&bytes)
+}
+
+fn archive_record_bytes(blocks: &[Vec<u8>]) -> Result<u64, ArchiveError> {
+    if blocks.is_empty() {
+        return Err(ArchiveError::Invalid("empty archive"));
+    }
+    if blocks.len() > usize::try_from(MAX_BLOCKS_PER_ARCHIVE).expect("u32 fits usize") {
+        return Err(ArchiveError::Invalid("too many blocks"));
+    }
+    let mut records_bytes = 0_u64;
+    for block in blocks {
+        if block.len() > MAX_BLOCK_BYTES {
+            return Err(ArchiveError::Invalid("block too large"));
+        }
+        records_bytes = records_bytes
+            .checked_add(4)
+            .and_then(|bytes| {
+                bytes.checked_add(u64::try_from(block.len()).expect("block length fits u64"))
+            })
+            .ok_or(ArchiveError::Invalid("records too large"))?;
+        if records_bytes > MAX_RECORDS_BYTES {
+            return Err(ArchiveError::Invalid("records too large"));
+        }
+    }
+    Ok(records_bytes)
+}
+
+fn compress_archive<W: Write>(
+    output: W,
+    blocks: &[Vec<u8>],
+    records_bytes: u64,
+) -> Result<(W, String), ArchiveError> {
+    let mut encoder = zstd::stream::Encoder::new(output, ARCHIVE_COMPRESSION_LEVEL)?;
+    let useful_workers = usize::try_from(
+        records_bytes
+            .div_ceil(MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER)
+            .max(1),
+    )
+    .unwrap_or(usize::MAX);
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(MAX_ARCHIVE_COMPRESSION_WORKERS)
+        .min(useful_workers);
+    if workers > 1 {
+        encoder.multithread(u32::try_from(workers).expect("compression worker bound fits u32"))?;
+    }
+    let mut records_hash = Sha256::new();
+    for block in blocks {
+        let len =
+            u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
+        let len = len.to_le_bytes();
+        records_hash.update(len);
+        records_hash.update(block);
+        encoder.write_all(&len)?;
+        encoder.write_all(block)?;
+    }
+    let output = encoder.finish()?;
+    Ok((output, crate::utxo::hex_lower(&records_hash.finalize())))
+}
+
+struct BoundedArchiveFile {
+    file: File,
+    remaining: u64,
+}
+impl Write for BoundedArchiveFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(
+                "compressed archive temporary byte limit exceeded",
+            ));
+        }
+        let written = self.file.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
 }
 
 /// Reads a contiguous byte/count-bounded selection while verifying the whole
@@ -394,9 +483,8 @@ pub(crate) fn verify_archive(path: impl AsRef<Path>) -> Result<ArchiveManifest, 
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let (manifest, _, _) = verify_archive_container(&bytes)?;
+    let (manifest, _, payload_offset) = read_manifest_header_from(&mut file)?;
+    verify_compressed_pieces_from(&mut file, payload_offset, &manifest)?;
     Ok(manifest)
 }
 
@@ -802,6 +890,57 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn streamed_archive_write_matches_encoding_and_admits_temporary_disk_first() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stream.rblk");
+        let mut state = 1_u32;
+        let blocks: Vec<Vec<u8>> = (0..2)
+            .map(|_| {
+                (0..3 * 1024 * 1024)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        state.to_le_bytes()[0]
+                    })
+                    .collect()
+            })
+            .collect();
+        let (expected, bytes) = encode_archive(20, &blocks).unwrap();
+        assert!(expected.piece_sha256.len() > 1);
+        assert_eq!(write_archive(&path, 20, &blocks).unwrap(), expected);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(verify_archive(&path).unwrap(), expected);
+        let budget = crate::node_memory::MemoryBudget::new(1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let occupied = budget
+            .reserve_spool(budget.spool_snapshot().limit - MAX_CONTAINER_BYTES + 1)
+            .unwrap();
+        assert!(write_archive(&path, 20, &blocks).is_err());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "denial precedes destination truncation"
+        );
+        drop(occupied);
+        assert_eq!(write_archive(&path, 20, &blocks).unwrap(), expected);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "anonymous compression scratch is removed"
+        );
+        let mut limited = BoundedArchiveFile {
+            file: tempfile::tempfile().unwrap(),
+            remaining: 3,
+        };
+        limited.write_all(&[1, 2, 3]).unwrap();
+        assert!(limited.write_all(&[4]).is_err());
+        assert_eq!(limited.file.metadata().unwrap().len(), 3);
+    }
 
     #[test]
     fn bounded_archive_selection_checks_skipped_records_and_keeps_a_prefix() {

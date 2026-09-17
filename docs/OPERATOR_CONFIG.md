@@ -283,8 +283,11 @@ requesting applied undo copies) spool completed preparation to anonymous files
 beside the database path. MDBX temporary results stay outside the environment
 directory so its maintenance rename does not move them.
 `execution_spool_reservations` reports its shared 16 GiB logical disk allowance;
-this is independent of Header file admission and is not a physical whole-node
-disk quota. Encoding and decoding reserve from the node memory allowance.
+it also covers anonymous archive-compression scratch, admitted conservatively
+at the maximum archive-container size before compression. This is independent
+of Header file admission and is not a physical whole-node disk quota. Execution
+result encoding and decoding reserve from the node memory allowance; native
+archive codec buffers still require separate admission.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.
