@@ -23,7 +23,8 @@ not change acceptance statuses or weaken thresholds.
    also use disk history. A [shared node memory owner](node-memory-owner-20260917.md)
    now connects chainstate/Header caches and admission candidates with configurable
    startup preflight. [Locally computed batch transaction IDs](batch-transaction-id-memory-20260917.md)
-   now obtain and retain shared admission before hashing/allocation. The user-selected default is now 32 GiB;
+   now obtain and retain shared admission before hashing/allocation. [Deferred script payloads](deferred-script-memory-20260917.md)
+   retain preallocation admission through queueing, execution and cancellation. The user-selected default is now 32 GiB;
    [bounded coin queries](bounded-coin-reads-20260917.md) check scripts before
    copying in ordinary stores and mutable snapshot overlays.
    [Snapshot-base group queries](snapshot-group-streaming-20260917.md) now

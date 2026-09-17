@@ -63,12 +63,39 @@ pub(crate) struct DeferredScriptCheck<'a> {
     transaction: &'a bitcoin::Transaction,
     prevouts: Vec<Utxo>,
     script_flags: u32,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl DeferredScriptCheck<'_> {
     pub(crate) fn set_block_order(&mut self, block_order: usize) {
         self.block_order = block_order;
     }
+}
+
+// Reserve all deferred clones and serialized jobs before creating the checks.
+// A shared lease follows every check/job, including work already dequeued when
+// the producer is cancelled. Original prepared transactions are separate owners.
+pub(crate) fn deferred_script_memory(block: &Block) -> Option<u64> {
+    let checks = block.txdata.len().saturating_sub(1) as u64;
+    if checks == 0 {
+        return Some(0);
+    }
+    let mut bytes = checks.checked_mul(size_of::<DeferredScriptCheck<'_>>() as u64)?;
+    // Include group rounding and the producer's next empty 16-job vector.
+    bytes = bytes.checked_add(
+        checks
+            .checked_add(31)?
+            .checked_mul(size_of::<ScriptValidationJob>() as u64)?,
+    )?;
+    bytes = bytes.checked_add(128)?; // Shared lease and container bookkeeping.
+    for transaction in block.txdata.iter().skip(1) {
+        bytes = bytes.checked_add((transaction.total_size() as u64).checked_mul(3)?)?;
+        bytes =
+            bytes.checked_add((transaction.input.len() as u64).checked_mul(
+                size_of::<Utxo>() as u64 + crate::chainstate::MAX_SCRIPT_SIZE as u64,
+            )?)?;
+    }
+    Some(bytes)
 }
 
 const SCRIPT_VALIDATION_WORK_SIZE: usize = 16;
@@ -82,12 +109,14 @@ struct ScriptValidationJob {
     input_count: usize,
     prevouts: Vec<Utxo>,
     script_flags: u32,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 struct ScriptValidationWork {
     jobs: Vec<ScriptValidationJob>,
     result: mpsc::Sender<ScriptValidationResult>,
     cancelled: Arc<AtomicBool>,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl ScriptValidationWork {
@@ -157,6 +186,7 @@ fn execute_script_work(work: ScriptValidationWork) {
         jobs,
         result,
         cancelled,
+        memory: _memory,
     } = work;
     // The submitting batch keeps its own live sender, so a dropped result
     // channel never disconnects the receiver. An unwinding job would
@@ -219,6 +249,12 @@ impl DeferredScriptBatch {
     }
 
     pub(crate) fn submit(&mut self, checks: Vec<DeferredScriptCheck<'_>>) {
+        if checks.is_empty() {
+            return;
+        }
+        // Inline execution can finish the final job before the producer drops
+        // its empty replacement vector. Retain admission through that vector.
+        let _memory = checks.first().and_then(|check| check.memory.clone());
         let pool = script_validation_pool();
         self.queue = Some(Arc::clone(&pool.queue));
         let mut jobs = Vec::with_capacity(SCRIPT_VALIDATION_WORK_SIZE);
@@ -230,10 +266,12 @@ impl DeferredScriptBatch {
                 input_count: check.transaction.input.len(),
                 prevouts: check.prevouts,
                 script_flags: check.script_flags,
+                memory: check.memory,
             });
             if jobs.len() == SCRIPT_VALIDATION_WORK_SIZE {
                 self.work_items += 1;
                 pool.enqueue(ScriptValidationWork {
+                    memory: jobs.first().and_then(|job| job.memory.clone()),
                     jobs: std::mem::take(&mut jobs),
                     result: self.result.clone(),
                     cancelled: Arc::clone(&self.cancelled),
@@ -244,6 +282,7 @@ impl DeferredScriptBatch {
         if !jobs.is_empty() {
             self.work_items += 1;
             pool.enqueue(ScriptValidationWork {
+                memory: jobs.first().and_then(|job| job.memory.clone()),
                 jobs,
                 result: self.result.clone(),
                 cancelled: Arc::clone(&self.cancelled),
@@ -659,6 +698,7 @@ fn apply_prevalidated_block_with_deployments_inner<'a, S: UtxoStore>(
                         transaction: &block.txdata[index],
                         prevouts,
                         script_flags,
+                        memory: None,
                     });
                     let transaction = applied.last().expect("just pushed");
                     let transaction_fee = transaction
@@ -785,6 +825,7 @@ pub(crate) fn prepare_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>
     script_flags: u32,
     csv_active: bool,
     subsidy_sats: u64,
+    memory: Option<&Arc<crate::node_memory::MemoryLease>>,
     mut record: impl FnMut(&PreparedTransaction),
 ) -> Result<(PreparedBlock, Vec<DeferredScriptCheck<'a>>), BlockError> {
     if transaction_ids.len() != block.txdata.len() {
@@ -829,6 +870,7 @@ pub(crate) fn prepare_prevalidated_block_with_deferred_scripts<'a, S: UtxoStore>
                 transaction: &block.txdata[index],
                 prevouts: prepared.prevouts.clone(),
                 script_flags,
+                memory: memory.cloned(),
             });
             let transaction_fee = prepared
                 .validated
@@ -1584,6 +1626,7 @@ mod tests {
         };
         let (result, results) = mpsc::channel();
         pool.enqueue(ScriptValidationWork {
+            memory: None,
             jobs: vec![ScriptValidationJob {
                 index: 7,
                 block_order: 3,
@@ -1591,6 +1634,7 @@ mod tests {
                 input_count: 1,
                 prevouts: vec![],
                 script_flags: 0,
+                memory: None,
             }],
             result,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -1609,6 +1653,50 @@ mod tests {
     }
 
     #[test]
+    fn script_memory_follows_queued_and_dequeued_work_through_cancellation() {
+        for dequeue in [false, true] {
+            let memory = crate::node_memory::MemoryBudget::new(1024);
+            let lease = Arc::new(memory.reserve(1024).unwrap());
+            let queue = Arc::new(ScriptValidationQueue::new(4096));
+            let mut batch = DeferredScriptBatch::new();
+            batch.queue = Some(queue.clone());
+            let work = ScriptValidationWork {
+                jobs: vec![ScriptValidationJob {
+                    index: 0,
+                    block_order: 0,
+                    raw_transaction: vec![],
+                    input_count: 1,
+                    prevouts: vec![],
+                    script_flags: 0,
+                    memory: Some(lease.clone()),
+                }],
+                result: batch.result.clone(),
+                cancelled: batch.cancelled.clone(),
+                memory: Some(lease.clone()),
+            };
+            assert!(
+                queue
+                    .try_push(work, 1024, batch.cancelled.clone())
+                    .is_none()
+            );
+            drop(lease);
+            assert!(memory.reserve(1).is_err());
+            let running = dequeue.then(|| queue.pop());
+            drop(batch);
+            if let Some(work) = running {
+                assert_eq!(
+                    memory.snapshot().used,
+                    1024,
+                    "running work survives producer cancellation"
+                );
+                execute_script_work(work);
+            }
+            assert_eq!(memory.snapshot().used, 0);
+            assert!(memory.reserve(1024).is_ok());
+        }
+    }
+
+    #[test]
     fn upstream_dropping_a_batch_releases_pending_script_jobs() {
         let queue = Arc::new(ScriptValidationQueue::new(1_024));
         let mut batch = DeferredScriptBatch::new();
@@ -1618,6 +1706,7 @@ mod tests {
             queue
                 .try_push(
                     ScriptValidationWork {
+                        memory: None,
                         jobs: vec![],
                         result,
                         cancelled: batch.cancelled.clone(),

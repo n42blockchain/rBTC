@@ -1099,6 +1099,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             let next = &next_prepare;
             let prepared_slots = &prepared_slots;
             let spool = spool.as_ref();
+            let resources = execution_resources.as_ref();
             let versions = &versions;
             let cumulative = &cumulative;
             let tips = &tips;
@@ -1130,6 +1131,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         &deployments[index],
                         structure_prevalidated,
                         Some(transaction_ids[index].as_slice()),
+                        resources,
                     );
                     // Scripts go to the pool the moment a block is prepared,
                     // so the script workers run beside the rest of the
@@ -1366,6 +1368,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
     deployments: &BlockDeploymentContext,
     structure_prevalidated: bool,
     transaction_ids: Option<&[Txid]>,
+    resources: Option<&crate::execution_spool::ExecutionSpoolContext>,
 ) -> Result<
     (
         PreparedActiveBlock,
@@ -1428,6 +1431,17 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
             .collect::<Vec<_>>();
         computed_ids.as_slice()
     };
+    let script_memory = resources
+        .filter(|_| block.txdata.len() > 1)
+        .map(|resources| {
+            let bytes = crate::blockchain::deferred_script_memory(block)
+                .ok_or_else(|| memory_error("deferred script allocation estimate overflow"))?;
+            resources
+                .reserve_memory(bytes)
+                .map(Arc::new)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let (prepared, scripts) = prepare_prevalidated_block_with_deferred_scripts(
         &view,
         block,
@@ -1438,6 +1452,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         deployments.script_flags,
         deployments.csv_active,
         deployments.subsidy_sats,
+        script_memory.as_ref(),
         |transaction| view.record(transaction),
     )
     .map_err(BlockExecutionError::Block)?;
