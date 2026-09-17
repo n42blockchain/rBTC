@@ -92,6 +92,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [patch.crates-io]
+zstd-sys = { path = "vendor/zstd-sys" }
 bitcoinconsensus = { path = "vendor/bitcoinconsensus" }
 # Vendored to add a safe `copy_compact` binding for `mdbx_env_copy`, which
 # upstream 0.6.6 does not expose. Keeping the `unsafe` inside the dependency

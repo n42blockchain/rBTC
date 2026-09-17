@@ -79,13 +79,23 @@ pub enum ArchiveError {
     ResourceBudget(std::io::Error),
     /// Filesystem or compression I/O failure.
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     /// Metadata parse failure.
     #[error("manifest: {0}")]
     Manifest(#[from] serde_json::Error),
     /// Invalid immutable archive.
     #[error("invalid block archive: {0}")]
     Invalid(&'static str),
+}
+
+impl From<std::io::Error> for ArchiveError {
+    fn from(error: std::io::Error) -> Self {
+        if rbtc_codec_memory::is_admission_error(&error) {
+            Self::ResourceBudget(error)
+        } else {
+            Self::Io(error)
+        }
+    }
 }
 
 /// Immutable serialized block whose clones share payload and any admission.
@@ -466,7 +476,12 @@ pub fn write_archive(
         file: tempfile::tempfile_in(parent)?,
         remaining: MAX_CONTAINER_BYTES,
     };
-    let (temporary, records_sha256) = compress_archive(temporary, blocks, records_bytes)?;
+    let (temporary, records_sha256) = compress_archive(
+        temporary,
+        blocks,
+        records_bytes,
+        crate::node_memory::for_path(path)?,
+    )?;
     finish_archive_file(
         path,
         first_height,
@@ -539,6 +554,7 @@ pub fn encode_archive(
         Vec::with_capacity(compressed_capacity),
         blocks,
         records_bytes,
+        None,
     )?;
     let manifest: ArchiveManifest = ArchiveManifestFields {
         format_version: FORMAT_VERSION,
@@ -608,8 +624,9 @@ fn compress_archive<W: Write>(
     output: W,
     blocks: &[impl AsRef<[u8]>],
     records_bytes: u64,
+    memory: Option<crate::node_memory::MemoryBudget>,
 ) -> Result<(W, String), ArchiveError> {
-    let mut encoder = archive_encoder(output, records_bytes)?;
+    let mut encoder = archive_encoder(output, records_bytes, memory)?;
     let mut records_hash = Sha256::new();
     for block in blocks {
         let block = block.as_ref();
@@ -625,11 +642,45 @@ fn compress_archive<W: Write>(
     Ok((output, crate::utxo::hex_lower(&records_hash.finalize())))
 }
 
+struct NativeArchiveBudget(crate::node_memory::MemoryBudget);
+impl rbtc_codec_memory::AllocationBudget for NativeArchiveBudget {
+    type Lease = crate::node_memory::MemoryLease;
+    fn reserve(&self, bytes: usize) -> Option<Self::Lease> {
+        self.0.try_reserve(u64::try_from(bytes).ok()?)
+    }
+}
+enum ArchiveEncoder<W: Write> {
+    Unbound(zstd::stream::Encoder<'static, W>),
+    Admitted(rbtc_codec_memory::Encoder<W, NativeArchiveBudget>),
+}
+impl<W: Write> ArchiveEncoder<W> {
+    fn finish(self) -> Result<W, ArchiveError> {
+        match self {
+            Self::Unbound(encoder) => encoder.finish().map_err(Into::into),
+            Self::Admitted(encoder) => encoder.finish().map_err(Into::into),
+        }
+    }
+}
+impl<W: Write> Write for ArchiveEncoder<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Unbound(encoder) => encoder.write(bytes),
+            Self::Admitted(encoder) => encoder.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Unbound(encoder) => encoder.flush(),
+            Self::Admitted(encoder) => encoder.flush(),
+        }
+    }
+}
+
 fn archive_encoder<W: Write>(
     output: W,
     records_bytes: u64,
-) -> Result<zstd::stream::Encoder<'static, W>, ArchiveError> {
-    let mut encoder = zstd::stream::Encoder::new(output, ARCHIVE_COMPRESSION_LEVEL)?;
+    memory: Option<crate::node_memory::MemoryBudget>,
+) -> Result<ArchiveEncoder<W>, ArchiveError> {
     let useful_workers = usize::try_from(
         records_bytes
             .div_ceil(MIN_ARCHIVE_BYTES_PER_COMPRESSION_WORKER)
@@ -640,10 +691,24 @@ fn archive_encoder<W: Write>(
         .map_or(1, std::num::NonZero::get)
         .min(MAX_ARCHIVE_COMPRESSION_WORKERS)
         .min(useful_workers);
+    if let Some(memory) = memory {
+        let workers = if workers > 1 {
+            u32::try_from(workers).expect("bounded workers")
+        } else {
+            0
+        };
+        return Ok(ArchiveEncoder::Admitted(rbtc_codec_memory::Encoder::new(
+            output,
+            NativeArchiveBudget(memory),
+            ARCHIVE_COMPRESSION_LEVEL,
+            workers,
+        )?));
+    }
+    let mut encoder = zstd::stream::Encoder::new(output, ARCHIVE_COMPRESSION_LEVEL)?;
     if workers > 1 {
         encoder.multithread(u32::try_from(workers).expect("compression worker bound fits u32"))?;
     }
-    Ok(encoder)
+    Ok(ArchiveEncoder::Unbound(encoder))
 }
 
 /// Re-encodes a verified prefix without retaining the source blocks. The
@@ -678,7 +743,11 @@ pub(crate) fn write_archive_prefix(
         file: tempfile::tempfile_in(parent)?,
         remaining: MAX_CONTAINER_BYTES,
     };
-    let mut encoder = archive_encoder(temporary, records_bytes)?;
+    let mut encoder = archive_encoder(
+        temporary,
+        records_bytes,
+        crate::node_memory::for_path(destination)?,
+    )?;
     let mut digest = Sha256::new();
     let mut failure = None;
     visit_archive_prefix(source, expected, count, &mut |_, block| {
@@ -1415,6 +1484,128 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn native_encoder_accounts_workers_and_refunds_each_injected_allocation_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct FailingBudget {
+            memory: crate::node_memory::MemoryBudget,
+            attempts: Arc<AtomicUsize>,
+            fail_at: usize,
+        }
+        impl rbtc_codec_memory::AllocationBudget for FailingBudget {
+            type Lease = crate::node_memory::MemoryLease;
+            fn reserve(&self, bytes: usize) -> Option<Self::Lease> {
+                if self.attempts.fetch_add(1, Ordering::Relaxed) == self.fail_at {
+                    return None;
+                }
+                self.memory.try_reserve(u64::try_from(bytes).ok()?)
+            }
+        }
+        let mut input = vec![0; 1024 * 1024];
+        let mut random = 7_u32;
+        for byte in &mut input {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            *byte = random.to_le_bytes()[0];
+        }
+        for workers in [0, 2, 3, 4] {
+            let memory = crate::node_memory::MemoryBudget::new(256 * 1024 * 1024);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let run = |fail_at| -> std::io::Result<Vec<u8>> {
+                let budget = FailingBudget {
+                    memory: memory.clone(),
+                    attempts: attempts.clone(),
+                    fail_at,
+                };
+                let mut encoder = rbtc_codec_memory::Encoder::new(Vec::new(), budget, 1, workers)?;
+                for _ in 0..20 {
+                    encoder.write_all(&input)?;
+                }
+                encoder.finish()
+            };
+            let encoded = run(usize::MAX).unwrap();
+            let allocations = attempts.load(Ordering::Relaxed);
+            assert!(allocations > if workers == 0 { 3 } else { 10 });
+            assert!(memory.snapshot().peak > 1024 * 1024);
+            assert!(memory.snapshot().peak <= memory.snapshot().limit);
+            assert_eq!(memory.snapshot().used, 0);
+            let mut reference = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+            if workers != 0 {
+                reference.multithread(workers).unwrap();
+            }
+            for _ in 0..20 {
+                reference.write_all(&input).unwrap();
+            }
+            assert_eq!(encoded, reference.finish().unwrap());
+            assert_eq!(
+                zstd::decode_all(encoded.as_slice()).unwrap().len(),
+                20 * input.len()
+            );
+            // Fail each observed allocation position, including worker-pool and
+            // job-buffer construction. Scheduling may reorder later attempts.
+            for fail_at in 0..allocations {
+                attempts.store(0, Ordering::Relaxed);
+                match run(fail_at) {
+                    Err(error) => assert!(rbtc_codec_memory::is_admission_error(&error)),
+                    Ok(_) => assert!(attempts.load(Ordering::Relaxed) <= fail_at),
+                }
+                assert_eq!(
+                    memory.snapshot().used,
+                    0,
+                    "allocation {fail_at} leaked admission"
+                );
+            }
+        }
+        assert!(matches!(
+            ArchiveError::from(std::io::Error::other("ordinary writer failure")),
+            ArchiveError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn native_encoder_releases_admission_on_writer_failure_and_early_drop() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected output failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+        {
+            let mut encoder = rbtc_codec_memory::Encoder::new(
+                Vec::new(),
+                NativeArchiveBudget(memory.clone()),
+                1,
+                2,
+            )
+            .unwrap();
+            encoder.write_all(&vec![1; 1024 * 1024]).unwrap();
+            assert!(memory.snapshot().used > 0);
+        }
+        assert_eq!(memory.snapshot().used, 0);
+        let mut encoder = rbtc_codec_memory::Encoder::new(
+            FailingWriter,
+            NativeArchiveBudget(memory.clone()),
+            1,
+            2,
+        )
+        .unwrap();
+        let result = encoder
+            .write_all(&[1, 2, 3])
+            .and_then(|()| encoder.finish().map(|_| ()));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected output failure")
+        );
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[test]
     fn generated_manifest_admission_preserves_outputs_and_survives_prefix_aliases() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source.rblk");
@@ -1435,6 +1626,18 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
         drop(pressure);
         assert_eq!(budget.snapshot().used, 0);
+        // Metadata fits exactly; native encoder admission must fail as a
+        // local resource error without truncating the existing destination.
+        let pressure = budget.reserve(budget.snapshot().limit - peak).unwrap();
+        assert!(matches!(
+            write_archive(&target, 3, &[vec![9]]),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve this destination");
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - peak);
+        drop(pressure);
         let manifest = write_archive(&target, 3, &[vec![9]]).unwrap();
         assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
         let alias = manifest.clone();
@@ -1795,11 +1998,11 @@ mod tests {
         let path = dir.path().join("scratch.rblk");
         let manifest = write_archive(&path, 10, &[vec![3; 128]]).unwrap();
         let original = fs::read(&path).unwrap();
-        let metadata_peak = MANIFEST_MEMORY_BYTES + GENERATED_MANIFEST_BYTES as u64;
-        let budget =
-            crate::node_memory::MemoryBudget::new(PIECE_SCRATCH_BYTES as u64 + metadata_peak);
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
-        let occupied = budget.reserve(metadata_peak + 1).unwrap();
+        let occupied = budget
+            .reserve(budget.snapshot().limit - PIECE_SCRATCH_BYTES as u64 + 1)
+            .unwrap();
         assert!(matches!(
             verify_archive(&path),
             Err(ArchiveError::ResourceBudget(_))
@@ -1811,8 +2014,11 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(budget.spool_snapshot().used, 0);
         drop(occupied);
+        let occupied = budget
+            .reserve(budget.snapshot().limit - PIECE_SCRATCH_BYTES as u64)
+            .unwrap();
         let mut scratch = PieceScratch::new(&path).unwrap();
-        assert_eq!(budget.snapshot().used, PIECE_SCRATCH_BYTES as u64);
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit);
         assert!(matches!(
             PieceScratch::new(&path),
             Err(ArchiveError::ResourceBudget(_))
@@ -1829,6 +2035,7 @@ mod tests {
         );
         assert_eq!(scratch.next_hash(&mut input).unwrap(), None);
         drop(scratch);
+        drop(occupied);
         assert_eq!(budget.snapshot().used, 0);
         assert_eq!(verify_archive(&path).unwrap(), manifest);
         assert_eq!(write_archive(&path, 10, &[vec![3; 128]]).unwrap(), manifest);
@@ -1887,7 +2094,7 @@ mod tests {
         assert_eq!(write_archive(&path, 20, &blocks).unwrap(), expected);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(verify_archive(&path).unwrap(), expected);
-        let budget = crate::node_memory::MemoryBudget::new(128 * 1024);
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let occupied = budget
             .reserve_spool(budget.spool_snapshot().limit - MAX_CONTAINER_BYTES + 1)

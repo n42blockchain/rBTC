@@ -128,6 +128,7 @@ members = ["."]
 # not propagate here. Fuzz targets must exercise the same audited interpreter
 # ABI and crash-hardened storage implementation as the production crate.
 [patch.crates-io]
+zstd-sys = { path = "../vendor/zstd-sys" }
 bitcoinconsensus = { path = "../vendor/bitcoinconsensus" }
 redb = { path = "../vendor/redb" }
 libmdbx = { path = "../vendor/libmdbx" }

@@ -62,19 +62,24 @@ impl MemoryBudget {
     }
     /// Reserves before allocation; the returned lease follows its actual owner.
     pub fn reserve(&self, bytes: u64) -> io::Result<MemoryLease> {
+        self.try_reserve(bytes)
+            .ok_or_else(|| io::Error::other("node memory reservation allowance exhausted"))
+    }
+
+    // Native allocator callbacks must not allocate an error merely to reject
+    // another allocation. The successful permit is stored in preadmitted slots.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Option<MemoryLease> {
         let mut usage = self
             .0
             .usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if bytes > self.0.limit.saturating_sub(usage.used) {
-            return Err(io::Error::other(
-                "node memory reservation allowance exhausted",
-            ));
+            return None;
         }
         usage.used += bytes;
         usage.peak = usage.peak.max(usage.used);
-        Ok(MemoryLease {
+        Some(MemoryLease {
             budget: self.clone(),
             bytes,
         })

@@ -293,7 +293,11 @@ payloads and handle arrays retain reservations through shared clones and node
 replay staging. File manifest parsing reserves temporary scratch and bounded
 immutable metadata that stays charged through its last alias. File writers
 admit result metadata and fixed JSON/piece scratch before compression as well.
-Multithreaded archive compression, newly serialized network payloads and other node batch objects still need admission.
+Node-bound archive encoders admit each native heap allocation (including worker
+contexts), a fixed tracking table and their Rust output buffer. The pinned
+vendored codec includes allocation-failure cleanup fixes; system zstd overrides
+are rejected. OS worker stacks, allocator overhead, newly serialized network
+payloads and other node batch objects still need accounting.
 These reservation limits do not establish a whole-node RSS ceiling.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and

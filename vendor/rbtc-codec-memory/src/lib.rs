@@ -1,4 +1,4 @@
-//! Allocation-free estimates from the exact native codec used by the node.
+//! Budgeted encoding and allocation-free decoder estimates for the node codec.
 
 /// Native streaming decoder allowance, without dictionaries, for a bounded
 /// 8–128 MiB maximum window. This does not include the Rust input buffer.
@@ -15,3 +15,6 @@ pub fn decoder_bytes(window_log: u32) -> Option<usize> {
         Some(bytes)
     }
 }
+
+mod encoder;
+pub use encoder::{AllocationBudget, Encoder, is_admission_error};
