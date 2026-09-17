@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -606,9 +606,7 @@ impl PrunedBlockLedger {
                 )
             })?;
         } else if manifest.first_height.checked_add(block_count) == retained_next {
-            let (_, blocks) = read_archive(self.staged_path())?;
-            let count = usize::try_from(block_count).expect("staged block count fits usize");
-            if !self.retained_bytes_match(&index, manifest.first_height, &blocks[..count])? {
+            if !self.retained_bytes_match(&index, &manifest, block_count)? {
                 return Err(LedgerError::Invalid(
                     "staged segment does not extend ledger tip",
                 ));
@@ -1340,21 +1338,100 @@ impl PrunedBlockLedger {
     fn retained_bytes_match(
         &self,
         index: &LedgerIndex,
-        first_height: u32,
-        expected: &[Vec<u8>],
+        expected: &ArchiveManifest,
+        count: u32,
     ) -> Result<bool, LedgerError> {
-        for (offset, expected) in expected.iter().enumerate() {
-            let height = first_height
-                .checked_add(u32::try_from(offset).expect("staged block offset fits u32"))
-                .ok_or(LedgerError::Invalid("height overflow"))?;
-            let Some(actual) = self.read_block_from_index(index, height)? else {
-                return Ok(false);
-            };
-            if actual != *expected {
+        if count == 0 || count > expected.block_count {
+            return Err(LedgerError::Invalid("invalid staged comparison count"));
+        }
+        let _spool = crate::node_memory::for_path(&self.staged_path())?
+            .map(|budget| budget.reserve_spool(crate::archive::MAX_RECORDS_BYTES))
+            .transpose()?;
+        let mut records = tempfile::tempfile_in(&self.root)?;
+        let mut failure = None;
+        crate::archive::visit_archive_prefix(
+            self.staged_path(),
+            expected,
+            count,
+            &mut |_, raw| {
+                let length = u32::try_from(raw.len())
+                    .expect("verified block size")
+                    .to_le_bytes();
+                if let Err(error) = records
+                    .write_all(&length)
+                    .and_then(|()| records.write_all(raw))
+                {
+                    failure = Some(error);
+                    return false;
+                }
+                true
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error.into());
+        }
+        // The scanner rejects more than MAX_RECORDS_BYTES before invoking a
+        // callback, so this scratch file cannot exceed its pre-admitted bound.
+        records.seek(SeekFrom::Start(0))?;
+        let last = expected
+            .first_height
+            .checked_add(count - 1)
+            .ok_or(LedgerError::Invalid("height overflow"))?;
+        let mut matched = 0_u32;
+        let mut same = true;
+        let mut scratch = vec![0_u8; 64 * 1024].into_boxed_slice();
+        for segment in &index.segments {
+            if segment_end_inclusive(segment)? < expected.first_height
+                || segment.first_height > last
+            {
+                continue;
+            }
+            let path = self.slot_path(segment.slot);
+            let manifest = read_archive_manifest(&path)?;
+            if manifest.first_height != segment.first_height
+                || manifest.block_count != segment.block_count
+            {
+                return Err(LedgerError::Invalid("archive does not match ledger index"));
+            }
+            crate::archive::visit_archive_prefix(
+                &path,
+                &manifest,
+                manifest.block_count,
+                &mut |height, raw| {
+                    if height < expected.first_height {
+                        return true;
+                    }
+                    if height > last {
+                        return false;
+                    }
+                    if expected.first_height.checked_add(matched) != Some(height) {
+                        same = false;
+                        return false;
+                    }
+                    match compare_spooled_record(&mut records, raw, &mut scratch) {
+                        Ok(true) => {
+                            matched += 1;
+                            true
+                        }
+                        Ok(false) => {
+                            same = false;
+                            false
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            false
+                        }
+                    }
+                },
+            )?;
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
+            if !same {
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(matched == count)
     }
 
     fn read_block_from_index(
@@ -1369,20 +1446,44 @@ impl PrunedBlockLedger {
         else {
             return Ok(None);
         };
-        let (manifest, blocks) = read_archive(self.slot_path(segment.slot))?;
+        let (manifest, blocks) = crate::archive::read_archive_batch(
+            self.slot_path(segment.slot),
+            height,
+            1,
+            crate::archive::MAX_RECORDS_BYTES,
+        )?;
         if manifest.first_height != segment.first_height
             || manifest.block_count != segment.block_count
         {
             return Err(LedgerError::Invalid("archive does not match ledger index"));
         }
-        let offset = usize::try_from(height - segment.first_height)
-            .expect("archive block offset fits usize");
         blocks
-            .get(offset)
-            .cloned()
+            .into_iter()
+            .next()
             .map(Some)
             .ok_or(LedgerError::Invalid("archive block missing"))
     }
+}
+
+// Compare framing and bytes directly; no per-record hashes or large decoded
+// comparison buffer substitute for the original byte equality check.
+fn compare_spooled_record(
+    records: &mut File,
+    actual: &[u8],
+    scratch: &mut [u8],
+) -> io::Result<bool> {
+    let mut length = [0_u8; 4];
+    records.read_exact(&mut length)?;
+    if u32::from_le_bytes(length) as usize != actual.len() {
+        return Ok(false);
+    }
+    for chunk in actual.chunks(scratch.len()) {
+        records.read_exact(&mut scratch[..chunk.len()])?;
+        if &scratch[..chunk.len()] != chunk {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_read_only_plan_index(
@@ -2749,6 +2850,51 @@ mod tests {
         assert!(ledger.retained_tip().unwrap().is_none());
         ledger.commit_staged(1).unwrap();
         assert_eq!(ledger.read_block(10).unwrap(), Some(vec![99]));
+    }
+
+    #[test]
+    fn published_prefix_comparison_streams_across_slots_and_preserves_failed_stage() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        let first = vec![1; 70_000];
+        let second = vec![2; 80_000];
+        let third = vec![3; 90_000];
+        ledger.append(10, &[vec![0], first.clone()]).unwrap();
+        ledger.append(12, &[second.clone(), third.clone()]).unwrap();
+        let blocks = [first, second, third, vec![4]];
+        ledger.stage(11, &blocks).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
+        assert!(ledger.commit_staged(3).is_err());
+        assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+        assert_eq!(ledger.retained_tip().unwrap(), Some(13));
+        drop(pressure);
+        ledger.commit_staged(3).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(ledger.read_block(12).unwrap(), Some(blocks[1].clone()));
+        for change_length in [false, true] {
+            let mut wrong = blocks.clone();
+            if change_length {
+                wrong[1].push(7);
+            } else {
+                wrong[1][70_000] ^= 1;
+            }
+            ledger.stage(11, &wrong).unwrap();
+            let identity = ledger.staged_manifest().unwrap().unwrap();
+            assert!(matches!(
+                ledger.commit_staged(3),
+                Err(LedgerError::Invalid(
+                    "staged segment does not extend ledger tip"
+                ))
+            ));
+            assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+            assert_eq!(ledger.retained_tip().unwrap(), Some(13));
+            assert_eq!(budget.spool_snapshot().used, 0);
+            ledger.discard_staged().unwrap();
+        }
     }
 
     #[test]

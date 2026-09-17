@@ -18,7 +18,7 @@ const PIECE_SIZE: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_SIZE: usize = 16 * 1024 * 1024;
 const MAX_BLOCK_BYTES: usize = 4_000_000;
 const MAX_BLOCKS_PER_ARCHIVE: u32 = 100_000;
-const MAX_RECORDS_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_RECORDS_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_CONTAINER_BYTES: u64 = MAX_RECORDS_BYTES + MAX_MANIFEST_SIZE as u64 + 12;
 const MAX_PIECES: usize = 261;
 // Ledger segments are produced on the IBD hot path and retained only inside a
