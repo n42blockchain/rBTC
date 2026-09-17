@@ -271,7 +271,7 @@ impl ArchiveBlocksBuilder {
 
 /// Sidecar-equivalent data needed by a BitTorrent/webseed transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ArchiveManifest {
+pub struct ArchiveManifestFields {
     /// Container format version.
     pub format_version: u16,
     /// First block height in this archive.
@@ -282,11 +282,123 @@ pub struct ArchiveManifest {
     #[serde(default)]
     pub records_bytes: u64,
     /// Hash of the uncompressed frame stream.
+    #[serde(deserialize_with = "deserialize_digest")]
     pub records_sha256: String,
     /// Fixed transfer piece size.
     pub piece_size: usize,
     /// SHA-256 digest of each compressed transfer piece.
+    #[serde(deserialize_with = "deserialize_pieces")]
     pub piece_sha256: Vec<String>,
+}
+
+/// Immutable archive identity; clones share metadata and its admission owner.
+#[derive(Clone, Debug)]
+pub struct ArchiveManifest(Arc<ManifestStorage>);
+#[derive(Debug)]
+struct ManifestStorage {
+    fields: ArchiveManifestFields,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+impl ArchiveManifest {
+    fn admitted(
+        fields: ArchiveManifestFields,
+        reservation: Option<crate::node_memory::MemoryLease>,
+    ) -> Self {
+        Self(Arc::new(ManifestStorage {
+            fields,
+            _reservation: reservation,
+        }))
+    }
+    #[cfg(test)]
+    fn fields_mut(&mut self) -> &mut ArchiveManifestFields {
+        *self = self.0.fields.clone().into();
+        &mut Arc::get_mut(&mut self.0).unwrap().fields
+    }
+}
+impl From<ArchiveManifestFields> for ArchiveManifest {
+    /// Wraps caller-owned fields without admitting their existing allocations.
+    fn from(fields: ArchiveManifestFields) -> Self {
+        Self::admitted(fields, None)
+    }
+}
+impl std::ops::Deref for ArchiveManifest {
+    type Target = ArchiveManifestFields;
+    fn deref(&self) -> &Self::Target {
+        &self.0.fields
+    }
+}
+impl PartialEq for ArchiveManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.fields == other.0.fields
+    }
+}
+impl Eq for ArchiveManifest {}
+impl Serialize for ArchiveManifest {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.fields.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for ArchiveManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ArchiveManifestFields::deserialize(deserializer).map(Into::into)
+    }
+}
+// Fixed result capacity, separate from the JSON parser's temporary scratch.
+const MANIFEST_MEMORY_BYTES: u64 = (std::mem::size_of::<ManifestStorage>()
+    + 2 * std::mem::size_of::<usize>()
+    + MAX_PIECES * (std::mem::size_of::<String>() + 64)
+    + 64) as u64;
+fn deserialize_digest<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    struct DigestVisitor;
+    impl serde::de::Visitor<'_> for DigestVisitor {
+        type Value = String;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a digest no longer than 64 bytes")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
+            if value.len() > 64 {
+                return Err(E::custom("archive digest too long"));
+            }
+            Ok(value.to_owned())
+        }
+    }
+    deserializer.deserialize_str(DigestVisitor)
+}
+fn deserialize_pieces<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    struct BoundedDigest(String);
+    impl<'de> Deserialize<'de> for BoundedDigest {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserialize_digest(deserializer).map(Self)
+        }
+    }
+    struct PiecesVisitor;
+    impl<'de> serde::de::Visitor<'de> for PiecesVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded archive piece list")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut pieces = Vec::with_capacity(MAX_PIECES);
+            while pieces.len() < MAX_PIECES {
+                let Some(BoundedDigest(digest)) = sequence.next_element()? else {
+                    return Ok(pieces);
+                };
+                pieces.push(digest);
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("too many archive pieces"));
+            }
+            Ok(pieces)
+        }
+    }
+    deserializer.deserialize_seq(PiecesVisitor)
 }
 
 /// Creates a zstd archive whose compressed bytes can be safely piece-verified before import.
@@ -337,7 +449,7 @@ fn finish_archive_file(
     while let Some(hash) = scratch.next_hash(&mut compressed)? {
         piece_sha256.push(hash);
     }
-    let manifest = ArchiveManifest {
+    let manifest: ArchiveManifest = ArchiveManifestFields {
         format_version: FORMAT_VERSION,
         first_height,
         block_count,
@@ -345,7 +457,8 @@ fn finish_archive_file(
         records_sha256,
         piece_size: PIECE_SIZE,
         piece_sha256,
-    };
+    }
+    .into();
     let metadata = serde_json::to_vec(&manifest)?;
     let compressed_bytes = compressed.metadata()?.len();
     if 12 + metadata.len() as u64 + compressed_bytes > MAX_CONTAINER_BYTES {
@@ -377,7 +490,7 @@ pub fn encode_archive(
         blocks,
         records_bytes,
     )?;
-    let manifest = ArchiveManifest {
+    let manifest: ArchiveManifest = ArchiveManifestFields {
         format_version: FORMAT_VERSION,
         first_height,
         block_count: u32::try_from(blocks.len())
@@ -386,7 +499,8 @@ pub fn encode_archive(
         records_sha256,
         piece_size: PIECE_SIZE,
         piece_sha256: compressed.chunks(PIECE_SIZE).map(hash_hex).collect(),
-    };
+    }
+    .into();
     let metadata = serde_json::to_vec(&manifest)?;
     let metadata_len =
         u32::try_from(metadata.len()).map_err(|_| ArchiveError::Invalid("manifest too large"))?;
@@ -619,7 +733,7 @@ fn scan_archive_selection(
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
     }
-    let (manifest, records_limit, payload_offset) = read_manifest_header_from(&mut file)?;
+    let (manifest, records_limit, payload_offset) = read_manifest_header_from(path, &mut file)?;
     if expected.is_some_and(|expected| expected != &manifest) {
         return Err(ArchiveError::Invalid("archive identity changed"));
     }
@@ -771,7 +885,7 @@ pub(crate) fn verify_archive(path: impl AsRef<Path>) -> Result<ArchiveManifest, 
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
     }
-    let (manifest, _, payload_offset) = read_manifest_header_from(&mut file)?;
+    let (manifest, _, payload_offset) = read_manifest_header_from(path, &mut file)?;
     verify_compressed_pieces_from(path, &mut file, payload_offset, &manifest)?;
     Ok(manifest)
 }
@@ -881,10 +995,13 @@ fn map_record_read_error(error: std::io::Error, field: &'static str) -> ArchiveE
 
 fn read_manifest_header(path: &Path) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
     let mut file = File::open(path)?;
-    read_manifest_header_from(&mut file)
+    read_manifest_header_from(path, &mut file)
 }
 
-fn read_manifest_header_from(file: &mut File) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
+fn read_manifest_header_from(
+    path: &Path,
+    file: &mut File,
+) -> Result<(ArchiveManifest, u64, u64), ArchiveError> {
     file.seek(SeekFrom::Start(0))?;
     let mut header = [0_u8; 12];
     file.read_exact(&mut header)?;
@@ -898,9 +1015,14 @@ fn read_manifest_header_from(file: &mut File) -> Result<(ArchiveManifest, u64, u
     if metadata_len == 0 || metadata_len > MAX_MANIFEST_SIZE {
         return Err(ArchiveError::Invalid("manifest length"));
     }
+    // Source bytes, parser scratch and bounded error formatting, including
+    // old/new growth overlap. This is conservative, not an RSS estimate.
+    let _parse_reservation = reserve_archive_memory(path, 8 * metadata_len as u64 + 64 * 1024)?;
+    let result_reservation = reserve_archive_memory(path, MANIFEST_MEMORY_BYTES)?;
     let mut metadata = vec![0_u8; metadata_len];
     file.read_exact(&mut metadata)?;
-    let manifest: ArchiveManifest = serde_json::from_slice(&metadata)?;
+    let fields: ArchiveManifestFields = serde_json::from_slice(&metadata)?;
+    let manifest = ArchiveManifest::admitted(fields, result_reservation);
     let records_limit = validate_manifest(&manifest)?;
     let payload_offset = 12_u64
         .checked_add(u64::try_from(metadata_len).expect("manifest length fits u64"))
@@ -1113,24 +1235,7 @@ fn verify_archive_container(file: &[u8]) -> Result<(ArchiveManifest, u64, &[u8])
 /// This is used to reconstruct a rotating ledger index after interruption;
 /// full piece and record verification still occurs when block bytes are read.
 pub fn read_archive_manifest(path: impl AsRef<Path>) -> Result<ArchiveManifest, ArchiveError> {
-    let mut file = fs::File::open(path)?;
-    let mut header = [0_u8; 12];
-    file.read_exact(&mut header)?;
-    if &header[..8] != MAGIC {
-        return Err(ArchiveError::Invalid("magic"));
-    }
-    let metadata_len = usize::try_from(u32::from_le_bytes(
-        header[8..12].try_into().expect("fixed manifest header"),
-    ))
-    .expect("u32 fits usize");
-    if metadata_len > MAX_MANIFEST_SIZE {
-        return Err(ArchiveError::Invalid("manifest too large"));
-    }
-    let mut metadata = vec![0_u8; metadata_len];
-    file.read_exact(&mut metadata)?;
-    let manifest: ArchiveManifest = serde_json::from_slice(&metadata)?;
-    validate_manifest(&manifest)?;
-    Ok(manifest)
+    read_manifest_header(path.as_ref()).map(|(manifest, _, _)| manifest)
 }
 
 fn validate_manifest(manifest: &ArchiveManifest) -> Result<u64, ArchiveError> {
@@ -1258,6 +1363,85 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn file_manifest_admission_survives_aliases_and_preserves_wire_identity() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("manifest.rblk");
+        let expected = write_archive(&path, 1, &[vec![4; 30]]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let json_bytes = u64::from(u32::from_le_bytes(original[8..12].try_into().unwrap()));
+        let peak = 8 * json_bytes + 64 * 1024 + MANIFEST_MEMORY_BYTES;
+        let budget = crate::node_memory::MemoryBudget::new(peak);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(1).unwrap();
+        assert!(matches!(
+            read_archive_manifest(&path),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(budget.snapshot().used, 1);
+        drop(pressure);
+        let manifest = read_archive_manifest(&path).unwrap();
+        assert_eq!(manifest, expected);
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        let alias = manifest.clone();
+        assert_eq!(
+            manifest.records_sha256.as_ptr(),
+            alias.records_sha256.as_ptr()
+        );
+        assert_eq!(manifest.piece_sha256.as_ptr(), alias.piece_sha256.as_ptr());
+        assert_eq!(
+            serde_json::to_vec(&manifest).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        drop(manifest);
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        drop(alias);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn manifest_parser_bounds_digest_outputs_and_piece_arrays_before_validation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("malicious.rblk");
+        let manifest = write_archive(&path, 1, &[vec![4]]).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let valid = serde_json::to_value(&manifest).unwrap();
+        let mut excessive_pieces = valid.clone();
+        excessive_pieces["piece_sha256"] = serde_json::json!(vec!["00".repeat(32); MAX_PIECES + 1]);
+        let mut excessive_digest = valid.clone();
+        excessive_digest["records_sha256"] = serde_json::json!("0".repeat(128 * 1024));
+        for (value, reason) in [
+            (excessive_pieces, "too many archive pieces"),
+            (excessive_digest, "archive digest too long"),
+        ] {
+            let metadata = serde_json::to_vec(&value).unwrap();
+            let mut bytes = MAGIC.to_vec();
+            bytes.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(&metadata);
+            fs::write(&path, bytes).unwrap();
+            let error = read_archive_manifest(&path).unwrap_err();
+            assert!(matches!(error, ArchiveError::Manifest(_)));
+            assert!(error.to_string().contains(reason));
+            assert_eq!(budget.snapshot().used, 0);
+        }
+        let metadata = serde_json::to_string(&valid).unwrap();
+        let escaped = metadata.replace(&manifest.records_sha256, &"\\u0030".repeat(64));
+        let decoded: ArchiveManifest = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(decoded.records_sha256, "0".repeat(64));
+        // Oversized declared input is rejected by admission before any missing
+        // JSON bytes are read or allocated.
+        let mut header = MAGIC.to_vec();
+        header.extend_from_slice(&u32::try_from(MAX_MANIFEST_SIZE).unwrap().to_le_bytes());
+        fs::write(&path, header).unwrap();
+        assert!(matches!(
+            read_archive_manifest(&path),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
     fn handle_storage_is_admitted_shared_and_retained_by_partial_iterators() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("handles.rblk");
@@ -1303,7 +1487,7 @@ mod tests {
         let native = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
         let payload = ArchiveBlock::allocation_bytes(data.len());
         let handles = ArchiveBlocksBuilder::allocation_bytes(1).unwrap();
-        let limit = native + 64 * 1024 + payload + handles;
+        let limit = native + 64 * 1024 + payload + handles + MANIFEST_MEMORY_BYTES;
         let budget = crate::node_memory::MemoryBudget::new(limit);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve(1).unwrap();
@@ -1342,16 +1526,21 @@ mod tests {
         let manifest = write_archive(&path, 1, &[vec![7; 70_000], vec![8; 80_000]]).unwrap();
         let original = fs::read(&path).unwrap();
         let native = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
-        let limit = native + 64 * 1024 + 70_000;
+        let limit = native + 64 * 1024 + 70_000 + MANIFEST_MEMORY_BYTES;
         let budget = crate::node_memory::MemoryBudget::new(limit);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         // Native context fits, but the scan buffer cannot be allocated.
-        let pressure = budget.reserve(limit - native).unwrap();
+        let pressure = budget
+            .reserve(limit - native - MANIFEST_MEMORY_BYTES)
+            .unwrap();
         assert!(matches!(
             verify_archive_streaming(&path),
             Err(ArchiveError::ResourceBudget(_))
         ));
-        assert_eq!(budget.snapshot().used, limit - native);
+        assert_eq!(
+            budget.snapshot().used,
+            limit - native - MANIFEST_MEMORY_BYTES
+        );
         drop(pressure);
         // Scan buffer fits, but the first callback payload misses by one byte.
         let pressure = budget.reserve(1).unwrap();
@@ -1397,7 +1586,7 @@ mod tests {
         assert!(rbtc_codec_memory::decoder_bytes(28).is_none());
         let payload_allowance = ArchiveBlock::allocation_bytes(512 * 1024);
         let handles = ArchiveBlocksBuilder::allocation_bytes(1).unwrap();
-        let total = allowance + 64 * 1024 + payload_allowance + handles;
+        let total = allowance + 64 * 1024 + payload_allowance + handles + MANIFEST_MEMORY_BYTES;
         let budget = crate::node_memory::MemoryBudget::new(total);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve(total - allowance + 1).unwrap();
@@ -1415,7 +1604,10 @@ mod tests {
             visit_archive_prefix(&path, &manifest, 1, &mut |_, raw| {
                 calls += 1;
                 assert_eq!(raw.len(), 512 * 1024);
-                assert_eq!(budget.snapshot().used, allowance + 64 * 1024 + 512 * 1024);
+                assert_eq!(
+                    budget.snapshot().used,
+                    allowance + 64 * 1024 + 512 * 1024 + MANIFEST_MEMORY_BYTES
+                );
                 assert!(
                     budget
                         .reserve(payload_allowance - 512 * 1024 + handles + 1)
@@ -1465,9 +1657,12 @@ mod tests {
         let path = dir.path().join("scratch.rblk");
         let manifest = write_archive(&path, 10, &[vec![3; 128]]).unwrap();
         let original = fs::read(&path).unwrap();
-        let budget = crate::node_memory::MemoryBudget::new(PIECE_SCRATCH_BYTES as u64);
+        let json_bytes = u64::from(u32::from_le_bytes(original[8..12].try_into().unwrap()));
+        let metadata_peak = MANIFEST_MEMORY_BYTES + 8 * json_bytes;
+        let budget =
+            crate::node_memory::MemoryBudget::new(PIECE_SCRATCH_BYTES as u64 + metadata_peak);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
-        let occupied = budget.reserve(1).unwrap();
+        let occupied = budget.reserve(metadata_peak + 1).unwrap();
         assert!(matches!(
             verify_archive(&path),
             Err(ArchiveError::ResourceBudget(_))
@@ -1620,7 +1815,7 @@ mod tests {
         );
         assert_eq!(visited, vec![(10, 1), (11, 256 * 1024), (12, 1)]);
         let mut invalid = manifest.clone();
-        invalid.records_sha256 = "00".repeat(32);
+        invalid.fields_mut().records_sha256 = "00".repeat(32);
         let metadata = serde_json::to_vec(&invalid).unwrap();
         let mut changed = MAGIC.to_vec();
         changed.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
@@ -1738,7 +1933,7 @@ mod tests {
         let payload_offset = 12 + metadata_len;
         let mut manifest: ArchiveManifest =
             serde_json::from_slice(&bytes[12..payload_offset]).unwrap();
-        manifest.records_bytes = 4;
+        manifest.fields_mut().records_bytes = 4;
         let metadata = serde_json::to_vec(&manifest).unwrap();
         let mut bounded = Vec::new();
         bounded.extend_from_slice(MAGIC);
@@ -1786,8 +1981,8 @@ mod tests {
         let payload_offset = 12 + metadata_len;
         let mut manifest: ArchiveManifest =
             serde_json::from_slice(&bytes[12..payload_offset]).unwrap();
-        manifest.format_version = LEGACY_FORMAT_VERSION;
-        manifest.records_bytes = 0;
+        manifest.fields_mut().format_version = LEGACY_FORMAT_VERSION;
+        manifest.fields_mut().records_bytes = 0;
         let metadata = serde_json::to_vec(&manifest).unwrap();
         let mut legacy = Vec::new();
         legacy.extend_from_slice(MAGIC);
@@ -1805,7 +2000,7 @@ mod tests {
         encoder.include_contentsize(false).unwrap();
         encoder.write_all(&records).unwrap();
         let compressed = encoder.finish().unwrap();
-        let manifest = ArchiveManifest {
+        let manifest: ArchiveManifest = ArchiveManifestFields {
             format_version: FORMAT_VERSION,
             first_height: 1,
             block_count: 1,
@@ -1813,7 +2008,8 @@ mod tests {
             records_sha256: hash_hex(&records),
             piece_size: PIECE_SIZE,
             piece_sha256: vec![hash_hex(&compressed)],
-        };
+        }
+        .into();
         let metadata = serde_json::to_vec(&manifest).unwrap();
         let mut archive = Vec::new();
         archive.extend_from_slice(MAGIC);

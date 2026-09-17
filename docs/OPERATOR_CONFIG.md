@@ -290,8 +290,9 @@ result encoding and decoding reserve from the node memory allowance. File archiv
 decoders reserve their bounded native context and Rust input buffer before
 creation. Piece hashing and record scans reserve scratch; returned archive
 payloads and handle arrays retain reservations through shared clones and node
-replay staging. Multithreaded archive compression, manifest metadata, newly
-serialized network payloads and other node batch objects still need admission.
+replay staging. File manifest parsing reserves temporary scratch and bounded
+immutable metadata that stays charged through its last alias. Multithreaded
+archive compression, generated writer metadata, newly serialized network payloads and other node batch objects still need admission.
 These reservation limits do not establish a whole-node RSS ceiling.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
