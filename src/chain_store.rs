@@ -467,7 +467,13 @@ impl LeasedConnectTransition {
         transition: ConnectTransition,
         reservation: crate::node_memory::MemoryLease,
     ) -> Self {
-        let reservation = Arc::new(reservation);
+        Self::with_shared_reservation(transition, Arc::new(reservation))
+    }
+
+    pub(crate) fn with_shared_reservation(
+        transition: ConnectTransition,
+        reservation: Arc<crate::node_memory::MemoryLease>,
+    ) -> Self {
         for undo in &transition.transaction_undos {
             undo.retain_memory(Arc::clone(&reservation));
         }

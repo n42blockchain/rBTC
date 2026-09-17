@@ -25,7 +25,8 @@ not change acceptance statuses or weaken thresholds.
    startup preflight. [Locally computed batch transaction IDs](batch-transaction-id-memory-20260917.md)
    now obtain and retain shared admission before hashing/allocation. [Deferred script payloads](deferred-script-memory-20260917.md)
    retain preallocation admission through queueing, execution and cancellation. [Immutable undo ownership](undo-shared-ownership-20260917.md)
-   now shares payloads and retains existing admission through escaped undo handles. The user-selected default is now 32 GiB;
+   now shares payloads and retains existing admission through escaped undo handles. [Original block preparation](block-preparation-memory-20260917.md)
+   now reserves before worker payload allocation and transfers ownership through net changes and undo. The user-selected default is now 32 GiB;
    [bounded coin queries](bounded-coin-reads-20260917.md) check scripts before
    copying in ordinary stores and mutable snapshot overlays.
    [Snapshot-base group queries](snapshot-group-streaming-20260917.md) now

@@ -1315,7 +1315,14 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             };
             applied_blocks.push(applied);
             apply_elapsed += apply_started.elapsed();
-            Ok(transition.into())
+            Ok(match changes.memory {
+                Some(memory) => {
+                    crate::chain_store::LeasedConnectTransition::with_shared_reservation(
+                        transition, memory,
+                    )
+                }
+                None => transition.into(),
+            })
         });
     let commit_started = Instant::now();
     chainstate.commit_connect_batch_stream(&mut transitions, tips.last().copied())?;
@@ -1353,6 +1360,36 @@ fn validate_active_block<S: UtxoStore>(
         crate::validation_profile::add(crate::validation_profile::NET, net_started.elapsed());
         Ok((applied, changes))
     })
+}
+
+// Admission for original preparation and its net/undo conversion. Hash table
+// rounding/growth, read-result overlap and vector relocation are conservative;
+// deferred script copies have a separate lease. Canonical input scripts are
+// bounded by the execution read contract, including overwritten BIP30 coins.
+fn preparation_memory(block: &Block) -> Option<u64> {
+    let mut bytes = 4096_u64;
+    let key = size_of::<OutPointKey>() as u64;
+    let coin = size_of::<Utxo>() as u64;
+    let hash = 8 * (key + size_of::<Option<Utxo>>() as u64 + 1) + 8 * (key + 1);
+    for transaction in &block.txdata {
+        bytes = bytes.checked_add(
+            3 * (size_of::<PreparedTransaction>() as u64
+                + UtxoUndo::allocation_overhead() as u64
+                + size_of::<Txid>() as u64),
+        )?;
+        let entries =
+            (transaction.input.len() as u64).checked_add(transaction.output.len() as u64)?;
+        bytes = bytes.checked_add(entries.checked_mul(hash + 12 * key)?)?;
+        // Originals, bulk-lookup overlap, and BIP30 pre-images; covers both
+        // retained vectors and the transient read/undo conversion containers.
+        bytes = bytes.checked_add(
+            entries.checked_mul(4 * (coin + key + crate::chainstate::MAX_SCRIPT_SIZE as u64))?,
+        )?;
+        for output in &transaction.output {
+            bytes = bytes.checked_add((output.script_pubkey.len() as u64).checked_mul(4)?)?;
+        }
+    }
+    Some(bytes)
 }
 
 /// The pipeline's counterpart of [`validate_active_block_inner`]: the same
@@ -1402,12 +1439,22 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
     let parent_mtp = headers
         .median_time_past(current.hash)?
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
+    let memory = resources
+        .map(|resources| {
+            let bytes = preparation_memory(block)
+                .ok_or_else(|| memory_error("block preparation allocation estimate overflow"))?;
+            resources
+                .reserve_memory(bytes)
+                .map(Arc::new)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let capacity = block
         .txdata
         .iter()
         .map(|transaction| transaction.input.len() + transaction.output.len())
         .sum();
-    let view = BlockPrepareView::new(chainstate, capacity);
+    let view = BlockPrepareView::new(chainstate, capacity, memory.clone());
     let exception_undo = prepare_bip30_rules(&view, block, deployments)?;
     if !structure_prevalidated {
         validate_block_structure_with_deployments(
@@ -1460,6 +1507,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         PreparedActiveBlock {
             block: prepared,
             exception_undo,
+            memory,
         },
         view.into_delta(),
         scripts,
@@ -1638,6 +1686,7 @@ struct UtxoChanges {
     spent: Vec<OutPointKey>,
     created: Vec<(OutPointKey, Utxo)>,
     undo: UtxoUndo,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 /// Independently locked shards per overlay.
@@ -1881,6 +1930,7 @@ pub(crate) struct PreparedDelta {
     /// Keys the block spent (or overwrote under BIP30) that existed before it,
     /// as opposed to coins it created and spent itself.
     spent_from_base: AHashSet<OutPointKey>,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl PreparedDelta {
@@ -1888,6 +1938,7 @@ impl PreparedDelta {
         Self {
             state: AHashMap::with_capacity(capacity),
             spent_from_base: AHashSet::with_capacity(capacity),
+            memory: None,
         }
     }
 
@@ -1932,6 +1983,7 @@ impl PreparedDelta {
             spent,
             created,
             undo: UtxoUndo::from_parts(Vec::new(), Vec::new()),
+            memory: self.memory,
         }
     }
 }
@@ -1944,10 +1996,16 @@ struct BlockPrepareView<'a, S> {
 }
 
 impl<'a, S: UtxoStore> BlockPrepareView<'a, S> {
-    fn new(base: &'a S, capacity: usize) -> Self {
+    fn new(
+        base: &'a S,
+        capacity: usize,
+        memory: Option<Arc<crate::node_memory::MemoryLease>>,
+    ) -> Self {
+        let mut delta = PreparedDelta::with_capacity(capacity);
+        delta.memory = memory;
         Self {
             base,
-            delta: Mutex::new(PreparedDelta::with_capacity(capacity)),
+            delta: Mutex::new(delta),
         }
     }
 
@@ -2055,6 +2113,7 @@ impl<S: UtxoStore> UtxoStore for BlockPrepareView<'_, S> {
 struct PreparedActiveBlock {
     block: PreparedBlock,
     exception_undo: Option<UtxoUndo>,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl PreparedActiveBlock {
@@ -2076,6 +2135,14 @@ impl PreparedActiveBlock {
                     .map(|(outpoint, _)| outpoint)
                     .collect();
                 transaction_undos.push(UtxoUndo::from_parts(spent, created));
+            }
+        } else {
+            drop(self.block);
+            drop(self.exception_undo);
+        }
+        if let Some(memory) = self.memory {
+            for undo in &transaction_undos {
+                undo.retain_memory(Arc::clone(&memory));
             }
         }
         AppliedBlock {
@@ -2136,6 +2203,7 @@ fn net_changes_of(shards: &[Mutex<OverlayState>]) -> Result<UtxoChanges, UtxoErr
         spent,
         created,
         undo: UtxoUndo::new(undo_spent, undo_created),
+        memory: None,
     })
 }
 
@@ -3259,6 +3327,86 @@ mod tests {
             budget.snapshot().used > baseline + 256 * crate::chainstate::MAX_SCRIPT_SIZE as u64
         );
         drop(prefetch);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn preparation_admission_denies_before_allocating_and_follows_returned_undo() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chain.redb"), Network::Regtest).unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let block = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .insert_contextual(block.header, block.header.time)
+            .unwrap();
+        let context = store.execution_spool().unwrap();
+        let baseline = budget.snapshot().used;
+        let needed = preparation_memory(&block).unwrap();
+        let occupied = budget
+            .reserve(budget.snapshot().limit - baseline - needed + 1)
+            .unwrap();
+        let prepare = || {
+            prepare_active_block_inner(
+                &store,
+                &headers,
+                &block,
+                store.execution_tip().unwrap(),
+                1,
+                &deployments(1),
+                false,
+                None,
+                Some(&context),
+            )
+        };
+        assert!(matches!(
+            prepare(),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionMemory(_)
+            ))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - needed + 1);
+        assert_eq!(store.execution_tip().unwrap().height, 0);
+        drop(occupied);
+        let (prepared, delta, scripts) = prepare().unwrap();
+        assert!(scripts.is_empty());
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        let applied = prepared.into_applied(true);
+        let escaped = applied.transaction_undos.clone();
+        drop(delta);
+        drop(applied);
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        assert!(!escaped.is_empty());
+        drop(escaped);
+        assert_eq!(budget.snapshot().used, baseline);
+        let (prepared, delta, scripts) = prepare().unwrap();
+        drop(scripts);
+        assert!(prepared.into_applied(false).transaction_undos.is_empty());
+        assert_eq!(
+            budget.snapshot().used,
+            baseline + needed,
+            "delta still owns created coins"
+        );
+        let changes = delta.into_net_changes();
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        let transition = crate::chain_store::LeasedConnectTransition::with_shared_reservation(
+            ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: block.block_hash(),
+                },
+                spent: changes.spent,
+                created: changes.created,
+                transaction_undos: Vec::new(),
+            },
+            changes.memory.unwrap(),
+        );
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        drop(transition);
         assert_eq!(budget.snapshot().used, baseline);
     }
 
