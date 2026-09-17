@@ -191,3 +191,47 @@ fn archive_admission_failure_reaches_the_node_as_a_local_resource_error() {
     assert_eq!(memory.spool_snapshot().used, 0);
     assert!(ledger.staged_manifest().unwrap().is_some());
 }
+
+#[test]
+fn replay_payload_admission_follows_prevalidation_staging_and_aliases() {
+    let directory = tempfile::tempdir().unwrap();
+    let ledger_directory = directory.path().join("ledger");
+    let config = DeploymentConfig::for_network(Network::Regtest);
+    let genesis = bitcoin::constants::genesis_block(Network::Regtest);
+    let block = submitted_regtest_block(genesis.block_hash(), 1, unix_time().unwrap());
+    let mut dag = HeaderDag::with_deployments(config.clone());
+    dag.insert(block.header).unwrap();
+    let headers = NodeHeaderState::test_seed(dag, &directory.path().join("headers.redb"));
+    let ledger = PrunedBlockLedger::open(&ledger_directory, LedgerRetention::default()).unwrap();
+    ledger.append(1, &[serialize(&block)]).unwrap();
+    let memory = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+    memory.bind(&[ledger_directory]).unwrap();
+    let batch = ledger.read_block_batch(1, 1, 1_000_000).unwrap();
+    let used = memory.snapshot().used;
+    assert!(used > serialize(&block).len() as u64);
+    let cloned_batch = batch.clone();
+    assert_eq!(memory.snapshot().used, used);
+    let validated = prevalidate_replay_blocks(&config, &headers, 1, batch.blocks).unwrap();
+    assert_eq!(memory.snapshot().used, used);
+    assert_eq!(validated[0].bytes.as_ptr(), cloned_batch.blocks[0].as_ptr());
+    let mut prefetch = PrefetchedBlocks {
+        validated,
+        ..PrefetchedBlocks::default()
+    };
+    drop(cloned_batch);
+    assert_eq!(memory.snapshot().used, used);
+    let bytes = prefetch.validated.pop().unwrap().bytes;
+    let alias = bytes.clone();
+    let serialized = vec![bytes];
+    ledger.stage(2, &serialized).unwrap();
+    drop(serialized);
+    drop(prefetch);
+    assert_eq!(memory.snapshot().used, used);
+    assert_eq!(alias.as_ref(), serialize(&block));
+    drop(alias);
+    assert_eq!(memory.snapshot().used, 0);
+    let single = ledger.read_owned_block(1).unwrap().unwrap();
+    assert_eq!(memory.snapshot().used, used);
+    drop(single);
+    assert_eq!(memory.snapshot().used, 0);
+}

@@ -97,7 +97,7 @@ use rbtc::{
         WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
         explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
-    archive::bounded_archive_prefix_len,
+    archive::{ArchiveBlock, bounded_archive_prefix_len},
     asmap::Asmap,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
@@ -2643,7 +2643,7 @@ struct ValidationLimits {
 #[derive(Default)]
 struct PrefetchedBlocks {
     /// Blocks fetched ahead as bytes; decoded and validated by the next batch.
-    serialized: Vec<Vec<u8>>,
+    serialized: Vec<ArchiveBlock>,
     /// Blocks a replay read-ahead already decoded and structure-validated,
     /// in height order after `serialized`.
     validated: Vec<PrevalidatedBlock>,
@@ -2660,7 +2660,7 @@ struct PrevalidatedBlock {
     hash: BlockHash,
     deployments: BlockDeploymentContext,
     transaction_ids: ValidatedBlockTransactionIds,
-    bytes: Vec<u8>,
+    bytes: ArchiveBlock,
 }
 
 impl Default for ValidationLimits {
@@ -11960,7 +11960,7 @@ fn stage_submitted_blocks(
         staged_any = true;
         if headers.active_tip().hash == hash {
             let height = headers.active_tip().height;
-            prefetched_blocks.serialized.push(serialize(&block));
+            prefetched_blocks.serialized.push(serialize(&block).into());
             awaiting.push((hash, height, verdict));
             rbtc_info!("staged submitted block {hash} at height {height}");
         } else {
@@ -13103,7 +13103,7 @@ fn reconcile_fee_estimator(
             .active_header(next_height)?
             .ok_or_else(|| format!("missing active fee-estimator header at {next_height}"))?;
         let Some(raw) = ledger
-            .read_block(next_height)
+            .read_owned_block(next_height)
             .map_err(|error| error.to_string())?
         else {
             estimator
@@ -14116,7 +14116,7 @@ async fn sync_validating_node(
                 break;
             }
             match ledger
-                .read_block(tip.height)
+                .read_owned_block(tip.height)
                 .map_err(|error| error.to_string())?
             {
                 Some(raw) => {
@@ -14831,7 +14831,7 @@ async fn replay_wallet_blocks(
         let mut all_local = true;
         for header in &expected {
             let Some(bytes) = ledger
-                .read_block(header.height)
+                .read_owned_block(header.height)
                 .map_err(|error| error.to_string())?
             else {
                 all_local = false;
@@ -15217,7 +15217,7 @@ async fn reconcile_explorer(
         let mut all_local = true;
         for header in &expected {
             let Some(bytes) = ledger
-                .read_block(header.height)
+                .read_owned_block(header.height)
                 .map_err(|error| error.to_string())?
             else {
                 all_local = false;
@@ -15356,7 +15356,7 @@ async fn reconcile_auxiliary_indexes(
             let mut all_local = true;
             for header in &expected {
                 let Some(bytes) = ledger
-                    .read_block(header.height)
+                    .read_owned_block(header.height)
                     .map_err(|error| error.to_string())?
                 else {
                     all_local = false;
@@ -15525,7 +15525,7 @@ async fn download_execution_prefetch(
     auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
     hashes: &[BlockHash],
     compact_candidates: &[Transaction],
-) -> Result<Vec<Vec<u8>>, PeerRunError> {
+) -> Result<Vec<ArchiveBlock>, PeerRunError> {
     let mut serialized = Vec::with_capacity(hashes.len());
     let mut offset = 0;
     while offset < hashes.len() {
@@ -15544,8 +15544,16 @@ async fn download_execution_prefetch(
                 compact_candidates,
             )
             .await?;
-            serialized.extend(primary_blocks.into_iter().map(|block| serialize(&block)));
-            serialized.extend(auxiliary_blocks.into_iter().map(|block| serialize(&block)));
+            serialized.extend(
+                primary_blocks
+                    .into_iter()
+                    .map(|block| ArchiveBlock::from(serialize(&block))),
+            );
+            serialized.extend(
+                auxiliary_blocks
+                    .into_iter()
+                    .map(|block| ArchiveBlock::from(serialize(&block))),
+            );
             offset += primary_len + auxiliary_len;
             if !keep_auxiliary {
                 *auxiliary_session = None;
@@ -15559,7 +15567,11 @@ async fn download_execution_prefetch(
                 "execution prefetch",
             )
             .await?;
-            serialized.extend(blocks.into_iter().map(|block| serialize(&block)));
+            serialized.extend(
+                blocks
+                    .into_iter()
+                    .map(|block| ArchiveBlock::from(serialize(&block))),
+            );
             offset += window_len;
         }
     }
@@ -15871,9 +15883,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             .ok_or_else(|| PeerRunError::transient("replay height overflow"))?;
         let batch = replay
             .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
-            .map_err(|error| {
-                PeerRunError::transient(format!("replay ledger read at {first}: {error}"))
-            })?;
+            .map_err(|error| PeerRunError::ledger(&error))?;
         if batch.first_height != first || batch.blocks.is_empty() {
             return Err(PeerRunError::transient(format!(
                 "replay ledger does not retain height {first}"
@@ -16622,7 +16632,7 @@ fn validate_downloaded_block(
     (
         BlockDeploymentContext,
         ValidatedBlockTransactionIds,
-        Vec<u8>,
+        ArchiveBlock,
     ),
     PeerRunError,
 > {
@@ -16647,7 +16657,11 @@ fn validate_downloaded_block(
             "downloaded block structure at height {height}: {error}"
         ))
     })?;
-    Ok((deployments, transaction_ids, serialize(block)))
+    Ok((
+        deployments,
+        transaction_ids,
+        ArchiveBlock::from(serialize(block)),
+    ))
 }
 
 /// Decodes and structure-validates blocks a replay read ahead of execution,
@@ -16656,7 +16670,7 @@ fn prevalidate_replay_blocks(
     deployment_config: &DeploymentConfig,
     headers: &dyn HeaderView,
     first_height: u32,
-    serialized: Vec<Vec<u8>>,
+    serialized: Vec<ArchiveBlock>,
 ) -> Result<Vec<PrevalidatedBlock>, String> {
     let mut validated = Vec::with_capacity(serialized.len());
     for (offset, bytes) in serialized.into_iter().enumerate() {
@@ -16705,7 +16719,7 @@ fn validate_downloaded_blocks(
     Vec<(
         BlockDeploymentContext,
         ValidatedBlockTransactionIds,
-        Vec<u8>,
+        ArchiveBlock,
     )>,
     PeerRunError,
 > {
@@ -20461,7 +20475,7 @@ mod tests {
         let mut prefetched = PrefetchedBlocks {
             validated: Vec::new(),
             utxos: None,
-            serialized: vec![serialize(&genesis)],
+            serialized: vec![ArchiveBlock::from(serialize(&genesis))],
         };
         stage_submitted_blocks(
             &pending,
@@ -31247,7 +31261,7 @@ mod tests {
             PrunedBlockLedger::open(directory.path().join("blocks"), LedgerRetention::default())
                 .unwrap();
         assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 1)]);
-        let archived: Block = deserialize(&ledger.read_block(1).unwrap().unwrap()).unwrap();
+        let archived: Block = deserialize(&ledger.read_owned_block(1).unwrap().unwrap()).unwrap();
         assert_eq!(archived.block_hash(), block_hash);
         assert!(ledger.staged().unwrap().is_none());
         let explorer =

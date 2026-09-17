@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::archive::{
-    ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, verify_archive,
-    verify_archive_block_hashes_streaming, verify_archive_streaming, write_archive,
+    ArchiveBlock, ArchiveError, ArchiveManifest, read_archive, read_archive_manifest,
+    verify_archive, verify_archive_block_hashes_streaming, verify_archive_streaming, write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -114,7 +114,7 @@ pub struct LedgerBlockBatch {
     /// Exact canonical record bytes retained in this batch.
     pub record_bytes: u64,
     /// Consensus-serialized blocks in ascending height order.
-    pub blocks: Vec<Vec<u8>>,
+    pub blocks: Vec<ArchiveBlock>,
 }
 
 /// Deterministic manual-prefix prune plan.
@@ -449,7 +449,7 @@ impl PrunedBlockLedger {
     pub fn append(
         &self,
         first_height: u32,
-        blocks: &[Vec<u8>],
+        blocks: &[impl AsRef<[u8]>],
     ) -> Result<ArchiveManifest, LedgerError> {
         let _guard = self.lock();
         self.append_locked(first_height, blocks)
@@ -459,7 +459,7 @@ impl PrunedBlockLedger {
     ///
     /// Only one segment may be staged. It is not visible through retained
     /// reads until [`Self::commit_staged`] publishes its validated prefix.
-    pub fn stage(&self, first_height: u32, blocks: &[Vec<u8>]) -> Result<(), LedgerError> {
+    pub fn stage(&self, first_height: u32, blocks: &[impl AsRef<[u8]>]) -> Result<(), LedgerError> {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty staged segment"));
         }
@@ -662,7 +662,7 @@ impl PrunedBlockLedger {
     fn append_locked(
         &self,
         first_height: u32,
-        blocks: &[Vec<u8>],
+        blocks: &[impl AsRef<[u8]>],
     ) -> Result<ArchiveManifest, LedgerError> {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty segment"));
@@ -780,6 +780,12 @@ impl PrunedBlockLedger {
     /// The complete containing archive is checksum-verified before the block
     /// is returned. A pruned or not-yet-appended height returns `None`.
     pub fn read_block(&self, height: u32) -> Result<Option<Vec<u8>>, LedgerError> {
+        self.read_owned_block(height)
+            .map(|block| block.map(|bytes| bytes.to_vec()))
+    }
+
+    /// Reads one immutable block, retaining admission through its final alias.
+    pub fn read_owned_block(&self, height: u32) -> Result<Option<ArchiveBlock>, LedgerError> {
         let _guard = self.lock();
         let index = self.read_index()?;
         self.read_block_from_index(&index, height)
@@ -1439,7 +1445,7 @@ impl PrunedBlockLedger {
         &self,
         index: &LedgerIndex,
         height: u32,
-    ) -> Result<Option<Vec<u8>>, LedgerError> {
+    ) -> Result<Option<ArchiveBlock>, LedgerError> {
         let Some(segment) = index
             .segments
             .iter()

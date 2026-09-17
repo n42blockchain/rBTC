@@ -4,6 +4,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::Arc,
 };
 
 use bitcoin::{Block, BlockHash, consensus::deserialize};
@@ -40,8 +41,8 @@ const MAX_ZSTD_WINDOW_LOG: u32 = 27;
 /// Individual blocks are checked against the same consensus payload bound as
 /// [`encode_archive`]. A non-empty valid input always admits at least one
 /// block because the per-block ceiling is smaller than the archive ceiling.
-pub fn bounded_archive_prefix_len(blocks: &[Vec<u8>]) -> Result<usize, ArchiveError> {
-    bounded_archive_prefix_len_from_lengths(blocks.iter().map(Vec::len))
+pub fn bounded_archive_prefix_len(blocks: &[impl AsRef<[u8]>]) -> Result<usize, ArchiveError> {
+    bounded_archive_prefix_len_from_lengths(blocks.iter().map(|block| block.as_ref().len()))
 }
 
 fn bounded_archive_prefix_len_from_lengths(
@@ -85,6 +86,61 @@ pub enum ArchiveError {
     Invalid(&'static str),
 }
 
+/// Immutable serialized block whose clones share payload and any admission.
+/// Borrowing bytes never transfers the reservation away from the allocation.
+#[derive(Clone, Debug)]
+pub struct ArchiveBlock(Arc<ArchiveBlockPayload>);
+
+#[derive(Debug)]
+struct ArchiveBlockPayload {
+    bytes: Vec<u8>,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+
+impl ArchiveBlock {
+    fn allocation_bytes(length: usize) -> u64 {
+        (length + std::mem::size_of::<ArchiveBlockPayload>() + 2 * std::mem::size_of::<usize>())
+            as u64
+    }
+
+    fn admitted(bytes: Vec<u8>, reservation: Option<crate::node_memory::MemoryLease>) -> Self {
+        Self(Arc::new(ArchiveBlockPayload {
+            bytes,
+            _reservation: reservation,
+        }))
+    }
+}
+
+impl From<Vec<u8>> for ArchiveBlock {
+    /// Wraps bytes already owned by the caller; this does not admit new memory.
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::admitted(bytes, None)
+    }
+}
+
+impl std::ops::Deref for ArchiveBlock {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0.bytes
+    }
+}
+impl AsRef<[u8]> for ArchiveBlock {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+impl PartialEq for ArchiveBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+impl Eq for ArchiveBlock {}
+impl PartialEq<Vec<u8>> for ArchiveBlock {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
 /// Sidecar-equivalent data needed by a BitTorrent/webseed transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchiveManifest {
@@ -109,7 +165,7 @@ pub struct ArchiveManifest {
 pub fn write_archive(
     path: impl AsRef<Path>,
     first_height: u32,
-    blocks: &[Vec<u8>],
+    blocks: &[impl AsRef<[u8]>],
 ) -> Result<ArchiveManifest, ArchiveError> {
     let path = path.as_ref();
     let records_bytes = archive_record_bytes(blocks)?;
@@ -230,7 +286,7 @@ pub fn read_archive(
     decode_archive(&bytes)
 }
 
-fn archive_record_bytes(blocks: &[Vec<u8>]) -> Result<u64, ArchiveError> {
+fn archive_record_bytes(blocks: &[impl AsRef<[u8]>]) -> Result<u64, ArchiveError> {
     if blocks.is_empty() {
         return Err(ArchiveError::Invalid("empty archive"));
     }
@@ -239,6 +295,7 @@ fn archive_record_bytes(blocks: &[Vec<u8>]) -> Result<u64, ArchiveError> {
     }
     let mut records_bytes = 0_u64;
     for block in blocks {
+        let block = block.as_ref();
         if block.len() > MAX_BLOCK_BYTES {
             return Err(ArchiveError::Invalid("block too large"));
         }
@@ -257,12 +314,13 @@ fn archive_record_bytes(blocks: &[Vec<u8>]) -> Result<u64, ArchiveError> {
 
 fn compress_archive<W: Write>(
     output: W,
-    blocks: &[Vec<u8>],
+    blocks: &[impl AsRef<[u8]>],
     records_bytes: u64,
 ) -> Result<(W, String), ArchiveError> {
     let mut encoder = archive_encoder(output, records_bytes)?;
     let mut records_hash = Sha256::new();
     for block in blocks {
+        let block = block.as_ref();
         let len =
             u32::try_from(block.len()).map_err(|_| ArchiveError::Invalid("block too large"))?;
         let len = len.to_le_bytes();
@@ -388,7 +446,7 @@ pub(crate) fn read_archive_batch(
     first_height: u32,
     max_blocks: u32,
     max_record_bytes: u64,
-) -> Result<(ArchiveManifest, Vec<Vec<u8>>), ArchiveError> {
+) -> Result<(ArchiveManifest, Vec<ArchiveBlock>), ArchiveError> {
     if max_blocks == 0 || max_record_bytes == 0 {
         return Err(ArchiveError::Invalid("archive batch bound"));
     }
@@ -427,7 +485,7 @@ fn scan_archive_selection(
     max_blocks: u32,
     max_record_bytes: u64,
     mut visit: Option<ArchiveVisitor<'_>>,
-) -> Result<(ArchiveManifest, Vec<Vec<u8>>, bool), ArchiveError> {
+) -> Result<(ArchiveManifest, Vec<ArchiveBlock>, bool), ArchiveError> {
     let path = path.as_ref();
     let mut file = File::open(path)?;
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
@@ -473,13 +531,12 @@ fn scan_archive_selection(
             .ok_or(ArchiveError::Invalid("height overflow"))?;
         let wanted = !stopped && height >= first_height && selected_count < max_blocks;
         if wanted && bytes <= max_record_bytes.saturating_sub(selected_bytes) {
-            // Visitor payloads cannot escape the callback. Returned batches
-            // need a separate owning API before their allocation can be leased.
-            let _block_reservation = if visit.is_some() {
-                reserve_archive_memory(path, length as u64)?
+            let reservation_bytes = if visit.is_some() {
+                length as u64
             } else {
-                None
+                ArchiveBlock::allocation_bytes(length)
             };
+            let block_reservation = reserve_archive_memory(path, reservation_bytes)?;
             let mut block = vec![0_u8; length];
             bounded
                 .read_exact(&mut block)
@@ -491,7 +548,7 @@ fn scan_archive_selection(
                 complete = visit(height, &block);
                 stopped |= !complete;
             } else {
-                blocks.push(block);
+                blocks.push(ArchiveBlock::admitted(block, block_reservation));
             }
         } else {
             stopped |= wanted;
@@ -1064,6 +1121,46 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn returned_block_clones_keep_admission_through_writing_and_final_drop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owned.rblk");
+        let data = vec![3; 100_000];
+        let manifest = write_archive(&path, 1, std::slice::from_ref(&data)).unwrap();
+        let native = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
+        let payload = ArchiveBlock::allocation_bytes(data.len());
+        let limit = native + 64 * 1024 + payload;
+        let budget = crate::node_memory::MemoryBudget::new(limit);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(1).unwrap();
+        assert!(matches!(
+            read_archive_batch(&path, 1, 1, MAX_RECORDS_BYTES),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert_eq!(budget.snapshot().used, 1);
+        drop(pressure);
+        let (_, blocks) = read_archive_batch(&path, 1, 1, MAX_RECORDS_BYTES).unwrap();
+        assert_eq!(budget.snapshot().used, payload);
+        let alias = blocks[0].clone();
+        assert_eq!(alias.as_ptr(), blocks[0].as_ptr());
+        let cloned_batch = blocks.clone();
+        drop(blocks);
+        assert_eq!(budget.snapshot().used, payload);
+        let output = dir.path().join("copy.rblk");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| write_archive(&output, 1, &cloned_batch).unwrap())
+                .join()
+                .unwrap();
+        });
+        assert_eq!(fs::read(&path).unwrap(), fs::read(output).unwrap());
+        drop(cloned_batch);
+        assert_eq!(budget.snapshot().used, payload);
+        assert_eq!(alias.as_ref(), data);
+        drop(alias);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
     fn visitor_scratch_denial_precedes_callback_and_early_stop_refunds() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("visitor.rblk");
@@ -1123,7 +1220,8 @@ mod tests {
         assert!(ArchiveDecoder::allowance(MAX_RECORDS_BYTES).unwrap() > 128 * 1024 * 1024);
         assert!(rbtc_codec_memory::decoder_bytes(22).is_none());
         assert!(rbtc_codec_memory::decoder_bytes(28).is_none());
-        let total = allowance + 64 * 1024 + 512 * 1024;
+        let payload_allowance = ArchiveBlock::allocation_bytes(512 * 1024);
+        let total = allowance + 64 * 1024 + payload_allowance;
         let budget = crate::node_memory::MemoryBudget::new(total);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve(total - allowance + 1).unwrap();
@@ -1141,8 +1239,8 @@ mod tests {
             visit_archive_prefix(&path, &manifest, 1, &mut |_, raw| {
                 calls += 1;
                 assert_eq!(raw.len(), 512 * 1024);
-                assert_eq!(budget.snapshot().used, total);
-                assert!(budget.reserve(1).is_err());
+                assert_eq!(budget.snapshot().used, allowance + 64 * 1024 + 512 * 1024);
+                assert!(budget.reserve(payload_allowance - 512 * 1024 + 1).is_err());
                 true
             })
             .unwrap()
