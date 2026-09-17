@@ -32,6 +32,9 @@ impl DiskHeaderIndex {
         pinned: &[BlockHash],
         work: &mut HeaderWorkBudget,
     ) -> Result<StagedDiskHeaderEviction<'_>, HeaderIndexError> {
+        if self.base.is_some() {
+            return Err(local("shared header overlays do not support eviction").into());
+        }
         if self.poisoned {
             return Err(local("derived header index requires rebuild").into());
         }

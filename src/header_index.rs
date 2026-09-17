@@ -98,17 +98,23 @@ pub struct DiskHeaderView {
     transaction: Arc<ReadTransaction>,
     deployments: DeploymentConfig,
     tip: HeaderInfo,
-    _scratch: Option<Arc<tempfile::TempDir>>,
+    scratch: Option<Arc<tempfile::TempDir>>,
+    base: Option<Arc<DiskHeaderView>>,
+    len: u64,
 }
 
 impl DiskHeaderView {
     fn record(&self, hash: BlockHash) -> Result<Option<Record>, HeaderReadError> {
         let table = self.transaction.open_table(RECORDS).map_err(local)?;
-        table
+        let record = table
             .get(hash.as_byte_array().as_slice())
             .map_err(local)?
             .map(|value| Record::decode(hash, value.value()))
-            .transpose()
+            .transpose()?;
+        match (record, &self.base) {
+            (None, Some(base)) => base.record(hash),
+            (record, _) => Ok(record),
+        }
     }
 }
 
@@ -200,6 +206,7 @@ pub struct DiskHeaderIndex {
     len: u64,
     poisoned: bool,
     scratch: Option<Arc<tempfile::TempDir>>,
+    base: Option<Arc<DiskHeaderView>>,
 }
 
 /// An unpublished index transaction. Dropping aborts all inserted records;
@@ -289,6 +296,7 @@ impl DiskHeaderIndex {
             len: 0,
             poisoned: false,
             scratch: None,
+            base: None,
         })
     }
 
@@ -318,8 +326,29 @@ impl DiskHeaderIndex {
             transaction: Arc::new(self.db.begin_read().map_err(local)?),
             deployments: self.deployments.clone(),
             tip: self.tip,
-            _scratch: self.scratch.clone(),
+            scratch: self.scratch.clone(),
+            base: self.base.clone(),
+            len: self.len,
         })
+    }
+
+    /// Creates a private scratch overlay sharing one validated read-only seed.
+    /// Only new headers occupy its tables; seed history and cache are shared.
+    /// Nested overlays are refused to keep lookup depth bounded at two reads.
+    pub(crate) fn overlay(base: Arc<DiskHeaderView>) -> Result<Self, HeaderIndexError> {
+        if base.base.is_some() {
+            return Err(local("nested header overlays are not supported").into());
+        }
+        let parent = base
+            .scratch
+            .as_ref()
+            .and_then(|directory| directory.path().parent())
+            .ok_or_else(|| local("header overlay requires an owned scratch seed"))?;
+        let mut index = Self::create_scratch(parent, base.deployments.clone())?;
+        index.tip = base.tip;
+        index.len = base.len;
+        index.base = Some(base);
+        Ok(index)
     }
 
     /// Number of validated non-genesis entries, including side branches.
@@ -366,7 +395,7 @@ impl DiskHeaderIndex {
         for header in batch {
             // Covers skip-index reads (at most 32 levels of at most 32 steps),
             // hashing, and bounded batch metadata before the first lookup.
-            work.consume(2_048)?;
+            work.consume(if self.base.is_some() { 4_096 } else { 2_048 })?;
             let pending = PendingView {
                 base: &base,
                 records: &records,
@@ -381,8 +410,9 @@ impl DiskHeaderIndex {
                 .is_none_or(|context| context.tip().hash != header.prev_blockhash)
             {
                 work.consume(
-                    2 * crate::headers::core_params(self.deployments.network())
-                        .difficulty_adjustment_interval()
+                    (if self.base.is_some() { 4 } else { 2 })
+                        * crate::headers::core_params(self.deployments.network())
+                            .difficulty_adjustment_interval()
                         + 128,
                 )?;
                 context = Some(CandidateContext::new(&pending, header.prev_blockhash)?);
@@ -425,8 +455,16 @@ impl DiskHeaderIndex {
                 let count = children
                     .get(parent.as_byte_array().as_slice())
                     .map_err(local)?
-                    .ok_or(HeaderReadError::Inconsistent("missing parent child count"))?
-                    .value();
+                    .map(|value| value.value());
+                let count = match count {
+                    Some(count) => count,
+                    None if self.base.is_some() && base.header(&parent)?.is_some() => 0,
+                    None => {
+                        return Err(
+                            HeaderReadError::Inconsistent("missing parent child count").into()
+                        );
+                    }
+                };
                 let count = count
                     .checked_add(1)
                     .ok_or(HeaderReadError::Inconsistent("child count overflow"))?;

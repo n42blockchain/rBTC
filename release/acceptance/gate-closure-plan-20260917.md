@@ -12,7 +12,8 @@ not change acceptance statuses or weaken thresholds.
    The current disk-view and block-execution progress is described in
    [the view report](header-views-20260917.md) and
    [node ownership report](header-node-disk-state-20260917.md). Main-node ownership
-   is connected; standby copies and aggregate resource admission remain.
+   is connected; [standby history is shared on disk](header-standby-sharing-20260917.md).
+   Aggregate resource admission and whole-node acceptance remain.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

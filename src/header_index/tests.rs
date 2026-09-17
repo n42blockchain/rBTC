@@ -1,6 +1,7 @@
 use super::*;
 use crate::{header_store::RedbHeaderStore, headers::HeaderReadError};
 use bitcoin::{Network, TxMerkleNode, block::Version, pow::Target};
+use redb::ReadableTableMetadata;
 use tempfile::TempDir;
 
 fn child(parent: HeaderInfo, spacing: u32) -> Header {
@@ -280,4 +281,92 @@ fn disk_leaf_eviction_preserves_pins_and_old_versions() {
         index.snapshot().unwrap().active_tip().hash,
         active.block_hash()
     );
+}
+
+#[test]
+fn shared_seed_overlays_validate_independent_forks_without_copying_history() {
+    let dir = TempDir::new().unwrap();
+    let mut memory = HeaderDag::new(Network::Regtest);
+    let mut seed_index =
+        DiskHeaderIndex::create_scratch(dir.path(), memory.deployments().clone()).unwrap();
+    let genesis = memory.active_tip();
+    let mut batch = Vec::new();
+    for _ in 0..257 {
+        let header = child(memory.active_tip(), 1);
+        memory.insert_contextual(header, u32::MAX).unwrap();
+        batch.push(header);
+    }
+    seed_index
+        .append(&batch, u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    let seed = Arc::new(seed_index.snapshot().unwrap());
+    let seed_directory = seed_index.scratch.as_ref().unwrap().path().to_path_buf();
+    let mut left = DiskHeaderIndex::overlay(Arc::clone(&seed)).unwrap();
+    let mut right = DiskHeaderIndex::overlay(Arc::clone(&seed)).unwrap();
+    assert!(Arc::ptr_eq(
+        left.base.as_ref().unwrap(),
+        right.base.as_ref().unwrap()
+    ));
+    assert_eq!(
+        left.db
+            .begin_read()
+            .unwrap()
+            .open_table(RECORDS)
+            .unwrap()
+            .len()
+            .unwrap(),
+        1
+    );
+    let left_old = left.snapshot().unwrap();
+    let mut parent = genesis;
+    let mut fork = Vec::new();
+    for _ in 0..258 {
+        let header = child(parent, 2);
+        parent = memory.insert_contextual(header, u32::MAX).unwrap();
+        fork.push(header);
+    }
+    left.append(&fork, u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    let left_view = left.snapshot().unwrap();
+    assert_eq!(left_view.active_tip(), memory.active_tip());
+    for height in 0..=258 {
+        assert_eq!(
+            left_view.active_header(height).unwrap(),
+            memory.active_header_at(height)
+        );
+    }
+    let right_header = child(seed.active_tip(), 3);
+    right
+        .append(&[right_header], u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    let right_view = right.snapshot().unwrap();
+    assert_eq!(right_view.active_tip().hash, right_header.block_hash());
+    assert_eq!(
+        right_view.header(&left_view.active_tip().hash).unwrap(),
+        None
+    );
+    assert_eq!(left_view.header(&right_header.block_hash()).unwrap(), None);
+    assert_eq!(left_old.active_tip(), seed.active_tip());
+    assert_eq!(
+        left_view.branch_locator(seed.active_tip().hash).unwrap(),
+        Some(seed.block_locator().unwrap())
+    );
+    assert!(DiskHeaderIndex::overlay(Arc::new(left_view.clone())).is_err());
+    assert!(
+        left.stage_eviction(0, 1, &[], &mut HeaderWorkBudget::default())
+            .is_err()
+    );
+    drop(seed_index);
+    drop(seed);
+    drop(left);
+    drop(right);
+    drop(left_old);
+    drop(left_view);
+    assert!(seed_directory.exists());
+    assert_eq!(
+        right_view.active_header(257).unwrap().unwrap().hash,
+        batch[256].block_hash()
+    );
+    drop(right_view);
+    assert!(!seed_directory.exists());
 }

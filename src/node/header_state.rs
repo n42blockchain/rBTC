@@ -109,6 +109,10 @@ impl NodeHeaderState {
         })
     }
 
+    pub(super) fn shared_disk_view(&self) -> std::sync::Arc<DiskHeaderView> {
+        std::sync::Arc::new(self.view.clone())
+    }
+
     pub(super) fn retained_header_count(&self) -> usize {
         usize::try_from(self.index.len())
             .unwrap_or(usize::MAX)

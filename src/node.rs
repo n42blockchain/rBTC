@@ -3,6 +3,7 @@
 mod config_file;
 mod header_state;
 mod header_sync;
+use crate::header_index::{DiskHeaderIndex, DiskHeaderView};
 use header_state::NodeHeaderState;
 use header_sync::sync_headers;
 
@@ -10132,7 +10133,10 @@ async fn maintain_standby(
         keepalive_interval,
         ping_nonce,
         transaction_relay,
-        header_dag,
+        header_dag.map(|dag| {
+            NodeHeaderState::test_seed(dag, &std::env::temp_dir().join("rbtc-standby-test-headers"))
+                .shared_disk_view()
+        }),
         transaction_pool,
         &NetworkTime::default(),
     )
@@ -10146,7 +10150,7 @@ async fn maintain_standby_with_time(
     keepalive_interval: Duration,
     mut ping_nonce: u64,
     mut transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
-    mut header_dag: Option<HeaderDag>,
+    header_seed: Option<Arc<DiskHeaderView>>,
     transaction_pool: Option<&Arc<Mutex<TransactionAdmissionPool>>>,
     network_time: &NetworkTime,
 ) -> Result<ConnectedPeer, PeerRunError> {
@@ -10155,6 +10159,8 @@ async fn maintain_standby_with_time(
         Keepalive,
         Relay(Result<TransactionRelay, broadcast::error::RecvError>),
     }
+    // Allocate the private overlay only when this peer actually stays standby.
+    let mut header_index: Option<(DiskHeaderIndex, u64)> = None;
     let mut keepalive = tokio::time::interval(keepalive_interval);
     keepalive.tick().await;
     loop {
@@ -10194,14 +10200,24 @@ async fn maintain_standby_with_time(
                     })?
                     .map_err(|error| PeerRunError::p2p(&error))?;
                 ping_nonce = ping_nonce.wrapping_add(1);
-                if let Some(dag) = header_dag.as_mut() {
+                if let Some(seed) = header_seed.as_ref() {
+                    if header_index.is_none() {
+                        let index = DiskHeaderIndex::overlay(Arc::clone(seed))
+                            .map_err(|error| PeerRunError::local(error.to_string()))?;
+                        let seed_count = index.len();
+                        header_index = Some((index, seed_count));
+                    }
+                    let (index, seed_count) = header_index.as_mut().expect("initialized overlay");
+                    let view = index
+                        .snapshot()
+                        .map_err(|error| PeerRunError::local(error.to_string()))?;
                     let locator = {
                         let mut lease = header_sync::work(header_sync::BATCH_WORK).await;
                         lease
                             .budget
-                            .consume(2 * dag.retained_header_count() as u64 + 128)
+                            .consume(180_000)
                             .map_err(|error| PeerRunError::local(error.to_string()))?;
-                        dag.block_locator()
+                        view.block_locator()?
                     };
                     request_headers(&mut connected.session, locator).await?;
                     let headers = receive_headers(&mut connected.session).await?;
@@ -10210,21 +10226,39 @@ async fn maintain_standby_with_time(
                         .budget
                         .consume(4 * headers.len() as u64)
                         .map_err(|error| PeerRunError::local(error.to_string()))?;
-                    let unseen = unseen_header_suffix(dag, &headers)
+                    let unseen = unseen_header_suffix(&view, &headers)
                         .map_err(|error| PeerRunError::header(&error))?;
+                    // Bound unactivated peer progress independently of seed size.
+                    // This is local backpressure, never evidence of invalidity.
+                    if index.len().saturating_sub(*seed_count) + unseen.len() as u64
+                        > IDLE_SIDE_HEADER_TARGET as u64
+                    {
+                        return Err(PeerRunError::local(
+                            "standby header overlay allowance exhausted",
+                        ));
+                    }
                     if !unseen.is_empty() {
-                        let staged = dag
-                            .stage_batch_contextual_with_budget(
+                        index
+                            .append(
                                 unseen,
                                 network_time
                                     .adjusted_time(unix_time().map_err(PeerRunError::transient)?),
-                                crate::headers::HeaderBatchLimits::default(),
                                 &mut lease.budget,
                             )
-                            .map_err(|error| PeerRunError::header(&error))?;
-                        let _ = staged.commit();
+                            .map_err(|error| match error {
+                                crate::header_index::HeaderIndexError::Header(error) => {
+                                    PeerRunError::header(&error)
+                                }
+                                other => PeerRunError::local(other.to_string()),
+                            })?;
                     }
-                    connected.validated_header_height = Some(dag.active_tip().height);
+                    connected.validated_header_height = Some(
+                        index
+                            .snapshot()
+                            .map_err(|error| PeerRunError::local(error.to_string()))?
+                            .active_tip()
+                            .height,
+                    );
                 }
             }
             StandbyAction::Relay(Ok(relay)) => {
@@ -10298,7 +10332,7 @@ async fn connect_and_maintain_standby(
     ready: tokio::sync::oneshot::Sender<()>,
     activate: tokio::sync::oneshot::Receiver<()>,
     transaction_relay: Option<broadcast::Receiver<TransactionRelay>>,
-    header_dag: Option<HeaderDag>,
+    header_dag: Option<Arc<DiskHeaderView>>,
     mempool_relay_source: Option<MempoolRelaySource>,
     transaction_pool: Option<Arc<Mutex<TransactionAdmissionPool>>>,
     advertised_address: Option<(SocketAddr, ServiceFlags)>,
@@ -10396,7 +10430,7 @@ async fn connect_and_maintain_standby(
     result
 }
 
-async fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, String> {
+async fn standby_header_seed(options: &Options) -> Result<Option<Arc<DiskHeaderView>>, String> {
     let path = options
         .data_dir
         .as_ref()
@@ -10405,11 +10439,6 @@ async fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, Str
     let Some(path) = path else {
         return Ok(None);
     };
-    if !path.exists() {
-        return Ok(Some(HeaderDag::with_deployments(
-            options.deployments.clone(),
-        )));
-    }
     let store = RedbHeaderStore::open(&path).map_err(|error| error.to_string())?;
     Box::pin(header_sync::recover_pending_promotion(
         &store,
@@ -10419,10 +10448,17 @@ async fn standby_header_seed(options: &Options) -> Result<Option<HeaderDag>, Str
     ))
     .await
     .map_err(|error| error.to_string())?;
-    store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let state = Box::pin(NodeHeaderState::resume(
+        &store,
+        &path,
+        &options.deployments,
+        unix_time()?,
+        None,
+        None,
+    ))
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(Some(state.shared_disk_view()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10438,6 +10474,9 @@ async fn spawn_peer_connections(
     i2p_session: Option<&Arc<I2pSamSession>>,
     network_time: &Arc<NetworkTime>,
 ) -> Result<VecDeque<(NodePeerTarget, PendingPeer)>, String> {
+    if remotes.is_empty() {
+        return Ok(VecDeque::new());
+    }
     let header_seed = standby_header_seed(options).await?;
     Ok(remotes
         .iter()
@@ -19852,7 +19891,7 @@ mod tests {
         );
 
         // Persistence preserves this header on startup/failover, while ordinary
-        // caught-up polls retain the same in-memory DAG.
+        // caught-up polls retain the same validated disk index.
         let reloaded = RedbHeaderStore::open(&headers_path)
             .unwrap()
             .load_dag_with_deployments(
