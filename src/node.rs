@@ -8827,6 +8827,20 @@ fn runtime_transaction_pool(
     ))
 }
 
+// Keep startup ownership scoped to the node task while allowing a
+// multi-thread runtime to replace the worker during synchronous initialization.
+// In particular, an already-bound listener must not remain in that worker's
+// local task queue until a database open completes.
+fn startup_io<T>(work: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_peer_pool_session(
     options: &Options,
@@ -8836,7 +8850,7 @@ async fn run_peer_pool_session(
     admission_budget: &crate::admission_resources::AdmissionBudget,
 ) -> Result<(), String> {
     let network_time = Arc::new(NetworkTime::default());
-    let api_runtime = prepare_api_runtime(options)?;
+    let api_runtime = startup_io(|| prepare_api_runtime(options))?;
     let zmq_publisher = match options.zmq_listen {
         Some(listen) => Some(
             ZmqPublisher::bind(listen, ZmqPublisherConfig::default())
@@ -8848,7 +8862,8 @@ async fn run_peer_pool_session(
     let zmq_notifier = zmq_publisher
         .as_ref()
         .map(|publisher| ZmqNotifier::new(publisher.handle()));
-    let transaction_pool = runtime_transaction_pool(&options.resources, admission_budget);
+    let transaction_pool =
+        startup_io(|| runtime_transaction_pool(&options.resources, admission_budget));
     let mempool_pool = Arc::clone(&transaction_pool);
     let mempool_relay_source = MempoolRelaySource::new(move || {
         mempool_pool
@@ -8922,31 +8937,36 @@ async fn run_peer_pool_session(
         }
         _ => None,
     };
-    // The map is resolved before asking whether a peer store exists, so a
-    // broken --asmap file refuses startup instead of being silently unused
-    // on a store-less node.
-    let asmap = match &options.resources.asmap {
-        NodeAsmapSource::Off => None,
-        NodeAsmapSource::Embedded => Some(Asmap::embedded().map_err(|error| error.to_string())?),
-        NodeAsmapSource::File(path) => {
-            Some(Arc::new(Asmap::from_file(path).map_err(|error| {
-                format!("--asmap {}: {error}", path.display())
-            })?))
-        }
-    };
-    let peer_store = if let Some(data_dir) = &options.data_dir {
-        Some(Arc::new(
-            RedbPeerStore::open_with_policy(
-                data_dir.join("peers.redb"),
-                options.network,
-                asmap,
-                options.resources.cjdns_reachable,
-            )
-            .map_err(|error| error.to_string())?,
-        ))
-    } else {
-        None
-    };
+    let peer_store = startup_io(|| -> Result<_, String> {
+        // The map is resolved before asking whether a peer store exists, so a
+        // broken --asmap file refuses startup instead of being silently unused
+        // on a store-less node.
+        let asmap = match &options.resources.asmap {
+            NodeAsmapSource::Off => None,
+            NodeAsmapSource::Embedded => {
+                Some(Asmap::embedded().map_err(|error| error.to_string())?)
+            }
+            NodeAsmapSource::File(path) => {
+                Some(Arc::new(Asmap::from_file(path).map_err(|error| {
+                    format!("--asmap {}: {error}", path.display())
+                })?))
+            }
+        };
+        let peer_store = if let Some(data_dir) = &options.data_dir {
+            Some(Arc::new(
+                RedbPeerStore::open_with_policy(
+                    data_dir.join("peers.redb"),
+                    options.network,
+                    asmap,
+                    options.resources.cjdns_reachable,
+                )
+                .map_err(|error| error.to_string())?,
+            ))
+        } else {
+            None
+        };
+        Ok(peer_store)
+    })?;
     if let Some(source) = &inbound_source {
         source.install_peer_store(peer_store.as_ref().map(Arc::clone));
     }
@@ -19505,6 +19525,7 @@ mod tests {
     mod inbound_projection;
     mod index_recovery;
     mod memory_budget;
+    mod startup_io;
     #[test]
     fn execution_spool_failure_is_local_not_peer_misbehavior() {
         use crate::chain_store::ChainStoreError;
