@@ -218,11 +218,50 @@ pub(crate) fn read_archive_batch(
     if max_blocks == 0 || max_record_bytes == 0 {
         return Err(ArchiveError::Invalid("archive batch bound"));
     }
+    scan_archive_selection(path, None, first_height, max_blocks, max_record_bytes, None)
+        .map(|(manifest, blocks, _)| (manifest, blocks))
+}
+
+// Callbacks may validate but must not publish: the record digest is checked
+// after the final callback, including records beyond the requested prefix.
+pub(crate) fn visit_archive_prefix(
+    path: impl AsRef<Path>,
+    expected: &ArchiveManifest,
+    count: u32,
+    visit: &mut dyn FnMut(u32, &[u8]) -> bool,
+) -> Result<bool, ArchiveError> {
+    if count > expected.block_count {
+        return Err(ArchiveError::Invalid("archive prefix count"));
+    }
+    scan_archive_selection(
+        path,
+        Some(expected),
+        expected.first_height,
+        count,
+        MAX_RECORDS_BYTES,
+        Some(visit),
+    )
+    .map(|(_, _, complete)| complete)
+}
+
+type ArchiveVisitor<'a> = &'a mut dyn FnMut(u32, &[u8]) -> bool;
+
+fn scan_archive_selection(
+    path: impl AsRef<Path>,
+    expected: Option<&ArchiveManifest>,
+    first_height: u32,
+    max_blocks: u32,
+    max_record_bytes: u64,
+    mut visit: Option<ArchiveVisitor<'_>>,
+) -> Result<(ArchiveManifest, Vec<Vec<u8>>, bool), ArchiveError> {
     let mut file = File::open(path)?;
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
         return Err(ArchiveError::Invalid("archive too large"));
     }
     let (manifest, records_limit, payload_offset) = read_manifest_header_from(&mut file)?;
+    if expected.is_some_and(|expected| expected != &manifest) {
+        return Err(ArchiveError::Invalid("archive identity changed"));
+    }
     verify_compressed_pieces_from(&mut file, payload_offset, &manifest)?;
     file.seek(SeekFrom::Start(payload_offset))?;
     let mut decoder = zstd::stream::Decoder::new(file)?;
@@ -232,6 +271,8 @@ pub(crate) fn read_archive_batch(
     let mut digest = Sha256::new();
     let mut records_bytes = 0_u64;
     let mut selected_bytes = 0_u64;
+    let mut selected_count = 0_u32;
+    let mut complete = true;
     let mut stopped = first_height < manifest.first_height;
     let mut blocks = Vec::new();
     for offset in 0..manifest.block_count {
@@ -255,7 +296,7 @@ pub(crate) fn read_archive_batch(
             .first_height
             .checked_add(offset)
             .ok_or(ArchiveError::Invalid("height overflow"))?;
-        let wanted = !stopped && height >= first_height && blocks.len() < max_blocks as usize;
+        let wanted = !stopped && height >= first_height && selected_count < max_blocks;
         if wanted && bytes <= max_record_bytes.saturating_sub(selected_bytes) {
             let mut block = vec![0_u8; length];
             bounded
@@ -263,7 +304,13 @@ pub(crate) fn read_archive_batch(
                 .map_err(|error| map_record_read_error(error, "block length"))?;
             digest.update(&block);
             selected_bytes += bytes;
-            blocks.push(block);
+            selected_count += 1;
+            if let Some(visit) = visit.as_mut() {
+                complete = visit(height, &block);
+                stopped |= !complete;
+            } else {
+                blocks.push(block);
+            }
         } else {
             stopped |= wanted;
             let mut remaining = length;
@@ -287,7 +334,7 @@ pub(crate) fn read_archive_batch(
     if crate::utxo::hex_lower(&digest.finalize()) != manifest.records_sha256 {
         return Err(ArchiveError::Invalid("records checksum"));
     }
-    Ok((manifest, blocks))
+    Ok((manifest, blocks, complete))
 }
 
 /// Checks a bounded in-memory archive and returns its consensus-serialized blocks.
@@ -782,7 +829,16 @@ mod tests {
         let bytes = fs::read(&file).unwrap();
         let offset =
             12 + usize::try_from(u32::from_le_bytes(bytes[8..12].try_into().unwrap())).unwrap();
-        let mut invalid = manifest;
+        let mut visited = Vec::new();
+        assert!(
+            visit_archive_prefix(&file, &manifest, 3, &mut |height, raw| {
+                visited.push((height, raw.len()));
+                true
+            })
+            .unwrap()
+        );
+        assert_eq!(visited, vec![(10, 1), (11, 256 * 1024), (12, 1)]);
+        let mut invalid = manifest.clone();
         invalid.records_sha256 = "00".repeat(32);
         let metadata = serde_json::to_vec(&invalid).unwrap();
         let mut changed = MAGIC.to_vec();
@@ -794,6 +850,23 @@ mod tests {
             read_archive_batch(&file, 10, 1, 5),
             Err(ArchiveError::Invalid("records checksum"))
         ));
+        let mut calls = 0;
+        assert!(matches!(
+            visit_archive_prefix(&file, &manifest, 3, &mut |_, _| {
+                calls += 1;
+                true
+            }),
+            Err(ArchiveError::Invalid("archive identity changed"))
+        ));
+        assert_eq!(calls, 0, "identity must be checked before callbacks");
+        assert!(matches!(
+            visit_archive_prefix(&file, &invalid, 3, &mut |_, _| {
+                calls += 1;
+                false
+            }),
+            Err(ArchiveError::Invalid("records checksum"))
+        ));
+        assert_eq!(calls, 1, "early stop still verifies the omitted suffix");
     }
 
     #[test]

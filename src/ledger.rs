@@ -509,6 +509,21 @@ impl PrunedBlockLedger {
         }
     }
 
+    /// Validates a staged prefix in one bounded-memory record traversal.
+    /// The callback must not publish state: success is returned only after the
+    /// entire archive's framing and record digest are checked. A false callback
+    /// stops further callbacks but the remaining records are still verified.
+    pub(crate) fn visit_staged_prefix(
+        &self,
+        expected: &ArchiveManifest,
+        count: u32,
+        visit: &mut dyn FnMut(u32, &[u8]) -> bool,
+    ) -> Result<bool, LedgerError> {
+        let _guard = self.lock();
+        crate::archive::visit_archive_prefix(self.staged_path(), expected, count, visit)
+            .map_err(Into::into)
+    }
+
     /// Reads a bounded contiguous part of a previously verified staged segment.
     /// The complete identity must still match `expected`. This never publishes,
     /// truncates, removes or replaces staged data, even when admission is too

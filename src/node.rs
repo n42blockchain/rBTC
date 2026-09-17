@@ -7913,34 +7913,24 @@ fn visit_staged_prefix(
     count: u32,
     mut visit: impl FnMut(u32, &[u8]) -> Result<bool, String>,
 ) -> Result<bool, String> {
-    if count > expected.block_count {
-        return Err("staged prefix exceeds archive".to_owned());
+    let mut failure = None;
+    let complete = ledger
+        .visit_staged_prefix(
+            expected,
+            count,
+            &mut |height, raw| match visit(height, raw) {
+                Ok(keep_going) => keep_going,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(complete),
     }
-    let mut consumed = 0_u32;
-    while consumed < count {
-        let first = expected
-            .first_height
-            .checked_add(consumed)
-            .ok_or_else(|| "staged prefix height overflow".to_owned())?;
-        let batch = ledger
-            .read_staged_batch(
-                expected,
-                first,
-                (count - consumed).min(16),
-                32 * 1024 * 1024,
-            )
-            .map_err(|error| error.to_string())?;
-        for (offset, raw) in batch.blocks.iter().enumerate() {
-            let height = first
-                .checked_add(u32::try_from(offset).expect("bounded staged batch offset"))
-                .ok_or_else(|| "staged prefix height overflow".to_owned())?;
-            if !visit(height, raw)? {
-                return Ok(false);
-            }
-        }
-        consumed += u32::try_from(batch.blocks.len()).expect("bounded staged batch length");
-    }
-    Ok(true)
 }
 
 fn execute_local_reindex_batch(
