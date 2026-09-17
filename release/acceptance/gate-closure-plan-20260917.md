@@ -33,7 +33,9 @@ not change acceptance statuses or weaken thresholds.
    [Streamed index publication](snapshot-index-streamed-output-20260917.md)
    removes whole encoded output copies. [Build array admission](snapshot-build-tables-memory-20260917.md)
    now charges MPHF scratch/retained arrays and slot tables through the database
-   owner; scanned groups and locations still need bounded storage and admission. [Supporting database caches](supporting-cache-memory-20260917.md)
+   owner. [Snapshot scans](snapshot-scan-spool-20260917.md) now admit location-list
+   growth and spill large decoded groups to charged private files; table storage
+   still scales with input and resource denial is not yet resumable. [Supporting database caches](supporting-cache-memory-20260917.md)
    and maintenance opens now share that owner too; remaining allocations and
    whole-node acceptance are still open.
    [AS-map payloads](asmap-memory-20260917.md) now reserve before startup reads

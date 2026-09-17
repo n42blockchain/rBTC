@@ -20,9 +20,12 @@
 //!
 //! Hash levels and optional fingerprints remain resident at query time; packed
 //! offsets are read from disk. Node-bound builds admit MPHF arrays, slot tables
-//! and publication scratch through the shared memory owner. The scan still
-//! retains all group locations and one whole decoded coin group for canonical
-//! sorting; total build memory is not yet bounded by that owner.
+//! and publication scratch through the shared memory owner. Scans admit group
+//! offsets and location-list growth, spilling large decoded groups to private
+//! temporary files. Location lists and MPHF arrays still scale with input;
+//! resource exhaustion fails closed rather than providing resumable progress.
+
+mod group;
 
 use std::{
     fs::File,
@@ -39,7 +42,7 @@ use crate::{
     core_snapshot::{
         CoreSnapshotError, CoreSnapshotMetadata, MAX_COINS_PER_TXID, METADATA_BYTES,
         decompress_amount, decompress_script, find_anchor, network_for_magic, read_compact_size,
-        read_core_varint, read_metadata, update_core_utxo_hash,
+        read_core_varint, read_metadata,
     },
     mphf::{Mphf, MphfError},
     snapshot::Core31AssumeUtxoAnchor,
@@ -280,6 +283,8 @@ struct ScannedSnapshot {
     snapshot_bytes: u64,
     /// Offset just past the last coin, so the widest group can be measured.
     coin_bytes_end: u64,
+    // The location Vec is dropped before its reservation.
+    _locations_memory: Option<crate::node_memory::MemoryLease>,
 }
 
 /// One txid group's position in the snapshot.
@@ -309,10 +314,16 @@ pub fn build_core_snapshot_index(
     index_path: impl AsRef<Path>,
 ) -> Result<CoreSnapshotIndexReport, CoreSnapshotIndexError> {
     let snapshot_path = snapshot_path.as_ref();
+    let memory = crate::node_memory::for_path(index_path.as_ref())?;
+    let read_memory = memory
+        .as_ref()
+        .map(|budget| budget.reserve(64 * 1024))
+        .transpose()?;
     let mut reader = BufReader::new(File::open(snapshot_path)?);
     let metadata = read_metadata(&mut reader)?;
     let anchor = find_anchor(metadata)?;
     drop(reader);
+    drop(read_memory);
     build_core_snapshot_index_with_identity(snapshot_path, index_path, &anchor_identity(anchor)?)
 }
 
@@ -369,7 +380,13 @@ pub(crate) fn build_with_identity_and_memory(
         snapshot_sha256,
         snapshot_bytes,
         coin_bytes_end,
-    } = scan_snapshot(snapshot_path, identity)?;
+        _locations_memory: locations_memory,
+    } = scan_snapshot(
+        snapshot_path,
+        identity,
+        staging_directory(index_path),
+        memory,
+    )?;
 
     let groups = u64::try_from(locations.len()).expect("group count fits u64");
     let mphf = Mphf::build_with_memory(
@@ -384,17 +401,7 @@ pub(crate) fn build_with_identity_and_memory(
         .map(|location| location.offset)
         .max()
         .expect("scan yields at least one group");
-    // The widest group this snapshot actually contains, measured rather than
-    // bounded by the format's theoretical ceiling. This caps the streaming
-    // decoder's read span even if a stored group count is damaged.
-    let max_group_bytes = locations
-        .windows(2)
-        .map(|pair| pair[1].offset.saturating_sub(pair[0].offset))
-        .chain(std::iter::once(coin_bytes_end.saturating_sub(
-            locations.last().expect("at least one group").offset,
-        )))
-        .max()
-        .expect("scan yields at least one group");
+    let max_group_bytes = max_group_span(&locations, coin_bytes_end);
     let offset_bits = bit_width(max_offset);
     let entry_bits = u64::from(offset_bits);
     let table_words = usize::try_from(
@@ -430,6 +437,7 @@ pub(crate) fn build_with_identity_and_memory(
     // These build inputs are no longer needed once all slots are populated.
     drop(occupied);
     drop(locations);
+    drop(locations_memory);
     let mut bytes = Vec::with_capacity(INDEX_HEADER_BYTES);
     bytes.extend_from_slice(INDEX_MAGIC);
     bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
@@ -467,6 +475,20 @@ pub(crate) fn build_with_identity_and_memory(
     })
 }
 
+fn max_group_span(locations: &[GroupLocation], coin_bytes_end: u64) -> u64 {
+    // The widest group this snapshot actually contains, measured rather than
+    // bounded by the format's theoretical ceiling. This caps the streaming
+    // decoder's read span even if a stored group count is damaged.
+    locations
+        .windows(2)
+        .map(|pair| pair[1].offset.saturating_sub(pair[0].offset))
+        .chain(std::iter::once(coin_bytes_end.saturating_sub(
+            locations.last().expect("at least one group").offset,
+        )))
+        .max()
+        .expect("scan yields at least one group")
+}
+
 // Keep this lease through publication; MPHF and old-base owners remain live.
 fn reserve_build_tables(
     memory: Option<&crate::node_memory::MemoryBudget>,
@@ -482,6 +504,42 @@ fn reserve_build_tables(
     memory.map(|budget| budget.reserve(allowance)).transpose()
 }
 
+fn staging_directory(index_path: &Path) -> &Path {
+    index_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn push_location(
+    locations: &mut Vec<GroupLocation>,
+    reservation: &mut Option<crate::node_memory::MemoryLease>,
+    memory: Option<&crate::node_memory::MemoryBudget>,
+    location: GroupLocation,
+) -> std::io::Result<()> {
+    if locations.len() == locations.capacity() {
+        let capacity = locations
+            .capacity()
+            .checked_mul(2)
+            .map(|n| n.max(64))
+            .ok_or_else(|| std::io::Error::other("snapshot location capacity overflow"))?;
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<GroupLocation>())
+            .filter(|n| isize::try_from(*n).is_ok())
+            .ok_or_else(|| std::io::Error::other("snapshot location size overflow"))?;
+        // Hold the old allocation's lease until replacement allocation succeeds.
+        let replacement = memory
+            .map(|budget| budget.reserve(bytes as u64))
+            .transpose()?;
+        locations
+            .try_reserve_exact(capacity - locations.len())
+            .map_err(std::io::Error::other)?;
+        *reservation = replacement;
+    }
+    locations.push(location);
+    Ok(())
+}
+
 /// Streams the snapshot once, enforcing the same canonical-form rules as the
 /// activation loader, and returns per-coin file locations plus the transport
 /// digest. Rejects the file unless Core's UTXO-set commitment matches the
@@ -490,7 +548,11 @@ fn reserve_build_tables(
 fn scan_snapshot(
     snapshot_path: &Path,
     identity: &SnapshotBaseIdentity,
+    directory: &Path,
+    memory: Option<&crate::node_memory::MemoryBudget>,
 ) -> Result<ScannedSnapshot, CoreSnapshotIndexError> {
+    let _reader_memory = memory.map(|budget| budget.reserve(64 * 1024)).transpose()?;
+    let mut locations_memory = None;
     let mut reader = DigestReader::new(BufReader::new(File::open(snapshot_path)?));
     let metadata = read_metadata(&mut reader)?;
     if metadata.base_block_hash != identity.block_hash {
@@ -515,11 +577,8 @@ fn scan_snapshot(
         if group_count == 0 || group_count > remaining || group_count > MAX_COINS_PER_TXID {
             return Err(CoreSnapshotError::Invalid("invalid coins-per-txid count").into());
         }
-        let mut group = Vec::with_capacity(
-            usize::try_from(group_count).expect("bounded group count fits usize"),
-        );
+        let mut group = group::Group::new(group_count, memory)?;
         for _ in 0..group_count {
-            let coin_offset = reader.position();
             let vout = read_compact_size(&mut reader)?;
             let vout =
                 u32::try_from(vout).map_err(|_| CoreSnapshotError::Invalid("vout overflow"))?;
@@ -540,46 +599,35 @@ fn scan_snapshot(
                 return Err(CoreSnapshotError::Invalid("amount exceeds MAX_MONEY").into());
             }
             let script_pubkey = decompress_script(&mut reader)?;
-            group.push((
+            group.push(
                 vout,
-                coin_offset,
-                height,
-                code & 1 == 1,
-                value_sats,
-                script_pubkey,
-            ));
-            remaining -= 1;
-        }
-        // Core's database cursor order is not numeric vout order; the
-        // commitment hashes the numerically sorted group and duplicate vouts
-        // are rejected, exactly as the activation loader does.
-        group.sort_unstable_by_key(|(vout, ..)| *vout);
-        if group.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(CoreSnapshotError::Invalid("duplicate output index").into());
-        }
-        for (vout, _coin_offset, height, is_coinbase, value_sats, script_pubkey) in group {
-            let mut key = [0_u8; 36];
-            key[..32].copy_from_slice(&txid);
-            key[32..].copy_from_slice(&vout.to_le_bytes());
-            update_core_utxo_hash(
-                &mut core_hash,
-                OutPointKey::from_bytes(&key).expect("fixed key length"),
                 &Utxo {
                     value_sats,
                     height,
-                    is_coinbase,
+                    is_coinbase: code & 1 == 1,
                     last_touched: 0,
                     creation_mtp: 0,
                     script_pubkey,
                 },
-            );
+                directory,
+                memory,
+            )?;
+            remaining -= 1;
         }
+        // Sort offsets, then hash only first-pass decoded data from bounded
+        // memory or our private spool, never by rereading the mutable input.
+        group.hash(txid, &mut core_hash)?;
         // One record per group, not per coin: the commitment above still
         // walks every coin, but the index only needs to find the group.
-        locations.push(GroupLocation {
-            txid,
-            offset: txid_offset,
-        });
+        push_location(
+            &mut locations,
+            &mut locations_memory,
+            memory,
+            GroupLocation {
+                txid,
+                offset: txid_offset,
+            },
+        )?;
     }
     // Where the coin stream ends, so the widest group can be measured.
     let coin_bytes_end = reader.position();
@@ -602,6 +650,7 @@ fn scan_snapshot(
         snapshot_sha256,
         snapshot_bytes,
         coin_bytes_end,
+        _locations_memory: locations_memory,
     })
 }
 
@@ -884,12 +933,19 @@ impl CoreSnapshotUtxoIndex {
             ));
         }
         let opened = Self::open(index_path, snapshot_path.as_ref())?;
-        let scanned = scan_snapshot(snapshot_path.as_ref(), identity)?;
+        let memory = crate::node_memory::for_path(index_path)?;
+        let scanned = scan_snapshot(
+            snapshot_path.as_ref(),
+            identity,
+            staging_directory(index_path),
+            memory.as_ref(),
+        )?;
         if u64::try_from(scanned.groups.len()).ok() != Some(opened.groups) {
             return Err(CoreSnapshotIndexError::IdentityMismatch(
                 "snapshot group count does not match the index",
             ));
         }
+        let _fingerprints_memory = reserve_build_tables(memory.as_ref(), 0, opened.groups)?;
         let mut fingerprints =
             vec![0_u16; usize::try_from(opened.groups).expect("group count fits usize")];
         for location in &scanned.groups {
@@ -1598,6 +1654,65 @@ mod tests {
     }
 
     #[test]
+    fn location_growth_admission_keeps_old_payload_and_refunds_replacement() {
+        use crate::node_memory::MemoryBudget;
+        let capacity_bytes = 64 * std::mem::size_of::<GroupLocation>() as u64;
+        let budget = MemoryBudget::new(8 * capacity_bytes);
+        let mut reservation = None;
+        let mut locations = Vec::new();
+        for offset in 0..64 {
+            push_location(
+                &mut locations,
+                &mut reservation,
+                Some(&budget),
+                GroupLocation {
+                    txid: [1; 32],
+                    offset,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(locations.capacity(), 64);
+        assert_eq!(budget.snapshot().used, capacity_bytes);
+        let pressure = budget
+            .reserve(budget.snapshot().limit - capacity_bytes * 3 + 1)
+            .unwrap();
+        let before = budget.snapshot().used;
+        assert!(
+            push_location(
+                &mut locations,
+                &mut reservation,
+                Some(&budget),
+                GroupLocation {
+                    txid: [2; 32],
+                    offset: 64
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(budget.snapshot().used, before);
+        assert_eq!(locations.len(), 64);
+        assert_eq!(locations.capacity(), 64);
+        assert_eq!(locations.last().unwrap().offset, 63);
+        drop(pressure);
+        push_location(
+            &mut locations,
+            &mut reservation,
+            Some(&budget),
+            GroupLocation {
+                txid: [2; 32],
+                offset: 64,
+            },
+        )
+        .unwrap();
+        assert_eq!(locations.capacity(), 128);
+        assert_eq!(budget.snapshot().used, capacity_bytes * 2);
+        drop(locations);
+        drop(reservation);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
     fn large_group_lookup_streams_with_bounded_scratch_and_honors_ceiling() {
         let directory = TempDir::new().unwrap();
         let txid = [9; 32];
@@ -1615,7 +1730,13 @@ mod tests {
         fs::write(&snapshot, &bytes).unwrap();
         let identity = authenticated_identity(&snapshot, [7; 32], directory.path());
         let index_path = directory.path().join("large.idx");
+        let budget = crate::node_memory::MemoryBudget::new(4 << 20);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
         build_core_snapshot_index_with_identity(&snapshot, &index_path, &identity).unwrap();
+        assert_eq!(budget.snapshot().used, 0);
+        assert!(budget.snapshot().peak < 256 * 1024);
+        assert!(budget.spool_snapshot().peak > 640_000);
+        assert_eq!(budget.spool_snapshot().used, 0);
         let mut index = CoreSnapshotUtxoIndex::open(&index_path, &snapshot).unwrap();
         let last = OutPoint::new(Txid::from_byte_array(txid), 63);
         let key = OutPointKey::from(last);
@@ -1728,7 +1849,8 @@ mod tests {
             .unwrap();
         let occupied = budget.snapshot().used;
         let path = directory.path().join("new.idx");
-        // MPHF fits, but table/publication admission must fail before any output.
+        // Neither publication scratch nor the full scan fits beside this live owner.
+        assert!(reserve_build_tables(Some(&budget), 0, 1).is_err());
         assert!(matches!(
             build_core_snapshot_index_with_identity(&snapshot, &path, &identity),
             Err(CoreSnapshotIndexError::Io(_))
