@@ -271,6 +271,7 @@ fn bind_with_limits(
 
 #[derive(Debug)]
 struct Backend {
+    memory: Option<crate::node_memory::MemoryLease>,
     file: Mutex<File>,
     path: PathBuf,
     pool: Arc<Budget>,
@@ -279,6 +280,9 @@ struct Backend {
 impl Backend {
     fn open(path: &Path, fresh: bool, cache: u64, pool: Arc<Budget>) -> io::Result<Self> {
         // Reserve before opening a file or allocating an engine cache.
+        let memory = crate::node_memory::for_path(pool.directory.as_deref().unwrap_or(path))?
+            .map(|budget| budget.reserve(cache))
+            .transpose()?;
         pool.reserve(cache, 0)?;
         let opened = (|| {
             let _ = inventory::file_len(path)?;
@@ -297,6 +301,7 @@ impl Backend {
         })();
         match opened {
             Ok((file, path)) => Ok(Self {
+                memory,
                 file: Mutex::new(file),
                 path,
                 pool,
@@ -349,6 +354,11 @@ impl StorageBackend for Backend {
         }
         // Reserve the in-flight allocation before reading; once returned it is
         // owned by redb, whose configured cache is reserved separately.
+        let _memory_read = self
+            .memory
+            .as_ref()
+            .map(|lease| lease.reserve_additional(len as u64))
+            .transpose()?;
         self.pool.reserve(len as u64, 0)?;
         let _read = ReadReservation {
             pool: &self.pool,

@@ -31,6 +31,8 @@ use thiserror::Error;
 
 #[derive(Default)]
 struct RuntimeControl {
+    memory: std::sync::OnceLock<crate::node_memory::MemoryBudget>,
+    admission: std::sync::OnceLock<crate::admission_resources::AdmissionBudget>,
     shutdown_requested: AtomicBool,
     checkpoints_in_flight: AtomicUsize,
     shutdown_notify: tokio::sync::Notify,
@@ -195,8 +197,8 @@ const DEFAULT_VALIDATION_BATCH_SIZE: usize = 256;
 const VALIDATION_BLOCK_WINDOW_SIZE: usize = MAX_BLOCKS_IN_FLIGHT * 4;
 const MAX_VALIDATION_BATCH_SIZE: usize = 1_008;
 const MAX_VALIDATION_PREFETCH_BATCH_SIZE: usize = MAX_VALIDATION_BATCH_SIZE;
-const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
-const BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const BULK_VALIDATION_CHAINSTATE_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const BACKGROUND_PIPELINE_CHAINSTATE_CACHE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const STANDBY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const STANDBY_REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -751,6 +753,10 @@ impl Default for NodeStorageConfig {
 /// Bounded peer and transaction-pool resources for one node instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeResourceConfig {
+    /// Aggregate ceiling for registered memory reservations, in bytes.
+    /// This is not an RSS ceiling; unregistered allocations remain observable
+    /// only through whole-node acceptance measurements.
+    pub memory_budget_bytes: u64,
     /// Maximum automatically discovered hot standby sessions.
     pub automatic_hot_standbys: usize,
     /// Maximum admitted mempool transactions.
@@ -978,6 +984,7 @@ pub type NodeLogConfig = LogConfig;
 impl Default for NodeResourceConfig {
     fn default() -> Self {
         Self {
+            memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
             automatic_hot_standbys: DEFAULT_AUTOMATIC_HOT_STANDBYS,
             mempool_max_transactions: MAX_ADMITTED_TRANSACTIONS,
             mempool_max_bytes: MAX_ADMITTED_TRANSACTION_BYTES,
@@ -1589,7 +1596,88 @@ fn validate_peer_options(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+// Admission for the known simultaneous cache plan plus 1 GiB of room for
+// Headers and candidates. This is a startup lower bound, not a total RSS proof.
+fn validate_memory_plan(options: &Options) -> Result<(), String> {
+    let limit = options.resources.memory_budget_bytes;
+    if !(1024 * 1024 * 1024..=1024_u64.pow(4)).contains(&limit) {
+        return Err("memory reservation budget must be between 1 GiB and 1 TiB".to_owned());
+    }
+    let cache = if options.background_assumeutxo.is_some() {
+        (options.cache.background_chainstate_bytes as u64).checked_mul(2)
+    } else if options.finalize_assumeutxo.is_some() || options.complete_assumeutxo.is_some() {
+        (options.cache.active_chainstate_bytes as u64).checked_mul(2)
+    } else if matches!(
+        options.offline_action,
+        Some(OfflineAction::ReindexFromFreezer { .. } | OfflineAction::ReindexChainstate { .. })
+    ) {
+        (options.cache.bulk_validation_bytes as u64)
+            .checked_add(options.cache.active_chainstate_bytes as u64)
+    } else {
+        Some(chainstate_cache_bytes(options.network_execution, false, options.cache) as u64)
+    };
+    let required = cache.and_then(|bytes| bytes.checked_add(1024 * 1024 * 1024));
+    if required.is_none_or(|bytes| bytes > limit) {
+        return Err("startup cache plan plus header/candidate headroom exceeds node memory reservation budget".to_owned());
+    }
+    Ok(())
+}
+
+fn runtime_memory(options: &Options) -> crate::node_memory::MemoryBudget {
+    options
+        .runtime_control
+        .memory
+        .get_or_init(|| {
+            crate::node_memory::MemoryBudget::new(options.resources.memory_budget_bytes)
+        })
+        .clone()
+}
+
+fn runtime_admission_budget(options: &Options) -> crate::admission_resources::AdmissionBudget {
+    options
+        .runtime_control
+        .admission
+        .get_or_init(|| {
+            crate::admission_resources::AdmissionBudget::with_memory(
+                crate::admission_resources::AdmissionResourceLimits::default(),
+                Some(runtime_memory(options)),
+            )
+        })
+        .clone()
+}
+
+fn bind_runtime_memory(options: &Options) -> Result<(), String> {
+    validate_memory_plan(options)?;
+    let memory = runtime_memory(options);
+    if memory.snapshot().limit != options.resources.memory_budget_bytes {
+        return Err("cannot change a live runtime memory budget".to_owned());
+    }
+    let mut roots = Vec::new();
+    roots.extend(options.data_dir.iter().cloned());
+    roots.extend(options.background_assumeutxo.iter().cloned());
+    roots.extend(options.complete_assumeutxo.iter().cloned());
+    roots.extend(options.finalize_assumeutxo.iter().cloned());
+    if let Some(path) = &options.headers_db {
+        roots.push(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .to_owned(),
+        );
+    }
+    if let Some(
+        OfflineAction::ReindexFromFreezer { output } | OfflineAction::ReindexChainstate { output },
+    ) = &options.offline_action
+    {
+        roots.push(output.clone());
+    }
+    memory
+        .bind(&roots)
+        .map_err(|error| format!("node memory admission: {error}"))
+}
+
 fn validate_storage_options(options: &Options) -> Result<(), String> {
+    validate_memory_plan(options)?;
     if !(MIN_PRUNE_RETENTION_BLOCKS..=MAX_PRUNE_RETENTION_BLOCKS)
         .contains(&options.ledger_retention.max_blocks)
     {
@@ -3559,6 +3647,7 @@ struct NodeStatusProgress {
 
 #[derive(Clone)]
 struct NodeStatus {
+    memory: Option<crate::node_memory::MemoryBudget>,
     started: Instant,
     progress: Arc<Mutex<NodeStatusProgress>>,
     inbound: Option<Arc<InboundStats>>,
@@ -4999,6 +5088,7 @@ struct NodeTrustResponse {
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct NodeStatusResponse {
+    memory_reservations: Option<crate::node_memory::MemorySnapshot>,
     network: String,
     phase: &'static str,
     ready: bool,
@@ -5148,14 +5238,20 @@ impl NodeStatus {
             started: Instant::now(),
             progress: Arc::new(Mutex::new(progress)),
             inbound: None,
+            memory: None,
         }
     }
 
-    fn with_inbound(progress: NodeStatusProgress, inbound: Option<Arc<InboundStats>>) -> Self {
+    fn with_inbound(
+        progress: NodeStatusProgress,
+        inbound: Option<Arc<InboundStats>>,
+        memory: Option<crate::node_memory::MemoryBudget>,
+    ) -> Self {
         Self {
             started: Instant::now(),
             progress: Arc::new(Mutex::new(progress)),
             inbound,
+            memory,
         }
     }
 
@@ -5204,6 +5300,10 @@ impl NodeStatus {
             "assumed_ready"
         };
         NodeStatusResponse {
+            memory_reservations: self
+                .memory
+                .as_ref()
+                .map(crate::node_memory::MemoryBudget::snapshot),
             network: progress.network,
             phase,
             ready,
@@ -6803,6 +6903,7 @@ fn read_owner_only_text_file(
 
 #[allow(clippy::too_many_lines)]
 async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String> {
+    bind_runtime_memory(&options)?;
     if let Some(OfflineAction::DownloadCoreSnapshot(config)) = &options.offline_action {
         let report = download_snapshot(config).map_err(|error| error.to_string())?;
         println!(
@@ -8266,7 +8367,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         .inbound_listen
         .map_or_else(|| "disabled".to_owned(), |address| address.to_string());
     format!(
-        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} private_broadcast={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
+        "startup configuration network={} data_dir={} preferred_peers={} dns={} onlynet={:?} proxy={} v2_transport={} asmap={} cjdns_reachable={} private_broadcast={} zmq={} torcontrol={} i2psam={} automatic_hot_standbys={} once={} full_rbf={} txindex={} spent_output_index={} block_filter_index={} inbound={} max_inbound_peers={} max_inbound_per_ip={} max_upload_bytes_per_day={} inbound_requests_per_minute={} mempool_max_transactions={} mempool_max_bytes={} memory_budget_bytes={} cache_active_bytes={} cache_background_bytes={} cache_bulk_bytes={} prune_blocks={} prune_bytes={} minimum_free_bytes={} log_level={} log_max_bytes={} log_max_files={} validation={} validation_batch={} validation_pause_ms={} validation_quick_repair={} api={} rpc={} wallet={}",
         options.network,
         options
             .data_dir
@@ -8310,6 +8411,7 @@ fn startup_configuration_summary(options: &Options) -> String {
         options.inbound_limits.max_requests_per_minute,
         options.resources.mempool_max_transactions,
         options.resources.mempool_max_bytes,
+        options.resources.memory_budget_bytes,
         options.cache.active_chainstate_bytes,
         options.cache.background_chainstate_bytes,
         options.cache.bulk_validation_bytes,
@@ -8622,7 +8724,7 @@ async fn run_peer_pool(
         local_nonce,
         background_validation,
         validation_scheduler,
-        crate::admission_resources::AdmissionBudget::default(),
+        runtime_admission_budget(options),
     )
     .await
 }
@@ -9107,6 +9209,7 @@ async fn run_background_assumeutxo(
     // instead of after every catch-up checkpoint.
     active_options.validation_limits = active_assumeutxo_limits(options.validation_limits);
 
+    let admission_budget = runtime_admission_budget(&options);
     let mut validation_options = options;
     validation_options.data_dir = Some(validation_dir.clone());
     validation_options.once = false;
@@ -9123,7 +9226,6 @@ async fn run_background_assumeutxo(
         assumed.base.height,
         assumed.base.hash
     );
-    let admission_budget = crate::admission_resources::AdmissionBudget::default();
     let validation_admission = admission_budget.clone();
     let validation_status = status.clone();
     let validation = tokio::spawn(async move {
@@ -13799,6 +13901,7 @@ async fn sync_validating_node(
                     inbound_enabled
                         .then(|| inbound_source.map(|source| source.stats()))
                         .flatten(),
+                    runtime_control.memory.get().cloned(),
                 )
             })
         })
@@ -17155,6 +17258,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
     let mut automatic_hot_standbys = None;
     let mut mempool_max_transactions = None;
     let mut mempool_max_bytes = None;
+    let mut memory_budget_bytes = None;
     let mut log_level = None;
     let mut log_dir = None;
     let mut log_max_bytes = None;
@@ -17956,6 +18060,19 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
                     value
                         .parse::<usize>()
                         .map_err(|_| format!("invalid mempool transaction target: {value}"))?,
+                );
+            }
+            "--memory-budget-bytes" => {
+                if memory_budget_bytes.is_some() {
+                    return Err(
+                        "--memory-budget-bytes cannot be supplied more than once".to_owned()
+                    );
+                }
+                let value = required_option_value(&mut args, "--memory-budget-bytes")?;
+                memory_budget_bytes = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid memory budget: {value}"))?,
                 );
             }
             "--mempool-max-bytes" => {
@@ -19164,6 +19281,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             preferred_peer_ips: preferred_inbound_ips,
         },
         resources: NodeResourceConfig {
+            memory_budget_bytes: memory_budget_bytes.unwrap_or(crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES),
             automatic_hot_standbys: automatic_hot_standbys
                 .unwrap_or(DEFAULT_AUTOMATIC_HOT_STANDBYS),
             mempool_max_transactions: mempool_max_transactions.unwrap_or(MAX_ADMITTED_TRANSACTIONS),
@@ -19269,7 +19387,7 @@ fn print_usage() {
             "  rbtcd --config PATH [COMMAND-LINE OVERRIDES]\n",
             "  rbtcd [--connect HOST:PORT ...] [--dns-seed HOST[:PORT] ... | --no-dns-seeds] [--network bitcoin|testnet|testnet4|signet|regtest]\n",
             "  rbtcd [PEER OPTIONS] --headers-db PATH [--network NETWORK] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
-            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion|i2p ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--i2psam 127.0.0.1:7656] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
+            "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet|testnet4|signet|regtest [--onlynet ipv4|ipv6|onion|i2p ...] [--proxy IP:PORT --no-dns-seeds] [--v2-transport] [--txindex] [--spent-output-index] [--block-filter-index] [--listen IP:PORT [--external-address IP:PORT] [--whitelist IP ...] [--max-inbound-peers 1..256] [--max-inbound-peers-per-ip N] [--max-upload-bytes-per-day BYTES] [--inbound-requests-per-minute 60..100000]] [--automatic-hot-standbys 0..16] [--mempool-max-transactions 1..300000] [--mempool-max-bytes 4000000..1073741824] [--memory-budget-bytes BYTES] [--prune-blocks 288..1008] [--prune-max-bytes BYTES] [--minimum-free-bytes 536870912..1099511627776] [--chainstate-cache-bytes BYTES] [--background-chainstate-cache-bytes BYTES] [--bulk-validation-cache-bytes BYTES] [--log-level error|warn|info|debug] [--log-dir PATH] [--log-max-bytes 1048576..1073741824] [--log-max-files 2..20] [--mempool-full-rbf] [--once] [--explorer-listen 127.0.0.1:3000 [--rpc-auth-token-file PATH] [--wallet-descriptors PATH --wallet-auth-token-file PATH]] [--zmq-listen 127.0.0.1:28332] [--torcontrol 127.0.0.1:9051 --torcontrol-cookie PATH] [--i2psam 127.0.0.1:7656] [--vbparams taproot:START:END[:MIN_HEIGHT]] [--testactivationheight NAME@HEIGHT] [--signetchallenge HEX] [--signetseednode HOST[:PORT] ...] [--minimum-chainwork HEX] [--assumevalid HASH|0]\n",
             "  rbtcd [PEER OPTIONS] --data-dir PATH --network bitcoin|testnet --experimental-network-execution --once [--extend-validation-target] --validate-until-height HEIGHT --validate-until-blockhash HASH [--validation-deferred-repair]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --background-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir] [--once] [EXPLORER/RPC/WALLET OPTIONS]\n",
             "  rbtcd [PEER OPTIONS] --data-dir ACTIVE --network bitcoin|testnet|testnet4|signet|regtest --complete-assumeutxo VALIDATION_DATA_DIR [--validation-batch-size N] [--validation-pause-ms MS] [--cleanup-validation-dir]\n",
@@ -19307,6 +19425,7 @@ mod tests {
     mod header_resync;
     mod inbound_projection;
     mod index_recovery;
+    mod memory_budget;
     #[cfg(feature = "mdbx")]
     mod overlay_replay;
     mod private_broadcast_interop;
@@ -25175,6 +25294,7 @@ mod tests {
         assert_eq!(
             options.resources,
             NodeResourceConfig {
+                memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
                 automatic_hot_standbys: 12,
                 mempool_max_transactions: 4_096,
                 mempool_max_bytes: 300 * 1024 * 1024,
@@ -25462,6 +25582,7 @@ mod tests {
         assert_eq!(
             options.resources,
             NodeResourceConfig {
+                memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
                 automatic_hot_standbys: 10,
                 mempool_max_transactions: 2_048,
                 mempool_max_bytes: 300 * 1024 * 1024,
@@ -25511,6 +25632,7 @@ mod tests {
             bulk_validation_bytes: 1024 * 1024 * 1024,
         };
         config.resources = NodeResourceConfig {
+            memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
             automatic_hot_standbys: 4,
             mempool_max_transactions: 4_096,
             mempool_max_bytes: 300 * 1024 * 1024,
@@ -25563,6 +25685,7 @@ mod tests {
         assert_eq!(
             options.resources,
             NodeResourceConfig {
+                memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
                 automatic_hot_standbys: 4,
                 mempool_max_transactions: 4_096,
                 mempool_max_bytes: 300 * 1024 * 1024,
@@ -25658,6 +25781,7 @@ mod tests {
             .once(true)
             .mempool_full_rbf(true)
             .resources(NodeResourceConfig {
+                memory_budget_bytes: crate::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
                 automatic_hot_standbys: 2,
                 mempool_max_transactions: 1_024,
                 mempool_max_bytes: 64 * 1024 * 1024,

@@ -1372,9 +1372,7 @@ impl RedbChainStore {
         // Convert that boundary panic into an explicit startup rejection so a
         // damaged chainstate cannot take the daemon down without diagnosis.
         let mut database = catch_unwind(AssertUnwindSafe(|| {
-            Database::builder()
-                .set_cache_size(options.cache_size_bytes)
-                .create(path)
+            crate::node_memory::open_redb(path.as_ref(), options.cache_size_bytes)
         }))
         .map_err(|_| ChainStoreError::Damaged)??;
         if !options.retain_block_undo && clear_block_undos_database(&database)? {

@@ -46,8 +46,9 @@ prune_blocks=1008
 prune_max_bytes=1073741824
 minimum_free_bytes=5368709120
 chainstate_cache_bytes=1073741824
-background_chainstate_cache_bytes=8589934592
-bulk_validation_cache_bytes=17179869184
+background_chainstate_cache_bytes=4294967296
+bulk_validation_cache_bytes=8589934592
+memory_budget_bytes=17179869184
 
 [bitcoin]
 connect=203.0.113.10:8333
@@ -269,3 +270,12 @@ must not be a symlink. Authenticated `getloginfo` reports the effective level
 and dropped count; `setloglevel ["error"|"warn"|"info"|"debug"]` changes the
 level without restart. Embedded hosts do not install this process-global sink
 and instead consume the bounded typed status/event receivers.
+
+`memory_budget_bytes` (`--memory-budget-bytes`) caps shared reservations for
+chainstate caches, Headers caches/read buffers and admission candidates. The
+default is 16 GiB. Startup rejects a known simultaneous cache plan that cannot
+leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
+settings. The status API exposes `memory_reservations` (limit, used, peak).
+These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
+pages, additional databases and other unregistered allocations still require
+integration and whole-node acceptance. The overall memory gate remains open.

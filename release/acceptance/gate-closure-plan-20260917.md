@@ -20,7 +20,9 @@ not change acceptance statuses or weaken thresholds.
    [Concurrent background Header pipelines](header-background-budget-20260917.md)
    share those allowances. [Snapshot activation and finalization](snapshot-header-memory-20260917.md)
    now use disk history and configured caches. [Offline reindex and verification](offline-header-memory-20260917.md)
-   also use disk history. Aggregate node resources and whole-node acceptance remain.
+   also use disk history. A [shared node memory owner](node-memory-owner-20260917.md)
+   now connects chainstate/Header caches and admission candidates with configurable
+   startup preflight; remaining allocations and whole-node acceptance are still open.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

@@ -317,6 +317,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         bulk_validation_bytes: 1024 * 1024 * 1024,
     };
     config.resources = NodeResourceConfig {
+        memory_budget_bytes: rbtc::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
         automatic_hot_standbys: 4,
         mempool_max_transactions: 4_096,
         mempool_max_bytes: 300 * 1024 * 1024,

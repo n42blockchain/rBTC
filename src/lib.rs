@@ -44,6 +44,7 @@ pub mod mdbx_utxo;
 pub mod merkle_proof;
 pub mod mphf;
 pub mod node;
+pub mod node_memory;
 pub mod p2p;
 pub mod p2p_v2;
 pub mod peer_store;

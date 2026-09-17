@@ -80,6 +80,7 @@ struct State {
 }
 
 struct Shared {
+    memory: Option<crate::node_memory::MemoryBudget>,
     limits: AdmissionResourceLimits,
     state: Mutex<State>,
 }
@@ -98,7 +99,17 @@ impl AdmissionBudget {
     /// Creates an independent node ledger with explicit limits.
     #[must_use]
     pub fn new(limits: AdmissionResourceLimits) -> Self {
+        Self::with_memory(limits, None)
+    }
+
+    /// Creates a stage ledger whose candidate leases also debit the node ledger.
+    #[must_use]
+    pub fn with_memory(
+        limits: AdmissionResourceLimits,
+        memory: Option<crate::node_memory::MemoryBudget>,
+    ) -> Self {
         Self(Arc::new(Shared {
+            memory,
             limits,
             state: Mutex::new(State {
                 remaining: limits.work_burst,
@@ -172,11 +183,26 @@ impl AdmissionBudget {
                 reason: "shared candidate memory allowance exhausted",
             });
         };
+        let memory = self
+            .0
+            .memory
+            .as_ref()
+            .map(|budget| budget.reserve(bytes as u64))
+            .transpose()
+            .map_err(|_| {
+                let index = AdmissionStage::Metadata as usize;
+                state.counters.deferred[index] = state.counters.deferred[index].saturating_add(1);
+                AdmissionDeferred {
+                    stage: AdmissionStage::Metadata,
+                    reason: "node memory reservation allowance exhausted",
+                }
+            })?;
         state.counters.candidate_bytes = total;
         state.counters.peak_candidate_bytes = state.counters.peak_candidate_bytes.max(total);
         Ok(CandidateReservation {
             shared: Arc::clone(&self.0),
             bytes,
+            _memory: memory,
         })
     }
 
@@ -194,6 +220,7 @@ impl AdmissionBudget {
 
 /// A non-cloneable lease released on success, error, unwind or cancellation.
 pub struct CandidateReservation {
+    _memory: Option<crate::node_memory::MemoryLease>,
     shared: Arc<Shared>,
     bytes: usize,
 }
