@@ -172,6 +172,7 @@ pub struct SnapshotOverlayChainstate {
     snapshot_path: PathBuf,
     index_path: PathBuf,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 impl SnapshotOverlayChainstate {
@@ -258,7 +259,10 @@ impl SnapshotOverlayChainstate {
                 "creation-MTP table must cover exactly heights 0..=base",
             ));
         }
+        let execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(&config.database_dir)?;
         Ok(Self {
+            execution_spool,
             environment_allowance: db.allowance(),
             db: Some(db),
             database_dir: config.database_dir,
@@ -1780,6 +1784,10 @@ impl UtxoStore for SnapshotOverlayChainstate {
 }
 
 impl ExecutionChainStore for SnapshotOverlayChainstate {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn take_commit_profile(&self) -> Option<[u64; 5]> {
         Some(self.commit_profile.take_millis())
     }

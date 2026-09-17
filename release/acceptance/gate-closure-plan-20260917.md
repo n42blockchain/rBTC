@@ -55,7 +55,8 @@ not change acceptance statuses or weaken thresholds.
    on late engine failures; its compatibility copies remain to be bounded.
    [Execution preparation spooling](execution-preparation-spool-20260917.md) now
    evicts completed ordinary redb preparation results and admits codec memory
-   and temporary bytes before allocation/growth. Preparation inputs, indexed
+   and temporary bytes before allocation/growth. [MDBX and snapshot overlays](overlay-execution-spool-20260917.md)
+   now share that context through maintenance too. Preparation inputs, indexed
    paths, resumable resource scheduling and whole-node acceptance remain open.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact

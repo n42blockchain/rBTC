@@ -278,8 +278,10 @@ pipelines, optional indexes, explorer and wallet rebroadcast caches. It rejects
 a known simultaneous cache plan that cannot
 leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
 settings. The status API exposes `memory_reservations` (limit, used, peak).
-The ordinary redb batch path (without indexes requesting applied undo copies)
-spools completed preparation to anonymous files in the chainstate directory.
+Node-bound redb, MDBX and snapshot-overlay batch paths (without indexes
+requesting applied undo copies) spool completed preparation to anonymous files
+beside the database path. MDBX temporary results stay outside the environment
+directory so its maintenance rename does not move them.
 `execution_spool_reservations` reports its shared 16 GiB logical disk allowance;
 this is independent of Header file admission and is not a physical whole-node
 disk quota. Encoding and decoding reserve from the node memory allowance.

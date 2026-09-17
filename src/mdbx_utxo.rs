@@ -441,6 +441,7 @@ pub struct MdbxUtxoStore {
     database_dir: PathBuf,
     capacity_bytes: u64,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 impl MdbxUtxoStore {
@@ -491,7 +492,10 @@ impl MdbxUtxoStore {
         transaction.commit()?;
         remove_compaction_manifest(&database_dir)?;
         remove_stale_compaction_paths(&database_dir)?;
+        let execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(&database_dir)?;
         Ok(Self {
+            execution_spool,
             db: Some(db),
             database_dir,
             capacity_bytes,
@@ -1847,6 +1851,10 @@ impl UtxoStore for MdbxUtxoStore {
 }
 
 impl ExecutionChainStore for MdbxUtxoStore {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db().begin_ro_txn().map_err(UtxoError::from)?;
         let meta = transaction

@@ -92,6 +92,7 @@ pub struct SnapshotOverlayRedbChainstate {
     snapshot_path: PathBuf,
     index_path: PathBuf,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 impl SnapshotOverlayRedbChainstate {
@@ -186,7 +187,10 @@ impl SnapshotOverlayRedbChainstate {
                 "creation-MTP table must cover exactly heights 0..=base",
             ));
         }
+        let execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(&config.database_dir)?;
         Ok(Self {
+            execution_spool,
             db,
             database_path: config.database_dir,
             base,
@@ -986,6 +990,10 @@ impl SnapshotOverlayRedbChainstate {
 }
 
 impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db.begin_read()?;
         let meta = transaction.open_table(META)?;

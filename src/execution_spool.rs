@@ -427,4 +427,161 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(files, vec![std::ffi::OsString::from("ready")]);
     }
+    #[cfg(feature = "mdbx")]
+    fn assert_backend_spool(
+        store: &impl crate::chain_store::ExecutionChainStore,
+        budget: &MemoryBudget,
+    ) {
+        use crate::chain_store::ChainStoreError;
+        let baseline = budget.snapshot().used;
+        let base = store.execution_tip().unwrap();
+        let context = store
+            .execution_spool()
+            .expect("bound backend exposes its node spool");
+        let spool = context.open().unwrap();
+        let transitions = (1..=2)
+            .map(|offset| {
+                let height = base.height + offset;
+                let key = OutPointKey::from_bytes(&[u8::try_from(height).unwrap(); 36]).unwrap();
+                let coin = Utxo {
+                    value_sats: 42,
+                    height,
+                    is_coinbase: false,
+                    last_touched: 0,
+                    creation_mtp: 1000 + height,
+                    script_pubkey: vec![0x51],
+                };
+                ConnectTransition {
+                    expected_parent: if offset == 1 {
+                        base.hash
+                    } else {
+                        BlockHash::from_byte_array([u8::try_from(height - 1).unwrap(); 32])
+                    },
+                    next: ExecutionTip {
+                        height,
+                        hash: BlockHash::from_byte_array([u8::try_from(height).unwrap(); 32]),
+                    },
+                    spent: Vec::new(),
+                    created: vec![(key, coin)],
+                    transaction_undos: vec![UtxoUndo::from_parts(Vec::new(), vec![key])],
+                }
+            })
+            .collect::<Vec<_>>();
+        let records = transitions
+            .iter()
+            .map(|transition| spool.write(transition).unwrap())
+            .collect::<Vec<_>>();
+        let end = transitions[1].next;
+        let mut failed = [
+            Ok(spool.read(&records[0]).unwrap()),
+            Err(ChainStoreError::ExecutionSpool(io::Error::other(
+                "late read failure",
+            ))),
+        ]
+        .into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut failed, Some(end))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), base);
+        assert_eq!(budget.snapshot().used, baseline);
+        for transition in &transitions {
+            assert!(store.get(transition.created[0].0).unwrap().is_none());
+            assert!(store.block_undo(transition.next.hash).unwrap().is_none());
+        }
+        let mut stream = records
+            .iter()
+            .map(|record| spool.read(record).map_err(ChainStoreError::ExecutionSpool));
+        store
+            .commit_connect_batch_stream(&mut stream, Some(end))
+            .unwrap();
+        assert_eq!(store.execution_tip().unwrap(), end);
+        assert_eq!(budget.snapshot().used, baseline);
+        for transition in &transitions {
+            assert_eq!(
+                store
+                    .get(transition.created[0].0)
+                    .unwrap()
+                    .unwrap()
+                    .value_sats,
+                42
+            );
+            assert_eq!(
+                store.block_undo(transition.next.hash).unwrap().unwrap(),
+                transition.transaction_undos
+            );
+        }
+        assert!(budget.spool_snapshot().used > 0);
+        drop(spool);
+        assert_eq!(budget.spool_snapshot().used, 0);
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn mdbx_backend_spool_survives_compaction_with_the_shared_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(4 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let mut store = crate::mdbx_utxo::MdbxUtxoStore::open_with_capacity(
+            directory.path().join("chainstate"),
+            32 << 20,
+        )
+        .unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([0; 32]),
+            })
+            .unwrap();
+        assert_backend_spool(&store, &budget);
+        store.compact_with_reserve(0).unwrap();
+        assert_backend_spool(&store, &budget);
+        drop(store);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn snapshot_backend_spools_share_owner_across_compaction() {
+        use crate::snapshot_overlay::{
+            SnapshotOverlayChainstate, SnapshotOverlayConfig,
+            tests::{
+                BASE_HEIGHT, IMPORT_TIME, base_coins, block_hash, mtp_for, write_base_snapshot,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(4 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        let config = |name: &str| SnapshotOverlayConfig {
+            database_dir: directory.path().join(name),
+            snapshot_path: snapshot_path.clone(),
+            index_path: index_path.clone(),
+            capacity_bytes: 32 << 20,
+            import_time: IMPORT_TIME,
+            mtp_by_height: (0..=BASE_HEIGHT).map(mtp_for).collect(),
+        };
+        let mut mdbx =
+            SnapshotOverlayChainstate::open(config("overlay-mdbx"), Some(&identity)).unwrap();
+        let mut redb = crate::snapshot_overlay_redb::SnapshotOverlayRedbChainstate::open(
+            config("overlay.redb"),
+            Some(&identity),
+        )
+        .unwrap();
+        assert_backend_spool(&mdbx, &budget);
+        assert_backend_spool(&redb, &budget);
+        mdbx.compact().unwrap();
+        redb.compact().unwrap();
+        assert_backend_spool(&mdbx, &budget);
+        assert_backend_spool(&redb, &budget);
+        drop(mdbx);
+        drop(redb);
+        assert_eq!(budget.snapshot().used, 0);
+    }
 }
