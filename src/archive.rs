@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
@@ -439,8 +439,7 @@ fn scan_archive_selection(
     }
     verify_compressed_pieces_from(path, &mut file, payload_offset, &manifest)?;
     file.seek(SeekFrom::Start(payload_offset))?;
-    let mut decoder = zstd::stream::Decoder::new(file)?;
-    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let decoder = ArchiveDecoder::new(path, file, records_limit)?;
     let mut bounded = decoder.take(records_limit.saturating_add(1));
     let mut scratch = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut digest = Sha256::new();
@@ -620,8 +619,7 @@ pub(crate) fn verify_archive_block_hashes_streaming(
 
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(payload_offset))?;
-    let mut decoder = zstd::stream::Decoder::new(file)?;
-    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let decoder = ArchiveDecoder::new(path, file, records_limit)?;
     let mut bounded = decoder.take(records_limit.saturating_add(1));
     let mut digest = Sha256::new();
     let mut records_bytes = 0_u64;
@@ -787,8 +785,7 @@ fn verify_record_stream(
 ) -> Result<(), ArchiveError> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(payload_offset))?;
-    let mut decoder = zstd::stream::Decoder::new(file)?;
-    decoder.window_log_max(zstd_window_log(records_limit))?;
+    let decoder = ArchiveDecoder::new(path, file, records_limit)?;
     let mut bounded = decoder.take(records_limit.saturating_add(1));
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut verifier = RecordStreamVerifier::default();
@@ -998,6 +995,46 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+// The native decoder and Rust input buffer must die before their allowance.
+struct ArchiveDecoder {
+    inner: zstd::stream::Decoder<'static, BufReader<File>>,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+
+impl ArchiveDecoder {
+    fn allowance(records_limit: u64) -> Result<u64, ArchiveError> {
+        let native = rbtc_codec_memory::decoder_bytes(zstd_window_log(records_limit))
+            .ok_or(ArchiveError::Invalid("decoder memory estimate"))?;
+        native
+            .checked_add(zstd::zstd_safe::DCtx::in_size())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(ArchiveError::Invalid("decoder memory estimate"))
+    }
+
+    fn new(path: &Path, file: File, records_limit: u64) -> Result<Self, ArchiveError> {
+        let allowance = Self::allowance(records_limit)?;
+        let reservation = crate::node_memory::for_path(path)?
+            .map(|budget| {
+                budget
+                    .reserve(allowance)
+                    .map_err(ArchiveError::ResourceBudget)
+            })
+            .transpose()?;
+        let mut inner = zstd::stream::Decoder::new(file)?;
+        inner.window_log_max(zstd_window_log(records_limit))?;
+        Ok(Self {
+            inner,
+            _reservation: reservation,
+        })
+    }
+}
+
+impl Read for ArchiveDecoder {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(output)
+    }
+}
+
 fn zstd_window_log(records_bytes: u64) -> u32 {
     let required = u64::BITS - records_bytes.saturating_sub(1).leading_zeros();
     required.clamp(MIN_ZSTD_WINDOW_LOG, MAX_ZSTD_WINDOW_LOG)
@@ -1007,6 +1044,62 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn native_decoder_admission_survives_callbacks_and_refunds_failures() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("decoder.rblk");
+        let manifest = write_archive(&path, 20, &[vec![9; 512 * 1024]]).unwrap();
+        let allowance = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
+        assert!(allowance > 8 * 1024 * 1024);
+        assert!(ArchiveDecoder::allowance(MAX_RECORDS_BYTES).unwrap() > 128 * 1024 * 1024);
+        assert!(rbtc_codec_memory::decoder_bytes(22).is_none());
+        assert!(rbtc_codec_memory::decoder_bytes(28).is_none());
+        let budget = crate::node_memory::MemoryBudget::new(allowance);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(1).unwrap();
+        for result in [
+            read_archive_batch(&path, 20, 1, MAX_RECORDS_BYTES).map(|_| ()),
+            verify_archive_streaming(&path).map(|_| ()),
+            verify_archive_block_hashes_streaming(&path).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(ArchiveError::ResourceBudget(_))));
+            assert_eq!(budget.snapshot().used, 1);
+        }
+        drop(pressure);
+        let mut calls = 0;
+        assert!(
+            visit_archive_prefix(&path, &manifest, 1, &mut |_, raw| {
+                calls += 1;
+                assert_eq!(raw.len(), 512 * 1024);
+                assert_eq!(budget.snapshot().used, allowance);
+                assert!(budget.reserve(1).is_err());
+                true
+            })
+            .unwrap()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(verify_archive_streaming(&path).unwrap(), manifest);
+        assert_eq!(budget.snapshot().used, 0);
+        // A valid archive container is not itself a zstd frame. Exercise an
+        // error after context creation, with the allowance held until drop.
+        let mut decoder =
+            ArchiveDecoder::new(&path, File::open(&path).unwrap(), manifest.records_bytes).unwrap();
+        assert_eq!(budget.snapshot().used, allowance);
+        assert!(decoder.read(&mut [0; 16]).is_err());
+        assert_eq!(budget.snapshot().used, allowance);
+        drop(decoder);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(
+            read_archive_batch(&path, 20, 1, MAX_RECORDS_BYTES)
+                .unwrap()
+                .1[0]
+                .len(),
+            512 * 1024
+        );
+        assert_eq!(budget.snapshot().used, 0);
+    }
 
     #[test]
     fn piece_scratch_admission_lifetime_and_short_reads() {

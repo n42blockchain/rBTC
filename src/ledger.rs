@@ -2648,7 +2648,7 @@ mod tests {
         ledger.append(10, &blocks).unwrap();
         ledger.append(13, &[vec![13], vec![14]]).unwrap();
         let old_bytes = fs::read(ledger.slot_path(0)).unwrap();
-        let budget = crate::node_memory::MemoryBudget::new(128 * 1024);
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
         assert!(ledger.truncate_from(12).is_err());
@@ -2898,7 +2898,7 @@ mod tests {
         let blocks = [first, second, third, vec![4]];
         ledger.stage(11, &blocks).unwrap();
         let identity = ledger.staged_manifest().unwrap().unwrap();
-        let budget = crate::node_memory::MemoryBudget::new(128 * 1024);
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
         assert!(ledger.commit_staged(3).is_err());

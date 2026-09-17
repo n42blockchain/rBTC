@@ -57,6 +57,7 @@ name = "storage_engine_comparison"
 required-features = ["mdbx"]
 
 [dependencies]
+rbtc-codec-memory = { path = "vendor/rbtc-codec-memory", version = "0.1.0" }
 ahash = "0.8.12"
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
 bitcoin = { version = "=0.32.102", default-features = true }
