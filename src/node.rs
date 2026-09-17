@@ -1634,6 +1634,17 @@ fn validate_memory_plan(options: &Options) -> Result<(), String> {
         + u64::from(options.explorer_listen.is_some())
         + u64::from(options.wallet_api_files.is_some());
     let supporting_bytes = supporting * crate::node_memory::DEFAULT_REDB_CACHE_BYTES as u64;
+    #[cfg(feature = "mdbx")]
+    let supporting_bytes = supporting_bytes
+        + if options
+            .snapshot_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.engine == SnapshotOverlayEngine::Mdbx)
+        {
+            2 * crate::mdbx_memory::RESERVATION_BYTES
+        } else {
+            0
+        };
     let required = cache
         .and_then(|bytes| bytes.checked_add(supporting_bytes))
         .and_then(|bytes| bytes.checked_add(1024 * 1024 * 1024));

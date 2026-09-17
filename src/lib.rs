@@ -40,6 +40,8 @@ pub mod inbound;
 pub mod index_policy;
 pub mod ledger;
 #[cfg(feature = "mdbx")]
+mod mdbx_memory;
+#[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod merkle_proof;
 pub mod mphf;

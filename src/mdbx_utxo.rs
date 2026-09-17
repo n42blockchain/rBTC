@@ -16,8 +16,8 @@ use std::{
 
 use bitcoin::{BlockHash, OutPoint, Txid, hashes::Hash};
 use libmdbx::{
-    Database, DatabaseKind, DatabaseOptions, Mode, NoWriteMap, RO, ReadWriteOptions, SyncMode,
-    Table, TableFlags, Transaction, TransactionKind, WriteFlags,
+    Database, DatabaseKind, NoWriteMap, RO, Table, TableFlags, Transaction, TransactionKind,
+    WriteFlags,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -437,7 +437,7 @@ fn take_mdbx_u32(bytes: &[u8], cursor: &mut usize, field: &'static str) -> Resul
 /// creation MTP, and execution tip. Keeping these in one environment lets each
 /// block (or 256-block IBD checkpoint) commit UTXOs, undo, and tip atomically.
 pub struct MdbxUtxoStore {
-    db: Option<Database<NoWriteMap>>,
+    db: Option<crate::mdbx_memory::Environment>,
     database_dir: PathBuf,
     capacity_bytes: u64,
     write_guard: Mutex<()>,
@@ -630,11 +630,7 @@ impl MdbxUtxoStore {
         self.compact_inner(0, phase_hook)
     }
 
-    fn compact_inner(
-        &mut self,
-        reserve_bytes: u64,
-        mut phase_hook: impl FnMut(MdbxCompactionPhase),
-    ) -> Result<MdbxCompactionReport, UtxoError> {
+    fn check_compaction_space(&self, reserve_bytes: u64) -> Result<(), UtxoError> {
         let metrics = self.metrics()?;
         let copy_margin = (metrics.live_page_bytes / 10).max(64 * 1024 * 1024);
         let required_free = metrics
@@ -653,6 +649,28 @@ impl MdbxUtxoStore {
             )
             .into());
         }
+        Ok(())
+    }
+
+    fn compact_inner(
+        &mut self,
+        reserve_bytes: u64,
+        mut phase_hook: impl FnMut(MdbxCompactionPhase),
+    ) -> Result<MdbxCompactionReport, UtxoError> {
+        // Keep the node owner through closing and reopening the active engine.
+        let memory = self.db.as_ref().expect("active environment").memory();
+        let active_allowance = self.db.as_ref().expect("active environment").allowance();
+        let active_path = self.database_dir.clone();
+        let capacity = self.capacity_bytes;
+        let reopen = || {
+            crate::mdbx_memory::Environment::open_reserved(
+                &active_path,
+                capacity,
+                active_allowance.clone(),
+            )
+        };
+        self.check_compaction_space(reserve_bytes)?;
+        let copy_allowance = crate::mdbx_memory::Allowance::reserve(memory.clone())?;
         let before = self.audit()?;
         let before_bytes = before.high_water_bytes;
         let fresh_dir = compaction_path(&self.database_dir);
@@ -661,7 +679,11 @@ impl MdbxUtxoStore {
         remove_path_if_exists(&old_dir)?;
         fs::create_dir_all(&fresh_dir)?;
         self.db().copy_compact(&fresh_dir.join("mdbx.dat"))?;
-        let copied = open_environment(&fresh_dir, self.capacity_bytes)?;
+        let copied = crate::mdbx_memory::Environment::open_reserved(
+            &fresh_dir,
+            self.capacity_bytes,
+            copy_allowance,
+        )?;
         validate_compacted_environment(&copied)?;
         let copied_audit = audit_environment(&copied, &fresh_dir, self.capacity_bytes)?;
         if CompactionManifest::from_audit(before) != CompactionManifest::from_audit(copied_audit) {
@@ -675,31 +697,31 @@ impl MdbxUtxoStore {
 
         drop(self.db.take());
         if let Err(error) = fs::rename(&self.database_dir, &old_dir) {
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(reopen()?);
             return Err(error.into());
         }
         phase_hook(MdbxCompactionPhase::SourceRenamed);
         if let Err(error) = sync_database_parent(&self.database_dir) {
             fs::rename(&old_dir, &self.database_dir)?;
             sync_database_parent(&self.database_dir)?;
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(reopen()?);
             return Err(error);
         }
         phase_hook(MdbxCompactionPhase::SourceRenameSynced);
         if let Err(error) = fs::rename(&fresh_dir, &self.database_dir) {
             fs::rename(&old_dir, &self.database_dir)?;
             sync_database_parent(&self.database_dir)?;
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(reopen()?);
             return Err(error.into());
         }
         phase_hook(MdbxCompactionPhase::CopyPromoted);
         if let Err(error) = sync_database_parent(&self.database_dir) {
             restore_compaction_old(&self.database_dir, &fresh_dir, &old_dir)?;
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(reopen()?);
             return Err(error);
         }
         phase_hook(MdbxCompactionPhase::CopyPromotionSynced);
-        match open_environment(&self.database_dir, self.capacity_bytes).and_then(|db| {
+        match reopen().and_then(|db| {
             validate_compacted_environment(&db)?;
             validate_compaction_manifest(&db, &self.database_dir, self.capacity_bytes)?;
             Ok(db)
@@ -707,7 +729,7 @@ impl MdbxUtxoStore {
             Ok(db) => self.db = Some(db),
             Err(open_error) => {
                 restore_compaction_old(&self.database_dir, &fresh_dir, &old_dir)?;
-                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                self.db = Some(reopen()?);
                 return Err(open_error);
             }
         }
@@ -1289,22 +1311,8 @@ fn creation_mtp_key(height: u32) -> [u8; 5] {
 fn open_environment(
     database_dir: &Path,
     capacity_bytes: u64,
-) -> Result<Database<NoWriteMap>, UtxoError> {
-    fs::create_dir_all(database_dir)?;
-    let capacity = isize::try_from(capacity_bytes)
-        .map_err(|_| UtxoError::Malformed("MDBX capacity exceeds platform limit"))?;
-    Ok(Database::open_with_options(
-        database_dir,
-        DatabaseOptions {
-            max_tables: Some(4),
-            mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
-                max_size: Some(capacity),
-                ..ReadWriteOptions::default()
-            }),
-            ..DatabaseOptions::default()
-        },
-    )?)
+) -> Result<crate::mdbx_memory::Environment, UtxoError> {
+    crate::mdbx_memory::open(database_dir, capacity_bytes)
 }
 
 fn metrics_environment(
