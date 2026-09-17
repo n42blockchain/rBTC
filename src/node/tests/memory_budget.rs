@@ -219,19 +219,20 @@ fn replay_payload_admission_follows_prevalidation_staging_and_aliases() {
         ..PrefetchedBlocks::default()
     };
     drop(cloned_batch);
-    assert_eq!(memory.snapshot().used, used);
+    let payload_used = memory.snapshot().used;
+    assert!(payload_used > 0 && payload_used < used);
     let bytes = prefetch.validated.pop().unwrap().bytes;
     let alias = bytes.clone();
     let serialized = vec![bytes];
     ledger.stage(2, &serialized).unwrap();
     drop(serialized);
     drop(prefetch);
-    assert_eq!(memory.snapshot().used, used);
+    assert_eq!(memory.snapshot().used, payload_used);
     assert_eq!(alias.as_ref(), serialize(&block));
     drop(alias);
     assert_eq!(memory.snapshot().used, 0);
     let single = ledger.read_owned_block(1).unwrap().unwrap();
-    assert_eq!(memory.snapshot().used, used);
+    assert_eq!(memory.snapshot().used, payload_used);
     drop(single);
     assert_eq!(memory.snapshot().used, 0);
 }

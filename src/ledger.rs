@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::archive::{
-    ArchiveBlock, ArchiveError, ArchiveManifest, read_archive, read_archive_manifest,
-    verify_archive, verify_archive_block_hashes_streaming, verify_archive_streaming, write_archive,
+    ArchiveBlock, ArchiveBlocks, ArchiveBlocksBuilder, ArchiveError, ArchiveManifest, read_archive,
+    read_archive_manifest, verify_archive, verify_archive_block_hashes_streaming,
+    verify_archive_streaming, write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -114,7 +115,7 @@ pub struct LedgerBlockBatch {
     /// Exact canonical record bytes retained in this batch.
     pub record_bytes: u64,
     /// Consensus-serialized blocks in ascending height order.
-    pub blocks: Vec<ArchiveBlock>,
+    pub blocks: ArchiveBlocks,
 }
 
 /// Deterministic manual-prefix prune plan.
@@ -889,7 +890,10 @@ impl PrunedBlockLedger {
         let index = self.read_index()?;
         let mut next_height = first_height;
         let mut record_bytes = 0_u64;
-        let mut blocks = Vec::with_capacity(usize::try_from(max_blocks).expect("u32 fits usize"));
+        let mut blocks = ArchiveBlocksBuilder::new(
+            &self.root,
+            usize::try_from(max_blocks).expect("u32 fits usize"),
+        )?;
         for segment in &index.segments {
             let segment_end = segment_end_inclusive(segment)?;
             if segment_end < next_height {
@@ -938,11 +942,11 @@ impl PrunedBlockLedger {
                     return Ok(LedgerBlockBatch {
                         first_height,
                         record_bytes,
-                        blocks,
+                        blocks: blocks.finish(),
                     });
                 }
                 record_bytes = next_record_bytes;
-                blocks.push(block);
+                blocks.push(block)?;
                 next_height = next_height
                     .checked_add(1)
                     .ok_or(LedgerError::Invalid("height overflow"))?;
@@ -950,7 +954,7 @@ impl PrunedBlockLedger {
                     return Ok(LedgerBlockBatch {
                         first_height,
                         record_bytes,
-                        blocks,
+                        blocks: blocks.finish(),
                     });
                 }
             }
@@ -963,7 +967,7 @@ impl PrunedBlockLedger {
         Ok(LedgerBlockBatch {
             first_height,
             record_bytes,
-            blocks,
+            blocks: blocks.finish(),
         })
     }
 
@@ -2810,6 +2814,39 @@ mod tests {
                 "requested retained block range is incomplete"
             ))
         ));
+    }
+
+    #[test]
+    fn shared_batch_arrays_hold_admission_across_segment_merge_and_partial_iteration() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.append(1, &[vec![1; 20], vec![2; 30]]).unwrap();
+        ledger.append(3, &[vec![3; 40]]).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(budget.snapshot().limit - 1).unwrap();
+        assert!(matches!(
+            ledger.read_block_batch(1, 3, 1_000),
+            Err(LedgerError::Archive(ArchiveError::ResourceBudget(_)))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - 1);
+        drop(pressure);
+        let batch = ledger.read_block_batch(1, 3, 1_000).unwrap();
+        assert_eq!(batch.blocks, vec![vec![1; 20], vec![2; 30], vec![3; 40]]);
+        let used = budget.snapshot().used;
+        let alias = batch.clone();
+        assert_eq!(batch.blocks.as_ptr(), alias.blocks.as_ptr());
+        assert_eq!(budget.snapshot().used, used);
+        let mut iterator = batch.blocks.into_iter();
+        let escaped = iterator.next().unwrap();
+        drop(alias);
+        assert_eq!(budget.snapshot().used, used);
+        drop(iterator);
+        assert!(budget.snapshot().used > 0 && budget.snapshot().used < used);
+        assert_eq!(escaped.as_ref(), &[1; 20]);
+        drop(escaped);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 2), (3, 3)]);
     }
 
     #[test]

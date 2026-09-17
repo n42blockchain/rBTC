@@ -141,6 +141,134 @@ impl PartialEq<Vec<u8>> for ArchiveBlock {
     }
 }
 
+/// Immutable block handles with shared, admitted storage for the handle array.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveBlocks(Option<Arc<ArchiveBlocksStorage>>);
+
+#[derive(Debug)]
+struct ArchiveBlocksStorage {
+    blocks: Vec<ArchiveBlock>,
+    _reservation: Option<crate::node_memory::MemoryLease>,
+}
+
+impl std::ops::Deref for ArchiveBlocks {
+    type Target = [ArchiveBlock];
+    fn deref(&self) -> &[ArchiveBlock] {
+        self.0
+            .as_ref()
+            .map_or(&[], |storage| storage.blocks.as_slice())
+    }
+}
+impl PartialEq for ArchiveBlocks {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for ArchiveBlocks {}
+impl PartialEq<Vec<Vec<u8>>> for ArchiveBlocks {
+    fn eq(&self, other: &Vec<Vec<u8>>) -> bool {
+        **self == *other
+    }
+}
+impl<const N: usize> PartialEq<[Vec<u8>; N]> for ArchiveBlocks {
+    fn eq(&self, other: &[Vec<u8>; N]) -> bool {
+        **self == *other
+    }
+}
+
+/// Iterator retaining handle storage until it is dropped; yielded blocks retain
+/// their independent payload admission after the iterator is gone.
+pub struct ArchiveBlocksIter {
+    blocks: ArchiveBlocks,
+    offset: usize,
+}
+impl Iterator for ArchiveBlocksIter {
+    type Item = ArchiveBlock;
+    fn next(&mut self) -> Option<Self::Item> {
+        let block = self.blocks.get(self.offset)?.clone();
+        self.offset += 1;
+        Some(block)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.blocks.len() - self.offset;
+        (remaining, Some(remaining))
+    }
+}
+impl ExactSizeIterator for ArchiveBlocksIter {}
+impl IntoIterator for ArchiveBlocks {
+    type Item = ArchiveBlock;
+    type IntoIter = ArchiveBlocksIter;
+    fn into_iter(self) -> Self::IntoIter {
+        ArchiveBlocksIter {
+            blocks: self,
+            offset: 0,
+        }
+    }
+}
+impl<'a> IntoIterator for &'a ArchiveBlocks {
+    type Item = &'a ArchiveBlock;
+    type IntoIter = std::slice::Iter<'a, ArchiveBlock>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub(crate) struct ArchiveBlocksBuilder {
+    blocks: Vec<ArchiveBlock>,
+    capacity: usize,
+    reservation: Option<crate::node_memory::MemoryLease>,
+}
+impl ArchiveBlocksBuilder {
+    fn allocation_bytes(capacity: usize) -> Result<u64, ArchiveError> {
+        if capacity == 0 {
+            return Ok(0);
+        }
+        capacity
+            .checked_mul(std::mem::size_of::<ArchiveBlock>())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    std::mem::size_of::<ArchiveBlocksStorage>() + 2 * std::mem::size_of::<usize>(),
+                )
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(ArchiveError::Invalid("archive handle capacity overflow"))
+    }
+    pub(crate) fn new(path: &Path, capacity: usize) -> Result<Self, ArchiveError> {
+        let reservation = if capacity == 0 {
+            None
+        } else {
+            reserve_archive_memory(path, Self::allocation_bytes(capacity)?)?
+        };
+        Ok(Self {
+            blocks: Vec::with_capacity(capacity),
+            capacity,
+            reservation,
+        })
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.blocks.len()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+    pub(crate) fn push(&mut self, block: ArchiveBlock) -> Result<(), ArchiveError> {
+        if self.blocks.len() == self.capacity {
+            return Err(ArchiveError::Invalid("archive handle capacity exhausted"));
+        }
+        self.blocks.push(block);
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> ArchiveBlocks {
+        if self.capacity == 0 {
+            return ArchiveBlocks::default();
+        }
+        ArchiveBlocks(Some(Arc::new(ArchiveBlocksStorage {
+            blocks: self.blocks,
+            _reservation: self.reservation,
+        })))
+    }
+}
+
 /// Sidecar-equivalent data needed by a BitTorrent/webseed transport.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchiveManifest {
@@ -446,7 +574,7 @@ pub(crate) fn read_archive_batch(
     first_height: u32,
     max_blocks: u32,
     max_record_bytes: u64,
-) -> Result<(ArchiveManifest, Vec<ArchiveBlock>), ArchiveError> {
+) -> Result<(ArchiveManifest, ArchiveBlocks), ArchiveError> {
     if max_blocks == 0 || max_record_bytes == 0 {
         return Err(ArchiveError::Invalid("archive batch bound"));
     }
@@ -485,7 +613,7 @@ fn scan_archive_selection(
     max_blocks: u32,
     max_record_bytes: u64,
     mut visit: Option<ArchiveVisitor<'_>>,
-) -> Result<(ArchiveManifest, Vec<ArchiveBlock>, bool), ArchiveError> {
+) -> Result<(ArchiveManifest, ArchiveBlocks, bool), ArchiveError> {
     let path = path.as_ref();
     let mut file = File::open(path)?;
     if file.metadata()?.len() > MAX_CONTAINER_BYTES {
@@ -507,7 +635,16 @@ fn scan_archive_selection(
     let mut selected_count = 0_u32;
     let mut complete = true;
     let mut stopped = first_height < manifest.first_height;
-    let mut blocks = Vec::new();
+    let capacity = if visit.is_some() || first_height < manifest.first_height {
+        0
+    } else {
+        let available = manifest
+            .block_count
+            .saturating_sub(first_height - manifest.first_height);
+        usize::try_from(u64::from(max_blocks.min(available)).min(max_record_bytes / 4))
+            .expect("validated archive count fits usize")
+    };
+    let mut blocks = ArchiveBlocksBuilder::new(path, capacity)?;
     for offset in 0..manifest.block_count {
         let mut length = [0_u8; 4];
         bounded
@@ -548,7 +685,7 @@ fn scan_archive_selection(
                 complete = visit(height, &block);
                 stopped |= !complete;
             } else {
-                blocks.push(ArchiveBlock::admitted(block, block_reservation));
+                blocks.push(ArchiveBlock::admitted(block, block_reservation))?;
             }
         } else {
             stopped |= wanted;
@@ -573,7 +710,7 @@ fn scan_archive_selection(
     if crate::utxo::hex_lower(&digest.finalize()) != manifest.records_sha256 {
         return Err(ArchiveError::Invalid("records checksum"));
     }
-    Ok((manifest, blocks, complete))
+    Ok((manifest, blocks.finish(), complete))
 }
 
 /// Checks a bounded in-memory archive and returns its consensus-serialized blocks.
@@ -1121,6 +1258,43 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn handle_storage_is_admitted_shared_and_retained_by_partial_iterators() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("handles.rblk");
+        let bytes = ArchiveBlocksBuilder::allocation_bytes(2).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(bytes);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(1).unwrap();
+        assert!(matches!(
+            ArchiveBlocksBuilder::new(&path, 2),
+            Err(ArchiveError::ResourceBudget(_))
+        ));
+        assert!(ArchiveBlocksBuilder::allocation_bytes(usize::MAX).is_err());
+        drop(pressure);
+        let mut builder = ArchiveBlocksBuilder::new(&path, 2).unwrap();
+        assert_eq!(budget.snapshot().used, bytes);
+        builder.push(vec![1].into()).unwrap();
+        builder.push(vec![2].into()).unwrap();
+        assert!(builder.push(vec![3].into()).is_err());
+        let blocks = builder.finish();
+        let alias = blocks.clone();
+        assert_eq!(blocks.as_ptr(), alias.as_ptr());
+        assert_eq!(budget.snapshot().used, bytes);
+        let mut iterator = blocks.into_iter();
+        let escaped = iterator.next().unwrap();
+        assert_eq!(iterator.len(), 1);
+        drop(alias);
+        assert_eq!(budget.snapshot().used, bytes);
+        drop(iterator);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(escaped.as_ref(), &[1]);
+        let empty = ArchiveBlocksBuilder::new(&path, 0).unwrap().finish();
+        assert!(empty.is_empty());
+        assert_eq!(budget.snapshot().used, 0);
+        assert!(empty.into_iter().next().is_none());
+    }
+
+    #[test]
     fn returned_block_clones_keep_admission_through_writing_and_final_drop() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("owned.rblk");
@@ -1128,7 +1302,8 @@ mod tests {
         let manifest = write_archive(&path, 1, std::slice::from_ref(&data)).unwrap();
         let native = ArchiveDecoder::allowance(manifest.records_bytes).unwrap();
         let payload = ArchiveBlock::allocation_bytes(data.len());
-        let limit = native + 64 * 1024 + payload;
+        let handles = ArchiveBlocksBuilder::allocation_bytes(1).unwrap();
+        let limit = native + 64 * 1024 + payload + handles;
         let budget = crate::node_memory::MemoryBudget::new(limit);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve(1).unwrap();
@@ -1139,12 +1314,12 @@ mod tests {
         assert_eq!(budget.snapshot().used, 1);
         drop(pressure);
         let (_, blocks) = read_archive_batch(&path, 1, 1, MAX_RECORDS_BYTES).unwrap();
-        assert_eq!(budget.snapshot().used, payload);
+        assert_eq!(budget.snapshot().used, payload + handles);
         let alias = blocks[0].clone();
         assert_eq!(alias.as_ptr(), blocks[0].as_ptr());
         let cloned_batch = blocks.clone();
         drop(blocks);
-        assert_eq!(budget.snapshot().used, payload);
+        assert_eq!(budget.snapshot().used, payload + handles);
         let output = dir.path().join("copy.rblk");
         std::thread::scope(|scope| {
             scope
@@ -1221,7 +1396,8 @@ mod tests {
         assert!(rbtc_codec_memory::decoder_bytes(22).is_none());
         assert!(rbtc_codec_memory::decoder_bytes(28).is_none());
         let payload_allowance = ArchiveBlock::allocation_bytes(512 * 1024);
-        let total = allowance + 64 * 1024 + payload_allowance;
+        let handles = ArchiveBlocksBuilder::allocation_bytes(1).unwrap();
+        let total = allowance + 64 * 1024 + payload_allowance + handles;
         let budget = crate::node_memory::MemoryBudget::new(total);
         budget.bind(&[dir.path().to_path_buf()]).unwrap();
         let pressure = budget.reserve(total - allowance + 1).unwrap();
@@ -1240,7 +1416,11 @@ mod tests {
                 calls += 1;
                 assert_eq!(raw.len(), 512 * 1024);
                 assert_eq!(budget.snapshot().used, allowance + 64 * 1024 + 512 * 1024);
-                assert!(budget.reserve(payload_allowance - 512 * 1024 + 1).is_err());
+                assert!(
+                    budget
+                        .reserve(payload_allowance - 512 * 1024 + handles + 1)
+                        .is_err()
+                );
                 true
             })
             .unwrap()

@@ -286,8 +286,13 @@ directory so its maintenance rename does not move them.
 it also covers anonymous archive-compression scratch, admitted conservatively
 at the maximum archive-container size before compression. This is independent
 of Header file admission and is not a physical whole-node disk quota. Execution
-result encoding and decoding reserve from the node memory allowance; native
-archive codec buffers still require separate admission.
+result encoding and decoding reserve from the node memory allowance. File archive
+decoders reserve their bounded native context and Rust input buffer before
+creation. Piece hashing and record scans reserve scratch; returned archive
+payloads and handle arrays retain reservations through shared clones and node
+replay staging. Multithreaded archive compression, manifest metadata, newly
+serialized network payloads and other node batch objects still need admission.
+These reservation limits do not establish a whole-node RSS ceiling.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.

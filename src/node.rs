@@ -97,7 +97,7 @@ use rbtc::{
         WALLET_BROADCAST_QUEUE_CAPACITY, WalletBroadcastRequest, WalletBroadcastSink,
         explorer_events_router, explorer_router, rpc_router_with_operator, wallet_router_with_sink,
     },
-    archive::{ArchiveBlock, bounded_archive_prefix_len},
+    archive::{ArchiveBlock, ArchiveBlocks, bounded_archive_prefix_len},
     asmap::Asmap,
     auxiliary_index::{AuxiliaryIndexKind, RedbAuxiliaryIndex},
     block_execution::{
@@ -16670,7 +16670,7 @@ fn prevalidate_replay_blocks(
     deployment_config: &DeploymentConfig,
     headers: &dyn HeaderView,
     first_height: u32,
-    serialized: Vec<ArchiveBlock>,
+    serialized: ArchiveBlocks,
 ) -> Result<Vec<PrevalidatedBlock>, String> {
     let mut validated = Vec::with_capacity(serialized.len());
     for (offset, bytes) in serialized.into_iter().enumerate() {
