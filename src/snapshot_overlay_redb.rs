@@ -109,7 +109,12 @@ impl SnapshotOverlayRedbChainstate {
         config: SnapshotOverlayConfig,
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
+        let memory = crate::node_memory::for_path(&config.database_dir)?;
+        let base = CoreSnapshotUtxoIndex::open_with_memory(
+            &config.index_path,
+            &config.snapshot_path,
+            memory.as_ref(),
+        )?;
         if let Some(parent) = config.database_dir.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -503,7 +508,8 @@ impl SnapshotOverlayRedbChainstate {
     ) -> Result<RebaseReport, SnapshotOverlayError> {
         let new_snapshot_path = new_snapshot_path.as_ref();
         let new_index_path = new_index_path.as_ref();
-        if new_snapshot_path.exists() || new_index_path.exists() {
+        let fingerprint_path = crate::core_snapshot_index::fingerprint_sidecar_path(new_index_path);
+        if new_snapshot_path.exists() || new_index_path.exists() || fingerprint_path.exists() {
             return Err(SnapshotOverlayError::Invalid(
                 "rebase output paths already exist",
             ));
@@ -674,10 +680,18 @@ impl SnapshotOverlayRedbChainstate {
             block_hash: tip.hash,
             hash_serialized: sha256d::Hash::from_engine(core_hash).to_string(),
         };
+        // The builder publishes the index and then its optional fingerprint
+        // sidecar. Own both paths before either publication can fail.
+        cleanup.track(new_index_path.to_owned());
+        cleanup.track(fingerprint_path);
         let report =
             build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
-        cleanup.track(new_index_path.to_owned());
-        let new_base = CoreSnapshotUtxoIndex::open(new_index_path, new_snapshot_path)?;
+        let memory = crate::node_memory::for_path(&self.database_path)?;
+        let new_base = CoreSnapshotUtxoIndex::open_with_memory(
+            new_index_path,
+            new_snapshot_path,
+            memory.as_ref(),
+        )?;
 
         let identity_bytes = encode_identity(&identity, &new_base)?;
         {

@@ -294,8 +294,10 @@ read-ahead refresh and overlay ownership transfer. Node-bound ordinary Redb/MDBX
 and mutable snapshot-overlay coin queries reject scripts over 10,000 bytes
 before copying them; MDBX read-only queries borrow raw records. Immutable
 snapshot-base queries use a 192-byte probe and fixed 16 KiB streaming buffer
-for large groups. Snapshot-index startup, journal reads, other engine-internal
-allocations, preparation copies, script queues,
+for large groups. Snapshot-index startup readers, MPHF decode and fingerprint
+caches reserve from the same owner, including external base paths and old/new
+indexes during rebase. Snapshot/index building, caller-created MTP tables,
+journal reads, other engine-internal allocations, preparation copies, script queues,
 thread stacks and indexed undo copies still require further accounting.
 These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
 pages, SQLite, MDBX and other unregistered allocations still require

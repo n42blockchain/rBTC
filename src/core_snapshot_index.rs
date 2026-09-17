@@ -113,6 +113,13 @@ fn encode_fingerprint_sidecar(
     bytes
 }
 
+#[derive(Debug)]
+struct Fingerprints {
+    values: Vec<u16>,
+    // Drop the payload before returning its allowance.
+    _memory: Option<crate::node_memory::MemoryLease>,
+}
+
 /// Loads the sidecar if it exists and belongs to exactly this index.
 ///
 /// Any mismatch or damage yields `None`: lookups then take the slow path,
@@ -121,37 +128,70 @@ fn load_fingerprint_sidecar(
     path: &Path,
     index_digest: &[u8; INDEX_DIGEST_BYTES],
     groups: u64,
-) -> Option<Vec<u16>> {
-    let bytes = std::fs::read(path).ok()?;
-    let expected_len = FINGERPRINT_HEADER_BYTES
-        .checked_add(usize::try_from(groups).ok()?.checked_mul(2)?)?
-        .checked_add(INDEX_DIGEST_BYTES)?;
-    if bytes.len() != expected_len {
-        return None;
+    memory: Option<&crate::node_memory::MemoryBudget>,
+) -> Result<Option<Fingerprints>, CoreSnapshotIndexError> {
+    let Some((mut file, expected_len)) = (|| {
+        let file = File::open(path).ok()?;
+        let expected_len = FINGERPRINT_HEADER_BYTES
+            .checked_add(usize::try_from(groups).ok()?.checked_mul(2)?)?
+            .checked_add(INDEX_DIGEST_BYTES)?;
+        if file.metadata().ok()?.len() != u64::try_from(expected_len).ok()? {
+            return None;
+        }
+        Some((file, expected_len))
+    })() else {
+        return Ok(None);
+    };
+    let allowance = u64::try_from(expected_len)
+        .ok()
+        .and_then(|n| n.checked_mul(2))
+        .and_then(|n| n.checked_add(64 * 1024))
+        .ok_or(CoreSnapshotIndexError::Invalid(
+            "fingerprint memory size overflow",
+        ))?;
+    let mut reservation = memory.map(|budget| budget.reserve(allowance)).transpose()?;
+    let mut bytes = vec![0; expected_len];
+    // Read only the expected bytes even if the sidecar grows after metadata.
+    if file.read_exact(&mut bytes).is_err() || file.read(&mut [0]).ok() != Some(0) {
+        return Ok(None);
     }
-    let (body, stored) = bytes.split_at(bytes.len() - INDEX_DIGEST_BYTES);
-    let digest: [u8; 32] = Sha256::digest(body).into();
-    if digest != stored {
-        return None;
+    let fingerprints: Option<Vec<u16>> = (|| {
+        let (body, stored) = bytes.split_at(bytes.len() - INDEX_DIGEST_BYTES);
+        let digest: [u8; 32] = Sha256::digest(body).into();
+        if digest != stored {
+            return None;
+        }
+        let groups_field = 10 + INDEX_DIGEST_BYTES;
+        if &body[..8] != FINGERPRINT_MAGIC
+            || u16::from_le_bytes(body[8..10].try_into().ok()?) != FINGERPRINT_VERSION
+            || &body[10..groups_field] != index_digest
+            || u64::from_le_bytes(
+                body[groups_field..FINGERPRINT_HEADER_BYTES]
+                    .try_into()
+                    .ok()?,
+            ) != groups
+        {
+            return None;
+        }
+        Some(
+            body[FINGERPRINT_HEADER_BYTES..]
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect(),
+        )
+    })();
+    drop(bytes);
+    if let (Some(values), Some(lease)) = (&fingerprints, &mut reservation) {
+        lease.shrink_to(
+            u64::try_from(values.capacity())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(2),
+        )?;
     }
-    let groups_field = 10 + INDEX_DIGEST_BYTES;
-    if &body[..8] != FINGERPRINT_MAGIC
-        || u16::from_le_bytes(body[8..10].try_into().ok()?) != FINGERPRINT_VERSION
-        || &body[10..groups_field] != index_digest
-        || u64::from_le_bytes(
-            body[groups_field..FINGERPRINT_HEADER_BYTES]
-                .try_into()
-                .ok()?,
-        ) != groups
-    {
-        return None;
-    }
-    Some(
-        body[FINGERPRINT_HEADER_BYTES..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect(),
-    )
+    Ok(fingerprints.map(|values| Fingerprints {
+        values,
+        _memory: reservation,
+    }))
 }
 /// First-attempt read width for one txid group: its 32-byte header, the
 /// coin count, and a coin of standard shape. Larger groups stream through
@@ -558,7 +598,9 @@ pub struct CoreSnapshotUtxoIndex {
     /// Digest the container carried; names the sidecar that belongs to it.
     container_digest: [u8; INDEX_DIGEST_BYTES],
     /// One 16-bit txid fingerprint per slot when the sidecar is present.
-    fingerprints: Option<Vec<u16>>,
+    fingerprints: Option<Fingerprints>,
+    // Payloads above must be destroyed before their node reservations.
+    _memory: Option<crate::node_memory::MemoryLease>,
 }
 
 impl CoreSnapshotUtxoIndex {
@@ -574,10 +616,20 @@ impl CoreSnapshotUtxoIndex {
     /// # Errors
     ///
     /// Fails closed on I/O errors, container damage, or identity mismatch.
-    #[allow(clippy::too_many_lines)]
     pub fn open(
         index_path: impl AsRef<Path>,
         snapshot_path: impl AsRef<Path>,
+    ) -> Result<Self, CoreSnapshotIndexError> {
+        let memory = crate::node_memory::for_path(index_path.as_ref())?;
+        Self::open_with_memory(index_path, snapshot_path, memory.as_ref())
+    }
+
+    /// The overlay supplies its owner explicitly when base files live elsewhere.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn open_with_memory(
+        index_path: impl AsRef<Path>,
+        snapshot_path: impl AsRef<Path>,
+        memory: Option<&crate::node_memory::MemoryBudget>,
     ) -> Result<Self, CoreSnapshotIndexError> {
         // The container is streamed rather than read whole. Buffering it and
         // then decoding out of that buffer held two copies of a gigabyte-scale
@@ -592,6 +644,7 @@ impl CoreSnapshotUtxoIndex {
         // the file's real length below, which bounds allocation by the bytes
         // that actually exist. The digest is still verified before `open`
         // returns, so no lookup is ever served from unverified content.
+        let _read_memory = memory.map(|budget| budget.reserve(64 * 1024)).transpose()?;
         let index_file = File::open(index_path.as_ref())?;
         let container_bytes = index_file.metadata()?.len();
         let container_floor = u64::try_from(INDEX_HEADER_BYTES + INDEX_DIGEST_BYTES)
@@ -656,6 +709,15 @@ impl CoreSnapshotUtxoIndex {
             .filter(|mphf_bytes| *mphf_bytes > 0)
             .ok_or(CoreSnapshotIndexError::Invalid("table length mismatch"))?;
 
+        // Encoded words + decoded words + rank samples coexist. The fixed
+        // headroom covers 64 level descriptors, reader buffers and verification.
+        let allowance = mphf_bytes
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(INDEX_READ_WINDOW_BYTES as u64 + 64 * 1024))
+            .ok_or(CoreSnapshotIndexError::Invalid(
+                "index memory size overflow",
+            ))?;
+        let mut reservation = memory.map(|budget| budget.reserve(allowance)).transpose()?;
         let mut mphf_section = vec![
             0_u8;
             usize::try_from(mphf_bytes).map_err(|_| {
@@ -713,7 +775,8 @@ impl CoreSnapshotUtxoIndex {
             &fingerprint_sidecar_path(index_path.as_ref()),
             &stored_digest,
             groups,
-        );
+            memory,
+        )?;
         let index = reader.into_inner();
 
         let snapshot = File::open(snapshot_path.as_ref())?;
@@ -733,6 +796,9 @@ impl CoreSnapshotUtxoIndex {
                 "snapshot metadata does not match the indexed identity",
             ));
         }
+        if let Some(lease) = &mut reservation {
+            lease.shrink_to(mphf.resident_bytes())?;
+        }
         Ok(Self {
             network,
             base_block_hash,
@@ -749,6 +815,7 @@ impl CoreSnapshotUtxoIndex {
             snapshot,
             container_digest: stored_digest,
             fingerprints,
+            _memory: reservation,
         })
     }
 
@@ -763,7 +830,7 @@ impl CoreSnapshotUtxoIndex {
         self.fingerprints.as_ref().is_some_and(|fingerprints| {
             usize::try_from(slot)
                 .ok()
-                .and_then(|slot| fingerprints.get(slot))
+                .and_then(|slot| fingerprints.values.get(slot))
                 .is_some_and(|stored| *stored != fingerprint_of(key))
         })
     }
@@ -1505,6 +1572,103 @@ mod tests {
     }
 
     #[test]
+    fn index_memory_admission_preserves_live_owners_and_refunds_failed_opens() {
+        use crate::node_memory::MemoryBudget;
+        let directory = TempDir::new().unwrap();
+        let snapshot = directory.path().join("coins.dat");
+        let (bytes, _) = synthetic_snapshot([7; 32], &test_groups());
+        fs::write(&snapshot, bytes).unwrap();
+        let identity = authenticated_identity(&snapshot, [7; 32], directory.path());
+        let path = directory.path().join("coins.idx");
+        build_core_snapshot_index_with_identity(&snapshot, &path, &identity).unwrap();
+        let budget = MemoryBudget::new(4 << 20);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let first = CoreSnapshotUtxoIndex::open(&path, &snapshot).unwrap();
+        let retained = budget.snapshot().used;
+        assert!(first.has_fingerprints());
+        assert_eq!(
+            retained,
+            first.mphf.resident_bytes()
+                + u64::try_from(first.fingerprints.as_ref().unwrap().values.capacity() * 2)
+                    .unwrap()
+        );
+        assert!(retained > 0);
+        let second = CoreSnapshotUtxoIndex::open(&path, &snapshot).unwrap();
+        assert_eq!(budget.snapshot().used, 2 * retained);
+        drop(second);
+        let pressure = budget
+            .reserve(budget.snapshot().limit - retained - 64 * 1024)
+            .unwrap();
+        assert!(matches!(
+            CoreSnapshotUtxoIndex::open(&path, &snapshot),
+            Err(CoreSnapshotIndexError::Io(_))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - 64 * 1024);
+        drop(pressure);
+        assert_eq!(budget.snapshot().used, retained);
+        assert!(
+            first
+                .get(&OutPoint::new(Txid::from_byte_array([1; 32]), 0))
+                .is_ok()
+        );
+        // A late digest failure must release decoded hashes and transient buffers.
+        let mut damaged = fs::read(&path).unwrap();
+        *damaged.last_mut().unwrap() ^= 1;
+        let corrupt_path = directory.path().join("corrupt.idx");
+        fs::write(&corrupt_path, damaged).unwrap();
+        assert!(matches!(
+            CoreSnapshotUtxoIndex::open(&corrupt_path, &snapshot),
+            Err(CoreSnapshotIndexError::Invalid("container digest mismatch"))
+        ));
+        assert_eq!(budget.snapshot().used, retained);
+        drop(first);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
+    fn fingerprint_load_checks_file_size_and_reserves_before_reading() {
+        use crate::node_memory::MemoryBudget;
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("fingerprints");
+        let digest = [7; 32];
+        let encoded = encode_fingerprint_sidecar(&digest, &[1, 2, 3]);
+        fs::write(&path, &encoded).unwrap();
+        let denied = MemoryBudget::new(0);
+        assert!(load_fingerprint_sidecar(&path, &digest, 3, Some(&denied)).is_err());
+        assert_eq!(denied.snapshot().used, 0);
+        let budget = MemoryBudget::new(1 << 20);
+        let loaded = load_fingerprint_sidecar(&path, &digest, 3, Some(&budget))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.values, [1, 2, 3]);
+        assert_eq!(budget.snapshot().used, 6);
+        drop(loaded);
+        assert_eq!(budget.snapshot().used, 0);
+        let mut corrupt = encoded;
+        corrupt[0] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(
+            load_fingerprint_sidecar(&path, &digest, 3, Some(&budget))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(budget.snapshot().used, 0);
+        // Sparse oversized sidecars are ignored BEFORE a reservation or read.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        assert!(
+            load_fingerprint_sidecar(&path, &digest, 3, Some(&denied))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(denied.snapshot().peak, 0);
+    }
+
+    #[test]
     fn builds_and_looks_up_every_coin_exactly() {
         let directory = TempDir::new().unwrap();
         let base_hash = [7_u8; 32];
@@ -1728,6 +1892,7 @@ mod tests {
             mphf: Mphf::build(1, |_| [0_u8; 32], INDEX_SEED).unwrap(),
             container_digest: [0_u8; INDEX_DIGEST_BYTES],
             fingerprints: None,
+            _memory: None,
             index: File::open(&container_path).unwrap(),
             table_start: TABLE_START,
             snapshot: File::open(&container_path).unwrap(),

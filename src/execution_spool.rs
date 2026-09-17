@@ -576,7 +576,58 @@ mod tests {
 
     #[cfg(feature = "mdbx")]
     #[test]
-    fn snapshot_backend_spools_share_owner_across_compaction() {
+    fn snapshot_backends_admit_external_base_before_creating_databases() {
+        use crate::snapshot_overlay::{
+            SnapshotOverlayChainstate, SnapshotOverlayConfig, SnapshotOverlayError,
+            tests::{
+                BASE_HEIGHT, IMPORT_TIME, base_coins, block_hash, mtp_for, write_base_snapshot,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let node = directory.path().join("node");
+        std::fs::create_dir(&node).unwrap();
+        let budget = MemoryBudget::new(64 * 1024);
+        budget.bind(&[node.clone()]).unwrap();
+        let (snapshot_path, index_path, identity) = write_base_snapshot(
+            directory.path(),
+            BASE_HEIGHT,
+            block_hash(BASE_HEIGHT),
+            &base_coins(),
+        );
+        assert!(crate::node_memory::for_path(&index_path).unwrap().is_none());
+        let config = |name: &str| SnapshotOverlayConfig {
+            database_dir: node.join(name),
+            snapshot_path: snapshot_path.clone(),
+            index_path: index_path.clone(),
+            capacity_bytes: 32 << 20,
+            import_time: IMPORT_TIME,
+            mtp_by_height: (0..=BASE_HEIGHT).map(mtp_for).collect(),
+        };
+        assert!(matches!(
+            SnapshotOverlayChainstate::open(config("mdbx"), Some(&identity)),
+            Err(SnapshotOverlayError::Index(
+                crate::core_snapshot_index::CoreSnapshotIndexError::Io(_)
+            ))
+        ));
+        assert!(matches!(
+            crate::snapshot_overlay_redb::SnapshotOverlayRedbChainstate::open(
+                config("redb"),
+                Some(&identity)
+            ),
+            Err(SnapshotOverlayError::Index(
+                crate::core_snapshot_index::CoreSnapshotIndexError::Io(_)
+            ))
+        ));
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.snapshot().peak, 64 * 1024);
+        assert!(!node.join("mdbx").exists());
+        assert!(!node.join("redb").exists());
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn snapshot_backend_resources_share_owner_across_rebase_and_compaction() {
+        use crate::chain_store::ExecutionChainStore as _;
         use crate::snapshot_overlay::{
             SnapshotOverlayChainstate, SnapshotOverlayConfig,
             tests::{
@@ -585,7 +636,9 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let budget = MemoryBudget::new(4 * 1024 * 1024 * 1024);
-        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let node = directory.path().join("node");
+        std::fs::create_dir(&node).unwrap();
+        budget.bind(&[node.clone()]).unwrap();
         let (snapshot_path, index_path, identity) = write_base_snapshot(
             directory.path(),
             BASE_HEIGHT,
@@ -593,7 +646,7 @@ mod tests {
             &base_coins(),
         );
         let config = |name: &str| SnapshotOverlayConfig {
-            database_dir: directory.path().join(name),
+            database_dir: node.join(name),
             snapshot_path: snapshot_path.clone(),
             index_path: index_path.clone(),
             capacity_bytes: 32 << 20,
@@ -607,6 +660,48 @@ mod tests {
             Some(&identity),
         )
         .unwrap();
+        // Base files are outside the registered node root; replacement opens
+        // must still use the overlay owner while the old base remains alive.
+        macro_rules! check_rebase {
+            ($store:expr, $name:literal) => {{
+                let old_tip = $store.execution_tip().unwrap();
+                let snapshot = directory.path().join(concat!($name, ".dat"));
+                let index = directory.path().join(concat!($name, ".idx"));
+                let fingerprint = crate::core_snapshot_index::fingerprint_sidecar_path(&index);
+                std::fs::write(&fingerprint, b"existing sidecar").unwrap();
+                assert!(matches!(
+                    $store.rebase_into(&snapshot, &index, &[]),
+                    Err(crate::snapshot_overlay::SnapshotOverlayError::Invalid(
+                        "rebase output paths already exist"
+                    ))
+                ));
+                assert_eq!(std::fs::read(&fingerprint).unwrap(), b"existing sidecar");
+                assert!(!snapshot.exists());
+                assert!(!index.exists());
+                std::fs::remove_file(&fingerprint).unwrap();
+                let baseline = budget.snapshot().used;
+                let pressure = budget
+                    .reserve(budget.snapshot().limit - baseline - 256 * 1024)
+                    .unwrap();
+                assert!(matches!(
+                    $store.rebase_into(&snapshot, &index, &[]),
+                    Err(crate::snapshot_overlay::SnapshotOverlayError::Index(
+                        crate::core_snapshot_index::CoreSnapshotIndexError::Io(_)
+                    ))
+                ));
+                assert_eq!($store.execution_tip().unwrap(), old_tip);
+                assert!(!snapshot.exists());
+                assert!(!index.exists());
+                assert!(!crate::core_snapshot_index::fingerprint_sidecar_path(&index).exists());
+                drop(pressure);
+                assert_eq!(budget.snapshot().used, baseline);
+                $store.rebase_into(&snapshot, &index, &[]).unwrap();
+                assert_eq!($store.execution_tip().unwrap(), old_tip);
+                assert_eq!(budget.snapshot().used, baseline);
+            }};
+        }
+        check_rebase!(mdbx, "mdbx-rebased");
+        check_rebase!(redb, "redb-rebased");
         assert_bound_reads_reject_oversized_scripts(&mdbx);
         assert_bound_reads_reject_oversized_scripts(&redb);
         assert_backend_spool(&mdbx, &budget);

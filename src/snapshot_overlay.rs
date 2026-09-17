@@ -190,7 +190,12 @@ impl SnapshotOverlayChainstate {
         config: SnapshotOverlayConfig,
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
+        let memory = crate::node_memory::for_path(&config.database_dir)?;
+        let base = CoreSnapshotUtxoIndex::open_with_memory(
+            &config.index_path,
+            &config.snapshot_path,
+            memory.as_ref(),
+        )?;
         let db = open_environment(&config.database_dir, config.capacity_bytes)?;
         let identity = {
             let transaction = db.begin_rw_txn()?;
@@ -714,7 +719,8 @@ impl SnapshotOverlayChainstate {
         mtp_extension: &[u32],
         reopen: impl FnOnce(&Path, u64) -> Result<crate::mdbx_memory::Environment, SnapshotOverlayError>,
     ) -> Result<RebaseReport, SnapshotOverlayError> {
-        if new_snapshot_path.exists() || new_index_path.exists() {
+        let fingerprint_path = crate::core_snapshot_index::fingerprint_sidecar_path(new_index_path);
+        if new_snapshot_path.exists() || new_index_path.exists() || fingerprint_path.exists() {
             return Err(SnapshotOverlayError::Invalid(
                 "rebase output paths already exist",
             ));
@@ -882,10 +888,18 @@ impl SnapshotOverlayChainstate {
         };
         // The index build re-decodes the complete file and re-derives the
         // commitment, so a compression asymmetry cannot survive publication.
+        // The builder publishes the index and then its optional fingerprint
+        // sidecar. Own both paths before either publication can fail.
+        cleanup.track(new_index_path.to_owned());
+        cleanup.track(fingerprint_path);
         let report =
             build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
-        cleanup.track(new_index_path.to_owned());
-        let new_base = CoreSnapshotUtxoIndex::open(new_index_path, new_snapshot_path)?;
+        let memory = crate::node_memory::for_path(&self.database_dir)?;
+        let new_base = CoreSnapshotUtxoIndex::open_with_memory(
+            new_index_path,
+            new_snapshot_path,
+            memory.as_ref(),
+        )?;
 
         // `clear_table` alone is not enough: MDBX's copy-on-write B-tree
         // reclaims freed pages onto a freelist for reuse, but `last_pgno` —

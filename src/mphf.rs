@@ -315,6 +315,22 @@ fn take<'bytes>(
     Ok(slice)
 }
 
+impl Mphf {
+    /// Heap capacity retained after decoding, including rank and level tables.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let levels = self
+            .levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Level>());
+        let bytes = self.levels.iter().fold(levels, |total, level| {
+            total
+                .saturating_add(level.words.capacity().saturating_mul(8))
+                .saturating_add(level.rank_samples.capacity().saturating_mul(8))
+        });
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
