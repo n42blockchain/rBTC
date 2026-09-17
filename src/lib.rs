@@ -25,6 +25,7 @@ pub mod core_snapshot;
 pub mod core_snapshot_index;
 pub mod deployments;
 pub mod diagnostics;
+pub mod execution_spool;
 pub mod execution_store;
 pub mod explorer_store;
 pub mod fee_estimator;

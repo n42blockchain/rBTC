@@ -278,6 +278,14 @@ pipelines, optional indexes, explorer and wallet rebroadcast caches. It rejects
 a known simultaneous cache plan that cannot
 leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
 settings. The status API exposes `memory_reservations` (limit, used, peak).
+The ordinary redb batch path (without indexes requesting applied undo copies)
+spools completed preparation to anonymous files in the chainstate directory.
+`execution_spool_reservations` reports its shared 16 GiB logical disk allowance;
+this is independent of Header file admission and is not a physical whole-node
+disk quota. Encoding and decoding reserve from the node memory allowance.
+Temporary results disappear on close/process death; restart replays durable raw
+blocks from the committed execution checkpoint. Preparation workers, full-batch
+prefetch/version maps and indexed undo copies still require further accounting.
 These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
 pages, SQLite, MDBX and other unregistered allocations still require
 integration and whole-node acceptance. The overall memory gate remains open.

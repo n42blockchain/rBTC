@@ -14,6 +14,9 @@ use std::{
 /// Default aggregate reservation allowance (16 GiB).
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Aggregate logical byte allowance for ephemeral execution results (16 GiB).
+pub const DEFAULT_EXECUTION_SPOOL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Cache configured by redb 2.6 for stores without a caller-selected cache.
 pub(crate) const DEFAULT_REDB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -30,6 +33,7 @@ struct Usage {
 struct Shared {
     limit: u64,
     usage: Mutex<Usage>,
+    spool_usage: Mutex<Usage>,
 }
 
 /// One node's memory ledger. Clones share the same allowance.
@@ -53,6 +57,7 @@ impl MemoryBudget {
         Self(Arc::new(Shared {
             limit,
             usage: Mutex::default(),
+            spool_usage: Mutex::default(),
         }))
     }
     /// Reserves before allocation; the returned lease follows its actual owner.
@@ -74,6 +79,40 @@ impl MemoryBudget {
             bytes,
         })
     }
+    pub(crate) fn reserve_spool(&self, bytes: u64) -> io::Result<SpoolLease> {
+        let mut usage = self
+            .0
+            .spool_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Shared by active/background pipelines. This is an ephemeral logical
+        // byte limit, not a physical quota for all node files.
+        if bytes > DEFAULT_EXECUTION_SPOOL_BYTES.saturating_sub(usage.used) {
+            return Err(io::Error::other("execution spool disk allowance exhausted"));
+        }
+        usage.used += bytes;
+        usage.peak = usage.peak.max(usage.used);
+        Ok(SpoolLease {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
+    /// Logical temporary execution bytes; independent of the memory ledger.
+    #[must_use]
+    pub fn spool_snapshot(&self) -> MemorySnapshot {
+        let usage = self
+            .0
+            .spool_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MemorySnapshot {
+            limit: DEFAULT_EXECUTION_SPOOL_BYTES,
+            used: usage.used,
+            peak: usage.peak,
+        }
+    }
+
     /// Reads usage without resetting counters.
     #[must_use]
     pub fn snapshot(&self) -> MemorySnapshot {
@@ -140,6 +179,21 @@ impl Drop for MemoryLease {
         self.budget
             .0
             .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .used -= self.bytes;
+    }
+}
+
+pub(crate) struct SpoolLease {
+    budget: MemoryBudget,
+    bytes: u64,
+}
+impl Drop for SpoolLease {
+    fn drop(&mut self) {
+        self.budget
+            .0
+            .spool_usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .used -= self.bytes;

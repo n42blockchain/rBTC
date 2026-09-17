@@ -785,6 +785,10 @@ impl<C: ExecutionChainStore + 'static> UtxoStore for WriteBackChainstate<C> {
 }
 
 impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainstate<C> {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.inner.execution_spool()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let pending = self.read();
         let in_flight = self.in_flight_state();

@@ -2766,6 +2766,12 @@ impl PeerRunError {
     }
 
     fn block(error: &BlockExecutionError) -> Self {
+        if matches!(
+            error,
+            BlockExecutionError::ChainStore(crate::chain_store::ChainStoreError::ExecutionSpool(_))
+        ) {
+            return Self::local(error.to_string());
+        }
         if error.is_peer_invalid() {
             Self::protocol(error.to_string())
         } else {
@@ -5120,6 +5126,7 @@ struct NodeTrustResponse {
 #[derive(Clone, Debug, serde::Serialize)]
 struct NodeStatusResponse {
     memory_reservations: Option<crate::node_memory::MemorySnapshot>,
+    execution_spool_reservations: Option<crate::node_memory::MemorySnapshot>,
     network: String,
     phase: &'static str,
     ready: bool,
@@ -5331,6 +5338,10 @@ impl NodeStatus {
             "assumed_ready"
         };
         NodeStatusResponse {
+            execution_spool_reservations: self
+                .memory
+                .as_ref()
+                .map(crate::node_memory::MemoryBudget::spool_snapshot),
             memory_reservations: self
                 .memory
                 .as_ref()
@@ -19457,6 +19468,19 @@ mod tests {
     mod inbound_projection;
     mod index_recovery;
     mod memory_budget;
+    #[test]
+    fn execution_spool_failure_is_local_not_peer_misbehavior() {
+        let error =
+            BlockExecutionError::ChainStore(crate::chain_store::ChainStoreError::ExecutionSpool(
+                std::io::Error::other("allowance exhausted"),
+            ));
+        assert!(!error.is_peer_invalid());
+        assert_eq!(
+            PeerRunError::block(&error).kind,
+            PeerFailureKind::LocalResource
+        );
+    }
+
     #[cfg(feature = "mdbx")]
     mod overlay_replay;
     mod private_broadcast_interop;

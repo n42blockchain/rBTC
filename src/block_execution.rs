@@ -872,6 +872,17 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let use_script_pool = blocks.len() > 1;
     let script_batches: Mutex<Vec<DeferredScriptBatch>> = Mutex::new(Vec::new());
     let serial_scripts: Mutex<Vec<DeferredScriptCheck<'_>>> = Mutex::new(Vec::new());
+    // Indexed callers still retain applied undo vectors. The ordinary node
+    // path drops those copies and can evict completed preparation to disk.
+    let spool = if applied_undos == AppliedUndos::Drop {
+        chainstate
+            .execution_spool()
+            .map(|context| context.open())
+            .transpose()
+            .map_err(ChainStoreError::ExecutionSpool)?
+    } else {
+        None
+    };
     let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
         .collect();
@@ -882,6 +893,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         for _ in 0..workers {
             let next = &next_prepare;
             let prepared_slots = &prepared_slots;
+            let spool = spool.as_ref();
             let versions = &versions;
             let cumulative = &cumulative;
             let tips = &tips;
@@ -917,7 +929,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                     // Scripts go to the pool the moment a block is prepared,
                     // so the script workers run beside the rest of the
                     // batch's preparation instead of after it.
-                    let prepared = prepared.map(|(prepared, delta, mut scripts)| {
+                    let prepared = prepared.and_then(|(prepared, delta, mut scripts)| {
                         let submit_started = Instant::now();
                         for script in &mut scripts {
                             script.set_block_order(index);
@@ -931,7 +943,23 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                                 .extend(scripts);
                         }
                         submit_elapsed += submit_started.elapsed();
-                        (prepared, delta)
+                        if let Some(spool) = spool {
+                            let changes = delta.into_net_changes();
+                            let applied = prepared.into_applied(retains_undo);
+                            let transition = ConnectTransition {
+                                expected_parent: block_current.hash,
+                                next: tips[index],
+                                spent: changes.spent,
+                                created: changes.created,
+                                transaction_undos: applied.transaction_undos,
+                            };
+                            let record = spool
+                                .write(&transition)
+                                .map_err(ChainStoreError::ExecutionSpool)?;
+                            Ok(PreparedResult::Disk(record))
+                        } else {
+                            Ok(PreparedResult::Memory(prepared, delta))
+                        }
                     });
                     prepared_slots[index]
                         .set(prepared)
@@ -968,7 +996,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     breakdown.submit += *submit_total.lock().expect("submit total lock not poisoned");
     // The first failing block wins, exactly as sequential preparation would
     // have reported it; a script failure outranks it only when it belongs to
-    // an earlier block. Nothing was written anywhere.
+    // an earlier block. Only disposable preparation files may have been written;
+    // no execution state has been published.
     let mut prepared_blocks = Vec::with_capacity(blocks.len());
     let mut failure = None;
     for (index, slot) in prepared_slots.into_iter().enumerate() {
@@ -1038,35 +1067,48 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // errors abort the entire checkpoint. Scripts have already drained.
     let mut applied_blocks = Vec::with_capacity(prepared_blocks.len());
     let mut apply_elapsed = Duration::ZERO;
-    let mut transitions =
-        prepared_blocks
-            .into_iter()
-            .enumerate()
-            .map(|(index, (prepared, delta))| {
-                let apply_started = Instant::now();
-                let changes = delta.into_net_changes();
-                let mut applied = prepared.into_applied(retains_undo);
-                let transition = ConnectTransition {
-                    expected_parent: if index == 0 {
-                        base.hash
-                    } else {
-                        tips[index - 1].hash
-                    },
-                    next: tips[index],
-                    spent: changes.spent,
-                    created: changes.created,
-                    transaction_undos: match (retains_undo, applied_undos) {
-                        (false, _) => Vec::new(),
-                        (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
-                        (true, AppliedUndos::Drop) => {
-                            std::mem::take(&mut applied.transaction_undos)
-                        }
-                    },
-                };
-                applied_blocks.push(applied);
-                apply_elapsed += apply_started.elapsed();
-                Ok(transition.into())
-            });
+    let mut transitions = prepared_blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let apply_started = Instant::now();
+            let (prepared, delta) = match result {
+                PreparedResult::Memory(prepared, delta) => (prepared, delta),
+                PreparedResult::Disk(record) => {
+                    let transition = spool
+                        .as_ref()
+                        .expect("disk result owns a spool")
+                        .read(&record)
+                        .map_err(ChainStoreError::ExecutionSpool)?;
+                    applied_blocks.push(AppliedBlock {
+                        hash: transition.next.hash,
+                        transaction_undos: Vec::new(),
+                    });
+                    apply_elapsed += apply_started.elapsed();
+                    return Ok(transition);
+                }
+            };
+            let changes = delta.into_net_changes();
+            let mut applied = prepared.into_applied(retains_undo);
+            let transition = ConnectTransition {
+                expected_parent: if index == 0 {
+                    base.hash
+                } else {
+                    tips[index - 1].hash
+                },
+                next: tips[index],
+                spent: changes.spent,
+                created: changes.created,
+                transaction_undos: match (retains_undo, applied_undos) {
+                    (false, _) => Vec::new(),
+                    (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                    (true, AppliedUndos::Drop) => std::mem::take(&mut applied.transaction_undos),
+                },
+            };
+            applied_blocks.push(applied);
+            apply_elapsed += apply_started.elapsed();
+            Ok(transition.into())
+        });
     let commit_started = Instant::now();
     chainstate.commit_connect_batch_stream(&mut transitions, tips.last().copied())?;
     breakdown.apply += apply_elapsed;
@@ -1428,7 +1470,11 @@ pub(crate) fn drain_script_batches(
 
 /// One block's parallel-preparation result, in batch order; its deferred
 /// script checks were already handed to the pool by the preparing worker.
-type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
+type PreparedSlot = Result<PreparedResult, BlockExecutionError>;
+enum PreparedResult {
+    Memory(PreparedActiveBlock, PreparedDelta),
+    Disk(crate::execution_spool::Record),
+}
 /// The whole batch's coin history as of one block: every version each key
 /// takes across the batch, tagged with the block that wrote it. A block reads
 /// the latest version an *earlier* block left and never a later one, so every
@@ -2814,6 +2860,95 @@ mod tests {
     }
 
     #[test]
+    fn execution_spool_commits_through_write_back_and_releases_reservations() {
+        use crate::write_back_chainstate::{WriteBackChainstate, WriteBackLimits};
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let cache_used = budget.snapshot().used;
+        let store = WriteBackChainstate::new(
+            store,
+            WriteBackLimits {
+                max_batches: 10,
+                max_created: u64::MAX,
+            },
+        );
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let second = height_block(first.block_hash(), first.header.time + 1, 2);
+        headers
+            .insert_contextual(second.header, second.header.time)
+            .unwrap();
+        let blocks = [first, second];
+        // With the common node owner exhausted, the first spool write fails
+        // locally. Neither block nor a durable prefix can be published.
+        let occupied = budget
+            .reserve(budget.snapshot().limit - cache_used)
+            .unwrap();
+        assert!(
+            connect_active_blocks_inner(
+                &store,
+                &headers,
+                &blocks,
+                1,
+                60,
+                &[deployments(1), deployments(2)],
+                false,
+                None,
+                None,
+                AppliedUndos::Drop,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap().height, 0);
+        assert_eq!(store.pending_blocks(), 0);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        drop(occupied);
+        let (applied, _) = connect_active_blocks_inner(
+            &store,
+            &headers,
+            &blocks,
+            1,
+            60,
+            &[deployments(1), deployments(2)],
+            false,
+            None,
+            None,
+            AppliedUndos::Drop,
+            None,
+        )
+        .unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(
+            applied
+                .iter()
+                .all(|block| block.transaction_undos.is_empty())
+        );
+        assert_eq!(store.execution_tip().unwrap().height, 2);
+        assert!(budget.spool_snapshot().peak > 0);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert!(
+            budget.snapshot().used > cache_used,
+            "buffered decoded inputs retain reservations"
+        );
+        store.flush().unwrap();
+        assert_eq!(budget.snapshot().used, cache_used);
+        drop(store);
+        let reopened = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution_tip().unwrap().height, 2);
+        for block in blocks {
+            assert!(reopened.block_undo(block.block_hash()).unwrap().is_some());
+        }
+    }
+
+    #[test]
     fn ibd_checkpoint_commits_all_blocks_or_no_blocks() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("chainstate.redb");
@@ -2894,16 +3029,27 @@ mod tests {
 
     #[test]
     fn ibd_checkpoint_defers_all_scripts_but_reports_the_earliest_block() {
-        assert_invalid_scripts_do_not_commit(false);
+        assert_invalid_scripts_do_not_commit(false, false);
     }
 
     #[test]
     fn replay_script_carry_cannot_commit_an_invalid_batch() {
-        assert_invalid_scripts_do_not_commit(true);
+        assert_invalid_scripts_do_not_commit(true, false);
     }
 
-    fn assert_invalid_scripts_do_not_commit(replay: bool) {
+    #[test]
+    fn execution_spool_script_failure_discards_all_results() {
+        assert_invalid_scripts_do_not_commit(true, true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_invalid_scripts_do_not_commit(replay: bool, spool: bool) {
         let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        if spool {
+            budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        }
+
         let chainstate =
             RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
@@ -2976,9 +3122,17 @@ mod tests {
             true,
             None,
             None,
-            AppliedUndos::Keep,
+            if spool {
+                AppliedUndos::Drop
+            } else {
+                AppliedUndos::Keep
+            },
             replay.then_some(&mut carry),
         );
+        if spool {
+            assert!(budget.spool_snapshot().peak > 0);
+            assert_eq!(budget.spool_snapshot().used, 0);
+        }
         assert!(matches!(
             result,
             Err(BlockExecutionError::Block(BlockError::Transaction {

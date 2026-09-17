@@ -81,6 +81,9 @@ impl Default for ChainStoreOptions {
 /// Errors from the unified chain-state database.
 #[derive(Debug, Error)]
 pub enum ChainStoreError {
+    /// Temporary execution results could not be admitted, written or read locally.
+    #[error("execution spool: {0}")]
+    ExecutionSpool(std::io::Error),
     /// A validated local header could not be read; the operation is not published.
     #[error("header lookup: {0}")]
     HeaderRead(#[from] crate::headers::HeaderReadError),
@@ -204,6 +207,7 @@ pub struct RedbChainStore {
     options: ChainStoreOptions,
     validation_journal: Option<Mutex<ValidationJournal>>,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 // Exists only inside an uncommitted materialization transaction. Distinct-key
@@ -600,6 +604,10 @@ pub trait ExecutionChainStore: UtxoStore {
     ) -> Result<(), ChainStoreError> {
         self.commit_connect_batch(&transitions)
     }
+    /// Optional temporary-result storage sharing the node's resource owner.
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        None
+    }
     /// Consumes transitions while preserving one atomic publication boundary.
     ///
     /// A late source error must leave no committed prefix. `final_tip` binds
@@ -697,6 +705,10 @@ pub trait ExecutionChainStore: UtxoStore {
 }
 
 impl ExecutionChainStore for RedbChainStore {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         Ok(self.execution().tip()?)
     }
@@ -1493,7 +1505,11 @@ impl RedbChainStore {
             database.compact()?;
         }
         let db = Arc::new(database);
-        Self::from_database(db, network, options)
+        let mut store = Self::from_database(db, network, options)?;
+        store.execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(path.as_ref())
+                .map_err(ChainStoreError::ExecutionSpool)?;
+        Ok(store)
     }
 
     /// Compacts a closed chainstate database and reports whether maintenance work ran.
@@ -1728,6 +1744,7 @@ impl RedbChainStore {
             options,
             validation_journal,
             write_guard: Mutex::new(()),
+            execution_spool: None,
         })
     }
 
