@@ -47,7 +47,12 @@ Node memory update (2026-09-17): each node load reserves the byte payload plus
 64 KiB of validation headroom before reading an operator file or copying the
 embedded bytes. After validation, only the payload capacity and object allowance
 remain reserved; shared `Arc` views retain that charge until their last owner
-is gone. Node loads validate their own owned copy. The standalone library's
+is gone. Embedded node validation yields every 1,024 instructions so shutdown
+can cancel it without detaching its payload or reservation. Concurrent node
+loads serialize the first validation of the immutable compiled bytes and share
+only a completed-validation bit; cancelled validation is not cached. Each node
+still owns its own admitted byte copy. Operator-file validation remains
+synchronous and is not covered by this cooperative path. The standalone library's
 `Asmap::embedded()` compatibility cache remains process-global.
 
 Operator files are opened once, size-checked on that handle, and read into a

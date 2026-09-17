@@ -47,7 +47,10 @@ not change acceptance statuses or weaken thresholds.
    full resumable scheduling remain open.
    [Startup listener progress](startup-listener-progress-20260917.md) now releases
    multi-thread runtime workers during API/pool/peer-store initialization, with
-   a reproduced ZMQ greeting starvation regression; platform acceptance remains open.
+   a reproduced ZMQ greeting starvation regression. [Cooperative embedded AS-map
+   validation](asmap-cooperative-startup-20260917.md) addresses a separately
+   reproduced coverage shutdown failure and repeated concurrent validation;
+   final-source platform acceptance remains open.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

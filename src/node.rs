@@ -8937,21 +8937,22 @@ async fn run_peer_pool_session(
         }
         _ => None,
     };
+    // The map is resolved before asking whether a peer store exists, so a
+    // broken --asmap file refuses startup instead of being silently unused
+    // on a store-less node.
+    let asmap = match &options.resources.asmap {
+        NodeAsmapSource::Off => None,
+        NodeAsmapSource::Embedded => Some(
+            Asmap::embedded_with_memory(&runtime_memory(options))
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        NodeAsmapSource::File(path) => Some(Arc::new(
+            startup_io(|| Asmap::from_file_with_memory(path, Some(&runtime_memory(options))))
+                .map_err(|error| format!("--asmap {}: {error}", path.display()))?,
+        )),
+    };
     let peer_store = startup_io(|| -> Result<_, String> {
-        // The map is resolved before asking whether a peer store exists, so a
-        // broken --asmap file refuses startup instead of being silently unused
-        // on a store-less node.
-        let asmap = match &options.resources.asmap {
-            NodeAsmapSource::Off => None,
-            NodeAsmapSource::Embedded => Some(
-                Asmap::embedded_with_memory(&runtime_memory(options))
-                    .map_err(|error| error.to_string())?,
-            ),
-            NodeAsmapSource::File(path) => Some(Arc::new(
-                Asmap::from_file_with_memory(path, Some(&runtime_memory(options)))
-                    .map_err(|error| format!("--asmap {}: {error}", path.display()))?,
-            )),
-        };
         let peer_store = if let Some(data_dir) = &options.data_dir {
             Some(Arc::new(
                 RedbPeerStore::open_with_policy(

@@ -164,11 +164,47 @@ impl Asmap {
 
     /// Node-owned embedded payload: unlike the process-global compatibility
     /// cache, its reservation and bytes are released with the final node view.
-    pub(crate) fn embedded_with_memory(
+    pub(crate) async fn embedded_with_memory(
         memory: &crate::node_memory::MemoryBudget,
     ) -> Result<Arc<Self>, AsmapError> {
-        let mut encoded = EMBEDDED_ASMAP;
-        Self::read_admitted(&mut encoded, EMBEDDED_ASMAP.len(), Some(memory)).map(Arc::new)
+        // Only a validation bit is shared. Node payloads and their allowances
+        // remain independently owned and released with the last node view.
+        static VALIDATED: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+        Self::embedded_admitted(memory, &VALIDATED).await
+    }
+
+    async fn embedded_admitted(
+        memory: &crate::node_memory::MemoryBudget,
+        validated: &tokio::sync::Mutex<bool>,
+    ) -> Result<Arc<Self>, AsmapError> {
+        let mut reservation = memory.reserve(EMBEDDED_ASMAP.len() as u64 + 64 * 1024)?;
+        let map = Self {
+            data: EMBEDDED_ASMAP.to_vec(),
+            _memory: None,
+        };
+        {
+            let mut validated = validated.lock().await;
+            if !*validated {
+                let mut validation = SanityCheck::new(&map);
+                loop {
+                    if let Some(valid) = validation.advance(1024) {
+                        if !valid {
+                            return Err(AsmapError::EmbeddedInvalid);
+                        }
+                        *validated = true;
+                        break;
+                    }
+                    // The parent can poll shutdown between bounded slices.
+                    // Cancellation releases the map, lease and validation lock.
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        reservation.shrink_to(map.data.capacity() as u64 + 128)?;
+        Ok(Arc::new(Self {
+            data: map.data,
+            _memory: Some(reservation),
+        }))
     }
 
     /// Returns the map compiled into this binary, validating it once.
@@ -291,123 +327,138 @@ impl Asmap {
     /// the trailing padding is shorter than one byte and zero.
     ///
     /// Port of Core's `SanityCheckASMap` over 128 address bits.
-    #[allow(clippy::too_many_lines)]
     fn sanity_check(&self) -> bool {
-        let end = self.bit_len();
-        let mut reader = BitReader {
-            map: self,
-            position: 0,
-        };
-        let mut bits: u32 = 128;
-        // Pending jump targets: bit offset paired with the address bits that
-        // remain to be consumed on that branch. Targets are strictly
-        // decreasing from back to front, so the vector never exceeds one
-        // entry per address bit.
-        let mut jumps: Vec<(usize, u32)> = Vec::with_capacity(128);
-        let mut previous = Instruction::Jump;
-        let mut had_incomplete_match = false;
-        while reader.remaining() > 0 {
-            if let Some(&(target, _)) = jumps.last() {
-                if reader.position >= target {
+        SanityCheck::new(self).advance(usize::MAX).unwrap_or(false)
+    }
+}
+
+// Validation state is retained across bounded instruction slices. The pending
+// jump stack has at most one entry per address bit (128 entries).
+struct SanityCheck<'a> {
+    reader: BitReader<'a>,
+    bits: u32,
+    jumps: Vec<(usize, u32)>,
+    previous: Instruction,
+    had_incomplete_match: bool,
+}
+
+impl<'a> SanityCheck<'a> {
+    fn new(map: &'a Asmap) -> Self {
+        Self {
+            reader: BitReader { map, position: 0 },
+            bits: 128,
+            jumps: Vec::with_capacity(128),
+            previous: Instruction::Jump,
+            had_incomplete_match: false,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn advance(&mut self, instructions: usize) -> Option<bool> {
+        for _ in 0..instructions {
+            if self.reader.remaining() == 0 {
+                return Some(false);
+            }
+            if let Some(&(target, _)) = self.jumps.last() {
+                if self.reader.position >= target {
                     // A jump landed inside the previous instruction.
-                    return false;
+                    return Some(false);
                 }
             }
-            let Some(opcode) = decode_type(&mut reader) else {
-                return false;
+            let Some(opcode) = decode_type(&mut self.reader) else {
+                return Some(false);
             };
             match opcode {
                 Instruction::Return => {
-                    if previous == Instruction::Default {
+                    if self.previous == Instruction::Default {
                         // A RETURN directly after a DEFAULT could have been
                         // one RETURN.
-                        return false;
+                        return Some(false);
                     }
-                    if decode_bits(&mut reader, 1, ASN_BIT_SIZES) == INVALID {
-                        return false;
+                    if decode_bits(&mut self.reader, 1, ASN_BIT_SIZES) == INVALID {
+                        return Some(false);
                     }
-                    match jumps.pop() {
+                    match self.jumps.pop() {
                         None => {
-                            if end - reader.position > 7 {
+                            if self.reader.map.bit_len() - self.reader.position > 7 {
                                 // More than one byte of padding.
-                                return false;
+                                return Some(false);
                             }
-                            while reader.remaining() > 0 {
-                                if reader.read() != Some(true) {
+                            while self.reader.remaining() > 0 {
+                                if self.reader.read() != Some(true) {
                                     continue;
                                 }
                                 // Nonzero padding bit.
-                                return false;
+                                return Some(false);
                             }
-                            return true;
+                            return Some(true);
                         }
                         Some((target, remaining_bits)) => {
-                            if reader.position != target {
+                            if self.reader.position != target {
                                 // Unreachable code before the jump target.
-                                return false;
+                                return Some(false);
                             }
-                            bits = remaining_bits;
-                            previous = Instruction::Jump;
+                            self.bits = remaining_bits;
+                            self.previous = Instruction::Jump;
                         }
                     }
                 }
                 Instruction::Jump => {
-                    let jump = decode_bits(&mut reader, 17, JUMP_BIT_SIZES);
+                    let jump = decode_bits(&mut self.reader, 17, JUMP_BIT_SIZES);
                     if jump == INVALID {
-                        return false;
+                        return Some(false);
                     }
-                    if jump as usize > reader.remaining() {
-                        return false;
+                    if jump as usize > self.reader.remaining() {
+                        return Some(false);
                     }
-                    if bits == 0 {
+                    if self.bits == 0 {
                         // Consuming address bits past the end of the input.
-                        return false;
+                        return Some(false);
                     }
-                    bits -= 1;
-                    let target = reader.position + jump as usize;
-                    if let Some(&(pending, _)) = jumps.last() {
+                    self.bits -= 1;
+                    let target = self.reader.position + jump as usize;
+                    if let Some(&(pending, _)) = self.jumps.last() {
                         if target >= pending {
                             // Intersecting jump ranges.
-                            return false;
+                            return Some(false);
                         }
                     }
-                    jumps.push((target, bits));
-                    previous = Instruction::Jump;
+                    self.jumps.push((target, self.bits));
+                    self.previous = Instruction::Jump;
                 }
                 Instruction::Match => {
-                    let matched = decode_bits(&mut reader, 2, MATCH_BIT_SIZES);
+                    let matched = decode_bits(&mut self.reader, 2, MATCH_BIT_SIZES);
                     if matched == INVALID {
-                        return false;
+                        return Some(false);
                     }
                     let match_len = 31 - matched.leading_zeros();
-                    if previous != Instruction::Match {
-                        had_incomplete_match = false;
+                    if self.previous != Instruction::Match {
+                        self.had_incomplete_match = false;
                     }
-                    if match_len < 8 && had_incomplete_match {
+                    if match_len < 8 && self.had_incomplete_match {
                         // Only the last match in a chain may be short.
-                        return false;
+                        return Some(false);
                     }
-                    had_incomplete_match = match_len < 8;
-                    if bits < match_len {
-                        return false;
+                    self.had_incomplete_match = match_len < 8;
+                    if self.bits < match_len {
+                        return Some(false);
                     }
-                    bits -= match_len;
-                    previous = Instruction::Match;
+                    self.bits -= match_len;
+                    self.previous = Instruction::Match;
                 }
                 Instruction::Default => {
-                    if previous == Instruction::Default {
+                    if self.previous == Instruction::Default {
                         // Two successive DEFAULTs could have been one.
-                        return false;
+                        return Some(false);
                     }
-                    if decode_bits(&mut reader, 1, ASN_BIT_SIZES) == INVALID {
-                        return false;
+                    if decode_bits(&mut self.reader, 1, ASN_BIT_SIZES) == INVALID {
+                        return Some(false);
                     }
-                    previous = Instruction::Default;
+                    self.previous = Instruction::Default;
                 }
             }
         }
-        // Reached the end without a terminating RETURN.
-        false
+        None
     }
 }
 
@@ -813,8 +864,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn node_map_reservation_follows_the_last_shared_view() {
+    #[tokio::test]
+    async fn node_map_reservation_follows_the_last_shared_view() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("asmap.dat");
         let encoded = test_encoder::encode(&[test_encoder::v4_prefix16(8, 8, 15169)]);
@@ -837,9 +888,13 @@ mod tests {
         assert_eq!(budget.snapshot().used, retained);
         drop(view);
         assert_eq!(budget.snapshot().used, 0);
-        assert!(Asmap::embedded_with_memory(&crate::node_memory::MemoryBudget::new(0)).is_err());
+        assert!(
+            Asmap::embedded_with_memory(&crate::node_memory::MemoryBudget::new(0))
+                .await
+                .is_err()
+        );
         let budget = crate::node_memory::MemoryBudget::new(32 << 20);
-        let embedded = Asmap::embedded_with_memory(&budget).unwrap();
+        let embedded = Asmap::embedded_with_memory(&budget).await.unwrap();
         assert_eq!(
             budget.snapshot().used,
             embedded.data.capacity() as u64 + 128
@@ -851,6 +906,36 @@ mod tests {
                 .map_asn("8.8.8.8".parse().unwrap())
         );
         drop(embedded);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn node_embedded_validation_yields_and_cancellation_refunds_its_payload() {
+        use std::{
+            future::Future as _,
+            task::{Context, Poll, Waker},
+        };
+        let budget = crate::node_memory::MemoryBudget::new(4 << 20);
+        let validated = tokio::sync::Mutex::new(false);
+        let mut load = Box::pin(Asmap::embedded_admitted(&budget, &validated));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(load.as_mut().poll(&mut context), Poll::Pending));
+        assert!(budget.snapshot().used >= super::EMBEDDED_ASMAP.len() as u64);
+        drop(load);
+        assert_eq!(budget.snapshot().used, 0);
+        assert!(!*validated.try_lock().unwrap());
+        let map = Asmap::embedded_admitted(&budget, &validated).await.unwrap();
+        assert!(*validated.try_lock().unwrap());
+        // Cached validation admits a fresh payload without another CPU pass.
+        let mut cached = Box::pin(Asmap::embedded_admitted(&budget, &validated));
+        let Poll::Ready(Ok(other)) = cached.as_mut().poll(&mut context) else {
+            panic!("validated embedded bytes must not be revalidated");
+        };
+        assert!(!std::sync::Arc::ptr_eq(&map, &other));
+        drop(other);
+        drop(cached);
+        assert_eq!(map.map_asn("8.8.8.8".parse().unwrap()), 15169);
+        drop(map);
         assert_eq!(budget.snapshot().used, 0);
     }
 

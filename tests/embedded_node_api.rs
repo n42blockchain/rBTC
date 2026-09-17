@@ -146,7 +146,19 @@ async fn serve_one_block_regtest_node(
     let mut released = false;
     let mut release = Some(release);
     loop {
-        match peer.read_message().await.unwrap().into_payload() {
+        let message = match peer.read_message().await {
+            Ok(message) => message.into_payload(),
+            Err(rbtc::p2p::P2pError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("one-block peer read failed: {error}"),
+        };
+        match message {
             NetworkMessage::GetHeaders(_) => {
                 if released {
                     peer.write_message(NetworkMessage::Headers(Vec::new()))
@@ -672,5 +684,8 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
         .await
         .expect("node with a ZMQ endpoint must stop cleanly")
         .unwrap();
-    peer.abort();
+    timeout(Duration::from_secs(3), peer)
+        .await
+        .expect("the block peer must observe shutdown")
+        .expect("the block peer must finish without a detached panic");
 }
