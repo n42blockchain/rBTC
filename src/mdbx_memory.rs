@@ -78,6 +78,10 @@ impl Environment {
                 max_tables: Some(4),
                 txn_dp_limit: Some(DIRTY_PAGES),
                 dp_reserve_limit: Some(RESERVE_PAGES),
+                // Do not let host-RAM heuristics populate a speculative mapped
+                // working set outside the node's explicit resource planning.
+                // Demand-faulted pages still require RSS acceptance.
+                no_rdahead: true,
                 mode: Mode::ReadWrite(ReadWriteOptions {
                     sync_mode: SyncMode::Durable,
                     max_size: Some(capacity),
@@ -111,14 +115,20 @@ mod tests {
         budget.bind(std::slice::from_ref(&first_path)).unwrap();
         let first = open(&first_path, 64 * 1024 * 1024).unwrap();
         assert_eq!(budget.snapshot().used, RESERVATION_BYTES);
+        assert!(first.info().unwrap().read_ahead_disabled());
         let sibling = root.path().join("active.compact");
         let owner = first.memory();
         assert!(Environment::open(&sibling, 64 * 1024 * 1024, owner.clone()).is_err());
         assert!(!sibling.exists());
         drop(first);
-        let second = Environment::open(&sibling, 64 * 1024 * 1024, owner).unwrap();
+        let second = Environment::open(&sibling, 64 * 1024 * 1024, owner.clone()).unwrap();
+        assert!(second.info().unwrap().read_ahead_disabled());
         assert_eq!(budget.snapshot().used, RESERVATION_BYTES);
         drop(second);
+        assert_eq!(budget.snapshot().used, 0);
+        let reopened = Environment::open(&first_path, 64 * 1024 * 1024, owner).unwrap();
+        assert!(reopened.info().unwrap().read_ahead_disabled());
+        drop(reopened);
         assert_eq!(budget.snapshot().used, 0);
     }
     #[test]
