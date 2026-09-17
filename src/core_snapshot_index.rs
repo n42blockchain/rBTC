@@ -31,7 +31,7 @@
 
 use std::{
     fs::File,
-    io::{BufReader, Cursor, Read},
+    io::{BufReader, BufWriter, Cursor, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -91,6 +91,7 @@ fn fingerprint_of(txid: &[u8]) -> u16 {
     u16::from_le_bytes([txid[0], txid[1]])
 }
 
+#[cfg(test)]
 fn encode_fingerprint_sidecar(
     index_digest: &[u8; INDEX_DIGEST_BYTES],
     fingerprints: &[u16],
@@ -362,7 +363,6 @@ pub fn build_core_snapshot_index_with_identity(
         coin_bytes_end,
     } = scan_snapshot(snapshot_path, identity)?;
 
-    let coins = metadata.coins_count;
     let groups = u64::try_from(locations.len()).expect("group count fits u64");
     let mphf = Mphf::build(
         groups,
@@ -376,9 +376,8 @@ pub fn build_core_snapshot_index_with_identity(
         .max()
         .expect("scan yields at least one group");
     // The widest group this snapshot actually contains, measured rather than
-    // bounded by the format's theoretical ceiling. A reader that knows it
-    // never widens a read past what the file can hold, so a damaged group
-    // count cannot drive an allocation toward the size of the whole file.
+    // bounded by the format's theoretical ceiling. This caps the streaming
+    // decoder's read span even if a stored group count is damaged.
     let max_group_bytes = locations
         .windows(2)
         .map(|pair| pair[1].offset.saturating_sub(pair[0].offset))
@@ -418,12 +417,15 @@ pub fn build_core_snapshot_index_with_identity(
             fingerprint_of(&location.txid);
     }
 
-    let mut bytes = Vec::new();
+    // These build inputs are no longer needed once all slots are populated.
+    drop(occupied);
+    drop(locations);
+    let mut bytes = Vec::with_capacity(INDEX_HEADER_BYTES);
     bytes.extend_from_slice(INDEX_MAGIC);
     bytes.extend_from_slice(&INDEX_VERSION.to_le_bytes());
     bytes.extend_from_slice(&metadata.network.magic().to_bytes());
     bytes.extend_from_slice(metadata.base_block_hash.as_byte_array());
-    bytes.extend_from_slice(&coins.to_le_bytes());
+    bytes.extend_from_slice(&metadata.coins_count.to_le_bytes());
     bytes.extend_from_slice(&snapshot_bytes.to_le_bytes());
     bytes.extend_from_slice(&snapshot_sha256);
     bytes.extend_from_slice(&identity.height.to_le_bytes());
@@ -431,23 +433,25 @@ pub fn build_core_snapshot_index_with_identity(
     bytes.extend_from_slice(&max_group_bytes.to_le_bytes());
     bytes.push(offset_bits);
     debug_assert_eq!(bytes.len(), INDEX_HEADER_BYTES);
-    mphf.encode_into(&mut bytes);
-    for word in &table {
-        bytes.extend_from_slice(&word.to_le_bytes());
-    }
-    let digest: [u8; 32] = Sha256::digest(&bytes).into();
-    bytes.extend_from_slice(&digest);
-
-    publish_atomically(index_path, &bytes)?;
-    publish_atomically(
+    let (digest, index_bytes) = publish_digest(index_path, |out| {
+        out.write_all(&bytes)?;
+        mphf.write_to(out)?;
+        for word in &table {
+            out.write_all(&word.to_le_bytes())?;
+        }
+        Ok(())
+    })?;
+    drop(table);
+    publish_fingerprints(
         &fingerprint_sidecar_path(index_path),
-        &encode_fingerprint_sidecar(&digest, &fingerprints),
+        &digest,
+        &fingerprints,
     )?;
     Ok(CoreSnapshotIndexReport {
-        coins,
+        coins: metadata.coins_count,
         snapshot_bytes,
         snapshot_sha256,
-        index_bytes: u64::try_from(bytes.len()).expect("index length fits u64"),
+        index_bytes,
         mphf_levels: mphf.level_count(),
         mphf_bits: mphf.bit_len(),
     })
@@ -871,10 +875,7 @@ impl CoreSnapshotUtxoIndex {
             fingerprints[usize::try_from(slot).expect("slot fits usize")] =
                 fingerprint_of(&location.txid);
         }
-        publish_atomically(
-            &sidecar,
-            &encode_fingerprint_sidecar(&opened.container_digest, &fingerprints),
-        )?;
+        publish_fingerprints(&sidecar, &opened.container_digest, &fingerprints)?;
         Ok(opened.groups)
     }
 
@@ -1277,14 +1278,72 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     Ok(())
 }
 
-/// Publishes through a same-directory temporary file, file sync, and atomic
-/// rename. Delegates to `snapshot::atomic_write`'s pid- and randomly-suffixed,
-/// collision-retrying temporary name instead of a fixed `<name>.tmp` sibling,
-/// so two independent builds racing on the same output path (an operator
-/// rebuild run against a path a live node's rebase is concurrently writing)
-/// cannot collide on the same temporary file.
-fn publish_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    crate::snapshot::atomic_write(path, bytes)
+/// Hashes only the bytes successfully accepted by the underlying writer.
+struct DigestWriter<W> {
+    inner: W,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<W: Write> Write for DigestWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        self.bytes = self
+            .bytes
+            .checked_add(written as u64)
+            .ok_or_else(|| std::io::Error::other("index output size overflow"))?;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn publish_digest(
+    path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<([u8; 32], u64)> {
+    crate::snapshot::atomic_write_with(path, |file| {
+        let mut out = DigestWriter {
+            inner: file,
+            digest: Sha256::new(),
+            bytes: 0,
+        };
+        {
+            // Buffer before hashing as well as before I/O, so the encoding's
+            // small integer fields do not cause one hash update per word.
+            let mut buffered = BufWriter::with_capacity(64 * 1024, &mut out);
+            write(&mut buffered)?;
+            buffered.flush()?;
+        }
+        let digest: [u8; 32] = out.digest.finalize().into();
+        let bytes = out
+            .bytes
+            .checked_add(INDEX_DIGEST_BYTES as u64)
+            .ok_or_else(|| std::io::Error::other("index output size overflow"))?;
+        out.inner.write_all(&digest)?;
+        out.inner.flush()?;
+        Ok((digest, bytes))
+    })
+}
+
+fn publish_fingerprints(
+    path: &Path,
+    digest: &[u8; 32],
+    fingerprints: &[u16],
+) -> std::io::Result<()> {
+    publish_digest(path, |out| {
+        out.write_all(FINGERPRINT_MAGIC)?;
+        out.write_all(&FINGERPRINT_VERSION.to_le_bytes())?;
+        out.write_all(digest)?;
+        out.write_all(&(fingerprints.len() as u64).to_le_bytes())?;
+        for value in fingerprints {
+            out.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1666,6 +1725,47 @@ mod tests {
                 .is_none()
         );
         assert_eq!(denied.snapshot().peak, 0);
+    }
+
+    #[test]
+    fn streaming_publication_matches_sidecar_bytes_and_preserves_prior_file_on_error() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("stream.idx");
+        let fingerprints: Vec<u16> = (0..40_000).collect();
+        let digest = [7; 32];
+        publish_fingerprints(&path, &digest, &fingerprints).unwrap();
+        let expected = encode_fingerprint_sidecar(&digest, &fingerprints);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let result = publish_digest(&path, |out| {
+            for _ in 0..100 {
+                out.write_all(&[0x55; 4096])?;
+            }
+            Err(std::io::Error::other("injected encoder failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        let (digest, bytes) = publish_digest(&path, |out| {
+            for _ in 0..1024 {
+                out.write_all(&[0x61; 8192])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(bytes, 8 * 1024 * 1024 + 32);
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes);
+        let mut input = File::open(&path).unwrap();
+        let mut expected = Sha256::new();
+        let mut block = [0; 8192];
+        for _ in 0..1024 {
+            input.read_exact(&mut block).unwrap();
+            assert!(block.iter().all(|byte| *byte == 0x61));
+            expected.update(block);
+        }
+        let mut trailer = [0; 32];
+        input.read_exact(&mut trailer).unwrap();
+        assert_eq!(trailer, digest);
+        assert_eq!(digest, <[u8; 32]>::from(expected.finalize()));
     }
 
     #[test]

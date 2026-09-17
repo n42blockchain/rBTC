@@ -388,6 +388,13 @@ pub fn export_snapshot<S: UtxoStore>(
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    atomic_write_with(path, |file| file.write_all(contents))
+}
+
+pub(crate) fn atomic_write_with<T>(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> Result<T, std::io::Error>,
+) -> Result<T, std::io::Error> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -423,13 +430,13 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::
         ));
     };
     let result = (|| {
-        file.write_all(contents)?;
+        let value = write(&mut file)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary_path, path)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
-        Ok(())
+        Ok(value)
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary_path);

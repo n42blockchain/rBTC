@@ -217,6 +217,20 @@ impl Mphf {
         }
     }
 
+    /// Writes the canonical encoding without constructing an encoded copy.
+    pub(crate) fn write_to<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(&self.seed.to_le_bytes())?;
+        out.write_all(&self.key_count.to_le_bytes())?;
+        out.write_all(&self.level_count().to_le_bytes())?;
+        for level in &self.levels {
+            out.write_all(&level.bit_count.to_le_bytes())?;
+            for word in &level.words {
+                out.write_all(&word.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the exact persisted length in bytes.
     #[must_use]
     pub fn encoded_len(&self) -> u64 {
@@ -346,6 +360,46 @@ mod tests {
             keys.insert(key);
         }
         keys.into_iter().collect()
+    }
+
+    #[test]
+    fn streamed_encoding_matches_legacy_bytes_and_propagates_short_write_failure() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let length = bytes
+                    .len()
+                    .min(3)
+                    .min(self.limit.saturating_sub(self.bytes.len()));
+                if length == 0 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                self.bytes.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let keys = random_keys(1000, 7);
+        let mphf = Mphf::build(1000, |ordinal| keys[usize_from(ordinal)], 42).unwrap();
+        let mut expected = Vec::new();
+        mphf.encode_into(&mut expected);
+        let mut out = ShortWriter {
+            bytes: Vec::new(),
+            limit: usize::MAX,
+        };
+        mphf.write_to(&mut out).unwrap();
+        assert_eq!(out.bytes, expected);
+        let mut failing = ShortWriter {
+            bytes: Vec::new(),
+            limit: 37,
+        };
+        assert!(mphf.write_to(&mut failing).is_err());
+        assert_eq!(failing.bytes, expected[..37]);
     }
 
     #[test]
