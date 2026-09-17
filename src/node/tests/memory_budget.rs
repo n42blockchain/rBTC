@@ -125,3 +125,46 @@ fn background_startup_counts_both_caches_and_status_exposes_live_usage() {
             .contains("live runtime")
     );
 }
+
+#[test]
+fn staged_prefix_validation_is_ordered_bounded_and_never_publishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
+    let blocks: Vec<_> = (0_u8..35).map(|n| vec![n]).collect();
+    ledger.stage(10, &blocks).unwrap();
+    let identity = ledger.staged_manifest().unwrap().unwrap();
+    let mut seen = Vec::new();
+    assert!(
+        visit_staged_prefix(&ledger, &identity, 35, |height, raw| {
+            seen.push((height, raw[0]));
+            Ok(true)
+        })
+        .unwrap()
+    );
+    assert_eq!(
+        seen,
+        (0_u8..35)
+            .map(|n| (10 + u32::from(n), n))
+            .collect::<Vec<_>>()
+    );
+    assert!(ledger.retained_tip().unwrap().is_none());
+    seen.clear();
+    assert!(
+        !visit_staged_prefix(&ledger, &identity, 35, |height, raw| {
+            seen.push((height, raw[0]));
+            Ok(height < 27)
+        })
+        .unwrap()
+    );
+    assert_eq!(seen.len(), 18);
+    assert_eq!(seen.last(), Some(&(27, 17)));
+    assert_eq!(
+        visit_staged_prefix(&ledger, &identity, 35, |_, _| Err(
+            "injected validation failure".to_owned()
+        ))
+        .unwrap_err(),
+        "injected validation failure"
+    );
+    assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+    assert!(ledger.retained_tip().unwrap().is_none());
+}

@@ -497,6 +497,67 @@ impl PrunedBlockLedger {
         }
     }
 
+    /// Fully verifies staged data without materializing its block payloads.
+    pub fn staged_manifest(&self) -> Result<Option<ArchiveManifest>, LedgerError> {
+        let _guard = self.lock();
+        match verify_archive_streaming(self.staged_path()) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Reads a bounded contiguous part of a previously verified staged segment.
+    /// The complete identity must still match `expected`. This never publishes,
+    /// truncates, removes or replaces staged data, even when admission is too
+    /// small for its first requested record. Consensus revalidation remains the
+    /// caller's responsibility before committing any returned prefix.
+    pub fn read_staged_batch(
+        &self,
+        expected: &ArchiveManifest,
+        first_height: u32,
+        max_blocks: u32,
+        max_record_bytes: u64,
+    ) -> Result<LedgerBlockBatch, LedgerError> {
+        if max_blocks == 0
+            || max_blocks > u32::from(MAX_AUDIT_SLOT_NAMESPACE)
+            || max_record_bytes == 0
+            || first_height
+                .checked_sub(expected.first_height)
+                .is_none_or(|offset| offset >= expected.block_count)
+        {
+            return Err(LedgerError::Invalid("invalid staged block batch bound"));
+        }
+        let _guard = self.lock();
+        let (manifest, blocks) = crate::archive::read_archive_batch(
+            self.staged_path(),
+            first_height,
+            max_blocks,
+            max_record_bytes,
+        )?;
+        if &manifest != expected {
+            return Err(LedgerError::Invalid("staged archive identity changed"));
+        }
+        if blocks.is_empty() {
+            return Err(LedgerError::Invalid(
+                "staged block batch byte budget was exhausted",
+            ));
+        }
+        let record_bytes = blocks.iter().try_fold(0_u64, |total, block| {
+            total
+                .checked_add(4)
+                .and_then(|total| total.checked_add(block.len() as u64))
+                .ok_or(LedgerError::Invalid("staged block batch byte overflow"))
+        })?;
+        Ok(LedgerBlockBatch {
+            first_height,
+            record_bytes,
+            blocks,
+        })
+    }
+
     /// Publishes the first `block_count` staged blocks and discards the rest.
     ///
     /// Repeating this after interruption is safe: if the same prefix is
@@ -2603,6 +2664,60 @@ mod tests {
             ))
         ));
         assert!(ledger.read_block_batch(9, 1, 100).is_err());
+    }
+
+    #[test]
+    fn bounded_staged_reads_preserve_durable_data_and_reject_identity_changes() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        let blocks = [vec![10], vec![11; 256 * 1024], vec![12]];
+        ledger.stage(10, &blocks).unwrap();
+        let original = fs::read(ledger.staged_path()).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        assert!(ledger.read_staged_batch(&identity, 10, 2, 4).is_err());
+        let prefix = ledger.read_staged_batch(&identity, 10, 2, 5).unwrap();
+        assert_eq!(prefix.blocks, vec![vec![10]]);
+        assert_eq!(prefix.record_bytes, 5);
+        assert!(ledger.read_staged_batch(&identity, 11, 2, 5).is_err());
+        assert_eq!(
+            ledger
+                .read_staged_batch(&identity, 12, 1, 5)
+                .unwrap()
+                .blocks,
+            vec![vec![12]]
+        );
+        assert!(ledger.read_staged_batch(&identity, 9, 1, 5).is_err());
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        assert!(ledger.read_block(10).unwrap().is_none());
+        assert!(ledger.read_block_batch(10, 1, 5).is_err());
+        drop(ledger);
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+        assert_eq!(
+            ledger
+                .read_staged_batch(&identity, 10, 3, 300_000)
+                .unwrap()
+                .blocks,
+            blocks
+        );
+        ledger.discard_staged().unwrap();
+        ledger.stage(10, &[vec![99]]).unwrap();
+        assert!(matches!(
+            ledger.read_staged_batch(&identity, 10, 1, 5),
+            Err(LedgerError::Invalid("staged archive identity changed"))
+        ));
+        let replacement = ledger.staged_manifest().unwrap().unwrap();
+        assert_eq!(
+            ledger
+                .read_staged_batch(&replacement, 10, 1, 5)
+                .unwrap()
+                .blocks,
+            vec![vec![99]]
+        );
+        assert!(ledger.retained_tip().unwrap().is_none());
+        ledger.commit_staged(1).unwrap();
+        assert_eq!(ledger.read_block(10).unwrap(), Some(vec![99]));
     }
 
     #[test]

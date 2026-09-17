@@ -7875,40 +7875,72 @@ fn recover_local_reindex_staging(
             .truncate_from(first_unexecuted)
             .map_err(|error| error.to_string())?;
     }
-    let Some(staged) = ledger.staged().map_err(|error| error.to_string())? else {
+    let Some(staged) = ledger
+        .staged_manifest()
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(());
     };
-    if staged.manifest.first_height > tip.height {
+    if staged.first_height > tip.height {
         ledger.discard_staged().map_err(|error| error.to_string())?;
         return Ok(());
     }
     let validated_count = tip
         .height
-        .checked_sub(staged.manifest.first_height)
+        .checked_sub(staged.first_height)
         .and_then(|distance| distance.checked_add(1))
         .ok_or_else(|| "reindex staged height overflow".to_owned())?
-        .min(staged.manifest.block_count);
-    for (offset, raw) in staged
-        .blocks
-        .iter()
-        .take(usize::try_from(validated_count).expect("staged block bound fits usize"))
-        .enumerate()
-    {
-        let height = staged
-            .manifest
-            .first_height
-            .checked_add(u32::try_from(offset).expect("staged offset fits u32"))
-            .ok_or_else(|| "reindex staged height overflow".to_owned())?;
+        .min(staged.block_count);
+    visit_staged_prefix(ledger, &staged, validated_count, |height, raw| {
         let block: Block = deserialize(raw)
             .map_err(|error| format!("decode staged reindex block at {height}: {error}"))?;
         let expected = headers
             .active_header(height)?
             .ok_or_else(|| format!("missing active header at reindex height {height}"))?;
         validate_archive_block(deployments, headers, height, expected.hash, &block)?;
-    }
+        Ok(true)
+    })?;
     ledger
         .commit_staged(validated_count)
         .map_err(|error| error.to_string())
+}
+
+// Staged data remains unpublished throughout validation. A changed identity,
+// truncated record or invalid block aborts before commit_staged can publish it.
+fn visit_staged_prefix(
+    ledger: &PrunedBlockLedger,
+    expected: &crate::archive::ArchiveManifest,
+    count: u32,
+    mut visit: impl FnMut(u32, &[u8]) -> Result<bool, String>,
+) -> Result<bool, String> {
+    if count > expected.block_count {
+        return Err("staged prefix exceeds archive".to_owned());
+    }
+    let mut consumed = 0_u32;
+    while consumed < count {
+        let first = expected
+            .first_height
+            .checked_add(consumed)
+            .ok_or_else(|| "staged prefix height overflow".to_owned())?;
+        let batch = ledger
+            .read_staged_batch(
+                expected,
+                first,
+                (count - consumed).min(16),
+                32 * 1024 * 1024,
+            )
+            .map_err(|error| error.to_string())?;
+        for (offset, raw) in batch.blocks.iter().enumerate() {
+            let height = first
+                .checked_add(u32::try_from(offset).expect("bounded staged batch offset"))
+                .ok_or_else(|| "staged prefix height overflow".to_owned())?;
+            if !visit(height, raw)? {
+                return Ok(false);
+            }
+        }
+        consumed += u32::try_from(batch.blocks.len()).expect("bounded staged batch length");
+    }
+    Ok(true)
 }
 
 fn execute_local_reindex_batch(
@@ -12348,7 +12380,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     // `commit_staged`; this driver takes the simpler always-discard path and
     // re-downloads, which is a bounded, one-batch bandwidth cost.
     if ledger
-        .staged()
+        .staged_manifest()
         .map_err(|error| PeerRunError::transient(error.to_string()))?
         .is_some()
     {
@@ -14866,41 +14898,41 @@ async fn reconcile_ledger(
             .map_err(|error| error.to_string())?;
     }
 
-    if let Some(staged) = ledger.staged().map_err(|error| error.to_string())? {
-        if staged.manifest.first_height > tip.height {
+    if let Some(staged) = ledger
+        .staged_manifest()
+        .map_err(|error| error.to_string())?
+    {
+        if staged.first_height > tip.height {
             ledger.discard_staged().map_err(|error| error.to_string())?;
         } else {
             let available = tip
                 .height
-                .checked_sub(staged.manifest.first_height)
+                .checked_sub(staged.first_height)
                 .and_then(|distance| distance.checked_add(1))
                 .ok_or_else(|| "staged ledger height overflow".to_owned())?;
-            let validated_count = available.min(staged.manifest.block_count);
-            let mut on_active_chain = true;
-            for (offset, bytes) in staged
-                .blocks
-                .iter()
-                .take(usize::try_from(validated_count).expect("staged count fits usize"))
-                .enumerate()
-            {
-                let height = staged
-                    .manifest
-                    .first_height
-                    .checked_add(u32::try_from(offset).expect("staged offset fits u32"))
-                    .ok_or_else(|| "staged ledger height overflow".to_owned())?;
-                let block: Block = deserialize(bytes)
-                    .map_err(|error| format!("decode staged block at height {height}: {error}"))?;
-                let expected = headers
-                    .active_header(height)?
-                    .ok_or_else(|| format!("missing active header at height {height}"))?;
-                if block.block_hash() != expected.hash {
-                    on_active_chain = false;
-                    break;
-                }
-                validate_archive_block(deployment_config, headers, height, expected.hash, &block)?;
-            }
+            let validated_count = available.min(staged.block_count);
+            let on_active_chain =
+                visit_staged_prefix(ledger, &staged, validated_count, |height, bytes| {
+                    let block: Block = deserialize(bytes).map_err(|error| {
+                        format!("decode staged block at height {height}: {error}")
+                    })?;
+                    let expected = headers
+                        .active_header(height)?
+                        .ok_or_else(|| format!("missing active header at height {height}"))?;
+                    if block.block_hash() != expected.hash {
+                        return Ok(false);
+                    }
+                    validate_archive_block(
+                        deployment_config,
+                        headers,
+                        height,
+                        expected.hash,
+                        &block,
+                    )?;
+                    Ok(true)
+                })?;
             if on_active_chain {
-                let preceding_height = staged.manifest.first_height.saturating_sub(1);
+                let preceding_height = staged.first_height.saturating_sub(1);
                 backfill_ledger(
                     session,
                     deployment_config,
