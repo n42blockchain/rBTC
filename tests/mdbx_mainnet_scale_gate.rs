@@ -43,6 +43,7 @@ struct WorkloadReport {
     updates_per_block: u32,
     seed_batch: u64,
     commit_batch: u32,
+    consume_inputs: bool,
     undo_retention: u32,
     capacity_bytes: u64,
     compact_enabled: bool,
@@ -346,6 +347,7 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
         "RBTC_MDBX_GATE_CAPACITY_BYTES",
         DEFAULT_CHAINSTATE_CAPACITY_BYTES,
     );
+    let consume_inputs = enabled("RBTC_MDBX_GATE_CONSUME_INPUTS", false);
     let compact_enabled = enabled("RBTC_MDBX_GATE_COMPACT", true);
     let compact_trigger_percent = env_u8(
         "RBTC_MDBX_GATE_COMPACT_PERCENT",
@@ -388,6 +390,7 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
             updates_per_block,
             seed_batch,
             commit_batch,
+            consume_inputs,
             undo_retention,
             capacity_bytes,
             compact_enabled,
@@ -453,11 +456,15 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
         let transitions = (tip.height + 1..=end)
             .map(|height| transition(height, live_utxos, updates_per_block))
             .collect::<Vec<_>>();
-        store.commit_connect_batch(&transitions).unwrap();
         let previous_tip = tip.height;
         tip = transitions.last().expect("non-empty batch").next;
-        // Keep maintenance from overlapping the already committed input batch.
-        drop(transitions);
+        if consume_inputs {
+            store.commit_connect_batch_owned(transitions).unwrap();
+        } else {
+            store.commit_connect_batch(&transitions).unwrap();
+            // Keep maintenance from overlapping the committed borrowed batch.
+            drop(transitions);
+        }
         let previous_prune = previous_tip.saturating_sub(undo_retention);
         let prune_through = tip.height.saturating_sub(undo_retention);
         if prune_through > previous_prune {

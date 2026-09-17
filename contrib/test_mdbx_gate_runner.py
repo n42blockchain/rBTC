@@ -36,6 +36,24 @@ def fixture():
 
 
 class GateTests(unittest.TestCase):
+    def test_input_ownership_is_bound_to_reports_and_resume_identity(self):
+        report, values = fixture()
+        gate.validate_report(report, values, 64)  # legacy reports mean borrowed
+        owned = dict(values, CONSUME_INPUTS=1)
+        with self.assertRaises(ValueError):
+            gate.validate_report(report, owned, 64)
+        report['workload']['consume_inputs'] = True
+        gate.validate_report(report, owned, 64)
+        with self.assertRaises(ValueError):
+            gate.validate_report(report, values, 64)
+        legacy = dict(values)
+        legacy.pop('CONSUME_INPUTS')
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(gate.workload(legacy)['CONSUME_INPUTS'], 0)
+        with patch.dict(os.environ, {gate.PREFIX + 'CONSUME_INPUTS': '1'}, clear=True):
+            with self.assertRaises(ValueError):
+                gate.workload(legacy)
+
     def test_resuming_completed_lanes_preserves_the_original_rss_failure(self):
         report, values = fixture()
         with tempfile.TemporaryDirectory() as tmp:

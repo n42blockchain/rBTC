@@ -62,3 +62,13 @@ Evidence remains in `/Users/jieliu/Documents/n42/rBTC-storage-consumed-20260917/
 copies are under the primary workspace's session-state directory. No database
 was copied. This run used the original borrowed-input driver; the production
 owned-input route still needs separately identified measurement.
+
+## Ownership-specific follow-up
+
+The driver now accepts `RBTC_MDBX_GATE_CONSUME_INPUTS=1` for a separately
+identified owned-input measurement. Default remains 0 (the original borrowed
+route). The manifest and each report bind this choice; resume cannot switch
+it. Older reports without the field are accepted only as borrowed. Both modes
+still construct the same full input batch and commit the same 64/256 blocks
+atomically. No threshold or maintenance setting changes. Ten runner evidence
+tests and strict all-feature driver Clippy passed before measurement.
