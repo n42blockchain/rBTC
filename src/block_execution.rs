@@ -59,14 +59,169 @@ pub struct BlockDeploymentContext {
 #[derive(Debug)]
 pub struct ActiveBlockUtxoPrefetch {
     entries: Vec<(OutPointKey, Option<Utxo>)>,
+    // Payload first: leases remain live until its actual owner drops.
+    memory: Vec<crate::node_memory::MemoryLease>,
 }
 
 impl ActiveBlockUtxoPrefetch {
-    /// The prefetched coins, for a store that must overlay what changed
-    /// since they were read.
-    pub fn entries_mut(&mut self) -> &mut [(OutPointKey, Option<Utxo>)] {
-        &mut self.entries
+    fn check_owner<C: ExecutionChainStore>(&self, store: &C) -> Result<(), ChainStoreError> {
+        if let Some(resources) = store.execution_spool() {
+            let owner = resources
+                .reserve_memory(0)
+                .map_err(ChainStoreError::ExecutionMemory)?;
+            if self.memory.is_empty() || self.memory.iter().any(|lease| !lease.shares_owner(&owner))
+            {
+                return Err(memory_error(
+                    "prefetch must be read or refreshed through this node owner",
+                ));
+            }
+        }
+        Ok(())
     }
+
+    /// Refreshes read-ahead atomically: old data and its reservations survive
+    /// any read/admission failure. Successful replacement moves owned coins.
+    pub fn refresh<C: ExecutionChainStore>(
+        &mut self,
+        store: &C,
+    ) -> Result<(), BlockExecutionError> {
+        let _keys = reserve_execution_memory(
+            store,
+            (self.entries.len() as u64).checked_mul(size_of::<OutPointKey>() as u64),
+        )?;
+        let keys: Vec<_> = self.entries.iter().map(|(key, _)| *key).collect();
+        let replacement = read_prefetch(store, &keys)?;
+        *self = replacement;
+        Ok(())
+    }
+}
+
+fn memory_error(message: &'static str) -> ChainStoreError {
+    ChainStoreError::ExecutionMemory(std::io::Error::other(message))
+}
+fn reserve_execution_memory<C: ExecutionChainStore>(
+    store: &C,
+    bytes: Option<u64>,
+) -> Result<Option<crate::node_memory::MemoryLease>, ChainStoreError> {
+    let Some(resources) = store.execution_spool() else {
+        return Ok(None);
+    };
+    let bytes = bytes.ok_or_else(|| memory_error("execution allocation estimate overflow"))?;
+    resources
+        .reserve_memory(bytes)
+        .map(Some)
+        .map_err(ChainStoreError::ExecutionMemory)
+}
+fn discovery_reservation<'a, C: ExecutionChainStore>(
+    store: &C,
+    blocks: impl Iterator<Item = &'a Block>,
+) -> Result<Option<crate::node_memory::MemoryLease>, ChainStoreError> {
+    let mut bytes = Some(4096_u64);
+    for transaction in blocks.flat_map(|block| &block.txdata) {
+        bytes = bytes
+            .and_then(|n| {
+                n.checked_add(
+                    (transaction.input.len() as u64)
+                        .checked_mul(3 * size_of::<OutPointKey>() as u64)?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    (transaction.output.len() as u64)
+                        .checked_mul(8 * (size_of::<OutPointKey>() as u64 + 1))?,
+                )
+            });
+    }
+    reserve_execution_memory(store, bytes)
+}
+
+// The caller-facing read allowance covers canonical spendable coin records and
+// returned containers. Engine cache/dirty-page/internal read allocations remain
+// separate. A malformed backend can exceed its read contract before returning;
+// such payloads are rejected here, not accepted as accounted prefetch data.
+fn read_prefetch<C: ExecutionChainStore>(
+    store: &C,
+    keys: &[OutPointKey],
+) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
+    const CHUNK: usize = 128;
+    let Some(resources) = store.execution_spool() else {
+        let entries = store.get_many(keys)?;
+        if entries.len() != keys.len()
+            || entries
+                .iter()
+                .zip(keys)
+                .any(|((actual, _), expected)| actual != expected)
+        {
+            return Err(memory_error("prefetch read returned misaligned coins").into());
+        }
+        return Ok(ActiveBlockUtxoPrefetch {
+            entries,
+            memory: Vec::new(),
+        });
+    };
+    let count = keys.len() as u64;
+    let metadata = count
+        .checked_mul(size_of::<(OutPointKey, Option<Utxo>)>() as u64)
+        .and_then(|n| {
+            n.checked_add(
+                (keys.len().div_ceil(CHUNK) as u64 + 1)
+                    .checked_mul(8 * size_of::<crate::node_memory::MemoryLease>() as u64)?,
+            )
+        });
+    let container = resources
+        .reserve_memory(
+            metadata.ok_or_else(|| memory_error("prefetch metadata estimate overflow"))?,
+        )
+        .map_err(ChainStoreError::ExecutionMemory)?;
+    let mut memory = Vec::with_capacity(keys.len().div_ceil(CHUNK) + 1);
+    memory.push(container);
+    let mut entries = Vec::with_capacity(keys.len());
+    for wanted in keys.chunks(CHUNK) {
+        let allowance = (wanted.len() as u64)
+            * (4 * crate::chainstate::MAX_SCRIPT_SIZE as u64
+                + 16 * size_of::<(OutPointKey, Option<Utxo>)>() as u64)
+            + 65536;
+        let lease = resources
+            .reserve_memory(allowance)
+            .map_err(ChainStoreError::ExecutionMemory)?;
+        let current = store.get_many(wanted)?;
+        if current.len() != wanted.len()
+            || current
+                .iter()
+                .zip(wanted)
+                .any(|((actual, _), expected)| actual != expected)
+        {
+            return Err(memory_error("prefetch read returned misaligned coins").into());
+        }
+        let mut retained = 0_u64;
+        for (_, coin) in &current {
+            if let Some(coin) = coin {
+                if coin.script_pubkey.len() > crate::chainstate::MAX_SCRIPT_SIZE {
+                    return Err(
+                        memory_error("prefetch contains an oversized unspendable coin").into(),
+                    );
+                }
+                retained = retained
+                    .checked_add(coin.script_pubkey.capacity() as u64)
+                    .ok_or_else(|| memory_error("prefetch script capacity overflow"))?;
+            }
+        }
+        if retained > allowance {
+            return Err(memory_error("prefetch read exceeded its payload allowance").into());
+        }
+        // Attach ownership before moving payload so unwinding cannot refund
+        // this chunk while the outer entries vector still contains its coins.
+        memory.push(lease);
+        entries.extend(current);
+        // Returned temporary containers have now been destroyed; only scripts
+        // and the separately reserved final vector remain owned by prefetch.
+        memory
+            .last_mut()
+            .expect("chunk lease was attached")
+            .shrink_to(retained)
+            .map_err(ChainStoreError::ExecutionMemory)?;
+    }
+    Ok(ActiveBlockUtxoPrefetch { entries, memory })
 }
 
 /// Failures while connecting one downloaded active-chain block.
@@ -449,10 +604,10 @@ pub fn prefetch_prevalidated_active_block_utxos<C: ExecutionChainStore>(
         .flat_map(|block| &block.txdata)
         .map(|transaction| transaction.output.len())
         .sum::<usize>();
+    let _discovery = discovery_reservation(chainstate, blocks.iter())?;
     let input_outpoints =
         external_batch_input_outpoints(blocks, Some(transaction_ids), output_count);
-    let entries = chainstate.get_many(&input_outpoints)?;
-    Ok(ActiveBlockUtxoPrefetch { entries })
+    read_prefetch(chainstate, &input_outpoints)
 }
 
 /// [`prefetch_prevalidated_active_block_utxos`] over blocks that are not held
@@ -477,9 +632,9 @@ pub fn prefetch_active_block_utxos_from<'a, C: ExecutionChainStore>(
             .map(|transaction| transaction.output.len())
             .sum::<usize>();
     }
+    let _discovery = discovery_reservation(chainstate, blocks.clone().map(|(block, _)| block))?;
     let input_outpoints = external_input_outpoints_with_ids(blocks, output_count);
-    let entries = chainstate.get_many(&input_outpoints)?;
-    Ok(ActiveBlockUtxoPrefetch { entries })
+    read_prefetch(chainstate, &input_outpoints)
 }
 
 /// Connects a prevalidated batch using UTXOs read before archive staging ended.
@@ -708,12 +863,21 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         .flat_map(|block| &block.txdata)
         .map(|transaction| transaction.output.len())
         .sum::<usize>();
+    let discovery = discovery_reservation(chainstate, blocks.iter())?;
     let input_outpoints = external_batch_input_outpoints(blocks, transaction_ids, output_count);
-    let cumulative = UtxoOverlay::with_capacity(
-        chainstate,
-        input_outpoints.len().saturating_add(output_count),
-    );
+    let capacity = input_outpoints.len().saturating_add(output_count);
+    let overlay_bytes = (capacity as u64)
+        .checked_add(OVERLAY_SHARDS as u64)
+        .and_then(|n| {
+            n.checked_mul(
+                16 * (size_of::<(OutPointKey, Option<Utxo>)>() as u64 + 1)
+                    + size_of::<Mutex<OverlayState>>() as u64,
+            )
+        });
+    let overlay_memory = reserve_execution_memory(chainstate, overlay_bytes)?;
+    let cumulative = UtxoOverlay::with_capacity_reserved(chainstate, capacity, overlay_memory);
     if let Some(prefetched_utxos) = prefetched_utxos {
+        prefetched_utxos.check_owner(chainstate)?;
         if prefetched_utxos.entries.len() != input_outpoints.len()
             || prefetched_utxos
                 .entries
@@ -723,10 +887,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         {
             return Err(BlockExecutionError::UtxoPrefetchMismatch);
         }
-        cumulative.seed_prefetched(prefetched_utxos.entries);
+        cumulative.seed_prefetched(prefetched_utxos);
     } else {
-        cumulative.prefetch(&input_outpoints)?;
+        cumulative.seed_prefetched(read_prefetch(chainstate, &input_outpoints)?);
     }
+    drop(input_outpoints);
+    drop(discovery);
     let retains_undo = chainstate.retains_block_undo();
     // Which block each height belongs to, checked against the active chain
     // once for the whole batch; workers then prepare blocks independently.
@@ -1882,6 +2048,7 @@ impl PreparedActiveBlock {
 /// it off the validation thread.
 struct BlockDelta {
     shards: Vec<Mutex<OverlayState>>,
+    _memory: Mutex<Vec<crate::node_memory::MemoryLease>>,
 }
 
 impl BlockDelta {
@@ -1931,6 +2098,7 @@ fn net_changes_of(shards: &[Mutex<OverlayState>]) -> Result<UtxoChanges, UtxoErr
 struct UtxoOverlay<'a, S> {
     base: &'a S,
     shards: Vec<Mutex<OverlayState>>,
+    prefetch_memory: Mutex<Vec<crate::node_memory::MemoryLease>>,
 }
 
 impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
@@ -1939,8 +2107,17 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     }
 
     fn with_capacity(base: &'a S, capacity: usize) -> Self {
+        Self::with_capacity_reserved(base, capacity, None)
+    }
+
+    fn with_capacity_reserved(
+        base: &'a S,
+        capacity: usize,
+        memory: Option<crate::node_memory::MemoryLease>,
+    ) -> Self {
         let per_shard = capacity.div_ceil(OVERLAY_SHARDS);
         Self {
+            prefetch_memory: Mutex::new(memory.into_iter().collect()),
             base,
             shards: (0..OVERLAY_SHARDS)
                 .map(|_| {
@@ -1994,17 +2171,8 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     fn into_delta(self) -> BlockDelta {
         BlockDelta {
             shards: self.shards,
+            _memory: self.prefetch_memory,
         }
-    }
-
-    /// Folds a block's net change in. The batch overlay's own net change is
-    /// never read on the pipelined path — the blocks carry their transitions
-    /// — so only `current` is maintained: reads consult it first, and a key
-    /// the block wrote needs no `original` entry to be answered correctly.
-    fn prefetch(&self, outpoints: &[OutPointKey]) -> Result<(), UtxoError> {
-        let prefetched = self.base.get_many(outpoints)?;
-        self.seed_prefetched(prefetched);
-        Ok(())
     }
 
     /// Seeds the read cache with coins fetched ahead of validation.
@@ -2012,7 +2180,15 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     /// A batch's inputs run to millions of coins; they are partitioned by
     /// shard once and inserted by a few threads that each own a shard range,
     /// so no two threads ever contend for a lock.
-    fn seed_prefetched(&self, prefetched: Vec<(OutPointKey, Option<Utxo>)>) {
+    fn seed_prefetched(&self, prefetched: ActiveBlockUtxoPrefetch) {
+        let ActiveBlockUtxoPrefetch {
+            entries: prefetched,
+            memory,
+        } = prefetched;
+        self.prefetch_memory
+            .lock()
+            .expect("prefetch memory lock not poisoned")
+            .extend(memory);
         if prefetched.len() < PARALLEL_SEED_THRESHOLD {
             for (outpoint, value) in prefetched {
                 self.shard(&outpoint).original.insert(outpoint, value);
@@ -2922,6 +3098,126 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_memory_follows_refresh_overlay_and_detached_delta() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("prefetch.redb"), Network::Regtest).unwrap();
+        let key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([71; 32]), 0));
+        let mut coin = Utxo {
+            value_sats: 42,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 1,
+            creation_mtp: 0,
+            script_pubkey: vec![0x51],
+        };
+        store.apply(&[], &[(key, coin.clone())]).unwrap();
+        let baseline = budget.snapshot().used;
+        let mut prefetch = read_prefetch(&store, &[key]).unwrap();
+        let retained = budget.snapshot().used;
+        assert!(retained > baseline);
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        coin.script_pubkey.resize(4096, 0x51);
+        store.apply(&[key], &[(key, coin.clone())]).unwrap();
+        let occupied = budget.reserve(budget.snapshot().limit - retained).unwrap();
+        assert!(prefetch.refresh(&store).is_err());
+        assert_eq!(
+            prefetch.entries[0].1.as_ref().unwrap().script_pubkey.len(),
+            1
+        );
+        drop(occupied);
+        assert_eq!(budget.snapshot().used, retained);
+        prefetch.refresh(&store).unwrap();
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        let mut malformed = coin.clone();
+        malformed
+            .script_pubkey
+            .resize(crate::chainstate::MAX_SCRIPT_SIZE + 1, 0x51);
+        store.apply(&[key], &[(key, malformed)]).unwrap();
+        assert!(matches!(
+            prefetch.refresh(&store),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionMemory(_)
+            ))
+        ));
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        prefetch.check_owner(&store).unwrap();
+        let unleased = ActiveBlockUtxoPrefetch {
+            entries: Vec::new(),
+            memory: Vec::new(),
+        };
+        assert!(unleased.check_owner(&store).is_err());
+        let other = crate::node_memory::MemoryBudget::new(1);
+        let foreign = ActiveBlockUtxoPrefetch {
+            entries: Vec::new(),
+            memory: vec![other.reserve(1).unwrap()],
+        };
+        assert!(foreign.check_owner(&store).is_err());
+        let overlay = UtxoOverlay::new(&store);
+        overlay.seed_prefetched(prefetch);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        assert_eq!(overlay.get(key).unwrap().unwrap(), coin);
+        let delta = overlay.into_delta();
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        drop(delta);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn prefetch_memory_late_chunk_exhaustion_refunds_partial_results() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("prefetch.redb"), Network::Regtest).unwrap();
+        let coins = (0..256)
+            .map(|vout| {
+                (
+                    OutPointKey::from(OutPoint::new(Txid::from_byte_array([72; 32]), vout)),
+                    Utxo {
+                        value_sats: 42,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 1,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51; crate::chainstate::MAX_SCRIPT_SIZE],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        store.apply(&[], &coins).unwrap();
+        let keys = coins.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let baseline = budget.snapshot().used;
+        let occupied = budget
+            .reserve(budget.snapshot().limit - baseline - 6 * 1024 * 1024)
+            .unwrap();
+        let before = budget.snapshot().used;
+        assert!(matches!(
+            read_prefetch(&store, &keys),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionMemory(_)
+            ))
+        ));
+        assert!(
+            budget.snapshot().peak > before + 5 * 1024 * 1024,
+            "first chunk obtained its read allowance"
+        );
+        assert_eq!(budget.snapshot().used, before);
+        drop(occupied);
+        let prefetch = read_prefetch(&store, &keys).unwrap();
+        assert_eq!(prefetch.entries.len(), coins.len());
+        assert!(
+            budget.snapshot().used > baseline + 256 * crate::chainstate::MAX_SCRIPT_SIZE as u64
+        );
+        drop(prefetch);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
     fn execution_spool_commits_through_write_back_and_releases_reservations() {
         use crate::write_back_chainstate::{WriteBackChainstate, WriteBackLimits};
         let directory = TempDir::new().unwrap();
@@ -2948,8 +3244,8 @@ mod tests {
             .insert_contextual(second.header, second.header.time)
             .unwrap();
         let blocks = [first, second];
-        // Both indexed and non-indexed execution must obtain the version
-        // allowance before workers or spool writes can begin.
+        // Both indexed and non-indexed execution must obtain allocation
+        // allowances before workers or spool writes can begin.
         let occupied = budget
             .reserve(budget.snapshot().limit - cache_used)
             .unwrap();

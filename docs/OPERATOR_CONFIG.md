@@ -288,8 +288,11 @@ disk quota. Encoding and decoding reserve from the node memory allowance.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.
-Preparation results, full-batch prefetch, script queues, thread stacks and
-indexed undo copies still require further accounting.
+Input discovery and batch overlay maps reserve before construction; prefetch
+reads use 128-key chunks and retain actual returned script allowances through
+read-ahead refresh and overlay ownership transfer. Engine-internal read
+allocations (especially malformed records), preparation copies, script queues,
+thread stacks and indexed undo copies still require further accounting.
 These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
 pages, SQLite, MDBX and other unregistered allocations still require
 integration and whole-node acceptance. The overall memory gate remains open.

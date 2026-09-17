@@ -57,7 +57,10 @@ not change acceptance statuses or weaken thresholds.
    evicts completed ordinary redb preparation results and admits codec memory
    and temporary bytes before allocation/growth. [MDBX and snapshot overlays](overlay-execution-spool-20260917.md)
    now share that context through maintenance too. [Version-index admission](execution-version-admission-20260917.md)
-   reserves before building parallel output deltas and their history index. Preparation inputs, indexed
+   reserves before building parallel output deltas and their history index.
+   [Prefetch ownership](execution-prefetch-ownership-20260917.md) now charges
+   discovery/maps and retained query results through refresh and overlay transfer.
+   Engine-level read bounds, prepared copies, indexed
    paths, resumable resource scheduling and whole-node acceptance remain open.
 4. Optimizer: retain the previously accepted Core differential/budget result as
    historical evidence; rerun affected final-source acceptance and bind exact

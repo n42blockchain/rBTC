@@ -567,7 +567,9 @@ pub trait ExecutionChainStore: UtxoStore {
                 "prefetch refresh returned misaligned coins",
             ));
         }
-        entries.clone_from_slice(&current);
+        for (entry, refreshed) in entries.iter_mut().zip(current) {
+            *entry = refreshed;
+        }
         Ok(())
     }
 

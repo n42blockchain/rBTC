@@ -166,6 +166,25 @@ pub struct MemoryLease {
     bytes: u64,
 }
 impl MemoryLease {
+    pub(crate) fn shares_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.budget.0, &other.budget.0)
+    }
+
+    pub(crate) fn shrink_to(&mut self, bytes: u64) -> io::Result<()> {
+        if bytes > self.bytes {
+            return Err(io::Error::other("memory lease cannot grow by shrinking"));
+        }
+        let mut usage = self
+            .budget
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        usage.used -= self.bytes - bytes;
+        self.bytes = bytes;
+        Ok(())
+    }
+
     pub(crate) fn duplicate(&self) -> io::Result<Self> {
         self.budget.reserve(self.bytes)
     }
@@ -299,6 +318,23 @@ fn redb_with_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrinking_lease_refunds_only_released_capacity() {
+        let budget = MemoryBudget::new(100);
+        let mut lease = budget.reserve(80).unwrap();
+        assert!(lease.shrink_to(81).is_err());
+        assert_eq!(budget.snapshot().used, 80);
+        lease.shrink_to(30).unwrap();
+        let copy = lease.duplicate().unwrap();
+        assert_eq!(budget.snapshot().used, 60);
+        lease.shrink_to(0).unwrap();
+        assert_eq!(budget.snapshot().used, 30);
+        drop(copy);
+        drop(lease);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.snapshot().peak, 80);
+    }
 
     #[test]
     fn shared_reservations_do_not_overflow_and_release_on_unwind() {

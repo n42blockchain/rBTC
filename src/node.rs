@@ -16005,10 +16005,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
                     // Refresh against the current view before consuming it.
                     let ready = early.map(|mut prefetch| {
                         let started = Instant::now();
-                        let result = chainstate
-                            .reconcile_prefetch(prefetch.entries_mut())
-                            .map(|()| prefetch)
-                            .map_err(BlockExecutionError::from);
+                        let result = prefetch.refresh(chainstate).map(|()| prefetch);
                         (result, started.elapsed())
                     });
                     let utxos = ready.is_none().then(|| {
