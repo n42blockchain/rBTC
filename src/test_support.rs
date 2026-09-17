@@ -88,3 +88,30 @@ async fn failed_endpoint_reserves_its_port_through_repeated_connections() {
     drop(reservation);
     let _released = TcpListener::bind(address).expect("dropping the fixture releases its port");
 }
+
+/// Header provider that preserves identity but fails every storage lookup.
+pub(crate) struct UnavailableHeaders(pub crate::headers::HeaderDag);
+impl crate::headers::HeaderView for UnavailableHeaders {
+    fn deployments(&self) -> &crate::deployments::DeploymentConfig {
+        self.0.deployments()
+    }
+    fn active_tip(&self) -> crate::headers::HeaderInfo {
+        self.0.active_tip()
+    }
+    fn header(
+        &self,
+        _: &bitcoin::BlockHash,
+    ) -> Result<Option<crate::headers::HeaderInfo>, crate::headers::HeaderReadError> {
+        Err(crate::headers::HeaderReadError::Unavailable(
+            "injected header read failure".into(),
+        ))
+    }
+    fn active_header(
+        &self,
+        _: u32,
+    ) -> Result<Option<crate::headers::HeaderInfo>, crate::headers::HeaderReadError> {
+        Err(crate::headers::HeaderReadError::Unavailable(
+            "injected header read failure".into(),
+        ))
+    }
+}

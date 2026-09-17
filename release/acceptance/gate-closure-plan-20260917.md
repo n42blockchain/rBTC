@@ -18,7 +18,9 @@ not change acceptance statuses or weaken thresholds.
    shares cache/read allowances; [persistent file inventory and journal admission](header-persistent-inventory-20260917.md)
    now retain registered file charges through close/restart.
    [Concurrent background Header pipelines](header-background-budget-20260917.md)
-   share those allowances. Aggregate node resources and whole-node acceptance remain.
+   share those allowances. [Snapshot activation and finalization](snapshot-header-memory-20260917.md)
+   now use disk history and configured caches. Aggregate node resources and
+   whole-node acceptance remain.
 2. Admission: finish prevout and all candidate/escaping allocation reservations,
    preserve resumable candidates across work slices, and exercise simultaneous
    peers/local submissions/chain changes. Stable sizing and the existing shared

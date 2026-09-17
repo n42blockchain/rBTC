@@ -20,7 +20,7 @@ use bitcoin::{BlockHash, Network};
 use crate::{
     chain_store::{ChainStoreError, RedbChainStore, SnapshotContentIdentity},
     execution_store::ExecutionTip,
-    headers::HeaderDag,
+    headers::{HeaderReadError, HeaderView},
     utxo::{OutPointKey, Utxo, UtxoError, UtxoStore},
 };
 
@@ -143,6 +143,9 @@ pub fn core31_assumeutxo_anchors(network: Network) -> &'static [Core31AssumeUtxo
 /// Snapshot import and export failures.
 #[derive(Debug, Error)]
 pub enum SnapshotError {
+    /// Reading the validated header view failed locally.
+    #[error("header view: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// Filesystem access failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -308,7 +311,7 @@ impl VerifiedSnapshot {
     pub fn assume_into(
         self,
         store: &RedbChainStore,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         trusted: &SnapshotTrustAnchor,
         now: u64,
         hot_window_secs: u64,
@@ -318,7 +321,7 @@ impl VerifiedSnapshot {
         }
         validate_manifest_trust(&self.manifest, trusted)?;
         if headers
-            .active_header_at(trusted.height)
+            .active_header(trusted.height)?
             .is_none_or(|header| header.hash != trusted.block_hash)
         {
             return Err(SnapshotError::AnchorMismatch);
@@ -782,6 +785,9 @@ fn zstd_window_log(records_bytes: u64) -> u32 {
 }
 
 #[cfg(test)]
+use crate::headers::HeaderDag;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1148,6 +1154,20 @@ mod tests {
         .unwrap();
         let chainstate_path = directory.path().join("chainstate.redb");
         let chainstate = RedbChainStore::open(&chainstate_path, Network::Regtest).unwrap();
+        let unavailable = crate::test_support::UnavailableHeaders(headers.clone());
+        assert!(matches!(
+            verify_snapshot(&path).unwrap().assume_into(
+                &chainstate,
+                &unavailable,
+                &trusted,
+                100,
+                60
+            ),
+            Err(SnapshotError::HeaderRead(HeaderReadError::Unavailable(_)))
+        ));
+        assert_eq!(chainstate.execution().tip().unwrap().height, 0);
+        assert!(chainstate.execution().assumed_snapshot().unwrap().is_none());
+        assert!(chainstate.get(source_key).unwrap().is_none());
         verify_snapshot(&path)
             .unwrap()
             .assume_into(&chainstate, &headers, &trusted, 100, 60)

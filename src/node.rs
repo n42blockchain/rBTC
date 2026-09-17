@@ -7026,10 +7026,10 @@ async fn run_with_nonce(options: Options, local_nonce: u64) -> Result<(), String
             .map_err(|error| error.message)?;
     }
     if options.snapshot.is_some() {
-        return activate_assumed_snapshot(&options);
+        return activate_assumed_snapshot(&options).await;
     }
     if options.finalize_assumeutxo.is_some() {
-        return finalize_assumed_snapshot(&options);
+        return finalize_assumed_snapshot(&options).await;
     }
     if let Some(validation_dir) = options.background_assumeutxo.clone() {
         return run_background_assumeutxo(options, validation_dir, local_nonce).await;
@@ -9158,10 +9158,10 @@ async fn run_background_assumeutxo(
                 .map_err(|error| format!("active-chain task failed: {error}"))??;
         }
     }
-    finalize_background_if_pending(&finalize_options, &validation_dir)
+    finalize_background_if_pending(&finalize_options, &validation_dir).await
 }
 
-fn finalize_background_if_pending(
+async fn finalize_background_if_pending(
     options: &Options,
     validation_dir: &std::path::Path,
 ) -> Result<(), String> {
@@ -9183,7 +9183,7 @@ fn finalize_background_if_pending(
         .ok_or_else(|| "active chainstate is missing snapshot origin metadata".to_owned())?;
     drop(active);
     if pending {
-        finalize_assumed_snapshot_from(options, validation_dir)?;
+        finalize_assumed_snapshot_from(options, validation_dir).await?;
     }
     if options.cleanup_validation_dir && validation_dir.exists() {
         cleanup_completed_validation_dir(
@@ -9199,7 +9199,7 @@ fn finalize_background_if_pending(
     Ok(())
 }
 
-fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
+async fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
     let snapshot = options
         .snapshot
         .as_ref()
@@ -9212,21 +9212,26 @@ fn activate_assumed_snapshot(options: &Options) -> Result<(), String> {
             utxo_count,
             records_bytes,
             records_sha256,
-        } => activate_rbtc_assumed_snapshot(
-            options,
-            path,
-            *height,
-            *block_hash,
-            *utxo_count,
-            *records_bytes,
-            records_sha256,
-        ),
-        SnapshotActivationOptions::Core(path) => activate_core_assumed_snapshot(options, path),
+        } => {
+            activate_rbtc_assumed_snapshot(
+                options,
+                path,
+                *height,
+                *block_hash,
+                *utxo_count,
+                *records_bytes,
+                records_sha256,
+            )
+            .await
+        }
+        SnapshotActivationOptions::Core(path) => {
+            activate_core_assumed_snapshot(options, path).await
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn activate_rbtc_assumed_snapshot(
+async fn activate_rbtc_assumed_snapshot(
     options: &Options,
     snapshot: &std::path::Path,
     height: u32,
@@ -9239,11 +9244,9 @@ fn activate_rbtc_assumed_snapshot(
         .data_dir
         .as_ref()
         .expect("snapshot parser requires data directory");
-    let header_store =
-        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
-    let headers = header_store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
+    let headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "snapshot operation requires a header database".to_owned())?;
     let trusted = SnapshotTrustAnchor::new(
         options.network,
         height,
@@ -9253,14 +9256,21 @@ fn activate_rbtc_assumed_snapshot(
         records_sha256,
     )
     .map_err(|error| error.to_string())?;
-    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
-        .map_err(|error| error.to_string())?;
+    let chainstate = RedbChainStore::open_with_options(
+        data_dir.join("chainstate.redb"),
+        options.network,
+        ChainStoreOptions {
+            cache_size_bytes: options.cache.active_chainstate_bytes,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     let now = u64::from(unix_time()?);
     let manifest = verify_snapshot_with_trust(snapshot, &trusted)
         .and_then(|verified| {
             verified.assume_into(
                 &chainstate,
-                &headers,
+                headers.as_ref(),
                 &trusted,
                 now,
                 DEFAULT_HOT_WINDOW_SECS,
@@ -9277,7 +9287,7 @@ fn activate_rbtc_assumed_snapshot(
     Ok(())
 }
 
-fn activate_core_assumed_snapshot(
+async fn activate_core_assumed_snapshot(
     options: &Options,
     snapshot: &std::path::Path,
 ) -> Result<(), String> {
@@ -9285,19 +9295,24 @@ fn activate_core_assumed_snapshot(
         .data_dir
         .as_ref()
         .expect("Core snapshot parser requires data directory");
-    let header_store =
-        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
-    let headers = header_store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
-    let chainstate = RedbChainStore::open(data_dir.join("chainstate.redb"), options.network)
-        .map_err(|error| error.to_string())?;
+    let headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "snapshot operation requires a header database".to_owned())?;
+    let chainstate = RedbChainStore::open_with_options(
+        data_dir.join("chainstate.redb"),
+        options.network,
+        ChainStoreOptions {
+            cache_size_bytes: options.cache.active_chainstate_bytes,
+            ..ChainStoreOptions::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
     let now = u64::from(unix_time()?);
-    let verified =
-        verify_core31_snapshot(snapshot, &headers, now).map_err(|error| error.to_string())?;
+    let verified = verify_core31_snapshot(snapshot, headers.as_ref(), now)
+        .map_err(|error| error.to_string())?;
     let anchor = verified.anchor();
     let metadata = verified
-        .assume_into(&chainstate, &headers, DEFAULT_HOT_WINDOW_SECS)
+        .assume_into(&chainstate, headers.as_ref(), DEFAULT_HOT_WINDOW_SECS)
         .map_err(|error| error.to_string())?;
     rbtc_info!(
         "activated Bitcoin Core 31 assumed UTXO snapshot at {}:{} with {} entries and chain transaction count {}; background genesis validation remains required",
@@ -9309,15 +9324,15 @@ fn activate_core_assumed_snapshot(
     Ok(())
 }
 
-fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
+async fn finalize_assumed_snapshot(options: &Options) -> Result<(), String> {
     let validation_dir = options
         .finalize_assumeutxo
         .as_ref()
         .expect("caller checked snapshot finalization mode");
-    finalize_assumed_snapshot_from(options, validation_dir)
+    finalize_assumed_snapshot_from(options, validation_dir).await
 }
 
-fn finalize_assumed_snapshot_from(
+async fn finalize_assumed_snapshot_from(
     options: &Options,
     validation_dir: &std::path::Path,
 ) -> Result<(), String> {
@@ -9337,16 +9352,14 @@ fn finalize_assumed_snapshot_from(
         return Err("validation chainstate must be separate from active chainstate".to_owned());
     }
     reject_legacy_split_chainstate(validation_dir)?;
-    let header_store =
-        RedbHeaderStore::open(data_dir.join("headers.redb")).map_err(|error| error.to_string())?;
-    let headers = header_store
-        .load_dag_with_deployments(options.deployments.clone(), unix_time()?)
-        .map_err(|error| error.to_string())?;
+    let headers = load_disk_header_view(options)
+        .await?
+        .ok_or_else(|| "snapshot operation requires a header database".to_owned())?;
     let active = RedbChainStore::open_with_options(
         active_path,
         options.network,
         ChainStoreOptions {
-            cache_size_bytes: BULK_VALIDATION_CHAINSTATE_CACHE_BYTES,
+            cache_size_bytes: options.cache.active_chainstate_bytes,
             validation_delta_journal: true,
             ..ChainStoreOptions::default()
         },
@@ -9357,7 +9370,8 @@ fn finalize_assumed_snapshot_from(
         &options.deployments,
         &active,
         validation_dir,
-        &headers,
+        headers.as_ref(),
+        options.cache.active_chainstate_bytes,
     )
 }
 
@@ -9367,13 +9381,14 @@ fn finalize_assumed_snapshot_with(
     active: &RedbChainStore,
     validation_dir: &std::path::Path,
     headers: &dyn HeaderView,
+    cache_bytes: usize,
 ) -> Result<(), String> {
     let validation_path = validation_dir.join("chainstate.redb");
     let validation = RedbChainStore::open_with_options(
         validation_path,
         network,
         ChainStoreOptions {
-            cache_size_bytes: BULK_VALIDATION_CHAINSTATE_CACHE_BYTES,
+            cache_size_bytes: cache_bytes,
             validation_delta_journal: true,
             ..ChainStoreOptions::default()
         },
@@ -9415,6 +9430,7 @@ fn poll_background_validation(
     active: &RedbChainStore,
     active_dir: &std::path::Path,
     headers: &dyn HeaderView,
+    cache_bytes: usize,
 ) -> Result<(), PeerRunError> {
     let Some(status) = status else {
         return Ok(());
@@ -9431,6 +9447,7 @@ fn poll_background_validation(
                 active,
                 &status.validation_dir,
                 headers,
+                cache_bytes,
             ) {
                 status.set(BackgroundValidationState::Failed(error.clone()));
                 return Err(PeerRunError::transient(format!(
@@ -10482,7 +10499,7 @@ async fn connect_and_maintain_standby(
     result
 }
 
-async fn standby_header_seed(options: &Options) -> Result<Option<Arc<DiskHeaderView>>, String> {
+async fn load_disk_header_view(options: &Options) -> Result<Option<Arc<DiskHeaderView>>, String> {
     let path = options
         .data_dir
         .as_ref()
@@ -10529,7 +10546,7 @@ async fn spawn_peer_connections(
     if remotes.is_empty() {
         return Ok(VecDeque::new());
     }
-    let header_seed = standby_header_seed(options).await?;
+    let header_seed = load_disk_header_view(options).await?;
     Ok(remotes
         .iter()
         .cloned()
@@ -11104,7 +11121,9 @@ async fn complete_assumeutxo_validation(
         None,
     )
     .await?;
-    finalize_assumed_snapshot_from(options, &validation_dir).map_err(PeerRunError::transient)?;
+    finalize_assumed_snapshot_from(options, &validation_dir)
+        .await
+        .map_err(PeerRunError::transient)?;
     if options.cleanup_validation_dir {
         cleanup_completed_validation_dir(
             active_dir,
@@ -13801,6 +13820,7 @@ async fn sync_validating_node(
             &chainstate,
             &data_dir,
             &headers,
+            cache.background_chainstate_bytes,
         )?;
         if let Some(server) = &mut api_server {
             server.ensure_running().await?;
@@ -13819,6 +13839,7 @@ async fn sync_validating_node(
                 &chainstate,
                 &data_dir,
                 &headers,
+                cache.background_chainstate_bytes,
             )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             if headers
@@ -27780,6 +27801,7 @@ mod tests {
             &chainstate,
             directory.path(),
             &headers,
+            NodeCacheConfig::default().background_chainstate_bytes,
         )
         .unwrap_err();
         assert_eq!(error.kind, PeerFailureKind::Transient);
