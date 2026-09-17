@@ -953,6 +953,9 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }
     });
     drop(versions);
+    // Preparation has copied every needed input into its result/script work.
+    // The prefetch cache must not overlap transition construction or commit.
+    drop(cumulative);
     breakdown.validate += validate_started.elapsed();
     {
         let [prepare, utxo, net_change, checks] =
@@ -1008,6 +1011,28 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         return Err(error);
     }
 
+    let wait_started = Instant::now();
+    let own_batches = script_batches
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let serial = serial_scripts
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A store may flush at any batch/coin limit, during maintenance, or
+    // immediately (without a write-back wrapper). Every script in this
+    // batch must therefore finish before handing its transitions to it. Drain
+    // here so completed script inputs do not overlap transition construction.
+    let mut batches = script_carry.map(std::mem::take).unwrap_or_default();
+    batches.extend(own_batches);
+    let script_failure = drain_script_batches(batches, serial);
+    breakdown.script_wait = wait_started.elapsed();
+    if let Some((_, index, source)) = script_failure {
+        return Err(BlockExecutionError::Block(BlockError::Transaction {
+            index,
+            source: source.into(),
+        }));
+    }
+
     // Phase three: transitions and undo records, again in parallel per
     // block, collected in block order.
     let apply_started = Instant::now();
@@ -1035,7 +1060,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                             .take()
                             .expect("each block index is claimed once")
                     };
-                    let changes = delta.net_changes();
+                    let changes = delta.into_net_changes();
                     let mut applied = prepared.into_applied(retains_undo);
                     let expected_parent = if index == 0 {
                         base.hash
@@ -1072,26 +1097,6 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     current = *tips.last().expect("non-empty batch has a final tip");
     let _ = current;
 
-    let wait_started = Instant::now();
-    let own_batches = script_batches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let serial = serial_scripts
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A store may flush at any batch/coin limit, during maintenance, or
-    // immediately (without a write-back wrapper). Every script in this
-    // batch must therefore finish before handing its transitions to it.
-    let mut batches = script_carry.map(std::mem::take).unwrap_or_default();
-    batches.extend(own_batches);
-    let script_failure = drain_script_batches(batches, serial);
-    breakdown.script_wait = wait_started.elapsed();
-    if let Some((_, index, source)) = script_failure {
-        return Err(BlockExecutionError::Block(BlockError::Transaction {
-            index,
-            source: source.into(),
-        }));
-    }
     let commit_started = Instant::now();
     chainstate.commit_connect_batch_owned(transitions)?;
     breakdown.commit = commit_started.elapsed();
@@ -1625,12 +1630,12 @@ impl PreparedDelta {
     /// The block's net effect: coins it leaves behind, keys it removed from
     /// the state it started from. A BIP30 overwrite puts a key in both, the
     /// removal first. Sorted like the overlay's `net_changes`.
-    fn net_changes(&self) -> UtxoChanges {
-        let mut spent: Vec<OutPointKey> = self.spent_from_base.iter().copied().collect();
+    fn into_net_changes(self) -> UtxoChanges {
+        let mut spent: Vec<OutPointKey> = self.spent_from_base.into_iter().collect();
         let mut created: Vec<(OutPointKey, Utxo)> = self
             .state
-            .iter()
-            .filter_map(|(outpoint, value)| value.as_ref().map(|utxo| (*outpoint, utxo.clone())))
+            .into_iter()
+            .filter_map(|(outpoint, value)| value.map(|utxo| (outpoint, utxo)))
             .collect();
         spent.sort_unstable();
         created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
@@ -2349,6 +2354,41 @@ mod tests {
         headers::HeaderDag,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
+
+    #[test]
+    fn consuming_prepared_delta_moves_scripts_and_preserves_net_changes() {
+        let key = |byte| OutPointKey::from(OutPoint::new(Txid::from_byte_array([byte; 32]), 0));
+        let coin = Utxo {
+            value_sats: 42,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 3,
+            creation_mtp: 2,
+            script_pubkey: vec![0x51; 10_000],
+        };
+        let allocation = coin.script_pubkey.as_ptr();
+        let mut delta = PreparedDelta::with_capacity(3);
+        delta.state.insert(key(2), Some(coin));
+        delta.spend(key(1));
+        delta.state.insert(
+            key(3),
+            Some(Utxo {
+                value_sats: 1,
+                height: 1,
+                is_coinbase: false,
+                last_touched: 3,
+                creation_mtp: 2,
+                script_pubkey: vec![],
+            }),
+        );
+        delta.spend(key(3)); // output created and spent within this block
+        let changes = delta.into_net_changes();
+        assert_eq!(changes.spent, vec![key(1)]);
+        assert_eq!(changes.created.len(), 1);
+        assert_eq!(changes.created[0].0, key(2));
+        assert_eq!(changes.created[0].1.script_pubkey.as_ptr(), allocation);
+        assert_eq!(changes.created[0].1.value_sats, 42);
+    }
 
     #[test]
     fn only_downloaded_consensus_failures_are_peer_invalid() {
