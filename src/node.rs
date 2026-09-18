@@ -15805,6 +15805,116 @@ async fn download_execute_batch<C: ExecutionChainStore>(
     replay: Option<&PrunedBlockLedger>,
     zmq_notifier: Option<&ZmqNotifier>,
 ) -> Result<(), PeerRunError> {
+    let before = chainstate
+        .execution_tip()
+        .map_err(|error| PeerRunError::local(error.to_string()))?;
+    let remaining = maximum_height
+        .unwrap_or_else(|| headers.active_tip().height)
+        .min(headers.active_tip().height)
+        .saturating_sub(before.height);
+    let mut limit = maximum_batch_size;
+    let mut prefetch = prefetch_next_batch;
+    let mut replay_prefetch = true;
+    let entered_with_scripts = !script_carry.is_empty();
+    loop {
+        let result = download_execute_batch_attempt(
+            session,
+            deployment_config,
+            headers,
+            chainstate,
+            ledger,
+            explorer,
+            explorer_events,
+            wallet,
+            auxiliary_indexes,
+            compact_candidates,
+            transaction_pool,
+            maximum_height,
+            limit,
+            auxiliary_session,
+            prefetched_blocks,
+            script_carry,
+            prefetch,
+            replay,
+            zmq_notifier,
+            replay_prefetch,
+        )
+        .await;
+        let Err(error) = result else {
+            return Ok(());
+        };
+        let attempted = limit.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let Some(smaller) = next_unstaged_memory_retry(
+            error.kind,
+            attempted,
+            before,
+            chainstate.execution_tip().ok(),
+            ledger,
+            entered_with_scripts || !script_carry.is_empty(),
+        ) else {
+            return Err(error);
+        };
+        // The attempt has returned and joined its scoped workers. The unchanged
+        // checkpoint and absent stage establish that no batch was published.
+        // Drop speculative ownership before retrying the smaller window; never
+        // carry a suffix that would itself keep the exhausted budget occupied.
+        *prefetched_blocks = PrefetchedBlocks::default();
+        prefetch = false;
+        replay_prefetch = false;
+        rbtc_warn!(
+            "memory admission exhausted before staging; reducing validation batch from {attempted} to {smaller} blocks at height {}",
+            before.height
+        );
+        limit = smaller;
+    }
+}
+
+fn next_unstaged_memory_retry(
+    kind: PeerFailureKind,
+    attempted: usize,
+    before: crate::execution_store::ExecutionTip,
+    after: Option<crate::execution_store::ExecutionTip>,
+    ledger: &PrunedBlockLedger,
+    pending_scripts: bool,
+) -> Option<usize> {
+    if kind != PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+        || attempted <= 1
+        || pending_scripts
+        || after != Some(before)
+    {
+        return None;
+    }
+    // Read failures and existing (even corrupt) stages fail closed. Recovery of
+    // an existing stage is a separate phase, never an excuse to overwrite it.
+    if !matches!(ledger.staged_manifest(), Ok(None)) {
+        return None;
+    }
+    Some(attempted / 2)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn download_execute_batch_attempt<C: ExecutionChainStore>(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    deployment_config: &DeploymentConfig,
+    headers: &dyn HeaderView,
+    chainstate: &C,
+    ledger: &PrunedBlockLedger,
+    explorer: Option<&RedbExplorerIndex>,
+    explorer_events: Option<&ExplorerEventHub>,
+    wallet: Option<&EmbeddedWallet>,
+    auxiliary_indexes: &AuxiliaryIndexes,
+    compact_candidates: &[Transaction],
+    transaction_pool: &Arc<Mutex<TransactionAdmissionPool>>,
+    maximum_height: Option<u32>,
+    maximum_batch_size: usize,
+    auxiliary_session: &mut Option<rbtc::p2p::PeerSession<tokio::net::TcpStream>>,
+    prefetched_blocks: &mut PrefetchedBlocks,
+    script_carry: &mut Vec<DeferredScriptBatch>,
+    prefetch_next_batch: bool,
+    replay: Option<&PrunedBlockLedger>,
+    zmq_notifier: Option<&ZmqNotifier>,
+    allow_replay_prefetch: bool,
+) -> Result<(), PeerRunError> {
     let batch_started = Instant::now();
     // Only the explorer and auxiliary indexes read undo records from the
     // applied blocks; without them the executor moves the records straight
@@ -16151,7 +16261,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         // A replay reads the next batch from the ledger while this one
         // executes, the way the networked path downloads it: the bytes land
         // in the prefetch buffer and the next batch starts from them.
-        let read_ahead = replay.and_then(|replay| {
+        let read_ahead = replay.filter(|_| allow_replay_prefetch).and_then(|replay| {
             let last_height = expected
                 .last()
                 .expect("non-empty block batch has a last header")

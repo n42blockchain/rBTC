@@ -300,9 +300,12 @@ are rejected. OS worker stacks, allocator overhead, newly serialized network
 payloads and other node batch objects still need accounting.
 These reservation limits do not establish a whole-node RSS ceiling.
 Memory and execution-spool admission failures retain distinct internal error
-types through archive/execution paths. Both stop the current session as local
-failures without penalizing peers; they do not yet trigger automatic batch
-downshifting or staged-work resumption. Physical I/O failures are not inferred
+types through archive/execution paths. Both are local failures and do not penalize peers. Before staging, typed memory
+pressure can retry with successively halved block windows while the execution
+tip is unchanged and no deferred scripts or staged segment remain. Retries
+disable network and replay read-ahead and stop if one block cannot fit. Disk
+pressure and failures after staging/commit still stop the session; existing-stage
+resumption remains separate work. Physical I/O failures are not inferred
 to be reservation exhaustion from their text.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
