@@ -2704,8 +2704,15 @@ struct DnsSeed {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PeerFailureKind {
     LocalResource,
+    LocalBudget(crate::node_memory::ReservationKind),
     Transient,
     ProtocolViolation,
+}
+
+impl PeerFailureKind {
+    fn is_local(self) -> bool {
+        matches!(self, Self::LocalResource | Self::LocalBudget(_))
+    }
 }
 
 #[derive(Debug)]
@@ -2728,12 +2735,19 @@ impl PeerRunError {
         }
     }
 
+    fn budget(kind: Option<crate::node_memory::ReservationKind>, message: String) -> Self {
+        Self {
+            kind: kind.map_or(PeerFailureKind::LocalResource, PeerFailureKind::LocalBudget),
+            message,
+        }
+    }
+
     fn ledger(error: &crate::ledger::LedgerError) -> Self {
-        if matches!(
-            error,
-            crate::ledger::LedgerError::Archive(crate::archive::ArchiveError::ResourceBudget(_))
-        ) {
-            Self::local(error.to_string())
+        if let crate::ledger::LedgerError::Archive(
+            archive @ crate::archive::ArchiveError::ResourceBudget(_),
+        ) = error
+        {
+            Self::budget(archive.reservation_kind(), error.to_string())
         } else {
             Self::transient(error.to_string())
         }
@@ -2777,15 +2791,20 @@ impl PeerRunError {
     }
 
     fn block(error: &BlockExecutionError) -> Self {
-        if matches!(
-            error,
+        match error {
             BlockExecutionError::ChainStore(
-                crate::chain_store::ChainStoreError::ExecutionSpool(_)
-                    | crate::chain_store::ChainStoreError::ExecutionMemory(_)
-                    | crate::chain_store::ChainStoreError::ExecutionRead(_)
-            )
-        ) {
-            return Self::local(error.to_string());
+                crate::chain_store::ChainStoreError::ExecutionSpool(source)
+                | crate::chain_store::ChainStoreError::ExecutionMemory(source),
+            ) => {
+                return Self::budget(
+                    crate::node_memory::reservation_kind(source),
+                    error.to_string(),
+                );
+            }
+            BlockExecutionError::ChainStore(
+                crate::chain_store::ChainStoreError::ExecutionRead(_),
+            ) => return Self::local(error.to_string()),
+            _ => {}
         }
         if error.is_peer_invalid() {
             Self::protocol(error.to_string())
@@ -11150,7 +11169,7 @@ async fn try_peer_candidates(
                 return Ok(true);
             }
             Err(error) => {
-                if error.kind == PeerFailureKind::LocalResource {
+                if error.kind.is_local() {
                     abort_pending_connections(&mut pending).await;
                     return Err(error.message);
                 }
@@ -11640,6 +11659,10 @@ fn record_peer_failure(
     kind: PeerFailureKind,
     manual: bool,
 ) {
+    // Local pressure says nothing about peer health, including collision probes.
+    if kind.is_local() {
+        return;
+    }
     let Some(store) = store else {
         return;
     };
@@ -11947,7 +11970,7 @@ fn stage_submitted_blocks(
             let message = error.to_string();
             rbtc_warn!("could not stage submitted block {hash}: {message}");
             let _ = verdict.send(Err(message.clone()));
-            if error.kind == PeerFailureKind::LocalResource {
+            if error.kind.is_local() {
                 // A canonical commit can precede a failed derived-index commit.
                 // Stop this writer and rebuild, never continue from a stale view.
                 for pending in submitted {
@@ -19574,6 +19597,72 @@ mod tests {
     mod index_recovery;
     mod memory_budget;
     mod startup_io;
+    #[test]
+    fn reservation_failures_keep_their_pool_across_archive_and_execution() {
+        use crate::node_memory::{MemoryBudget, ReservationKind};
+        struct DenyNative;
+        impl rbtc_codec_memory::AllocationBudget for DenyNative {
+            type Lease = ();
+            fn reserve(&self, _: usize) -> Option<()> {
+                None
+            }
+        }
+        for kind in [ReservationKind::Memory, ReservationKind::ExecutionSpool] {
+            let denied = || {
+                let budget = MemoryBudget::new(0);
+                match kind {
+                    ReservationKind::Memory => budget.reserve(1).err().unwrap(),
+                    ReservationKind::ExecutionSpool => {
+                        budget.reserve_spool(u64::MAX).err().unwrap()
+                    }
+                }
+            };
+            let archive = crate::archive::ArchiveError::from(denied());
+            assert_eq!(archive.reservation_kind(), Some(kind));
+            let error = PeerRunError::ledger(&crate::ledger::LedgerError::Archive(archive));
+            assert_eq!(error.kind, PeerFailureKind::LocalBudget(kind));
+            assert!(error.kind.is_local());
+            let source = match kind {
+                ReservationKind::Memory => {
+                    crate::chain_store::ChainStoreError::ExecutionMemory(denied())
+                }
+                ReservationKind::ExecutionSpool => {
+                    crate::chain_store::ChainStoreError::ExecutionSpool(denied())
+                }
+            };
+            assert_eq!(
+                PeerRunError::block(&BlockExecutionError::ChainStore(source)).kind,
+                error.kind
+            );
+        }
+        let native = rbtc_codec_memory::Encoder::new(std::io::sink(), DenyNative, 1, 0)
+            .err()
+            .unwrap();
+        let error = PeerRunError::ledger(&crate::ledger::LedgerError::Archive(native.into()));
+        assert_eq!(
+            error.kind,
+            PeerFailureKind::LocalBudget(ReservationKind::Memory)
+        );
+        // A matching message, malformed input, or physical I/O failure does not
+        // establish reservation pressure and must never trigger a budget retry.
+        for source in [
+            std::io::Error::other("node memory reservation allowance exhausted"),
+            std::io::Error::other("execution spool disk allowance exhausted"),
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "filesystem failure"),
+        ] {
+            let archive = crate::archive::ArchiveError::from(source);
+            assert_eq!(archive.reservation_kind(), None);
+            assert!(matches!(archive, crate::archive::ArchiveError::Io(_)));
+        }
+        let unknown = crate::archive::ArchiveError::ResourceBudget(std::io::Error::other(
+            "untyped resource failure",
+        ));
+        assert_eq!(
+            PeerRunError::ledger(&crate::ledger::LedgerError::Archive(unknown)).kind,
+            PeerFailureKind::LocalResource
+        );
+    }
+
     #[test]
     fn execution_spool_failure_is_local_not_peer_misbehavior() {
         use crate::chain_store::ChainStoreError;

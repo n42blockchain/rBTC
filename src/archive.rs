@@ -90,10 +90,25 @@ pub enum ArchiveError {
 
 impl From<std::io::Error> for ArchiveError {
     fn from(error: std::io::Error) -> Self {
-        if rbtc_codec_memory::is_admission_error(&error) {
+        if rbtc_codec_memory::is_admission_error(&error)
+            || crate::node_memory::reservation_kind(&error).is_some()
+        {
             Self::ResourceBudget(error)
         } else {
             Self::Io(error)
+        }
+    }
+}
+
+impl ArchiveError {
+    pub(crate) fn reservation_kind(&self) -> Option<crate::node_memory::ReservationKind> {
+        let Self::ResourceBudget(error) = self else {
+            return None;
+        };
+        if rbtc_codec_memory::is_admission_error(error) {
+            Some(crate::node_memory::ReservationKind::Memory)
+        } else {
+            crate::node_memory::reservation_kind(error)
         }
     }
 }

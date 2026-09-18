@@ -299,6 +299,11 @@ vendored codec includes allocation-failure cleanup fixes; system zstd overrides
 are rejected. OS worker stacks, allocator overhead, newly serialized network
 payloads and other node batch objects still need accounting.
 These reservation limits do not establish a whole-node RSS ceiling.
+Memory and execution-spool admission failures retain distinct internal error
+types through archive/execution paths. Both stop the current session as local
+failures without penalizing peers; they do not yet trigger automatic batch
+downshifting or staged-work resumption. Physical I/O failures are not inferred
+to be reservation exhaustion from their text.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.

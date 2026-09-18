@@ -183,9 +183,18 @@ fn archive_admission_failure_reaches_the_node_as_a_local_resource_error() {
     ));
     assert_eq!(
         PeerRunError::ledger(&error).kind,
-        PeerFailureKind::LocalResource
+        PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::ExecutionSpool)
     );
     assert!(ledger.staged_manifest().unwrap().is_none());
+    drop(pressure);
+    let pressure = memory.reserve(memory.snapshot().limit).unwrap();
+    let error = ledger.stage(1, &[vec![1]]).unwrap_err();
+    assert_eq!(
+        PeerRunError::ledger(&error).kind,
+        PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+    );
+    assert!(ledger.staged_manifest().unwrap().is_none());
+    assert_eq!(memory.spool_snapshot().used, 0);
     drop(pressure);
     ledger.stage(1, &[vec![1]]).unwrap();
     assert_eq!(memory.spool_snapshot().used, 0);

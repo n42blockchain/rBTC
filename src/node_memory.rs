@@ -36,6 +36,30 @@ struct Shared {
     spool_usage: Mutex<Usage>,
 }
 
+/// Exact exhausted reservation pool; physical I/O errors are not admission errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReservationKind {
+    Memory,
+    ExecutionSpool,
+}
+#[derive(Debug)]
+struct ReservationDenied(ReservationKind);
+impl std::fmt::Display for ReservationDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self.0 {
+            ReservationKind::Memory => "node memory reservation allowance exhausted",
+            ReservationKind::ExecutionSpool => "execution spool disk allowance exhausted",
+        })
+    }
+}
+impl std::error::Error for ReservationDenied {}
+pub(crate) fn reservation_kind(error: &io::Error) -> Option<ReservationKind> {
+    error
+        .get_ref()?
+        .downcast_ref::<ReservationDenied>()
+        .map(|error| error.0)
+}
+
 /// One node's memory ledger. Clones share the same allowance.
 #[derive(Clone, Debug)]
 pub struct MemoryBudget(Arc<Shared>);
@@ -63,7 +87,7 @@ impl MemoryBudget {
     /// Reserves before allocation; the returned lease follows its actual owner.
     pub fn reserve(&self, bytes: u64) -> io::Result<MemoryLease> {
         self.try_reserve(bytes)
-            .ok_or_else(|| io::Error::other("node memory reservation allowance exhausted"))
+            .ok_or_else(|| io::Error::other(ReservationDenied(ReservationKind::Memory)))
     }
 
     // Native allocator callbacks must not allocate an error merely to reject
@@ -93,7 +117,9 @@ impl MemoryBudget {
         // Shared by active/background pipelines. This is an ephemeral logical
         // byte limit, not a physical quota for all node files.
         if bytes > DEFAULT_EXECUTION_SPOOL_BYTES.saturating_sub(usage.used) {
-            return Err(io::Error::other("execution spool disk allowance exhausted"));
+            return Err(io::Error::other(ReservationDenied(
+                ReservationKind::ExecutionSpool,
+            )));
         }
         usage.used += bytes;
         usage.peak = usage.peak.max(usage.used);
