@@ -105,7 +105,9 @@ async fn serve_one_block_regtest_node(
     listener: TcpListener,
     block: bitcoin::Block,
     release: oneshot::Receiver<()>,
+    accept_delay: Duration,
 ) {
+    tokio::time::sleep(accept_delay).await;
     let (stream, _) = listener.accept().await.unwrap();
     let mut peer = V1Transport::new(stream, Network::Regtest.magic());
     assert!(matches!(
@@ -615,6 +617,17 @@ async fn host_configured_zmq_endpoint_accepts_a_subscriber() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_zmq_endpoint_publishes_an_executed_block() {
+    exercise_zmq_block_publication(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_zmq_delivery_deadline_excludes_peer_startup() {
+    // Longer than the five-second frame deadline, shorter than the separate
+    // startup guard. This reproduced a frame timeout before the ordering fix.
+    exercise_zmq_block_publication(Duration::from_secs(6)).await;
+}
+
+async fn exercise_zmq_block_publication(accept_delay: Duration) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
@@ -626,7 +639,12 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
         ))
         .expect("regtest block assembles");
     let (release, gate) = oneshot::channel();
-    let peer = tokio::spawn(serve_one_block_regtest_node(listener, block.clone(), gate));
+    let peer = tokio::spawn(serve_one_block_regtest_node(
+        listener,
+        block.clone(),
+        gate,
+        accept_delay,
+    ));
     let zmq_address: SocketAddr = {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap()
@@ -642,6 +660,27 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     let mut subscriber = zmtp_subscribe(zmq_address, &[b""]).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     release.send(()).unwrap();
+
+    // Startup, peer negotiation and execution have their own deadline. Frame
+    // delivery is checked only after the block has actually been executed.
+    let mut status = controller.subscribe_status();
+    timeout(NODE_STARTUP_TIMEOUT, async {
+        loop {
+            if status
+                .borrow_and_update()
+                .execution
+                .is_some_and(|tip| tip.height == 1)
+            {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|error| panic!(
+        "execution must reach the published block: {error}; status={:?}, lifecycle={:?}, peer_finished={}",
+        controller.status(), controller.lifecycle(), peer.is_finished(),
+    ));
 
     let (topic, body, sequence) = read_zmq_notification(&mut subscriber).await;
     assert_eq!(topic, b"hashblock");
@@ -662,22 +701,6 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
         "Core reverses the hash on the sequence topic too, so it must match          the hashblock body byte for byte"
     );
     assert_eq!(body[32], b'C');
-
-    let mut status = controller.subscribe_status();
-    timeout(NODE_STARTUP_TIMEOUT, async {
-        loop {
-            if status
-                .borrow_and_update()
-                .execution
-                .is_some_and(|tip| tip.height == 1)
-            {
-                break;
-            }
-            status.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("execution must reach the published block");
 
     controller.request_shutdown();
     timeout(Duration::from_secs(3), handle.wait())
