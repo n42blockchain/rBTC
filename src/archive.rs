@@ -734,11 +734,42 @@ pub(crate) fn write_archive_prefix(
     count: u32,
     destination: &Path,
 ) -> Result<ArchiveManifest, ArchiveError> {
-    if count == 0 || count > expected.block_count {
-        return Err(ArchiveError::Invalid("archive prefix count"));
+    write_archive_range(source, expected, expected.first_height, count, destination)
+}
+
+/// Re-encodes a contiguous range with bounded scratch and one selected record
+/// at a time. Both passes verify the complete source, including skipped records.
+/// This produces a file only; publication and recovery belong to the ledger.
+pub(crate) fn write_archive_range(
+    source: &Path,
+    expected: &ArchiveManifest,
+    first_height: u32,
+    count: u32,
+    destination: &Path,
+) -> Result<ArchiveManifest, ArchiveError> {
+    let offset = first_height
+        .checked_sub(expected.first_height)
+        .ok_or(ArchiveError::Invalid("archive range start"))?;
+    if count == 0
+        || offset
+            .checked_add(count)
+            .is_none_or(|end| end > expected.block_count)
+    {
+        return Err(ArchiveError::Invalid("archive range count"));
     }
+    let visit_range = |visit: &mut dyn FnMut(u32, &[u8]) -> bool| {
+        scan_archive_selection(
+            source,
+            Some(expected),
+            first_height,
+            count,
+            MAX_RECORDS_BYTES,
+            Some(visit),
+        )
+        .map(|(_, _, complete)| complete)
+    };
     let mut records_bytes = 0_u64;
-    visit_archive_prefix(source, expected, count, &mut |_, block| {
+    visit_range(&mut |_, block| {
         records_bytes += 4 + block.len() as u64;
         true
     })?;
@@ -765,7 +796,7 @@ pub(crate) fn write_archive_prefix(
     )?;
     let mut digest = Sha256::new();
     let mut failure = None;
-    visit_archive_prefix(source, expected, count, &mut |_, block| {
+    visit_range(&mut |_, block| {
         let length = u32::try_from(block.len())
             .expect("verified record size")
             .to_le_bytes();
@@ -786,7 +817,7 @@ pub(crate) fn write_archive_prefix(
     let temporary = encoder.finish()?;
     finish_archive_file(
         destination,
-        expected.first_height,
+        first_height,
         count,
         records_bytes,
         crate::utxo::hex_lower(&digest.finalize()),
@@ -2092,6 +2123,94 @@ mod tests {
             encoded,
             "failed source verification must not truncate output"
         );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn streamed_ranges_preserve_heights_and_validate_skipped_records() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.rblk");
+        let target = dir.path().join("range.rblk");
+        let blocks = [vec![1; 256 * 1024], vec![2; 1000], vec![3; 4000]];
+        let original = write_archive(&source, 10, &blocks).unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        for (start, count) in [(10, 3), (11, 1), (11, 2), (12, 1)] {
+            let manifest = write_archive_range(&source, &original, start, count, &target).unwrap();
+            let (decoded, selected) = read_archive(&target).unwrap();
+            assert_eq!(decoded, manifest);
+            assert_eq!(manifest.first_height, start);
+            assert_eq!(manifest.block_count, count);
+            let offset = (start - 10) as usize;
+            assert_eq!(&selected[..], &blocks[offset..offset + count as usize]);
+            assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        }
+        let saved = fs::read(&target).unwrap();
+        for (start, count) in [(9, 1), (10, 0), (11, 3), (13, 1), (12, u32::MAX)] {
+            assert!(write_archive_range(&source, &original, start, count, &target).is_err());
+            assert_eq!(fs::read(&target).unwrap(), saved);
+        }
+        // Valid compressed-piece hashes do not suffice: the full record digest
+        // must still be checked when both the prefix and suffix are skipped.
+        let mut invalid = original.clone();
+        invalid.fields_mut().records_sha256 = "00".repeat(32);
+        let metadata = serde_json::to_vec(&invalid).unwrap();
+        let offset = 12 + u32::from_le_bytes(source_bytes[8..12].try_into().unwrap()) as usize;
+        let mut changed = MAGIC.to_vec();
+        changed.extend_from_slice(&u32::try_from(metadata.len()).unwrap().to_le_bytes());
+        changed.extend_from_slice(&metadata);
+        changed.extend_from_slice(&source_bytes[offset..]);
+        fs::write(&source, &changed).unwrap();
+        assert!(matches!(
+            write_archive_range(&source, &original, 11, 1, &target),
+            Err(ArchiveError::Invalid("archive identity changed"))
+        ));
+        assert!(matches!(
+            write_archive_range(&source, &invalid, 11, 1, &target),
+            Err(ArchiveError::Invalid("records checksum"))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), saved);
+        assert_eq!(fs::read(&source).unwrap(), changed);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn streamed_suffix_refunds_memory_and_spool_denials_without_replacing_files() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.rblk");
+        let target = dir.path().join("suffix.rblk");
+        let original = write_archive(&source, 10, &[vec![1; 300_000], vec![2; 1000]]).unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        fs::write(&target, b"preserve").unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(budget.snapshot().limit).unwrap();
+        let error = write_archive_range(&source, &original, 11, 1, &target).unwrap_err();
+        assert_eq!(
+            error.reservation_kind(),
+            Some(crate::node_memory::ReservationKind::Memory)
+        );
+        drop(pressure);
+        assert_eq!(budget.snapshot().used, 0);
+        let pressure = budget
+            .reserve_spool(budget.spool_snapshot().limit - MAX_CONTAINER_BYTES + 1)
+            .unwrap();
+        let error = write_archive_range(&source, &original, 11, 1, &target).unwrap_err();
+        assert_eq!(
+            error.reservation_kind(),
+            Some(crate::node_memory::ReservationKind::ExecutionSpool)
+        );
+        assert_eq!(budget.snapshot().used, 0);
+        drop(pressure);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        let suffix = write_archive_range(&source, &original, 11, 1, &target).unwrap();
+        assert_eq!(suffix.first_height, 11);
+        assert_eq!(read_archive(&target).unwrap().1, vec![vec![2; 1000]]);
+        assert_eq!(budget.snapshot().used, MANIFEST_MEMORY_BYTES);
+        drop(suffix);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.spool_snapshot().used, 0);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 

@@ -39,7 +39,8 @@ comparisons remain. The failed run and diagnostic hashes/summary are preserved.
 No production codec or acceptance resource threshold changed for this finding.
 
 Prior exact CI35324717780/901a0fe passed Linux, Windows and supply-chain checks.
-The new source still needs its own CI. This is not arbitrary-size staged recovery:
+Exact CI35388353685/7940749 subsequently passed Linux, Windows and supply-chain
+checks. This is not arbitrary-size staged recovery:
 a segment exceeding a smaller batch is retained but cannot yet make progress.
 Checkpoint-aware suffix preservation and post-commit publication/index recovery,
 fair pressure resumption, whole-node startup/RSS/disk and final-source/long-term
