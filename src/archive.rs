@@ -1551,11 +1551,19 @@ mod tests {
             for _ in 0..20 {
                 reference.write_all(&input).unwrap();
             }
-            assert_eq!(encoded, reference.finish().unwrap());
-            assert_eq!(
-                zstd::decode_all(encoded.as_slice()).unwrap().len(),
-                20 * input.len()
-            );
+            // Streaming buffer boundaries can produce different valid frames.
+            // Verify every decoded byte, not compressed-byte determinism or
+            // merely the decoded length. Small file-format comparisons remain
+            // covered separately by the archive writer tests.
+            for compressed in [encoded, reference.finish().unwrap()] {
+                let decoded = zstd::decode_all(compressed.as_slice()).unwrap();
+                assert_eq!(decoded.len(), 20 * input.len());
+                assert!(
+                    decoded
+                        .chunks_exact(input.len())
+                        .all(|chunk| chunk == input)
+                );
+            }
             // Fail each observed allocation position, including worker-pool and
             // job-buffer construction. Scheduling may reorder later attempts.
             for fail_at in 0..allocations {

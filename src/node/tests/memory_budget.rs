@@ -485,3 +485,218 @@ async fn memory_retry_replays_smaller_windows_without_duplicate_commits() {
     assert_eq!(memory.snapshot().used, 0);
     drop(peer);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
+    let directory = tempfile::tempdir().unwrap();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let mut headers = HeaderDag::new(Network::Regtest);
+    let mut blocks = Vec::new();
+    for height in 1..=2 {
+        let block =
+            crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+                headers.active_tip().hash,
+                height,
+                genesis.header.time + height,
+            ))
+            .unwrap();
+        headers.insert(block.header).unwrap();
+        blocks.push(serialize(&block));
+    }
+    let path = directory.path().join("blocks");
+    let ledger = PrunedBlockLedger::open(&path, LedgerRetention::default()).unwrap();
+    ledger.stage(1, &blocks).unwrap();
+    let identity = ledger.staged_manifest().unwrap().unwrap();
+    let bytes_before = fs::read(path.join("ledger-staged.rblk")).unwrap();
+    drop(ledger);
+    let ledger = PrunedBlockLedger::open_persisted(&path).unwrap();
+    let chainstate =
+        RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(accept_peer(listener, peer_version(9_201)));
+    let mut session = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9_202,
+        "/rbtc:staged-reuse/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let (peer, _) = server.await.unwrap();
+    timeout(
+        Duration::from_secs(10),
+        reconcile_ledger(
+            &mut session,
+            &deployments,
+            &headers,
+            chainstate.execution(),
+            &ledger,
+            &[],
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+    let indexes = AuxiliaryIndexes {
+        transaction: None,
+        spent_output: None,
+        basic_filter: None,
+    };
+    let pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let mut prefetched = PrefetchedBlocks::default();
+    let mut scripts = Vec::new();
+    let mut auxiliary = None;
+    let error = timeout(
+        Duration::from_secs(10),
+        download_execute_batch(
+            &mut session,
+            &deployments,
+            &headers,
+            &chainstate,
+            &ledger,
+            None,
+            None,
+            None,
+            &indexes,
+            &[],
+            &pool,
+            Some(2),
+            1,
+            &mut auxiliary,
+            &mut prefetched,
+            &mut scripts,
+            false,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.kind.is_local());
+    assert_eq!(chainstate.execution_tip().unwrap().height, 0);
+    assert_eq!(
+        fs::read(path.join("ledger-staged.rblk")).unwrap(),
+        bytes_before
+    );
+    let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+    memory.bind(std::slice::from_ref(&path)).unwrap();
+    let pressure = memory.reserve(memory.snapshot().limit).unwrap();
+    let denied = timeout(
+        Duration::from_secs(10),
+        download_execute_batch(
+            &mut session,
+            &deployments,
+            &headers,
+            &chainstate,
+            &ledger,
+            None,
+            None,
+            None,
+            &indexes,
+            &[],
+            &pool,
+            Some(2),
+            2,
+            &mut auxiliary,
+            &mut prefetched,
+            &mut scripts,
+            false,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        denied.kind,
+        PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+    );
+    assert_eq!(chainstate.execution_tip().unwrap().height, 0);
+    assert_eq!(
+        fs::read(path.join("ledger-staged.rblk")).unwrap(),
+        bytes_before
+    );
+    drop(pressure);
+    assert_eq!(memory.snapshot().used, 0);
+    // Staged bytes supersede unrelated speculative input, without any block
+    // request: the connected peer only completed the handshake and is idle.
+    prefetched.serialized.push(vec![99].into());
+    timeout(
+        Duration::from_secs(10),
+        download_execute_batch(
+            &mut session,
+            &deployments,
+            &headers,
+            &chainstate,
+            &ledger,
+            None,
+            None,
+            None,
+            &indexes,
+            &[],
+            &pool,
+            Some(2),
+            2,
+            &mut auxiliary,
+            &mut prefetched,
+            &mut scripts,
+            false,
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(chainstate.execution_tip().unwrap().height, 2);
+    assert!(ledger.staged_manifest().unwrap().is_none());
+    for (offset, expected) in blocks.iter().enumerate() {
+        assert_eq!(
+            ledger
+                .read_block(u32::try_from(offset + 1).unwrap())
+                .unwrap()
+                .unwrap(),
+            *expected
+        );
+    }
+    drop(peer);
+}
+
+#[test]
+fn staged_reuse_requires_identity_and_all_original_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
+    let blocks = [vec![1], vec![2]];
+    ledger.stage(1, &blocks).unwrap();
+    let identity = ledger.staged_manifest().unwrap().unwrap();
+    let before = fs::read(directory.path().join("ledger-staged.rblk")).unwrap();
+    ledger.stage_or_verify(1, &blocks, Some(&identity)).unwrap();
+    for (first, candidate) in [
+        (2, blocks.to_vec()),
+        (1, vec![vec![1]]),
+        (1, vec![vec![1], vec![3]]),
+    ] {
+        assert!(
+            ledger
+                .stage_or_verify(first, &candidate, Some(&identity))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(directory.path().join("ledger-staged.rblk")).unwrap(),
+            before
+        );
+    }
+    ledger.discard_staged().unwrap();
+    ledger.stage(1, &[vec![3], vec![4]]).unwrap();
+    let replacement = ledger.staged_manifest().unwrap().unwrap();
+    assert!(ledger.stage_or_verify(1, &blocks, Some(&identity)).is_err());
+    assert_eq!(ledger.staged_manifest().unwrap().unwrap(), replacement);
+    assert!(ledger.retained_tip().unwrap().is_none());
+}

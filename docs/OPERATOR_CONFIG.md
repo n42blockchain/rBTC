@@ -304,8 +304,11 @@ types through archive/execution paths. Both are local failures and do not penali
 pressure can retry with successively halved block windows while the execution
 tip is unchanged and no deferred scripts or staged segment remain. Retries
 disable network and replay read-ahead and stop if one block cannot fit. Disk
-pressure and failures after staging/commit still stop the session; existing-stage
-resumption remains separate work. Physical I/O failures are not inferred
+pressure and failures after staging/commit still stop the session. On resumption,
+a matching wholly unexecuted stage is preserved and reused if the complete segment
+fits the current batch/height limits; it is revalidated without rewriting it.
+Larger stages fail closed without truncating their suffix. Recovery across smaller
+checkpoints and automatic publication retry remain open. Physical I/O failures are not inferred
 to be reservation exhaustion from their text.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and

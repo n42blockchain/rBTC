@@ -12393,24 +12393,23 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     };
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    // A prior attempt may have staged a downloaded batch and then failed
-    // before committing it (for example, the chainstate transaction hitting
-    // the hard capacity ceiling) — `download_execute_batch` always stages
-    // fresh for the next batch and does not expect a pre-existing staged
-    // segment, so leaving one in place fails every subsequent attempt at the
-    // same height with "staged segment already exists" instead of
-    // recovering. The redb-backed driver reconciles this against its own
-    // chainstate tip and can resume already-validated staged blocks via
-    // `commit_staged`; this driver takes the simpler always-discard path and
-    // re-downloads, which is a bounded, one-batch bandwidth cost.
-    if ledger
+    // Preserve a fully validated next segment for identity-bound batch reuse.
+    // Other overlay restart cases retain their existing reconciliation policy.
+    if let Some(staged) = ledger
         .staged_manifest()
-        .map_err(|error| PeerRunError::transient(error.to_string()))?
-        .is_some()
+        .map_err(|error| PeerRunError::ledger(&error))?
     {
-        ledger
-            .discard_staged()
-            .map_err(|error| PeerRunError::transient(error.to_string()))?;
+        if !unexecuted_stage_matches_chain(
+            &options.deployments,
+            headers,
+            opened_tip,
+            &ledger,
+            &staged,
+        )? {
+            ledger
+                .discard_staged()
+                .map_err(|error| PeerRunError::ledger(&error))?;
+        }
     }
     // A committed segment can also outlive the chainstate that produced it.
     // The batch commits the chainstate before the ledger, so under a durable
@@ -14907,6 +14906,33 @@ async fn replay_wallet_blocks(
     Ok(())
 }
 
+fn unexecuted_stage_matches_chain(
+    deployment_config: &DeploymentConfig,
+    headers: &dyn HeaderView,
+    tip: crate::execution_store::ExecutionTip,
+    ledger: &PrunedBlockLedger,
+    staged: &crate::archive::ArchiveManifest,
+) -> Result<bool, String> {
+    if tip.height.checked_add(1) != Some(staged.first_height)
+        || headers
+            .active_header(tip.height)?
+            .is_none_or(|header| header.hash != tip.hash)
+    {
+        return Ok(false);
+    }
+    visit_staged_prefix(ledger, staged, staged.block_count, |height, raw| {
+        let Some(expected) = headers.active_header(height)? else {
+            return Ok(false);
+        };
+        let block: Block = deserialize(raw).map_err(|error| error.to_string())?;
+        if block.block_hash() != expected.hash {
+            return Ok(false);
+        }
+        validate_archive_block(deployment_config, headers, height, expected.hash, &block)?;
+        Ok(true)
+    })
+}
+
 async fn reconcile_ledger(
     session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
     deployment_config: &DeploymentConfig,
@@ -14927,7 +14953,9 @@ async fn reconcile_ledger(
         .map_err(|error| error.to_string())?
     {
         if staged.first_height > tip.height {
-            ledger.discard_staged().map_err(|error| error.to_string())?;
+            if !unexecuted_stage_matches_chain(deployment_config, headers, tip, ledger, &staged)? {
+                ledger.discard_staged().map_err(|error| error.to_string())?;
+            }
         } else {
             let available = tip
                 .height
@@ -15940,9 +15968,23 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
             tip.height
         ))
     })?;
-    let batch_len = usize::try_from(remaining)
+    let mut batch_len = usize::try_from(remaining)
         .unwrap_or(usize::MAX)
         .min(maximum_batch_size);
+    let staged = ledger
+        .staged_manifest()
+        .map_err(|error| PeerRunError::ledger(&error))?;
+    if let Some(identity) = &staged {
+        if identity.first_height != next_height || identity.block_count as usize > batch_len {
+            return Err(PeerRunError::local(
+                "existing stage cannot be consumed completely at this execution checkpoint and batch limit",
+            ));
+        }
+        batch_len = identity.block_count as usize;
+        // The durable stage is the source of truth. Speculative bytes must not
+        // replace it or keep memory occupied during recovery.
+        *prefetched_blocks = PrefetchedBlocks::default();
+    }
     let mut expected = (0..batch_len)
         .map(|offset| {
             let offset = u32::try_from(offset).expect("block batch fits u32");
@@ -16004,7 +16046,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
     }
     let mut offset = blocks.len();
     // The read-ahead may already have filled the whole batch.
-    if let Some(replay) = replay.filter(|_| offset < hashes.len()) {
+    if offset < hashes.len() && (staged.is_some() || replay.is_some()) {
         // Replay reads the same blocks from a retained ledger instead of
         // peers, so a storage change can be measured without the network in
         // the number. Everything downstream — structure validation, staging,
@@ -16014,9 +16056,14 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
         let first = next_height
             .checked_add(u32::try_from(offset).expect("batch offset fits u32"))
             .ok_or_else(|| PeerRunError::transient("replay height overflow"))?;
-        let batch = replay
-            .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
-            .map_err(|error| PeerRunError::ledger(&error))?;
+        let batch = if let Some(identity) = &staged {
+            ledger.read_staged_batch(identity, first, wanted, crate::archive::MAX_RECORDS_BYTES)
+        } else {
+            replay
+                .expect("a local source was checked")
+                .read_block_batch(first, wanted, REPLAY_BATCH_MAX_BYTES)
+        }
+        .map_err(|error| PeerRunError::ledger(&error))?;
         if batch.first_height != first || batch.blocks.is_empty() {
             return Err(PeerRunError::transient(format!(
                 "replay ledger does not retain height {first}"
@@ -16129,7 +16176,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
     };
     let structure_validated_at = Instant::now();
     let mut prefetch_error = None;
-    let next_prefetch_hashes = if prefetch_next_batch {
+    let next_prefetch_hashes = if prefetch_next_batch && staged.is_none() {
         let last_height = expected
             .last()
             .expect("non-empty block batch has a last header")
@@ -16223,7 +16270,8 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
                             shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                         (result, started.elapsed())
                     });
-                    let stage_result = ledger.stage(next_height, &serialized);
+                    let stage_result =
+                        ledger.stage_or_verify(next_height, &serialized, staged.as_ref());
                     let branch_staged_at = Instant::now();
                     let (utxo_result, utxo_elapsed) = match (ready, utxos) {
                         (Some(ready), _) => ready,
@@ -16261,24 +16309,26 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
         // A replay reads the next batch from the ledger while this one
         // executes, the way the networked path downloads it: the bytes land
         // in the prefetch buffer and the next batch starts from them.
-        let read_ahead = replay.filter(|_| allow_replay_prefetch).and_then(|replay| {
-            let last_height = expected
-                .last()
-                .expect("non-empty block batch has a last header")
-                .height;
-            let carried_len =
-                u32::try_from(carried_prefetch.len()).expect("validation prefetch length fits u32");
-            let carried_height = last_height.checked_add(carried_len)?;
-            let remaining = execution_ceiling.checked_sub(carried_height)?;
-            let wanted = u32::try_from(
-                validation_prefetch_limit(maximum_batch_size)
-                    .saturating_sub(carried_prefetch.len()),
-            )
-            .unwrap_or(u32::MAX)
-            .min(remaining);
-            let first = carried_height.checked_add(1)?;
-            (wanted > 0).then_some((replay, first, wanted))
-        });
+        let read_ahead = replay
+            .filter(|_| allow_replay_prefetch && staged.is_none())
+            .and_then(|replay| {
+                let last_height = expected
+                    .last()
+                    .expect("non-empty block batch has a last header")
+                    .height;
+                let carried_len = u32::try_from(carried_prefetch.len())
+                    .expect("validation prefetch length fits u32");
+                let carried_height = last_height.checked_add(carried_len)?;
+                let remaining = execution_ceiling.checked_sub(carried_height)?;
+                let wanted = u32::try_from(
+                    validation_prefetch_limit(maximum_batch_size)
+                        .saturating_sub(carried_prefetch.len()),
+                )
+                .unwrap_or(u32::MAX)
+                .min(remaining);
+                let first = carried_height.checked_add(1)?;
+                (wanted > 0).then_some((replay, first, wanted))
+            });
         let (execution_result, read_ahead_result, prefetch_elapsed) = std::thread::scope(|scope| {
             let ahead = read_ahead.map(|(replay, first, wanted)| {
                 scope.spawn(move || {
@@ -16405,7 +16455,8 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
                         shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                     (result, started.elapsed())
                 });
-                let stage_result = ledger.stage(next_height, &serialized);
+                let stage_result =
+                    ledger.stage_or_verify(next_height, &serialized, staged.as_ref());
                 let branch_staged_at = Instant::now();
                 let (utxo_result, utxo_prefetch_elapsed) = utxos
                     .join()
@@ -16495,7 +16546,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
                 let result = shard_validation_delta_candidates(chainstate, &delta_shard_candidates);
                 (result, started.elapsed())
             });
-            let stage_result = ledger.stage(next_height, &serialized);
+            let stage_result = ledger.stage_or_verify(next_height, &serialized, staged.as_ref());
             let branch_staged_at = Instant::now();
             let (utxo_result, utxo_elapsed) = utxos
                 .join()

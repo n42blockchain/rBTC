@@ -486,6 +486,42 @@ impl PrunedBlockLedger {
         self.sync_directory(LedgerSyncPoint::StagedPublish)
     }
 
+    /// Reuses an exact staged batch without writing or replacing it. A changed
+    /// identity or payload fails closed before chainstate execution.
+    pub(crate) fn stage_or_verify(
+        &self,
+        first_height: u32,
+        blocks: &[impl AsRef<[u8]>],
+        expected: Option<&ArchiveManifest>,
+    ) -> Result<(), LedgerError> {
+        let Some(expected) = expected else {
+            return self.stage(first_height, blocks);
+        };
+        if expected.first_height != first_height || blocks.len() != expected.block_count as usize {
+            return Err(LedgerError::Invalid(
+                "staged reuse requires the complete segment",
+            ));
+        }
+        let _guard = self.lock();
+        let mut position = 0;
+        let matches = crate::archive::visit_archive_prefix(
+            self.staged_path(),
+            expected,
+            expected.block_count,
+            &mut |_, raw| {
+                let same = blocks
+                    .get(position)
+                    .is_some_and(|block| block.as_ref() == raw);
+                position += 1;
+                same
+            },
+        )?;
+        if !matches || position != blocks.len() {
+            return Err(LedgerError::Invalid("staged reuse payload changed"));
+        }
+        Ok(())
+    }
+
     /// Returns the checksum-verified segment awaiting publication, if any.
     pub fn staged(&self) -> Result<Option<StagedSegment>, LedgerError> {
         let _guard = self.lock();
