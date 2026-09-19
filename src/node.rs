@@ -12393,24 +12393,6 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
     };
     let ledger = PrunedBlockLedger::open(data_dir.join("blocks"), options.ledger_retention)
         .map_err(|error| PeerRunError::transient(error.to_string()))?;
-    // Preserve a fully validated next segment for identity-bound batch reuse.
-    // Other overlay restart cases retain their existing reconciliation policy.
-    if let Some(staged) = ledger
-        .staged_manifest()
-        .map_err(|error| PeerRunError::ledger(&error))?
-    {
-        if !unexecuted_stage_matches_chain(
-            &options.deployments,
-            headers,
-            opened_tip,
-            &ledger,
-            &staged,
-        )? {
-            ledger
-                .discard_staged()
-                .map_err(|error| PeerRunError::ledger(&error))?;
-        }
-    }
     // A committed segment can also outlive the chainstate that produced it.
     // The batch commits the chainstate before the ledger, so under a durable
     // commit the chainstate can only be ahead and this is a no-op. It is kept
@@ -12438,6 +12420,7 @@ async fn run_overlay_catchup<C: OverlayCatchupStore>(
             );
         }
     }
+    reconcile_overlay_stage(&options.deployments, headers, opened_tip, &ledger)?;
     let auxiliary_indexes = AuxiliaryIndexes::open(
         data_dir,
         options.network,
@@ -14906,21 +14889,25 @@ async fn replay_wallet_blocks(
     Ok(())
 }
 
-fn unexecuted_stage_matches_chain(
+fn stage_matches_chain(
     deployment_config: &DeploymentConfig,
     headers: &dyn HeaderView,
     tip: crate::execution_store::ExecutionTip,
     ledger: &PrunedBlockLedger,
     staged: &crate::archive::ArchiveManifest,
+    count: u32,
 ) -> Result<bool, String> {
-    if tip.height.checked_add(1) != Some(staged.first_height)
+    if tip
+        .height
+        .checked_add(1)
+        .is_none_or(|next| next < staged.first_height)
         || headers
             .active_header(tip.height)?
             .is_none_or(|header| header.hash != tip.hash)
     {
         return Ok(false);
     }
-    visit_staged_prefix(ledger, staged, staged.block_count, |height, raw| {
+    visit_staged_prefix(ledger, staged, count, |height, raw| {
         let Some(expected) = headers.active_header(height)? else {
             return Ok(false);
         };
@@ -14931,6 +14918,50 @@ fn unexecuted_stage_matches_chain(
         validate_archive_block(deployment_config, headers, height, expected.hash, &block)?;
         Ok(true)
     })
+}
+
+// Overlay startup has no network backfill here. It can recover a staged
+// checkpoint contiguous with its ledger; missing earlier history fails closed.
+#[cfg(any(test, feature = "mdbx"))]
+fn reconcile_overlay_stage(
+    deployment_config: &DeploymentConfig,
+    headers: &dyn HeaderView,
+    tip: crate::execution_store::ExecutionTip,
+    ledger: &PrunedBlockLedger,
+) -> Result<(), PeerRunError> {
+    let Some(staged) = ledger
+        .staged_manifest()
+        .map_err(|error| PeerRunError::ledger(&error))?
+    else {
+        return Ok(());
+    };
+    let executed = tip
+        .height
+        .saturating_add(1)
+        .saturating_sub(staged.first_height)
+        .min(staged.block_count);
+    let keep_suffix = stage_matches_chain(
+        deployment_config,
+        headers,
+        tip,
+        ledger,
+        &staged,
+        staged.block_count,
+    )?;
+    if executed > 0
+        && (keep_suffix
+            || stage_matches_chain(deployment_config, headers, tip, ledger, &staged, executed)?)
+    {
+        ledger
+            .commit_staged_through(&staged, executed)
+            .map_err(|error| PeerRunError::ledger(&error))?;
+    }
+    if !keep_suffix {
+        ledger
+            .discard_staged()
+            .map_err(|error| PeerRunError::ledger(&error))?;
+    }
+    Ok(())
 }
 
 async fn reconcile_ledger(
@@ -14952,10 +14983,35 @@ async fn reconcile_ledger(
         .staged_manifest()
         .map_err(|error| error.to_string())?
     {
-        if staged.first_height > tip.height {
-            if !unexecuted_stage_matches_chain(deployment_config, headers, tip, ledger, &staged)? {
-                ledger.discard_staged().map_err(|error| error.to_string())?;
+        if stage_matches_chain(
+            deployment_config,
+            headers,
+            tip,
+            ledger,
+            &staged,
+            staged.block_count,
+        )? {
+            let executed = tip
+                .height
+                .saturating_add(1)
+                .saturating_sub(staged.first_height)
+                .min(staged.block_count);
+            if executed > 0 {
+                backfill_ledger(
+                    session,
+                    deployment_config,
+                    headers,
+                    ledger,
+                    staged.first_height.saturating_sub(1),
+                    compact_candidates,
+                )
+                .await?;
+                ledger
+                    .commit_staged_through(&staged, executed)
+                    .map_err(|error| error.to_string())?;
             }
+        } else if staged.first_height > tip.height {
+            ledger.discard_staged().map_err(|error| error.to_string())?;
         } else {
             let available = tip
                 .height
@@ -14963,26 +15019,14 @@ async fn reconcile_ledger(
                 .and_then(|distance| distance.checked_add(1))
                 .ok_or_else(|| "staged ledger height overflow".to_owned())?;
             let validated_count = available.min(staged.block_count);
-            let on_active_chain =
-                visit_staged_prefix(ledger, &staged, validated_count, |height, bytes| {
-                    let block: Block = deserialize(bytes).map_err(|error| {
-                        format!("decode staged block at height {height}: {error}")
-                    })?;
-                    let expected = headers
-                        .active_header(height)?
-                        .ok_or_else(|| format!("missing active header at height {height}"))?;
-                    if block.block_hash() != expected.hash {
-                        return Ok(false);
-                    }
-                    validate_archive_block(
-                        deployment_config,
-                        headers,
-                        height,
-                        expected.hash,
-                        &block,
-                    )?;
-                    Ok(true)
-                })?;
+            let on_active_chain = stage_matches_chain(
+                deployment_config,
+                headers,
+                tip,
+                ledger,
+                &staged,
+                validated_count,
+            )?;
             if on_active_chain {
                 let preceding_height = staged.first_height.saturating_sub(1);
                 backfill_ledger(
@@ -14995,8 +15039,13 @@ async fn reconcile_ledger(
                 )
                 .await?;
                 ledger
-                    .commit_staged(validated_count)
+                    .commit_staged_through(&staged, validated_count)
                     .map_err(|error| error.to_string())?;
+                // The committed prefix belongs to this chain but the future
+                // suffix does not. Publish the prefix before dropping stale input.
+                if validated_count < staged.block_count {
+                    ledger.discard_staged().map_err(|error| error.to_string())?;
+                }
                 rbtc_info!(
                     "recovered {validated_count} validated blocks from the staged ledger segment"
                 );
@@ -15975,12 +16024,13 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
         .staged_manifest()
         .map_err(|error| PeerRunError::ledger(&error))?;
     if let Some(identity) = &staged {
-        if identity.first_height != next_height || identity.block_count as usize > batch_len {
-            return Err(PeerRunError::local(
-                "existing stage cannot be consumed completely at this execution checkpoint and batch limit",
-            ));
-        }
-        batch_len = identity.block_count as usize;
+        let offset = next_height
+            .checked_sub(identity.first_height)
+            .filter(|offset| *offset < identity.block_count)
+            .ok_or_else(|| {
+                PeerRunError::local("existing stage does not cover the next execution checkpoint")
+            })?;
+        batch_len = batch_len.min((identity.block_count - offset) as usize);
         // The durable stage is the source of truth. Speculative bytes must not
         // replace it or keep memory occupied during recovery.
         *prefetched_blocks = PrefetchedBlocks::default();
@@ -16654,9 +16704,22 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
         .last()
         .expect("non-empty block batch has a last header");
     validate_live_indexes_before_prune(explorer, wallet, auxiliary_indexes, last.height)?;
-    ledger
-        .commit_staged(u32::try_from(blocks.len()).expect("block download batch count fits u32"))
-        .map_err(|error| PeerRunError::ledger(&error))?;
+    if let Some(identity) = &staged {
+        let executed = last
+            .height
+            .checked_sub(identity.first_height)
+            .and_then(|offset| offset.checked_add(1))
+            .ok_or_else(|| PeerRunError::local("staged execution checkpoint overflow"))?;
+        ledger
+            .commit_staged_through(identity, executed)
+            .map_err(|error| PeerRunError::ledger(&error))?;
+    } else {
+        ledger
+            .commit_staged(
+                u32::try_from(blocks.len()).expect("block download batch count fits u32"),
+            )
+            .map_err(|error| PeerRunError::ledger(&error))?;
+    }
     if let Some(zmq) = zmq_notifier {
         for block in &blocks {
             zmq.block_connected(block);

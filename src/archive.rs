@@ -874,10 +874,28 @@ pub(crate) fn visit_archive_prefix(
     if count > expected.block_count {
         return Err(ArchiveError::Invalid("archive prefix count"));
     }
+    visit_archive_range(path, expected, expected.first_height, count, visit)
+}
+
+/// Visits one contiguous range while verifying the complete immutable archive.
+pub(crate) fn visit_archive_range(
+    path: impl AsRef<Path>,
+    expected: &ArchiveManifest,
+    first_height: u32,
+    count: u32,
+    visit: &mut dyn FnMut(u32, &[u8]) -> bool,
+) -> Result<bool, ArchiveError> {
+    if first_height
+        .checked_sub(expected.first_height)
+        .and_then(|offset| offset.checked_add(count))
+        .is_none_or(|end| end > expected.block_count)
+    {
+        return Err(ArchiveError::Invalid("archive range count"));
+    }
     scan_archive_selection(
         path,
         Some(expected),
-        expected.first_height,
+        first_height,
         count,
         MAX_RECORDS_BYTES,
         Some(visit),

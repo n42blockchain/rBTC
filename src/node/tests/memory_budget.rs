@@ -487,8 +487,27 @@ async fn memory_retry_replays_smaller_windows_without_duplicate_commits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(clippy::too_many_lines)]
 async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
+    exercise_staged_checkpoint_recovery(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_staged_reuse_recovers_an_executed_prefix_and_keeps_its_suffix() {
+    exercise_staged_checkpoint_recovery(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn staged_reuse_recovers_committed_prefix_before_discarding_stale_suffix() {
+    exercise_staged_checkpoint_recovery(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlay_staged_reuse_recovers_committed_prefix_before_discarding_stale_suffix() {
+    exercise_staged_checkpoint_recovery(true, true).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn exercise_staged_checkpoint_recovery(overlay: bool, stale_suffix: bool) {
     let directory = tempfile::tempdir().unwrap();
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
     let deployments = DeploymentConfig::for_network(Network::Regtest);
@@ -551,7 +570,7 @@ async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
     let mut prefetched = PrefetchedBlocks::default();
     let mut scripts = Vec::new();
     let mut auxiliary = None;
-    let error = timeout(
+    timeout(
         Duration::from_secs(10),
         download_execute_batch(
             &mut session,
@@ -565,7 +584,7 @@ async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
             &indexes,
             &[],
             &pool,
-            Some(2),
+            Some(1),
             1,
             &mut auxiliary,
             &mut prefetched,
@@ -577,9 +596,68 @@ async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
     )
     .await
     .unwrap()
-    .unwrap_err();
-    assert!(error.kind.is_local());
-    assert_eq!(chainstate.execution_tip().unwrap().height, 0);
+    .unwrap();
+    assert_eq!(chainstate.execution_tip().unwrap().height, 1);
+    assert_eq!(ledger.read_block(1).unwrap().unwrap(), blocks[0]);
+    assert!(ledger.read_block(2).unwrap().is_none());
+    // Model execution commit surviving while ledger publication is absent.
+    // Recovery must publish from the retained stage without executing block 1 again.
+    ledger.truncate_from(1).unwrap();
+    drop(ledger);
+    drop(chainstate);
+    let chainstate =
+        RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest).unwrap();
+    let ledger = PrunedBlockLedger::open_persisted(&path).unwrap();
+    if stale_suffix {
+        let first: Block = deserialize(&blocks[0]).unwrap();
+        headers = HeaderDag::new(Network::Regtest);
+        headers.insert(first.header).unwrap();
+        let replacement =
+            crate::block_assembly::assemble_block(&crate::block_assembly::BlockTemplate::regtest(
+                first.block_hash(),
+                2,
+                genesis.header.time + 3,
+            ))
+            .unwrap();
+        headers.insert(replacement.header).unwrap();
+        assert_ne!(
+            replacement.block_hash(),
+            deserialize::<Block>(&blocks[1]).unwrap().block_hash()
+        );
+    }
+    if overlay {
+        reconcile_overlay_stage(
+            &deployments,
+            &headers,
+            chainstate.execution_tip().unwrap(),
+            &ledger,
+        )
+        .unwrap();
+    } else {
+        timeout(
+            Duration::from_secs(10),
+            reconcile_ledger(
+                &mut session,
+                &deployments,
+                &headers,
+                chainstate.execution(),
+                &ledger,
+                &[],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(chainstate.execution_tip().unwrap().height, 1);
+    assert_eq!(ledger.read_block(1).unwrap().unwrap(), blocks[0]);
+    if stale_suffix {
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        assert!(ledger.read_block(2).unwrap().is_none());
+        drop(peer);
+        return;
+    }
+    assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
     assert_eq!(
         fs::read(path.join("ledger-staged.rblk")).unwrap(),
         bytes_before
@@ -618,7 +696,7 @@ async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
         denied.kind,
         PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
     );
-    assert_eq!(chainstate.execution_tip().unwrap().height, 0);
+    assert_eq!(chainstate.execution_tip().unwrap().height, 1);
     assert_eq!(
         fs::read(path.join("ledger-staged.rblk")).unwrap(),
         bytes_before
@@ -670,7 +748,7 @@ async fn staged_reuse_survives_reopen_and_preserves_a_larger_suffix() {
 }
 
 #[test]
-fn staged_reuse_requires_identity_and_all_original_bytes() {
+fn staged_reuse_requires_identity_and_exact_selected_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
     let blocks = [vec![1], vec![2]];
@@ -678,9 +756,16 @@ fn staged_reuse_requires_identity_and_all_original_bytes() {
     let identity = ledger.staged_manifest().unwrap().unwrap();
     let before = fs::read(directory.path().join("ledger-staged.rblk")).unwrap();
     ledger.stage_or_verify(1, &blocks, Some(&identity)).unwrap();
+    ledger
+        .stage_or_verify(1, &blocks[..1], Some(&identity))
+        .unwrap();
+    ledger
+        .stage_or_verify(2, &blocks[1..], Some(&identity))
+        .unwrap();
     for (first, candidate) in [
         (2, blocks.to_vec()),
-        (1, vec![vec![1]]),
+        (1, vec![]),
+        (2, vec![vec![1]]),
         (1, vec![vec![1], vec![3]]),
     ] {
         assert!(

@@ -30,3 +30,7 @@ and whole-node fault/resource acceptance remain open. No readiness status change
 
 Previous exact CI35388353685/7940749 passed all jobs. This change requires its own
 CI; local tests and earlier CI do not establish final-source release acceptance.
+
+Follow-up: exact CI35389996036/dee1752 passed all jobs. Subsequent
+[checkpoint recovery](staged-checkpoint-recovery-20260919.md) connects the range
+writer to smaller node execution checkpoints without replacing the stage.

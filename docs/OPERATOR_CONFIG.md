@@ -305,10 +305,12 @@ pressure can retry with successively halved block windows while the execution
 tip is unchanged and no deferred scripts or staged segment remain. Retries
 disable network and replay read-ahead and stop if one block cannot fit. Disk
 pressure and failures after staging/commit still stop the session. On resumption,
-a matching wholly unexecuted stage is preserved and reused if the complete segment
-fits the current batch/height limits; it is revalidated without rewriting it.
-Larger stages fail closed without truncating their suffix. Recovery across smaller
-checkpoints and automatic publication retry remain open. Physical I/O failures are not inferred
+a matching stage is revalidated and consumed in batches within the current
+batch/height limits. The complete stage stays immutable while executed prefixes
+are published; only final publication removes it. Normal and overlay startup
+recover matching committed prefixes before resuming the remaining blocks.
+Publication failures may require reopening the ledger to recover its slot/index
+state. Automatic staged pressure downshifts and publication retries remain open. Physical I/O failures are not inferred
 to be reservation exhaustion from their text.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
