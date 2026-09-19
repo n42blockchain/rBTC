@@ -15,8 +15,10 @@ No readiness status or evidence identity has been rebound.
    normal and overlay startup publish a matching executed prefix before resuming
    its suffix. A stale future suffix is removed only after publishing its valid
    executed prefix. See [checkpoint tests](staged-checkpoint-recovery-20260919.md).
-   Automatic staged pressure downshifts, live publication retry, fair scheduling
-   and broader post-commit auxiliary-index recovery are still open. Checkpoint
+   Follow-up [staged memory retries](staged-memory-retry-20260919.md) now halve
+   batches finitely while the original stage identity and execution tip remain
+   unchanged. Live publication retry, fair scheduling and broader post-commit
+   auxiliary-index recovery are still open. Checkpoint
    scans remain linear in the full stage per pass; aggregate work admission is
    not established by bounded-memory scans.
 2. Shared allocation ownership and the startup/steady-state total memory bound
@@ -54,3 +56,7 @@ No readiness status or evidence identity has been rebound.
 
 No tag, signed artifact publication or public seven-day soak was started. All
 historical failed measurements remain historical evidence, not accepted results.
+
+Follow-up checkpoint source9d0b300ed47a3e183d47fd721463d65e09229aff passed
+CI35430419364 (Linux, Windows and supply-chain). Subsequent staged-pressure
+changes require their own CI and do not close the three open release gates.

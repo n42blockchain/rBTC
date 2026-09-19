@@ -258,7 +258,7 @@ fn memory_retry_refuses_committed_pending_and_existing_stages() {
     };
     let memory = PeerFailureKind::LocalBudget(ReservationKind::Memory);
     let next = |kind, size, after, scripts| {
-        next_unstaged_memory_retry(kind, size, before, after, &ledger, scripts)
+        next_memory_retry(kind, size, before, after, &ledger, scripts, None)
     };
     let mut size = 9;
     let mut sizes = Vec::new();
@@ -311,6 +311,71 @@ fn memory_retry_refuses_committed_pending_and_existing_stages() {
     fs::write(&path, b"corrupt stage must remain intact").unwrap();
     assert_eq!(next(memory, 9, Some(before), false), None);
     assert_eq!(fs::read(path).unwrap(), b"corrupt stage must remain intact");
+}
+
+#[test]
+fn staged_memory_retry_requires_the_original_identity_and_uncommitted_tip() {
+    use crate::execution_store::ExecutionTip;
+    use crate::node_memory::ReservationKind;
+    let directory = tempfile::tempdir().unwrap();
+    let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
+    ledger
+        .stage(1, &[vec![1], vec![2], vec![3], vec![4]])
+        .unwrap();
+    let identity = ledger.staged_manifest().unwrap().unwrap();
+    let path = directory.path().join("ledger-staged.rblk");
+    let original = fs::read(&path).unwrap();
+    let before = ExecutionTip {
+        height: 0,
+        hash: bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash(),
+    };
+    let memory = PeerFailureKind::LocalBudget(ReservationKind::Memory);
+    let next = |kind, size, after, scripts| {
+        next_memory_retry(kind, size, before, after, &ledger, scripts, Some(&identity))
+    };
+    assert_eq!(next(memory, 100, Some(before), false), Some(2));
+    assert_eq!(next(memory, 2, Some(before), false), Some(1));
+    assert_eq!(next(memory, 1, Some(before), false), None);
+    assert_eq!(next(memory, 0, Some(before), false), None);
+    assert_eq!(next(memory, 4, None, false), None);
+    assert_eq!(next(memory, 4, Some(before), true), None);
+    for after in [
+        ExecutionTip {
+            height: 1,
+            ..before
+        },
+        ExecutionTip {
+            hash: BlockHash::all_zeros(),
+            ..before
+        },
+    ] {
+        assert_eq!(next(memory, 4, Some(after), false), None);
+    }
+    for kind in [
+        PeerFailureKind::LocalResource,
+        PeerFailureKind::Transient,
+        PeerFailureKind::ProtocolViolation,
+        PeerFailureKind::LocalBudget(ReservationKind::ExecutionSpool),
+    ] {
+        assert_eq!(next(kind, 4, Some(before), false), None);
+    }
+    assert_eq!(fs::read(&path).unwrap(), original);
+    ledger.discard_staged().unwrap();
+    assert_eq!(next(memory, 4, Some(before), false), None);
+    ledger
+        .stage(1, &[vec![9], vec![8], vec![7], vec![6]])
+        .unwrap();
+    assert_eq!(next(memory, 4, Some(before), false), None);
+    let replacement = fs::read(&path).unwrap();
+    assert_ne!(replacement, original);
+    assert_eq!(fs::read(&path).unwrap(), replacement);
+    fs::write(&path, b"corrupt identity is not retryable").unwrap();
+    assert_eq!(next(memory, 4, Some(before), false), None);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"corrupt identity is not retryable"
+    );
+    assert!(ledger.retained_tip().unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,6 +549,227 @@ async fn memory_retry_replays_smaller_windows_without_duplicate_commits() {
     drop(pressure);
     assert_eq!(memory.snapshot().used, 0);
     drop(peer);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let mut headers = HeaderDag::new(Network::Regtest);
+    let mut blocks = Vec::new();
+    for height in 1..=16 {
+        let template = crate::block_assembly::BlockTemplate::regtest(
+            headers.active_tip().hash,
+            height,
+            genesis.header.time + height,
+        );
+        let mut block = crate::block_assembly::build_block(&template).unwrap();
+        let mut script = vec![0; 8192];
+        script[0] = 0x6a;
+        block.txdata[0]
+            .output
+            .extend((0..96).map(|_| bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(script.clone()),
+            }));
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let block = crate::block_assembly::grind_block(block, template.target).unwrap();
+        headers.insert(block.header).unwrap();
+        blocks.push(serialize(&block));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(accept_peer(listener, peer_version(9_301)));
+    let mut session = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9_302,
+        "/rbtc:staged-pressure/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let (peer, _) = server.await.unwrap();
+    let mut read_peak = 0;
+    let mut checkpoint_peak = 0;
+    // Separate fresh fixtures calibrate and exercise ownership, without copying
+    // databases or weakening the actual production reservations.
+    for case in ["calibrate", "retry", "postcommit"] {
+        let root = directory.path().join(case);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("blocks");
+        let ledger = PrunedBlockLedger::open(&path, LedgerRetention::default()).unwrap();
+        ledger.stage(1, &blocks).unwrap();
+        let original = fs::read(path.join("ledger-staged.rblk")).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let chainstate =
+            RedbChainStore::open(root.join("chainstate.redb"), Network::Regtest).unwrap();
+        let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+        memory.bind(std::slice::from_ref(&path)).unwrap();
+        if case == "calibrate" {
+            // Wrapper and attempt each hold a returned admitted identity.
+            let outer = ledger.staged_manifest().unwrap().unwrap();
+            let inner = ledger.staged_manifest().unwrap().unwrap();
+            drop(
+                ledger
+                    .read_staged_batch(&inner, 1, 1, crate::archive::MAX_RECORDS_BYTES)
+                    .unwrap(),
+            );
+            read_peak = memory.snapshot().peak;
+            drop((outer, inner));
+            staged_pressure_batch(&mut session, &headers, &chainstate, &ledger, 1)
+                .await
+                .unwrap();
+            checkpoint_peak = memory.snapshot().peak;
+            assert!(
+                checkpoint_peak > read_peak,
+                "publication needs more than read admission"
+            );
+            assert_eq!(chainstate.execution_tip().unwrap().height, 1);
+            assert_eq!(memory.snapshot().used, 0);
+            continue;
+        }
+        let allowance = if case == "retry" {
+            checkpoint_peak
+        } else {
+            read_peak
+        };
+        let pressure = memory.reserve(memory.snapshot().limit - allowance).unwrap();
+        {
+            let outer = ledger.staged_manifest().unwrap().unwrap();
+            let inner = ledger.staged_manifest().unwrap().unwrap();
+            assert!(
+                ledger
+                    .read_staged_batch(&inner, 1, 16, crate::archive::MAX_RECORDS_BYTES)
+                    .is_err()
+            );
+            drop((outer, inner));
+        }
+        if case == "retry" {
+            // A one-byte deficit in the calibrated one-block read must stop
+            // the finite retry sequence before any durable execution changes.
+            let extra = memory.reserve(checkpoint_peak - read_peak + 1).unwrap();
+            let error = staged_pressure_batch(&mut session, &headers, &chainstate, &ledger, 16)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind,
+                PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+            );
+            assert_eq!(chainstate.execution_tip().unwrap().height, 0);
+            assert!(ledger.retained_tip().unwrap().is_none());
+            assert_eq!(fs::read(path.join("ledger-staged.rblk")).unwrap(), original);
+            assert_eq!(
+                memory.snapshot().used,
+                memory.snapshot().limit - read_peak + 1
+            );
+            drop(extra);
+        }
+        let result = staged_pressure_batch(&mut session, &headers, &chainstate, &ledger, 16).await;
+        let advanced = chainstate.execution_tip().unwrap().height;
+        assert!(
+            advanced > 0 && advanced < 16,
+            "batch must shrink before it can execute"
+        );
+        if case == "postcommit" {
+            assert_eq!(
+                result.unwrap_err().kind,
+                PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+            );
+            assert_eq!(
+                advanced, 1,
+                "publication failure must not replay an executed batch"
+            );
+            assert!(ledger.retained_tip().unwrap().is_none());
+            assert_eq!(fs::read(path.join("ledger-staged.rblk")).unwrap(), original);
+            assert_eq!(memory.snapshot().used, memory.snapshot().limit - allowance);
+            drop(pressure);
+            reconcile_overlay_stage(
+                &DeploymentConfig::for_network(Network::Regtest),
+                &headers,
+                chainstate.execution_tip().unwrap(),
+                &ledger,
+            )
+            .unwrap();
+            assert_eq!(chainstate.execution_tip().unwrap().height, 1);
+            assert_eq!(ledger.read_block(1).unwrap().unwrap(), blocks[0]);
+        } else {
+            result.unwrap();
+            assert_eq!(ledger.retained_tip().unwrap(), Some(advanced));
+            assert_eq!(fs::read(path.join("ledger-staged.rblk")).unwrap(), original);
+            while chainstate.execution_tip().unwrap().height < 16 {
+                let before = chainstate.execution_tip().unwrap().height;
+                staged_pressure_batch(&mut session, &headers, &chainstate, &ledger, 16)
+                    .await
+                    .unwrap();
+                let after = chainstate.execution_tip().unwrap().height;
+                assert!(after > before && after <= 16);
+                assert_eq!(ledger.retained_tip().unwrap(), Some(after));
+                if after < 16 {
+                    assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+                }
+            }
+            assert!(ledger.staged_manifest().unwrap().is_none());
+            for (offset, expected) in blocks.iter().enumerate() {
+                assert_eq!(
+                    ledger
+                        .read_block(u32::try_from(offset + 1).unwrap())
+                        .unwrap()
+                        .unwrap(),
+                    *expected
+                );
+            }
+            drop(pressure);
+        }
+        assert_eq!(memory.snapshot().used, 0);
+        assert_eq!(memory.spool_snapshot().used, 0);
+    }
+    drop(peer);
+}
+
+async fn staged_pressure_batch(
+    session: &mut rbtc::p2p::PeerSession<tokio::net::TcpStream>,
+    headers: &HeaderDag,
+    chainstate: &RedbChainStore,
+    ledger: &PrunedBlockLedger,
+    limit: usize,
+) -> Result<(), PeerRunError> {
+    let indexes = AuxiliaryIndexes {
+        transaction: None,
+        spent_output: None,
+        basic_filter: None,
+    };
+    let pool = Arc::new(Mutex::new(TransactionAdmissionPool::default()));
+    let mut scripts = Vec::new();
+    let result = timeout(
+        Duration::from_secs(30),
+        download_execute_batch(
+            session,
+            &DeploymentConfig::for_network(Network::Regtest),
+            headers,
+            chainstate,
+            ledger,
+            None,
+            None,
+            None,
+            &indexes,
+            &[],
+            &pool,
+            Some(16),
+            limit,
+            &mut None,
+            &mut PrefetchedBlocks::default(),
+            &mut scripts,
+            false,
+            None,
+            None,
+        ),
+    )
+    .await
+    .expect("finite staged retry terminates");
+    assert!(scripts.is_empty());
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

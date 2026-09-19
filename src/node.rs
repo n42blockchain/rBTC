@@ -15889,6 +15889,11 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         .unwrap_or_else(|| headers.active_tip().height)
         .min(headers.active_tip().height)
         .saturating_sub(before.height);
+    // Hold the immutable starting identity across attempts. A newly created,
+    // replaced, missing or unreadable stage must never authorize a retry.
+    let initial_stage = ledger
+        .staged_manifest()
+        .map_err(|error| PeerRunError::ledger(&error))?;
     let mut limit = maximum_batch_size;
     let mut prefetch = prefetch_next_batch;
     let mut replay_prefetch = true;
@@ -15921,38 +15926,40 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             return Ok(());
         };
         let attempted = limit.min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let Some(smaller) = next_unstaged_memory_retry(
+        let Some(smaller) = next_memory_retry(
             error.kind,
             attempted,
             before,
             chainstate.execution_tip().ok(),
             ledger,
             entered_with_scripts || !script_carry.is_empty(),
+            initial_stage.as_ref(),
         ) else {
             return Err(error);
         };
         // The attempt has returned and joined its scoped workers. The unchanged
-        // checkpoint and absent stage establish that no batch was published.
+        // checkpoint and unchanged stage identity establish safe revalidation.
         // Drop speculative ownership before retrying the smaller window; never
         // carry a suffix that would itself keep the exhausted budget occupied.
         *prefetched_blocks = PrefetchedBlocks::default();
         prefetch = false;
         replay_prefetch = false;
         rbtc_warn!(
-            "memory admission exhausted before staging; reducing validation batch from {attempted} to {smaller} blocks at height {}",
+            "memory admission exhausted before execution commit; reducing validation batch from {attempted} to {smaller} blocks at height {}",
             before.height
         );
         limit = smaller;
     }
 }
 
-fn next_unstaged_memory_retry(
+fn next_memory_retry(
     kind: PeerFailureKind,
     attempted: usize,
     before: crate::execution_store::ExecutionTip,
     after: Option<crate::execution_store::ExecutionTip>,
     ledger: &PrunedBlockLedger,
     pending_scripts: bool,
+    expected_stage: Option<&crate::archive::ArchiveManifest>,
 ) -> Option<usize> {
     if kind != PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
         || attempted <= 1
@@ -15961,12 +15968,23 @@ fn next_unstaged_memory_retry(
     {
         return None;
     }
-    // Read failures and existing (even corrupt) stages fail closed. Recovery of
-    // an existing stage is a separate phase, never an excuse to overwrite it.
-    if !matches!(ledger.staged_manifest(), Ok(None)) {
+    // This full verification also fails closed for corruption and budget
+    // exhaustion. The guard cannot discard or replace a stage to make room.
+    let current = ledger.staged_manifest().ok()?;
+    if current.as_ref() != expected_stage {
         return None;
     }
-    Some(attempted / 2)
+    let attempted = if let Some(stage) = expected_stage {
+        let offset = before
+            .height
+            .checked_add(1)?
+            .checked_sub(stage.first_height)?;
+        let remaining = stage.block_count.checked_sub(offset)?;
+        attempted.min(remaining as usize)
+    } else {
+        attempted
+    };
+    (attempted > 1).then_some(attempted / 2)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

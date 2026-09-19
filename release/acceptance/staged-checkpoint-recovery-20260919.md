@@ -81,3 +81,7 @@ claim follows from bounded transient spool reservations.
 Previous exact CI35389996036/dee1752 passed all jobs; this source needs its own CI.
 No optimizer/storage evidence was rebound, no604800-second soak was accepted,
 and no release tag or publication was made. See the [current release audit](release-gate-audit-20260919.md).
+
+Follow-up: exact CI35430419364/9d0b300 passed all jobs.
+[Finite staged memory retries](staged-memory-retry-20260919.md) now handle an
+unchanged existing stage before execution commit; post-commit retries remain open.

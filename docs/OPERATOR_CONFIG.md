@@ -300,18 +300,23 @@ are rejected. OS worker stacks, allocator overhead, newly serialized network
 payloads and other node batch objects still need accounting.
 These reservation limits do not establish a whole-node RSS ceiling.
 Memory and execution-spool admission failures retain distinct internal error
-types through archive/execution paths. Both are local failures and do not penalize peers. Before staging, typed memory
-pressure can retry with successively halved block windows while the execution
-tip is unchanged and no deferred scripts or staged segment remain. Retries
-disable network and replay read-ahead and stop if one block cannot fit. Disk
-pressure and failures after staging/commit still stop the session. On resumption,
-a matching stage is revalidated and consumed in batches within the current
-batch/height limits. The complete stage stays immutable while executed prefixes
-are published; only final publication removes it. Normal and overlay startup
-recover matching committed prefixes before resuming the remaining blocks.
+types through archive/execution paths. Both are local failures and do not penalize
+peers. Typed memory pressure can retry with successively halved block windows while
+the execution tip is unchanged and no deferred scripts remain. If a stage existed
+at entry, every retry must verify its original complete identity; if none existed,
+a newly created stage prevents retry. Missing, changed, corrupt or unreadable
+stages fail closed. The retry window is capped by the remaining staged blocks.
+Retries disable network and replay read-ahead and stop if one block cannot fit.
+Disk pressure and failures after execution commit still stop the session; a smaller
+read is not a guarantee that later publication will have enough memory.
+On resumption, a matching stage is revalidated and consumed in batches within the
+current batch/height limits. The complete stage stays immutable while executed
+prefixes are published; only final publication removes it. Normal and overlay
+startup recover matching committed prefixes before resuming the remaining blocks.
 Publication failures may require reopening the ledger to recover its slot/index
-state. Automatic staged pressure downshifts and publication retries remain open. Physical I/O failures are not inferred
-to be reservation exhaustion from their text.
+state. Automatic publication retries and fair waiting for shared resources remain
+open. Physical I/O failures are not inferred to be reservation exhaustion from
+their text.
 Temporary results disappear on close/process death; restart replays durable raw
 blocks from the committed execution checkpoint. Parallel output deltas and
 their version index reserve a conservative allowance before construction.
