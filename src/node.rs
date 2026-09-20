@@ -16714,6 +16714,20 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
         &blocks,
         &applied_blocks,
     )?;
+    // Execution and all index consumers have finished with these owners.
+    // Release them before archive verification/compression competes for the
+    // same memory budget; block payloads remain available for ZMQ publication.
+    drop((
+        serialized,
+        transaction_ids,
+        deployment_contexts,
+        applied_blocks,
+    ));
+    let executed_count = blocks.len();
+    if zmq_notifier.is_none() {
+        // No remaining consumer needs the decoded transactions either.
+        blocks = Vec::new();
+    }
     let indexed_at = Instant::now();
     let first = expected
         .first()
@@ -16734,7 +16748,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
     } else {
         ledger
             .commit_staged(
-                u32::try_from(blocks.len()).expect("block download batch count fits u32"),
+                u32::try_from(executed_count).expect("block download batch count fits u32"),
             )
             .map_err(|error| PeerRunError::ledger(&error))?;
     }
@@ -16748,7 +16762,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
     let published_at = Instant::now();
     rbtc_info!(
         "validated and executed {} blocks {}-{}; active tip {}:{}; timings download={}ms structure={}ms stage={}ms execute={}ms execution-core={}ms core-validate={}ms core-validate-prepare={}ms core-validate-utxo={}ms core-validate-net={}ms core-validate-checks={}ms core-apply={}ms core-apply-net={}ms core-apply-fold={}ms core-submit={}ms core-script-wait={}ms core-commit={}ms{} utxo-prefetch={}ms prefetch={}ms index={}ms publish={}ms total={}ms",
-        blocks.len(),
+        executed_count,
         first.height,
         last.height,
         last.height,

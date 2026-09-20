@@ -60,3 +60,9 @@ historical failed measurements remain historical evidence, not accepted results.
 Follow-up checkpoint source9d0b300ed47a3e183d47fd721463d65e09229aff passed
 CI35430419364 (Linux, Windows and supply-chain). Subsequent staged-pressure
 changes require their own CI and do not close the three open release gates.
+
+Staged-pressure source `6e2f76c` passed CI `35474087150`. A subsequent
+[minimal publication-owner lifetime change](publication-owner-lifetime-20260919.md)
+releases completed batch inputs before archive publication. The repeated preflight
+still rejects the same three gates; signing secret lists and release runs remain
+empty. This is not a final-source acceptance or live post-commit retry claim.
