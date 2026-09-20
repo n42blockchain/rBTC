@@ -66,3 +66,8 @@ Staged-pressure source `6e2f76c` passed CI `35474087150`. A subsequent
 releases completed batch inputs before archive publication. The repeated preflight
 still rejects the same three gates; signing secret lists and release runs remain
 empty. This is not a final-source acceptance or live post-commit retry claim.
+
+[Validated block serialization](validated-serialization-memory-20260919.md) now
+reserves before encoding in live batches and local freezer reindex, retaining
+shared charges through escaped handles. This closes that allocation path only;
+whole-node resource acceptance and the three open release gates are unchanged.

@@ -125,6 +125,23 @@ struct ArchiveBlockPayload {
 }
 
 impl ArchiveBlock {
+    /// Reserves the exact encoded payload before allocating, retaining its
+    /// allowance through every shared handle (including execution prefetch).
+    pub(crate) fn serialize_for_path(path: &Path, block: &Block) -> Result<Self, ArchiveError> {
+        use bitcoin::consensus::Encodable;
+        let size = block.total_size();
+        if size > MAX_BLOCK_BYTES {
+            return Err(ArchiveError::Invalid("block exceeds archive byte limit"));
+        }
+        let reservation = reserve_archive_memory(path, Self::allocation_bytes(size))?;
+        let mut bytes = Vec::with_capacity(size);
+        block
+            .consensus_encode(&mut bytes)
+            .expect("in-memory writers do not fail");
+        debug_assert_eq!(bytes.len(), size);
+        Ok(Self::admitted(bytes, reservation))
+    }
+
     fn allocation_bytes(length: usize) -> u64 {
         (length + std::mem::size_of::<ArchiveBlockPayload>() + 2 * std::mem::size_of::<usize>())
             as u64

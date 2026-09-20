@@ -592,6 +592,7 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
     .unwrap();
     let (peer, _) = server.await.unwrap();
     let mut read_peak = 0;
+    let mut staging_peak = 0;
     let mut checkpoint_peak = 0;
     // Separate fresh fixtures calibrate and exercise ownership, without copying
     // databases or weakening the actual production reservations.
@@ -617,14 +618,21 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
                     .unwrap(),
             );
             read_peak = memory.snapshot().peak;
+            // Validation now retains an admitted serialization while staging
+            // verifies the immutable source, before durable execution begins.
+            let block = deserialize::<Block>(&blocks[0]).unwrap();
+            let encoded = ledger.serialize_block(&block).unwrap();
+            ledger.stage_or_verify(1, &[encoded], Some(&inner)).unwrap();
+            staging_peak = memory.snapshot().peak;
+            assert!(staging_peak > read_peak);
             drop((outer, inner));
             staged_pressure_batch(&mut session, &headers, &chainstate, &ledger, 1)
                 .await
                 .unwrap();
             checkpoint_peak = memory.snapshot().peak;
             assert!(
-                checkpoint_peak > read_peak,
-                "publication needs more than read admission"
+                checkpoint_peak > staging_peak,
+                "publication needs more than read and staging admission"
             );
             assert_eq!(chainstate.execution_tip().unwrap().height, 1);
             assert_eq!(memory.snapshot().used, 0);
@@ -633,7 +641,7 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
         let allowance = if case == "retry" {
             checkpoint_peak
         } else {
-            read_peak
+            staging_peak
         };
         let pressure = memory.reserve(memory.snapshot().limit - allowance).unwrap();
         {
@@ -670,7 +678,7 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
         let advanced = chainstate.execution_tip().unwrap().height;
         assert!(
             advanced > 0 && advanced < 16,
-            "batch must shrink before it can execute"
+            "{case}: batch must shrink before it can execute; height={advanced}, result={result:?}"
         );
         if case == "postcommit" {
             assert_eq!(
@@ -1070,4 +1078,60 @@ fn staged_reuse_requires_identity_and_exact_selected_bytes() {
     assert!(ledger.stage_or_verify(1, &blocks, Some(&identity)).is_err());
     assert_eq!(ledger.staged_manifest().unwrap().unwrap(), replacement);
     assert!(ledger.retained_tip().unwrap().is_none());
+}
+
+#[test]
+fn validated_serialization_keeps_shared_admission_and_refunds_parallel_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
+    let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+    memory.bind(&[directory.path().to_path_buf()]).unwrap();
+    let headers = HeaderDag::new(Network::Regtest);
+    let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let encoded = ledger.serialize_block(&block).unwrap();
+    assert_eq!(encoded.as_ref(), serialize(&block));
+    let per_block = memory.snapshot().used;
+    assert!(per_block > block.total_size() as u64);
+    let alias = encoded.clone();
+    drop(encoded);
+    assert_eq!(memory.snapshot().used, per_block);
+    drop(alias);
+    assert_eq!(memory.snapshot().used, 0);
+
+    let blocks = vec![block; 192];
+    let expected = vec![headers.active_tip(); blocks.len()];
+    // Allow all but the last encoded byte. Partially completed parallel workers
+    // must join and refund their payloads without staging or blaming the peer.
+    let allowance = per_block * blocks.len() as u64 - 1;
+    let pressure = memory.reserve(memory.snapshot().limit - allowance).unwrap();
+    let error = validate_downloaded_blocks(&deployments, &headers, &expected, &blocks, &ledger)
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
+    );
+    assert_eq!(memory.snapshot().used, memory.snapshot().limit - allowance);
+    assert!(ledger.staged_manifest().unwrap().is_none());
+    assert!(ledger.retained_tip().unwrap().is_none());
+    drop(pressure);
+    let validated =
+        validate_downloaded_blocks(&deployments, &headers, &expected, &blocks, &ledger).unwrap();
+    assert_eq!(memory.snapshot().used, per_block * blocks.len() as u64);
+    for (result, block) in validated.iter().zip(&blocks) {
+        assert_eq!(result.2.as_ref(), serialize(block));
+    }
+    let carried = validated[0].2.clone();
+    drop(validated);
+    assert_eq!(memory.snapshot().used, per_block);
+    drop(carried);
+    assert_eq!(memory.snapshot().used, 0);
+
+    // The exact preallocation must also include witness marker/flag and stacks.
+    let mut witness_block = blocks[0].clone();
+    witness_block.txdata[0].input[0].witness.push([42; 253]);
+    let encoded = ledger.serialize_block(&witness_block).unwrap();
+    assert_eq!(encoded.as_ref(), serialize(&witness_block));
+    drop(encoded);
+    assert_eq!(memory.snapshot().used, 0);
 }

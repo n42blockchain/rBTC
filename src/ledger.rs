@@ -486,6 +486,14 @@ impl PrunedBlockLedger {
         self.sync_directory(LedgerSyncPoint::StagedPublish)
     }
 
+    /// Encodes a validated block under this ledger's shared memory allowance.
+    pub(crate) fn serialize_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<ArchiveBlock, LedgerError> {
+        Ok(ArchiveBlock::serialize_for_path(&self.root, block)?)
+    }
+
     /// Verifies a selected batch against an immutable stage before execution.
     /// The whole archive identity and integrity are checked, including records
     /// outside this batch. Existing staged bytes are never rewritten here.

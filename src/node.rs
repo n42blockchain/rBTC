@@ -7997,8 +7997,9 @@ fn execute_local_reindex_batch(
                 .ok_or_else(|| format!("missing active header at reindex height {height}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let validated = validate_downloaded_blocks(&options.deployments, headers, &expected, &blocks)
-        .map_err(|error| error.to_string())?;
+    let validated =
+        validate_downloaded_blocks(&options.deployments, headers, &expected, &blocks, ledger)
+            .map_err(|error| error.to_string())?;
     let mut deployment_contexts = Vec::with_capacity(validated.len());
     let mut transaction_ids = Vec::with_capacity(validated.len());
     let mut serialized = Vec::with_capacity(validated.len());
@@ -16213,6 +16214,7 @@ async fn download_execute_batch_attempt<C: ExecutionChainStore>(
             headers,
             &expected[prevalidated.len()..],
             &blocks[prevalidated.len()..],
+            ledger,
         )?;
         prevalidated.extend(rest);
         prevalidated
@@ -16907,6 +16909,7 @@ fn validate_downloaded_block(
     height: u32,
     expected_hash: BlockHash,
     block: &Block,
+    ledger: &PrunedBlockLedger,
 ) -> Result<
     (
         BlockDeploymentContext,
@@ -16939,7 +16942,9 @@ fn validate_downloaded_block(
     Ok((
         deployments,
         transaction_ids,
-        ArchiveBlock::from(serialize(block)),
+        ledger
+            .serialize_block(block)
+            .map_err(|error| PeerRunError::ledger(&error))?,
     ))
 }
 
@@ -16994,6 +16999,7 @@ fn validate_downloaded_blocks(
     headers: &dyn HeaderView,
     expected: &[HeaderInfo],
     blocks: &[Block],
+    ledger: &PrunedBlockLedger,
 ) -> Result<
     Vec<(
         BlockDeploymentContext,
@@ -17026,6 +17032,7 @@ fn validate_downloaded_blocks(
                     expected.height,
                     expected.hash,
                     block,
+                    ledger,
                 )
             })
             .collect();
@@ -17048,6 +17055,7 @@ fn validate_downloaded_blocks(
                                 expected.height,
                                 expected.hash,
                                 block,
+                                ledger,
                             )
                         })
                         .collect::<Result<Vec<_>, PeerRunError>>()
@@ -24404,6 +24412,8 @@ mod tests {
 
     #[test]
     fn parallel_structure_validation_preserves_order_and_earliest_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = PrunedBlockLedger::open(directory.path(), LedgerRetention::default()).unwrap();
         let headers = HeaderDag::new(Network::Regtest);
         let block = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let expected = vec![headers.active_tip(); 192];
@@ -24411,7 +24421,8 @@ mod tests {
         let deployments = DeploymentConfig::for_network(Network::Regtest);
 
         let validated =
-            validate_downloaded_blocks(&deployments, &headers, &expected, &blocks).unwrap();
+            validate_downloaded_blocks(&deployments, &headers, &expected, &blocks, &ledger)
+                .unwrap();
         assert_eq!(validated.len(), expected.len());
 
         let mut invalid = expected;
@@ -24419,8 +24430,8 @@ mod tests {
         invalid[70].hash = BlockHash::all_zeros();
         invalid[130].height = 130;
         invalid[130].hash = BlockHash::all_zeros();
-        let error =
-            validate_downloaded_blocks(&deployments, &headers, &invalid, &blocks).unwrap_err();
+        let error = validate_downloaded_blocks(&deployments, &headers, &invalid, &blocks, &ledger)
+            .unwrap_err();
         assert!(error.to_string().contains("height 70"));
     }
 
