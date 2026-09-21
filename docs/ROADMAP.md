@@ -132,7 +132,10 @@ Primary references:
 - [ ] **Close production resource acceptance.** Finish admission preallocation
   and resumable scheduling, automatic bounded header ingress with safe stronger
   fork reacquisition, and adversarial optimizer budget acceptance. Existing
-  ledgers and eviction primitives do not close these gates.
+  ledgers and eviction primitives do not close these gates. On 2026-09-21
+  prevout precharging, wired side-chain header eviction with sync
+  reacquisition and adversarial optimizer sweeps landed; the remainders are in
+  [RESOURCE_GATES_2026-09-21.md](RESOURCE_GATES_2026-09-21.md).
 - [ ] **Freeze and bind final acceptance.** Preserve successful historical replay
   evidence and record final reviewed acceptance under `release/acceptance/`.
   Preflight rejects open gates and source identities that differ from the

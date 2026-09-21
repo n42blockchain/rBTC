@@ -103,3 +103,14 @@ The schema-source reader accepts both LF and Windows CRLF Rust checkouts;
 generated manifests still require canonical LF records. Both checkout styles
 are covered by the future-schema fixture. Same-ref release runs are serialized
 so signing and publication jobs cannot interleave uploads to one draft.
+
+## 2026-09-21 resource gate follow-up
+
+[RESOURCE_GATES_2026-09-21.md](RESOURCE_GATES_2026-09-21.md) records the next
+step on the three code-closable gates. The optimizer now has adversarial
+64-entry shape and budget-sweep acceptance plus a budgeted-search fuzz entry.
+Admission precharges prevout materialization before lookup and permanently
+refuses candidates that can never fit. Peer and local header ingress now evict
+low-work side-chain headers above a configurable cap and reacquire a
+stronger evicted fork through ordinary sync. All three gates stay open with the
+remainders listed there; the table above is otherwise unchanged.

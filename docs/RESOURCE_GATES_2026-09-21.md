@@ -1,0 +1,115 @@
+# Resource gate follow-up, 2026-09-21
+
+This round narrows the three code-closable production resource gates in
+[RELEASE_READINESS_2026-09-14.md](RELEASE_READINESS_2026-09-14.md). None of
+them is marked accepted: each keeps a stated remainder, and the public soak,
+native signing and frozen-source acceptance gates are unchanged.
+
+## Optimizer budget
+
+`adversarial_shapes_respect_budget_and_never_worsen_the_baseline`
+(`src/feerate_diagram/optimizer.rs`) runs five deterministic 64-entry shapes
+(long chain, complete DAG, wide fan-in, wide fan-out, layered bipartite) with
+three fee patterns (sawtooth, equal feerate, feerate descending with topology)
+at budgets 0, 1, 100, 2,000, 10,000, 100,000 and the production
+`DEFAULT_OPTIMIZER_WORK` (debug builds run 0, 100, 10,000 and the default).
+Every run asserts `work_used <= budget`, a complete topological order, a
+non-increasing chunk feerate sequence and a diagram that is `Better` or `Equal`
+against the supplied identity order. Work accounting is deterministic and
+identical in debug and release builds.
+
+| Shape | Sawtooth | Equal feerate | Descending |
+| --- | --- | --- | --- |
+| Long chain | 695,047 / converged | 513,823 / converged | 468,127 / converged |
+| Complete DAG | 1,000,000 / **not converged** | 599,104 / converged | 553,408 / converged |
+| Wide fan-in | 471,568 / converged | 474,112 / converged | 470,080 / converged |
+| Wide fan-out | 469,150 / converged | 470,206 / converged | 468,127 / converged |
+| Layered bipartite | 300,630 / converged | 534,624 / converged | 515,712 / converged |
+
+Values are work used at the default budget. The complete DAG has exactly one
+topological order, so the sawtooth case exhausts the whole default budget on a
+cluster with no ordering choice. The result is still non-worsening, so this is
+an efficiency gap rather than a correctness defect: a follow-up can
+short-circuit clusters whose dependency closure admits a single order.
+
+The `feerate_diagram` fuzz target now also calls `linearize_with_budget` with a
+fuzz-derived budget (0 to about 1.05 million) and no previous order, a valid
+previous order, or a reversed and possibly invalid one. It asserts the same
+budget, topology and chunk-order invariants, plus non-worsening whenever the
+previous order was reused. It builds and passes Clippy on
+`nightly-2026-07-13`; a campaign has not yet been run.
+
+Remainder: a fuzz campaign over the new entry, low-budget Core differential
+comparison, and the single-order short-circuit.
+
+## Admission resources
+
+Prevout materialization is now charged before any base-store lookup.
+`apply_to_overlay` precharges `inputs x PREVOUT_LOOKUP_BOUND_BYTES x 3`, where
+the bound is `chainstate::MAX_SCRIPT_SIZE` (10,000; larger outputs are never
+stored) plus the 29-byte fixed `Utxo` encoding prefix. The later precise charge
+only bills any positive excess over that precharge; charges remain
+non-refundable. Cloning the prevout scripts for verification is charged to the
+`Script` stage before the clone.
+
+A candidate whose precharge exceeds `work_burst` can never fit, even after a
+full refill. It is refused with the permanent
+`TransactionAdmissionError::CandidateUnfittable` instead of a retryable
+deferral. The node already caches it as an ordinary terminal rejection without
+peer scoring. With the default limits (8e9 burst, 1e9 per second), a maximal
+standard transaction (about 2,400 inputs) precharges about 7.3e7. This is far
+from unfittable and allows about 33,000 prevout lookups per second of sustained
+refill. Bulk reconciliation or pool reload can now defer earlier than before;
+deferral keeps candidates, so this slows the operation rather than losing work.
+
+Tests in `src/transaction_admission/tests/resource_budget.rs`:
+`prevout_precharge_defers_before_any_base_store_lookup` (a counting store sees
+zero lookups), `prevout_script_clone_is_charged_under_script_stage`, and
+`oversized_candidate_is_permanently_refused_while_a_normal_one_still_admits`.
+
+Remainder: `snapshot()`/`relay_snapshot()` clones remain uncharged. Admission
+remains serialized behind one pool mutex. Resumable scheduling of a large
+candidate that fits the burst but not the current allowance is not
+implemented; it is retried from the start.
+
+## Competing header retention
+
+Peer header sync (`sync_headers`) and local block submission
+(`stage_submitted_blocks`) now bound retained side-chain headers after every
+committed batch. The cap is `NodeResourceConfig::max_side_chain_headers`
+(default `DEFAULT_MAX_SIDE_CHAIN_HEADERS = 16,384`, about 1.6 MB of header
+metadata). `HeaderDag::select_side_chain_eviction_candidates` returns early
+without work while under the cap. Over the cap, it walks childless headers off
+the active chain, lowest chainwork first with a hash tie-break. Evicting a leaf
+can expose its parent in the same pass. The active chain is never a candidate,
+and submission-awaited hashes are pinned. Eviction is staged, persisted in one
+redb transaction and only then committed in memory. A staging or persistence
+failure is logged and rolled back; it never scores or disconnects a peer.
+
+`header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_fork`
+(`src/node/tests/header_resync.rs`, cap 4, loopback peer) shows:
+
+1. Ten competing low-work forks are bounded to the cap. The active chain and
+   peer session stay intact.
+2. The peer extends an evicted fork past the active chainwork. Ordinary
+   `getheaders` with the active-chain locator reacquires it from the common
+   ancestor, revalidates it and promotes it to the active header tip.
+3. After reopen, evicted headers that were not resent stay absent, and the
+   reacquired active chain is preserved.
+
+Two selector unit tests cover cap, pinning, leaf-first order and deterministic
+tie-breaking.
+
+Remainder: no sustained resource run under a hostile fork feeder. There is also
+no separate candidate stage for a stronger fork whose reacquired headers
+themselves exceed the cap before overtaking the active chain; those headers
+enter through normal validation and eviction, which only removes headers at or
+below active chainwork.
+
+## Verification
+
+Merged tree `beb6739`: `cargo clippy --lib --tests -- -D warnings` clean;
+`cargo test --lib` on Windows passed 877 with 9 ignored; all integration
+test targets compile. The Mac all-feature suite and readiness script tests are
+pending (the readiness script tests fail on Windows before and after this round
+because of CRLF checkout and symlink privilege, not because of these changes).

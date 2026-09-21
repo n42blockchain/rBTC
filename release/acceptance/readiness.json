@@ -5,17 +5,17 @@
   "gates": {
     "optimizer-budget": {
       "status": "open",
-      "reason": "Core differential samples pass; broader adversarial and budget-exhaustion acceptance remains open.",
+      "reason": "Core differential samples and adversarial 64-entry shape/budget sweeps pass; a budgeted-search fuzz campaign and low-budget differential remain open.",
       "evidence": []
     },
     "admission-resources": {
       "status": "open",
-      "reason": "Shared budgets exist; prevout preallocation, escaped allocations and resumable scheduling are not accepted.",
+      "reason": "Prevout materialization is precharged and unfittable candidates are refused; snapshot clones, concurrency and resumable scheduling are not accepted.",
       "evidence": []
     },
     "header-resources": {
       "status": "open",
-      "reason": "Eviction primitives exist; safe automatic ingress, fork reacquisition and sustained resource acceptance remain open.",
+      "reason": "Ingress evicts low-work side-chain headers above a cap and reacquires stronger forks through sync; sustained hostile-feeder resource acceptance remains open.",
       "evidence": []
     },
     "storage-replay": {
