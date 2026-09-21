@@ -100,11 +100,15 @@ failure is logged and rolled back; it never scores or disconnects a peer.
 Two selector unit tests cover cap, pinning, leaf-first order and deterministic
 tie-breaking.
 
-Remainder: no sustained resource run under a hostile fork feeder. There is also
-no separate candidate stage for a stronger fork whose reacquired headers
-themselves exceed the cap before overtaking the active chain; those headers
-enter through normal validation and eviction, which only removes headers at or
-below active chainwork.
+Declared boundary: a competing fork that stays at or below active chainwork
+for more than `max_side_chain_headers` headers has its own leaf evicted after
+each batch. It therefore cannot overtake through ordinary sync. At the default
+cap, this means a reorganization deeper than 16,384 blocks, far beyond any
+observed mainnet reorg. Handling it would need a separate bounded candidate
+stage, which is not implemented.
+
+Remainder: a sustained resource run under a hostile fork feeder, and the
+candidate stage above if the boundary is not accepted.
 
 ## Verification
 
