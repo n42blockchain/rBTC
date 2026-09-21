@@ -19,11 +19,12 @@ use thiserror::Error;
 
 use crate::{
     admission_resources::{
-        AdmissionBudget, AdmissionDeferred, AdmissionStage, CandidateReservation,
+        AdmissionBudget, AdmissionDeferred, AdmissionStage, AdmissionUnfittable,
+        CandidateReservation,
     },
     chainstate::{
-        ChainstateError, check_sequence_lock, enforces_bip68, prepare_transaction_for_block,
-        transaction_legacy_sigops,
+        ChainstateError, MAX_SCRIPT_SIZE, check_sequence_lock, enforces_bip68,
+        prepare_transaction_for_block, transaction_legacy_sigops,
     },
     consensus::{ConsensusError, verify_transaction_scripts_with_flags},
     transaction_policy::{
@@ -67,6 +68,17 @@ pub const ROLLING_FEE_HALFLIFE_SECS: u32 = 12 * 60 * 60;
 const SATOSHIS_PER_KVB: u64 = 1_000;
 const DEFAULT_MIN_RELAY_FEE_SAT_KVB: u64 = 100;
 const DEFAULT_BYTES_PER_SIGOP: usize = 20;
+/// `Utxo::encode`'s fixed prefix (value_sats, height, is_coinbase,
+/// last_touched, creation_mtp and the script length, 8+4+1+8+4+4 bytes)
+/// before the variable-length `script_pubkey`.
+const UTXO_FIXED_OVERHEAD_BYTES: u64 = 29;
+/// Conservative per-lookup upper bound for materializing one prevout `Utxo`
+/// that a base store can return. No stored coin can carry a scriptPubKey
+/// larger than `MAX_SCRIPT_SIZE`: Core's consensus rules make such an
+/// output provably unspendable and it is pruned rather than kept, so this
+/// bound covers the worst case for every `AdmissionUtxoOverlay::get` call
+/// before the lookup runs, not just the average case observed afterward.
+const PREVOUT_LOOKUP_BOUND_BYTES: u64 = MAX_SCRIPT_SIZE as u64 + UTXO_FIXED_OVERHEAD_BYTES;
 /// Core 26's per-transaction standard sigop cost ceiling.
 pub const MAX_STANDARD_TRANSACTION_SIGOP_COST: u64 = 16_000;
 /// Core 31's context-free legacy sigop ceiling per standard transaction.
@@ -136,6 +148,11 @@ pub enum TransactionAdmissionError {
     /// Local resource exhaustion; retry without caching transaction invalidity.
     #[error(transparent)]
     ResourceDeferred(#[from] AdmissionDeferred),
+    /// The candidate's worst-case resource requirement exceeds the shared
+    /// ledger's total single-reservation capacity; no retry can ever admit
+    /// it. A local policy refusal, not evidence of peer misbehavior.
+    #[error(transparent)]
+    CandidateUnfittable(#[from] AdmissionUnfittable),
     /// Consensus, finality, maturity, or chainstate lookup failed.
     #[error("chainstate validation: {0}")]
     Chainstate(#[from] ChainstateError),
@@ -2620,6 +2637,50 @@ struct AppliedAdmission {
     script_verification: ScriptVerificationStamp,
 }
 
+/// Charges the worst-case prevout materialization cost before any lookup
+/// runs: `prepare_transaction_for_block` fetches and clones one `Utxo` per
+/// input through the overlay's `get`, and that store call has no way to
+/// surface a mid-lookup `AdmissionDeferred`. Pre-charging the whole input
+/// count against `PREVOUT_LOOKUP_BOUND_BYTES` here is equivalent to
+/// charging inside `get`, since every lookup happens after this call
+/// returns. It also lets a candidate whose own worst case can never fit,
+/// even after a full refill, be refused permanently before touching the
+/// base store at all. Returns the amount charged, for the caller's later
+/// excess calculation.
+fn precharge_prevout_materialization<S: UtxoStore>(
+    overlay: &AdmissionUtxoOverlay<'_, S>,
+    transaction: &Transaction,
+) -> Result<u64, TransactionAdmissionError> {
+    let input_count = u64::try_from(transaction.input.len()).unwrap_or(u64::MAX);
+    let precharge = input_count
+        .saturating_mul(PREVOUT_LOOKUP_BOUND_BYTES)
+        .saturating_mul(3);
+    if !overlay.budget.fits_work_capacity(precharge) {
+        return Err(AdmissionUnfittable {
+            stage: AdmissionStage::Prevout,
+            reason: "prevout materialization exceeds total admission work capacity",
+        }
+        .into());
+    }
+    overlay.budget.charge(AdmissionStage::Prevout, precharge)?;
+    Ok(precharge)
+}
+
+/// Charges only the positive excess of the actual prevout byte total over
+/// the conservative bound already pre-charged; never refunds a surplus.
+fn charge_prevout_excess<S: UtxoStore>(
+    overlay: &AdmissionUtxoOverlay<'_, S>,
+    prevout_bytes: u64,
+    precharge: u64,
+) -> Result<(), AdmissionDeferred> {
+    let actual = prevout_bytes.saturating_mul(3);
+    let excess = actual.saturating_sub(precharge);
+    if excess > 0 {
+        overlay.budget.charge(AdmissionStage::Prevout, excess)?;
+    }
+    Ok(())
+}
+
 fn apply_to_overlay<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
@@ -2637,6 +2698,11 @@ fn apply_to_overlay<S: UtxoStore>(
             limit: MAX_STANDARD_TRANSACTION_LEGACY_SIGOPS,
         });
     }
+    // Charge the worst-case prevout materialization cost before any lookup
+    // runs, and permanently refuse a candidate that can never fit. See
+    // `precharge_prevout_materialization` for why this replaces charging
+    // inside the overlay's `get`.
+    let prevout_precharge = precharge_prevout_materialization(overlay, transaction)?;
     // Resolve inputs and check contextual accounting once, without running
     // scripts or mutating the overlay. Cheap policy failures must not consume
     // script-verification work or leave partially applied admission state.
@@ -2656,15 +2722,15 @@ fn apply_to_overlay<S: UtxoStore>(
     let prevout_bytes = prevouts.iter().fold(0_u64, |total, utxo| {
         total.saturating_add(u64::try_from(utxo.script_pubkey.len()).unwrap_or(u64::MAX))
     });
-    overlay
-        .budget
-        .charge(AdmissionStage::Prevout, prevout_bytes.saturating_mul(3))?;
+    // Overlay-local hits already materialized inside the overlay need no
+    // new charge; only a positive excess over the conservative bound
+    // already charged above is billed. Charges are never refunded, so a
+    // candidate whose actual prevouts are cheaper than the worst case
+    // simply leaves the surplus spent.
+    charge_prevout_excess(overlay, prevout_bytes, prevout_precharge)?;
     overlay.budget.charge(
         AdmissionStage::Script,
-        applied
-            .sigop_cost
-            .saturating_mul(10_000)
-            .saturating_add(prevout_bytes),
+        applied.sigop_cost.saturating_mul(10_000),
     )?;
     if !context.csv_active && enforces_bip68(transaction) {
         for (input, utxo) in transaction.input.iter().zip(prevouts) {
@@ -2683,6 +2749,9 @@ fn apply_to_overlay<S: UtxoStore>(
         .checked_sub(applied.output_value_sats)
         .expect("consensus validation rejects transaction inflation");
     validate_standard_transaction_at_rate(transaction, fee_sats, minimum_relay_fee_sat_kvb)?;
+    // Charge the clone allocation below before performing it, mirroring the
+    // prevout materialization charge above.
+    overlay.budget.charge(AdmissionStage::Script, prevout_bytes)?;
     let prevout_scripts = prevouts
         .iter()
         .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey.clone()))
