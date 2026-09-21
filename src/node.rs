@@ -5740,6 +5740,7 @@ impl NodeInboundSource {
         &self,
         transactions: Vec<Transaction>,
     ) -> Result<Vec<TestAcceptResult>, String> {
+        use crate::transaction_admission::TransactionAdmissionError as Admission;
         let budget = self
             .transaction_pool
             .lock()
@@ -5778,9 +5779,10 @@ impl NodeInboundSource {
             .map_err(|error| error.to_string())?;
         let outcome =
             candidate.admit_package_at(self.chainstate.as_ref(), transactions, context, now);
-        if let Err(crate::transaction_admission::TransactionAdmissionError::ResourceDeferred(
-            error,
-        )) = &outcome
+        // Deferral and capacity refusal are local resource outcomes, not a
+        // verdict on the transaction, so report both the same way.
+        if let Err(error @ (Admission::ResourceDeferred(_) | Admission::CandidateUnfittable(_))) =
+            &outcome
         {
             return Err(error.to_string());
         }
@@ -5906,19 +5908,18 @@ impl InboundDataSource for NodeInboundSource {
     }
 
     fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
-        Ok(self
+        // Indexed lookups answer one getdata without cloning the whole pool.
+        let pool = self
             .transaction_pool
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot()
-            .into_iter()
-            .find(|transaction| match inventory {
-                Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
-                    transaction.compute_txid() == txid
-                }
-                Inventory::WTx(wtxid) => transaction.compute_wtxid() == wtxid,
-                _ => false,
-            }))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(match inventory {
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                pool.transaction(txid)
+            }
+            Inventory::WTx(wtxid) => pool.transaction_by_wtxid(wtxid),
+            _ => None,
+        })
     }
 
     fn template_source(&self) -> Option<(Arc<RwLock<HeaderDag>>, DeploymentConfig)> {
@@ -11581,8 +11582,7 @@ fn stage_submitted_blocks(
         }
         let _ = staged.commit();
         staged_any = true;
-        let pinned_tips: Vec<BlockHash> =
-            awaiting.iter().map(|(awaited, _, _)| *awaited).collect();
+        let pinned_tips: Vec<BlockHash> = awaiting.iter().map(|(awaited, _, _)| *awaited).collect();
         evict_excess_side_chain_headers(headers, &store, &pinned_tips, max_side_chain_headers);
         if headers.active_tip().hash == hash {
             let height = headers.active_tip().height;

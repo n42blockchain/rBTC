@@ -1,5 +1,5 @@
 use super::*;
-use crate::admission_resources::{AdmissionBudget, AdmissionResourceLimits};
+use crate::admission_resources::{AdmissionBudget, AdmissionResourceLimits, AdmissionStage};
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -151,18 +151,50 @@ fn dry_run_resource_deferral_is_an_error_not_an_invalid_transaction_verdict() {
         .txdata
         .remove(0);
     transaction.input[0].previous_output = funding;
-    let budget = AdmissionBudget::new(AdmissionResourceLimits {
-        // Reach the inner admission call, then exhaust its first payload charge.
-        work_burst: u64::try_from(transaction.total_size()).unwrap() * 2 + 4 * 1024 * 1024,
+
+    // A temporarily insufficient allowance: comfortably above the
+    // candidate's worst-case estimate in total capacity, but drained by
+    // prior ledger activity to just past `dry_run_admission`'s own payload
+    // charge and `admission_candidate`'s metadata reservation. The
+    // up-front gate inside `admit_package_at` then defers (retryable)
+    // rather than refusing the candidate outright.
+    let bytes_charge = u64::try_from(transaction.total_size()).unwrap() * 2;
+    let metadata_charge = 4 * 1024 * 1024_u64;
+    let work_burst = 20_000_000_u64;
+    let deferred_budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst,
+        work_per_second: 0,
+        candidate_bytes: 16 * 1024 * 1024,
+    });
+    deferred_budget
+        .charge(
+            AdmissionStage::Graph,
+            work_burst - bytes_charge - metadata_charge - 50,
+        )
+        .unwrap();
+    *source.transaction_pool.lock().unwrap() =
+        TransactionAdmissionPool::default().with_admission_budget(deferred_budget.clone());
+    let error = source
+        .dry_run_admission(vec![transaction.clone()])
+        .unwrap_err();
+    assert!(error.contains("resource deferred"));
+    assert!(source.transaction_pool.lock().unwrap().is_empty());
+    assert_eq!(deferred_budget.snapshot().candidate_bytes, 0);
+
+    // A candidate whose worst-case estimate can never fit the ledger's own
+    // total capacity: a permanent refusal, still reported as an error
+    // rather than a per-transaction "invalid" verdict.
+    let unfittable_budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: bytes_charge + metadata_charge,
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
     });
     *source.transaction_pool.lock().unwrap() =
-        TransactionAdmissionPool::default().with_admission_budget(budget.clone());
+        TransactionAdmissionPool::default().with_admission_budget(unfittable_budget.clone());
     let error = source.dry_run_admission(vec![transaction]).unwrap_err();
-    assert!(error.contains("resource deferred"));
+    assert!(error.contains("cannot fit"));
     assert!(source.transaction_pool.lock().unwrap().is_empty());
-    assert_eq!(budget.snapshot().candidate_bytes, 0);
+    assert_eq!(unfittable_budget.snapshot().candidate_bytes, 0);
 }
 
 #[tokio::test]

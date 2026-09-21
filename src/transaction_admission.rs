@@ -568,19 +568,60 @@ impl TransactionAdmissionPool {
     pub fn admission_candidate(
         &self,
     ) -> Result<(Self, CandidateReservation), TransactionAdmissionError> {
-        let metadata = self
-            .entries
-            .len()
-            .saturating_mul(512)
-            .saturating_add(self.spent.len().saturating_mul(128))
-            .saturating_add(self.orphan_bytes)
-            .saturating_add(4 * 1024 * 1024);
+        let metadata = self.metadata_reservation_bytes();
         self.budget.charge(
             AdmissionStage::Metadata,
             u64::try_from(metadata).unwrap_or(u64::MAX),
         )?;
         let reservation = self.budget.reserve_candidate(metadata)?;
         Ok((self.clone(), reservation))
+    }
+
+    /// Same formula charged by `admission_candidate`'s Metadata reservation;
+    /// factored out so `candidate_work_estimate` reuses it verbatim.
+    fn metadata_reservation_bytes(&self) -> usize {
+        self.entries
+            .len()
+            .saturating_mul(512)
+            .saturating_add(self.spent.len().saturating_mul(128))
+            .saturating_add(self.orphan_bytes)
+            .saturating_add(4 * 1024 * 1024)
+    }
+
+    /// Conservative upper bound of every stage charge this candidate could
+    /// incur across `admit_package_at`/`admit_package_inner`, computed
+    /// purely from static transaction shape (no store access), so it can
+    /// gate the candidate before any stage work begins.
+    ///
+    /// For already-admitted entries the exact, previously validated
+    /// `sigop_cost` is reused, which is a true bound (it cannot regress on
+    /// replay of the same transaction against an unchanged overlay). For a
+    /// brand-new, not-yet-validated transaction the witness/P2SH sigop cost
+    /// is only knowable after prevout resolution, so this estimate omits it;
+    /// an adversarial candidate with an unusually high sigop cost can still
+    /// exhaust the ledger mid-pipeline exactly as before this change, only
+    /// for that narrow case (see module docs for the accepted trade-off).
+    fn candidate_work_estimate(&self, transactions: &[Transaction]) -> u64 {
+        let mut total = u64::try_from(transactions.len()).unwrap_or(u64::MAX);
+        for transaction in transactions {
+            total = total
+                .saturating_add(payload_traversal_charge(transaction))
+                .saturating_add(payload_bytes_charge(transaction))
+                .saturating_add(apply_to_overlay_estimate(transaction, None));
+        }
+        total = total
+            .saturating_add(u64::try_from(self.metadata_reservation_bytes()).unwrap_or(u64::MAX));
+        total = total.saturating_add(graph_charge_estimate(
+            self.entries.len(),
+            transactions.len(),
+        ));
+        for entry in &self.entries {
+            total = total.saturating_add(apply_to_overlay_estimate(
+                &entry.transaction,
+                Some(entry.sigop_cost),
+            ));
+        }
+        total
     }
 
     /// Creates an empty pool with node-validated resource ceilings.
@@ -1281,6 +1322,20 @@ impl TransactionAdmissionPool {
             .collect()
     }
 
+    /// Returns one retained transaction by txid without cloning the pool.
+    pub fn transaction(&self, txid: Txid) -> Option<Transaction> {
+        self.entry(txid).map(|entry| (*entry.transaction).clone())
+    }
+
+    /// Returns one retained transaction by wtxid without cloning the pool or
+    /// rehashing entries; each entry already stores its wtxid.
+    pub fn transaction_by_wtxid(&self, wtxid: Wtxid) -> Option<Transaction> {
+        self.entries
+            .iter()
+            .find(|entry| entry.wtxid == wtxid)
+            .map(|entry| (*entry.transaction).clone())
+    }
+
     /// Validates and retains one transaction without mutating chainstate.
     ///
     /// Inputs may be confirmed UTXOs or outputs of already-admitted parents.
@@ -1340,25 +1395,35 @@ impl TransactionAdmissionPool {
         context: TransactionAdmissionContext,
         now: u32,
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
+        // Gate the candidate's whole conservative worst-case work up front,
+        // before any stage below spends real ledger allowance. `transactions`
+        // upper-bounds the eventual deduplicated, topologically ordered
+        // package, so estimating from it is always conservative. A permanent
+        // over-capacity candidate is refused here instead of deep inside the
+        // pipeline; a merely-currently-unaffordable one defers with every
+        // stage counter untouched, so a retry after refill starts clean. See
+        // `candidate_work_estimate` for what this does not (yet) bound.
+        let estimate = self.candidate_work_estimate(&transactions);
+        if !self.budget.fits_work_capacity(estimate) {
+            return Err(AdmissionUnfittable {
+                stage: AdmissionStage::Payload,
+                reason: "candidate's worst-case work exceeds total admission work capacity",
+            }
+            .into());
+        }
+        self.budget
+            .try_reserve_work(AdmissionStage::Payload, estimate)?;
         self.budget.charge(
             AdmissionStage::Payload,
             u64::try_from(transactions.len()).unwrap_or(u64::MAX),
         )?;
         for transaction in &transactions {
-            let traversal = transaction
-                .input
-                .len()
-                .saturating_add(transaction.output.len());
             self.budget.charge(
                 AdmissionStage::Payload,
-                u64::try_from(traversal).unwrap_or(u64::MAX),
+                payload_traversal_charge(transaction),
             )?;
-            self.budget.charge(
-                AdmissionStage::Payload,
-                u64::try_from(transaction.total_size())
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(3),
-            )?;
+            self.budget
+                .charge(AdmissionStage::Payload, payload_bytes_charge(transaction))?;
         }
         validate_package_bounds(&transactions)?;
         self.decay_rolling_minimum_fee(now);
@@ -1393,9 +1458,7 @@ impl TransactionAdmissionPool {
     ) -> Result<PackageAdmissionOutcome, TransactionAdmissionError> {
         self.budget.charge(
             AdmissionStage::Graph,
-            u64::try_from(self.entries.len().saturating_add(ordered.len()))
-                .unwrap_or(u64::MAX)
-                .saturating_mul(4096),
+            graph_charge_estimate(self.entries.len(), ordered.len()),
         )?;
         let child_with_parents = is_child_with_parents_tree(&ordered);
         let replacement = self.prepare_replacement(&ordered, context.full_rbf)?;
@@ -1756,9 +1819,7 @@ impl TransactionAdmissionPool {
     ) -> Result<usize, TransactionAdmissionError> {
         self.budget.charge(
             AdmissionStage::Graph,
-            u64::try_from(self.entries.len())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(4096),
+            graph_charge_estimate(self.entries.len(), 0),
         )?;
         let before = self.entries.len();
         let overlay = AdmissionUtxoOverlay::new(store, &self.budget);
@@ -2637,6 +2698,65 @@ struct AppliedAdmission {
     script_verification: ScriptVerificationStamp,
 }
 
+/// `admit_package_at`'s Payload traversal charge: input/output count.
+fn payload_traversal_charge(transaction: &Transaction) -> u64 {
+    u64::try_from(
+        transaction
+            .input
+            .len()
+            .saturating_add(transaction.output.len()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// `admit_package_at`'s Payload byte-size charge.
+fn payload_bytes_charge(transaction: &Transaction) -> u64 {
+    u64::try_from(transaction.total_size())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3)
+}
+
+/// `admit_package_inner`'s and `reconcile_inner`'s Graph charge.
+fn graph_charge_estimate(existing: usize, incoming: usize) -> u64 {
+    u64::try_from(existing.saturating_add(incoming))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(4096)
+}
+
+/// `AdmissionUtxoOverlay::charge_preparation`'s formula.
+fn prevout_preparation_charge(transaction: &Transaction) -> u64 {
+    u64::try_from(transaction.input.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1024)
+        .saturating_add(payload_bytes_charge(transaction))
+}
+
+/// `precharge_prevout_materialization`'s formula.
+fn prevout_precharge_amount(transaction: &Transaction) -> u64 {
+    u64::try_from(transaction.input.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(PREVOUT_LOOKUP_BOUND_BYTES)
+        .saturating_mul(3)
+}
+
+/// Conservative upper bound of everything `apply_to_overlay` could charge
+/// for one transaction: `charge_preparation` plus the prevout precharge
+/// (their sum always dominates any later prevout excess charge, which stays
+/// at zero whenever every prevout script is within `MAX_SCRIPT_SIZE`, the
+/// only case a stored coin can ever be in) plus the Script stage's sigop and
+/// script-byte-clone charges. `sigop_cost_bound` is `None` when the real
+/// cost is not yet known (a not-yet-validated transaction); see
+/// `TransactionAdmissionPool::candidate_work_estimate` for why that is safe.
+fn apply_to_overlay_estimate(transaction: &Transaction, sigop_cost_bound: Option<u64>) -> u64 {
+    let input_count = u64::try_from(transaction.input.len()).unwrap_or(u64::MAX);
+    let script_bytes_bound = input_count.saturating_mul(MAX_SCRIPT_SIZE as u64);
+    let sigop_charge = sigop_cost_bound.unwrap_or(0).saturating_mul(10_000);
+    prevout_preparation_charge(transaction)
+        .saturating_add(prevout_precharge_amount(transaction))
+        .saturating_add(sigop_charge)
+        .saturating_add(script_bytes_bound)
+}
+
 /// Charges the worst-case prevout materialization cost before any lookup
 /// runs: `prepare_transaction_for_block` fetches and clones one `Utxo` per
 /// input through the overlay's `get`, and that store call has no way to
@@ -2651,10 +2771,7 @@ fn precharge_prevout_materialization<S: UtxoStore>(
     overlay: &AdmissionUtxoOverlay<'_, S>,
     transaction: &Transaction,
 ) -> Result<u64, TransactionAdmissionError> {
-    let input_count = u64::try_from(transaction.input.len()).unwrap_or(u64::MAX);
-    let precharge = input_count
-        .saturating_mul(PREVOUT_LOOKUP_BOUND_BYTES)
-        .saturating_mul(3);
+    let precharge = prevout_precharge_amount(transaction);
     if !overlay.budget.fits_work_capacity(precharge) {
         return Err(AdmissionUnfittable {
             stage: AdmissionStage::Prevout,
@@ -2751,7 +2868,9 @@ fn apply_to_overlay<S: UtxoStore>(
     validate_standard_transaction_at_rate(transaction, fee_sats, minimum_relay_fee_sat_kvb)?;
     // Charge the clone allocation below before performing it, mirroring the
     // prevout materialization charge above.
-    overlay.budget.charge(AdmissionStage::Script, prevout_bytes)?;
+    overlay
+        .budget
+        .charge(AdmissionStage::Script, prevout_bytes)?;
     let prevout_scripts = prevouts
         .iter()
         .map(|utxo| ScriptBuf::from_bytes(utxo.script_pubkey.clone()))
@@ -2819,14 +2938,7 @@ impl<'a, S> AdmissionUtxoOverlay<'a, S> {
     fn charge_preparation(&self, transaction: &Transaction) -> Result<(), AdmissionDeferred> {
         self.budget.charge(
             AdmissionStage::Prevout,
-            u64::try_from(transaction.input.len())
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1024)
-                .saturating_add(
-                    u64::try_from(transaction.total_size())
-                        .unwrap_or(u64::MAX)
-                        .saturating_mul(3),
-                ),
+            prevout_preparation_charge(transaction),
         )
     }
 }

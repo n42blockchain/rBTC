@@ -104,11 +104,18 @@ fn many_inputs_transaction(inputs: u16) -> Transaction {
 fn rejection_and_pool_clones_cannot_reset_the_shared_allowance() {
     let (_directory, store) = store();
     let (_, _, tx) = spend(1);
-    let budget = AdmissionBudget::new(AdmissionResourceLimits {
-        work_burst: 1,
+    let limits = AdmissionResourceLimits {
+        work_burst: 10_000_000,
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
-    });
+    };
+    let budget = AdmissionBudget::new(limits);
+    // Leave an allowance above zero but far below this candidate's
+    // conservative worst-case estimate, so the up-front gate defers
+    // (retryable) instead of refusing the candidate permanently.
+    budget
+        .charge(AdmissionStage::Graph, limits.work_burst - 1)
+        .unwrap();
     let mut pool = TransactionAdmissionPool::default().with_admission_budget(budget.clone());
     let error = pool.admit(&store, tx.clone(), context()).unwrap_err();
     assert!(matches!(
@@ -126,9 +133,16 @@ fn rejection_and_pool_clones_cannot_reset_the_shared_allowance() {
     assert!(pool.is_empty());
     assert!(!pool.is_recently_rejected(tx.compute_txid()));
     assert_eq!(budget.snapshot().candidate_bytes, 0);
+    // Cloning the pool and retrying cannot manufacture free work either:
+    // the up-front gate never charges anything for a deferred candidate,
+    // so only the earlier real Graph charge is ever recorded.
+    assert_eq!(
+        budget.snapshot().charged[AdmissionStage::Graph as usize],
+        limits.work_burst - 1
+    );
     assert_eq!(
         budget.snapshot().charged[AdmissionStage::Payload as usize],
-        1
+        0
     );
 }
 
@@ -191,7 +205,9 @@ fn prevout_precharge_defers_before_any_base_store_lookup() {
     // Exactly enough for every charge before the new prevout precharge:
     // package/traversal/byte payload, candidate metadata, the graph charge,
     // and the coarse `charge_preparation` estimate. Nothing is left for the
-    // precharge itself, so it must defer without ever calling `get`.
+    // precharge itself: this ledger's own capacity can never cover this
+    // candidate's conservative estimate, so the up-front gate refuses it
+    // permanently before any stage charge and before `get` is ever called.
     let payload = 1 + 2 + u64::try_from(tx.total_size()).unwrap() * 3;
     let metadata = 4 * 1024 * 1024;
     let graph = 4096;
@@ -205,14 +221,17 @@ fn prevout_precharge_defers_before_any_base_store_lookup() {
     let error = pool.admit(&counting, tx, context()).unwrap_err();
     assert!(matches!(
         error,
-        TransactionAdmissionError::ResourceDeferred(_)
+        TransactionAdmissionError::CandidateUnfittable(_)
     ));
     assert_eq!(
         counting.get_calls(),
         0,
-        "the base store must not be touched once the precharge itself defers"
+        "the base store must not be touched once the up-front gate refuses"
     );
-    assert!(pool.is_empty(), "a deferred candidate leaves the pool unchanged");
+    assert!(
+        pool.is_empty(),
+        "a refused candidate leaves the pool unchanged"
+    );
 }
 
 #[test]
@@ -267,4 +286,110 @@ fn oversized_candidate_is_permanently_refused_while_a_normal_one_still_admits() 
         normal_pool.admit(&store, normal_tx, context()),
         Ok(TransactionAdmissionOutcome::Accepted { .. })
     ));
+}
+
+#[test]
+fn a_candidate_below_its_estimate_defers_atomically_then_admits_after_refill() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, tx) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+    let counting = CountingStore::new(&store);
+    let limits = AdmissionResourceLimits {
+        // Comfortably above this one-input candidate's conservative
+        // worst-case estimate (dominated by the ~4 MiB metadata charge),
+        // so the candidate fits the ledger's total capacity.
+        work_burst: 10_000_000,
+        work_per_second: 0,
+        candidate_bytes: 16 * 1024 * 1024,
+    };
+    let budget = AdmissionBudget::new(limits);
+    // Simulate prior ledger activity that leaves an allowance above zero
+    // but far below the candidate's estimate.
+    budget
+        .charge(AdmissionStage::Graph, limits.work_burst - 100)
+        .unwrap();
+    let before = budget.snapshot();
+    let mut pool = TransactionAdmissionPool::default().with_admission_budget(budget.clone());
+    let error = pool.admit(&counting, tx.clone(), context()).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionAdmissionError::ResourceDeferred(_)
+    ));
+    assert_eq!(
+        counting.get_calls(),
+        0,
+        "the up-front gate defers before any base-store lookup"
+    );
+    let after = budget.snapshot();
+    assert_eq!(
+        after.charged, before.charged,
+        "no stage charge runs before the up-front gate defers"
+    );
+    assert!(pool.is_empty());
+
+    // A fresh ledger under the same limits models the allowance recovering
+    // through refill; the same candidate now admits.
+    let refilled = AdmissionBudget::new(limits);
+    let mut pool = TransactionAdmissionPool::default().with_admission_budget(refilled);
+    assert!(matches!(
+        pool.admit(&counting, tx, context()),
+        Ok(TransactionAdmissionOutcome::Accepted { .. })
+    ));
+}
+
+#[test]
+fn repeated_deferrals_never_drain_the_ledger() {
+    let (_directory, store) = store();
+    let (_, _, tx) = spend(1);
+    let limits = AdmissionResourceLimits {
+        work_burst: 10_000_000,
+        work_per_second: 0,
+        candidate_bytes: 16 * 1024 * 1024,
+    };
+    let budget = AdmissionBudget::new(limits);
+    budget
+        .charge(AdmissionStage::Graph, limits.work_burst - 100)
+        .unwrap();
+    let pool = TransactionAdmissionPool::default().with_admission_budget(budget.clone());
+    for _ in 0..5 {
+        assert!(matches!(
+            pool.clone().admit(&store, tx.clone(), context()),
+            Err(TransactionAdmissionError::ResourceDeferred(_))
+        ));
+    }
+    assert_eq!(
+        budget.snapshot().charged[AdmissionStage::Graph as usize],
+        limits.work_burst - 100,
+        "repeated deferrals leave the one real prior charge untouched"
+    );
+    for stage in [
+        AdmissionStage::Payload,
+        AdmissionStage::Metadata,
+        AdmissionStage::Prevout,
+        AdmissionStage::Script,
+        AdmissionStage::Snapshot,
+    ] {
+        assert_eq!(
+            budget.snapshot().charged[stage as usize],
+            0,
+            "no other stage is ever charged by a deferred candidate"
+        );
+    }
+}
+
+#[test]
+fn single_transaction_lookups_do_not_clone_the_pool() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, tx) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+    let mut pool = TransactionAdmissionPool::default();
+    pool.admit(&store, tx.clone(), context()).unwrap();
+    assert_eq!(pool.transaction(tx.compute_txid()), Some(tx.clone()));
+    assert_eq!(
+        pool.transaction_by_wtxid(tx.compute_wtxid()),
+        Some(tx.clone())
+    );
+    let (_, _, absent) = spend(2);
+    assert_eq!(pool.transaction(absent.compute_txid()), None);
+    assert_eq!(pool.transaction_by_wtxid(absent.compute_wtxid()), None);
 }

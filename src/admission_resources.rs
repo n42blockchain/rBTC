@@ -123,14 +123,9 @@ impl AdmissionBudget {
         }))
     }
 
-    /// Charges work before performing it. Failed reservations consume remaining
-    /// work, and candidate rollback never refunds prior successful charges.
-    pub fn charge(&self, stage: AdmissionStage, amount: u64) -> Result<(), AdmissionDeferred> {
-        let mut ledger = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Applies pending refill to a locked ledger. Shared by `charge` and
+    /// `try_reserve_work` so both observe the same live allowance.
+    fn refill_locked(&self, ledger: &mut State) {
         let now = Instant::now();
         let accrued = now
             .duration_since(ledger.updated)
@@ -147,6 +142,17 @@ impl AdmissionBudget {
         if ledger.remaining == self.0.limits.work_burst {
             ledger.fractional = 0;
         }
+    }
+
+    /// Charges work before performing it. Failed reservations consume remaining
+    /// work, and candidate rollback never refunds prior successful charges.
+    pub fn charge(&self, stage: AdmissionStage, amount: u64) -> Result<(), AdmissionDeferred> {
+        let mut ledger = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refill_locked(&mut ledger);
         let charged = amount.min(ledger.remaining);
         ledger.remaining -= charged;
         let index = stage as usize;
@@ -159,6 +165,43 @@ impl AdmissionBudget {
             });
         }
         Ok(())
+    }
+
+    /// Up-front, all-or-nothing affordability gate for a candidate's whole
+    /// conservative worst-case work estimate, checked before any of its
+    /// per-stage charges run.
+    ///
+    /// This is the narrower of the two designs described for avoiding
+    /// wasted partial admission work: it does *not* itself deduct `amount`
+    /// from the ledger (so it never double-charges alongside the unchanged
+    /// per-stage `charge` calls that follow it), it only refuses to let the
+    /// candidate start when the live allowance could not possibly cover its
+    /// estimate. A deferral here therefore leaves every stage's charged
+    /// counters untouched, unlike a `charge` failure, which still consumes
+    /// whatever remained. Callers still need `AdmissionBudget::fits_work_capacity`
+    /// beforehand to distinguish a permanent [`AdmissionUnfittable`] refusal
+    /// (estimate exceeds total burst capacity) from a retryable deferral
+    /// (estimate exceeds only the currently available allowance).
+    pub fn try_reserve_work(
+        &self,
+        stage: AdmissionStage,
+        amount: u64,
+    ) -> Result<(), AdmissionDeferred> {
+        let mut ledger = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refill_locked(&mut ledger);
+        if ledger.remaining >= amount {
+            return Ok(());
+        }
+        let index = stage as usize;
+        ledger.counters.deferred[index] = ledger.counters.deferred[index].saturating_add(1);
+        Err(AdmissionDeferred {
+            stage,
+            reason: "shared work allowance below candidate's worst-case estimate",
+        })
     }
 
     /// Reserves candidate-construction memory until the returned guard is dropped.
