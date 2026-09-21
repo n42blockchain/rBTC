@@ -18,7 +18,10 @@ use crate::{
 pub const COINBASE_MATURITY: u32 = 100;
 /// Total bitcoin supply cap in satoshis.
 pub const MAX_MONEY_SATS: u64 = 21_000_000 * 100_000_000;
-const MAX_SCRIPT_SIZE: usize = 10_000;
+/// Core's consensus ceiling on a non-provably-unspendable scriptPubKey.
+/// Reused by admission accounting as the worst-case script size any stored
+/// `Utxo` can carry, since larger outputs are pruned rather than stored.
+pub(crate) const MAX_SCRIPT_SIZE: usize = 10_000;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_FFFF;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 /// Keys charged for an `OP_CHECKMULTISIG` whose key count is not a known push.

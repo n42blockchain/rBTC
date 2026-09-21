@@ -59,6 +59,20 @@ pub struct AdmissionDeferred {
     pub reason: &'static str,
 }
 
+/// A permanent local refusal: a candidate's worst-case requirement for
+/// `stage` exceeds the ledger's total capacity for a single reservation, so
+/// no amount of waiting or retrying can ever admit it. Unlike
+/// [`AdmissionDeferred`], this is never retryable and callers must not treat
+/// it as evidence of peer misbehavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[error("admission candidate cannot fit at {stage:?}: {reason}")]
+pub struct AdmissionUnfittable {
+    /// Stage whose single-reservation capacity the candidate exceeds.
+    pub stage: AdmissionStage,
+    /// Stable local reason; never a peer-invalid classification.
+    pub reason: &'static str,
+}
+
 /// Cumulative ledger counters, including failed and rejected attempts.
 #[derive(Clone, Debug, Default)]
 pub struct AdmissionResourceSnapshot {
@@ -178,6 +192,22 @@ impl AdmissionBudget {
             shared: Arc::clone(&self.0),
             bytes,
         })
+    }
+
+    /// Returns whether `amount` could ever be charged in full at a single
+    /// call, even immediately after an idle interval fully refills the
+    /// bucket. An amount above the bucket's own burst capacity can never
+    /// succeed regardless of how many times it is retried.
+    #[must_use]
+    pub fn fits_work_capacity(&self, amount: u64) -> bool {
+        amount <= self.0.limits.work_burst
+    }
+
+    /// Returns whether `bytes` could ever be reserved as a single candidate,
+    /// even with no other candidate reservation outstanding.
+    #[must_use]
+    pub fn fits_candidate_capacity(&self, bytes: usize) -> bool {
+        bytes <= self.0.limits.candidate_bytes
     }
 
     /// Reads cumulative counters without resetting work or refunding a failure.
