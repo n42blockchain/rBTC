@@ -97,7 +97,11 @@ impl Cluster {
         // this in O(n + edges) and, if the budget can cover the check, skip
         // the closure search entirely rather than spend the full allowance
         // proving what a single pass already shows.
-        let edge_count: u64 = self.parents.iter().map(|parents| parents.len() as u64).sum();
+        let edge_count: u64 = self
+            .parents
+            .iter()
+            .map(|parents| parents.len() as u64)
+            .sum();
         let uniqueness_check_cost = self.len() as u64 + edge_count;
         if work.spend(uniqueness_check_cost).is_some()
             && self.has_unique_topological_order(&baseline)
@@ -613,7 +617,13 @@ mod tests {
     /// A single sink transaction depends on every other transaction.
     fn fan_in_parents(count: usize) -> Vec<Vec<usize>> {
         (0..count)
-            .map(|i| if i + 1 == count { (0..i).collect() } else { vec![] })
+            .map(|i| {
+                if i + 1 == count {
+                    (0..i).collect()
+                } else {
+                    vec![]
+                }
+            })
             .collect()
     }
 
@@ -629,7 +639,13 @@ mod tests {
     fn layered_bipartite_parents(count: usize) -> Vec<Vec<usize>> {
         let half = count / 2;
         (0..count)
-            .map(|i| if i < half { vec![] } else { (0..half).collect() })
+            .map(|i| {
+                if i < half {
+                    vec![]
+                } else {
+                    (0..half).collect()
+                }
+            })
             .collect()
     }
 

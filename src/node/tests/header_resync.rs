@@ -171,18 +171,32 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-        .await
-        .unwrap();
+    let mut dag = sync_headers(
+        &mut session,
+        &deployments,
+        path.clone(),
+        &clock,
+        None,
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rbtc::header_store::REPLAYED_HEADERS.with(std::cell::Cell::get),
         batch.len()
     );
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
     for _ in 0..8 {
-        dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-            .await
-            .unwrap();
+        dag = sync_headers(
+            &mut session,
+            &deployments,
+            path.clone(),
+            &clock,
+            Some(dag),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+        )
+        .await
+        .unwrap();
         assert_eq!(dag.active_tip(), reference.active_tip());
         assert_eq!(
             dag.retained_header_count(),
@@ -280,9 +294,16 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-        .await
-        .unwrap();
+    let dag = sync_headers(
+        &mut session,
+        &deployments,
+        path.clone(),
+        &clock,
+        Some(dag),
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rbtc::header_store::REPLAYED_HEADERS.with(std::cell::Cell::get),
         0
@@ -364,8 +385,7 @@ async fn header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_f
     let server = tokio::spawn(async move {
         let (mut peer, _) = accept_peer(listener, peer_version(701)).await;
         // Round one: several competing low-work forks alongside the winning chain.
-        let NetworkMessage::GetHeaders(request) =
-            peer.read_message().await.unwrap().into_payload()
+        let NetworkMessage::GetHeaders(request) = peer.read_message().await.unwrap().into_payload()
         else {
             panic!("expected first header poll");
         };
@@ -724,9 +744,16 @@ async fn header_resync_resource_probe() {
     .await
     .unwrap();
     let clock = NetworkTime::default();
-    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-        .await
-        .unwrap();
+    let mut dag = sync_headers(
+        &mut session,
+        &deployments,
+        path.clone(),
+        &clock,
+        None,
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+    )
+    .await
+    .unwrap();
     let memory = || {
         fs::read_to_string("/proc/self/status").ok().map(|status| {
             ["VmRSS:", "VmHWM:"].map(|field| {
@@ -745,15 +772,29 @@ async fn header_resync_resource_probe() {
     let started = Instant::now();
     for _ in 0..rounds {
         dag = if mode == "reuse" {
-            sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-                .await
-                .unwrap()
+            sync_headers(
+                &mut session,
+                &deployments,
+                path.clone(),
+                &clock,
+                Some(dag),
+                DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+            )
+            .await
+            .unwrap()
         } else {
             // This is the pre-change serving-loop assignment: the old DAG
             // stays alive until full replay returns its replacement.
-            sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
-                .await
-                .unwrap()
+            sync_headers(
+                &mut session,
+                &deployments,
+                path.clone(),
+                &clock,
+                None,
+                DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+            )
+            .await
+            .unwrap()
         };
         assert_eq!(dag.active_tip(), expected);
         assert_eq!(dag.retained_header_count(), count);

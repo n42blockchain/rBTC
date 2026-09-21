@@ -218,11 +218,7 @@ fuzz_target!(|input: &[u8]| {
     assert_eq!(budgeted.order.len(), cluster.len());
     let mut budget_position = vec![usize::MAX; cluster.len()];
     for (index, &tx) in budgeted.order.iter().enumerate() {
-        assert_eq!(
-            budget_position[tx],
-            usize::MAX,
-            "no duplicates (budgeted)"
-        );
+        assert_eq!(budget_position[tx], usize::MAX, "no duplicates (budgeted)");
         budget_position[tx] = index;
     }
     for (child, direct) in parents.iter().enumerate() {
