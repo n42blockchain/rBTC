@@ -92,6 +92,21 @@ impl Cluster {
             remaining: max_work,
             used: 0,
         };
+        // A cluster with exactly one topological order has nothing to
+        // optimize: the baseline order is already the unique optimum. Detect
+        // this in O(n + edges) and, if the budget can cover the check, skip
+        // the closure search entirely rather than spend the full allowance
+        // proving what a single pass already shows.
+        let edge_count: u64 = self.parents.iter().map(|parents| parents.len() as u64).sum();
+        let uniqueness_check_cost = self.len() as u64 + edge_count;
+        if work.spend(uniqueness_check_cost).is_some()
+            && self.has_unique_topological_order(&baseline)
+        {
+            result.order = baseline;
+            result.optimal = true;
+            result.work_used = work.used;
+            return result;
+        }
         let mut remaining = u64::MAX >> (64 - self.len());
         while remaining != 0 {
             let suffix = baseline
@@ -128,6 +143,22 @@ impl Cluster {
                 .iter()
                 .all(|&parent| positions[parent] < positions[child])
         })
+    }
+
+    /// Whether `order` (assumed a valid topological order for this cluster)
+    /// is the cluster's *only* topological order.
+    ///
+    /// Equivalent to Kahn's algorithm never holding more than one ready
+    /// vertex at a time: if some consecutive pair `order[i], order[i+1]`
+    /// lacks a direct edge, they can be swapped (nothing else constrains
+    /// their relative position), producing a second valid order. Conversely
+    /// if every consecutive pair is a direct edge, no permutation of `order`
+    /// can be topological, since reordering any pair would place a child
+    /// before its direct parent. Runs in O(n + edges).
+    fn has_unique_topological_order(&self, order: &[usize]) -> bool {
+        order
+            .windows(2)
+            .all(|pair| self.parents[pair[1]].contains(&pair[0]))
     }
 
     fn fraction_for(&self, mask: u64) -> FeeFrac {
@@ -721,5 +752,48 @@ mod tests {
                 "adversarial shape={shape} fee={fee} work_used@DEFAULT={work} converged={converged}"
             );
         }
+    }
+
+    #[test]
+    fn unique_order_clusters_short_circuit_the_search() {
+        for &(shape_name, shape_fn) in &[
+            ("complete_dag", complete_dag_parents as ShapeFn),
+            ("long_chain", chain_parents as ShapeFn),
+        ] {
+            let parents = shape_fn(ADVERSARIAL_COUNT);
+            let entries = sawtooth_fees(ADVERSARIAL_COUNT);
+            let cluster = Cluster::new(entries, parents).unwrap();
+            let old = (0..ADVERSARIAL_COUNT).collect::<Vec<_>>();
+            let result = cluster.linearize_with_budget(Some(&old), DEFAULT_OPTIMIZER_WORK);
+            eprintln!(
+                "unique-order short-circuit shape={shape_name} work_used={} optimal={}",
+                result.work_used, result.optimal
+            );
+            assert!(
+                result.optimal,
+                "{shape_name}: a cluster with one topological order is already optimal"
+            );
+            assert!(
+                result.work_used < 10_000,
+                "{shape_name}: expected a cheap short-circuit, spent {}",
+                result.work_used
+            );
+            assert_eq!(result.order, old);
+            assert!(result.previous_reused);
+        }
+    }
+
+    #[test]
+    fn independent_roots_are_not_short_circuited() {
+        // Two independent roots (0 and 1) both feed a shared child (2): the
+        // orders [0, 1, 2] and [1, 0, 2] are both topological, so this
+        // cluster has no unique order and must not be short-circuited.
+        let cluster = Cluster::new(
+            vec![FeeFrac::new(1, 1); 3],
+            vec![vec![], vec![], vec![0, 1]],
+        )
+        .unwrap();
+        assert!(!cluster.has_unique_topological_order(&[0, 1, 2]));
+        assert!(!cluster.has_unique_topological_order(&[1, 0, 2]));
     }
 }
