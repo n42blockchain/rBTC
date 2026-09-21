@@ -165,3 +165,48 @@ crates), `cargo clippy --all-targets --all-features` and the fuzz crate
 Clippy are clean. `cargo test --lib` passed 882 with 9 ignored, and all
 integration targets compile. This pass also applied rustfmt to the first-pass
 code (`05a32bd`); CI would otherwise have rejected it.
+
+## Third pass, same day
+
+**Peer `mempool` serving** (`1b0caa0`). `serve_mempool` previously cloned every
+retained transaction and rehashed each one for every `mempool` message. It
+now reads up to `MAX_INVENTORY_ENTRIES` stored `(txid, wtxid)` pairs through
+`TransactionAdmissionPool::inventory_ids` and answers at most once per inbound
+connection. Repeats are ignored without disconnecting or penalizing the peer.
+`InboundDataSource::mempool` now takes a limit and returns identifiers.
+Covered by `mempool_is_served_at_most_once_per_connection`.
+
+**Sigop estimate.** For a transaction whose sigop cost is not yet known, the
+up-front work gate now bounds the script sigop charge with
+`MAX_STANDARD_TRANSACTION_SIGOP_COST` (16,000); transactions above it are
+non-standard and rejected anyway. This adds 1.6e8 per new transaction, so a
+25-transaction package estimates about 4e9, still within the 8e9 default
+burst. `sigop_worst_case_bound_defers_up_front_without_store_lookups` shows
+the formerly missed case now defers before any stage or store work.
+
+**Hostile side-chain feeder** (`9e5c568`). At cap 1,024, a regtest store and
+DAG receive valid low-work forks off several active ancestors: mostly one
+header deep, every 37th fork three deep. Each batch commits, then runs the
+node's select, stage, persist and commit eviction sequence.
+
+| Headers fed | Evicted | Peak side-chain | Final redb file | Debug | Release |
+| --- | --- | --- | --- | --- | --- |
+| 10,000 (default test) | 8,984 | 1,024 | 2,641,920 B | 2.05 s | 0.71 s |
+| 100,000 (`#[ignore]`) | 98,984 | 1,024 | 2,641,920 B | 22.4 s | 4.56 s |
+
+The file size stops growing once the cap saturates. At the end, a fork
+evicted early is resubmitted with an extension from its retained ancestor and
+becomes active. A bounded reopen keeps the side-chain count within the cap.
+This exercises the store and DAG retention path directly, not a live P2P
+session, and it does not measure process RSS.
+
+**Declared boundary: serialized admission.** All admission, reconciliation
+and snapshot work runs under one `Mutex<TransactionAdmissionPool>`. This
+limits admission to one CPU. It is also a hard concurrency bound: no two
+candidates can hold overlapping leases or interleave partial pool state.
+Sharding is not required for the outbound-only production claim and is not
+planned for this release.
+
+Verification of the third pass on Windows (merge `e74f24e`): `cargo fmt --check`
+(both crates) and `cargo clippy --all-targets` are clean. `cargo test --lib`
+passed 885 with 10 ignored, and all integration targets compile.

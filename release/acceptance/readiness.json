@@ -10,12 +10,12 @@
     },
     "admission-resources": {
       "status": "open",
-      "reason": "Prevout precharge, an up-front candidate work gate and unfittable refusal exist; sigop estimate gap, whole-pool snapshot budgeting and serialized admission are not accepted.",
+      "reason": "Prevout precharge, a sigop-bounded up-front work gate, unfittable refusal and id-only peer mempool serving exist; whole-pool snapshot budgeting is not accepted and serialized admission is a declared boundary.",
       "evidence": []
     },
     "header-resources": {
       "status": "open",
-      "reason": "Ingress evicts low-work side-chain headers above a cap and reacquires stronger forks through sync; sustained hostile-feeder resource acceptance remains open.",
+      "reason": "Ingress evicts low-work side-chain headers above a cap, a 100,000-header hostile feeder stays within cap and storage plateau, and stronger forks are reacquired; live-process sustained acceptance remains open.",
       "evidence": []
     },
     "storage-replay": {
