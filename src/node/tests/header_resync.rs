@@ -171,7 +171,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None)
+    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
         .await
         .unwrap();
     assert_eq!(
@@ -180,7 +180,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     );
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
     for _ in 0..8 {
-        dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag))
+        dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
             .await
             .unwrap();
         assert_eq!(dag.active_tip(), reference.active_tip());
@@ -238,6 +238,7 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         &clock,
         &mut PrefetchedBlocks::default(),
         &mut Vec::new(),
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
     )
     .unwrap();
     assert_eq!(dag.active_tip().hash, local.block_hash());
@@ -279,7 +280,7 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag))
+    let dag = sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
         .await
         .unwrap();
     assert_eq!(
@@ -310,6 +311,164 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         dag.get(&local.block_hash())
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_fork() {
+    const CAP: usize = 4;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let clock = NetworkTime::default();
+    let dag = HeaderDag::with_deployments(deployments.clone());
+    let genesis = dag.active_tip();
+
+    // The chain a normal peer extension keeps active throughout round one.
+    let mut active = Vec::new();
+    let mut parent = genesis.header;
+    for _ in 0..3 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+        active.push(parent);
+    }
+
+    // Ten distinct single-header competing side forks off genesis, all tied
+    // on chainwork (regtest mining sits at the fixed minimum difficulty) and
+    // each individually weaker than the three-header active chain above.
+    let mut side_forks: Vec<Header> = (0..10u32)
+        .map(|offset| mine_regtest_child(genesis.hash, genesis.header.time + 100 + offset))
+        .collect();
+    let mut first_response = active.clone();
+    first_response.extend(side_forks.iter().copied());
+
+    // Ties break on ascending hash, so the selector keeps the four
+    // greatest-hash forks and evicts the other six.
+    side_forks.sort_by_key(|header| header.block_hash().to_byte_array());
+    let (evicted_forks, retained_forks) = side_forks.split_at(side_forks.len() - CAP);
+    let reacquired = evicted_forks[0];
+
+    // Extend the evicted fork past the active chain's chainwork (height 4
+    // beats height 3), so the node must reacquire it to win the tip back.
+    let mut extension = Vec::new();
+    let mut tip = reacquired;
+    for _ in 0..3 {
+        tip = mine_regtest_child(tip.block_hash(), tip.time + 1);
+        extension.push(tip);
+    }
+    let mut second_response = vec![reacquired];
+    second_response.extend(extension.iter().copied());
+
+    let locator_round_one = dag.block_locator();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(701)).await;
+        // Round one: several competing low-work forks alongside the winning chain.
+        let NetworkMessage::GetHeaders(request) =
+            peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected first header poll");
+        };
+        assert_eq!(request.locator_hashes, locator_round_one);
+        peer.write_message(NetworkMessage::Headers(first_response))
+            .await
+            .unwrap();
+        // Round two: the node's locator still only reflects the active
+        // chain, so the peer must resend the evicted fork from the shared
+        // ancestor (genesis) rather than from anything the node retained.
+        let NetworkMessage::GetHeaders(_) = peer.read_message().await.unwrap().into_payload()
+        else {
+            panic!("expected second header poll");
+        };
+        peer.write_message(NetworkMessage::Headers(second_response))
+            .await
+            .unwrap();
+    });
+
+    let mut session = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        700,
+        "/rbtcd:test/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    // (a) Several competing low-work forks exceed the cap: retained
+    // side-chain headers are bounded and the active chain is untouched. A
+    // rejected/evicted competing fork is ordinary local resource handling,
+    // never a peer fault, so this call must still return `Ok`.
+    let dag = sync_headers(
+        &mut session,
+        &deployments,
+        path.clone(),
+        &clock,
+        Some(dag),
+        CAP,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dag.active_tip().hash, active.last().unwrap().block_hash());
+    assert_eq!(dag.active_tip().height, 3);
+    let side_after_round_one = dag.retained_header_count() - 4;
+    assert_eq!(
+        side_after_round_one, CAP,
+        "ten competing forks over a cap of {CAP} must be bounded down to exactly the cap"
+    );
+    for header in retained_forks {
+        assert!(dag.get(&header.block_hash()).is_some());
+    }
+    for header in evicted_forks {
+        assert!(dag.get(&header.block_hash()).is_none());
+    }
+
+    // (b) The peer then extends an evicted fork past the active chain's
+    // chainwork; ordinary `getheaders` resync (the active-chain locator
+    // above) reacquires and revalidates it from the common ancestor, making
+    // it the new active header tip.
+    let dag = sync_headers(
+        &mut session,
+        &deployments,
+        path.clone(),
+        &clock,
+        Some(dag),
+        CAP,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dag.active_tip().hash,
+        extension.last().unwrap().block_hash()
+    );
+    assert_eq!(dag.active_tip().height, 4);
+    let side_after_round_two = dag.retained_header_count() - 5;
+    assert!(
+        side_after_round_two <= CAP,
+        "retained {side_after_round_two} side-chain headers above the cap"
+    );
+    assert!(dag.get(&reacquired.block_hash()).is_some());
+    for header in &evicted_forks[1..] {
+        assert!(
+            dag.get(&header.block_hash()).is_none(),
+            "an evicted fork the peer never resent must not reappear on its own"
+        );
+    }
+
+    server.await.unwrap();
+    drop(session);
+
+    // (c) Reopening the durable store never resurrects evicted headers, and
+    // the reacquired active chain survives the reload.
+    let restored = RedbHeaderStore::open(&path)
+        .unwrap()
+        .load_dag(Network::Regtest, unix_time().unwrap())
+        .unwrap();
+    assert_eq!(restored.active_tip(), dag.active_tip());
+    for header in &evicted_forks[1..] {
+        assert!(restored.get(&header.block_hash()).is_none());
+    }
+    assert!(restored.get(&reacquired.block_hash()).is_some());
 }
 
 #[tokio::test]
@@ -348,6 +507,7 @@ async fn header_resync_rejects_an_invalid_batch_without_persisting_its_prefix() 
         path.clone(),
         &NetworkTime::default(),
         Some(dag),
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
     )
     .await
     .err()
@@ -416,6 +576,7 @@ async fn header_resync_cancellation_keeps_committed_batches_for_restart() {
         path.clone(),
         &clock,
         Some(dag),
+        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
     ));
     tokio::select! {
         result = &mut syncing => panic!("sync ended before cancellation: {:?}", result.err()),
@@ -483,6 +644,7 @@ async fn header_resync_rejects_local_count_or_configuration_mismatch() {
             path,
             &NetworkTime::default(),
             Some(dag),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .await
         .err()
@@ -562,7 +724,7 @@ async fn header_resync_resource_probe() {
     .await
     .unwrap();
     let clock = NetworkTime::default();
-    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None)
+    let mut dag = sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
         .await
         .unwrap();
     let memory = || {
@@ -583,13 +745,13 @@ async fn header_resync_resource_probe() {
     let started = Instant::now();
     for _ in 0..rounds {
         dag = if mode == "reuse" {
-            sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag))
+            sync_headers(&mut session, &deployments, path.clone(), &clock, Some(dag), DEFAULT_MAX_SIDE_CHAIN_HEADERS)
                 .await
                 .unwrap()
         } else {
             // This is the pre-change serving-loop assignment: the old DAG
             // stays alive until full replay returns its replacement.
-            sync_headers(&mut session, &deployments, path.clone(), &clock, None)
+            sync_headers(&mut session, &deployments, path.clone(), &clock, None, DEFAULT_MAX_SIDE_CHAIN_HEADERS)
                 .await
                 .unwrap()
         };

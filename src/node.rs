@@ -200,6 +200,19 @@ const USER_AGENT: &str = concat!("/rbtcd:", env!("CARGO_PKG_VERSION"), "/");
 const MAX_CONFIGURED_PEERS: usize = 16;
 const DEFAULT_AUTOMATIC_HOT_STANDBYS: usize = 8;
 const MAX_AUTOMATIC_HOT_STANDBYS: usize = 16;
+/// Maximum side-chain (non-active) headers this node retains before pruning
+/// leaf-first by ascending chainwork.
+///
+/// A peer offering competing low-work forks costs this node one `HeaderInfo`
+/// (roughly 100 bytes) per header regardless of whether that fork ever wins;
+/// unbounded retention turns that into an unbounded local liability. Bitcoin
+/// mainnet reorgs have stayed at most a few dozen blocks deep in practice, so
+/// 16,384 retained side-chain headers (roughly 1.6 MB) leaves wide headroom
+/// below any observed legitimate reorg while still bounding a peer that keeps
+/// feeding this node fresh low-work forks. A stronger fork that outgrows this
+/// cap is reacquired through ordinary `getheaders` locator sync once it
+/// extends past the active tip's chainwork; nothing here weakens that path.
+const DEFAULT_MAX_SIDE_CHAIN_HEADERS: usize = 16_384;
 const MAX_DNS_SEEDS: usize = 16;
 const MAX_DNS_ADDRESSES_PER_SEED: usize = 64;
 const UTXO_ACTIVITY_WINDOWS: [u32; 11] = [
@@ -782,6 +795,9 @@ pub struct NodeResourceConfig {
     /// configured; a broadcast that cannot reach one fails, bounded — it
     /// never falls back to clearnet relay.
     pub private_broadcast: bool,
+    /// Maximum retained side-chain (non-active) headers before leaf-first,
+    /// lowest-chainwork-first eviction bounds them back down.
+    pub max_side_chain_headers: usize,
 }
 
 /// Origin of the ASN map used for peer-address diversity bucketing.
@@ -980,6 +996,7 @@ impl Default for NodeResourceConfig {
             asmap: NodeAsmapSource::Embedded,
             cjdns_reachable: false,
             private_broadcast: false,
+            max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         }
     }
 }
@@ -10831,6 +10848,7 @@ async fn run_connected_peer(
                 inbound_source,
                 options.inbound_listen.is_some(),
                 options.mempool_full_rbf,
+                options.resources.max_side_chain_headers,
                 api_runtime,
                 background_validation,
                 validation_scheduler,
@@ -10869,6 +10887,7 @@ async fn run_connected_peer(
             path.clone(),
             network_time,
             None,
+            options.resources.max_side_chain_headers,
         )
         .await?;
         let status = options
@@ -10966,6 +10985,7 @@ async fn complete_assumeutxo_validation(
         None,
         false,
         options.mempool_full_rbf,
+        options.resources.max_side_chain_headers,
         None,
         None,
         None,
@@ -11456,6 +11476,50 @@ fn settle_submitted_blocks(
     *awaiting = still_pending;
 }
 
+/// Bounds retained side-chain headers after a successful ingress commit.
+///
+/// This is a local resource action, never a peer fault: a competing fork a
+/// peer sends is ordinary valid consensus data, so a failure to stage or
+/// persist its eventual eviction must never be scored against or disconnect
+/// that peer, only logged. `dag` and `store` must be the in-memory DAG and
+/// its durable backing that the caller just committed a batch onto.
+/// `pinned_tips` additionally protects header hashes the caller still
+/// references for pending block download, execution or submission, beyond
+/// the active chain itself, which is never a candidate.
+fn evict_excess_side_chain_headers(
+    dag: &mut HeaderDag,
+    store: &RedbHeaderStore,
+    pinned_tips: &[BlockHash],
+    max_side_chain_headers: usize,
+) {
+    let candidates = dag.select_side_chain_eviction_candidates(pinned_tips, max_side_chain_headers);
+    if candidates.is_empty() {
+        return;
+    }
+    let count = candidates.len();
+    let stage = match dag.stage_leaf_evictions(&candidates, pinned_tips, count) {
+        Ok(stage) => stage,
+        Err(error) => {
+            rbtc_warn!("could not stage bounded header retention eviction: {error}");
+            return;
+        }
+    };
+    match store.persist_eviction(&stage) {
+        Ok(()) => {
+            stage.commit();
+            rbtc_info!(
+                "evicted {count} retained side-chain header{} above the retention cap",
+                if count == 1 { "" } else { "s" }
+            );
+        }
+        Err(error) => {
+            // `stage` drops at the end of this arm, rolling back the
+            // in-memory removal so the DAG and durable store cannot disagree.
+            rbtc_warn!("could not persist bounded header retention eviction: {error}");
+        }
+    }
+}
+
 /// Stages locally submitted blocks so the ordinary execution path connects them.
 ///
 /// Every other block this node connects is announced by a header first. A
@@ -11468,6 +11532,7 @@ fn settle_submitted_blocks(
 /// A header-level rejection is answered here. A block that reaches the active
 /// chain cannot be answered yet, because it has not been connected: its
 /// channel joins `awaiting` and is settled once execution has run.
+#[allow(clippy::too_many_arguments)]
 fn stage_submitted_blocks(
     pending: &Mutex<PendingBlockQueue>,
     headers: &mut HeaderDag,
@@ -11476,6 +11541,7 @@ fn stage_submitted_blocks(
     network_time: &NetworkTime,
     prefetched_blocks: &mut PrefetchedBlocks,
     awaiting: &mut AwaitingSubmissions,
+    max_side_chain_headers: usize,
 ) -> Result<(), PeerRunError> {
     // Blocks already carried over from a previous batch must be consumed in
     // their own order first; appending behind them would break the contiguous
@@ -11515,6 +11581,9 @@ fn stage_submitted_blocks(
         }
         let _ = staged.commit();
         staged_any = true;
+        let pinned_tips: Vec<BlockHash> =
+            awaiting.iter().map(|(awaited, _, _)| *awaited).collect();
+        evict_excess_side_chain_headers(headers, &store, &pinned_tips, max_side_chain_headers);
         if headers.active_tip().hash == hash {
             let height = headers.active_tip().height;
             prefetched_blocks.serialized.push(serialize(&block));
@@ -11545,6 +11614,7 @@ async fn sync_headers(
     path: PathBuf,
     network_time: &NetworkTime,
     existing: Option<HeaderDag>,
+    max_side_chain_headers: usize,
 ) -> Result<HeaderDag, PeerRunError> {
     let store =
         RedbHeaderStore::open(path).map_err(|error| PeerRunError::transient(error.to_string()))?;
@@ -11604,6 +11674,7 @@ async fn sync_headers(
             .append_batch(unseen)
             .map_err(|error| PeerRunError::transient(error.to_string()))?;
         let _ = staged.commit();
+        evict_excess_side_chain_headers(&mut dag, &store, &[], max_side_chain_headers);
         rbtc_info!(
             "validated and persisted {} headers; active tip {}:{}",
             unseen.len(),
@@ -11650,6 +11721,7 @@ async fn sync_snapshot_overlay_node(
         data_dir.join("headers.redb"),
         network_time,
         None,
+        options.resources.max_side_chain_headers,
     )
     .await?;
 
@@ -13448,6 +13520,7 @@ async fn sync_validating_node(
     inbound_source: Option<&Arc<SharedInboundSource>>,
     inbound_enabled: bool,
     mempool_full_rbf: bool,
+    max_side_chain_headers: usize,
     api_runtime: Option<&ApiRuntime>,
     background_validation: Option<&BackgroundValidationStatus>,
     validation_scheduler: Option<&BackgroundValidationStatus>,
@@ -13625,6 +13698,7 @@ async fn sync_validating_node(
         headers_path.clone(),
         network_time,
         None,
+        max_side_chain_headers,
     )
     .await?;
     let inbound_headers = Arc::new(RwLock::new(headers.active_chain_snapshot()));
@@ -13992,6 +14066,7 @@ async fn sync_validating_node(
                 network_time,
                 &mut prefetched_blocks,
                 &mut awaiting_submissions,
+                max_side_chain_headers,
             )?;
             let tip = execution_store.tip().map_err(|error| error.to_string())?;
             // Settle before anything can return or park: a submission staged in
@@ -14176,6 +14251,7 @@ async fn sync_validating_node(
                     headers_path.clone(),
                     network_time,
                     Some(headers),
+                    max_side_chain_headers,
                 )
                 .await?;
                 headers.refresh_active_chain_snapshot(
@@ -19039,6 +19115,7 @@ fn parse_merged_options(args: impl Iterator<Item = String>) -> Result<Option<Opt
             asmap: asmap_source.unwrap_or_default(),
             cjdns_reachable,
             private_broadcast,
+            max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         },
         logging: NodeLogConfig {
             level: log_level.unwrap_or(default_logging.level),
@@ -19837,6 +19914,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut Vec::new(),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .unwrap();
 
@@ -19888,6 +19966,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut Vec::new(),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .expect("a rejected submission is not a node failure");
 
@@ -19922,6 +20001,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut awaiting,
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .unwrap();
 
@@ -19961,6 +20041,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut awaiting,
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .unwrap();
 
@@ -20007,6 +20088,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut Vec::new(),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .unwrap();
 
@@ -20052,6 +20134,7 @@ mod tests {
             &NetworkTime::default(),
             &mut prefetched,
             &mut Vec::new(),
+            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         )
         .unwrap();
 
@@ -25014,6 +25097,7 @@ mod tests {
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
                 private_broadcast: false,
+                max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
             }
         );
 
@@ -25301,6 +25385,7 @@ mod tests {
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
                 private_broadcast: false,
+                max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Warn);
@@ -25350,6 +25435,7 @@ mod tests {
             asmap: NodeAsmapSource::Embedded,
             cjdns_reachable: false,
             private_broadcast: false,
+            max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
         };
         config.logging = NodeLogConfig {
             level: LogLevel::Debug,
@@ -25402,6 +25488,7 @@ mod tests {
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
                 private_broadcast: false,
+                max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
             }
         );
         assert_eq!(options.logging.level, LogLevel::Debug);
@@ -25497,6 +25584,7 @@ mod tests {
                 asmap: NodeAsmapSource::Embedded,
                 cjdns_reachable: false,
                 private_broadcast: false,
+                max_side_chain_headers: DEFAULT_MAX_SIDE_CHAIN_HEADERS,
             })
             .ledger_retention(576, DEFAULT_MAX_BYTES)
             .into_options()

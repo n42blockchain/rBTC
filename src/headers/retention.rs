@@ -1,5 +1,9 @@
-//! Explicit retention transactions. These primitives deliberately leave policy
-//! selection to a future recovery scheduler; node ingress does not auto-evict.
+//! Explicit retention transactions and the leaf-first side-chain candidate
+//! selector node ingress uses to bound retained competing headers.
+
+use std::{cmp::Reverse, collections::BinaryHeap};
+
+use bitcoin::{hashes::Hash, pow::Work};
 
 use super::{BlockHash, HashMap, HeaderDag, HeaderInfo};
 use thiserror::Error;
@@ -49,6 +53,28 @@ impl StagedHeaderEviction<'_> {
     }
 }
 
+/// Orders eviction candidates by ascending chainwork, then by hash so ties
+/// resolve identically wherever this selector runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EvictionCandidate {
+    chainwork: Work,
+    hash: BlockHash,
+}
+
+impl PartialOrd for EvictionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EvictionCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.chainwork
+            .cmp(&other.chainwork)
+            .then_with(|| self.hash.to_byte_array().cmp(&other.hash.to_byte_array()))
+    }
+}
+
 impl Drop for StagedHeaderEviction<'_> {
     fn drop(&mut self) {
         if !self.committed {
@@ -62,12 +88,15 @@ impl Drop for StagedHeaderEviction<'_> {
 impl HeaderDag {
     /// Stages explicitly selected side-chain leaves within a removal allowance.
     ///
-    /// This is a maintenance primitive, not an automatic fork-selection policy.
-    /// The first call builds an `O(retained headers)` child index; subsequent
-    /// insertions, rollbacks and removals maintain it incrementally. Active
-    /// history, retained descendants and caller-pinned tips cannot be removed.
-    /// A recovery scheduler must reacquire evicted ancestry before retrying a
-    /// stronger fork; callers must not classify any error as consensus invalid.
+    /// This is a maintenance primitive; it does not choose which headers to
+    /// remove itself (see [`Self::select_side_chain_eviction_candidates`] for
+    /// node ingress's bounded policy). The first call builds an
+    /// `O(retained headers)` child index; subsequent insertions, rollbacks and
+    /// removals maintain it incrementally. Active history, retained
+    /// descendants and caller-pinned tips cannot be removed. Ordinary
+    /// `getheaders` sync must reacquire evicted ancestry before a stronger
+    /// fork can win again; callers must not classify any error here as
+    /// consensus invalid.
     pub fn stage_leaf_evictions(
         &mut self,
         hashes: &[BlockHash],
@@ -82,12 +111,8 @@ impl HeaderDag {
                 return Err(HeaderRetentionError::Unknown(*hash));
             }
         }
-        if self.child_counts.is_none() && !hashes.is_empty() {
-            let mut counts = HashMap::new();
-            for info in self.headers.values().filter(|info| info.height > 0) {
-                *counts.entry(info.header.prev_blockhash).or_insert(0) += 1;
-            }
-            self.child_counts = Some(counts);
+        if !hashes.is_empty() {
+            self.ensure_child_counts();
         }
         let mut stage = StagedHeaderEviction {
             dag: self,
@@ -114,6 +139,96 @@ impl HeaderDag {
             stage.removed.push(info);
         }
         Ok(stage)
+    }
+
+    /// Selects side-chain leaves to keep retained side-chain headers within
+    /// `max_side_chain_headers`, for a subsequent [`Self::stage_leaf_evictions`].
+    ///
+    /// A candidate must be off the active chain (a header with more chainwork
+    /// than the active tip would already be the active tip, so no side-chain
+    /// header ever exceeds it), not in `pinned_tips`, and currently childless.
+    /// Candidates are ordered lowest chainwork first; ties break on hash so
+    /// independent runs of this selector agree without sharing arrival order.
+    /// Evicting a leaf can expose its parent as a new leaf, which this walk
+    /// then considers in the same pass, so a run of low-work side-chain
+    /// headers is fully reclaimed leaf-first without a second call. The
+    /// active chain and its ancestors are never candidates: every entry on
+    /// it fails the off-active-chain check at every step of the walk.
+    ///
+    /// Returns an empty vector when retained side-chain headers are already
+    /// within the cap, or once no further eligible header remains.
+    pub fn select_side_chain_eviction_candidates(
+        &mut self,
+        pinned_tips: &[BlockHash],
+        max_side_chain_headers: usize,
+    ) -> Vec<BlockHash> {
+        let side_chain_count = self.headers.len().saturating_sub(self.active_chain.len());
+        if side_chain_count <= max_side_chain_headers {
+            return Vec::new();
+        }
+        self.ensure_child_counts();
+        let mut remaining_children = self.child_counts.clone().unwrap_or_default();
+        let active_work = self.active_tip().chainwork;
+        let mut heap: BinaryHeap<Reverse<EvictionCandidate>> = self
+            .headers
+            .values()
+            .filter(|info| {
+                info.chainwork <= active_work
+                    && !pinned_tips.contains(&info.hash)
+                    && !remaining_children.contains_key(&info.hash)
+                    && self.active_height_of(info.hash).is_none()
+            })
+            .map(|info| {
+                Reverse(EvictionCandidate {
+                    chainwork: info.chainwork,
+                    hash: info.hash,
+                })
+            })
+            .collect();
+        let mut to_evict = side_chain_count - max_side_chain_headers;
+        let mut evicted = Vec::with_capacity(to_evict);
+        while to_evict > 0 {
+            let Some(Reverse(candidate)) = heap.pop() else {
+                break;
+            };
+            let Some(parent) = self
+                .headers
+                .get(&candidate.hash)
+                .map(|info| info.header.prev_blockhash)
+            else {
+                continue;
+            };
+            evicted.push(candidate.hash);
+            to_evict -= 1;
+            let Some(count) = remaining_children.get_mut(&parent) else {
+                continue;
+            };
+            *count -= 1;
+            if *count > 0 {
+                continue;
+            }
+            remaining_children.remove(&parent);
+            if pinned_tips.contains(&parent) || self.active_height_of(parent).is_some() {
+                continue;
+            }
+            if let Some(chainwork) = self.headers.get(&parent).map(|info| info.chainwork) {
+                heap.push(Reverse(EvictionCandidate {
+                    chainwork,
+                    hash: parent,
+                }));
+            }
+        }
+        evicted
+    }
+
+    fn ensure_child_counts(&mut self) {
+        if self.child_counts.is_none() {
+            let mut counts = HashMap::new();
+            for info in self.headers.values().filter(|info| info.height > 0) {
+                *counts.entry(info.header.prev_blockhash).or_insert(0) += 1;
+            }
+            self.child_counts = Some(counts);
+        }
     }
 
     pub(super) fn remove_retained_header(&mut self, hash: BlockHash) {

@@ -327,6 +327,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         asmap: rbtc::node::NodeAsmapSource::Embedded,
         cjdns_reachable: false,
         private_broadcast: false,
+        max_side_chain_headers: 16_384,
     };
     config.storage = NodeStorageConfig {
         prune_blocks: 576,
